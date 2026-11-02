@@ -10461,7 +10461,8 @@ approvals. Compatible legacy plans without recommendations keep their existing r
 
 ## Internal image reviewer transport (library only)
 
-Issue #1794 exposes internal APIs, not public visual command-line options. First
+Issue #1794 supplies the internal transport APIs used by the opt-in
+[visual defect review](#visual-defect-review) lifecycle. For library callers, first
 call `review_images_capabilities.preflight_images(config, selection)` with one
 configured named or legacy reviewer; omission requires the configured primary.
 The immutable reviewer invocation view fixes model, effort, permissions and
@@ -10506,8 +10507,9 @@ text and retains the original frozen proof out of band; it cannot reassess image
 No semantic re-ask, completion resume, provider fallback or post-submission replay
 is supported. Uncertain completion remains unsuccessful. Text-only calls retain
 their existing warning and recovery behavior. No screenshot clearance, code
-approval, normal finding lifecycle, durable workflow state or PR scheduling is
-introduced. Parent #1787 owns integration and rollout.
+approval or scheduler authority is introduced by the transport itself. The
+visual lifecycle below handles scoped findings; durable dispatch recovery and
+rollout remain deferred under #1795 and #1796.
 
 Pinned-release conformance is opt-in: set `IMAGE_CONTRACT_CODEX` and
 `IMAGE_CONTRACT_CLAUDE` to the pinned executables, then run
@@ -10519,3 +10521,59 @@ actual loopback-only model requests and refuses
 missing prerequisites rather than skipping. Default collection deselects this
 marker before managed sharding, including direct file selection. Replay tests
 remain in ordinary CI. See `tests/fixtures/review_images/README.md` for provenance.
+
+## Visual defect review
+
+This experimental first slice of #1795 works within one uninterrupted issue or
+PR invocation. It is **not ready for rollout until #1795 and #1796 finish**.
+It requires the existing Linux capture isolation and pinned image CLI admission;
+it does not launch a browser or select a different model automatically.
+
+| Option | Default / meaning |
+| --- | --- |
+| `--review-images-cmd COMMAND` | Operator-owned capture command; required when globs enable capture |
+| `--review-images-paths GLOB` | Repeatable literal Git-path glob; no globs disables all image activity |
+| `--review-images-seat SEAT` | Exactly one configured reviewer; omission requires an explicit primary |
+| `--review-images-runtime-grant PATH` | Repeatable absolute offline runtime grant; nonempty when enabled |
+| `--review-images-timeout SECONDS` | Capture only, 300 seconds; positive finite, maximum 1800 |
+| `--review-images-max-images N` | 16 logical entries; positive integer, maximum 16 |
+| `--review-images-max-bytes N` | 67108864 aggregate referenced PNG bytes, including baselines; positive integer, maximum 67108864 |
+| `--review-images-max-pixels N` | 64000000 aggregate referenced pixels, including baselines; positive integer, maximum 64000000 |
+
+The visual reviewer has a separate fixed **300-second acquisition timeout**,
+independent of capture and ordinary reviewer timeouts. Each PNG remains bounded
+by 768 pixels per dimension and 2 MiB. Viewport metadata may describe a larger
+original viewport (up to 16000 per dimension).
+
+Grants come only from the operator's CLI settings, never repository content,
+manifest data, agent output or dependency discovery. Explicitly cover the
+worker's `/usr/bin/python3`, the `/bin/sh` target, Python stdlib/extensions,
+native loader/libraries and capture assets. Grant only root-owned, nonwritable,
+canonical system runtime paths without overlapping grants. Validator mounts are
+narrowed from the same allowlist; missing dependencies or isolation prerequisites
+produce failed evidence without broadening mounts or weakening isolation.
+
+Added, modified, renamed (both names) and deleted paths participate without
+filesystem existence checks. Complete, stable changed-file listings are required.
+A matching new head receives at most one attempt in the invocation, after bounded
+CI-start observation. Ordinary CI need not finish; absent/unavailable CI is
+diagnosed, and managed final CI remains approval-gated. Capture uses the immutable
+head, and the prompt contains sealed images, manifest and a bounded pinned diff.
+
+Only verified delivery of every image can produce a visual verdict. Visible
+findings use stable normal blocking, same-PR and future follow-up rules; they
+supply no code approval, panel opening, sweep completion, requester screenshot
+clearance, CI qualification or merge permission. An image-less code turn cannot
+clear a visual finding, even when performed by the same seat. Capture, transport,
+validation and reviewer failures are failed evidence; ordinary review continues.
+Cancellation propagates after resource cleanup; unconfirmed cleanup stops work.
+
+A carried visual blocker that cannot obtain a verified disposition preserves its
+ID and owner obligation and routes to a human decision after permitted ordinary
+work, before merge or another futile coder turn. This includes a coder dispute
+or nothing-to-change result at an unchanged head whose visual attempt is spent.
+A fresh successful visual pass or explicit human resolution is required.
+Restart resets attempts and accepts no earlier success or private spool output;
+unresolved visual findings survive. Durable dispatch/recovery and digest skipping
+are deferred. Requester coverage and separate usage reporting belong to #1795;
+browser scripts, costs and rollout belong to #1796.

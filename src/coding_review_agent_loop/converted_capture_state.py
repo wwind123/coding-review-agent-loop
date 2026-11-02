@@ -1,4 +1,5 @@
 """Pure converted-capture eligibility reconstructed from ordered round records."""
+from .review_scope import is_visual_review, is_visual_item, authority_records
 
 from .round_state import EVIDENCE_FREEZE_PHASE
 
@@ -10,6 +11,7 @@ def capture_candidates(records, *, items, head, matrix_identity, diagnostic=None
     binding consumes it, even when it reports no evidence or pushes a new head.
     No round arithmetic or commit ordering is evidence of causal linkage.
     """
+    records = authority_records(records)
     def stop(reason):
         if diagnostic is not None:
             diagnostic(reason)
@@ -70,6 +72,7 @@ def evidence_review_boundary(records, *, head, matrix_identity=None):
     from .protocol import EVIDENCE_SOURCE_TOOL_CAPTURED, parse_risk_test_matrix_evidence
     from .errors import AgentLoopError
 
+    records = authority_records(records)
     boundary = -1
     episodes = set()
     published_evidence = {}
@@ -150,9 +153,7 @@ def capture_stale_reviewers(records, *, head, boundary):
         return ()
     latest = {}
     for record in records:
-        if record.metadata.role == "reviewer" and record.metadata.subject == head:
+        if not is_visual_review(record.metadata) and record.metadata.role == "reviewer" and record.metadata.subject == head:
             latest[record.metadata.agent] = record
     return tuple(name for name, record in latest.items()
                  if record.index <= boundary and record.metadata.state == "approved")
-
-

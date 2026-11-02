@@ -683,9 +683,9 @@ guards remain intact. Display acceptance grants no strict citation eligibility.
 
 ## Internal exact-head image capture
 
-`review_images_config.py` and `review_images_capture.py` expose a disconnected
-library service. There are no public visual flags, provider calls, PR dispatch,
-CI policy changes, screenshot clearance or durable visual history in this phase.
+`review_images_config.py` and `review_images_capture.py` provide the isolated
+service used by the opt-in `review_images.py` lifecycle. Capture itself grants
+no screenshot clearance or CI authority.
 `CaptureConfig` defaults to no path patterns or commands. `eligible` performs
 case-sensitive matching of normalized changed paths, including both rename
 names and deleted names, without filesystem access. Disabled calls allocate
@@ -886,9 +886,13 @@ explicit selection fails on missing prerequisites.
 including timeout/nonzero exits and envelope normalization. Repair has no images
 or authority to change proof. Resume, re-asks, fallbacks, updater replay and
 post-submission retries are disabled; uncertain completion is terminal. The bounded prompt encloses manifest, inventory, mappings
-and diff as escaped untrusted data and requests only visible defects and coverage.
-Parent #1787 owns scheduling, durable state, finding authority, screenshot
-clearance and public flags; these library APIs provide none.
+and diff as escaped untrusted data and requests only visible defects, excluding
+requester coverage. The opt-in lifecycle supplies scheduling and scoped finding
+handling. Durable dispatch recovery, screenshot clearance and rollout remain
+deferred under #1795 and #1796.
+
+Visual dispatch rechecks seat admission and uses a fixed 300-second acquisition
+timeout. Restart requires fresh delivery proof.
 
 ## Decisions
 

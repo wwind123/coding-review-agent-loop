@@ -3056,7 +3056,8 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
 @pytest.mark.parametrize("policy", ["selective-intermediate", "primary-then-panel"])
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("persistent_latch", [False, True])
-def test_non_capture_digest_change_preserves_carry_after_restart(tmp_path, monkeypatch, policy, parallel, persistent_latch):
+@pytest.mark.parametrize("visual_tail", [False, True])
+def test_non_capture_digest_change_preserves_carry_after_restart(tmp_path, monkeypatch, policy, parallel, persistent_latch, visual_tail):
     """An ordinary same-head follow-up changes obligations, not approval eligibility."""
     runner = FakeRunner(
         advance_pr_head_on_coder_followup=False,
@@ -3098,6 +3099,9 @@ def test_non_capture_digest_change_preserves_carry_after_restart(tmp_path, monke
         return None
 
     _rewrite_pr_metadata(runner, change)
+    if visual_tail:
+        from review_images_helpers import append_visual_record
+        append_visual_record(runner, round_number=2)
     runner.simulate_new_process()
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert _agent_sequence(runner).count("codex") == 1
@@ -3107,3 +3111,27 @@ def test_non_capture_digest_change_preserves_carry_after_restart(tmp_path, monke
     runner.simulate_new_process()
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert _agent_sequence(runner) == before
+
+
+@pytest.mark.parametrize('policy', ['selective-intermediate','primary-then-panel'])
+@pytest.mark.parametrize('parallel', [False, True])
+def test_visual_only_new_head_has_identical_scheduler_recovery(tmp_path, policy, parallel):
+    from review_images_helpers import append_visual_record
+    from test_pr_loop_evidence_conversion import _push_external_head
+    results = []
+    for visual_tail in (False, True):
+        config = make_config(tmp_path / str(visual_tail), reviewer=('codex','gemini'),
+            pr_review_policy=policy, primary_reviewer='codex' if policy=='primary-then-panel' else None,
+            review_parallel=parallel, max_rounds=5)
+        runner = FakeRunner(codex_outputs=[structured_pr_review()]*4,
+                            gemini_outputs=[structured_pr_review(reviewer='Google Gemini')]*4)
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        _push_external_head(runner, '6946a6f1ac1c65132a6a53600572ceb4af0ee23b')
+        if visual_tail:
+            append_visual_record(runner, round_number=1)
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        metadata = _posted_scheduler_metadata(runner)
+        results.append((sorted(_agent_sequence(runner)), [(m.scheduler_selected_reviewers,
+            m.scheduler_previous_sha,m.scheduler_phase,m.scheduler_force_full,m.scheduler_reasons)
+            for m in metadata]))
+    assert results[0] == results[1]

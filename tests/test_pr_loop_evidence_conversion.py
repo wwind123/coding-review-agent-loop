@@ -595,7 +595,8 @@ def test_an_external_push_releases_a_frozen_converted_row_with_the_same_item_id(
     assert "Bounded recovery capture" in _prompts(runner, "claude")[-1]
 
 
-def test_a_cleared_row_reopens_at_a_new_head_with_bounded_capture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("visual_tail", [False, True])
+def test_a_cleared_row_reopens_at_a_new_head_with_bounded_capture(tmp_path, monkeypatch, visual_tail):
     """`convert-head-change` and `convert-head-change-no-dispatch` (resume after an external push)."""
     context = _plan_context("row-a", "row-b")
     runner, config = _frozen_after_auto_conversion(tmp_path, monkeypatch, context)
@@ -605,6 +606,9 @@ def test_a_cleared_row_reopens_at_a_new_head_with_bounded_capture(tmp_path, monk
     tombstone = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-a")[0]
     assert tombstone.lifecycle == "cleared"
 
+    if visual_tail:
+        from review_images_helpers import append_visual_record
+        append_visual_record(runner, round_number=_records(runner)[-1].metadata.round_number)
     _push_external_head(runner, "6946a6f1ac1c65132a6a53600572ceb4af0ee23b")
     # The reviewer approves the new head with no code finding.
     runner.advance_pr_head_on_coder_followup = False
@@ -627,10 +631,13 @@ def test_a_cleared_row_reopens_at_a_new_head_with_bounded_capture(tmp_path, monk
     assert reopened.lifecycle == "evidence_frozen"
     # The answer for H does not satisfy H2: no merge, and a restart at H2 stays frozen.
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    if visual_tail:
+        append_visual_record(runner, round_number=_records(runner)[-1].metadata.round_number)
     runner.simulate_new_process()
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6946a6f1ac1c65132a6a53600572ceb4af0ee23b"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
-    [still] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-a")
+    [still] = _evidence_items(next(r for r in reversed(_records(runner))
+        if r.metadata.phase == "evidence-freeze").metadata.prior_items, "row-a")
     assert still.item_id == tombstone.item_id
 
 

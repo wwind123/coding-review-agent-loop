@@ -491,7 +491,8 @@ def test_cleared_evidence_with_signed_input_during_the_pass_refreshes_at_the_cei
     assert {record.metadata.round_number for record in _release_records(runner)} == {1}
 
 
-def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path, monkeypatch):
+@pytest.mark.parametrize("visual_tail", [False, True])
+def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path, monkeypatch, visual_tail):
     """Row evidence-response-outcome (restart variant)."""
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path)
@@ -515,6 +516,9 @@ def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path
         "evidence-cleared"
     ]
 
+    if visual_tail:
+        from review_images_helpers import append_visual_record
+        append_visual_record(runner, round_number=_release_records(runner)[-1].metadata.round_number)
     runner.pr_payload["comments"].append(_signed("One more requirement: keep the flag.", 2))
     runner.codex_outputs.append(_evidence_review(hr=True, summary="Checked the new requirement."))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0

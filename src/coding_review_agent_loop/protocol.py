@@ -313,13 +313,11 @@ class UnresolvedReviewItem:
     # and matrix identity they stand for.  Both or neither; evidence only.
     converted_row_id: str | None = None
     converted_matrix_identity: str | None = None
-    # Plan review findings only (#1505), both fixed when the orchestrator mints
-    # the item and never changed afterwards.  ``provenance`` is the reviewer's
-    # advisory ``revision_introduced``/``pre_existing`` tag; ``repeat_of`` is the
-    # orchestrator-computed ID of the carried item whose normalized text this
-    # new finding repeats.  Neither affects dispositions or approval.
+    # Advisory plan provenance and repeated-finding identity, fixed at mint (#1505).
+    # Visual origin_scope preserves finding authority across recovery.
     provenance: str | None = None
     repeat_of: str | None = None
+    origin_scope: str | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_row_ids and (

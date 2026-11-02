@@ -214,6 +214,8 @@ def run_issue_loop(
     requested_policy: str | None = None,
     usage_context: RunUsageContext | None = None,
 ) -> int:
+    from .review_images import startup as visual_startup
+    visual_startup(config)
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     reset_authenticated_github_actor(runner)

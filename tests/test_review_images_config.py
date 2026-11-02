@@ -76,12 +76,12 @@ def test_limits_require_positive_finite(field, value):
 
 @pytest.mark.parametrize('mode', ['issue', 'pr'])
 @pytest.mark.parametrize('option', ['cmd', 'paths', 'seat', 'timeout', 'max-images', 'max-bytes', 'max-pixels'])
-def test_public_options_rejected(mode, option):
+def test_public_options_accepted(mode, option):
     from coding_review_agent_loop.cli import build_parser
     parser = build_parser()
-    with pytest.raises(SystemExit) as error:
-        parser.parse_args([mode, '1793', '--review-images-' + option, 'value'])
-    assert error.value.code == 2
+    value = '1' if option in {'timeout', 'max-images', 'max-bytes', 'max-pixels'} else 'value'
+    args = parser.parse_args([mode, '1793', '--review-images-' + option, value])
+    assert getattr(args, 'review_images_' + option.replace('-', '_')) is not None
 
 
 @pytest.mark.parametrize('platform',['win32','darwin'])
@@ -121,3 +121,38 @@ def test_missing_host_namespace_metadata_refuses_before_staging(monkeypatch):
     assert result.state=='isolation-unavailable' and 'namespace' in result.diagnostic
     assert calls==['containment','bubblewrap','validator']
     assert namespaces==['/proc/self/ns/user']
+
+
+@pytest.mark.parametrize('name,value', [('review_images_timeout', 0), ('review_images_timeout', float('nan')),
+    ('review_images_timeout', 1801), ('review_images_max_images', 17), ('review_images_max_images', 1.5),
+    ('review_images_max_bytes', True), ('review_images_max_pixels', 64000001),
+    ('review_images_runtime_grant', ()), ('review_images_runtime_grant', ('/tmp',)),
+    ('review_images_runtime_grant', ('/usr/bin', '/usr/bin/python3'))])
+def test_enabled_public_settings_refuse_before_capture(tmp_path, name, value):
+    from dataclasses import replace
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.review_images import settings
+    config = make_config(tmp_path, review_images_paths=('ui/*',), review_images_cmd='capture',
+                         review_images_runtime_grant=('/usr/bin/python3',))
+    with pytest.raises((ValueError, OSError)):
+        settings(replace(config, **{name: value}))
+
+
+def test_disabled_lifecycle_never_imports_linux_transport():
+    code = '''import builtins,sys
+from types import SimpleNamespace
+original=builtins.__import__
+def guarded(name,*args,**kwargs):
+ if name in {'review_images_transport','review_images_manifest','review_images_isolation','review_images_png'}:
+  raise AssertionError('disabled lifecycle imported image transport or isolation')
+ return original(name,*args,**kwargs)
+builtins.__import__=guarded
+from coding_review_agent_loop.review_images import startup,VisualRun
+config=SimpleNamespace(review_images_paths=(),dry_run=False)
+startup(config)
+result=VisualRun().attempt(None,config=config,metadata=None,checkout=None,items=(),managed=False,current_head=None,diagnostic=None)
+assert result.diagnostic=='disabled'
+assert 'coding_review_agent_loop.review_images_transport' not in sys.modules
+'''
+    subprocess.run([sys.executable,'-c',code],stdin=subprocess.DEVNULL,check=True,timeout=10,
+                   env={**os.environ,'PYTHONPATH':str(Path(__file__).resolve().parents[1]/'src')})

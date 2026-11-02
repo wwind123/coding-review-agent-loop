@@ -451,3 +451,25 @@ def test_payload_cannot_add_unbounded_storage_mounts(tmp_path):
     result=required(capture(root,head,dataclasses.replace(config(),command=command),[{'status':'modified','filename':'capture.py'}]))
     assert result.isolation_proof[0]['nested_userns_disabled']
     result.snapshots.close()
+
+
+def test_public_cli_grants_reach_real_capture_preflight_and_validator(tmp_path):
+    """No capture/isolation/validator stubs; security-required mode forbids skip."""
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+    from coding_review_agent_loop.review_images import settings
+    from agent_loop_helpers import FakeRunner
+    root, head, _git = repository(tmp_path)
+    grants = tuple(p for p in ('/usr/bin', '/usr/lib', '/usr/lib64') if Path(p).is_dir())
+    args = ['pr', '77', '--repo', 'OWNER/REPO', '--review-images-paths', '*.py',
+            '--review-images-cmd', 'printf %s "$AGENT_LOOP_REVIEW_IMAGES_HEAD_SHA" > dependency; /usr/bin/python3 capture.py']
+    for grant in grants:
+        args.extend(['--review-images-runtime-grant', grant])
+    parsed = build_parser().parse_args(args)
+    configured = config_from_args(parsed, FakeRunner())
+    effective = settings(configured)
+    assert effective.runtime_grants == grants
+    result = required(capture(root, head, effective, [{'status': 'added', 'filename': 'capture.py'}]))
+    with result.snapshots:
+        assert result.snapshots.head_sha == head
+        assert len(result.isolation_proof) == 2

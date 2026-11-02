@@ -4978,6 +4978,8 @@ def preflight_operator_evidence_conversion(
     assert head_sha is not None
     records = admitted_pr_records(runner, config, pr_number=pr_number, comments=comments, resume=True)
     identity = approved_plan_context.risk_test_matrix_identity
+    from .review_scope import authority_records
+    records = authority_records(records)
     at_head = [record for record in records if record.metadata.subject == head_sha]
     if at_head and at_head[-1].metadata.phase == EVIDENCE_FREEZE_PHASE:
         _evidence_conversion.validate_operator_conversion_rows(

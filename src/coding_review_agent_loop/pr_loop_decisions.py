@@ -138,3 +138,13 @@ def _plumbing_observation_lines(failed, stuck) -> list[str]:
         for check in stuck
     )
     return lines
+
+
+def recovery_skips_reviewers(current_resume, broken_freeze_head, checkpoint):
+    """Re-evaluate recovery after checkpoint identity validation, before launch."""
+    from .unresolved_items import _is_evidence_obligation
+    return bool(current_resume is not None and (
+        (current_resume.unrecorded_head_advance and broken_freeze_head is None
+         and any(not _is_evidence_obligation(item) for item in current_resume.prior_items))
+        or (checkpoint is not None and checkpoint.valid
+            and checkpoint.lifecycle in {"repair_required", "qualification_ready", "qualifying"})))

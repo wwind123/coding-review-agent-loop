@@ -239,7 +239,7 @@ for the full receipt eligibility contract.
 
 ## Internal image transport components
 
-The library-only image transport (#1794) is owned by
+The image transport foundation (#1794) is owned by
 `review_images_transport.py` (sealed input ownership),
 `review_images_capabilities.py` (seat and executable/model admission),
 `review_images_adapter.py` and `review_images_proof.py` (native delivery and proof),
@@ -247,6 +247,18 @@ The library-only image transport (#1794) is owned by
 `review_images_prompts.py` (bounded visual scope). Optional inputs pass through
 `agents/base.py`, `agents/registry.py`, both supported adapters and
 `validated_agent.py`. See [Execution and concurrency](execution-and-concurrency.md#internal-image-transport-1794).
+
+The opt-in `review_images.py` lifecycle connects public configuration, complete
+head-bound changed-path eligibility, bounded CI-start observation, trusted Git
+imports and immutable bounded diffs to capture and proof-checked acquisition.
+The configured seat receives a fresh finite visual turn. `review_scope.py`
+classifies bound visible-defects records separately from code/evidence authority;
+visual findings retain their origin in the ordinary ledger. This experimental
+single-invocation slice of #1795 remains unavailable for rollout pending #1795
+and #1796.
+
+The read-only entry board-floor check `_enforce_pr_board_floor` lives in
+`pr_board_entry.py` and is re-exported by `pr_loop.py`.
 
 ## Decisions
 

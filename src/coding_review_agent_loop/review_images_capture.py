@@ -1,4 +1,4 @@
-"""Disconnected exact-head capture service. No public CLI or PR-loop dispatch."""
+"""Exact-head isolated capture service used by the opt-in visual lifecycle."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import hashlib

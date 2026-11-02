@@ -1,4 +1,4 @@
-"""Operator-owned, library-only capture configuration and pure eligibility."""
+"""Operator-owned capture configuration and pure eligibility."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

@@ -206,6 +206,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     def add_common(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--review-images-cmd", help="Operator-owned isolated capture command")
+        subparser.add_argument("--review-images-paths", action="append", default=[], help="Literal changed-path glob; repeatable; no globs disables visual review")
+        subparser.add_argument("--review-images-seat", help="Configured image-capable reviewer seat; defaults to explicit primary")
+        subparser.add_argument("--review-images-runtime-grant", action="append", default=[], help="Operator-owned absolute offline runtime path; repeatable")
+        subparser.add_argument("--review-images-timeout", type=float, default=300, help="Capture timeout in seconds (default 300)")
+        subparser.add_argument("--review-images-max-images", type=int, default=16)
+        subparser.add_argument("--review-images-max-bytes", type=int, default=67108864)
+        subparser.add_argument("--review-images-max-pixels", type=int, default=64000000)
         subparser.add_argument("--repo", help="GitHub repo as owner/name. Defaults to gh repo view.")
         subparser.add_argument(
             "--base",
