@@ -6307,12 +6307,12 @@ it names the immediately preceding terminal attempt of the same Actions run.
 
 Validation alone exposes the expected SHA. The exact-head job checks out that
 SHA, verifies `git rev-parse HEAD`, installs `.[dev]` on Python 3.12, and runs
-`python -m pytest` once, split into three shard legs named
-`Test validated exact head (shard k/3)`. The aggregate job keeps the original
+`python -m pytest` once, split into six repository-selected shard legs named
+`Test validated exact head (shard k/6)`. The aggregate job keeps the original
 `Test validated exact head` name and fails unless every shard succeeded and
 the shard manifests prove exactly-once coverage of the collection; the
 publisher reads only that aggregate. The ordinary suite is likewise
-`Python 3.12 full suite (shard k/3)` legs plus a `Python 3.12 full suite`
+`Python 3.12 full suite (shard k/6)` legs plus a `Python 3.12 full suite`
 aggregate (skipped when routing suppresses CI, as before). After
 "Re-run failed jobs" the verifier uses the highest-attempt manifest per shard;
 if a manifest is missing (for example expired artifacts) it asks for "Re-run
