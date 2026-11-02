@@ -38,6 +38,47 @@ def inputs(provider="claude", *, multiple=True):
     return snapshot, acquired
 
 
+@pytest.mark.parametrize('viewport', [(390, 844), (1280, 720)])
+def test_transport_accepts_downscaled_viewports_without_widening_png_policy(viewport):
+    from coding_review_agent_loop.review_images_config import delivery_limits
+    snapshot, template = inputs()
+    cap = template.capability
+    template.close()
+    snapshot.close()
+    value = manifest()
+    value['images'][0]['viewport'] = dict(zip(('width', 'height'), viewport))
+    policy = delivery_limits()
+    with publish(json.dumps(value).encode(), value['head_sha'], policy,
+                 {'one.png': png(), 'base.png': png()},
+                 {'one.png': (2, 2), 'base.png': (2, 2)}, 'config') as snapshot:
+        with acquire_images(snapshot, cap, head_sha=snapshot.head_sha,
+                            config_digest=snapshot.config_digest,
+                            snapshot_digest=snapshot.digest, limits=policy) as acquired:
+            assert json.loads(acquired.manifest_json)['images'][0]['viewport']['height'] == viewport[1]
+
+
+@pytest.mark.parametrize('field,value', [('entries', 1), ('dimension', 1), ('pixels', 3),
+                                      ('file_bytes', 1), ('total_bytes', 1), ('total_pixels', 15)])
+def test_transport_enforces_lower_operator_limits_including_shared_baselines(field, value):
+    from coding_review_agent_loop.review_images_config import delivery_limits
+    snapshot, template = inputs()
+    cap = template.capability
+    template.close()
+    policy = replace(delivery_limits(), **{field: value})
+    with snapshot, pytest.raises(ValueError):
+        acquire_images(snapshot, cap, head_sha=snapshot.head_sha,
+                       config_digest=snapshot.config_digest,
+                       snapshot_digest=snapshot.digest, limits=policy)
+
+
+def test_transport_rejects_operator_limits_above_concrete_admission():
+    snapshot, images = inputs()
+    with snapshot, images, pytest.raises(ValueError, match='bound'):
+        acquire_images(snapshot, images.capability, head_sha=snapshot.head_sha,
+                       config_digest=snapshot.config_digest,
+                       snapshot_digest=snapshot.digest, limits=ImageLimits())
+
+
 def claude_events(images, *, models=None, content="VISUAL_OK"):
     binding = images.binding
     models = [binding.configured_model] if models is None else models

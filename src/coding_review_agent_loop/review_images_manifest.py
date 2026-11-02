@@ -43,7 +43,7 @@ def schema(raw: bytes, head: str, limits: ImageLimits):
         viewport = image['viewport']
         if not isinstance(viewport, dict) or set(viewport) != {'width', 'height'}:
             raise ValueError('invalid viewport')
-        if any(isinstance(n, bool) or not isinstance(n, int) or not 0 < n <= limits.dimension for n in viewport.values()):
+        if any(isinstance(n, bool) or not isinstance(n, int) or not 0 < n <= limits.viewport_dimension for n in viewport.values()):
             raise ValueError('invalid viewport dimensions')
         if 'diff_score' in image:
             score = image['diff_score']

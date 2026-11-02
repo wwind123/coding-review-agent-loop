@@ -48,6 +48,98 @@ from agent_loop_helpers import FakeRunner as _FakeRunner, structured_plan_state
 
 FOOTER = KNOWN_HOST_COMMENT_FOOTER
 ACTOR = ("agent-loop", 7)
+
+
+def _changed_paths_read(monkeypatch, tmp_path, responses):
+    from coding_review_agent_loop import github_changed_paths as reader
+    config = SimpleNamespace(repo='owner/repo', gh_cmd='gh')
+    calls = []
+    pending = iter(responses)
+
+    def run(_runner, command, **kwargs):
+        calls.append(command)
+        assert kwargs['cwd'] == tmp_path and kwargs['check'] is False
+        value = next(pending)
+        if isinstance(value, Exception):
+            raise value
+        return SimpleNamespace(returncode=0, stdout=json.dumps(value))
+
+    monkeypatch.setattr(reader, 'run_gh_read', run)
+    monkeypatch.setattr(reader, 'github_api_cwd', lambda: tmp_path)
+    result = github_module.get_pr_changed_paths(None, config=config, pr_number=12, head_sha='a'*40)
+    return result, calls
+
+
+def _changed_paths_metadata(count, head='a'*40):
+    return {'head': {'sha': head}, 'changed_files': count}
+
+
+def test_changed_paths_reads_all_pages_and_rechecks_head(monkeypatch, tmp_path):
+    first = [{'status': 'modified', 'filename': f'ui/{n}.tsx'} for n in range(100)]
+    last = [{'status': 'renamed', 'filename': 'new.py', 'previous_filename': 'ui/old.tsx'},
+            {'status': 'copied', 'filename': 'copy.tsx'},
+            {'status': 'changed', 'filename': 'changed.tsx'}]
+    metadata = _changed_paths_metadata(103)
+    result, calls = _changed_paths_read(monkeypatch, tmp_path, [metadata, first, last, metadata])
+    assert result.available and len(result.changes) == 103
+    assert result.changes[100].as_record() == last[0]
+    assert result.changes[101].status == 'added'
+    assert result.changes[102].status == 'modified'
+    assert [call[2] for call in calls] == ['repos/owner/repo/pulls/12',
+        'repos/owner/repo/pulls/12/files?per_page=100&page=1',
+        'repos/owner/repo/pulls/12/files?per_page=100&page=2', 'repos/owner/repo/pulls/12']
+
+
+def test_changed_paths_exact_page_boundary_reads_completion_page(monkeypatch, tmp_path):
+    metadata = _changed_paths_metadata(100)
+    batch = [{'status': 'added', 'filename': f'{n}.txt'} for n in range(100)]
+    result, calls = _changed_paths_read(monkeypatch, tmp_path, [metadata, batch, [], metadata])
+    assert result.available and len(result.changes) == 100 and len(calls) == 4
+
+
+def test_changed_paths_empty_is_distinct_from_unavailable(monkeypatch, tmp_path):
+    metadata = _changed_paths_metadata(0)
+    result, calls = _changed_paths_read(monkeypatch, tmp_path, [metadata, [], metadata])
+    assert result.available and result.changes == () and len(calls) == 3
+
+
+@pytest.mark.parametrize('count', [3000, 3001, -1, None, True, 1.5])
+def test_changed_paths_refuses_unknown_count_and_api_ceiling(monkeypatch, tmp_path, count):
+    result, calls = _changed_paths_read(monkeypatch, tmp_path, [_changed_paths_metadata(count)])
+    assert not result.available and result.changes == () and len(calls) == 1
+
+
+@pytest.mark.parametrize('responses', [
+    [_changed_paths_metadata(1, 'b'*40)],
+    [_changed_paths_metadata(1), []],
+    [_changed_paths_metadata(0), [{'status': 'added', 'filename': 'x'}]],
+    [_changed_paths_metadata(1), [{'status': 'added', 'filename': 'x'}], _changed_paths_metadata(1, 'b'*40)],
+    [_changed_paths_metadata(1), [{'status': 'added', 'filename': 'x'}], _changed_paths_metadata(2)],
+    [_changed_paths_metadata(2), [{'status': 'added', 'filename': 'x'}]*2],
+    [_changed_paths_metadata(1), [{'status': 'unknown', 'filename': 'x'}]],
+    [_changed_paths_metadata(1), [{'status': [], 'filename': 'x'}]],
+    [_changed_paths_metadata(1), [{'status': 'renamed', 'filename': 'x'}]],
+    [_changed_paths_metadata(1), [{'status': 'added', 'filename': '../x'}]],
+    [_changed_paths_metadata(1), {'message': 'error'}],
+    [AgentLoopError('secret credential in stderr')],
+])
+def test_changed_paths_unstable_partial_or_malformed_never_supplies_changes(monkeypatch, tmp_path, responses):
+    result, _calls = _changed_paths_read(monkeypatch, tmp_path, responses)
+    assert not result.available and result.changes == ()
+    assert result.diagnostic and 'secret' not in result.diagnostic
+
+
+def test_changed_paths_literal_names_reach_pure_matching_without_artifact_admission(monkeypatch, tmp_path):
+    from coding_review_agent_loop.review_images_config import CaptureConfig, eligible
+    changes = [{'status': 'added', 'filename': name} for name in ['notes:a', 'notes\\a', 'notes\na']]
+    metadata = _changed_paths_metadata(3)
+    result, _calls = _changed_paths_read(monkeypatch, tmp_path, [metadata, changes, metadata])
+    assert result.available
+    records = [change.as_record() for change in result.changes]
+    assert not eligible(CaptureConfig(paths=('ui/*',), command='capture'), records)
+    with pytest.raises(ValueError, match='unsafe repository-relative'):
+        eligible(CaptureConfig(paths=('*',), command='capture'), records)
+
 NEAR_MISSES = (
     # A different URL.
     "\n\n---\n_Generated by [Claude Code](http://claude.ai/code)_",

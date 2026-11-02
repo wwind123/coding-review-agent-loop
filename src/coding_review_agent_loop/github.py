@@ -48,6 +48,7 @@ from .github_issue_references import (
     parse_linked_issue_numbers,
 )
 from .github_transport import TransportConfigError, is_graphql_refusal, transport_mode
+from .github_changed_paths import ChangedPath, PullRequestChangedPaths, get_pr_changed_paths
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER,
     PR_EXPECTED_CLOSING_MARKER_RE,
