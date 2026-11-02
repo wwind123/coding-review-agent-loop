@@ -14,17 +14,20 @@ def scope_present(metadata):
 
 def is_complete_code_review(metadata):
     get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
-    return get("role") == "reviewer" and not scope_present(metadata)
+    return get("role") == "reviewer" and not scope_present(metadata) and not visual_candidate(metadata)
 
 
 def encode_review_scope(metadata):
-    return {**({"review_scope": metadata.review_scope} if scope_present(metadata) else {}),
+    return {**({"visual_lifecycle": metadata.visual_lifecycle} if lifecycle_present(metadata) else {}),
+            **({"review_scope": metadata.review_scope} if scope_present(metadata) else {}),
             **({"capture_review_binding": metadata.capture_review_binding}
                if metadata.capture_review_binding is not None else {})}
 
 
 def decode_review_scope(payload):
-    return {**({"review_scope": payload["review_scope"], "review_scope_present": True}
+    return {**({"visual_lifecycle": payload["visual_lifecycle"], "visual_lifecycle_present": True}
+               if "visual_lifecycle" in payload else {}),
+            **({"review_scope": payload["review_scope"], "review_scope_present": True}
                if "review_scope" in payload else {}),
             **({"capture_review_binding": payload["capture_review_binding"]}
                if "capture_review_binding" in payload else {})}
@@ -42,10 +45,10 @@ def valid_evidence_scope(scope):
 
 
 def is_visual_review(metadata):
-    """Only a fully bound visible-defects record is outside ordinary authority.
+    """Recognize the legacy four-key visual assessment scope.
 
-    Unknown, null and malformed scopes remain in authority readers so their
-    existing conservative recovery rules still apply.
+    Use visual_candidate for quarantine and identity hydration: lifecycle
+    candidates must stay outside unrelated authority even when malformed.
     """
     get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
     scope = get("review_scope")
@@ -60,8 +63,22 @@ def is_visual_review(metadata):
 
 
 def authority_records(records):
-    return tuple(record for record in records if not is_visual_review(record.metadata))
+    return tuple(record for record in records if not visual_candidate(record.metadata))
 
 
 def is_visual_item(item):
     return getattr(item, "origin_scope", None) == "visible-defects"
+
+
+def lifecycle_present(metadata):
+    if isinstance(metadata, Mapping):
+        return "visual_lifecycle" in metadata
+    return getattr(metadata, "visual_lifecycle_present", False) or getattr(metadata, "visual_lifecycle", None) is not None
+
+
+def visual_candidate(metadata):
+    """Broad quarantine before authentication or strict lifecycle validation."""
+    get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
+    scope = get("review_scope")
+    return lifecycle_present(metadata) or is_visual_review(metadata) or (
+        isinstance(scope, Mapping) and scope.get("kind") == "visible-defects")

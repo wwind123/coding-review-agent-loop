@@ -4379,6 +4379,22 @@ def post_verified_trusted_issue_protocol_comment(
     )
 
 
+def post_verified_trusted_pr_round_comment(
+    runner, *, config, pr_number, body, expected_author_login, expected_author_id,
+):
+    """Verify each transport sidecar and return the verified final PR anchor."""
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Verified PR round posting requires a TrustedBody.")
+    anchor = None
+    for prepared in prepare_round_comment(body):
+        anchor = post_verified_trusted_pr_protocol_comment_observed(
+            runner, config=config, pr_number=pr_number, body=prepared,
+            expected_author_login=expected_author_login, expected_author_id=expected_author_id)
+    if anchor is None:
+        raise AgentLoopError("Verified PR round posting produced no anchor.")
+    return anchor
+
+
 def post_verified_trusted_issue_round_comment(
     runner: Runner,
     *,

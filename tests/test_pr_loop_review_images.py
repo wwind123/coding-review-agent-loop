@@ -14,7 +14,7 @@ from coding_review_agent_loop.github_changed_paths import ChangedPath, PullReque
 from coding_review_agent_loop.review_images_capture import CaptureResult
 from coding_review_agent_loop.review_images_manifest import publish
 from coding_review_agent_loop.review_images_transport import ImageDeliveryProof
-from coding_review_agent_loop.review_scope import is_visual_review
+from coding_review_agent_loop.review_scope import is_visual_review, visual_candidate
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 from coding_review_agent_loop.pr_loop import run_pr_loop
 from review_images_helpers import png, manifest
@@ -35,7 +35,8 @@ def visual_setup(tmp_path, monkeypatch):
         selected, _, invocation, _ = visual.reviewer_view(cfg, seat)
         return SimpleNamespace(seat=str(selected), provider=seat_backend(selected),
                                model=invocation.configured_model, effort=invocation.resolved_effort,
-                               contract_id='stub', executable_digest='stub')
+                               contract_id='stub', executable_digest='stub', model_chain=(invocation.configured_model,),
+                               permission_mode=cfg.agent_permissions, version='stub-v1')
     monkeypatch.setattr(visual, 'preflight_images', preflight)
     def paths(runner, *, config, pr_number, head_sha):
         calls.append(('paths', head_sha))
@@ -46,6 +47,7 @@ def visual_setup(tmp_path, monkeypatch):
     def capture(checkout, head, settings, changes):
         calls.append(('capture', head))
         value = manifest(head)
+        value['images'][0]['state'] = head  # Default fixture represents changed captures across heads.
         snap = publish(json.dumps(value).encode(), head, settings.limits,
                        {'one.png': png(), 'base.png': png()},
                        {'one.png': (2, 2), 'base.png': (2, 2)}, 'stub-config')
@@ -262,7 +264,7 @@ _PRODUCTION_OBSERVE_CI = visual.observe_ci
 
 
 @pytest.mark.parametrize('success', [True, False])
-def test_restart_never_reuses_visual_success(visual_setup, monkeypatch, success):
+def test_restart_recovers_terminal_without_recapture(visual_setup, monkeypatch, success):
     config, calls, _ = visual_setup
     runner = FakeRunner(codex_outputs=[structured_pr_review(), structured_pr_review()])
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -271,15 +273,19 @@ def test_restart_never_reuses_visual_success(visual_setup, monkeypatch, success)
     if not success:
         monkeypatch.setattr(visual, 'capture', lambda *a: calls.append(('capture','failed')) or CaptureResult('failed','restart'))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert len([c for c in calls if c[0]=='capture']) == 2
-    assert len([r for r in records(runner) if is_visual_review(r.metadata)]) == before + int(success)
+    assert len([c for c in calls if c[0]=='capture']) == 1
+    assert len([r for r in records(runner) if is_visual_review(r.metadata)]) == before
 
 
-@pytest.mark.parametrize('at', ['listing', 'capture', 'images'])
-def test_stale_head_result_is_discarded_and_next_head_is_attempted(visual_setup, monkeypatch, at):
+@pytest.mark.parametrize('policy,parallel', [('all-reviewers',False),('all-reviewers',True),('primary-then-panel',False)])
+@pytest.mark.parametrize('at', ['listing', 'capture', 'acquisition', 'images', 'publication'])
+def test_stale_head_result_is_discarded_and_next_head_is_attempted(visual_setup, monkeypatch, at, policy, parallel):
     config, calls, original = visual_setup
+    config=replace(config,reviewer=('codex','gemini') if policy=='primary-then-panel' else ('codex',),
+        pr_review_policy=policy,primary_reviewer='codex' if policy=='primary-then-panel' else None,review_parallel=parallel)
     from test_pr_loop_evidence_conversion import _push_external_head
-    runner = FakeRunner(codex_outputs=[structured_pr_review()])
+    runner = FakeRunner(codex_outputs=[structured_pr_review()],
+                        gemini_outputs=[structured_pr_review(reviewer='Google Gemini')]*3)
     moved = [False]
     def move():
         if not moved[0]:
@@ -301,6 +307,22 @@ def test_stale_head_result_is_discarded_and_next_head_is_attempted(visual_setup,
             move()
             return result
         monkeypatch.setattr(visual, 'capture', capture)
+    elif at=='acquisition':
+        from contextlib import contextmanager
+        from coding_review_agent_loop import review_images_transport
+        acquire=review_images_transport.acquire_images
+        @contextmanager
+        def acquiring(*a,**kw):
+            with acquire(*a,**kw) as inputs:
+                move()
+                yield inputs
+        monkeypatch.setattr(review_images_transport,'acquire_images',acquiring)
+    elif at=='publication':
+        publish_assessment=visual.publish_assessment
+        def publish(*a,**kw):
+            move()
+            return publish_assessment(*a,**kw)
+        monkeypatch.setattr(visual,'publish_assessment',publish)
     else:
         def reviewer(runner, **kw):
             result = original(runner, **kw)
@@ -423,6 +445,13 @@ def test_no_push_coder_dispute_or_nothing_to_change_uses_visual_human_stop(visua
     assert len([cmd for cmd,_ in runner.commands if cmd[:1]==['claude']]) == 1
     assert not any(cmd[:3]==['gh','pr','merge'] for cmd,_ in runner.commands)
 
+    for _ in range(2):
+        runner.simulate_new_process()
+        with pytest.raises(HumanDecisionRequiredError,match='visual findings item-1'):
+            run_pr_loop(runner,pr_number=77,config=config)
+    assert len([c for c in calls if c[0]=='images'])==1
+    assert len([cmd for cmd,_ in runner.commands if cmd[:1]==['claude']])==1
+
 
 def run_entry(runner, config, entry):
     if entry == 'pr':
@@ -444,7 +473,7 @@ def test_named_visual_seat_publication_preserves_binding_on_restart(visual_setup
     assert published[0].seat_binding == reviewer_seat_binding(config)
     assert published[0].agent == 'visual'
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert len([c for c in calls if c[0]=='capture']) == 2
+    assert len([c for c in calls if c[0]=='capture']) == 1
 
 
 @pytest.mark.parametrize('selection', ['explicit', 'primary'])
@@ -490,50 +519,19 @@ def test_carried_visual_owner_disposition_opportunity_controls_human_stop(
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(coder_calls) == 1
     coder_calls.clear()
-    if selection == 'explicit':
-        runner.simulate_new_process()
-    else:
-        # Seed the real visual publication without ordinary board history:
-        # an in-flight primary change otherwise stops at the separate board gate.
-        visual_comments = [comment for comment in runner.pr_payload['comments'] if any(
-            is_visual_review(record.metadata) for record in _extract_round_metadata_records(
-                [SimpleNamespace(body=comment['body'])], flow='pr'))]
-        runner = FakeRunner(codex_outputs=[structured_pr_review()] * 8,
-                            pr_payload={'comments': visual_comments})
     selected = seats[0] if opportunity == 'assigned' else seats[1]
-    config = replace(config, review_images_seat=str(selected) if selection == 'explicit' else None,
-        primary_reviewer=None if selection == 'explicit' else selected)
-    if opportunity == 'failed':
-        monkeypatch.setattr(visual, 'capture', lambda *args: CaptureResult('failed', 'stub capture failed'))
-    elif opportunity == 'nonmatching':
-        monkeypatch.setattr(github_changed_paths, 'get_pr_changed_paths', lambda *args, **kwargs:
-            PullRequestChangedPaths(kwargs['head_sha'], True, (ChangedPath('modified', 'server.py'),)))
-    if opportunity == 'assigned':
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    else:
-        with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1') as error:
-            run_pr_loop(runner, pr_number=77, config=config)
-        assert runner.pr_payload['headRefOid'] in str(error.value)
-        if opportunity == 'other-seat':
-            assert 'visual seat beta' in str(error.value) and 'item-1 owners alpha' in str(error.value)
-        else:
-            assert ('stub capture failed' if opportunity == 'failed' else 'no matching changed paths') in str(error.value)
-        # Ordinary work completes (or exact-head approvals are reused) before the stop.
-        assert any(r.metadata.role == 'reviewer' and not is_visual_review(r.metadata)
-                   and r.metadata.state == 'approved' for r in records(runner))
-        recovered = visual.recover_visual_findings(records(runner), reconciliation_mode='owner-scoped')
-        assert len(recovered) == 1
-        assert (recovered[0].item_id, recovered[0].reviewer, recovered[0].status) == ('item-1', 'alpha', status)
-        assert (recovered[0].resolution_owners or (recovered[0].reviewer,)) == ('alpha',)
+    # Keep the scheduling board fixed; vary only the selected visual seat.
+    config = replace(config, review_images_seat=str(selected))
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
+        run_pr_loop(runner, pr_number=77, config=config)
     assert not coder_calls
-    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
-    publications = [r.metadata for r in records(runner) if is_visual_review(r.metadata)]
-    assert len(publications) == (2 if opportunity in {'assigned', 'other-seat'} else 1)
-    if opportunity == 'other-seat':
-        assert publications[-1].agent == 'beta' and publications[-1].prior_items == ()
-        assert publications[-1].state == 'approved'
-        prompt = [c[1]['prompt'] for c in calls if c[0] == 'images'][-1]
-        assert 'Clipped title in mobile view.' not in prompt
+    assert len([c for c in calls if c[0] == 'images']) == 1
+    assert len([c for c in calls if c[0] == 'capture']) == 1
+    recovered = visual.recover_visual_findings(visual.load_history(runner, config, 77), reconciliation_mode='owner-scoped')
+    assert len(recovered) == 1 and recovered[0].item_id == 'item-1'
+    assert recovered[0].status == status
+    assert not any(cmd[:3] == ['gh','pr','merge'] for cmd, _ in runner.commands)
 
 
 @pytest.mark.parametrize('parallel', [False, True])
@@ -592,50 +590,21 @@ def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
         original_required_reviewers=('alpha', 'beta', 'gamma'), policy=policy,
         primary_reviewer=None, removed_reviewers=('alpha',), effective_from_round=1,
         reason='seat-unavailable', rationale='Alpha is unavailable.'))
-    runner.simulate_new_process()
     config = replace(config, review_images_seat='beta')
-    if kept:
-        with pytest.raises(KeyboardInterrupt):
-            run_pr_loop(runner, pr_number=77, config=config)
-        assert len(coder_calls) == 1
-    else:
-        with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1') as error:
-            run_pr_loop(runner, pr_number=77, config=config)
-        assert 'visual seat beta cannot disposition item-1 owners gamma (pending)' in str(error.value)
-        assert runner.pr_payload['headRefOid'] in str(error.value)
-        assert not coder_calls
-    publications = [r.metadata for r in records(runner) if is_visual_review(r.metadata)]
-    assert len(publications) == 2 and publications[-1].agent == 'beta'
-    assigned = publications[-1].prior_items[0]
-    assert assigned.resolution_owners == ('beta', 'gamma')
-    assert dict(assigned.owner_states) == {'beta': 'pending', 'gamma': 'pending'}
-    retained, = [item for item in reconciled[-1] if item.item_id == 'item-1']
-    assert retained.item_id == 'item-1' and retained.status == status
-    assert dict(retained.owner_states) == {'beta': 'pending' if kept else 'cleared', 'gamma': 'pending'}
-    assert len([c for c in calls if c[0] == 'capture']) == 2
-    assert len([c for c in calls if c[0] == 'images']) == 2
-    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
-    # Replay must preserve the identical owner shares even when the caller
-    # uses aggregate code reconciliation. A restart without fresh images must
-    # stop before coder dispatch or merge, retaining gamma's pending share.
-    for mode in ('aggregate', 'owner-scoped'):
-        replayed, = visual.recover_visual_findings(records(runner), reconciliation_mode=mode)
-        assert replayed.status == status
-        assert replayed.resolution_owners == ('beta', 'gamma')
-        assert replayed.owner_states == retained.owner_states
     runner.simulate_new_process()
-    coder_calls.clear()
     with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
-        run_pr_loop(runner, pr_number=77, config=replace(config, review_images_paths=()))
-    restarted, = [item for item in reconciled[-1] if item.item_id == 'item-1']
-    assert restarted.status == status and restarted.owner_states == retained.owner_states
+        run_pr_loop(runner, pr_number=77, config=config)
     assert not coder_calls
-    assert len([c for c in calls if c[0] == 'capture']) == 2
-    assert len([c for c in calls if c[0] == 'images']) == 2
-    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+    assert len([c for c in calls if c[0] == 'images']) == 1
+    assert len([c for c in calls if c[0] == 'capture']) == 1
+    retained, = [item for item in reconciled[-1] if item.item_id == 'item-1']
+    assert retained.status == status
+    assert retained.resolution_owners == ('beta', 'gamma')
+    assert dict(retained.owner_states) == {'beta': 'pending', 'gamma': 'pending'}
+    assert not any(cmd[:3] == ['gh','pr','merge'] for cmd, _ in runner.commands)
 
 
-def test_amended_visual_owner_can_resolve_and_stays_resolved_after_restart(visual_setup, monkeypatch):
+def test_amended_visual_owner_cannot_reopen_spent_head(visual_setup, monkeypatch):
     from coding_review_agent_loop import pr_loop
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
     from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
@@ -669,19 +638,12 @@ def test_amended_visual_owner_can_resolve_and_stays_resolved_after_restart(visua
         original_required_reviewers=('alpha','beta'),policy='all-reviewers',primary_reviewer=None,
         removed_reviewers=('alpha',),effective_from_round=1,reason='seat-unavailable',rationale='Alpha is unavailable.'))
     monkeypatch.setattr(pr_loop,'_run_validated_agent',run)
-    runner.simulate_new_process()
     config = replace(config,review_images_seat='beta')
-    assert run_pr_loop(runner,pr_number=77,config=config) == 0
-    prompt = [c[1]['prompt'] for c in calls if c[0]=='images'][-1]
-    assert 'Clipped title in mobile view.' in prompt and '"resolution_owners": ["beta"]' in prompt
-    publications = [r.metadata for r in records(runner) if is_visual_review(r.metadata)]
-    assert publications[-1].agent == 'beta'
-    assert publications[-1].dispositions[0].item_id == 'item-1'
-    # Historical disposition remains a finding outcome, never image acceptance.
-    # Disabled restart must preserve that outcome without resurrecting its blocker.
     runner.simulate_new_process()
-    assert run_pr_loop(runner,pr_number=77,config=replace(config,review_images_paths=())) == 0
-    assert len([c for c in calls if c[0]=='capture']) == 2
+    with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
+        run_pr_loop(runner,pr_number=77,config=config)
+    assert len([c for c in calls if c[0]=='images']) == 1
+    assert len([c for c in calls if c[0]=='capture']) == 1
 
 
 def test_managed_root_path_captures_before_approval_without_final_ci(visual_setup, monkeypatch):
@@ -805,3 +767,397 @@ def test_visual_changes_after_coder_checkpoint_do_not_change_scheduler(visual_se
         results.append((m.scheduler_selected_reviewers,m.scheduler_paused_reviewers,
             m.scheduler_reasons,m.scheduler_phase,m.scheduler_force_full,m.scheduler_obligation_digest))
     assert results[0][:-1] == results[1][:-1]
+
+
+@pytest.mark.parametrize('policy,parallel', [('all-reviewers',False),('all-reviewers',True),('primary-then-panel',False)])
+@pytest.mark.parametrize('crash', ['none','before-intent','after-intent','after-launch','before-result'])
+def test_durable_dispatch_order_and_crash_resume(visual_setup, monkeypatch, policy, parallel, crash):
+    from coding_review_agent_loop import github
+    config, calls, original = visual_setup
+    config = replace(config, reviewer=('codex','gemini') if policy=='primary-then-panel' else ('codex',),
+                     pr_review_policy=policy, primary_reviewer='codex' if policy=='primary-then-panel' else None,
+                     review_parallel=parallel)
+    runner = FakeRunner(codex_outputs=[structured_pr_review()]*8,
+                        gemini_outputs=[structured_pr_review(reviewer='Google Gemini')]*8)
+    persist = visual.persist_lifecycle
+    def intent(*args, **kwargs):
+        if crash == 'before-intent': raise KeyboardInterrupt()
+        written = persist(*args, **kwargs)
+        calls.append(('intent', written.comment_id))
+        if crash == 'after-intent': raise KeyboardInterrupt()
+        return written
+    monkeypatch.setattr(visual, 'persist_lifecycle', intent)
+    def reviewer(runner, **kwargs):
+        if kwargs.get('image_inputs'):
+            assert any(c[0]=='intent' for c in calls)
+        result = original(runner, **kwargs)
+        if kwargs.get('image_inputs') and crash == 'after-launch': raise KeyboardInterrupt()
+        return result
+    monkeypatch.setattr(validated_agent, 'run_agent_result', reviewer)
+    publish = github.post_verified_trusted_pr_round_comment
+    if crash == 'before-result':
+        monkeypatch.setattr(github, 'post_verified_trusted_pr_round_comment',
+                            lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()))
+    if crash != 'none':
+        with pytest.raises(KeyboardInterrupt): run_pr_loop(runner, pr_number=77, config=config)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    before = len([c for c in calls if c[0]=='images'])
+    monkeypatch.setattr(visual, 'persist_lifecycle', persist)
+    monkeypatch.setattr(github, 'post_verified_trusted_pr_round_comment', publish)
+    monkeypatch.setattr(validated_agent, 'run_agent_result', original)
+    runner.simulate_new_process()
+    for _ in range(2): assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([c for c in calls if c[0]=='images']) == before + int(crash == 'before-intent')
+    assert len([c for c in calls if c[0]=='images']) <= 1
+    assert len([c for c in calls if c[0]=='capture']) == (2 if crash=='before-intent' else 1)
+
+
+def _append_lifecycle(runner, *, value=None, head=None, foreign=False):
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    head = runner.pr_payload['headRefOid'] if head is None else head
+    m = PostedRoundMetadata(flow='pr', role='reviewer', agent='OpenAI Codex', round_number=1,
+                            subject=head, visual_lifecycle=value, visual_lifecycle_present=True)
+    runner.pr_payload.setdefault('comments', []).append({'author': {'login':'attacker' if foreign else 'coding-review-agent-loop'},
+        '_rest_author_id':999 if foreign else 424242, 'createdAt':'2026-10-01T00:00:00Z',
+        'body': _attach_round_metadata('Visual lifecycle audit.',m)})
+
+
+@pytest.mark.parametrize('mode', ['enabled','disabled','dry-run','nonmatching'])
+@pytest.mark.parametrize('foreign', [False,True])
+@pytest.mark.parametrize('value', [None, {'version':99}, []])
+def test_lifecycle_authentication_precedes_validation_and_obeys_applicability(visual_setup, monkeypatch, mode, foreign, value):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()]*5)
+    _append_lifecycle(runner, value=value, foreign=foreign)
+    if mode == 'disabled': config = replace(config,review_images_paths=())
+    elif mode == 'dry-run':
+        config = replace(config,dry_run=True)
+        _supply_dry_run_history(monkeypatch)
+    elif mode == 'nonmatching':
+        from coding_review_agent_loop import github_changed_paths
+        monkeypatch.setattr(github_changed_paths,'get_pr_changed_paths',lambda *a, **kw:
+            PullRequestChangedPaths(kw['head_sha'],True,(ChangedPath('modified','server.py'),)))
+    if mode=='enabled' and not foreign:
+        with pytest.raises(HumanDecisionRequiredError, match='comment'): run_pr_loop(runner,pr_number=77,config=config)
+    else:
+        assert run_pr_loop(runner,pr_number=77,config=config)==0
+    assert len([c for c in calls if c[0]=='images']) == int(mode=='enabled' and foreign)
+    assert len([c for c in calls if c[0]=='capture']) == int(mode=='enabled' and foreign)
+    if mode in {'disabled','dry-run'}: assert calls == []
+
+
+@pytest.mark.parametrize('kind', ['old','unknown','incomplete','legacy'])
+def test_authenticated_history_admission_at_production_seam(visual_setup, kind):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()]*5)
+    if kind=='legacy':
+        from review_images_helpers import append_visual_record
+        append_visual_record(runner)
+    else:
+        _append_lifecycle(runner,head='a'*40 if kind=='old' else 'unknown' if kind=='unknown' else None)
+        if kind=='incomplete': runner.pr_payload['comments'][0].pop('_rest_author_id')
+    if kind in {'unknown','incomplete'}:
+        with pytest.raises(HumanDecisionRequiredError): run_pr_loop(runner,pr_number=77,config=config)
+    else:
+        assert run_pr_loop(runner,pr_number=77,config=config)==0
+    assert len([c for c in calls if c[0]=='images']) == int(kind=='old')
+
+
+@pytest.mark.parametrize('blocking', [False,True])
+def test_fresh_capture_skip_chain_preserves_source_blockers_without_coder(visual_setup, monkeypatch, blocking):
+    from test_pr_loop_evidence_conversion import _push_external_head
+    from coding_review_agent_loop import pr_loop
+    config,calls,original = visual_setup
+    capture = visual.capture
+    def unchanged(checkout, head, settings, changes):
+        # Independent head bindings, identical validated manifest/image content.
+        calls.append(('capture',head))
+        value=manifest(head)
+        snap=publish(json.dumps(value).encode(),head,settings.limits,{'one.png':png(),'base.png':png()},
+                     {'one.png':(2,2),'base.png':(2,2)},head)
+        return CaptureResult('success',snapshots=snap)
+    monkeypatch.setattr(visual,'capture',unchanged)
+    def reviewer(runner,**kwargs):
+        result=original(runner,**kwargs)
+        if blocking and kwargs.get('image_inputs'):
+            text=structured_pr_review(state='blocking',blocking_items=['Source-raised clipped title'])
+            return replace(result,text=text,message_text=text,raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent,'run_agent_result',reviewer)
+    run=pr_loop._run_validated_agent
+    coder=[]
+    def stop(*a,**kw):
+        if kw.get('role')=='coder': coder.append(1); raise KeyboardInterrupt()
+        return run(*a,**kw)
+    monkeypatch.setattr(pr_loop,'_run_validated_agent',stop)
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*12)
+    if blocking:
+        with pytest.raises(KeyboardInterrupt): run_pr_loop(runner,pr_number=77,config=config)
+    else: assert run_pr_loop(runner,pr_number=77,config=config)==0
+    coder.clear()
+    for head in ('b'*40,'c'*40):
+        # Exercise visual recovery independently of interrupted code-recovery checkpoints.
+        runner.pr_payload['comments'] = [c for c in runner.pr_payload['comments'] if any(
+            visual_candidate(r.metadata) for r in _extract_round_metadata_records([SimpleNamespace(body=c['body'])],flow='pr'))]
+        _push_external_head(runner,head)
+        for _ in range(2):
+            if blocking:
+                with pytest.raises(HumanDecisionRequiredError,match='visual findings item-1'):
+                    run_pr_loop(runner,pr_number=77,config=config)
+            else: assert run_pr_loop(runner,pr_number=77,config=config)==0
+    lifecycle=[r.metadata.visual_lifecycle for r in records(runner) if r.metadata.visual_lifecycle_present]
+    assert [v['kind'] for v in lifecycle]==['intent','result','skip','skip']
+    assert lifecycle[-1]['original_id']==lifecycle[-2]['original_id']
+    assert lifecycle[-1]['capture']!=lifecycle[-2]['capture']
+    assert lifecycle[-1]['comparison']==lifecycle[-2]['comparison']
+    assert len([c for c in calls if c[0]=='capture'])==3
+    assert len([c for c in calls if c[0]=='images'])==1
+    assert coder==[]
+
+
+@pytest.mark.parametrize('failure', ['capture','paths','diff'])
+def test_preintent_work_once_per_invocation_but_restart_can_retry(visual_setup, monkeypatch, failure):
+    config,calls,_=visual_setup
+    runner=FakeRunner(codex_outputs=[structured_pr_review(state='blocking',blocking_items=['Fix code']),
+                                    structured_pr_review(prior_item_dispositions=[{'item_id':'item-1','disposition':'resolved'}])]*2,
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])]*2,
+        advance_pr_head_on_coder_followup=False)
+    if failure=='capture':
+        monkeypatch.setattr(visual,'capture',lambda *a: calls.append(('failed-capture',a[1])) or CaptureResult('failed','stub'))
+    elif failure=='diff':
+        monkeypatch.setattr(visual,'pinned_diff',lambda *a: calls.append(('failed-diff',a[2].head_sha)) or (_ for _ in ()).throw(ValueError('stub')))
+    else:
+        from coding_review_agent_loop import github_changed_paths
+        monkeypatch.setattr(github_changed_paths,'get_pr_changed_paths',lambda *a,**kw:
+            calls.append(('failed-paths',kw['head_sha'])) or PullRequestChangedPaths(kw['head_sha'],False,diagnostic='stub'))
+    assert run_pr_loop(runner,pr_number=77,config=config)==0
+    key={'capture':'failed-capture','paths':'failed-paths','diff':'failed-diff'}[failure]
+    assert len([c for c in calls if c[0]==key])==1
+    runner.simulate_new_process()
+    assert run_pr_loop(runner,pr_number=77,config=config)==0
+    assert len([c for c in calls if c[0]==key])==2
+    assert not any(c[0]=='images' for c in calls)
+
+
+@pytest.mark.parametrize('mode', ['enabled','disabled','dry-run','nonmatching'])
+@pytest.mark.parametrize('foreign', [False,True])
+@pytest.mark.parametrize('broken', ['envelope','shared-payload','missing-sidecar'])
+def test_shared_transport_failure_stops_before_visual_admission(visual_setup, monkeypatch, mode, foreign, broken):
+    from test_round_transport import _comment, _random_text
+    from coding_review_agent_loop import round_transport, github_changed_paths
+    config,calls,_=visual_setup
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*3)
+    value={'flow':'pr','role':'reviewer','agent':'Codex','round_number':1,'subject':runner.pr_payload['headRefOid']}
+    if broken=='envelope':
+        body=_comment(value).replace(round_transport.encode_mapping(value),'undecodable')
+    elif broken=='shared-payload': body=_comment(dict(value,round_number='invalid'))
+    else:
+        value['canonical_reviewer_response']=_random_text(70000)
+        prepared=round_transport.prepare_round_comment(_comment(value))
+        assert len(prepared)>1
+        body=prepared[-1]
+    runner.pr_payload['comments']=[{'body':body,'author':{'login':'attacker' if foreign else 'coding-review-agent-loop'},
+        '_rest_author_id':999 if foreign else 424242,'createdAt':'2026-10-01T00:00:00Z'}]
+    if mode=='disabled': config=replace(config,review_images_paths=())
+    elif mode=='dry-run':
+        config=replace(config,dry_run=True)
+        _supply_dry_run_history(monkeypatch)
+    elif mode=='nonmatching':
+        monkeypatch.setattr(github_changed_paths,'get_pr_changed_paths',lambda *a,**kw:
+            PullRequestChangedPaths(kw['head_sha'],True,(ChangedPath('modified','server.py'),)))
+    with pytest.raises(AgentLoopError): run_pr_loop(runner,pr_number=77,config=config)
+    assert not any(c[0] in {'capture','images','ci','diff'} for c in calls)
+    assert len(runner.pr_payload['comments'])==1
+    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    with pytest.raises(AgentLoopError): _latest_pr_approved_reviews_for_head([SimpleNamespace(body=body)],head_sha=value['subject'],configured_reviewers=('codex',))
+
+
+@pytest.mark.parametrize('failure', ['before-anchor','readback','lost-response'])
+def test_visual_publication_recovery_never_relaunches_or_mutates_ledger_early(visual_setup, monkeypatch, failure):
+    from coding_review_agent_loop import github
+    config,calls,original=visual_setup
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*6)
+    def reviewer(runner,**kw):
+        result=original(runner,**kw)
+        if kw.get('image_inputs'):
+            text=structured_pr_review(state='blocking',blocking_items=['Publication blocker'])
+            return replace(result,text=text,message_text=text,raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent,'run_agent_result',reviewer)
+    writer=github.post_verified_trusted_pr_round_comment
+    def broken(*a,**kw):
+        if failure!='before-anchor': writer(*a,**kw)
+        raise AgentLoopError('read-back unavailable' if failure=='readback' else 'write response lost')
+    monkeypatch.setattr(github,'post_verified_trusted_pr_round_comment',broken)
+    # An unpublished assessment has no in-memory finding authority or coder opportunity.
+    assert run_pr_loop(runner,pr_number=77,config=config)==0
+    assert not any(cmd[:1]==['claude'] for cmd,_ in runner.commands)
+    monkeypatch.setattr(github,'post_verified_trusted_pr_round_comment',writer)
+    runner.simulate_new_process()
+    if failure=='before-anchor': assert run_pr_loop(runner,pr_number=77,config=config)==0
+    else:
+        with pytest.raises(HumanDecisionRequiredError,match='visual findings item-1'):
+            run_pr_loop(runner,pr_number=77,config=config)
+    assert len([c for c in calls if c[0]=='images'])==1
+    assert len([c for c in calls if c[0]=='capture'])==1
+    assert not any(cmd[:1]==['claude'] for cmd,_ in runner.commands)
+
+
+@pytest.mark.parametrize('applicable', ['enabled','disabled','dry-run','nonmatching'])
+@pytest.mark.parametrize('history', ['absent','current-invalid','old-invalid','unknown'])
+def test_final_qualification_uses_same_applicable_lifecycle_validation(visual_setup, monkeypatch, applicable, history):
+    from coding_review_agent_loop.pr_loop_support import _fresh_pr_qualification_snapshot
+    from coding_review_agent_loop import github_changed_paths
+    config,calls,_=visual_setup
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*3)
+    if history!='absent': _append_lifecycle(runner,head='a'*40 if history=='old-invalid' else 'unknown' if history=='unknown' else None)
+    if applicable=='disabled': config=replace(config,review_images_paths=())
+    elif applicable=='dry-run':
+        config=replace(config,dry_run=True)
+        _supply_dry_run_history(monkeypatch)
+    elif applicable=='nonmatching':
+        monkeypatch.setattr(github_changed_paths,'get_pr_changed_paths',lambda *a,**kw:
+            PullRequestChangedPaths(kw['head_sha'],True,(ChangedPath('modified','server.py'),)))
+    if applicable=='enabled' and history in {'current-invalid','unknown'}:
+        with pytest.raises(HumanDecisionRequiredError): _fresh_pr_qualification_snapshot(runner,config=config,pr_number=77,issue_context=None,parent_issue_context=None)
+    else:
+        context,_,_,_=_fresh_pr_qualification_snapshot(runner,config=config,pr_number=77,issue_context=None,parent_issue_context=None)
+        assert context.metadata.head_sha==runner.pr_payload['headRefOid']
+    assert not any(c[0] in {'images','capture','ci','diff'} for c in calls)
+
+
+def _supply_dry_run_history(monkeypatch):
+    """Supply a decoded snapshot: normal dry-run's synthetic GitHub view is empty."""
+    from coding_review_agent_loop import pr_loop, pr_loop_support
+    from coding_review_agent_loop.pr_head_sync import get_observed_pr_review_context
+    def observed(runner, *, config, pr_number, **kwargs):
+        return get_observed_pr_review_context(runner, config=replace(config,dry_run=False),pr_number=pr_number,**kwargs)
+    monkeypatch.setattr(pr_loop,'get_observed_pr_review_context',observed)
+    monkeypatch.setattr(pr_loop_support,'get_observed_pr_review_context',observed)
+
+
+@pytest.mark.parametrize('change', ['contract','configuration','latest-source','uncovered-assignment'])
+def test_new_head_reuse_mismatch_assesses_once_and_never_searches_older_sources(visual_setup, monkeypatch, change):
+    from test_pr_loop_evidence_conversion import _push_external_head
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    config,calls,original=visual_setup
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*12,
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],advance_pr_head_on_coder_followup=False)
+    initial=runner.pr_payload['headRefOid']
+    def capture(checkout,head,settings,changes):
+        calls.append(('capture',head))
+        value=manifest(head)
+        if change=='latest-source' and head=='b'*40: value['images'][0]['locale']='fr'
+        snap=publish(json.dumps(value).encode(),head,settings.limits,{'one.png':png(),'base.png':png()},
+                     {'one.png':(2,2),'base.png':(2,2)},head)
+        return CaptureResult('success',snapshots=snap)
+    monkeypatch.setattr(visual,'capture',capture)
+    assert run_pr_loop(runner,pr_number=77,config=config)==0
+    if change=='contract':
+        preflight=visual.preflight_images
+        monkeypatch.setattr(visual,'preflight_images',lambda *a,**kw: SimpleNamespace(**dict(vars(preflight(*a,**kw)),version='stub-v2')))
+    elif change=='configuration': config=replace(config,review_images_timeout=7)
+    elif change=='uncovered-assignment':
+        replay=visual.recover_visual_findings
+        item=replace(_next_unresolved_item(item_number=9,reviewer='Codex',source_round=1,
+            text='Transferred pending visual share',status='blocking'),origin_scope='visible-defects')
+        monkeypatch.setattr(visual,'recover_visual_findings',lambda records,**kw:(*replay(records,**kw),item))
+        def reviewer(runner,**kw):
+            result=original(runner,**kw)
+            if kw.get('image_inputs'):
+                text=structured_pr_review(prior_item_dispositions=[{'item_id':'item-9','disposition':'resolved'}])
+                return replace(result,text=text,message_text=text,raw_output=text)
+            return result
+        monkeypatch.setattr(validated_agent,'run_agent_result',reviewer)
+    if change=='latest-source':
+        def reviewer(runner,**kw):
+            result=original(runner,**kw)
+            if kw.get('image_inputs'):
+                head=kw['image_inputs'].binding.head_sha
+                text=(structured_pr_review(state='blocking',blocking_items=['Changed B capture clips the title'])
+                      if head=='b'*40 else structured_pr_review(prior_item_dispositions=[{'item_id':'item-1','disposition':'resolved'}]))
+                return replace(result,text=text,message_text=text,raw_output=text)
+            return result
+        monkeypatch.setattr(validated_agent,'run_agent_result',reviewer)
+    _push_external_head(runner,'b'*40)
+    if change=='latest-source':
+        with pytest.raises(HumanDecisionRequiredError,match='visual findings item-1'):
+            run_pr_loop(runner,pr_number=77,config=config)
+        # C starts ordinary code review independently of B's completed checkpoint.
+        runner.pr_payload['comments']=[c for c in runner.pr_payload['comments'] if any(
+            visual_candidate(r.metadata) for r in _extract_round_metadata_records([SimpleNamespace(body=c['body'])],flow='pr'))]
+        _push_external_head(runner,'c'*40)
+        assert run_pr_loop(runner,pr_number=77,config=config)==0
+    else: assert run_pr_loop(runner,pr_number=77,config=config)==0
+    assert len([c for c in calls if c[0]=='images'])==(3 if change=='latest-source' else 2)
+    assert not any(r.metadata.visual_lifecycle.get('kind')=='skip' for r in records(runner)
+                   if isinstance(r.metadata.visual_lifecycle,dict))
+
+
+@pytest.mark.parametrize('lifecycle', ['repair_required','qualification_ready','qualifying'])
+@pytest.mark.parametrize('history', ['absent','invalid','old-invalid','unknown'])
+def test_recovery_checkpoint_validates_lifecycle_without_opening_execution(visual_setup, monkeypatch, tmp_path, lifecycle, history):
+    from test_pr_loop_managed_ci import _managed_qualifying_resume
+    from coding_review_agent_loop import pr_loop
+    from coding_review_agent_loop.managed_ci import ManagedCiContract
+    from coding_review_agent_loop.round_state import _attach_round_metadata
+    visual_config,calls,_=visual_setup
+    config,runner=_managed_qualifying_resume(tmp_path,reviewer_codex_model='gpt-6.1-sol')
+    config=replace(config,review_images_paths=visual_config.review_images_paths,
+        review_images_cmd=visual_config.review_images_cmd,review_images_runtime_grant=visual_config.review_images_runtime_grant,
+        review_images_seat='codex')
+    for comment in runner.pr_payload['comments']:
+        r=_extract_round_metadata_records([SimpleNamespace(body=comment['body'])],flow='pr')[0]
+        m=r.metadata
+        if m.qualification_checkpoint is not None:
+            m=replace(m,qualification_checkpoint=replace(m.qualification_checkpoint,lifecycle=lifecycle,
+                failed_head_sha=m.subject if lifecycle=='repair_required' else 'old-head',
+                candidate_head_sha=None if lifecycle=='repair_required' else m.subject),
+                prior_items=tuple(replace(item,lifecycle=lifecycle,
+                    failed_head_sha=m.subject if lifecycle=='repair_required' else 'old-head',
+                    candidate_head_sha=None if lifecycle=='repair_required' else m.subject) for item in m.prior_items))
+            comment['body']=_attach_round_metadata('Recovery checkpoint.',m)
+    if history!='absent': _append_lifecycle(runner,head='a'*40 if history=='old-invalid' else 'unknown' if history=='unknown' else None)
+    monkeypatch.setattr(pr_loop,'activate_managed_ci',lambda *a,**kw:ManagedCiContract(protocol_version=2))
+    monkeypatch.setattr(pr_loop,'revalidate_adopted_managed_ci',lambda *a,**kw:True)
+    validate=visual.validate_boundary
+    validated=[]
+    def boundary(*a,**kw):
+        validate(*a,**kw)
+        validated.append(1)
+        raise KeyboardInterrupt()  # Stop before unrelated qualification actions.
+    monkeypatch.setattr(visual,'validate_boundary',boundary)
+    if history in {'invalid','unknown'}:
+        with pytest.raises(HumanDecisionRequiredError): run_pr_loop(runner,pr_number=77,config=config)
+    else:
+        with pytest.raises(KeyboardInterrupt): run_pr_loop(runner,pr_number=77,config=config)
+        assert validated==[1]
+    assert not any(c[0] in {'capture','images','ci','diff'} for c in calls)
+
+
+def test_later_lifecycle_corruption_cannot_erase_verified_findings_when_disabled(visual_setup, monkeypatch):
+    from coding_review_agent_loop import pr_loop
+    config,calls,original=visual_setup
+    def reviewer(runner,**kwargs):
+        result=original(runner,**kwargs)
+        if kwargs.get('image_inputs'):
+            text=structured_pr_review(state='blocking',blocking_items=['Persist this visual blocker'])
+            return replace(result,text=text,message_text=text,raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent,'run_agent_result',reviewer)
+    run=pr_loop._run_validated_agent
+    def stop(*args,**kwargs):
+        if kwargs.get('role')=='coder': raise KeyboardInterrupt()
+        return run(*args,**kwargs)
+    monkeypatch.setattr(pr_loop,'_run_validated_agent',stop)
+    runner=FakeRunner(codex_outputs=[structured_pr_review()]*5)
+    with pytest.raises(KeyboardInterrupt): run_pr_loop(runner,pr_number=77,config=config)
+    _append_lifecycle(runner,head='unknown')
+    recovered=visual.recover_visual_findings(visual.load_history(runner,config,77),reconciliation_mode='owner-scoped')
+    assert len(recovered)==1 and recovered[0].item_id=='item-1'
+    assert recovered[0].text=='Persist this visual blocker'
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError,match='visual findings item-1'):
+        run_pr_loop(runner,pr_number=77,config=replace(config,review_images_paths=()))
+    assert len([c for c in calls if c[0]=='images'])==1

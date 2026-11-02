@@ -251,10 +251,13 @@ The image transport foundation (#1794) is owned by
 The opt-in `review_images.py` lifecycle connects public configuration, complete
 head-bound changed-path eligibility, bounded CI-start observation, trusted Git
 imports and immutable bounded diffs to capture and proof-checked acquisition.
-The configured seat receives a fresh finite visual turn. `review_scope.py`
+The configured seat receives one durably admitted finite visual turn per head.
+`review_images_state.py` owns authenticated lifecycle reduction, comparison
+identities, reviewer compatibility and original-assessment skip provenance.
+`github.py` verifies intent writes and terminal round anchors before adoption. `review_scope.py`
 classifies bound visible-defects records separately from code/evidence authority;
 visual findings retain their origin in the ordinary ledger. This experimental
-single-invocation slice of #1795 remains unavailable for rollout pending #1795
+durability slice of #1795 remains unavailable for rollout pending #1795
 and #1796.
 
 The read-only entry board-floor check `_enforce_pr_board_floor` lives in

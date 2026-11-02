@@ -1,4 +1,4 @@
-"""Invocation-local visual review lifecycle; image evidence has no code authority."""
+"""Durable and invocation-local visual review lifecycle; image evidence has no code authority."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
@@ -7,12 +7,12 @@ import subprocess
 import time
 
 from .agents.registry import agent_display_name
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .review_images_config import CaptureConfig, delivery_limits, eligible
 from .review_images_capabilities import preflight_images, reviewer_view
 from .review_images_capture import capture
 from .review_images_prompts import build_visual_prompt
-from .review_scope import is_visual_item, is_visual_review
+from .review_scope import is_visual_item, is_visual_review, visual_candidate, lifecycle_present
 
 
 def settings(config):
@@ -37,6 +37,8 @@ def settings(config):
 
 
 def startup(config):
+    if not config.review_images_paths or config.dry_run:
+        return
     try:
         if settings(config) is not None:
             preflight_images(config, config.review_images_seat)
@@ -142,13 +144,18 @@ class VisualOutcome:
     scope: dict | None = None
     diagnostic: str = ''
     stale: bool = False
+    lifecycle: dict | None = None
+    fresh: bool = False
 
 
 class VisualRun:
-    def __init__(self):
+    def __init__(self, runner=None):
+        if runner is not None:
+            runner._visual_boundary_paths = {}
         self.attempted = set()
         self.coder_heads = set()
         self.reasons = {}
+        self.outcomes = {}
 
     @staticmethod
     def rebind_items(items, ledger_view):
@@ -159,7 +166,7 @@ class VisualRun:
 
     def blocker_stop_reason(self, blockers, head, outcome):
         """Success offers an opportunity only while the selected owner is pending."""
-        if outcome is not None and outcome.response is not None:
+        if outcome is not None and outcome.response is not None and outcome.fresh:
             seat = outcome.scope['seat']
             assigned_ids = {item.item_id for item in assigned_items(blockers, seat)
                             if dict(item.owner_states).get(seat, 'pending') != 'cleared'}
@@ -173,19 +180,21 @@ class VisualRun:
                 return f"visual seat {seat} cannot disposition {owners}"
             if head not in self.coder_heads:
                 return None
-        return self.reasons.get(head, 'the invocation-local visual attempt is spent')
+        return self.reasons.get(head, 'the durable visual opportunity is spent; use a new head with changed images and an explicit assessment disposition, or an explicit human decision')
 
-    def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic):
+    def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic, round_number=1):
         if not config.review_images_paths or config.dry_run:
             return VisualOutcome(diagnostic='disabled')
         head = metadata.head_sha
         if head in self.attempted:
-            return VisualOutcome(diagnostic=self.reasons.get(head, 'visual attempt already spent'))
+            return self.outcomes.get(head, VisualOutcome(diagnostic=self.reasons.get(head, 'visual attempt already spent')))
         self.attempted.add(head)
+        history = load_history(runner, config, metadata.number)
         try:
             from .github_changed_paths import get_pr_changed_paths
             settings_ = settings(config)
             paths = get_pr_changed_paths(runner, config=config, pr_number=metadata.number, head_sha=head)
+            _cache_paths(runner, config, metadata, paths)
             if not paths.available:
                 if current_head() != head:
                     return VisualOutcome(stale=True)
@@ -194,6 +203,12 @@ class VisualRun:
             if not eligible(settings_, changes):
                 self.reasons[head] = 'no matching changed paths'
                 return VisualOutcome(diagnostic=self.reasons[head])
+            from .review_images_state import reduce_history
+            admission = reduce_history(history, repo=config.repo, pr=metadata.number, head=head)
+            if admission.spent:
+                reason = admission.diagnostic or 'recovered durable visual result; no coder opportunity'
+                self.reasons[head] = reason
+                return VisualOutcome(diagnostic=reason)
             observe_ci(runner, config, metadata, managed=managed, diagnostic=diagnostic)
             diff = pinned_diff(runner, config, metadata, checkout)
             if current_head() != head:
@@ -209,11 +224,30 @@ class VisualRun:
                 selected, _, _, _ = reviewer_view(config, config.review_images_seat)
                 name = agent_display_name(selected)
                 assigned = assigned_items(items, name)
+                from .review_images_state import new_binding, can_reuse, owner_shares
+                binding = new_binding(config, metadata, snapshots, settings_, capability, name)
+                if can_reuse(admission, binding, assigned):
+                    binding.update(kind='skip', source_id=admission.latest[0], original_id=admission.original[0],
+                                   assigned=[list(share) for share in owner_shares(assigned, name)])
+                    if current_head() != head:
+                        return VisualOutcome(stale=True)
+                    persist_lifecycle(runner, config, metadata, binding, round_number=round_number)
+                    if current_head() != head:
+                        return VisualOutcome(stale=True)
+                    self.reasons[head] = 'unchanged images reused from a durable assessment; no coder opportunity'
+                    return VisualOutcome(diagnostic=self.reasons[head], lifecycle=binding)
+                if current_head() != head:
+                    return VisualOutcome(stale=True)
+                intent = persist_lifecycle(runner, config, metadata, binding, round_number=round_number)
+                if current_head() != head:
+                    return VisualOutcome(stale=True)
                 from .review_images_transport import acquire_images
                 with acquire_images(snapshots, capability, head_sha=head,
                                     config_digest=snapshots.config_digest,
                                     snapshot_digest=snapshots.digest, limits=settings_.limits) as images:
                     prompt = build_visual_prompt(images, diff) + visual_response_instructions(assigned)
+                    if current_head() != head:
+                        return VisualOutcome(stale=True)
                     from .validated_agent import _run_validated_agent
                     response = _run_validated_agent(runner, agent=selected, config=config,
                         prompt=prompt, role='reviewer', session_id=None, timeout_seconds=300,
@@ -225,12 +259,19 @@ class VisualRun:
                 if response.acquisition_outcome != 'success':
                     raise ValueError('visual reviewer acquisition did not succeed')
                 parsed = validate_visual(response.text, reviewer=name, items=assigned)
+                from .review_images_state import digest
+                binding.update(kind='result', intent_id=intent.comment_id,
+                               proof=digest(asdict(response.image_delivery_proof)))
                 return VisualOutcome(response, parsed, {'version': 1, 'kind': 'visible-defects',
-                                                       'head': head, 'seat': name})
+                                                       'head': head, 'seat': name},
+                                     lifecycle=binding)
+        except HumanDecisionRequiredError:
+            raise
         except StaleDispatchInputs:
             # No capture was launched. The refreshed tuple must pass listing,
             # CI observation and pin verification before consuming its attempt.
             self.attempted.discard(head)
+            getattr(runner, "_visual_boundary_paths", {}).pop((config.repo, metadata.number, head), None)
             return VisualOutcome(stale=True)
         except (AgentLoopError, ValueError, OSError, TimeoutError, subprocess.SubprocessError, KeyError) as exc:
             # Cleanup uncertainty is a security stop, never failed evidence continuation.
@@ -268,22 +309,56 @@ def admitted_visual_history(runner, config, pr_number, comments):
     """Hydrate authorship before any visual finding replay or ID allocation."""
     from .pr_loop_support import _authenticated_pr_comments_status
     from .round_state import _recovery_record_admitted, _extract_round_metadata_records
+    from .review_images_state import History
     comments, actor, complete = _authenticated_pr_comments_status(
-        runner, config, pr_number=pr_number, comments=comments, resume=True)
+        runner, config, pr_number=pr_number, comments=comments, resume=False)
     records = _extract_round_metadata_records(comments, flow="pr")
-    if not complete and any(is_visual_review(record.metadata) for record in records):
-        raise AgentLoopError("Visual finding history cannot be authenticated; retry with readable identity data.")
-    return tuple(record for record in records if not is_visual_review(record.metadata)
-                 or _recovery_record_admitted(record, comments, actor))
+    if not complete and any(visual_candidate(r.metadata) and (r.metadata.prior_items or r.metadata.new_items)
+                            for r in records):
+        raise AgentLoopError('Visual finding history cannot be authenticated; complete identity data is required.')
+    return History((record for record in records if not visual_candidate(record.metadata)
+                    or _recovery_record_admitted(record, comments, actor)),
+                   identities={record.index: getattr(comments[record.index], 'comment_id', None)
+                               for record in records}, complete=complete,
+                   diagnostic='complete authenticated PR comment history is required', repo=config.repo, pr=pr_number)
 
 
 def recover_visual_findings(records, *, reconciliation_mode):
     """Replay only author-admitted verified visual publications, independent of authority boundaries."""
     from .unresolved_items import _apply_unresolved_item_dispositions
+    from .review_images_state import reduce_history, reliable_head, History
+    from .errors import HumanDecisionRequiredError
+    allowed = set()
+    conservative = set()
+    if isinstance(records, History):
+        for position, record in enumerate(records):
+            if not lifecycle_present(record.metadata):
+                continue
+            prefix = History(records[:position+1], identities=records.identities,
+                             complete=records.complete, repo=records.repo, pr=records.pr)
+            try:
+                admitted = reduce_history(prefix, repo=records.repo, pr=records.pr,
+                                          head=reliable_head(record.metadata))
+                if admitted.terminal is not record:
+                    continue
+                conservative.add(record.index)
+                admitted = reduce_history(records, repo=records.repo, pr=records.pr,
+                                          head=reliable_head(record.metadata))
+                if admitted.terminal is record:
+                    allowed.add(record.index)
+            except HumanDecisionRequiredError:
+                pass
     ledger = []
     for record in records:
         m = record.metadata
         if not is_visual_review(m) or m.acquisition_outcome != 'success':
+            continue
+        if lifecycle_present(m) and record.index not in allowed:
+            # Later corruption cannot delete an earlier verified blocker. It
+            # cannot supply clearance, ownership transfer or new acceptance.
+            if record.index in conservative:
+                known = {item.item_id for item in ledger}
+                ledger.extend(item for item in m.new_items if is_visual_item(item) and item.item_id not in known)
             continue
         # A tool-written assignment carries derived board-amendment ownership.
         # Transfer only ownership of the identical original visual claim; never
@@ -312,3 +387,93 @@ def recover_visual_findings(records, *, reconciliation_mode):
         known = {item.item_id for item in ledger}
         ledger.extend(item for item in m.new_items if is_visual_item(item) and item.item_id not in known)
     return tuple(ledger)
+
+
+def load_history(runner, config, pr_number):
+    from .pr_head_sync import get_observed_pr_review_context
+    context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+    return admitted_visual_history(runner, config, pr_number, context.comments)
+
+
+def persist_lifecycle(runner, config, metadata, binding, *, round_number=1):
+    from .github import resolve_authenticated_github_actor, post_verified_trusted_pr_protocol_comment_observed
+    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    actor = resolve_authenticated_github_actor(runner, config=config)
+    from .reviewer_seats import reviewer_seat_binding
+    scope = {'version': 1, 'kind': 'visible-defects', 'head': metadata.head_sha, 'seat': binding['seat']}
+    m = PostedRoundMetadata(flow='pr', role='visual-' + binding['kind'], agent=binding['seat'],
+        round_number=round_number, subject=metadata.head_sha, review_scope=scope, visual_lifecycle=binding,
+        seat_binding=reviewer_seat_binding(config))
+    from .review_images_state import validate
+    from .round_state import PostedRoundRecord
+    validate(PostedRoundRecord(0, m, ''), repo=config.repo, pr=metadata.number)
+    body = _attach_round_metadata('Visual lifecycle: ' + binding['kind'], m)
+    return post_verified_trusted_pr_protocol_comment_observed(runner, config=config,
+        pr_number=metadata.number, body=body, expected_author_login=actor[0], expected_author_id=actor[1])
+
+
+def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
+                       round_number, seat_binding, reconciliation_mode, current_head, diagnostic):
+    """Only a verified final anchor may mutate the live finding ledger."""
+    if outcome.response is None or outcome.fresh:
+        return outcome, items, next_number
+    from .github import post_verified_trusted_pr_round_comment, resolve_authenticated_github_actor
+    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .unresolved_items import _next_unresolved_item, _apply_unresolved_item_dispositions
+    from .agent_failure import _metadata_identity_fields
+    parsed = outcome.parsed
+    name = outcome.scope['seat']
+    prior = assigned_items(items, name)
+    new = []
+    for status, findings in (('blocking', parsed.blocking_items), ('same-pr', parsed.followups.same_pr),
+                            ('future', parsed.followups.future if config.approved_followups != 'ignore' else ())):
+        for finding in findings:
+            item = _next_unresolved_item(item_number=next_number + len(new), reviewer=name,
+                source_round=round_number, text=finding.text, status=status,
+                fix_scope=getattr(finding, 'fix_scope', None), sub_items=getattr(finding, 'sub_items', ()))
+            new.append(replace(item, origin_scope='visible-defects'))
+    if current_head() != metadata.head_sha:
+        return VisualOutcome(stale=True), items, next_number
+    try:
+        actor = resolve_authenticated_github_actor(runner, config=config)
+        post_verified_trusted_pr_round_comment(runner, config=config, pr_number=metadata.number,
+            expected_author_login=actor[0], expected_author_id=actor[1],
+            body=_attach_round_metadata(outcome.response.text,
+                PostedRoundMetadata(flow='pr', role='reviewer', agent=name, round_number=round_number,
+                    subject=metadata.head_sha, prior_items=tuple(prior), dispositions=parsed.dispositions,
+                    new_items=tuple(new), state=parsed.state, review_scope=outcome.scope,
+                    visual_lifecycle=outcome.lifecycle, phase='visual', seat_binding=seat_binding,
+                    **_metadata_identity_fields(outcome.response), acquisition_outcome='success', acquisition_returncode=0)))
+    except (AgentLoopError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        diagnostic('Visual publication unknown; durable intent remains spent: ' + str(exc)[:1024])
+        return VisualOutcome(diagnostic='visual publication unknown; no ledger mutation'), items, next_number
+    if current_head() != metadata.head_sha:
+        return VisualOutcome(stale=True), items, next_number
+    updated, _ = _apply_unresolved_item_dispositions(items, {d.item_id: [d] for d in parsed.dispositions},
+                                                   reconciliation_mode=reconciliation_mode)
+    return replace(outcome, fresh=True), [*updated, *new], next_number + len(new)
+
+
+def validate_boundary(runner, *, config, metadata, comments=None, diagnostic=lambda _: None):
+    """Read-only lifecycle validation never opens a recovery or freeze gate."""
+    if not config.review_images_paths or config.dry_run:
+        return
+    from .github_changed_paths import get_pr_changed_paths
+    paths = getattr(runner, '_visual_boundary_paths', {}).get((config.repo, metadata.number, metadata.head_sha))
+    if paths is None:
+        paths = get_pr_changed_paths(runner, config=config, pr_number=metadata.number, head_sha=metadata.head_sha)
+        _cache_paths(runner, config, metadata, paths)
+    if not paths.available or not eligible(CaptureConfig(paths=config.review_images_paths, command=config.review_images_cmd), [path.as_record() for path in paths.changes]):
+        return
+    from .review_images_state import reduce_history
+    history = (admitted_visual_history(runner, config, metadata.number, comments)
+               if comments is not None else load_history(runner, config, metadata.number))
+    admission = reduce_history(history, repo=config.repo, pr=metadata.number, head=metadata.head_sha)
+    diagnostic(admission.diagnostic or ('recovered visual state; no coder opportunity' if admission.spent
+                                       else 'no durable visual acceptance; execution gate retained'))
+
+
+def _cache_paths(runner, config, metadata, paths):
+    if not hasattr(runner, '_visual_boundary_paths'):
+        runner._visual_boundary_paths = {}
+    runner._visual_boundary_paths[(config.repo, metadata.number, metadata.head_sha)] = paths

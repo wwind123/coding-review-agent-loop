@@ -10508,8 +10508,8 @@ No semantic re-ask, completion resume, provider fallback or post-submission repl
 is supported. Uncertain completion remains unsuccessful. Text-only calls retain
 their existing warning and recovery behavior. No screenshot clearance, code
 approval or scheduler authority is introduced by the transport itself. The
-visual lifecycle below handles scoped findings; durable dispatch recovery and
-rollout remain deferred under #1795 and #1796.
+visual lifecycle below handles scoped findings and durable per-head dispatch;
+screenshot-evidence coverage and rollout remain deferred under #1795 and #1796.
 
 Pinned-release conformance is opt-in: set `IMAGE_CONTRACT_CODEX` and
 `IMAGE_CONTRACT_CLAUDE` to the pinned executables, then run
@@ -10555,7 +10555,7 @@ produce failed evidence without broadening mounts or weakening isolation.
 
 Added, modified, renamed (both names) and deleted paths participate without
 filesystem existence checks. Complete, stable changed-file listings are required.
-A matching new head receives at most one attempt in the invocation, after bounded
+A matching head receives at most one durable assessment, after bounded
 CI-start observation. Ordinary CI need not finish; absent/unavailable CI is
 diagnosed, and managed final CI remains approval-gated. Capture uses the immutable
 head, and the prompt contains sealed images, manifest and a bounded pinned diff.
@@ -10575,7 +10575,27 @@ or nothing-to-change result at an unchanged head whose visual attempt is spent.
 It also includes a successful pass by a different visual seat that cannot
 disposition the carried blocker; the stop names the owner and current seat.
 A fresh successful visual pass or explicit human resolution is required.
-Restart resets attempts and accepts no earlier success or private spool output;
-unresolved visual findings survive. Durable dispatch/recovery and digest skipping
-are deferred. Requester coverage and separate usage reporting belong to #1795;
+The invocation-local guard suppresses repeated pre-intent work at the same head.
+Restart may retry capture only when no durable intent exists. An authenticated,
+verified intent is written before model launch; a crash before or after launch
+leaves the head spent, with unknown completion and no inferred acceptance.
+Verified results recover without another coder opportunity. Unresolved visual
+blockers then require a new head with changed images and explicit dispositions,
+or an explicit human decision.
+
+Every new eligible head is freshly captured. Equal image content, relevant
+metadata and operator settings under the same complete reviewer contract may
+reuse only the latest authenticated successful assessment or its validated skip
+chain. The skip records the new head's capture and original result provenance;
+it preserves findings and owner shares, including blockers raised by the source.
+It grants no dispositions, coder opportunity, code approval or screenshot credit.
+Changed contracts, uncovered owner shares, invalid provenance and failed/unknown
+attempts cannot supply reuse. Malformed current-head lifecycle history or
+incomplete authentication stops applicable visual review for a human; foreign
+records grant no authority. Older-head lifecycle corruption disables reuse while
+allowing normal admission of a new unspent head. Shared transport decode failures
+and missing sidecars retain their existing run-wide stop in every mode.
+Disabled, dry-run and nonmatching heads gain no new lifecycle corruption stop;
+freeze and qualification recovery never open execution merely because images
+were enabled on rerun. Requester coverage and separate usage reporting belong to #1795;
 browser scripts, costs and rollout belong to #1796.

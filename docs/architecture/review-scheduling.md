@@ -473,6 +473,24 @@ ledger digest, including coder checkpoints and qualification comparisons. A fres
 visual pass adding or settling a finding cannot invalidate a code checkpoint,
 select an image-less owner turn, or latch a full-board recovery.
 
+Visual dispatch runs once before reviewer fanout in sequential, parallel and
+primary-then-panel scheduling. Its invocation-local guard also suppresses repeated
+listing, CI observation, diff and capture after pre-intent failures. Only stale
+pre-capture dispatch inputs release that local guard; durable spend is never
+released. Restart can retry pre-intent work but cannot repeat an intent-backed
+assessment. Only a fresh, verified published assessment in the same invocation
+can offer the existing single coder opportunity while the selected owner is
+pending. Recovered results and skips never replenish that opportunity.
+
+Fresh captures on a new head compare only with the latest authenticated terminal
+source and its original assessment. Matching images and reviewer contracts may
+skip assessment while retaining the new head's capture binding. Source coverage
+includes prior assignments and findings raised by that assessment, with their
+owner shares. New pending shares outside that coverage prohibit reuse. A source's
+own blocker does not prohibit reuse: it carries unchanged and requires a human
+when no fresh disposition opportunity exists. Skips have no dispositions and no
+code approval, screenshot-evidence, panel, sweep or scheduler authority.
+
 ## Decisions
 
 [Decision log](decisions/review-scheduling.md)

@@ -414,6 +414,8 @@ class PostedRoundMetadata:
     signed_evidence_references: tuple[SignedEvidenceReference, ...] = ()
     review_scope: object = None
     review_scope_present: bool = False
+    visual_lifecycle: object = None
+    visual_lifecycle_present: bool = False
     capture_review_binding: object = None
 
     def __post_init__(self) -> None:

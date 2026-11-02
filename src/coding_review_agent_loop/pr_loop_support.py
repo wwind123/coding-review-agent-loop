@@ -31,7 +31,7 @@ from typing import Literal, NoReturn
 from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
-from .review_scope import is_complete_code_review, is_visual_item, is_visual_review
+from .review_scope import is_complete_code_review, is_visual_item, is_visual_review, visual_candidate, authority_records
 from .reviewer_seats import reviewer_seat_binding
 from .config import (
     AgentLoopConfig,
@@ -3494,9 +3494,9 @@ def _fresh_pr_qualification_snapshot(
         # reviewer contract. A fresh qualification read must never silently
         # accept malformed or conflicting audit state, including a record
         # posted while managed CI was running.
-        fresh_scheduler_records = _extract_round_metadata_records(
+        fresh_scheduler_records = authority_records(_extract_round_metadata_records(
             context.comments, flow="pr"
-        )
+        ))
         superseded_invalid_indexes: set[int] = set()
         for record_position, record in enumerate(fresh_scheduler_records):
             status = record.metadata.scheduler_metadata_status
@@ -3748,6 +3748,9 @@ def _fresh_pr_qualification_snapshot(
             comments=context.comments, head=context.metadata.head_sha,
             plan=fresh_approved_plan_context, requirements=requirements.effective_requirements):
             context = dataclasses_replace(context, converted_capture_review_pending=True)
+    from .review_images import validate_boundary
+    validate_boundary(runner, config=config, metadata=context.metadata, comments=context.comments,
+                      diagnostic=lambda message: log(config, message))
     return context, requirement_ids, fresh_approved_plan_context, config
 
 
@@ -4412,7 +4415,7 @@ def _authenticated_pr_comments_status(
         return comments, None, False
     authority_indexes = [
         record.index for record in records
-        if record_carries_evidence_authority(record.metadata) or is_visual_review(record.metadata)
+        if record_carries_evidence_authority(record.metadata) or visual_candidate(record.metadata)
     ]
     if not authority_indexes:
         return comments, _cached_trusted_actor(runner), True

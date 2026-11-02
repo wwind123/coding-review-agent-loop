@@ -1296,6 +1296,19 @@ class FakeRunner(Runner):
             self.issue_comments.append(posted)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
+        if cmd[:4] == ["gh", "api", "--method", "POST"] and cmd[4].endswith('/comments'):
+            number = int(cmd[4].split('/')[-2])
+            body = next(part[5:] for part in cmd if part.startswith('body='))
+            login, actor_id = self.authenticated_actor or ('coding-review-agent-loop', 424242)
+            comments = self.pr_payload.setdefault('comments', []) if number == self.pr_payload['number'] else self._issue_comments_for(number)
+            posted = {'author': {'login': login}, '_rest_author_id': actor_id,
+                      'createdAt': f"2026-05-23T00:00:{len(comments):02d}Z", 'body': body}
+            if self.authenticated_actor is not None:
+                posted['createdAt'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            comments.append(posted)
+            return CommandResult(cmd, cwd_path, json_dumps({'id': 10_000 + len(comments), 'body': body,
+                'user': {'login': login, 'id': actor_id}, 'created_at': posted['createdAt']}), '', 0)
+
         if cmd[:3] == ["gh", "api", "user"] and (
             self.authenticated_actor is not None or self.default_pr_actor
         ):

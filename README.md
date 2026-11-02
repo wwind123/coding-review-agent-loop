@@ -2251,5 +2251,11 @@ No path globs means no image activity. `--review-images-seat SEAT` selects one
 configured image-capable reviewer; omission requires an explicit primary.
 Unsupported executable/model/fallback combinations are refused without fallback.
 See [the CLI guide](docs/local_agent_loop.md#visual-defect-review) for grants,
-limits and failure semantics. This first slice of #1795 is **not ready for
+limits and failure semantics. These core and durability slices of #1795 are **not ready for
 rollout until #1795 and #1796 finish**.
+
+Visual assessment dispatch is durable per PR head: a verified intent precedes
+launch, and restart never retries a spent head. New matching heads are captured
+freshly; unchanged content may reuse the latest compatible authenticated result
+while preserving findings and granting no code approval or new coder turn. See
+[visual review recovery](docs/local_agent_loop.md#visual-defect-review).
