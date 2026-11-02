@@ -716,7 +716,7 @@ def run_pr_loop(
     from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
     from .workdirs import active_workdir
     visual_startup(config)
-    visual_run = VisualRun()
+    visual_run = VisualRun(runner)
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     managed_ci = None
@@ -3674,47 +3674,38 @@ def run_pr_loop(
             # Freeze/recovery gates above own permission to execute; visual work
             # never opens them, and carries no scheduler or code-round metadata.
             visual_outcome = None
-            if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
-                unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
-                visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
-                    checkout=active_workdir(config), items=unresolved_items,
-                    managed=managed_ci is not None,
-                    current_head=lambda: get_observed_pr_review_context(
-                        runner, config=config, pr_number=pr_number).metadata.head_sha,
-                    diagnostic=lambda message: log(config, message))
-                if visual_outcome.stale:
-                    prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
-                    continue
-                if visual_outcome.response is not None:
-                    visual_parsed = visual_outcome.parsed
-                    visual_name = visual_outcome.scope["seat"]
-                    visual_prior = assigned_items(unresolved_items, visual_name)
-                    visual_new = []
-                    for status, findings in (("blocking", visual_parsed.blocking_items),
-                                             ("same-pr", visual_parsed.followups.same_pr),
-                                             ("future", visual_parsed.followups.future
-                                              if config.approved_followups != "ignore" else ())):
-                        for finding in findings:
-                            item = _next_unresolved_item(item_number=next_unresolved_item_number,
-                                reviewer=visual_name, source_round=round_number, text=finding.text,
-                                status=status, fix_scope=getattr(finding, "fix_scope", None),
-                                sub_items=getattr(finding, "sub_items", ()))
-                            visual_new.append(dataclasses_replace(item, origin_scope="visible-defects"))
-                            next_unresolved_item_number += 1
-                    visual_dispositions = {d.item_id: [d] for d in visual_parsed.dispositions}
-                    # Publish atomically only after proof and complete assignment validation.
-                    post_pr_comment(runner, config=config, pr_number=pr_number,
-                        body=_attach_round_metadata(visual_outcome.response.text,
-                            PostedRoundMetadata(flow="pr", role="reviewer", agent=visual_name,
-                                round_number=round_number, subject=pr_metadata.head_sha,
-                                prior_items=tuple(visual_prior), dispositions=visual_parsed.dispositions,
-                                new_items=tuple(visual_new), state=visual_parsed.state,
-                                review_scope=visual_outcome.scope, phase="visual", seat_binding=seat_binding,
-                                **_metadata_identity_fields(visual_outcome.response),
-                                acquisition_outcome="success", acquisition_returncode=0)))
-                    unresolved_items, _ = _apply_unresolved_item_dispositions(unresolved_items,
-                        visual_dispositions, reconciliation_mode=pr_reconciliation_mode)
-                    unresolved_items.extend(visual_new)
+            try:
+                if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
+                    unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
+                    visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
+                        checkout=active_workdir(config), items=unresolved_items, round_number=round_number,
+                        managed=managed_ci is not None,
+                        current_head=lambda: get_observed_pr_review_context(
+                            runner, config=config, pr_number=pr_number).metadata.head_sha,
+                        diagnostic=lambda message: log(config, message))
+                    visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
+                    if visual_outcome.stale:
+                        prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+                        continue
+                    from .review_images import publish_assessment
+                    visual_outcome, unresolved_items, next_unresolved_item_number = publish_assessment(
+                        runner, config=config, metadata=pr_metadata, outcome=visual_outcome,
+                        items=unresolved_items, next_number=next_unresolved_item_number,
+                        round_number=round_number, seat_binding=seat_binding,
+                        reconciliation_mode=pr_reconciliation_mode,
+                        current_head=lambda: get_observed_pr_review_context(
+                            runner, config=config, pr_number=pr_number).metadata.head_sha,
+                        diagnostic=lambda message: log(config, message))
+                    visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
+                    if visual_outcome.stale:
+                        prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+                        continue
+                else:
+                    from .review_images import validate_boundary
+                    validate_boundary(runner, config=config, metadata=pr_metadata, comments=pr_comments,
+                                      diagnostic=lambda message: log(config, message))
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
@@ -6157,8 +6148,8 @@ def run_pr_loop(
             if visual_blockers and reason is not None:
                 stop_for_human_decision(HumanDecisionRequiredError(
                     f"Unresolved visual findings {', '.join(item.item_id for item in visual_blockers)} "
-                    f"at head {pr_metadata.head_sha}: {reason}. A fresh successful visual pass "
-                    "or explicit human resolution is required."), round_number=round_number)
+                    f"at head {pr_metadata.head_sha}: {reason}. A new head with changed images and explicit visual dispositions "
+                    "or an explicit human decision is required."), round_number=round_number)
 
             if use_compact_pr_context:
                 pr_compact_prior_summaries = list(

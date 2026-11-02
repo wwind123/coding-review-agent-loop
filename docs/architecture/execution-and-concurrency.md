@@ -882,17 +882,16 @@ checking requests and reasoning/multiple-message output in a loopback-only netwo
 namespace. Default CI replays fixtures and deselects real CLI tests before sharding;
 explicit selection fails on missing prerequisites.
 
-`review_images_validation.py` requires original proof for every candidate,
-including timeout/nonzero exits and envelope normalization. Repair has no images
-or authority to change proof. Resume, re-asks, fallbacks, updater replay and
-post-submission retries are disabled; uncertain completion is terminal. The bounded prompt encloses manifest, inventory, mappings
-and diff as escaped untrusted data and requests only visible defects, excluding
-requester coverage. The opt-in lifecycle supplies scheduling and scoped finding
-handling. Durable dispatch recovery, screenshot clearance and rollout remain
-deferred under #1795 and #1796.
+`review_images_validation.py` requires original proof even for timeout/nonzero
+exits and normalization. Repair has no image/proof authority. Re-asks, completion
+resume, fallback and replay are disabled. Prompt manifest, inventory, mappings
+and diff remain escaped untrusted data; requester coverage is excluded.
 
-Visual dispatch rechecks seat admission and uses a fixed 300-second acquisition
-timeout. Restart requires fresh delivery proof.
+Visual dispatch rechecks seat and head with a 300-second acquisition timeout.
+Verified intent precedes launch; spent heads never retry. New heads are captured
+freshly. Reuse compares independent settings/content identities and reviewer
+contracts. See [durable recovery](round-state-and-resume.md#durable-visible-defects-lifecycle).
+Screenshot clearance and rollout remain deferred under #1795 and #1796.
 
 ## Decisions
 

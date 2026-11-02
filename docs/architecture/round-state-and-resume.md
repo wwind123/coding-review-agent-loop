@@ -466,6 +466,73 @@ publications cannot introduce findings or settle carried findings. Unavailable
 identity data stops resume before capture or agent execution and preserves the
 existing ledger for a later authenticated retry.
 
+## Durable visible-defects lifecycle
+
+`review_images_state.py` reduces authenticated visual round metadata. GitHub is
+its durable store; local sealed captures and private responses grant no recovery
+authority. Before the single model acquisition, the lifecycle writes and verifies
+an intent through the trusted PR protocol writer. The intent consumes that PR
+head's opportunity independently of seat or settings, including a crash before
+spawn. Missing completion, failed proof and uncertain publication remain spent
+and unaccepted. Independent simultaneous orchestrators on different hosts are
+outside this comment-based coordination contract.
+
+| Durable state | Recovery behavior |
+| --- | --- |
+| No intent | Normal execution gates may admit one fresh capture and assessment. |
+| Intent only | Completion unknown; no assessment retry or acceptance. |
+| Verified result | Recover the published finding outcomes without another coder opportunity. |
+| Verified skip | Validate every link to the original assessment; retain all findings unchanged. |
+| Legacy visual publication | Spend its head and conservatively replay authenticated findings, without acceptance or reuse. |
+
+Versioned lifecycle data binds repository, PR, full head, attempt, seat, immutable
+reviewer contract, current capture, independent configuration and comparison
+identities. Results additionally bind the verified intent and original delivery
+proof digest. Skips bind the latest terminal anchor, original assessment anchor
+and covered assignment. The independent configuration digest hashes validated
+operator paths, command, grants, timeouts and limits directly, excluding head and
+runtime wrapper data. Comparison canonicalizes manifest metadata, stable image
+IDs, screenshot/baseline associations and multiplicity, and actual sealed file
+hashes, dimensions and sizes. Reuse requires identical seat, provider, explicit
+model/effort/chain, executable digest, permission mode and transport/proof/prompt/
+schema versions; missing fields prevent reuse. A verified PR round writer publishes sidecars before the
+final anchor and returns its verified server identity. Findings mutate only after
+that anchor is verified. Sidecars alone, incomplete anchors, duplicate results or
+conflicting provenance cannot authorize acceptance; publication recovery never
+relaunches the model.
+
+Shared extraction still stops the run for undecodable envelopes, invalid shared
+payloads or missing required sidecars, for every author and mode. Successfully
+decoded lifecycle content preserves its raw value and presence (including null)
+through transport. Broad candidate classification quarantines it from code,
+scheduler, sweep and evidence authority before lifecycle validation. REST identity
+hydration and authenticated actor matching precede strict visual reduction.
+Foreign candidates supply neither spend nor acceptance nor findings. An
+applicable current-head invalid record, unknown head binding or incomplete
+identity coverage stops for human investigation, naming the comment where
+possible. Reliably older-head corruption prevents reuse but permits the new
+unspent head's ordinary admission; there is no fallback to older matching images.
+Conservative blocker replay checks each assessment against its own head's
+intent lineage, so unrelated corruption before or after it cannot erase its
+new findings. Full-history validation is still required for clearance and
+ownership changes. Lifecycle human stops post the ordinary PR diagnostic.
+A stale local outcome triggers one head refresh; revisiting that head returns
+the spent-attempt diagnostic rather than repeating the stale refresh.
+If the head moves during a verified result publication, the live ledger retains
+all newly published findings and reserves their IDs before refreshing. Stale
+dispositions, acceptance and coder opportunities are withheld; an unchanged-image
+skip at the new head therefore carries the same obligations as restart replay.
+Author-aware recovery from shared transport corruption remains separate work.
+
+Lifecycle corruption stops apply only to enabled, non-dry-run, matching heads.
+Disabled, dry-run and nonmatching paths do not gain lifecycle stops or runtime
+probes for diagnostics. Independent finding-authentication and cleanup stops
+remain effective. Recovery/freeze gates remain closed to new visual execution;
+a checkpoint with no lifecycle record grants no visual acceptance and continues
+independent code/CI qualification. Fresh qualification snapshots apply the same
+read-only validation to the live head. Head movement refreshes admission without
+reopening the old head's budget. None of this adds a screenshot-evidence gate.
+
 ## Decisions
 
 [Decision log](decisions/round-state-and-resume.md)

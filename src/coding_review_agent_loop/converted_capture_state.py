@@ -1,5 +1,5 @@
 """Pure converted-capture eligibility reconstructed from ordered round records."""
-from .review_scope import is_visual_review, is_visual_item, authority_records
+from .review_scope import visual_candidate, is_visual_review, is_visual_item, authority_records
 
 from .round_state import EVIDENCE_FREEZE_PHASE
 
@@ -153,7 +153,7 @@ def capture_stale_reviewers(records, *, head, boundary):
         return ()
     latest = {}
     for record in records:
-        if not is_visual_review(record.metadata) and record.metadata.role == "reviewer" and record.metadata.subject == head:
+        if not visual_candidate(record.metadata) and record.metadata.role == "reviewer" and record.metadata.subject == head:
             latest[record.metadata.agent] = record
     return tuple(name for name, record in latest.items()
                  if record.index <= boundary and record.metadata.state == "approved")
