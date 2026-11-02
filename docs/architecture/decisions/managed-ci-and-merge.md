@@ -27,3 +27,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Reusable ordinary and managed shard jobs share an optional consumer-selected job budget; named pytest timeouts and the outer shard ceiling address different hangs while preserving aggregate and authorization gates, and local CI watching remains independent (#1769).
 
 - The local watch defaults to 2400 seconds; authenticated current-attempt test failures can authorize early repair through fresh live job evidence while active intents remain attached and historical clearance retains completed-result gates (#1790).
+
+- Timing coverage is advisory balance bookkeeping, with no CI or review threshold; retain mean-weight fallback, exactly-once guards and real-failure gates, and refresh measured durations separately from ordinary feature work (#1850).

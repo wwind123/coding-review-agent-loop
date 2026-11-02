@@ -214,6 +214,13 @@ The whole boundary is a reusable `workflow_call` workflow
 exactly the permissions the callee jobs need; the dispatch must execute from the
 live default branch, whose head the intent's `workflow_revision` is bound to.
 The ordinary `Python 3.12 full suite` check is sharded the same way.
+Timing data in `tests/.test_durations` is advisory balance input: unknown IDs
+receive the mean weight of known collected IDs (or unit weight with no known
+IDs), and stale IDs do not influence that mean. Timing drift alone never blocks
+CI or review. Exactly-once manifest verification and real test failures remain
+blocking. Full measured setup/call/teardown replacement refreshes belong in
+maintenance PRs; optional add-missing maintenance preserves existing entries.
+
 Both reusable workflows expose an optional numeric `shard_timeout_minutes`
 input controlling the runner job ceiling for every shard, including single-shard
 callers. A shard timeout flows through the existing always-evaluated aggregate
