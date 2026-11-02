@@ -461,7 +461,9 @@ Only proof-verified assigned visual dispositions settle visual findings; ordinar
 code turns cannot do so. Failed evidence permits ordinary work, then unresolved
 visual blockers with no disposition opportunity require a human decision before
 merge or another futile coder dispatch (including unchanged-head retries).
-A successful pass offers that opportunity only for its assigned owners. If the
+A successful pass offers that opportunity only while its selected owner remains
+pending after reconciliation. Clearing that seat's share of a multi-owner finding
+leaves other pending owners intact and requires the same human stop. If the
 selected visual seat changes while a blocker's owner remains on the board,
 the blocker survives and the human stop names its owners and the current seat;
 an unrelated successful pass cannot authorize another coder turn.

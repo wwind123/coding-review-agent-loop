@@ -158,14 +158,17 @@ class VisualRun:
         return [derived.get(item.item_id, item) if is_visual_item(item) else item for item in items]
 
     def blocker_stop_reason(self, blockers, head, outcome):
-        """Success offers a disposition opportunity only to the assigned owners."""
+        """Success offers an opportunity only while the selected owner is pending."""
         if outcome is not None and outcome.response is not None:
             seat = outcome.scope['seat']
-            assigned_ids = {item.item_id for item in assigned_items(blockers, seat)}
+            assigned_ids = {item.item_id for item in assigned_items(blockers, seat)
+                            if dict(item.owner_states).get(seat, 'pending') != 'cleared'}
             unassigned = [item for item in blockers if item.item_id not in assigned_ids]
             if unassigned:
                 owners = '; '.join(
-                    f"{item.item_id} owners {', '.join(item.resolution_owners or (item.reviewer,))}"
+                    f"{item.item_id} owners {', '.join(owner for owner in
+                        (item.resolution_owners or (item.reviewer,))
+                        if dict(item.owner_states).get(owner, 'pending') != 'cleared')} (pending)"
                     for item in unassigned)
                 return f"visual seat {seat} cannot disposition {owners}"
             if head not in self.coder_heads:

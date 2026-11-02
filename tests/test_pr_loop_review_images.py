@@ -536,6 +536,86 @@ def test_carried_visual_owner_disposition_opportunity_controls_human_stop(
         assert 'Clipped title in mobile view.' not in prompt
 
 
+@pytest.mark.parametrize('parallel', [False, True])
+@pytest.mark.parametrize('status', ['blocking', 'same-pr'])
+@pytest.mark.parametrize('disposition', ['resolved', 'future', 'keep-open'])
+def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
+        visual_setup, monkeypatch, parallel, status, disposition):
+    from coding_review_agent_loop import pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from pr_loop_test_helpers import _m943_append
+    config, calls, original = visual_setup
+    seats = []
+    for name in ('alpha', 'beta', 'gamma'):
+        directory = config.codex_dir.parent / name
+        directory.mkdir()
+        seats.append(SeatAgent(ReviewerSeat(name, 'codex', ('gpt-6.1-sol',), 'medium'), directory))
+    config = replace(config, reviewer=tuple(seats), reviewer_seats=tuple(seats),
+        review_images_seat='alpha', pr_review_policy='selective-intermediate',
+        primary_reviewer=None, review_parallel=parallel)
+    kept = disposition == 'keep-open'
+    texts = [structured_pr_review(state='blocking', **{
+        'blocking_items' if status == 'blocking' else 'same_pr_followups': ['Clipped mobile title.']}),
+        structured_pr_review(state='blocking' if kept else 'approved', prior_item_dispositions=[{
+            'item_id': 'item-1', 'disposition': status if kept else disposition,
+            'note': 'The mobile title is still clipped in the sealed image; widen its container and test the mobile viewport.'}])]
+    def reviewer(runner, **kwargs):
+        result = original(runner, **kwargs)
+        if kwargs.get('image_inputs'):
+            text = texts.pop(0)
+            return replace(result, text=text, message_text=text, raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent, 'run_agent_result', reviewer)
+    reconciled = []
+    settle = pr_loop._settle_pr_round_ledger
+    def record_settlement(*args, **kwargs):
+        result = settle(*args, **kwargs)
+        reconciled.append(result[0])
+        return result
+    monkeypatch.setattr(pr_loop, '_settle_pr_round_ledger', record_settlement)
+    run = pr_loop._run_validated_agent
+    coder_calls = []
+    def stop_at_coder(*args, **kwargs):
+        if kwargs.get('role') == 'coder':
+            coder_calls.append(kwargs)
+            raise KeyboardInterrupt()
+        return run(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, '_run_validated_agent', stop_at_coder)
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 10)
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(coder_calls) == 1
+    coder_calls.clear()
+    _m943_append(runner, format_reviewer_board_amendment_comment(flow='pr', issue=None, pr_number=77,
+        original_required_reviewers=('alpha', 'beta', 'gamma'), policy='selective-intermediate',
+        primary_reviewer=None, removed_reviewers=('alpha',), effective_from_round=1,
+        reason='seat-unavailable', rationale='Alpha is unavailable.'))
+    runner.simulate_new_process()
+    config = replace(config, review_images_seat='beta')
+    if kept:
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert len(coder_calls) == 1
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1') as error:
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert 'visual seat beta cannot disposition item-1 owners gamma (pending)' in str(error.value)
+        assert runner.pr_payload['headRefOid'] in str(error.value)
+        assert not coder_calls
+    publications = [r.metadata for r in records(runner) if is_visual_review(r.metadata)]
+    assert len(publications) == 2 and publications[-1].agent == 'beta'
+    assigned = publications[-1].prior_items[0]
+    assert assigned.resolution_owners == ('beta', 'gamma')
+    assert dict(assigned.owner_states) == {'beta': 'pending', 'gamma': 'pending'}
+    retained, = [item for item in reconciled[-1] if item.item_id == 'item-1']
+    assert retained.item_id == 'item-1' and retained.status == status
+    assert dict(retained.owner_states) == {'beta': 'pending' if kept else 'cleared', 'gamma': 'pending'}
+    assert len([c for c in calls if c[0] == 'capture']) == 2
+    assert len([c for c in calls if c[0] == 'images']) == 2
+    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+
+
 def test_amended_visual_owner_can_resolve_and_stays_resolved_after_restart(visual_setup, monkeypatch):
     from coding_review_agent_loop import pr_loop
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
