@@ -447,6 +447,95 @@ def test_named_visual_seat_publication_preserves_binding_on_restart(visual_setup
     assert len([c for c in calls if c[0]=='capture']) == 2
 
 
+@pytest.mark.parametrize('selection', ['explicit', 'primary'])
+@pytest.mark.parametrize('parallel', [False, True])
+@pytest.mark.parametrize('status', ['blocking', 'same-pr'])
+@pytest.mark.parametrize('opportunity', ['other-seat', 'failed', 'nonmatching', 'assigned'])
+def test_carried_visual_owner_disposition_opportunity_controls_human_stop(
+        visual_setup, monkeypatch, selection, parallel, status, opportunity):
+    from coding_review_agent_loop import pr_loop, github_changed_paths
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+    config, calls, original = visual_setup
+    seats = []
+    for name in ('alpha', 'beta'):
+        directory = config.codex_dir.parent / name
+        directory.mkdir()
+        seats.append(SeatAgent(ReviewerSeat(name, 'codex', ('gpt-6.1-sol',), 'medium'), directory))
+    config = replace(config, reviewer=tuple(seats), reviewer_seats=tuple(seats),
+        review_parallel=parallel, review_images_seat='alpha' if selection == 'explicit' else None,
+        pr_review_policy='all-reviewers' if selection == 'explicit' else 'primary-then-panel',
+        primary_reviewer=None if selection == 'explicit' else seats[0])
+    texts = [structured_pr_review(state='blocking', **{
+        'blocking_items' if status == 'blocking' else 'same_pr_followups': ['Clipped title in mobile view.']}),
+        structured_pr_review(prior_item_dispositions=[{'item_id': 'item-1', 'disposition': 'resolved'}])
+        if opportunity == 'assigned' else structured_pr_review()]
+    def reviewer(runner, **kwargs):
+        result = original(runner, **kwargs)
+        if kwargs.get('image_inputs'):
+            text = texts.pop(0)
+            return replace(result, text=text, message_text=text, raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent, 'run_agent_result', reviewer)
+    run = pr_loop._run_validated_agent
+    coder_calls = []
+    def stop_at_coder(*args, **kwargs):
+        if kwargs.get('role') == 'coder':
+            coder_calls.append(kwargs)
+            raise KeyboardInterrupt()
+        return run(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, '_run_validated_agent', stop_at_coder)
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 8)
+    # A newly reported blocker still gets its first ordinary coder opportunity.
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(coder_calls) == 1
+    coder_calls.clear()
+    if selection == 'explicit':
+        runner.simulate_new_process()
+    else:
+        # Seed the real visual publication without ordinary board history:
+        # an in-flight primary change otherwise stops at the separate board gate.
+        visual_comments = [comment for comment in runner.pr_payload['comments'] if any(
+            is_visual_review(record.metadata) for record in _extract_round_metadata_records(
+                [SimpleNamespace(body=comment['body'])], flow='pr'))]
+        runner = FakeRunner(codex_outputs=[structured_pr_review()] * 8,
+                            pr_payload={'comments': visual_comments})
+    selected = seats[0] if opportunity == 'assigned' else seats[1]
+    config = replace(config, review_images_seat=str(selected) if selection == 'explicit' else None,
+        primary_reviewer=None if selection == 'explicit' else selected)
+    if opportunity == 'failed':
+        monkeypatch.setattr(visual, 'capture', lambda *args: CaptureResult('failed', 'stub capture failed'))
+    elif opportunity == 'nonmatching':
+        monkeypatch.setattr(github_changed_paths, 'get_pr_changed_paths', lambda *args, **kwargs:
+            PullRequestChangedPaths(kwargs['head_sha'], True, (ChangedPath('modified', 'server.py'),)))
+    if opportunity == 'assigned':
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1') as error:
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert runner.pr_payload['headRefOid'] in str(error.value)
+        if opportunity == 'other-seat':
+            assert 'visual seat beta' in str(error.value) and 'item-1 owners alpha' in str(error.value)
+        else:
+            assert ('stub capture failed' if opportunity == 'failed' else 'no matching changed paths') in str(error.value)
+        # Ordinary work completes (or exact-head approvals are reused) before the stop.
+        assert any(r.metadata.role == 'reviewer' and not is_visual_review(r.metadata)
+                   and r.metadata.state == 'approved' for r in records(runner))
+        recovered = visual.recover_visual_findings(records(runner), reconciliation_mode='owner-scoped')
+        assert len(recovered) == 1
+        assert (recovered[0].item_id, recovered[0].reviewer, recovered[0].status) == ('item-1', 'alpha', status)
+        assert (recovered[0].resolution_owners or (recovered[0].reviewer,)) == ('alpha',)
+    assert not coder_calls
+    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+    publications = [r.metadata for r in records(runner) if is_visual_review(r.metadata)]
+    assert len(publications) == (2 if opportunity in {'assigned', 'other-seat'} else 1)
+    if opportunity == 'other-seat':
+        assert publications[-1].agent == 'beta' and publications[-1].prior_items == ()
+        assert publications[-1].state == 'approved'
+        prompt = [c[1]['prompt'] for c in calls if c[0] == 'images'][-1]
+        assert 'Clipped title in mobile view.' not in prompt
+
+
 def test_amended_visual_owner_can_resolve_and_stays_resolved_after_restart(visual_setup, monkeypatch):
     from coding_review_agent_loop import pr_loop
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent

@@ -157,6 +157,21 @@ class VisualRun:
         derived = {item.item_id: item for item in ledger_view(items)}
         return [derived.get(item.item_id, item) if is_visual_item(item) else item for item in items]
 
+    def blocker_stop_reason(self, blockers, head, outcome):
+        """Success offers a disposition opportunity only to the assigned owners."""
+        if outcome is not None and outcome.response is not None:
+            seat = outcome.scope['seat']
+            assigned_ids = {item.item_id for item in assigned_items(blockers, seat)}
+            unassigned = [item for item in blockers if item.item_id not in assigned_ids]
+            if unassigned:
+                owners = '; '.join(
+                    f"{item.item_id} owners {', '.join(item.resolution_owners or (item.reviewer,))}"
+                    for item in unassigned)
+                return f"visual seat {seat} cannot disposition {owners}"
+            if head not in self.coder_heads:
+                return None
+        return self.reasons.get(head, 'the invocation-local visual attempt is spent')
+
     def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic):
         if not config.review_images_paths or config.dry_run:
             return VisualOutcome(diagnostic='disabled')

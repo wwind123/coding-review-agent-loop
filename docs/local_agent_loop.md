@@ -10572,6 +10572,8 @@ A carried visual blocker that cannot obtain a verified disposition preserves its
 ID and owner obligation and routes to a human decision after permitted ordinary
 work, before merge or another futile coder turn. This includes a coder dispute
 or nothing-to-change result at an unchanged head whose visual attempt is spent.
+It also includes a successful pass by a different visual seat that cannot
+disposition the carried blocker; the stop names the owner and current seat.
 A fresh successful visual pass or explicit human resolution is required.
 Restart resets attempts and accepts no earlier success or private spool output;
 unresolved visual findings survive. Durable dispatch/recovery and digest skipping

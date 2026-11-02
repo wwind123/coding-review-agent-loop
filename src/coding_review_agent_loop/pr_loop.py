@@ -6153,10 +6153,8 @@ def run_pr_loop(
             )
             visual_blockers = [item for item in unresolved_items if is_visual_item(item)
                                and item.status in {"blocking", "same-pr"}]
-            if visual_blockers and (pr_metadata.head_sha in visual_run.coder_heads
-                    or visual_outcome is None or visual_outcome.response is None):
-                reason = visual_run.reasons.get(pr_metadata.head_sha,
-                    "the invocation-local visual attempt is spent")
+            reason = visual_run.blocker_stop_reason(visual_blockers, pr_metadata.head_sha, visual_outcome)
+            if visual_blockers and reason is not None:
                 stop_for_human_decision(HumanDecisionRequiredError(
                     f"Unresolved visual findings {', '.join(item.item_id for item in visual_blockers)} "
                     f"at head {pr_metadata.head_sha}: {reason}. A fresh successful visual pass "
