@@ -512,6 +512,12 @@ applicable current-head invalid record, unknown head binding or incomplete
 identity coverage stops for human investigation, naming the comment where
 possible. Reliably older-head corruption prevents reuse but permits the new
 unspent head's ordinary admission; there is no fallback to older matching images.
+Conservative blocker replay checks each assessment against its own head's
+intent lineage, so unrelated corruption before or after it cannot erase its
+new findings. Full-history validation is still required for clearance and
+ownership changes. Lifecycle human stops post the ordinary PR diagnostic.
+A stale local outcome triggers one head refresh; revisiting that head returns
+the spent-attempt diagnostic rather than repeating the stale refresh.
 Author-aware recovery from shared transport corruption remains separate work.
 
 Lifecycle corruption stops apply only to enabled, non-dry-run, matching heads.

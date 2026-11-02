@@ -3674,35 +3674,38 @@ def run_pr_loop(
             # Freeze/recovery gates above own permission to execute; visual work
             # never opens them, and carries no scheduler or code-round metadata.
             visual_outcome = None
-            if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
-                unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
-                visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
-                    checkout=active_workdir(config), items=unresolved_items, round_number=round_number,
-                    managed=managed_ci is not None,
-                    current_head=lambda: get_observed_pr_review_context(
-                        runner, config=config, pr_number=pr_number).metadata.head_sha,
-                    diagnostic=lambda message: log(config, message))
-                visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
-                if visual_outcome.stale:
-                    prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
-                    continue
-                from .review_images import publish_assessment
-                visual_outcome, unresolved_items, next_unresolved_item_number = publish_assessment(
-                    runner, config=config, metadata=pr_metadata, outcome=visual_outcome,
-                    items=unresolved_items, next_number=next_unresolved_item_number,
-                    round_number=round_number, seat_binding=seat_binding,
-                    reconciliation_mode=pr_reconciliation_mode,
-                    current_head=lambda: get_observed_pr_review_context(
-                        runner, config=config, pr_number=pr_number).metadata.head_sha,
-                    diagnostic=lambda message: log(config, message))
-                visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
-                if visual_outcome.stale:
-                    prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
-                    continue
-            else:
-                from .review_images import validate_boundary
-                validate_boundary(runner, config=config, metadata=pr_metadata, comments=pr_comments,
-                                  diagnostic=lambda message: log(config, message))
+            try:
+                if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
+                    unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
+                    visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
+                        checkout=active_workdir(config), items=unresolved_items, round_number=round_number,
+                        managed=managed_ci is not None,
+                        current_head=lambda: get_observed_pr_review_context(
+                            runner, config=config, pr_number=pr_number).metadata.head_sha,
+                        diagnostic=lambda message: log(config, message))
+                    visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
+                    if visual_outcome.stale:
+                        prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+                        continue
+                    from .review_images import publish_assessment
+                    visual_outcome, unresolved_items, next_unresolved_item_number = publish_assessment(
+                        runner, config=config, metadata=pr_metadata, outcome=visual_outcome,
+                        items=unresolved_items, next_number=next_unresolved_item_number,
+                        round_number=round_number, seat_binding=seat_binding,
+                        reconciliation_mode=pr_reconciliation_mode,
+                        current_head=lambda: get_observed_pr_review_context(
+                            runner, config=config, pr_number=pr_number).metadata.head_sha,
+                        diagnostic=lambda message: log(config, message))
+                    visual_run.outcomes[pr_metadata.head_sha] = visual_outcome
+                    if visual_outcome.stale:
+                        prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+                        continue
+                else:
+                    from .review_images import validate_boundary
+                    validate_boundary(runner, config=config, metadata=pr_metadata, comments=pr_comments,
+                                      diagnostic=lambda message: log(config, message))
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {

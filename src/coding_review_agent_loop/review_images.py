@@ -187,7 +187,10 @@ class VisualRun:
             return VisualOutcome(diagnostic='disabled')
         head = metadata.head_sha
         if head in self.attempted:
-            return self.outcomes.get(head, VisualOutcome(diagnostic=self.reasons.get(head, 'visual attempt already spent')))
+            cached = self.outcomes.get(head)
+            if cached is not None and not cached.stale:
+                return cached
+            return VisualOutcome(diagnostic=self.reasons.get(head, 'visual attempt already spent'))
         self.attempted.add(head)
         history = load_history(runner, config, metadata.number)
         try:
@@ -334,7 +337,13 @@ def recover_visual_findings(records, *, reconciliation_mode):
         for position, record in enumerate(records):
             if not lifecycle_present(record.metadata):
                 continue
-            prefix = History(records[:position+1], identities=records.identities,
+            # Conservative blocker replay needs only this head's intent/result
+            # lineage. Unrelated corruption must never erase authenticated
+            # obligations, even when it prevents full-history clearance.
+            head = reliable_head(record.metadata)
+            prefix = History((r for r in records[:position+1]
+                              if head is not None and reliable_head(r.metadata) == head),
+                             identities=records.identities,
                              complete=records.complete, repo=records.repo, pr=records.pr)
             try:
                 admitted = reduce_history(prefix, repo=records.repo, pr=records.pr,
