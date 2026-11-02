@@ -451,6 +451,28 @@ refuse before either write, including at the round limit, with the plan, round,
 missing seats and their seat/restoration/parent-requirement bindings. Requirement,
 obligation, inherited-matrix and growth checks still govern execution.
 
+A matching opt-in visual pass follows applicable bounded CI-start observation
+and existing execution/freeze gates. It never authorizes final managed CI.
+Bound visible-defects publications have no scheduler metadata or code approval,
+panel, sweep, capture acceptance or evidence-boundary authority. Authority readers
+exclude those records before checking history presence or selecting current/prior
+state, while full history preserves visual finding IDs and owner obligations.
+Only proof-verified assigned visual dispositions settle visual findings; ordinary
+code turns cannot do so. Failed evidence permits ordinary work, then unresolved
+visual blockers with no disposition opportunity require a human decision before
+merge or another futile coder dispatch (including unchanged-head retries).
+A successful pass offers that opportunity only while its selected owner remains
+pending after reconciliation. Clearing that seat's share of a multi-owner finding
+leaves other pending owners intact and requires the same human stop. If the
+selected visual seat changes while a blocker's owner remains on the board,
+the blocker survives and the human stop names its owners and the current seat;
+an unrelated successful pass cannot authorize another coder turn.
+
+Visual findings are excluded from code scheduler obligations and every scheduler
+ledger digest, including coder checkpoints and qualification comparisons. A fresh
+visual pass adding or settling a finding cannot invalidate a code checkpoint,
+select an image-less owner turn, or latch a full-board recovery.
+
 ## Decisions
 
 [Decision log](decisions/review-scheduling.md)

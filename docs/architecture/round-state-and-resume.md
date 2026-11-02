@@ -459,6 +459,13 @@ Approval refusal diagnostics inspect the full current-scope history, preserving
 excluded approval status, round and recorded bindings for operator recovery.
 Qualification continues to use its filtered evidence view.
 
+Visible-defects finding replay hydrates REST comment identities and admits only
+publications authored by the authenticated orchestrator actor, matching both login
+and numeric identity. This applies even when image capture is disabled. Foreign
+publications cannot introduce findings or settle carried findings. Unavailable
+identity data stops resume before capture or agent execution and preserves the
+existing ledger for a later authenticated retry.
+
 ## Decisions
 
 [Decision log](decisions/round-state-and-resume.md)

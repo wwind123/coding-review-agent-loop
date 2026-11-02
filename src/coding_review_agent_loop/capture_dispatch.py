@@ -1,4 +1,5 @@
 """PR dispatch adapters for the pure capture acceptance contract."""
+from .review_scope import is_visual_review, is_visual_item, authority_records
 from .agents.registry import agent_display_name
 from .capture_acceptance import capture_assignments, accepted_capture_reviewers, assigned_findings, reviewer_contract
 from .review_scope import is_complete_code_review
@@ -26,7 +27,7 @@ def narrow_capture_scopes(records, *, head, plan, required_reviewers, primary,
 
 def scoped_review_items(items, scopes, reviewer):
     scope = scopes.get(reviewer)
-    return assigned_findings(items, scope, reviewer) if scope is not None else items
+    return assigned_findings(items, scope, reviewer) if scope is not None else tuple(item for item in items if not is_visual_item(item))
 
 
 def scoped_validator(validate, *, scopes, reviewer, items):
@@ -89,6 +90,7 @@ def resume_capture_round(records, *, comments, trusted_actor, head):
     from .round_state import (ResumedReviewRound, _recovery_record_admitted,
                               _max_unresolved_item_number_from_records)
     from .review_scope import scope_present, valid_evidence_scope
+    records = authority_records(records)
     current = [record for record in records if record.metadata.subject == head]
     if not current:
         return None

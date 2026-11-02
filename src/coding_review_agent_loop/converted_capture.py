@@ -1,5 +1,6 @@
 """A converted freeze's capture opportunity, reconstructed from existing records."""
 
+from .review_scope import authority_records
 from .errors import HumanDecisionRequiredError
 from .logging import log
 from .converted_capture_state import (
@@ -26,7 +27,7 @@ def recovery_capture(runner, config, *, pr_number, items, head, plan):
     if not complete:
         log(config, "Converted capture history is unavailable; retaining the final evidence barrier")
         return ()
-    records = _extract_round_metadata_records(comments, flow="pr")
+    records = authority_records(_extract_round_metadata_records(comments, flow="pr"))
     # Author admission is required for the entire causal chain, not just audits.
     if any(not _recovery_record_admitted(r, comments, actor) for r in records):
         log(config, "Converted capture history has uncertain authorship; retaining the final evidence barrier")

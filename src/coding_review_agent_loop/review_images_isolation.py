@@ -1,6 +1,5 @@
 """Fail-closed Bubblewrap layouts; only root-owned offline runtime grants."""
 from __future__ import annotations
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -11,6 +10,7 @@ from .secure_git import _trusted_path
 
 
 def sealed(data: bytes, name='capture-control'):
+    import fcntl
     fd = os.memfd_create(name, os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
     try:
         with os.fdopen(os.dup(fd), 'wb') as stream:
@@ -35,6 +35,11 @@ def preflight(grants):
     help_result = subprocess.run([bwrap, '--help'], env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
     if help_result.returncode or b'--size' not in help_result.stdout:
         raise ValueError('Bubblewrap lacks --size')
+    validate_grants(grants)
+    return bwrap
+
+
+def validate_grants(grants):
     if not grants:
         raise ValueError('explicit offline runtime grants are required')
     normalized = []
@@ -54,7 +59,7 @@ def preflight(grants):
         if any(resolved == old or resolved.startswith(old + '/') or old.startswith(resolved + '/') for old in normalized):
             raise ValueError('overlapping runtime grants')
         normalized.append(resolved)
-    return bwrap
+
 
 
 def trusted_directory(path):

@@ -2301,3 +2301,108 @@ def test_neutral_rollover_does_not_treat_malformed_wire_scheduler_as_absent():
     assert decoded.scheduler_metadata_status == "invalid"
     assert not neutral_plan_rollover_indices([PostedRoundRecord(0, settled, "body"),
                                              PostedRoundRecord(1, decoded, "body")])
+
+
+@pytest.mark.parametrize('operator', [False, True])
+@pytest.mark.parametrize('move', [False, True])
+@pytest.mark.parametrize('boundary', ['release', 'conversion'])
+@pytest.mark.parametrize('nonempty', [False, True])
+def test_visual_tail_preserves_current_prior_boundary_and_operator_sources(operator, move, boundary, nonempty):
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    from coding_review_agent_loop.review_scope import authority_records
+    metadata = (_conversion_record() if boundary == 'conversion' else
+                replace(_freeze_metadata(()), phase='evidence-release', evidence_freeze=None))
+    if nonempty:
+        ordinary = replace(_item(), item_id='item-20', text='Ordinary carried claim')
+        visual = replace(_item(), item_id='item-21', text='Visual carried claim', origin_scope='visible-defects')
+        metadata = replace(metadata, prior_items=(*metadata.prior_items, ordinary, visual),
+            evidence_clearances=(('cleared-evidence', metadata.subject),))
+    head = metadata.subject
+    def comment(m):
+        return IssueComment(author='coding-review-agent-loop', author_id=424242,
+            created_at='2026-10-01T12:00:00Z', body=_attach_round_metadata('History.',m))
+    history = [comment(metadata)]
+    tail = PostedRoundMetadata(flow='pr',role='reviewer',agent='Codex',round_number=99,
+        subject=head,state='approved',phase='visual',review_scope={
+            'version':1,'kind':'visible-defects','head':head,'seat':'Codex'})
+    args = dict(head_sha='b'*40 if move else head, configured_reviewers=('codex',),
+                trusted_actor=('coding-review-agent-loop',424242), review_unrecorded_head=operator)
+    baseline = _resume_pr_round(history, **args)
+    if nonempty or boundary == 'conversion' or not move:
+        assert baseline is not None
+        assert baseline.round_number == metadata.round_number
+    if nonempty:
+        assert baseline.round_number == metadata.round_number
+        assert {'item-20', 'item-21'} <= {item.item_id for item in baseline.prior_items}
+        assert next(item for item in baseline.prior_items if item.item_id=='item-21').origin_scope == 'visible-defects'
+        assert baseline.recovery_round_budget is None
+        if boundary == 'release':
+            assert baseline.evidence_boundary == metadata
+            assert baseline.evidence_clearances == (() if move else metadata.evidence_clearances)
+    resumed = _resume_pr_round([*history,comment(tail)], **args)
+    assert resumed == baseline
+    assert _resume_pr_round([*history,comment(tail),comment(tail)], **args) == baseline
+    # Valid visual records never change authority selection; malformed scopes
+    # remain in the history for the ordinary fail-closed policy.
+    malformed = replace(tail, review_scope=None, review_scope_present=True)
+    assert len(authority_records((PostedRoundRecord(index=0,body='',metadata=malformed),))) == 1
+
+
+def test_visual_origin_roundtrips_and_changes_only_visual_ledger_signature():
+    from coding_review_agent_loop.round_state import (
+        _serialize_unresolved_item, _deserialize_unresolved_item, _prior_item_ledger_signature)
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    ordinary = _next_unresolved_item(item_number=1, reviewer='Codex', source_round=1,
+                                     text='Title clips', status='blocking')
+    visual = replace(ordinary, origin_scope='visible-defects')
+    assert 'origin_scope' not in _serialize_unresolved_item(ordinary)
+    assert _deserialize_unresolved_item(_serialize_unresolved_item(visual)) == visual
+    ordinary_signature = _prior_item_ledger_signature((ordinary,))[0]
+    visual_signature = _prior_item_ledger_signature((visual,))[0]
+    assert visual_signature[:-1] == ordinary_signature
+    assert visual_signature[-1] == ('origin_scope','visible-defects')
+
+
+@pytest.mark.parametrize('operator', [False, True])
+@pytest.mark.parametrize('scope', ['visual', 'null', 'foreign'])
+def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(operator, scope):
+    ordinary = replace(_item(), item_id='item-20', text='ordinary prior')
+    new = replace(_item(), item_id='item-22', text='ordinary new')
+    visual = replace(_item(), item_id='item-21', origin_scope='visible-defects')
+    # A later ordinary handoff supersedes the old release and carries budget.
+    release = replace(_freeze_metadata(()), subject=_OLD, phase='evidence-release', evidence_freeze=None)
+    handoff = _handoff(subject=_OLD, round_number=4, items=(ordinary, visual))
+    reviewer = _reviewer(subject=_OLD, round_number=4, items=(ordinary, visual), new_items=(new,))
+    tail = PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex', round_number=99,
+        subject=_OLD, state='approved', phase='visual', review_scope={
+            'version':1,'kind':'visible-defects','head':_OLD,'seat':'Codex'})
+    if scope != 'visual':
+        tail = replace(tail, review_scope=None if scope=='null' else {'kind':'foreign'}, review_scope_present=True)
+    history = [release, handoff, reviewer]
+    baseline = _resume(history, _NEW, flag=operator)
+    assert baseline is not None and baseline.round_number == 4
+    # The later reviewer retires the automatic handoff budget. Operator
+    # override separately recovers authenticated budget sources below.
+    assert baseline.recovery_round_budget is None
+    from coding_review_agent_loop.round_state import _operator_head_review_resume, _extract_round_metadata_records
+    comments = _history(*history)
+    ordinary_records = _extract_round_metadata_records(comments, flow='pr')
+    override = _operator_head_review_resume(ordinary_records, ordinary_records,
+        comments=comments, trusted_actor=_ACTOR)
+    assert override is not None and override.round_number == 4
+    assert override.recovery_round_budget == _BUDGET
+    assert {i.item_id for i in override.prior_items} == {'item-20','item-21','item-22'}
+    assert {i.item_id for i in baseline.prior_items} == {'item-20','item-21','item-22'}
+    if scope == 'visual':
+        assert _resume([*history,tail], _NEW, flag=operator) == baseline
+        comments = _history(*history, tail)
+        mixed = _extract_round_metadata_records(comments, flow='pr')
+        assert _operator_head_review_resume(mixed, mixed, comments=comments, trusted_actor=_ACTOR) == override
+    else:
+        # Invalid scope is retained by the real resume reader; it cannot
+        # silently fall back to the older ordinary handoff.
+        if operator:
+            assert _resume([*history,tail], _NEW, flag=True) is None
+        else:
+            with pytest.raises(AgentLoopError, match='handoff could not be recovered safely'):
+                _resume([*history,tail], _NEW)

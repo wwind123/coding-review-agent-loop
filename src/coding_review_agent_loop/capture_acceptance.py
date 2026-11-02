@@ -3,6 +3,7 @@
 Callers supply authenticated history and independently qualified code approvals.
 Neither a tool receipt nor an evidence-only verdict grants code authority.
 """
+from .review_scope import is_visual_review, is_visual_item, authority_records
 import hashlib
 import json
 from collections.abc import Mapping
@@ -100,6 +101,8 @@ def accepted_capture_reviewers(records, *, assignments, head, boundary, approval
     latest = {}
     for record in records:
         m = record.metadata
+        if is_visual_review(m):
+            continue
         if m.role != "reviewer" or m.subject != head or record.index <= boundary:
             continue
         expected = assignments.get(m.agent)

@@ -9,7 +9,7 @@ import os
 import stat
 import uuid
 
-from .review_images_config import ImageLimits
+from .review_images_config import ImageLimits, delivery_limits
 from .review_images_manifest import SnapshotSet, schema
 
 
@@ -104,12 +104,13 @@ class ImageInputs:
 
 
 def acquire_images(snapshots: SnapshotSet, capability, *, head_sha: str,
-                   config_digest: str, snapshot_digest: str) -> ImageInputs:
+                   config_digest: str, snapshot_digest: str,
+                   limits: ImageLimits | None = None) -> ImageInputs:
     """Validate the capture API without opening any manifest-named path."""
     if (snapshots.head_sha != head_sha or snapshots.config_digest != config_digest
             or snapshots.digest != snapshot_digest):
         raise ValueError("snapshot identity mismatch")
-    limits = ImageLimits(dimension=768, pixels=768 * 768, file_bytes=2 * 1024**2)
+    limits = delivery_limits(limits)
     manifest, paths = schema(snapshots.manifest_json, head_sha, limits)
     names = tuple(f.path for f in snapshots.files)
     if names != tuple(sorted(set(names))) or set(names) != set(paths):
@@ -121,7 +122,6 @@ def acquire_images(snapshots: SnapshotSet, capability, *, head_sha: str,
         raise ValueError("snapshot digest mismatch")
     owned = []
     try:
-        total = 0
         for file in snapshots.files:
             if file._closed or not 0 < file.size <= limits.file_bytes:
                 raise ValueError("closed or oversized snapshot")
@@ -138,15 +138,19 @@ def acquire_images(snapshots: SnapshotSet, capability, *, head_sha: str,
                 raise ValueError("snapshot content mismatch")
             # Capture validated PNGs; also check their bound dimensions here.
             from .review_images_png import validate_png
-            if validate_png(data, dimension=768, pixels=768 * 768) != (file.width, file.height):
+            if validate_png(data, dimension=limits.dimension, pixels=limits.pixels) != (file.width, file.height):
                 raise ValueError("snapshot PNG dimensions mismatch")
             import struct
             if (data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24
                     or struct.unpack(">II", data[16:24]) != (file.width, file.height)
-                    or not 0 < file.width <= 768 or not 0 < file.height <= 768):
+                    or not 0 < file.width <= limits.dimension or not 0 < file.height <= limits.dimension):
                 raise ValueError("unsupported image dimensions/format")
-            total += file.size
-        if total > limits.total_bytes or len(owned) > 2 * limits.entries:
+        by_name = {file.path: file for file in snapshots.files}
+        # Count every screenshot/baseline reference, exactly as capture publish
+        # does. Shared baselines must not bypass a lower aggregate policy.
+        total = sum(by_name[path].size for path in paths)
+        pixels = sum(by_name[path].width * by_name[path].height for path in paths)
+        if total > limits.total_bytes or pixels > limits.total_pixels or len(owned) > 2 * limits.entries:
             raise ValueError("image inventory exceeds contract limits")
         index = {name: i for i, name in enumerate(names)}
         refs = tuple((image["id"], index[image["path"]],

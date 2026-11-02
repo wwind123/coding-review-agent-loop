@@ -24,7 +24,7 @@ DEFAULT_LIMIT = 6000
 ALLOWLIST: dict[str, int] = {
     "src/coding_review_agent_loop/managed_ci.py": 9755,
     "src/coding_review_agent_loop/protocol.py": 10238,
-    "src/coding_review_agent_loop/pr_loop.py": 9976,
+    "src/coding_review_agent_loop/pr_loop.py": 9945,
 }
 
 SPLIT_GUIDANCE = (

@@ -25,10 +25,21 @@ service = importlib.import_module('coding_review_agent_loop.review_images_captur
 
 @pytest.mark.parametrize('name', ['docs/a:b.md', 'a\\b.txt', 'a\u200b.txt'])
 @pytest.mark.parametrize('enabled', [False, True])
-def test_service_bounds_invalid_changes(tmp_path, name, enabled):
+def test_service_keeps_unusual_nonmatching_names_inert(tmp_path, monkeypatch, name, enabled):
     cfg = config() if enabled else CaptureConfig()
+    monkeypatch.setattr(containment, 'preflight_containment',
+                        lambda *_: pytest.fail('nonmatch reached containment preflight'))
     result = service.capture(tmp_path, 'a'*40, cfg, [{'status':'added','filename':name}])
-    assert result.state == ('failed' if enabled else 'disabled')
+    assert result.state == 'disabled'
+
+
+@pytest.mark.parametrize('name', ['docs/a:b.md', 'a\\b.txt', 'a\u200b.txt'])
+def test_service_still_refuses_matching_unsupported_names(tmp_path, monkeypatch, name):
+    cfg = dataclasses.replace(config(), paths=('*',))
+    monkeypatch.setattr(containment, 'preflight_containment',
+                        lambda *_: pytest.fail('invalid matching path reached preflight'))
+    result = service.capture(tmp_path, 'a'*40, cfg, [{'status': 'added', 'filename': name}])
+    assert result.state == 'failed' and result.snapshots is None
 
 
 @pytest.mark.parametrize('failure', ['missing-systemd', 'old-systemd', 'no-cgroup', 'user-manager', 'manifest'])

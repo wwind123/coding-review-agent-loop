@@ -1,6 +1,7 @@
 """Round metadata persistence and resume helpers."""
 
 from __future__ import annotations
+from .review_scope import authority_records
 
 import hashlib
 import json
@@ -1600,6 +1601,8 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
     # re-encode byte-identically.
     if item.provenance is not None:
         payload["provenance"] = item.provenance
+    if item.origin_scope is not None:
+        payload["origin_scope"] = item.origin_scope
     if item.repeat_of is not None:
         payload["repeat_of"] = item.repeat_of
     return payload
@@ -1842,6 +1845,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         converted_row_ids=converted_row_ids,
         provenance=_deserialize_item_provenance(payload),
         repeat_of=_deserialize_repeat_of(payload),
+        origin_scope=payload.get("origin_scope"),
     )
 
 
@@ -3309,6 +3313,12 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
 from .code_approval import _latest_pr_approved_reviews_for_head
 
 
+def _scheduler_item_ledger_signature(items):
+    """Code scheduling ignores findings owned by verified visual turns."""
+    from .review_scope import is_visual_item
+    return _prior_item_ledger_signature(tuple(item for item in items if not is_visual_item(item)))
+
+
 def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple[tuple[object, ...], ...]:
     return tuple(
         (
@@ -3330,6 +3340,8 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.failed_head_sha,
             item.candidate_head_sha,
             item.obligation_identity,
+            # Preserve legacy digests while distinguishing visual ownership.
+            *((('origin_scope', item.origin_scope),) if item.origin_scope is not None else ()),
             # Appended only for items with sub-items, so a legacy item keeps
             # its pre-#958 signature tuple exactly.
             *(
@@ -3352,6 +3364,7 @@ def _select_current_round_records(
     *,
     subject: str,
 ) -> ResumedRoundSelection | None:
+    records = authority_records(records)
     subject_records = [record for record in records if record.metadata.subject == subject]
     if not subject_records:
         return None
@@ -4139,7 +4152,7 @@ def unauthenticated_recovery_record_indexes(
     qualification-checkpoint anchor of a head that has no records of its own;
     and, under ``--review-unrecorded-head``, every checkpoint (a budget source).
     """
-    records = _extract_round_metadata_records(comments, flow="pr")
+    records = authority_records(_extract_round_metadata_records(comments, flow="pr"))
     needed: set[int] = set()
     for record in records:
         phase = record.metadata.phase
@@ -4167,7 +4180,7 @@ def pr_resume_needs_author_admission(
     """Whether resuming needs REST identities and the authenticated actor."""
     if review_unrecorded_head:
         return True
-    records = _extract_round_metadata_records(comments, flow="pr")
+    records = authority_records(_extract_round_metadata_records(comments, flow="pr"))
     if any(
         record.metadata.phase in RECOVERY_RECORD_PHASES
         or record_carries_evidence_authority(record.metadata)
@@ -4358,6 +4371,8 @@ def _operator_head_review_resume(
     trusted_actor: tuple[str, int] | None = None,
 ) -> ResumedReviewRound | None:
     """``--review-unrecorded-head``: an ordinary review round of the current head."""
+    records = authority_records(records)
+    walk_records = authority_records(walk_records)
     if not records:
         return None
     latest = records[-1].metadata
@@ -4420,6 +4435,9 @@ def _recover_unrecorded_pr_head_advance(
     ``walk_records`` additionally holds the admitted dispatch records the
     recovery-handoff walk inspects.
     """
+    records = authority_records(records)
+    if walk_records is not None:
+        walk_records = authority_records(walk_records)
     records = _drop_unterminated_evidence_response_records(records)
     walk_view = (
         records
@@ -4619,6 +4637,7 @@ def _latest_prior_pr_subject_is_coherent(
     comments: Sequence[object] = (),
     trusted_actor: tuple[str, int] | None = None,
 ) -> bool:
+    records = authority_records(records)
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
         return True
@@ -5223,6 +5242,8 @@ def _resume_pr_round_from_records(
     reconciliation_mode: str,
     trusted_actor: tuple[str, int] | None,
 ) -> ResumedReviewRound | None:
+    records = authority_records(records)
+    walk_records = authority_records(walk_records)
     handoff = _live_recovery_handoff(walk_records, head_sha, head_moved=False)
     if handoff is not None:
         return _consume_recovery_handoff(walk_records, handoff, head_moved=False)

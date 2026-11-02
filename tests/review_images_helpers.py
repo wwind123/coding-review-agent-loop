@@ -71,3 +71,16 @@ def stub_capture_prerequisites(monkeypatch):
     monkeypatch.setattr(review_images_isolation, 'preflight', bubblewrap_ready)
     monkeypatch.setattr(review_images_isolation, 'validator_grants', validator_ready)
     return calls
+
+
+def append_visual_record(runner, *, head=None, round_number=1, state='approved', scheduler=None):
+    """Append a bound visual publication without giving it ordinary authority."""
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    head = head or runner.pr_payload['headRefOid']
+    metadata = PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex',
+        round_number=round_number, subject=head, state=state, phase='visual',
+        review_scope={'version':1, 'kind':'visible-defects','head':head,'seat':'Codex'},
+        scheduler_contract=scheduler)
+    runner.pr_payload.setdefault('comments', []).append({
+        'author': {'login':'coding-review-agent-loop'}, '_rest_author_id':424242,
+        'createdAt':'2026-10-01T12:00:00Z', 'body':_attach_round_metadata('Visual assessment.',metadata)})

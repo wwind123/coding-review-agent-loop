@@ -1887,7 +1887,8 @@ def _staged_panel_history(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("opening", ["qualified", "never-opened"])
-def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, monkeypatch, opening):
+@pytest.mark.parametrize("visual", [False, True])
+def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, monkeypatch, opening, visual):
     """Item-4 (row pr-primary-change): only items created under a qualified
     panel opening before the epoch are exempt from the pre-panel stop."""
     from pr_loop_test_helpers import _staged_config
@@ -1907,12 +1908,19 @@ def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, mon
             r for r in records
             if not (r.metadata.scheduler_phase == "secondary-audit" and r.metadata.role == "summary")
         ]
+    if visual:
+        records = [dataclasses.replace(record, metadata=dataclasses.replace(record.metadata,
+            prior_items=tuple(dataclasses.replace(item, origin_scope='visible-defects') for item in record.metadata.prior_items),
+            new_items=tuple(dataclasses.replace(item, origin_scope='visible-defects') for item in record.metadata.new_items)))
+            for record in records]
     eligible = pre_epoch_panel_items(records, lineage)
+    if visual:
+        assert eligible == frozenset()
     ledger = [item for r in records for item in r.metadata.prior_items][-1:]
     carried = carried_secondary_obligations(
         ledger, epoch_round=4, primary="Antigravity", eligible=eligible,
     )
-    assert carried == (("item-1",) if opening == "qualified" else ())
+    assert carried == (("item-1",) if opening == "qualified" and not visual else ())
 
 
 def test_unqualified_secondary_item_still_stops_after_a_primary_change(tmp_path, monkeypatch):

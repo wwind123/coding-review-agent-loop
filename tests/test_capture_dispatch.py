@@ -24,6 +24,15 @@ def test_capture_dispatch_preserves_code_approval(tmp_path, monkeypatch, policy,
     assert review.metadata.review_scope is not None
     assert "EVIDENCE-ONLY REVIEW" in _prompts(runner, "codex")[-1]
     assert '"expected_outcome": "outcome row-a"' in _prompts(runner, "codex")[-1]
+    from review_images_helpers import append_visual_record
+    append_visual_record(runner, round_number=review.metadata.round_number)
+    from coding_review_agent_loop.converted_capture_state import capture_stale_reviewers
+    visual_tail = _records(runner)[-1]
+    before_capture = tuple(r for r in records if r.index <= capture.index)
+    baseline_stale = capture_stale_reviewers(before_capture, head=capture.metadata.subject, boundary=capture.index)
+    assert "Codex" in baseline_stale
+    assert capture_stale_reviewers((*before_capture, visual_tail), head=capture.metadata.subject,
+                                   boundary=capture.index) == baseline_stale
     comments = authenticated_pr_comments(runner, config, pr_number=77)[0]
     approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context)
@@ -153,8 +162,9 @@ def test_live_qualification_rejects_malformed_scoped_publication(tmp_path, monke
 
 
 @pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("visual_tail", [False, True])
 @pytest.mark.parametrize("seam", ["reviewer", "reconciliation"])
-def test_blocking_capture_publication_recovers_without_spool(tmp_path, monkeypatch, parallel, seam):
+def test_blocking_capture_publication_recovers_without_spool(tmp_path, monkeypatch, parallel, seam, visual_tail):
     from coding_review_agent_loop.review_rounds import _review_round_spool
     from test_pr_loop_evidence_conversion import _tagged
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch, policy="selective-intermediate")
@@ -178,6 +188,9 @@ def test_blocking_capture_publication_recovers_without_spool(tmp_path, monkeypat
         assert not publication.metadata.new_items
     _review_round_spool(config, surface="pr", number=77,
         round_number=publication.metadata.round_number, subject=publication.metadata.subject).discard()
+    if visual_tail:
+        from review_images_helpers import append_visual_record
+        append_visual_record(runner, round_number=publication.metadata.round_number)
     monkeypatch.setattr(loop, "post_pr_comment", original_post)
     runner.simulate_new_process()
     original_run = loop._run_validated_agent

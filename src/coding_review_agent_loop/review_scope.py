@@ -39,3 +39,29 @@ def valid_evidence_scope(scope):
             and isinstance(scope["rows"], list) and bool(scope["rows"])
             and all(isinstance(row, str) and row for row in scope["rows"])
             and len(set(scope["rows"])) == len(scope["rows"]))
+
+
+def is_visual_review(metadata):
+    """Only a fully bound visible-defects record is outside ordinary authority.
+
+    Unknown, null and malformed scopes remain in authority readers so their
+    existing conservative recovery rules still apply.
+    """
+    get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
+    scope = get("review_scope")
+    return (get("flow") == "pr" and get("role") == "reviewer" and isinstance(scope, Mapping)
+            and set(scope) == {"version", "kind", "head", "seat"}
+            and type(scope["version"]) is int and scope["version"] == 1
+            and scope["kind"] == "visible-defects"
+            and isinstance(scope["head"], str) and len(scope["head"]) == 40
+            and all(c in "0123456789abcdef" for c in scope["head"])
+            and scope["head"] == get("subject") and scope["seat"] == get("agent")
+            and isinstance(scope["seat"], str) and bool(scope["seat"]))
+
+
+def authority_records(records):
+    return tuple(record for record in records if not is_visual_review(record.metadata))
+
+
+def is_visual_item(item):
+    return getattr(item, "origin_scope", None) == "visible-defects"

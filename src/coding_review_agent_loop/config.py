@@ -286,6 +286,14 @@ class AgentLoopConfig:
     pr_review_policy: str = "all-reviewers"
     # Primary reviewer used only by the staged primary-then-panel policy.
     primary_reviewer: AgentName | None = None
+    review_images_cmd: str | None = None
+    review_images_paths: tuple[str, ...] = ()
+    review_images_seat: str | None = None
+    review_images_runtime_grant: tuple[str, ...] = ()
+    review_images_timeout: float = 300
+    review_images_max_images: int = 16
+    review_images_max_bytes: int = 67108864
+    review_images_max_pixels: int = 64000000
     pr_review_broad_rules: tuple[str, ...] = DEFAULT_BROAD_RULES
     pr_review_force_full: bool = False
     # Issue plan-review scheduling, selected independently of the PR policy
@@ -2660,6 +2668,14 @@ def config_from_args(
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,
         ci_startup_timeout_seconds=getattr(args, "ci_startup_timeout_seconds", 120),
+        review_images_cmd=getattr(args, "review_images_cmd", None),
+        review_images_paths=tuple(getattr(args, "review_images_paths", ())),
+        review_images_seat=getattr(args, "review_images_seat", None),
+        review_images_runtime_grant=tuple(getattr(args, "review_images_runtime_grant", ())),
+        review_images_timeout=getattr(args, "review_images_timeout", 300),
+        review_images_max_images=getattr(args, "review_images_max_images", 16),
+        review_images_max_bytes=getattr(args, "review_images_max_bytes", 67108864),
+        review_images_max_pixels=getattr(args, "review_images_max_pixels", 64000000),
         watch_pending_ci=(
             bool(getattr(args, "auto_merge", False))
             if getattr(args, "watch_pending_ci", None) is None

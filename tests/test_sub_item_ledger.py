@@ -63,6 +63,32 @@ def _disp(reviewer, disposition, note=None, subs=()):
     )
 
 
+@pytest.mark.parametrize("mode", ["aggregate", "owner-scoped"])
+@pytest.mark.parametrize("status", ["blocking", "same-pr"])
+@pytest.mark.parametrize("disposition", ["resolved", "future"])
+@pytest.mark.parametrize("sub_items", [False, True])
+def test_visual_reconciliation_preserves_all_owner_shares(mode, status, disposition, sub_items):
+    item = replace(_item(status=status), origin_scope="visible-defects",
+                   resolution_owners=("beta", "gamma"),
+                   owner_states=(("beta", "pending"), ("gamma", "pending")))
+    if not sub_items:
+        item = replace(item, sub_items=())
+    kept, _ = _apply_unresolved_item_dispositions(
+        [item], {item.item_id: [_disp("beta", disposition)]}, reconciliation_mode=mode)
+    retained, = kept
+    assert retained.status == status
+    assert retained.resolution_owners == ("beta", "gamma")
+    assert dict(retained.owner_states) == {"beta": "cleared", "gamma": "pending"}
+    settled, _ = _apply_unresolved_item_dispositions(
+        kept, {item.item_id: [_disp("gamma", "resolved")]}, reconciliation_mode=mode)
+    if disposition == "future":
+        deferred, = settled
+        assert deferred.status == "future"
+        assert dict(deferred.owner_states) == {"beta": "cleared", "gamma": "cleared"}
+    else:
+        assert settled == []
+
+
 def _reconcile(item, dispositions, *, mode="aggregate", round_number=5):
     cleared: list[ClearedItemProgress] = []
     notes: list[str] = []

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, observe_pr_head, explain_pr_head_recovery, diagnostic_origin
 
-from .review_scope import is_complete_code_review
+from .review_scope import is_complete_code_review, authority_records, is_visual_item, is_visual_review
 from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery, is_resumable_capture_review
 from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
 from .pr_restart import checkpoint_restart, review_inputs_changed
@@ -292,7 +292,7 @@ from .round_state import (
     _attach_round_metadata,
     _extract_round_metadata_records,
     _latest_pr_approved_reviews_for_head,
-    _prior_item_ledger_signature,
+    _prior_item_ledger_signature, _scheduler_item_ledger_signature,
     _resume_plan_round,
     make_approved_plan_context,
     scope_approved_plan_matrix,
@@ -556,91 +556,7 @@ from .pr_loop_decisions import (
 )
 
 
-def _enforce_pr_board_floor(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    pr_context: PullRequestReviewContext,
-    pr_number: int,
-    handoff_authorizations: Sequence[object] = (),
-) -> None:
-    """Resolve the PR board lineage read-only, then check the effective-board floor.
-
-    Malformed, unauthenticated or not-yet-activatable lineage history (signed
-    amendments and board-change links) fails closed here, and a board-change
-    candidate is floor-checked against the lineage that would exist after
-    posting it, so every caller refuses before any write (#1376).  Without a
-    floor, signed amendments or link records there is nothing to refuse
-    early: startup resolves the lineage before any agent invocation.
-    """
-    if not (
-        board_floor_enabled(config)
-        or comments_bear_board_change_links(pr_context.comments)
-        or collect_reviewer_board_amendments(
-            pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
-        )
-    ):
-        return
-    capabilities = policy_capabilities(config.pr_review_policy)
-    configured = reviewers(config)
-    configured_contract = make_contract(
-        tuple(agent_display_name(reviewer) for reviewer in configured),
-        config.pr_review_policy,
-        config.pr_review_broad_rules,
-        (
-            agent_display_name(config.primary_reviewer)
-            if config.primary_reviewer is not None
-            else None
-        ),
-    )
-
-    def resume_round(effective_config: object, _lineage: object) -> int:
-        resumed = _resume_pr_round_admitted(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            comments=pr_context.comments,
-            head_sha=pr_context.metadata.head_sha,
-            configured_reviewers=reviewers(effective_config),
-            reconciliation_mode=(
-                "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
-            ),
-        )
-        return board_reentry_round(
-            pr_context.comments, resumed.round_number if resumed is not None else None,
-            signed_amendment=True,
-        )
-
-    resolve_pr_board_state(
-        runner,
-        config=config,
-        pr_number=pr_number,
-        comments=pr_context.comments,
-        drift_error=lambda persisted, detail: _pr_contract_drift_error(
-            persisted,
-            detail,
-            pr_number=pr_number,
-            configured=configured_contract,
-            start_round_number=lambda: _pr_amendment_start_round(
-                pr_context, configured, capabilities, runner=runner, config=config,
-            ),
-            amendments_recognized=True,
-        ),
-        handoff_authorizations=handoff_authorizations,
-        resume_round=resume_round,
-        floor_refusal_hint=lambda persisted, refused: _board_amendment_route_clause(
-            flow="pr",
-            issue_number=None,
-            pr_number=pr_number,
-            persisted=persisted,
-            configured=refused,
-            start_round_number=lambda: _pr_amendment_start_round(
-                pr_context, configured, capabilities, runner=runner, config=config,
-            ),
-            amendments_recognized=True,
-        ),
-    )
-
+from .pr_board_entry import _enforce_pr_board_floor
 
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
@@ -797,6 +713,10 @@ def run_pr_loop(
     initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
+    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
+    from .workdirs import active_workdir
+    visual_startup(config)
+    visual_run = VisualRun()
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     managed_ci = None
@@ -2438,6 +2358,7 @@ def run_pr_loop(
                 same_status="same-pr",
             )
         }
+        startup_records = authority_records(startup_records)
         # Signed reviewer-board amendments (#943) live on the PR itself, in
         # the same comment list as the PR scheduler records, for issue-mode
         # and standalone runs alike.  A PR amendment on the owning issue is
@@ -3187,6 +3108,16 @@ def run_pr_loop(
 
         # Step-back entries recorded by the previous iteration's coder turn (#1251).
         pending_step_back_sweeps: dict = {}
+        visual_history = admitted_visual_history(runner, config, pr_number, initial_pr_context.comments)
+        visual_ledger = recover_visual_findings(visual_history, reconciliation_mode=pr_reconciliation_mode)
+        unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
+        if resumed_round is not None and tuple(unresolved_items) != resumed_round.prior_items:
+            resumed_round = dataclasses_replace(resumed_round, prior_items=tuple(unresolved_items))
+        next_unresolved_item_number = max(next_unresolved_item_number,
+            max((int(item.item_id.split("-")[-1]) + 1 for record in visual_history if is_visual_review(record.metadata)
+                 for item in (*record.metadata.prior_items, *record.metadata.new_items)
+                 if item.item_id.startswith("item-") and item.item_id[5:].isdigit()), default=1))
+
         for round_number in round_sequence:
             # The effective-board floor is checked at every round (pure, no I/O).
             check_lineage_floor(
@@ -3738,6 +3669,52 @@ def run_pr_loop(
             # complete board fresh; computed after the frozen-rerun path above
             # may have started a response pass.
             full_board_pass = evidence_pass is not None or conversion_pass
+            from .pr_loop_decisions import recovery_skips_reviewers
+            skip_visual_for_recovery = recovery_skips_reviewers(current_resume, broken_freeze_head, qualification_checkpoint)
+            # Freeze/recovery gates above own permission to execute; visual work
+            # never opens them, and carries no scheduler or code-round metadata.
+            visual_outcome = None
+            if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
+                unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
+                visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
+                    checkout=active_workdir(config), items=unresolved_items,
+                    managed=managed_ci is not None,
+                    current_head=lambda: get_observed_pr_review_context(
+                        runner, config=config, pr_number=pr_number).metadata.head_sha,
+                    diagnostic=lambda message: log(config, message))
+                if visual_outcome.stale:
+                    prefetched_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
+                    continue
+                if visual_outcome.response is not None:
+                    visual_parsed = visual_outcome.parsed
+                    visual_name = visual_outcome.scope["seat"]
+                    visual_prior = assigned_items(unresolved_items, visual_name)
+                    visual_new = []
+                    for status, findings in (("blocking", visual_parsed.blocking_items),
+                                             ("same-pr", visual_parsed.followups.same_pr),
+                                             ("future", visual_parsed.followups.future
+                                              if config.approved_followups != "ignore" else ())):
+                        for finding in findings:
+                            item = _next_unresolved_item(item_number=next_unresolved_item_number,
+                                reviewer=visual_name, source_round=round_number, text=finding.text,
+                                status=status, fix_scope=getattr(finding, "fix_scope", None),
+                                sub_items=getattr(finding, "sub_items", ()))
+                            visual_new.append(dataclasses_replace(item, origin_scope="visible-defects"))
+                            next_unresolved_item_number += 1
+                    visual_dispositions = {d.item_id: [d] for d in visual_parsed.dispositions}
+                    # Publish atomically only after proof and complete assignment validation.
+                    post_pr_comment(runner, config=config, pr_number=pr_number,
+                        body=_attach_round_metadata(visual_outcome.response.text,
+                            PostedRoundMetadata(flow="pr", role="reviewer", agent=visual_name,
+                                round_number=round_number, subject=pr_metadata.head_sha,
+                                prior_items=tuple(visual_prior), dispositions=visual_parsed.dispositions,
+                                new_items=tuple(visual_new), state=visual_parsed.state,
+                                review_scope=visual_outcome.scope, phase="visual", seat_binding=seat_binding,
+                                **_metadata_identity_fields(visual_outcome.response),
+                                acquisition_outcome="success", acquisition_returncode=0)))
+                    unresolved_items, _ = _apply_unresolved_item_dispositions(unresolved_items,
+                        visual_dispositions, reconciliation_mode=pr_reconciliation_mode)
+                    unresolved_items.extend(visual_new)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
@@ -4123,27 +4100,7 @@ def run_pr_loop(
                 capture_scopes.clear()
                 unchanged_head_approvals.clear()
                 request_automatic_scheduler_fallback("historical result review inputs changed")
-            skip_reviewers_for_recovery = bool(
-                current_resume is not None
-                and (
-                    (
-                        current_resume.unrecorded_head_advance
-                        # A broken freeze, or a recovered ledger holding only
-                        # evidence, has nothing for the coder: review in full.
-                        and broken_freeze_head is None
-                        and any(
-                            not _is_evidence_obligation(item)
-                            for item in current_resume.prior_items
-                        )
-                    )
-                    or (
-                        qualification_checkpoint is not None
-                        and qualification_checkpoint.valid
-                        and qualification_checkpoint.lifecycle
-                        in {"repair_required", "qualification_ready", "qualifying"}
-                    )
-                )
-            )
+            skip_reviewers_for_recovery = recovery_skips_reviewers(current_resume, broken_freeze_head, qualification_checkpoint)
             if skip_reviewers_for_recovery:
                 if current_resume is not None and current_resume.unrecorded_head_advance:
                     if current_resume.rejected_coder_followup_reason:
@@ -4304,7 +4261,7 @@ def run_pr_loop(
             if selective_policy:
                 try:
                     historical_records = drop_inert_post_reconciliation_checkpoints(
-                        _extract_round_metadata_records(pr_comments, flow="pr")
+                        authority_records(_extract_round_metadata_records(pr_comments, flow="pr"))
                     )
                 except AgentLoopError:
                     historical_records = ()
@@ -4435,7 +4392,7 @@ def run_pr_loop(
                     ),
                 )
                 current_obligation_digest = hashlib.sha256(
-                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                 ).hexdigest()[:16]
                 # The coder checkpoint is the conservative recovery latch for
                 # every ledger, including reviewer-only ledgers. Qualification
@@ -4756,7 +4713,7 @@ def run_pr_loop(
                         scheduler_previous_sha=scheduler_previous_sha,
                         scheduler_current_sha=current_pr_subject,
                         scheduler_obligation_digest=hashlib.sha256(
-                            repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                            repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16],
                         scheduler_selected_reviewers=selected,
                         scheduler_paused_reviewers=paused,
@@ -4998,7 +4955,7 @@ def run_pr_loop(
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
                                 hashlib.sha256(
-                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                                 ).hexdigest()[:16]
                                 if selective_policy else None
                             ),
@@ -6128,7 +6085,7 @@ def run_pr_loop(
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
                                 hashlib.sha256(
-                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                                 ).hexdigest()[:16]
                                 if selective_policy else None
                             ),
@@ -6194,6 +6151,15 @@ def run_pr_loop(
                 ledger_view=pr_ledger_view,
                 **evidence_reconciliation_kwargs,
             )
+            visual_blockers = [item for item in unresolved_items if is_visual_item(item)
+                               and item.status in {"blocking", "same-pr"}]
+            reason = visual_run.blocker_stop_reason(visual_blockers, pr_metadata.head_sha, visual_outcome)
+            if visual_blockers and reason is not None:
+                stop_for_human_decision(HumanDecisionRequiredError(
+                    f"Unresolved visual findings {', '.join(item.item_id for item in visual_blockers)} "
+                    f"at head {pr_metadata.head_sha}: {reason}. A fresh successful visual pass "
+                    "or explicit human resolution is required."), round_number=round_number)
+
             if use_compact_pr_context:
                 pr_compact_prior_summaries = list(
                     bound_compact_prior_summaries(
@@ -6352,7 +6318,7 @@ def run_pr_loop(
                     plan_digest=checkpoint_expected_plan_digest,
                     requirements_digest=checkpoint_expected_requirements_digest,
                     acquisition_digest=checkpoint_expected_acquisition_digest,
-                    scheduler_digest=_qualification_digest(_prior_item_ledger_signature(unresolved_items)),
+                    scheduler_digest=_qualification_digest(_scheduler_item_ledger_signature(unresolved_items)),
                 )
                 _persist_qualification_checkpoint(
                     runner, config=config, pr_number=pr_number, round_number=round_number,
@@ -7125,7 +7091,7 @@ def run_pr_loop(
                         ),
                         acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                         scheduler_digest=_qualification_digest(
-                            _prior_item_ledger_signature(unresolved_items)
+                            _scheduler_item_ledger_signature(unresolved_items)
                         ),
                         qualification_attempt_id=(
                             f"github-checks:{pr_metadata.head_sha}"
@@ -8029,7 +7995,7 @@ def run_pr_loop(
                                     ),
                                     acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                                     scheduler_digest=_qualification_digest(
-                                        _prior_item_ledger_signature(unresolved_items)
+                                        _scheduler_item_ledger_signature(unresolved_items)
                                     ),
                                 )
                                 if qualification_checkpoint is not None:
@@ -9244,7 +9210,7 @@ def run_pr_loop(
                 ),
                 acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                 scheduler_digest=_qualification_digest(
-                    _prior_item_ledger_signature(unresolved_items)
+                    _scheduler_item_ledger_signature(unresolved_items)
                 ),
             )
             if observe_repair_result(
@@ -9317,6 +9283,7 @@ def run_pr_loop(
             evidence_progress_receipts: frozenset[str] = frozenset()
             _followup_derived_risk_evidence = None
             try:
+                visual_run.coder_heads.add(pr_metadata.head_sha)
                 coder_response = _run_validated_agent(
                     runner,
                     agent=config.coder,
@@ -9596,7 +9563,7 @@ def run_pr_loop(
                     ),
                     acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                     scheduler_digest=_qualification_digest(
-                        _prior_item_ledger_signature(unresolved_items)
+                        _scheduler_item_ledger_signature(unresolved_items)
                     ),
                 )
                 latest_coder_metadata = bound_pr_metadata(
@@ -9659,7 +9626,7 @@ def run_pr_loop(
                     ),
                     scheduler_obligation_digest=(
                         hashlib.sha256(
-                            repr(_prior_item_ledger_signature(unresolved_items)).encode("utf-8")
+                            repr(_scheduler_item_ledger_signature(unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16]
                         if selective_policy else None
                     ),

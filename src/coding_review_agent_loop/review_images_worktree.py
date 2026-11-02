@@ -15,7 +15,7 @@ from .review_images_config import relative_path
 from .review_images_channel import write_record
 
 
-def git(root, args, *, input=None, output=None, cap=16*1024**2):
+def git(root, args, *, input=None, output=None, cap=16*1024**2, truncate=False):
     argv, env, fds = local_command(['-C', str(root), *args], checkout=root)
     # Never buffer an unbounded Git response or let pack output fill host disk.
     with tempfile.TemporaryFile() as source:
@@ -44,16 +44,16 @@ def git(root, args, *, input=None, output=None, cap=16*1024**2):
                         del error[:-4096]
                     else:
                         total += len(data)
-                        if total > cap:
+                        if total > cap and not truncate:
                             raise ValueError('Git staging exceeds byte cap')
                         if output is not None:
                             output.write(data)
                         else:
-                            result.extend(data)
+                            result.extend(data[:max(0, cap-len(result))])
             code = process.wait(timeout=max(.1, deadline-time.monotonic()))
             if code:
                 raise ValueError('confined Git staging failed: ' + error.decode(errors='replace'))
-            return bytes(result)
+            return bytes(result) + (b"\n[diff truncated at byte budget]\n" if truncate and total > cap else b"")
         finally:
             selector.close()
             if process.poll() is None:

@@ -827,6 +827,7 @@ def _validate_review_response(
     current_round_items: Sequence[UnresolvedReviewItem] = (),
     architecture_status_mode: str,
     approved_matrix_row_ids: Sequence[str] | None = None,
+    include_visual: bool = False,
     optional_item_ids: Sequence[str] = (),
 ) -> ParsedReview:
     """Validate a PR review against the carried ledger.
@@ -835,6 +836,9 @@ def _validate_review_response(
     future follow-ups in compact context, #1389): a disposition for them is
     accepted but not required.
     """
+    if not include_visual:
+        from .review_images import ordinary_items
+        unresolved_items = ordinary_items(unresolved_items)
     parsed = parse_pr_review(
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
     )
@@ -1416,7 +1420,10 @@ def _apply_unresolved_item_dispositions(
             item,
             dispositions,
             same_status=same_status,
-            reconciliation_mode=reconciliation_mode,
+            # A single visual seat may clear only its own share, regardless
+            # of the ordinary code-review policy, in live and replay paths.
+            reconciliation_mode=("owner-scoped" if item.origin_scope == "visible-defects"
+                                 else reconciliation_mode),
             round_number=round_number,
             cleared_items_progress=cleared_items_progress,
             sub_item_degradations=sub_item_degradations,

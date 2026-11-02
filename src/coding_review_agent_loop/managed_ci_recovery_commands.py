@@ -9,6 +9,9 @@ from .config import AgentLoopConfig
 
 
 _RECOVERY_VALUE_OPTIONS = frozenset({
+    "--review-images-cmd", "--review-images-paths", "--review-images-seat",
+    "--review-images-runtime-grant", "--review-images-timeout", "--review-images-max-images",
+    "--review-images-max-bytes", "--review-images-max-pixels",
     "--repo", "--base", "--trusted-local-origin", "--trusted-origin-protocol", "--git-ssh-identity",
     "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
     "--architecture-path", "--architecture-detail-dir", "--architecture-exclude",

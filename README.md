@@ -2240,4 +2240,16 @@ Pinned image transport conformance is an internal, opt-in developer check for
 #1794. Ordinary CI replays its fixtures without installed agent CLIs. See
 [internal image reviewer transport](docs/local_agent_loop.md#internal-image-reviewer-transport-library-only)
 for the explicit pytest option, pinned executable prerequisites, loopback-only
-harness and library API. Public visual review options remain deferred to #1787.
+harness and transport API. The experimental visual options below connect it to
+issue and PR runs; rollout remains deferred.
+
+### Opt-in visual defect review (experimental)
+
+Issue and PR runs accept `--review-images-cmd COMMAND` with repeatable
+`--review-images-paths GLOB` and `--review-images-runtime-grant /absolute/path`.
+No path globs means no image activity. `--review-images-seat SEAT` selects one
+configured image-capable reviewer; omission requires an explicit primary.
+Unsupported executable/model/fallback combinations are refused without fallback.
+See [the CLI guide](docs/local_agent_loop.md#visual-defect-review) for grants,
+limits and failure semantics. This first slice of #1795 is **not ready for
+rollout until #1795 and #1796 finish**.
