@@ -3313,6 +3313,12 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
 from .code_approval import _latest_pr_approved_reviews_for_head
 
 
+def _scheduler_item_ledger_signature(items):
+    """Code scheduling ignores findings owned by verified visual turns."""
+    from .review_scope import is_visual_item
+    return _prior_item_ledger_signature(tuple(item for item in items if not is_visual_item(item)))
+
+
 def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple[tuple[object, ...], ...]:
     return tuple(
         (

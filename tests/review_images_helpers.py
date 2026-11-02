@@ -82,5 +82,5 @@ def append_visual_record(runner, *, head=None, round_number=1, state='approved',
         review_scope={'version':1, 'kind':'visible-defects','head':head,'seat':'Codex'},
         scheduler_contract=scheduler)
     runner.pr_payload.setdefault('comments', []).append({
-        'author': {'login':'coding-review-agent-loop'}, 'authorId':424242,
+        'author': {'login':'coding-review-agent-loop'}, '_rest_author_id':424242,
         'createdAt':'2026-10-01T12:00:00Z', 'body':_attach_round_metadata('Visual assessment.',metadata)})

@@ -31,7 +31,7 @@ from typing import Literal, NoReturn
 from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
-from .review_scope import is_complete_code_review
+from .review_scope import is_complete_code_review, is_visual_item, is_visual_review
 from .reviewer_seats import reviewer_seat_binding
 from .config import (
     AgentLoopConfig,
@@ -154,6 +154,7 @@ from .round_state import (
     _extract_round_metadata_records,
     _is_followup_dispatch_head,
     _prior_item_ledger_signature,
+    _scheduler_item_ledger_signature,
     _resume_plan_round,
     scope_approved_plan_matrix,
     recover_approved_plan_context,
@@ -1145,7 +1146,8 @@ def _scheduler_obligations(
     for item in items:
         if item.status not in active_statuses:
             continue
-        if _is_evidence_obligation(item):
+        if _is_evidence_obligation(item) or is_visual_item(item):
+            # Image-less code turns cannot settle visual obligations.
             # No coder round can resolve human-only evidence, and its
             # unscoped owner would otherwise make every later code transition
             # broad (#1068).  Evidence passes run the full board by design.
@@ -1298,7 +1300,7 @@ def _machine_obligation_checkpoint(
         plan_digest = plan_digest or previous_checkpoint.plan_digest
         requirements_digest = requirements_digest or previous_checkpoint.requirements_digest
         acquisition_digest = acquisition_digest or previous_checkpoint.acquisition_digest
-        scheduler_digest = scheduler_digest or _qualification_digest(_prior_item_ledger_signature(items))
+        scheduler_digest = scheduler_digest or _qualification_digest(_scheduler_item_ledger_signature(items))
     checkpoint = QualificationCheckpoint(
         obligation_kind=item.obligation_kind or "unknown",
         obligation_identity=item.obligation_identity or item.item_id,
@@ -1397,7 +1399,7 @@ def _qualification_checkpoint_review_identity_matches(
         return False
     current_approval_digest = _qualification_digest(tuple(sorted(observed_reviewers)))
     current_scheduler_digest = _qualification_digest(
-        _prior_item_ledger_signature(unresolved_items)
+        _scheduler_item_ledger_signature(unresolved_items)
     )
     return (
         checkpoint.approval_digest == current_approval_digest
@@ -4384,7 +4386,7 @@ def _authenticated_pr_comments_status(
     comments: Sequence[object] | None = None,
     resume: bool = False,
 ) -> tuple[tuple[object, ...], tuple[str, int] | None, bool]:
-    """PR comments with REST identities whenever evidence authority is present (#1325).
+    """PR comments with REST identities for evidence and visual finding authority.
 
     The one accessor every consumer of conversion or signed-evidence authority
     uses instead of the raw GraphQL projection.  When any record carries such
@@ -4409,7 +4411,8 @@ def _authenticated_pr_comments_status(
             raise
         return comments, None, False
     authority_indexes = [
-        record.index for record in records if record_carries_evidence_authority(record.metadata)
+        record.index for record in records
+        if record_carries_evidence_authority(record.metadata) or is_visual_review(record.metadata)
     ]
     if not authority_indexes:
         return comments, _cached_trusted_actor(runner), True
@@ -4429,11 +4432,11 @@ def _authenticated_pr_comments_status(
         return comments, None, False
     missing = [
         index for index in authority_indexes
-        if index < len(merged) and getattr(merged[index], "author_id", None) is None
+        if index >= len(merged) or getattr(merged[index], "author_id", None) is None
     ]
-    if missing and resume:
+    if (missing or actor is None) and resume:
         raise AgentLoopError(
-            "PR evidence-conversion records cannot be authenticated: the REST comment read did "
+            "PR evidence/visual records cannot be authenticated: the REST comment read did "
             f"not cover record(s) at comment index {', '.join(map(str, missing))}; rerun once "
             "the complete comment history is readable. No agent was run."
         )
@@ -4444,7 +4447,7 @@ def _authenticated_pr_comments_status(
             + ", ".join(map(str, missing))
             + " were not covered by the REST identity read and are not admitted",
         )
-    return merged, actor, not missing
+    return merged, actor, not missing and actor is not None
 
 
 def admitted_capture_history(runner, config, *, pr_number, comments):

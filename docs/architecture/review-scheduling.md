@@ -462,6 +462,11 @@ code turns cannot do so. Failed evidence permits ordinary work, then unresolved
 visual blockers with no disposition opportunity require a human decision before
 merge or another futile coder dispatch (including unchanged-head retries).
 
+Visual findings are excluded from code scheduler obligations and every scheduler
+ledger digest, including coder checkpoints and qualification comparisons. A fresh
+visual pass adding or settling a finding cannot invalidate a code checkpoint,
+select an image-less owner turn, or latch a full-board recovery.
+
 ## Decisions
 
 [Decision log](decisions/review-scheduling.md)

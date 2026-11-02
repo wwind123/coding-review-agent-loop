@@ -2025,6 +2025,7 @@ def pre_epoch_panel_items(
     opening is not eligible, so it still raises the pre-panel stop (D5a).
     """
     from .panel_evidence import _derive_plan_panel_evidence, _derive_pr_panel_evidence
+    from .review_scope import is_visual_item
 
     if derive_evidence is None:
         derive_evidence = (
@@ -2065,7 +2066,7 @@ def pre_epoch_panel_items(
         )
         for record in history:
             for item in record.metadata.new_items:
-                if item.item_id in seen:
+                if is_visual_item(item) or item.item_id in seen:
                     continue
                 seen.add(item.item_id)
                 if (
@@ -2094,10 +2095,12 @@ def carried_secondary_obligations(
     """Active pre-epoch items pending on secondaries that a qualified opening created (D5a)."""
     if epoch_round is None:
         return ()
+    from .review_scope import is_visual_item
     carried: list[str] = []
     for item in items:
         if (
-            item.status not in {"blocking", same_status}
+            is_visual_item(item)
+            or item.status not in {"blocking", same_status}
             or item.source_round >= epoch_round
             or item.item_id not in eligible
         ):

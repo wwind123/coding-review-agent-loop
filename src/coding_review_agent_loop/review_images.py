@@ -246,8 +246,21 @@ def visual_response_instructions(items):
             '<untrusted-assigned-visual-findings>\n' + ledger + '\n</untrusted-assigned-visual-findings>\n')
 
 
+def admitted_visual_history(runner, config, pr_number, comments):
+    """Hydrate authorship before any visual finding replay or ID allocation."""
+    from .pr_loop_support import _authenticated_pr_comments_status
+    from .round_state import _recovery_record_admitted, _extract_round_metadata_records
+    comments, actor, complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=True)
+    records = _extract_round_metadata_records(comments, flow="pr")
+    if not complete and any(is_visual_review(record.metadata) for record in records):
+        raise AgentLoopError("Visual finding history cannot be authenticated; retry with readable identity data.")
+    return tuple(record for record in records if not is_visual_review(record.metadata)
+                 or _recovery_record_admitted(record, comments, actor))
+
+
 def recover_visual_findings(records, *, reconciliation_mode):
-    """Replay only verified visual publications, independent of authority boundaries."""
+    """Replay only author-admitted verified visual publications, independent of authority boundaries."""
     from .unresolved_items import _apply_unresolved_item_dispositions
     ledger = []
     for record in records:

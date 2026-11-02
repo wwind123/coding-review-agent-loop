@@ -292,7 +292,7 @@ from .round_state import (
     _attach_round_metadata,
     _extract_round_metadata_records,
     _latest_pr_approved_reviews_for_head,
-    _prior_item_ledger_signature,
+    _prior_item_ledger_signature, _scheduler_item_ledger_signature,
     _resume_plan_round,
     make_approved_plan_context,
     scope_approved_plan_matrix,
@@ -713,7 +713,7 @@ def run_pr_loop(
     initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
-    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items
+    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
     from .workdirs import active_workdir
     visual_startup(config)
     visual_run = VisualRun()
@@ -3108,7 +3108,7 @@ def run_pr_loop(
 
         # Step-back entries recorded by the previous iteration's coder turn (#1251).
         pending_step_back_sweeps: dict = {}
-        visual_history = _extract_round_metadata_records(initial_pr_context.comments, flow="pr")
+        visual_history = admitted_visual_history(runner, config, pr_number, initial_pr_context.comments)
         visual_ledger = recover_visual_findings(visual_history, reconciliation_mode=pr_reconciliation_mode)
         unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
         if resumed_round is not None and tuple(unresolved_items) != resumed_round.prior_items:
@@ -4392,7 +4392,7 @@ def run_pr_loop(
                     ),
                 )
                 current_obligation_digest = hashlib.sha256(
-                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                 ).hexdigest()[:16]
                 # The coder checkpoint is the conservative recovery latch for
                 # every ledger, including reviewer-only ledgers. Qualification
@@ -4713,7 +4713,7 @@ def run_pr_loop(
                         scheduler_previous_sha=scheduler_previous_sha,
                         scheduler_current_sha=current_pr_subject,
                         scheduler_obligation_digest=hashlib.sha256(
-                            repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                            repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16],
                         scheduler_selected_reviewers=selected,
                         scheduler_paused_reviewers=paused,
@@ -4955,7 +4955,7 @@ def run_pr_loop(
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
                                 hashlib.sha256(
-                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                                 ).hexdigest()[:16]
                                 if selective_policy else None
                             ),
@@ -6085,7 +6085,7 @@ def run_pr_loop(
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
                                 hashlib.sha256(
-                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                    repr(_scheduler_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                                 ).hexdigest()[:16]
                                 if selective_policy else None
                             ),
@@ -6320,7 +6320,7 @@ def run_pr_loop(
                     plan_digest=checkpoint_expected_plan_digest,
                     requirements_digest=checkpoint_expected_requirements_digest,
                     acquisition_digest=checkpoint_expected_acquisition_digest,
-                    scheduler_digest=_qualification_digest(_prior_item_ledger_signature(unresolved_items)),
+                    scheduler_digest=_qualification_digest(_scheduler_item_ledger_signature(unresolved_items)),
                 )
                 _persist_qualification_checkpoint(
                     runner, config=config, pr_number=pr_number, round_number=round_number,
@@ -7093,7 +7093,7 @@ def run_pr_loop(
                         ),
                         acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                         scheduler_digest=_qualification_digest(
-                            _prior_item_ledger_signature(unresolved_items)
+                            _scheduler_item_ledger_signature(unresolved_items)
                         ),
                         qualification_attempt_id=(
                             f"github-checks:{pr_metadata.head_sha}"
@@ -7997,7 +7997,7 @@ def run_pr_loop(
                                     ),
                                     acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                                     scheduler_digest=_qualification_digest(
-                                        _prior_item_ledger_signature(unresolved_items)
+                                        _scheduler_item_ledger_signature(unresolved_items)
                                     ),
                                 )
                                 if qualification_checkpoint is not None:
@@ -9212,7 +9212,7 @@ def run_pr_loop(
                 ),
                 acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                 scheduler_digest=_qualification_digest(
-                    _prior_item_ledger_signature(unresolved_items)
+                    _scheduler_item_ledger_signature(unresolved_items)
                 ),
             )
             if observe_repair_result(
@@ -9565,7 +9565,7 @@ def run_pr_loop(
                     ),
                     acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
                     scheduler_digest=_qualification_digest(
-                        _prior_item_ledger_signature(unresolved_items)
+                        _scheduler_item_ledger_signature(unresolved_items)
                     ),
                 )
                 latest_coder_metadata = bound_pr_metadata(
@@ -9628,7 +9628,7 @@ def run_pr_loop(
                     ),
                     scheduler_obligation_digest=(
                         hashlib.sha256(
-                            repr(_prior_item_ledger_signature(unresolved_items)).encode("utf-8")
+                            repr(_scheduler_item_ledger_signature(unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16]
                         if selective_policy else None
                     ),
