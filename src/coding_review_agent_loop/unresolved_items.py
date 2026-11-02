@@ -1420,7 +1420,10 @@ def _apply_unresolved_item_dispositions(
             item,
             dispositions,
             same_status=same_status,
-            reconciliation_mode=reconciliation_mode,
+            # A single visual seat may clear only its own share, regardless
+            # of the ordinary code-review policy, in live and replay paths.
+            reconciliation_mode=("owner-scoped" if item.origin_scope == "visible-defects"
+                                 else reconciliation_mode),
             round_number=round_number,
             cleared_items_progress=cleared_items_progress,
             sub_item_degradations=sub_item_degradations,

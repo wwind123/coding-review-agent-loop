@@ -539,8 +539,9 @@ def test_carried_visual_owner_disposition_opportunity_controls_human_stop(
 @pytest.mark.parametrize('parallel', [False, True])
 @pytest.mark.parametrize('status', ['blocking', 'same-pr'])
 @pytest.mark.parametrize('disposition', ['resolved', 'future', 'keep-open'])
+@pytest.mark.parametrize('policy', ['all-reviewers', 'selective-intermediate'])
 def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
-        visual_setup, monkeypatch, parallel, status, disposition):
+        visual_setup, monkeypatch, parallel, status, disposition, policy):
     from coding_review_agent_loop import pr_loop
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
     from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
@@ -552,7 +553,7 @@ def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
         directory.mkdir()
         seats.append(SeatAgent(ReviewerSeat(name, 'codex', ('gpt-6.1-sol',), 'medium'), directory))
     config = replace(config, reviewer=tuple(seats), reviewer_seats=tuple(seats),
-        review_images_seat='alpha', pr_review_policy='selective-intermediate',
+        review_images_seat='alpha', pr_review_policy=policy,
         primary_reviewer=None, review_parallel=parallel)
     kept = disposition == 'keep-open'
     texts = [structured_pr_review(state='blocking', **{
@@ -588,7 +589,7 @@ def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
     assert len(coder_calls) == 1
     coder_calls.clear()
     _m943_append(runner, format_reviewer_board_amendment_comment(flow='pr', issue=None, pr_number=77,
-        original_required_reviewers=('alpha', 'beta', 'gamma'), policy='selective-intermediate',
+        original_required_reviewers=('alpha', 'beta', 'gamma'), policy=policy,
         primary_reviewer=None, removed_reviewers=('alpha',), effective_from_round=1,
         reason='seat-unavailable', rationale='Alpha is unavailable.'))
     runner.simulate_new_process()
@@ -611,6 +612,24 @@ def test_amended_multi_owner_visual_stop_requires_pending_selected_owner(
     retained, = [item for item in reconciled[-1] if item.item_id == 'item-1']
     assert retained.item_id == 'item-1' and retained.status == status
     assert dict(retained.owner_states) == {'beta': 'pending' if kept else 'cleared', 'gamma': 'pending'}
+    assert len([c for c in calls if c[0] == 'capture']) == 2
+    assert len([c for c in calls if c[0] == 'images']) == 2
+    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+    # Replay must preserve the identical owner shares even when the caller
+    # uses aggregate code reconciliation. A restart without fresh images must
+    # stop before coder dispatch or merge, retaining gamma's pending share.
+    for mode in ('aggregate', 'owner-scoped'):
+        replayed, = visual.recover_visual_findings(records(runner), reconciliation_mode=mode)
+        assert replayed.status == status
+        assert replayed.resolution_owners == ('beta', 'gamma')
+        assert replayed.owner_states == retained.owner_states
+    runner.simulate_new_process()
+    coder_calls.clear()
+    with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
+        run_pr_loop(runner, pr_number=77, config=replace(config, review_images_paths=()))
+    restarted, = [item for item in reconciled[-1] if item.item_id == 'item-1']
+    assert restarted.status == status and restarted.owner_states == retained.owner_states
+    assert not coder_calls
     assert len([c for c in calls if c[0] == 'capture']) == 2
     assert len([c for c in calls if c[0] == 'images']) == 2
     assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)

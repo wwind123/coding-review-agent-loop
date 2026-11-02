@@ -10,6 +10,10 @@ Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed
 items; it does not silently redefine a finding or resolve another participant's
 obligation. Human requirements and approved plans are separate from that ledger.
+Visual findings always use owner-scoped reconciliation, including sub-items and
+restart replay, independently of the ordinary code-review policy. A verified
+visual seat's resolved or future disposition clears only its own share; the
+finding stays active while another resolution owner is pending.
 Original requirements, valid later human instructions, and safety constraints
 outrank the plan; plan conflicts must be surfaced explicitly.
 
