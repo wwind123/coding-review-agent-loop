@@ -10509,7 +10509,7 @@ is supported. Uncertain completion remains unsuccessful. Text-only calls retain
 their existing warning and recovery behavior. No screenshot clearance, code
 approval or scheduler authority is introduced by the transport itself. The
 visual lifecycle below handles scoped findings and durable per-head dispatch;
-screenshot-evidence coverage and rollout remain deferred under #1795 and #1796.
+requester-owned screenshot coverage is described below; operator rollout remains deferred under #1796.
 
 Pinned-release conformance is opt-in: set `IMAGE_CONTRACT_CODEX` and
 `IMAGE_CONTRACT_CLAUDE` to the pinned executables, then run
@@ -10597,5 +10597,93 @@ allowing normal admission of a new unspent head. Shared transport decode failure
 and missing sidecars retain their existing run-wide stop in every mode.
 Disabled, dry-run and nonmatching heads gain no new lifecycle corruption stop;
 freeze and qualification recovery never open execution merely because images
-were enabled on rerun. Requester coverage and separate usage reporting belong to #1795;
-browser scripts, costs and rollout belong to #1796.
+were enabled on rerun. Requester coverage and separate usage reporting extend this lifecycle below;
+browser scripts, live cost measurement and rollout belong to #1796.
+
+
+### Requester-owned screenshot coverage
+
+The existing image options and defaults above are unchanged. No globs means the
+feature remains disabled, including typed screenshot authority. With image review
+enabled, ordinary full and compact reviewers may emit `screenshot_requests`:
+
+```json
+[{"request_id":"mobile-home","kind":"screenshot","description":"Show the mobile home view"}]
+```
+
+Each list has at most 16 entries. Request IDs are at most 128 characters and
+descriptions at most 4096 bytes. Identity binds repository, PR, originating seat
+and request ID; model, effort and board contracts are provenance rather than
+identity. Reusing an ID with a changed description is refused. A different view
+needs a new ID. Duplicate typed, legacy and finding concerns are refused. Legacy
+`exact_head_evidence_requests` strings remain human-only and are never converted.
+Matrix evidence-only turns and the visible-defects assessment cannot create typed
+requests or acceptances.
+
+An authenticated successful assessment (including one reporting visible defects)
+can establish coverage for unrelated requested views. This never clears its
+visible findings. A compatible digest skip needs a fresh head-bound coverage
+attachment; it never inherits screenshot clearance. Reports lacking an attachment,
+verified delivery, validated lineage or available private artifacts cannot clear
+screenshots. The prompt exposes escaped assessment/head/snapshot bindings, image
+IDs and viewport/locale/state metadata, with a fixed 48 KiB aggregate ceiling.
+It exposes neither host paths nor image payloads. Overflow refuses context rather
+than truncating authority bindings.
+
+An ordinary requesting reviewer can explicitly accept a view using
+`screenshot_coverage_acceptances`:
+
+```json
+[{"request_id":"mobile-home","assessment_id":"<report assessment ID>","head_sha":"<exact head>","snapshot_digest":"<report snapshot digest>","image_ids":["mobile-home"]}]
+```
+
+Bindings must equal the available current-head report, and image IDs must be a
+nonempty unique subset of that manifest. A clean image verdict, free text or the
+absence of findings is never requester acceptance. Missing views and requests
+requiring direct inspection remain pending. Ordinary acceptance uses ordinary
+review usage accounting.
+
+At the existing evidence gates, after machine checks and any required response
+to new signed input, the loop can batch pending requests into a dedicated
+text-only requester turn. Paused requesters and carried code approvers can
+participate without a code review or panel opening. If a requester left the board,
+every current-board reviewer must vote. An unavailable voter keeps coverage open.
+Each seat has one dedicated attempt per repository/PR/head, and each request/voter
+assignment is spent at reservation. Contract changes, late requests, timeouts,
+invalid output, uncertain completion and restart cannot reset that budget. Late
+requests need an already-required ordinary requester review, human evidence or a
+new head. The dedicated acquisition timeout is 300 seconds. Decisions require the original
+per-acquisition response artifact; stdout diagnostics cannot supply them. No retries, fallback,
+completion recovery or second image assessment are introduced.
+
+The loop writes and reads back coverage intent before acquisition, and outcome
+and resolution receipts afterward. Full satisfaction writes a verified coverage
+release, retaining signed baselines and budgets, then resumes actual same-head
+CI/qualification/finalization with valid code reviews. Partial coverage and mixed
+human obligations retain the freeze. Failing machine gates precede new coverage
+spend. Coverage supplies no code, panel, sweep, managed-CI, merge, signed-human or
+risk-matrix authority.
+
+A private host-local coverage-evidence cache under the tool scratch root retains
+bounded sealed screenshot/baseline bytes after disposable capture cleanup. Cache
+names are generated; writes are exclusive and no-follow; permissions are private;
+reads accept bounded regular files and recompute digests. An inventory is published
+only after all artifacts exist. Authenticated GitHub attachments are authority;
+private files alone are not. Missing or corrupt artifacts reopen coverage without
+repeating image or dedicated acquisitions. Retain the cache when resuming on the
+same host. No automatic garbage collection is performed. Cross-host execution
+retains the existing single-writer constraint and cannot assume local availability.
+Publication uncertainty permits original-outcome publication recovery only.
+Repair preserves the presence and complete decoded values of both typed fields,
+including list order, and cannot invent acceptance. Dedicated output is a strict
+versioned decision set with no code verdicts, findings or requests.
+
+Usage summaries have a separate visual line and JSON groups for image assessment
+and text-only requester coverage. Actual acquisitions account once at validation,
+including proof/validation failures and interrupted calls. Bounded provider usage
+is preferred; otherwise text estimates are labeled and omit unknown image payload
+cost. Unreported interrupted usage stays unknown. Spawn failures invent no tokens.
+Preflight, capture, digest skips and publication-only replay create no provider
+charge. Accounting never establishes delivery or screenshot acceptance. External
+capture scripts, live cost measurement and automatic target rollout remain outside
+this stage.

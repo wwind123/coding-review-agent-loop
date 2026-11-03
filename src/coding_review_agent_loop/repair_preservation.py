@@ -32,7 +32,7 @@ from .protocol_markers import (
 _KINDS = {
     "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "plan_state",
     "coder_followup", "issue_implementation",
-    "task_result",
+    "task_result", "screenshot-coverage",
 }
 
 _FENCED_JSON_PREFIX_RE = re.compile(
@@ -1133,6 +1133,10 @@ def validate_repair_preservation(
     Do not heuristically parse broken JSON or interpret prose as item ledgers.
     """
     source, target = _payload(raw), _payload(repaired)
+    from .review_images_coverage import preserve_fields
+    if source is None and any(field in raw for field in ("screenshot_requests", "screenshot_coverage_acceptances", "screenshot-coverage")):
+        raise AgentLoopError("Screenshot authority source cannot be extracted for repair")
+    preserve_fields(source, target)
     if forbid_architecture_impact:
         require_repair_architecture_impact_absent(repaired)
     # Reviewer grounding is triggered by the repaired TARGET kind, so it also

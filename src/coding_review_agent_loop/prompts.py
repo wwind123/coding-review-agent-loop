@@ -4632,7 +4632,9 @@ def build_review_prompt(
     superseded_prepanel_review_context: SupersededPrepanelReview | None = None,
     sweep_context: str = "",
     evidence_scope: Mapping[str, object] | None = None,
+    screenshot_context: str = "",
 ) -> str:
+    coder_followup_context += screenshot_context
     from .capture_acceptance import evidence_prompt
     if evidence_scope is not None:
         sweep_context = ""

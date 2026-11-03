@@ -887,11 +887,15 @@ exits and normalization. Repair has no image/proof authority. Re-asks, completio
 resume, fallback and replay are disabled. Prompt manifest, inventory, mappings
 and diff remain escaped untrusted data; requester coverage is excluded.
 
-Visual dispatch rechecks seat and head with a 300-second acquisition timeout.
-Verified intent precedes launch; spent heads never retry. New heads are captured
-freshly. Reuse compares independent settings/content identities and reviewer
-contracts. See [durable recovery](round-state-and-resume.md#durable-visible-defects-lifecycle).
-Screenshot clearance and rollout remain deferred under #1795 and #1796.
+For image admission, see [durable recovery](round-state-and-resume.md#durable-visible-defects-lifecycle).
+Rollout: #1796.
+
+## Requester coverage execution
+
+Private coverage artifacts use bounded regular-file reads, exclusive no-follow
+writes and recomputed digests. Loss keeps coverage pending. Text-only requester
+turns have a separate 300-second, once-per-seat/head budget and usage accounting.
+See [coverage contracts](round-state-and-resume.md#screenshot-coverage-state).
 
 ## Decisions
 

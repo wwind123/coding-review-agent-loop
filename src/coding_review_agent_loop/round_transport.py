@@ -60,6 +60,7 @@ _SPILL_FIELDS = (
     "assembled_plan_sidecar",
     "raw_patch_provenance",
     "canonical_reviewer_response",
+    "screenshot_coverage",
     "raw_structured_coder_response",
     "canonical_plan",
     "round_synthesis",

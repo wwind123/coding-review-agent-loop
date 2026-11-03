@@ -476,6 +476,23 @@ interruption cleanup still runs. The branch tip
 never replaces the PR-record head as authority for review, CI or merge. Reads
 cannot be atomic with later pushes; existing exact-head gates remain necessary.
 
+## Requester-owned screenshot obligations
+
+Typed screenshot requests are separate machine evidence obligations with stable
+requester-bound identities; legacy strings remain human-only. Typed-only complete
+reviews normalize to code-approved/evidence-pending and never create a summary
+code blocker or coder call. An authenticated current-head report, even one with
+unresolved visible defects, may establish unrelated requested views only with
+explicit bound requester acceptance. Other seats cannot accept the request;
+removed requesters require all current-board votes. Partial/mixed obligations
+stay pending. Full satisfaction publishes a verified screenshot coverage release
+and returns to real same-head qualification; machine and signed-input gates retain
+precedence. Visual findings survive independent of coverage artifact availability.
+Both ordinary typed fields preserve presence and complete decoded values through
+repair, including malformed/extra content and order. Dedicated coverage is a
+strict versioned decision set and cannot become a code review. Reports and receipts
+supply no signed-human or risk-matrix conversion authority.
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

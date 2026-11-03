@@ -201,6 +201,12 @@ def attempt_risk_test_matrix_string_list_normalization(
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
+    if expected_kind == 'screenshot-coverage':
+        from .repair_preservation import recover_payload
+        value = recover_payload(raw)
+        if value is None or value.get('kind') != expected_kind:
+            return None
+        return json.dumps(value)
     if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
         return None
 

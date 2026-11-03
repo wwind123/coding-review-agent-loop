@@ -533,6 +533,25 @@ independent code/CI qualification. Fresh qualification snapshots apply the same
 read-only validation to the live head. Head movement refreshes admission without
 reopening the old head's budget. None of this adds a screenshot-evidence gate.
 
+## Screenshot coverage state
+
+`review_images_coverage_history.py` adds optional independently versioned
+attachments, assignments, outcomes and exact-head resolution receipts to round
+metadata without changing `visual_lifecycle` or its reducer. Complete authenticated
+history supplies budgets, provenance and reserved IDs; coverage auxiliary records
+are inert for ordinary round/freeze/release/conversion selection. Older visual
+records preserve their lifecycle and findings without acquiring coverage authority.
+Current-head report projection requires authenticated terminal lineage, verified
+delivery and recomputed private artifact availability. Skips receive a fresh
+head-bound attachment through the existing original-assessment lineage.
+Requester identity binds repository/PR/originating seat/request ID independently
+of contracts. Original source/contract provenance survives re-emission; immutable
+requests and separate head-bound receipts prevent same-head reopening or ID reuse.
+New heads require fresh acceptance. Artifact loss invalidates coverage independently
+of durable visual findings and consumed budgets. Coverage publication recovery
+never authorizes another provider call. A verified screenshot coverage release
+preserves signed baselines and receipt references before same-head validation.
+
 ## Decisions
 
 [Decision log](decisions/round-state-and-resume.md)

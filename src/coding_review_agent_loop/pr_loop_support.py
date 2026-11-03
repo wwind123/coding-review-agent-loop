@@ -1954,6 +1954,7 @@ def _render_evidence_freeze_notice(
 
 
 _EVIDENCE_RELEASE_MESSAGES = {
+    "screenshot-coverage": "the requesting reviewers explicitly accepted current-head screenshot coverage. The PR proceeds to final validation at the same head.",
     "machine-gate": (
         "a machine gate failed at the frozen head ({detail}). The requested evidence returns "
         "to deferred; the failure is repaired first and the evidence is requested again at "
@@ -2054,6 +2055,7 @@ def _publish_evidence_release(
     watch_head_extension_used: bool,
     clearances: Sequence[tuple[str, str]] = (),
     detail: str = "",
+    screenshot_receipt_refs: tuple[int, ...] = (),
     signed_evidence_references: Sequence[SignedEvidenceReference] = (),
 ) -> list[UnresolvedReviewItem]:
     """Post the single terminal release comment carrying the released ledger.
@@ -2062,13 +2064,23 @@ def _publish_evidence_release(
     record, so neither a partial clearance nor a release for findings loses
     a reference minted in this pass.
     """
+    from .review_images_coverage_run import terminal_fields
+    reason, screenshot_receipt_refs = terminal_fields(runner, config=config, pr=pr_number, head=head_sha,
+        items=items, reason=reason, refs=screenshot_receipt_refs)
     released = release_evidence_freeze(items)
     message = _EVIDENCE_RELEASE_MESSAGES[reason].format(detail=detail or "see the checks comment")
     heading = {
         "evidence-cleared": "## Exact-head evidence accepted",
         "refresh-clean": "## Same-head refresh complete",
     }.get(reason, "## Exact-head evidence freeze released")
-    post_pr_comment(
+    publisher = post_pr_comment
+    if reason == 'screenshot-coverage':
+        from functools import partial
+        from .github import resolve_authenticated_github_actor, post_verified_trusted_pr_round_comment
+        actor = resolve_authenticated_github_actor(runner, config=config)
+        publisher = partial(post_verified_trusted_pr_round_comment,
+            expected_author_login=actor[0], expected_author_id=actor[1])
+    publisher(
         runner,
         config=config,
         pr_number=pr_number,
@@ -2096,6 +2108,7 @@ def _publish_evidence_release(
                     watch_head_extension_used=watch_head_extension_used,
                 ),
                 evidence_clearances=tuple(clearances),
+                screenshot_receipt_refs=screenshot_receipt_refs,
                 signed_evidence_references=_cumulative_references(signed_evidence_references),
                 **_architecture_metadata_fields(config),
             ),
@@ -2190,8 +2203,16 @@ def _evidence_freeze_gate(
             in_process_references=signed_evidence_references,
             in_process_audits=in_process_audits,
         )
+    from .review_images_coverage_run import final_gate
+    transition = final_gate(runner, config=config, pr=pr_number, head=head_sha, items=items,
+        round_number=round_number, live_ids=live_ids, allowed_rounds=allowed_rounds,
+        failure_extension=watch_failure_extension_used, head_extension=watch_head_extension_used,
+        clearances=clearances, references=signed_evidence_references, collect_requirement_ids=collect_requirement_ids)
+    fresh = transition.context or fresh
+    if transition.action in {'head_changed', 'refresh'}:
+        return _EvidenceGateOutcome(transition.action, fresh)
     if not _pending_evidence_obligations(items):
-        return _EvidenceGateOutcome("proceed", fresh)
+        return _EvidenceGateOutcome("coverage_satisfied" if transition.action == "coverage_satisfied" else "proceed", fresh)
     still_frozen = bool(_frozen_evidence_obligations(items))
     frozen = _publish_evidence_freeze(
         runner,
@@ -2215,7 +2236,7 @@ def _evidence_freeze_gate(
 
 def _evidence_gate_needed(items: Sequence[UnresolvedReviewItem]) -> bool:
     """Pending evidence, or a converted row whose tombstone must be rebound (#1325)."""
-    return bool(_pending_evidence_obligations(items)) or any(
+    return any(item.screenshot_request for item in items) or bool(_pending_evidence_obligations(items)) or any(
         _is_row_converted_obligation(item) for item in items
     )
 
@@ -2257,7 +2278,7 @@ def _is_evidence_only_blocking_review(
     ]
     if any(disposition.item_id not in evidence_ids for disposition in active):
         return False
-    return bool(active) or bool(parsed.exact_head_evidence_requests)
+    return bool(active) or bool(parsed.exact_head_evidence_requests or parsed.screenshot_requests)
 
 
 def _evidence_review_context(
