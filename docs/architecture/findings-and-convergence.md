@@ -503,6 +503,10 @@ does not disable restoration or final-gate evidence revalidation: unavailable
 machine artifacts reopen typed obligations, while exact-head human clearances
 remain valid. Converted-row reconciliation preserves the shared caller ledger
 so coverage resolution reaches same-invocation finalization.
+Frozen recovery is selected from the authenticated boundary even when restored
+receipts have already cleared its ledger. Until the terminal release is durable,
+the same-head handoff retains completed code reviews and passes the existing
+machine and signed-input gates before publication-only recovery.
 
 ## Decisions
 

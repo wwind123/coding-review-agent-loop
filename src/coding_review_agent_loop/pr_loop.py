@@ -3536,8 +3536,8 @@ def run_pr_loop(
                 if (
                     live_evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
                     and freeze_payload is not None
-                    and _frozen_evidence_obligations(unresolved_items)
                 ):
+                    # The freeze owns recovery even after receipts clear its ledger.
                     # Frozen rerun: one check snapshot and one mergeability
                     # observation (the round-start probe above) at H, with no
                     # CI wait and no qualification dispatch.

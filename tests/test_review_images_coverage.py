@@ -272,7 +272,9 @@ def test_auxiliary_metadata_has_no_round_or_code_authority(tmp_path, attachment)
         assert authority_records([PostedRoundRecord(0, decoded, '')]) == ()
 
 
-def test_frozen_resume_releases_only_after_machine_gates_without_code_or_image_replay(visual_setup, monkeypatch):
+@pytest.mark.parametrize('point,enabled', [('none', True), ('before-receipt', True),
+    *[(point, enabled) for point in ('after-receipt', 'before-release', 'after-release') for enabled in (False, True)]])
+def test_frozen_resume_releases_only_after_machine_gates_without_code_or_image_replay(visual_setup, monkeypatch, point, enabled):
     from coding_review_agent_loop.pr_loop import run_pr_loop
     config, images, _ = visual_setup
     calls = responder(monkeypatch)
@@ -283,12 +285,46 @@ def test_frozen_resume_releases_only_after_machine_gates_without_code_or_image_r
         run_pr_loop(runner, pr_number=77, config=config)
     assert not calls
     monkeypatch.setattr(service, 'report', original)
+    original_publish, original_release = service.publish, service.release
+    def interrupted_publish(*args, **kwargs):
+        if args[5] == 'receipt' and point == 'before-receipt':
+            raise KeyboardInterrupt()
+        result = original_publish(*args, **kwargs)
+        if args[5] == 'receipt' and point == 'after-receipt':
+            raise KeyboardInterrupt()
+        return result
+    def interrupted_release(*args, **kwargs):
+        if point == 'before-release':
+            raise KeyboardInterrupt()
+        result = original_release(*args, **kwargs)
+        if point == 'after-release':
+            raise KeyboardInterrupt()
+        return result
+    monkeypatch.setattr(service, 'publish', interrupted_publish)
+    monkeypatch.setattr(service, 'release', interrupted_release)
+    def no_ordinary_call(*args, **kwargs):
+        pytest.fail('Frozen publication recovery must preserve completed code reviews')
+    monkeypatch.setattr('coding_review_agent_loop.pr_loop._run_validated_agent', no_ordinary_call)
     runner.simulate_new_process()
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    if point != 'none':
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+        published = records(runner)
+        assert any(r.metadata.screenshot_coverage and r.metadata.screenshot_coverage['kind'] == 'receipt'
+                   for r in published) == (point != 'before-receipt')
+        assert any(r.metadata.evidence_release for r in published) == (point == 'after-release')
+        monkeypatch.setattr(service, 'publish', original_publish)
+        monkeypatch.setattr(service, 'release', original_release)
+        runner.simulate_new_process()
+    resumed = replace(config, review_images_paths=config.review_images_paths if enabled else ())
+    assert run_pr_loop(runner, pr_number=77, config=resumed) == 0
     assert len(calls) == 1 and len([c for c in images if c[0] == 'images']) == 1
     terminal = [r for r in records(runner) if r.metadata.evidence_freeze or r.metadata.evidence_release]
     assert [r.metadata.phase for r in terminal] == ['evidence-freeze', 'evidence-release']
     assert terminal[-1].metadata.screenshot_receipt_refs
+    assert terminal[-1].metadata.subject == runner.git_head
+    assert terminal[-1].metadata.evidence_release.reason == coverage.KIND
+    assert all(i.status == 'resolved' for i in terminal[-1].metadata.prior_items if i.screenshot_request)
     assert len({(r.metadata.round_number, r.metadata.subject) for r in terminal}) == len(terminal)
 
 
@@ -458,7 +494,22 @@ def test_production_prompt_drives_ordinary_requester_acceptance_without_dedicate
     assert restored[0].item_id == 'item-1' and restored[0].status == 'blocking' and number == 2
 
 
-def test_signed_input_response_precedes_new_frozen_coverage(visual_setup, monkeypatch):
+def stop_after_frozen_receipt(runner, config, monkeypatch):
+    from coding_review_agent_loop.pr_loop import run_pr_loop
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+    with monkeypatch.context() as patch:
+        patch.setattr(service, 'release', interrupt)
+        runner.simulate_new_process()
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert any(r.metadata.screenshot_coverage and r.metadata.screenshot_coverage['kind'] == 'receipt'
+               for r in records(runner))
+    assert not any(r.metadata.evidence_release for r in records(runner))
+
+
+@pytest.mark.parametrize('durable_receipt', [False, True])
+def test_signed_input_response_precedes_new_frozen_coverage(visual_setup, monkeypatch, durable_receipt):
     from coding_review_agent_loop.pr_loop import run_pr_loop
     from pr_loop_test_helpers import _signed
     config, images, _ = visual_setup
@@ -468,25 +519,30 @@ def test_signed_input_response_precedes_new_frozen_coverage(visual_setup, monkey
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     monkeypatch.setattr(service, 'report', original_report)
+    calls = responder(monkeypatch)
+    if durable_receipt:
+        stop_after_frozen_receipt(runner, config, monkeypatch)
     runner.pr_payload['comments'].append(_signed('Keep the existing options unchanged.', 555))
     raw = typed_review()
     payload, end = json.JSONDecoder().raw_decode(raw)
     payload['prior_item_dispositions'] = [dict(item_id='item-1', disposition='blocking', note='The requested view is still needed.')]
     raw = json.dumps(payload) + '\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->' + raw[end:]
     runner.codex_outputs.append(raw)
-    calls = responder(monkeypatch)
     runner.simulate_new_process()
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     posted = records(runner)
     response = next(r for r in posted if r.metadata.phase == 'evidence-response')
     intent = next(r for r in posted if r.metadata.phase == 'screenshot-coverage-intent')
-    assert response.index < intent.index and len(calls) == 1
+    assert (response.index > intent.index) == durable_receipt
+    assert len(calls) == 1
     terminal = [r for r in posted if r.metadata.evidence_release][-1]
+    assert response.index < terminal.index
     assert set(response.metadata.surfaced_reviewer_requirement_ids) <= set(terminal.metadata.evidence_release.signed_requirement_ids_surfaced)
 
 
 @pytest.mark.parametrize('machine', ['checks', 'conflict'])
-def test_frozen_machine_failure_prevents_coverage_spend(visual_setup, monkeypatch, machine):
+@pytest.mark.parametrize('durable_receipt', [False, True])
+def test_frozen_machine_failure_prevents_coverage_spend(visual_setup, monkeypatch, machine, durable_receipt):
     from coding_review_agent_loop import pr_loop
     config, images, _ = visual_setup
     original = service.report
@@ -495,12 +551,14 @@ def test_frozen_machine_failure_prevents_coverage_spend(visual_setup, monkeypatc
     with pytest.raises(HumanDecisionRequiredError):
         pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     monkeypatch.setattr(service, 'report', original)
+    calls = responder(monkeypatch)
+    if durable_receipt:
+        stop_after_frozen_receipt(runner, config, monkeypatch)
     if machine == 'checks':
         runner.pr_check_runs_payload = {'check_runs': [{'name':'test', 'status':'completed', 'conclusion':'failure'}]}
     else:
         runner.mergeability_payloads = [dict(mergeable='CONFLICTING', mergeStateStatus='DIRTY',
             headRefOid=runner.git_head, baseRefName='main')]
-    calls = responder(monkeypatch)
     def stop_coder(*args, **kwargs):
         assert kwargs.get('role') == 'coder'
         raise KeyboardInterrupt()
@@ -508,9 +566,10 @@ def test_frozen_machine_failure_prevents_coverage_spend(visual_setup, monkeypatc
     runner.simulate_new_process()
     with pytest.raises(KeyboardInterrupt):
         pr_loop.run_pr_loop(runner, pr_number=77, config=config)
-    assert not calls
-    assert not any(r.metadata.phase == 'screenshot-coverage-intent' for r in records(runner))
+    assert len(calls) == int(durable_receipt)
+    assert sum(r.metadata.phase == 'screenshot-coverage-intent' for r in records(runner)) == int(durable_receipt)
     assert any(r.metadata.evidence_release and r.metadata.evidence_release.reason == 'machine-gate' for r in records(runner))
+    assert not any(r.metadata.evidence_release and r.metadata.evidence_release.reason == coverage.KIND for r in records(runner))
 
 
 def test_unicode_request_and_manifest_ids_keep_character_limits():
