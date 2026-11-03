@@ -2186,8 +2186,8 @@ def _coder_followup_required_items_instruction(
         raise ValueError("unresolved_item_ids may only be used for coder_followup repair")
     required = tuple(unresolved_item_ids)
     required_set = set(required)
-    # Retained future follow-ups (#1389) are valid but never mandatory, so the
-    # repair model must not strip them (#1388).
+    # The caller filters ledger-proven exclusions from this optional allowance.
+    # Generic optional claims without exclusion proof remain valid (#1388).
     optional = tuple(item_id for item_id in optional_item_ids if item_id not in required_set)
     rendered_ids = "\n".join(f"- `{item_id}`" for item_id in required)
     if not required and not optional:
@@ -2211,7 +2211,7 @@ def _coder_followup_required_items_instruction(
         rendered_optional = "\n".join(f"- `{item_id}`" for item_id in optional)
         instruction += (
             "## Optional coder follow-up item IDs:\n"
-            "These retained future follow-up IDs are valid but not mandatory. Keep a source "
+            "These optional follow-up IDs are valid but not mandatory. Keep a source "
             "classification of one of them, with its note, in at most one array; never add one "
             "that the source did not list:\n"
             f"{rendered_optional}\n"

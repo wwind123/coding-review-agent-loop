@@ -438,6 +438,14 @@ def test_1388_carried_or_future_item_is_never_dropped_by_the_resolved_rule():
     )
     assert optional.addressed_items == ("item-2",)
     assert optional.dropped_resolved_addressed_items == ()
+    excluded = _validate_structured_coder_followup_items(
+        _followup_1388(addressed_items=["item-2"]),
+        unresolved_items=(_item_1388("item-2", "future"),),
+        optional_item_ids=("item-2",), resolved_item_ids=("item-2",),
+    )
+    assert excluded.addressed_items == ()
+    assert excluded.dropped_resolved_addressed_items == ()
+    assert excluded.dropped_excluded_items == ("item-2",)
 
 
 def test_1388_resolved_proof_excludes_re_carried_and_machine_items():
@@ -486,3 +494,61 @@ def test_carried_item_review_rebuild_keeps_every_parsed_field(kind):
     assert with_items.architecture_impact.status == "changed"
     assert [r.outcome for r in with_items.architecture_impact_degradations] == ["normalized-to-changed"]
     assert [d.item_id for d in with_items.dispositions] == ["item-1"]
+
+
+def _excluded_1868(kind):
+    if kind in {"evidence", "tombstone"}:
+        ledger, _ = _evidence([], number=2)
+        item = ledger[0]
+        if kind == "tombstone":
+            from coding_review_agent_loop.unresolved_items import converted_evidence_obligation_identity
+            item = dataclasses.replace(item, converted_row_id="row-1", converted_matrix_identity="a" * 64,
+                                       obligation_identity=converted_evidence_obligation_identity("row-1", "a" * 64), lifecycle="cleared")
+        return item
+    if kind == "future":
+        return _item_1388("item-2", "future")
+    return dataclasses.replace(_item_1388("item-2"), status="converted", evidence_row_ids=("row-1",), converted_row_ids=("row-1",))
+
+
+@pytest.mark.parametrize("kind", ["evidence", "future", "converted", "tombstone"])
+@pytest.mark.parametrize("field", ["addressed_items", "remaining_items"])
+def test_excluded_1868_normalization_preserves_ledger_and_test_reports(kind, field):
+    from coding_review_agent_loop.round_state import _serialize_unresolved_item, _deserialize_unresolved_item
+    item = _excluded_1868(kind)
+    notes = field.replace("items", "item_notes")
+    parsed = _followup_1388(addressed_items=["item-1"])
+    from coding_review_agent_loop.protocol import TestObservationCitation
+    parsed = dataclasses.replace(
+        parsed, test_observations=(TestObservationCitation("pytest", "receipt", "current-result"),), **{field: (*getattr(parsed, field), "item-2"), notes: {"item-2": "Deferred."}},
+        addressed_sub_items=("item-2.sub-1",), tests_run=("python -m pytest tests/test_example.py",),
+    )
+    normalized = _validate_structured_coder_followup_items(
+        parsed, unresolved_items=(_item_1388("item-1"), item),
+        optional_item_ids=("item-2",), resolved_item_ids=("item-2",),
+    )
+    assert normalized.addressed_items == ("item-1",)
+    assert normalized.remaining_items == ()
+    assert getattr(normalized, notes) == {}
+    assert normalized.addressed_sub_items == ()
+    assert normalized.dropped_excluded_items == ("item-2",)
+    assert normalized.dropped_resolved_addressed_items == ()
+    assert normalized.tests_run == parsed.tests_run
+    assert normalized.test_observations == parsed.test_observations
+    assert _deserialize_unresolved_item(_serialize_unresolved_item(item)) == item
+
+
+@pytest.mark.parametrize("kind", ["evidence", "future", "converted", "tombstone"])
+def test_excluded_1868_dispute_is_invalid_even_with_optional_overlap(kind):
+    parsed = _followup_1388(disputed_items=["item-2"], dispute_evidence={"item-2": "Counterclaim."})
+    with pytest.raises(AgentLoopError, match="unknown.*item-2"):
+        _validate_structured_coder_followup_items(
+            parsed, unresolved_items=(_excluded_1868(kind),), optional_item_ids=("item-2",),
+        )
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "missing", "unknown"])
+def test_excluded_1868_keeps_strict_partition(defect):
+    claims = {"duplicate": ("item-2", "item-2"), "missing": ("item-2",), "unknown": ("item-1", "invented")}
+    parsed = dataclasses.replace(_followup_1388(), addressed_items=claims[defect])
+    with pytest.raises(AgentLoopError, match={"duplicate": "more than once", "missing": "did not classify", "unknown": "unknown"}[defect]):
+        _validate_structured_coder_followup_items(parsed, unresolved_items=(_item_1388("item-1"), _excluded_1868("future")))

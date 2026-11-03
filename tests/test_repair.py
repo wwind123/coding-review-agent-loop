@@ -5639,3 +5639,14 @@ def test_test_observations_repair_flag_is_rejected_for_other_kinds_1626(kind):
         _build_repair_prompt_1626("{}", expected_kind=kind, test_observations_shape_defect=True)
     with pytest.raises(ValueError, match="test_turn_receipts"):
         _build_repair_prompt_1626("{}", expected_kind=kind, test_turn_receipts=())
+
+
+@pytest.mark.parametrize("required", [(), ("item-1",)])
+def test_excluded_future_1868_filtered_repair_allowance_instructs_removal(required):
+    prompt = _build_repair_prompt(
+        '{"disputed_items":["item-2"],"dispute_evidence":{"item-2":"Later work"}}',
+        expected_kind="coder_followup", unresolved_item_ids=required, optional_item_ids=(),
+    )
+    assert "Optional coder follow-up item IDs" not in prompt
+    assert "Remove" in prompt and "`dispute_evidence`" in prompt
+    assert "- `item-2`" not in prompt

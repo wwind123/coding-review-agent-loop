@@ -344,6 +344,7 @@ from .unresolved_items import (
     _reconcile_human_requirements_ack_item,
     _raise_if_maintained_disputed_items,
     select_coder_followup_items,
+    excluded_coder_followup_item_ids,
     _frozen_evidence_obligations,
     _is_evidence_obligation,
     _pending_evidence_obligations,
@@ -9097,8 +9098,7 @@ def run_pr_loop(
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
-                # select_coder_followup_items drops retained future follow-ups,
-                # so the prompt and the validator share one non-future set (#1389).
+                # Prompt and validator share the selected work (#1389).
                 coder_followup_items = select_coder_followup_items(unresolved_items)
                 combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
@@ -9124,18 +9124,15 @@ def run_pr_loop(
             repair_unresolved_item_ids = tuple(
                 item.item_id for item in coder_followup_items
             )
-            # Retained future follow-ups outside this dispatch: valid, never
-            # required (#1389).  The validator and repair share this set.
+            coder_excluded_item_ids = excluded_coder_followup_item_ids(unresolved_items)
             coder_optional_item_ids = tuple(
                 item.item_id
                 for item in unresolved_items
                 if item.status == "future"
+                and item.item_id not in set(coder_excluded_item_ids)
                 and item.item_id not in set(repair_unresolved_item_ids)
             )
-            # Fail-closed proof of items already canonically cleared (#1388):
-            # recorded round history plus this round's live dispositions, the
-            # same rule the plan revision uses (#874).  Anything still in the
-            # ledger, and every machine obligation, stays out of the proof.
+            # Resolved-history proof excludes current ledger and machine items (#1388).
             current_ledger_ids = {item.item_id for item in unresolved_items}
             coder_resolved_item_ids = tuple(
                 item_id
@@ -9295,14 +9292,14 @@ def run_pr_loop(
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
                     architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
+                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
                         resolved_item_ids=resolved_ids,
+                        excluded_item_ids=excluded_ids,
                         human_requirements=human_requirements,
-                        # Every new coder-followup response is v1. A missing
-                        # document must not silently downgrade the protocol.
+                        # New follow-ups require the v1 architecture contract.
                         required_architecture_impact_contract=1,
                         delivered_risk_test_matrix=(
                             approved_plan_context.risk_test_matrix_payload
@@ -9361,6 +9358,9 @@ def run_pr_loop(
                 raw_structured_coder_response: str | None = None
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                     raw_structured_coder_response = coder_output
+                    if coder_response.marker_value.dropped_excluded_items:
+                        log(config, f"Round {round_number}: {coder_name} listed excluded ledger item(s) "
+                            + ", ".join(coder_response.marker_value.dropped_excluded_items) + "; dropped classifications")
                     if coder_response.marker_value.dropped_resolved_addressed_items:
                         dropped_names = ", ".join(
                             coder_response.marker_value.dropped_resolved_addressed_items

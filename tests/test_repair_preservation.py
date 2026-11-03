@@ -2986,3 +2986,16 @@ def test_candidate_must_retain_a_degradable_source_value_1626(source, candidate,
     assert candidate_retains_source_test_observations(
         _followup_1626(source), _followup_1626(candidate)
     ) is expected
+
+
+@pytest.mark.parametrize("required", [(), ("item-1",)])
+@pytest.mark.parametrize("field", ["addressed_items", "remaining_items", "disputed_items"])
+def test_excluded_future_1868_filtered_allowance_permits_claim_removal(required, field):
+    base = {"kind": "coder_followup", "addressed_items": list(required),
+            "addressed_item_notes": {i: "Fixed parser." for i in required}}
+    source = dict(base)
+    source[field] = [*source.get(field, []), "item-2"]
+    note_field = "dispute_evidence" if field == "disputed_items" else field.replace("items", "item_notes")
+    source[note_field] = {**source.get(note_field, {}), "item-2": "Later work."}
+    validate_repair_preservation(json.dumps(source), json.dumps(base),
+                                 unresolved_item_ids=required, optional_item_ids=())

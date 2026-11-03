@@ -17,6 +17,23 @@ finding stays active while another resolution owner is pending.
 Original requirements, valid later human instructions, and safety constraints
 outrank the plan; plan conflicts must be surfaced explicitly.
 
+Coder classification normalization uses trusted context from the complete current
+ledger, separately from the dispatch-selected required items. Evidence obligations,
+retained future work and inert provenance records listed as addressed or remaining
+are dropped with internal diagnostics, including their notes and advisory sub-item
+claims. Duplicates are checked first; unknown IDs and excluded disputes still fail.
+This does not clear evidence, resolve findings or change future publication eligibility.
+Reviewer prose can name records omitted from the rendered item list, so prompt
+filtering alone cannot enforce this boundary.
+
+Validation and repair share the same required IDs and optional allowance with
+ledger-proven exclusions removed, including an explicitly empty required set.
+Repair's complete-valid-set instruction and preservation exemptions permit removal
+of excluded classifications, notes and dispute evidence. Generic optional claims
+without ledger exclusion proof retain their existing protection. Diagnostics are
+internal and unparsed; no persisted schema changes. Carried ledger records, rather
+than raw coder classifications retained for audit, own lifecycle and replay state.
+
 Reviewer scope discipline. Plan and PR reviewer prompts limit blocking
 findings to the issue's stated requirements or signed human requirements,
 regressions in touched behaviour, and introduced security or data-loss risk;

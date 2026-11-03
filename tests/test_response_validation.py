@@ -1224,7 +1224,7 @@ def _malformed_1388(payload_text):
     return json_part + "\n## Changes made\nProse before the footer.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
 
 
-def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), resolved_ids=()):
+def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), resolved_ids=(), excluded_ids=()):
 
     real_attempt_repair = _repair_module_1388.attempt_repair
     prompts = []
@@ -1255,6 +1255,7 @@ def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), r
                 unresolved_items=items,
                 optional_item_ids=optional_ids,
                 resolved_item_ids=resolved_ids,
+                excluded_item_ids=excluded_ids,
                 human_requirements=(),
                 architecture_status_mode="legacy",
             ),
@@ -1361,3 +1362,27 @@ def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):
     assert degraded.tests_run == ("python3 -m pytest tests/test_api.py -q",)
     assert degraded.out_of_checkout_tests_run == (baseline,)
     assert response_validation._degrade_out_of_checkout_tests(degraded, config=config) is degraded
+
+
+@pytest.mark.parametrize("required", [True, False])
+@pytest.mark.parametrize("classification", ["addressed_items", "remaining_items", "disputed_items"])
+def test_excluded_future_1868_real_repair_removes_claims_and_preserves_reports(tmp_path, required, classification):
+    items = (_Item1388(item_id="item-1", reviewer="Codex", source_round=1, text="Fix it.", status="blocking"),) if required else ()
+    base = dict(addressed_items=["item-1"] if required else [], tests_run=["python -m pytest tests/test_example.py"])
+    source = dict(base)
+    source[classification] = [*source.get(classification, []), "item-2"]
+    if classification == "disputed_items":
+        source["dispute_evidence"] = {"item-2": "Future work is unnecessary."}
+    else:
+        source[classification.replace("items", "item_notes")] = {"item-2": "Deferred."}
+    response, prompts, calls = _run_repair_1388(
+        tmp_path, malformed=_malformed_1388(structured_coder_followup(**source)),
+        repaired=structured_coder_followup(**base), items=items, excluded_ids=("item-2",),
+    )
+    assert calls[0]["unresolved_item_ids"] == (("item-1",) if required else ())
+    assert calls[0].get("optional_item_ids", ()) == ()
+    assert "## Optional coder follow-up item IDs:" not in prompts[0]
+    assert "Remove" in prompts[0] and "dispute_evidence" in prompts[0]
+    assert response.marker_value.addressed_items == (("item-1",) if required else ())
+    assert response.marker_value.remaining_items == response.marker_value.disputed_items == ()
+    assert response.marker_value.tests_run == tuple(base["tests_run"])
