@@ -64,16 +64,17 @@ def required_voters(item, current_board):
     return (requester,) if requester in current_board else tuple(current_board)
 
 
-def restore_requests(runner, *, config, pr, head, items, number):
+def restore_requests(runner, *, config, pr, head, items, number, clearances=()):
     if not config.review_images_paths or config.dry_run:
         return list(items), number
     history = history_for(runner, config, pr)
-    return restore(history, config=config, pr=pr, head=head, items=items, number=number)
+    return restore(history, config=config, pr=pr, head=head, items=items, number=number, clearances=clearances)
 
 
-def restore(history, *, config, pr, head, items, number):
+def restore(history, *, config, pr, head, items, number, clearances=()):
     from .review_scope import is_complete_code_review
     from .capture_acceptance import reviewer_contract
+    clearances = human_clearances(history, head, clearances)
     result = list(items)
     # Consume the complete history, including reserved/resolved visual IDs.
     from .round_state import _max_unresolved_item_number_from_records
@@ -95,14 +96,14 @@ def restore(history, *, config, pr, head, items, number):
         for request in metadata.screenshot_requests:
             result, consumed = upsert(result, repo=config.repo, pr=pr, requester=metadata.agent,
                 request=request, contract=reviewer_contract(metadata), source=history.identities.get(record.index),
-                number=number, round_number=metadata.round_number, head=head)
+                number=number, round_number=metadata.round_number, head=head, clearances=clearances)
             number += consumed
     if not any(item.screenshot_request for item in result):
         return result, number
     attachment = report(history, repo=config.repo, pr=pr, head=head)
     receipts = verified_receipts(history, attachment, result, config=config, pr=pr, head=head)
     result = apply_receipts(result, receipts, board(config), head,
-                            human_clearances=human_clearances(history, head))
+                            human_clearances=clearances)
     return result, number
 
 
@@ -170,11 +171,13 @@ def verified_receipts(history, attachment, items, *, config, pr, head):
             if value['kind'] == 'receipt' and value['payload'] in candidates]
 
 
-def human_clearances(history, head):
-    return {pair for r in history if r.metadata.evidence_release is not None
-            and r.metadata.evidence_release.reason in {'evidence-cleared', 'refresh-clean'}
-            and r.metadata.evidence_release.signed_requirement_ids_surfaced
-            for pair in r.metadata.evidence_clearances if pair[1] == head}
+def human_clearances(history, head, clearances=()):
+    """Combine trusted live clearances with authenticated terminal carry state."""
+    carried = {pair for r in history
+               if (r.metadata.evidence_freeze is not None and r.metadata.evidence_freeze.valid
+                   or r.metadata.evidence_release is not None and r.metadata.evidence_release.valid)
+               for pair in r.metadata.evidence_clearances if pair[1] == head}
+    return carried | {pair for pair in clearances if pair[1] == head}
 
 
 def apply_receipts(items, receipts, current_board, head, *, human_clearances=()):
@@ -243,7 +246,7 @@ def validate_ordinary(parsed, *, runner, config, pr, head, requester, items, mat
     return parsed
 
 
-def gate(runner, *, config, pr, head, items, round_number, usage_context=None):
+def gate(runner, *, config, pr, head, items, round_number, usage_context=None, clearances=()):
     """Run only after the caller's machine and signed-input gates.
 
     Reservation is the admission boundary. A restart may publish original
@@ -259,7 +262,7 @@ def gate(runner, *, config, pr, head, items, round_number, usage_context=None):
     history = history_for(runner, config, pr)
     attachment = report(history, repo=config.repo, pr=pr, head=head)
     if attachment is None:
-        return apply_receipts(items, (), board(config), head, human_clearances=human_clearances(history, head)), 'pending'
+        return apply_receipts(items, (), board(config), head, human_clearances=human_clearances(history, head, clearances)), 'pending'
     current_board = board(config)
     updated = list(items)
     for seat, agent in current_board.items():
@@ -269,14 +272,14 @@ def gate(runner, *, config, pr, head, items, round_number, usage_context=None):
         # Revalidate availability before every acquisition/publication.
         attachment = report(history, repo=config.repo, pr=pr, head=head)
         if attachment is None:
-            return apply_receipts(updated, (), current_board, head, human_clearances=human_clearances(history, head)), 'pending'
+            return apply_receipts(updated, (), current_board, head, human_clearances=human_clearances(history, head, clearances)), 'pending'
         candidates = vote_candidates(history, attachment, updated, config=config, pr=pr, head=head)
         existing = verified_receipts(history, attachment, updated, config=config, pr=pr, head=head)
         for candidate in candidates:
             if candidate not in existing:
                 publish(runner, config, pr, head, round_number, 'receipt', candidate)
                 existing.append(candidate)
-        updated = apply_receipts(updated, existing, current_board, head, human_clearances=human_clearances(history, head))
+        updated = apply_receipts(updated, existing, current_board, head, human_clearances=human_clearances(history, head, clearances))
         pending = [item for item in updated if item.screenshot_request
                    and item.status in {'blocking', 'same-pr'} and seat in required_voters(item, current_board)
                    and not any(r['identity'] == item.obligation_identity and r['voter'] == seat for r in existing)]
@@ -337,7 +340,7 @@ def gate(runner, *, config, pr, head, items, round_number, usage_context=None):
         if candidate not in existing:
             publish(runner, config, pr, head, round_number, 'receipt', candidate)
             existing.append(candidate)
-    updated = apply_receipts(updated, existing, current_board, head, human_clearances=human_clearances(history, head))
+    updated = apply_receipts(updated, existing, current_board, head, human_clearances=human_clearances(history, head, clearances))
     from .unresolved_items import _pending_evidence_obligations
     return updated, 'pending' if _pending_evidence_obligations(updated) else 'coverage_satisfied'
 
@@ -390,7 +393,8 @@ def resume_frozen(runner, *, config, pr, head, items, round_number, baseline, cl
     if not config.review_images_paths or not any(item.screenshot_request for item in items):
         return CoverageTransition('pending')
     updated, action = gate(runner, config=config, pr=pr, head=head, items=items,
-        round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None))
+        round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None),
+        clearances=clearances)
     items[:] = updated
     refreshed = boundary(runner, config=config, pr=pr, head=head,
         baseline=baseline.signed_requirement_ids_at_freeze, collect_requirement_ids=collect_requirement_ids)
@@ -412,7 +416,8 @@ def final_gate(runner, *, config, pr, head, items, round_number, live_ids, allow
     if not config.review_images_paths or not any(item.screenshot_request for item in items):
         return CoverageTransition('pending')
     updated, action = gate(runner, config=config, pr=pr, head=head, items=items,
-        round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None))
+        round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None),
+        clearances=clearances)
     items[:] = updated
     refreshed = boundary(runner, config=config, pr=pr, head=head, baseline=live_ids,
                          collect_requirement_ids=collect_requirement_ids)

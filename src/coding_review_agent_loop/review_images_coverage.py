@@ -98,7 +98,7 @@ def request_identity(repo, pr, requester, request_id):
 
 
 def upsert(items, *, repo, pr, requester, request, contract, source, number, round_number,
-           head, receipts=()):
+           head, receipts=(), clearances=()):
     requests([request])
     identity = request_identity(repo, pr, requester, request['request_id'])
     binding = {'version': 1, 'repo': repo, 'pr': pr, 'requester': requester,
@@ -106,7 +106,8 @@ def upsert(items, *, repo, pr, requester, request, contract, source, number, rou
     existing = next((item for item in items if item.obligation_identity == identity), None)
     if existing and (existing.screenshot_request is None or existing.screenshot_request['request'] != request):
         fail('a request identity cannot change its description or kind')
-    satisfied = any(r.get('identity') == identity and r.get('head') == head for r in receipts)
+    satisfied = ((identity, head) in clearances
+                 or any(r.get('identity') == identity and r.get('head') == head for r in receipts))
     if existing:
         return [replace(item, status='resolved' if satisfied else 'blocking',
                         lifecycle='cleared' if satisfied else (item.lifecycle if item.lifecycle == 'evidence_frozen' and item.candidate_head_sha == head else 'evidence_deferred'),

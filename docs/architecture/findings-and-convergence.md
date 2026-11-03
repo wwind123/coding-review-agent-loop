@@ -493,6 +493,13 @@ repair, including malformed/extra content and order. Dedicated coverage is a
 strict versioned decision set and cannot become a code review. Reports and receipts
 supply no signed-human or risk-matrix conversion authority.
 
+Requester coverage restoration and final gates consume trusted in-process signed
+human clearances together with clearances carried by authenticated freeze and
+release records. These clearances are bound to obligation identity and exact
+head; they do not require a machine coverage receipt or available image cache.
+Partial clearance remains durable on the next freeze without reopening the
+cleared request, while a new head requires fresh evidence.
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

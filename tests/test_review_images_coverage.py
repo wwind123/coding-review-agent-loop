@@ -21,7 +21,8 @@ from coding_review_agent_loop.review_images_config import delivery_limits
 from coding_review_agent_loop.review_images_state import digest, History
 from coding_review_agent_loop.review_scope import authority_records, is_complete_code_review
 from coding_review_agent_loop.round_state import (PostedRoundMetadata, PostedRoundRecord,
-    _encode_round_metadata, _decode_round_metadata)
+    _encode_round_metadata, _decode_round_metadata, EVIDENCE_RELEASE_REASONS,
+    EvidenceFreezeRecord, EvidenceReleaseRecord)
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from test_pr_loop_review_images import visual_setup, records
 from test_review_images_state import binding, record, history, success, HEAD, OTHER
@@ -680,3 +681,87 @@ def test_large_coverage_attachment_spills_without_losing_visual_findings(attachm
     assert len(restored) == 1
     assert restored[0].metadata.new_items == (visual_item,)
     assert restored[0].metadata.screenshot_coverage == metadata.screenshot_coverage
+
+
+@pytest.mark.parametrize('available', [False, True])
+@pytest.mark.parametrize('mixed', [False, True])
+def test_signed_human_clearance_survives_restore_gates_and_frozen_resume(visual_setup, monkeypatch, available, mixed):
+    from coding_review_agent_loop.pr_loop import run_pr_loop
+    from pr_loop_test_helpers import _signed
+    config, images, _ = visual_setup
+    calls = responder(monkeypatch, accepted=False)
+    legacy = ['Operator must verify the unrelated audit'] if mixed else []
+    runner = FakeRunner(codex_outputs=[typed_review(legacy=legacy)])
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    typed = next(item for r in records(runner) if r.metadata.evidence_freeze
+                 for item in r.metadata.prior_items if item.screenshot_request)
+    if not available:
+        monkeypatch.setattr(service, 'report', lambda *a, **k: None)
+    runner.pr_payload['comments'].append(_signed('Screenshots supplied for the frozen head.', 555))
+    raw = typed_review(legacy=legacy)
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload['prior_item_dispositions'] = [dict(item_id=typed.item_id, disposition='resolved',
+        note='The signed screenshots satisfy my request.')]
+    if mixed:
+        other = next(item for r in records(runner) if r.metadata.evidence_freeze
+                     for item in r.metadata.prior_items if not item.screenshot_request)
+        payload['prior_item_dispositions'].append(dict(item_id=other.item_id, disposition='blocking',
+            note='The unrelated audit remains pending.'))
+    runner.codex_outputs.append(json.dumps(payload) + '\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->' + raw[end:])
+    runner.simulate_new_process()
+    if mixed:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+        frozen = [r.metadata for r in records(runner) if r.metadata.evidence_freeze][-1]
+        assert (typed.obligation_identity, runner.git_head) in frozen.evidence_clearances
+        assert next(i for i in frozen.prior_items if i.screenshot_request).status == 'resolved'
+        runner.simulate_new_process()
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert not any(r.metadata.evidence_release for r in records(runner))
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        releases = [r.metadata for r in records(runner) if r.metadata.evidence_release]
+        assert [r.evidence_release.reason for r in releases] == ['evidence-cleared']
+        assert (typed.obligation_identity, runner.git_head) in releases[0].evidence_clearances
+        assert next(i for i in releases[0].prior_items if i.screenshot_request).status == 'resolved'
+    assert len(calls) == 1  # The declined reservation is never retried.
+    assert len([c for c in images if c[0] == 'images']) == 1
+    h = service.history_for(runner, config, 77)
+    restored, number = service.restore(h, config=config, pr=77, head=runner.git_head, items=(), number=1)
+    assert next(i for i in restored if i.screenshot_request).status == 'resolved'
+    moved, _ = service.restore(h, config=config, pr=77, head=OTHER, items=restored, number=number)
+    assert next(i for i in moved if i.screenshot_request).status == 'blocking'
+
+
+@pytest.mark.parametrize('source', ['live', 'freeze', *sorted(EVIDENCE_RELEASE_REASONS), 'nonterminal', 'invalid'])
+@pytest.mark.parametrize('head', [HEAD, OTHER])
+def test_all_trusted_clearance_carriers_share_exact_head_satisfaction(tmp_path, monkeypatch, source, head):
+    config = make_config(tmp_path, review_images_paths=('ui/*',))
+    items, _ = coverage.upsert([], repo=config.repo, pr=77, requester='Codex', request=REQUEST,
+        contract='c'*64, source=100, number=1, round_number=1, head=HEAD)
+    pair = (items[0].obligation_identity, HEAD)
+    freeze = EvidenceFreezeRecord(HEAD, (pair[0],), ('signed-input',), 3, False, False)
+    release = EvidenceReleaseRecord(HEAD, source, ('signed-input',), 3, False, False)
+    metadata = PostedRoundMetadata(flow='pr', role='summary', agent='Orchestrator', round_number=1,
+        subject=HEAD, evidence_clearances=(pair,), prior_items=tuple(items),
+        evidence_freeze=freeze if source == 'freeze' else None,
+        evidence_release=EvidenceReleaseRecord.invalid() if source == 'invalid' else
+            release if source in EVIDENCE_RELEASE_REASONS else None)
+    h = History([PostedRoundRecord(0, metadata, '')], identities={0:100}, repo=config.repo, pr=77)
+    live = (pair,) if source == 'live' else ()
+    expected = head == HEAD and source not in {'nonterminal', 'invalid'}
+    clearances = service.human_clearances(h, head, live)
+    upserted, consumed = coverage.upsert(items, repo=config.repo, pr=77, requester='Codex', request=REQUEST,
+        contract='d'*64, source=200, number=2, round_number=2, head=head, clearances=clearances)
+    assert not consumed
+    monkeypatch.setattr(service, 'history_for', lambda *a, **k: h)
+    monkeypatch.setattr(service, 'report', lambda *a, **k: None)
+    restored, _ = service.restore_requests(None, config=config, pr=77, head=head,
+        items=upserted, number=2, clearances=live)
+    gated, _ = service.gate(None, config=config, pr=77, head=head, items=restored,
+        round_number=2, clearances=live)
+    for result in (upserted, restored, gated):
+        assert (result[0].status == 'resolved') == expected
+        assert (result[0].lifecycle == 'cleared') == expected

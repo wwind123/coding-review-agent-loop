@@ -80,6 +80,15 @@ def private_response_tempdir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_agy_settings_path(monkeypatch, tmp_path):
+    """Keep simulated agent turns off the host's settings and shared lock."""
+    from coding_review_agent_loop.agents import antigravity
+
+    settings_path = tmp_path / "agy-cli-settings" / "settings.json"
+    monkeypatch.setattr(antigravity, "_antigravity_settings_path", lambda: settings_path)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_agy_log_dir(monkeypatch, tmp_path_factory):
     """Never list or read the host's real agy CLI log directory (#1604)."""
     from coding_review_agent_loop.agents import antigravity

@@ -3452,7 +3452,7 @@ def run_pr_loop(
             # transient GitHub mergeability computation window never triggers an
             # unnecessary coder round.
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
-                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number)
+                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances)
             round_start_mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
             latest_mergeability = round_start_mergeability
             unresolved_items = _reconcile_merge_conflict_item(
@@ -6242,7 +6242,7 @@ def run_pr_loop(
                     if consumed_item_number:
                         next_unresolved_item_number += 1
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
-                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number)
+                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances)
             if round_evidence_clearances:
                 evidence_revalidation_required = True
                 log(
