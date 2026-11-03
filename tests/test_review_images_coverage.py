@@ -765,3 +765,70 @@ def test_all_trusted_clearance_carriers_share_exact_head_satisfaction(tmp_path, 
     for result in (upserted, restored, gated):
         assert (result[0].status == 'resolved') == expected
         assert (result[0].lifecycle == 'cleared') == expected
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('available', [False, True])
+@pytest.mark.parametrize('source', ['machine', 'human'])
+def test_released_coverage_resume_revalidates_without_acquisition(
+        visual_setup, monkeypatch, enabled, available, source):
+    from coding_review_agent_loop.pr_loop import run_pr_loop
+    from pr_loop_test_helpers import _signed
+    config, images, _ = visual_setup
+    calls = responder(monkeypatch, accepted=source == 'machine')
+    runner = FakeRunner(codex_outputs=[typed_review()])
+    if source == 'machine':
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    else:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+        typed = next(item for r in records(runner) if r.metadata.evidence_freeze
+                     for item in r.metadata.prior_items if item.screenshot_request)
+        runner.pr_payload['comments'].append(_signed('Screenshots supplied for this head.', 555))
+        raw = typed_review()
+        payload, end = json.JSONDecoder().raw_decode(raw)
+        payload['prior_item_dispositions'] = [dict(item_id=typed.item_id, disposition='resolved',
+            note='The signed screenshots satisfy my request.')]
+        runner.codex_outputs.append(json.dumps(payload) + '\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->' + raw[end:])
+        runner.simulate_new_process()
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert any(r.metadata.evidence_release for r in records(runner))
+    if not available:
+        attachment = next(r.metadata.screenshot_coverage['payload']['attachment']
+                          for r in records(runner) if r.metadata.screenshot_coverage
+                          and r.metadata.screenshot_coverage['kind'] == 'attachment')
+        (cache.root() / attachment['cache'] / '0').unlink()
+    resumed = replace(config, review_images_paths=config.review_images_paths if enabled else ())
+    image_count, call_count = len(images), len(calls)
+    runner.simulate_new_process()
+    runner.codex_outputs.append(structured_pr_review())
+    if source == 'machine' and not available:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=resumed)
+        frozen = [r.metadata for r in records(runner) if r.metadata.evidence_freeze][-1]
+        assert next(i for i in frozen.prior_items if i.screenshot_request).status == 'blocking'
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=resumed) == 0
+    assert len(calls) == call_count
+    assert len([c for c in images[image_count:] if c[0] in {'images', 'capture'}]) == 0
+
+
+def test_converted_tombstone_and_requester_coverage_finalize_in_one_invocation(visual_setup, monkeypatch):
+    from coding_review_agent_loop.pr_loop import run_pr_loop
+    from test_pr_loop_evidence_conversion import (_plan_context, _frozen_after_auto_conversion, _signed)
+    config, images, _ = visual_setup
+    config = replace(config, max_rounds=8, pr_non_convergence_rounds=0)
+    context = _plan_context('row-a', 'row-b')
+    runner, config = _frozen_after_auto_conversion(config.codex_dir.parent, monkeypatch, context, config=config)
+    runner.pr_payload['comments'].append(_signed('Verified row-a at the frozen head.', 1))
+    raw = typed_review()
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload['prior_item_dispositions'] = [dict(item_id='item-2', disposition='resolved', note='Accepted signed evidence.')]
+    runner.codex_outputs.append(json.dumps(payload) + '\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->' + raw[end:])
+    calls = responder(monkeypatch)
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    assert len(calls) == 1
+    release = [r.metadata for r in records(runner) if r.metadata.evidence_release][-1]
+    assert release.evidence_release.reason == coverage.KIND
+    assert all(i.status == 'resolved' and i.lifecycle == 'cleared'
+               for i in release.prior_items if i.screenshot_request or i.converted_row_id)

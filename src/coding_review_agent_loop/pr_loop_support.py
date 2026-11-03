@@ -2157,7 +2157,7 @@ def _evidence_freeze_gate(
     pr_number: int,
     round_number: int,
     head_sha: str | None,
-    items: Sequence[UnresolvedReviewItem],
+    items: list[UnresolvedReviewItem],
     surfaced_requirement_ids: Sequence[str] | None,
     collect_requirement_ids: Callable[[PullRequestReviewContext], Sequence[str]],
     allowed_rounds: int,
@@ -2192,7 +2192,8 @@ def _evidence_freeze_gate(
     if any(_is_row_converted_obligation(item) for item in items):
         # Defense in depth (#1325): a stale converted tombstone that survived
         # into finalization reopens here and freezes instead of proceeding.
-        items = _reconcile_converted_evidence(
+        # Coverage and finalization must share this caller-owned ledger.
+        items[:] = _reconcile_converted_evidence(
             runner,
             config,
             pr_number=pr_number,

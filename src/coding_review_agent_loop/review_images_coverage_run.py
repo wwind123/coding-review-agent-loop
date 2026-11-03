@@ -64,16 +64,23 @@ def required_voters(item, current_board):
     return (requester,) if requester in current_board else tuple(current_board)
 
 
-def restore_requests(runner, *, config, pr, head, items, number, clearances=()):
-    if not config.review_images_paths or config.dry_run:
-        return list(items), number
-    history = history_for(runner, config, pr)
+def restore_requests(runner, *, config, pr, head, items, number, clearances=(), comments=None):
+    if comments is not None and (not config.review_images_paths or config.dry_run):
+        # Reuse the observed snapshot; disabled acquisition adds no head polling.
+        from .review_images import admitted_visual_history
+        history = admitted_visual_history(runner, config, pr, comments)
+    else:
+        history = history_for(runner, config, pr)
     return restore(history, config=config, pr=pr, head=head, items=items, number=number, clearances=clearances)
 
 
 def restore(history, *, config, pr, head, items, number, clearances=()):
     from .review_scope import is_complete_code_review
     from .capture_acceptance import reviewer_contract
+    if (not config.review_images_paths or config.dry_run) and not any(item.screenshot_request for item in items) and not any(
+            r.metadata.screenshot_requests or any(item.screenshot_request
+                for item in (*r.metadata.prior_items, *r.metadata.new_items)) for r in history):
+        return list(items), number
     clearances = human_clearances(history, head, clearances)
     result = list(items)
     # Consume the complete history, including reserved/resolved visual IDs.
@@ -252,8 +259,6 @@ def gate(runner, *, config, pr, head, items, round_number, usage_context=None, c
     Reservation is the admission boundary. A restart may publish original
     outcomes/receipts, but can never repeat a reserved acquisition.
     """
-    if not config.review_images_paths or config.dry_run:
-        return list(items), 'pending'
     from .pr_head_sync import get_observed_pr_review_context
     from .validated_agent import _run_validated_agent
     from .logging import log
@@ -261,6 +266,13 @@ def gate(runner, *, config, pr, head, items, round_number, usage_context=None, c
         return get_observed_pr_review_context(runner, config=config, pr_number=pr).metadata.head_sha
     history = history_for(runner, config, pr)
     attachment = report(history, repo=config.repo, pr=pr, head=head)
+    if not config.review_images_paths or config.dry_run:
+        # Activation controls acquisition, never the validity of carried evidence.
+        receipts = verified_receipts(history, attachment, items, config=config, pr=pr, head=head)
+        updated = apply_receipts(items, receipts, board(config), head,
+            human_clearances=human_clearances(history, head, clearances))
+        from .unresolved_items import _pending_evidence_obligations
+        return updated, 'pending' if _pending_evidence_obligations(updated) else 'coverage_satisfied'
     if attachment is None:
         return apply_receipts(items, (), board(config), head, human_clearances=human_clearances(history, head, clearances)), 'pending'
     current_board = board(config)
@@ -390,7 +402,7 @@ def release(runner, *, config, pr, head, items, round_number, baseline, clearanc
 
 def resume_frozen(runner, *, config, pr, head, items, round_number, baseline, clearances, references,
                   collect_requirement_ids=None):
-    if not config.review_images_paths or not any(item.screenshot_request for item in items):
+    if not any(item.screenshot_request for item in items):
         return CoverageTransition('pending')
     updated, action = gate(runner, config=config, pr=pr, head=head, items=items,
         round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None),
@@ -413,7 +425,7 @@ def resume_frozen(runner, *, config, pr, head, items, round_number, baseline, cl
 def final_gate(runner, *, config, pr, head, items, round_number, live_ids, allowed_rounds,
                failure_extension, head_extension, clearances, references, collect_requirement_ids=None):
     """Return the explicit transition; the existing caller owns final validation."""
-    if not config.review_images_paths or not any(item.screenshot_request for item in items):
+    if not any(item.screenshot_request for item in items):
         return CoverageTransition('pending')
     updated, action = gate(runner, config=config, pr=pr, head=head, items=items,
         round_number=round_number, usage_context=getattr(runner, '_screenshot_coverage_usage', None),
