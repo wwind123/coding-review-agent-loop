@@ -491,6 +491,19 @@ own blocker does not prohibit reuse: it carries unchanged and requires a human
 when no fresh disposition opportunity exists. Skips have no dispositions and no
 code approval, screenshot-evidence, panel, sweep or scheduler authority.
 
+## Requester-owned coverage scheduling
+
+The merged image seat and at-most-once image lifecycle are unchanged.
+`review_images_coverage_run.py` batches pending typed screenshot assignments per
+requester seat/head at existing evidence gates, after machine gates and signed
+input response ordering. Paused requesters and carried code approvers can execute
+text-only coverage without code review or opening a panel. Removed requesters
+require every current-board vote. Intent publication/read-back spends one attempt
+per repository/PR/head/executing seat and one assignment per request/voter/head;
+contract changes and late requests cannot reset it. Failed/unknown attempts never
+retry. Original outcomes may be replayed only for publication. Neither scoped
+coverage nor its attachments qualify code reviews, sweeps, panels, CI or merges.
+
 ## Decisions
 
 [Decision log](decisions/review-scheduling.md)

@@ -717,16 +717,17 @@ def run_pr_loop(
     from .workdirs import active_workdir
     visual_startup(config)
     visual_run = VisualRun(runner)
+    runner._screenshot_coverage_pr = pr_number
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    runner._screenshot_coverage_usage = usage_context
+    from . import review_images_coverage_run as screenshot_coverage
     managed_ci = None
     ordinary_recovery: OrdinaryRecoveryCapability | None = None
     ordinary_recovery_selected = False
     managed_ci_qualified = False
     managed_pr_recovered = False
     authenticated_managed_resume: AuthenticatedManagedResume | None = None
-    # Captured once by the provenance block for a fresh planning child and
-    # passed to every qualification snapshot (#936); ``None`` otherwise.
     planning_child_binding: _PlanningChildBinding | None = None
 
     def recheck_pending_child_plan_supersession() -> None:
@@ -3450,6 +3451,8 @@ def run_pr_loop(
             # branch that cannot merge. `unknown` is left alone here so a
             # transient GitHub mergeability computation window never triggers an
             # unnecessary coder round.
+            unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
+                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
             round_start_mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
             latest_mergeability = round_start_mergeability
             unresolved_items = _reconcile_merge_conflict_item(
@@ -3474,8 +3477,6 @@ def run_pr_loop(
                     f"{round_start_mergeability.base_branch or config.base or 'the base branch'}; "
                     f"skipping reviewers and routing to {agent_display_name(config.coder)}",
                 )
-            # Exact-head evidence recovery (#1068).  A freeze or release record
-            # is the handoff boundary; an external push breaks a freeze.
             evidence_skip_reviewers = False
             broken_freeze_head = (
                 current_resume.broken_evidence_freeze_head
@@ -3535,8 +3536,8 @@ def run_pr_loop(
                 if (
                     live_evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
                     and freeze_payload is not None
-                    and _frozen_evidence_obligations(unresolved_items)
                 ):
+                    # The freeze owns recovery even after receipts clear its ledger.
                     # Frozen rerun: one check snapshot and one mergeability
                     # observation (the round-start probe above) at H, with no
                     # CI wait and no qualification dispatch.
@@ -3626,12 +3627,15 @@ def run_pr_loop(
                                 still_frozen=True,
                             )
                             evidence_budget_correction_pending = False
-                        # New human input is detected by signed-requirement
-                        # identity: an edit yields a new ID, a deletion none.
                         new_signed_ids = set(
                             _reviewer_requirement_identity_ids(human_requirements)
                         ) - set(freeze_payload.signed_requirement_ids_at_freeze)
-                        if not new_signed_ids:
+                        coverage_released = not new_signed_ids and screenshot_coverage.resume_frozen(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, round_number=round_number, baseline=freeze_payload, clearances=evidence_clearances, references=current_signed_references(), collect_requirement_ids=collect_live_requirement_ids)
+                        if screenshot_coverage.stage_transition(coverage_released,
+                            refresh=lambda context: stage_same_head_evidence_pass(context, current_round=round_number),
+                            head_changed=stage_evidence_head_change):
+                            continue
+                        if not new_signed_ids and not coverage_released:
                             log(
                                 config,
                                 f"Round {round_number}: PR #{pr_number} remains frozen at "
@@ -3644,10 +3648,14 @@ def run_pr_loop(
                                     items=unresolved_items,
                                 )
                             ), round_number=round_number)
-                        evidence_pass = "response"
+                        if coverage_released:
+                            round_number = coverage_released.round_number
+                            evidence_skip_reviewers = True
+                        else:
+                            evidence_pass = "response"
                         log(
                             config,
-                            f"Round {round_number}: new signed human input at frozen head "
+                            f"Round {round_number}: screenshot coverage release or new signed input at head "
                             f"{pr_metadata.head_sha}; re-invoking the full review board",
                         )
                 elif live_evidence_boundary.phase == EVIDENCE_RELEASE_PHASE:
@@ -3665,21 +3673,16 @@ def run_pr_loop(
             )
             if evidence_pass is not None:
                 evidence_skip_reviewers = False
-            # Evidence passes (#1068) and the conversion repeat (#1325) run the
-            # complete board fresh; computed after the frozen-rerun path above
-            # may have started a response pass.
             full_board_pass = evidence_pass is not None or conversion_pass
             from .pr_loop_decisions import recovery_skips_reviewers
             skip_visual_for_recovery = recovery_skips_reviewers(current_resume, broken_freeze_head, qualification_checkpoint)
-            # Freeze/recovery gates above own permission to execute; visual work
-            # never opens them, and carries no scheduler or code-round metadata.
             visual_outcome = None
             try:
                 if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
                     unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
                     visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
                         checkout=active_workdir(config), items=unresolved_items, round_number=round_number,
-                        managed=managed_ci is not None,
+                        managed=managed_ci is not None, usage_context=usage_context,
                         current_head=lambda: get_observed_pr_review_context(
                             runner, config=config, pr_number=pr_number).metadata.head_sha,
                         diagnostic=lambda message: log(config, message))
@@ -4939,6 +4942,7 @@ def run_pr_loop(
                             ),
                             phase=phase,
                             evidence_requests=parsed.exact_head_evidence_requests,
+                            screenshot_requests=parsed.screenshot_requests, screenshot_coverage_acceptances=parsed.screenshot_coverage_acceptances,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
                             reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
@@ -5318,6 +5322,7 @@ def run_pr_loop(
                                 config,
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
+                                screenshot_context=screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else "",
                                 pr_metadata=pr_metadata,
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
@@ -5565,6 +5570,7 @@ def run_pr_loop(
                         architecture_impact=resumed_impact,
                         architecture_impact_degradations=resumed_records,
                         exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
+                        screenshot_requests=resumed_record.metadata.screenshot_requests, screenshot_coverage_acceptances=resumed_record.metadata.screenshot_coverage_acceptances,
                         sub_item_degradations=resumed_record.metadata.sub_item_degradations,
                     )
                     review_state = parsed_review.state
@@ -5693,6 +5699,7 @@ def run_pr_loop(
                                 config,
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
+                                screenshot_context=screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else "",
                                 pr_metadata=pr_metadata,
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
@@ -6234,6 +6241,8 @@ def run_pr_loop(
                     )
                     if consumed_item_number:
                         next_unresolved_item_number += 1
+            unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
+                runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
             if round_evidence_clearances:
                 evidence_revalidation_required = True
                 log(
@@ -6543,10 +6552,12 @@ def run_pr_loop(
                             gate_outcome.context, current_round=round_number
                         )
                         continue
-                    raise AgentLoopError(
-                        f"PR #{pr_number} evidence gate proceeded while evidence is pending; "
-                        "no approval or merge was attempted."
-                    )
+                    if gate_outcome.action != 'coverage_satisfied':
+                        raise AgentLoopError(
+                            f"PR #{pr_number} evidence gate proceeded while evidence is pending; "
+                            "no approval or merge was attempted."
+                        )
+                    evidence_revalidation_required = True
                 else:
                     # A pre-freeze refresh pass with the evidence still
                     # deferred also ends with one terminal record, so a clean

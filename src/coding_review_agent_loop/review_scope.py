@@ -14,7 +14,8 @@ def scope_present(metadata):
 
 def is_complete_code_review(metadata):
     get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
-    return get("role") == "reviewer" and not scope_present(metadata) and not visual_candidate(metadata)
+    return (get("role") == "reviewer" and not scope_present(metadata)
+            and not visual_candidate(metadata) and not coverage_candidate(metadata))
 
 
 def encode_review_scope(metadata):
@@ -63,7 +64,8 @@ def is_visual_review(metadata):
 
 
 def authority_records(records):
-    return tuple(record for record in records if not visual_candidate(record.metadata))
+    return tuple(record for record in records if not visual_candidate(record.metadata)
+                 and not coverage_candidate(record.metadata))
 
 
 def is_visual_item(item):
@@ -82,3 +84,11 @@ def visual_candidate(metadata):
     scope = get("review_scope")
     return lifecycle_present(metadata) or is_visual_review(metadata) or (
         isinstance(scope, Mapping) and scope.get("kind") == "visible-defects")
+
+
+def coverage_candidate(metadata):
+    get = metadata.get if isinstance(metadata, Mapping) else lambda key: getattr(metadata, key, None)
+    scope = get('review_scope')
+    present = 'screenshot_coverage' in metadata if isinstance(metadata, Mapping) else get('screenshot_coverage') is not None
+    return (present or str(get('phase') or '').startswith('screenshot-coverage')
+            or isinstance(scope, Mapping) and scope.get('kind') == 'screenshot-coverage')

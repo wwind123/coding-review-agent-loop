@@ -313,13 +313,14 @@ class UnresolvedReviewItem:
     # and matrix identity they stand for.  Both or neither; evidence only.
     converted_row_id: str | None = None
     converted_matrix_identity: str | None = None
-    # Advisory plan provenance and repeated-finding identity, fixed at mint (#1505).
-    # Visual origin_scope preserves finding authority across recovery.
     provenance: str | None = None
     repeat_of: str | None = None
     origin_scope: str | None = None
+    screenshot_request: dict | None = None
 
     def __post_init__(self) -> None:
+        from .review_images_coverage import validate_item
+        validate_item(self)
         if self.evidence_row_ids and (
             self.authority is not None
             or self.obligation_kind is not None
@@ -438,10 +439,9 @@ class ParsedReview:
     raw_dispositions_text: str = ""
     architecture_impact: ArchitectureImpact | None = None
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
-    # Human-only evidence an agent session cannot produce (#1068).  These are
-    # never blocking code findings and are never routed to the coder.
+    screenshot_requests: tuple[dict, ...] = ()
+    screenshot_coverage_acceptances: tuple[dict, ...] = ()
     exact_head_evidence_requests: tuple[str, ...] = ()
-    # Parser-derived records of malformed sub-item content (#958).
     sub_item_degradations: tuple["ParseDegradation", ...] = ()
 
 
@@ -7349,7 +7349,7 @@ def parse_structured_pr_review(
             "same_pr_followups",
             "future_followups",
             "architecture_impact",
-            "exact_head_evidence_requests",
+            "exact_head_evidence_requests", "screenshot_requests", "screenshot_coverage_acceptances",
         },
     )
     state = _expect_state(payload["state"], context="pr_review.state")  # shape-check: fatal:no-conservative-reading
@@ -7407,9 +7407,10 @@ def parse_structured_pr_review(
         architecture_impact_degradations=architecture_impact_degradations,
         sub_item_degradations=tuple(sub_item_degradations),
     )
-    if not evidence_requests:
-        return parsed
-    return dataclasses.replace(parsed, exact_head_evidence_requests=evidence_requests)
+    from .review_images_coverage import parse_fields
+    typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
+    return dataclasses.replace(parsed, exact_head_evidence_requests=evidence_requests,
+                               screenshot_requests=typed, screenshot_coverage_acceptances=votes)
 
 
 def _expect_evidence_request_list(

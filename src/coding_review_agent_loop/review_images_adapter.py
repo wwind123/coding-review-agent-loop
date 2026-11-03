@@ -84,11 +84,13 @@ def _acquire(runner, config, prompt, images, *, provider, role, session_id,
                                  stdin_log_summary=f"[immutable image acquisition {images.binding.acquisition_id}; payload redacted]",
                                  timeout_seconds=timeout_seconds, containment_role="reviewer")
     ended = time.time()
+    from .review_images_usage import provider_usage
+    usage = provider_usage(provider, result.stdout)
     if result.containment is not None and result.containment.managed_cleanup_unconfirmed:
         sanitized = replace(result, stdout="", stderr="", capture_diagnostics=())
         return AgentResult(text="Image acquisition cleanup-failed: managed scope emptiness was not confirmed.",
                            raw_output="", message_text=None, returncode=result.returncode or 1,
-                           provider=provider, role="reviewer", log_path=log_path,
+                           provider=provider, role="reviewer", log_path=log_path, usage=usage,
                            command_result=sanitized)
     # On every failure exit only adapter-generated diagnostics leave this module.
     # Replay bytes stay in the private invocation log, never recovery candidates.
@@ -104,11 +106,11 @@ def _acquire(runner, config, prompt, images, *, provider, role, session_id,
     except (ValueError, OSError, KeyError, TypeError, AttributeError, UnicodeError):
         return AgentResult(text="Image acquisition lacks complete delivery/model evidence.",
                            raw_output="", message_text=None, returncode=result.returncode or 1,
-                           provider=provider, role="reviewer", log_path=log_path)
+                           provider=provider, role="reviewer", log_path=log_path, usage=usage)
     sanitized = replace(result, stdout=text, stderr="", capture_diagnostics=())
     return AgentResult(text=text, raw_output=text, message_text=text, session_id=proof.session_id,
                        log_path=log_path, returncode=result.returncode,
-                       provider=provider, role="reviewer", configured_model=invocation.configured_model,
+                       usage=usage, provider=provider, role="reviewer", configured_model=invocation.configured_model,
                        configured_effort=invocation.resolved_effort, effort_source=invocation.effort_source,
                        observed_model=invocation.configured_model,
                        observation_provenance=proof.model_evidence_source,

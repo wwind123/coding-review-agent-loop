@@ -216,6 +216,8 @@ def _resolve_usage_metadata(
 def _persist_usage_summary(config: AgentLoopConfig, usage_context: RunUsageContext) -> None:
     usage_context.write_summary()
     totals = usage_context.totals()
+    if config.review_images_paths or any(record.visual_kind is not None for record in usage_context.records):
+        log(config, usage_context.visual_summary_line())
     log(
         config,
         "Usage summary written to "
@@ -406,7 +408,7 @@ def _run_structured_repair(
         try:
             parsed = parse_response(repaired)
             if repair_kwargs.get("expected_kind") in {
-                "plan_revision_patch", "plan_review", "pr_review",
+                "plan_revision_patch", "plan_review", "pr_review", "screenshot-coverage",
             }:
                 validate_repair_preservation(
                     raw,
@@ -1138,6 +1140,10 @@ def _run_validated_agent(*args, **kwargs):
         if kwargs.get("image_inputs") is not None:
             from .review_images_validation import validate_image_turn
             return validate_image_turn(*args, run_agent=run_agent_result, **kwargs)
+        from .review_images_coverage_validation import validate_coverage_turn, guard_ordinary_validation
+        if kwargs.get("coverage_scope") is not None:
+            return validate_coverage_turn(*args, run_agent=run_agent_result, **kwargs)
+        guard_ordinary_validation(args[0] if args else kwargs["runner"], kwargs)
         return _run_validated_agent_in_scope(*args, **kwargs)
 
 

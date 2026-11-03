@@ -110,6 +110,10 @@ class UsageCallRecord:
     log_path: str | None = None
     fallback_planned: bool | None = None
     containment: dict[str, object] | None = None
+    visual_kind: str | None = None
+    visual_acquisition_id: str | None = None
+    visual_usage_provenance: str | None = None
+    image_payload_unknown: bool | None = None
     # Antigravity silent attempts (#1604): the agy CLI log located for it.
     agy_log_path: str | None = None
 
@@ -128,6 +132,7 @@ class UsageCallRecord:
             "backend", "role", "turn_role", "model", "configured_model", "configured_effort",
             "effort_source", "observed_model", "observed_effort", "observation_provenance",
             "outcome", "log_path", "fallback_planned", "containment", "agy_log_path",
+            "visual_kind", "image_payload_unknown", "visual_acquisition_id", "visual_usage_provenance",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -280,6 +285,17 @@ class RunUsageContext:
     def totals(self) -> UsageTotals:
         return accumulate_usage_totals(self.records)
 
+    def visual_totals(self):
+        return {kind: accumulate_usage_totals([record for record in self.records
+                    if record.visual_kind == kind]).to_dict()
+                for kind in ('image-assessment', 'requester-coverage')}
+
+    def visual_summary_line(self):
+        return 'Visual usage: ' + '; '.join(
+            f"{kind}: calls={totals['call_count']}, exact={totals['exact_calls']}, "
+            f"partial={totals['partial_calls']}, text estimates={totals['estimated_calls']}"
+            for kind, totals in self.visual_totals().items()) + '; unreported image payload cost is unknown'
+
     def per_agent_totals(self) -> dict[str, UsageTotals]:
         agent_records: dict[str, list[UsageCallRecord]] = {}
         for record in self.records:
@@ -361,6 +377,7 @@ class RunUsageContext:
             "per_agent": {
                 agent: totals.to_dict() for agent, totals in self.per_agent_totals().items()
             },
+            "visual": self.visual_totals(),
             "calls": [record.to_dict() for record in self.records],
         }
 

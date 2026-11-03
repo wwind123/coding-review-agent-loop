@@ -41,7 +41,7 @@ def scoped_validator(validate, *, scopes, reviewer, items):
         parsed = validate(text)
         if any(d.item_id not in allowed for d in parsed.dispositions):
             raise AgentLoopError("Evidence-only review disposition is outside the assigned findings")
-        if parsed.exact_head_evidence_requests:
+        if parsed.exact_head_evidence_requests or parsed.screenshot_requests or parsed.screenshot_coverage_acceptances:
             raise AgentLoopError("Evidence-only review cannot create machine evidence obligations")
         for item in (*parsed.blocking_items, *parsed.followups.same_pr):
             if not item.evidence_row_ids or not set(item.evidence_row_ids) <= set(scope["rows"]):

@@ -65,7 +65,7 @@ def validate_visual(text, *, reviewer, items):
         raise AgentLoopError('Visual dispositions must name exactly the assigned findings')
     parsed = _validate_review_response(text, reviewer=reviewer, unresolved_items=items,
                                       architecture_status_mode='strict', include_visual=True)
-    if parsed.exact_head_evidence_requests or any(
+    if parsed.exact_head_evidence_requests or parsed.screenshot_requests or parsed.screenshot_coverage_acceptances or any(
             getattr(item, 'evidence_row_ids', ()) for item in
             (*parsed.blocking_items, *parsed.followups.same_pr, *parsed.followups.future)):
         raise AgentLoopError('Visual assessment cannot request screenshot or matrix coverage')
@@ -146,6 +146,7 @@ class VisualOutcome:
     stale: bool = False
     lifecycle: dict | None = None
     fresh: bool = False
+    coverage: dict | None = None
 
 
 class VisualRun:
@@ -182,7 +183,7 @@ class VisualRun:
                 return None
         return self.reasons.get(head, 'the durable visual opportunity is spent; use a new head with changed images and an explicit assessment disposition, or an explicit human decision')
 
-    def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic, round_number=1):
+    def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic, round_number=1, usage_context=None):
         if not config.review_images_paths or config.dry_run:
             return VisualOutcome(diagnostic='disabled')
         head = metadata.head_sha
@@ -234,7 +235,9 @@ class VisualRun:
                                    assigned=[list(share) for share in owner_shares(assigned, name)])
                     if current_head() != head:
                         return VisualOutcome(stale=True)
-                    persist_lifecycle(runner, config, metadata, binding, round_number=round_number)
+                    coverage = coverage_attachment(snapshots, binding, config, metadata.number,
+                        proof=admission.original[1]["proof"], source_id=admission.original[0], diagnostic=diagnostic)
+                    persist_lifecycle(runner, config, metadata, binding, round_number=round_number, coverage=coverage)
                     if current_head() != head:
                         return VisualOutcome(stale=True)
                     self.reasons[head] = 'unchanged images reused from a durable assessment; no coder opportunity'
@@ -256,7 +259,7 @@ class VisualRun:
                         prompt=prompt, role='reviewer', session_id=None, timeout_seconds=300,
                         label='visible-defects', image_inputs=images,
                         validate=lambda text: validate_visual(text, reviewer=name, items=assigned),
-                        use_repair=False)
+                        use_repair=False, usage_context=usage_context)
                 if current_head() != head:
                     return VisualOutcome(stale=True)
                 if response.acquisition_outcome != 'success':
@@ -265,9 +268,11 @@ class VisualRun:
                 from .review_images_state import digest
                 binding.update(kind='result', intent_id=intent.comment_id,
                                proof=digest(asdict(response.image_delivery_proof)))
+                coverage = coverage_attachment(snapshots, binding, config, metadata.number,
+                    proof=binding['proof'], diagnostic=diagnostic)
                 return VisualOutcome(response, parsed, {'version': 1, 'kind': 'visible-defects',
                                                        'head': head, 'seat': name},
-                                     lifecycle=binding)
+                                     lifecycle=binding, coverage=coverage)
         except HumanDecisionRequiredError:
             raise
         except StaleDispatchInputs:
@@ -313,13 +318,17 @@ def admitted_visual_history(runner, config, pr_number, comments):
     from .pr_loop_support import _authenticated_pr_comments_status
     from .round_state import _recovery_record_admitted, _extract_round_metadata_records
     from .review_images_state import History
+    from .review_scope import coverage_candidate
     comments, actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments, resume=False)
     records = _extract_round_metadata_records(comments, flow="pr")
     if not complete and any(visual_candidate(r.metadata) and (r.metadata.prior_items or r.metadata.new_items)
                             for r in records):
         raise AgentLoopError('Visual finding history cannot be authenticated; complete identity data is required.')
-    return History((record for record in records if not visual_candidate(record.metadata)
+    return History((record for record in records if not (visual_candidate(record.metadata) or coverage_candidate(record.metadata)
+                            or record.metadata.screenshot_requests or record.metadata.screenshot_coverage_acceptances
+                            or record.metadata.screenshot_receipt_refs
+                            or any(item.screenshot_request for item in (*record.metadata.prior_items, *record.metadata.new_items)))
                     or _recovery_record_admitted(record, comments, actor)),
                    identities={record.index: getattr(comments[record.index], 'comment_id', None)
                                for record in records}, complete=complete,
@@ -404,7 +413,7 @@ def load_history(runner, config, pr_number):
     return admitted_visual_history(runner, config, pr_number, context.comments)
 
 
-def persist_lifecycle(runner, config, metadata, binding, *, round_number=1):
+def persist_lifecycle(runner, config, metadata, binding, *, round_number=1, coverage=None):
     from .github import resolve_authenticated_github_actor, post_verified_trusted_pr_protocol_comment_observed
     from .round_state import PostedRoundMetadata, _attach_round_metadata
     actor = resolve_authenticated_github_actor(runner, config=config)
@@ -412,7 +421,7 @@ def persist_lifecycle(runner, config, metadata, binding, *, round_number=1):
     scope = {'version': 1, 'kind': 'visible-defects', 'head': metadata.head_sha, 'seat': binding['seat']}
     m = PostedRoundMetadata(flow='pr', role='visual-' + binding['kind'], agent=binding['seat'],
         round_number=round_number, subject=metadata.head_sha, review_scope=scope, visual_lifecycle=binding,
-        seat_binding=reviewer_seat_binding(config))
+        seat_binding=reviewer_seat_binding(config), screenshot_coverage=coverage)
     from .review_images_state import validate
     from .round_state import PostedRoundRecord
     validate(PostedRoundRecord(0, m, ''), repo=config.repo, pr=metadata.number)
@@ -451,7 +460,7 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
                 PostedRoundMetadata(flow='pr', role='reviewer', agent=name, round_number=round_number,
                     subject=metadata.head_sha, prior_items=tuple(prior), dispositions=parsed.dispositions,
                     new_items=tuple(new), state=parsed.state, review_scope=outcome.scope,
-                    visual_lifecycle=outcome.lifecycle, phase='visual', seat_binding=seat_binding,
+                    visual_lifecycle=outcome.lifecycle, screenshot_coverage=outcome.coverage, phase='visual', seat_binding=seat_binding,
                     **_metadata_identity_fields(outcome.response), acquisition_outcome='success', acquisition_returncode=0)))
     except (AgentLoopError, OSError, ValueError, subprocess.SubprocessError) as exc:
         diagnostic('Visual publication unknown; durable intent remains spent: ' + str(exc)[:1024])
@@ -489,3 +498,14 @@ def _cache_paths(runner, config, metadata, paths):
     if not hasattr(runner, '_visual_boundary_paths'):
         runner._visual_boundary_paths = {}
     runner._visual_boundary_paths[(config.repo, metadata.number, metadata.head_sha)] = paths
+
+
+def coverage_attachment(snapshots, binding, config, pr, *, proof, source_id=None, diagnostic=lambda _: None):
+    from .review_images_coverage_cache import persist
+    from .review_images_coverage_history import envelope
+    try:
+        attachment = persist(snapshots, binding, proof=proof, source_id=source_id)
+        return envelope('attachment', config, pr, snapshots.head_sha, {'attachment': attachment})
+    except (AgentLoopError, OSError, ValueError) as exc:
+        diagnostic('Screenshot coverage attachment unavailable: ' + str(exc)[:512])
+        return None

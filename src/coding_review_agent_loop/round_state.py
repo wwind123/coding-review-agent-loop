@@ -352,6 +352,10 @@ class PostedRoundMetadata:
     # The freeze/release payloads and head-scoped clearances ride only on the
     # orchestrator's single freeze or release comment.  All are omitted from
     # the encoding when empty so historical records stay byte-stable.
+    screenshot_requests: tuple[dict, ...] = ()
+    screenshot_coverage_acceptances: tuple[dict, ...] = ()
+    screenshot_coverage: object = None
+    screenshot_receipt_refs: tuple[int, ...] = ()
     evidence_requests: tuple[str, ...] = ()
     evidence_freeze: "EvidenceFreezeRecord | None" = None
     evidence_release: "EvidenceReleaseRecord | None" = None
@@ -1398,7 +1402,7 @@ EVIDENCE_TERMINAL_PHASES = frozenset({EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PH
 # post-conversion ledger and the audit, and is written before any dispatch.
 EVIDENCE_CONVERSION_PHASE = "evidence-conversion"
 EVIDENCE_RELEASE_REASONS = frozenset(
-    {"evidence-cleared", "findings", "machine-gate", "refresh-clean"}
+    {"evidence-cleared", "findings", "machine-gate", "refresh-clean", "screenshot-coverage"}
 )
 
 
@@ -1603,6 +1607,8 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
     # re-encode byte-identically.
     if item.provenance is not None:
         payload["provenance"] = item.provenance
+    if item.screenshot_request is not None:
+        payload["screenshot_request"] = item.screenshot_request
     if item.origin_scope is not None:
         payload["origin_scope"] = item.origin_scope
     if item.repeat_of is not None:
@@ -1816,7 +1822,8 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
             obligation_identity=payload.get("obligation_identity"),
         )
         try:
-            item = UnresolvedReviewItem(**core, **machine, **_deserialize_converted_row(payload))
+            item = UnresolvedReviewItem(**core, **machine, **_deserialize_converted_row(payload),
+                screenshot_request=payload.get("screenshot_request"))
             # ``None`` is a valid default for the in-memory dataclass, but a
             # serialized record that contains machine keys and no usable
             # machine value is still a machine-shaped record.  Preserve it as
@@ -1848,6 +1855,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         provenance=_deserialize_item_provenance(payload),
         repeat_of=_deserialize_repeat_of(payload),
         origin_scope=payload.get("origin_scope"),
+        screenshot_request=payload.get("screenshot_request"),
     )
 
 
@@ -2448,6 +2456,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             if isinstance(metadata.qualification_checkpoint, QualificationCheckpoint)
             else metadata.qualification_checkpoint
         )
+    from .review_images_coverage_history import encode_fields
+    payload.update(encode_fields(metadata))
     if metadata.evidence_requests:
         payload["evidence_requests"] = list(metadata.evidence_requests)
     if metadata.evidence_freeze is not None:
@@ -2741,6 +2751,8 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
     decodes as an invalid record that recovery turns into a blocker.
     """
     fields: dict[str, object] = {}
+    from .review_images_coverage_history import decode_fields
+    fields.update(decode_fields(payload))
     if "evidence_requests" in payload:
         requests = _decode_string_list(payload["evidence_requests"])
         if requests is None:
@@ -3344,6 +3356,7 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.obligation_identity,
             # Preserve legacy digests while distinguishing visual ownership.
             *((('origin_scope', item.origin_scope),) if item.origin_scope is not None else ()),
+            *((('screenshot_request', repr(item.screenshot_request)),) if item.screenshot_request is not None else ()),
             # Appended only for items with sub-items, so a legacy item keeps
             # its pre-#958 signature tuple exactly.
             *(

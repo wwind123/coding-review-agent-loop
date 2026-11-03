@@ -6,12 +6,10 @@ into a bounded code-review loop with explicit evidence, resumable state, and
 optional CI qualification and merge. It is not a hosted agent service or a
 model API gateway.
 
-This file is the root overview of the architecture set: the component map,
-system-wide invariants, the main flows, and an index of the detail documents
-under `docs/architecture/`. Start with the [README](README.md) for installation
-and examples; use the [CLI guide](docs/local_agent_loop.md) for exact options,
-schemas, and recovery contracts. Diagrams in the detail documents show responsibility and
-data flow, not a strictly enforced Python import hierarchy.
+This overview links the component details under `docs/architecture/`. See the
+[README](README.md) for installation and the [CLI guide](docs/local_agent_loop.md)
+for options, schemas and recovery. Diagrams show responsibility and data flow,
+not enforced Python import hierarchy.
 
 ## Component map
 
@@ -33,7 +31,7 @@ document holds the full description.
 | CI and merge gates | Interpret the check board, qualify exact heads, guard merges. | `checks.py`, `ci_health.py`, `managed_ci.py`, `managed_ci_recovery_commands.py`, `managed_ci_intent_validation.py`, `coder_ci_guard.py` | [managed CI and merge](docs/architecture/managed-ci-and-merge.md) |
 | Checkouts and process execution | Per-run worktrees, the Git boundary, containment, test workers. | `run_worktrees.py`, `worktree_link_integrity.py`, `secure_git.py`, `git_transport.py`, `runner.py`, `containment.py`, `test_workers.py` | [execution and concurrency](docs/architecture/execution-and-concurrency.md) |
 | Architecture and prompt context | Render issue, plan, feedback and bounded advisory architecture context. | `prompts.py`, `prompt_context.py`, `memory.py`, `architecture_context.py`, `architecture_contract.py` | [testing and doc maintenance](docs/architecture/testing-and-doc-maintenance.md) |
-| Visual review | Opt-in exact-head visible-defects acquisition with independent code authority. | `review_images.py`, `review_scope.py`, `review_images_capture.py`, `review_images_transport.py` | [execution](docs/architecture/execution-and-concurrency.md) |
+| Visual review | Opt-in exact-head visible-defects acquisition with independent code authority. | `review_images.py`, `review_images_coverage_run.py`, `review_images_usage.py` | [execution](docs/architecture/execution-and-concurrency.md) |
 | Local evidence, history and triage | Test evidence, salvage, usage, history export and advisory triage. | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `history_export.py`, `triage.py` | [components](docs/architecture/components.md) |
 
 ## System-wide invariants
@@ -67,6 +65,7 @@ document holds the full description.
   reconciles findings, and the coder addresses feedback and CI failures until
   the required reviews are satisfied or a bounded stop applies. See
   [findings and convergence](docs/architecture/findings-and-convergence.md).
+- **Screenshot coverage.** Bounded requester acceptance binds screenshot obligations to current-head visual reports. See [evidence](docs/architecture/findings-and-convergence.md).
 - **Managed CI.** A reviewed candidate receives an authenticated exact-head
   workflow dispatch, and qualification requires correlated exact-head evidence
   before a head-guarded merge. See
