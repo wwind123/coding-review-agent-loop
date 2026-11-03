@@ -87,6 +87,18 @@ def select_coder_followup_items(
     )
 
 
+def excluded_coder_followup_item_ids(
+    items: Sequence[UnresolvedReviewItem],
+) -> tuple[str, ...]:
+    """Trusted records owned by evidence, publication or provenance paths."""
+    return tuple(
+        item.item_id for item in items
+        if _is_evidence_obligation(item)
+        or item.status == "future"
+        or item.is_inert_ledger_record
+    )
+
+
 def coder_followup_is_ci_repair(
     coder_followup_items: Sequence[UnresolvedReviewItem],
 ) -> bool:
@@ -1179,21 +1191,21 @@ def _validate_structured_coder_followup_items(
     unresolved_items: Sequence[UnresolvedReviewItem],
     optional_item_ids: Sequence[str] = (),
     resolved_item_ids: Sequence[str] = (),
+    excluded_item_ids: Sequence[str] = (),
 ) -> StructuredCoderFollowup:
-    # ``optional_item_ids`` are retained future follow-ups outside this
-    # dispatch (#1389): a coder may still list them, but never has to.
+    # Optional membership is valid only without trusted ledger exclusion proof.
     # ``resolved_item_ids`` is the orchestrator's fail-closed proof of items
     # already canonically resolved (#1388).  Listing one as addressed asserts
     # nothing new, so it is dropped with a diagnostic instead of rejected;
     # listing one as remaining or disputed is still an unknown ID.
+    excluded = set(excluded_item_ids) | set(excluded_coder_followup_item_ids(unresolved_items))
     allowed_ids = [
         *(item.item_id for item in select_coder_followup_items(unresolved_items)),
-        *optional_item_ids,
+        *(item_id for item_id in optional_item_ids if item_id not in excluded),
     ]
     # The caller supplies the dispatch-specific item set that was rendered in
     # the prompt. Every selected item is therefore required in the coder's
-    # addressed/remaining/disputed partition.  Retained future work is never
-    # selected (#1389); it is only accepted through ``optional_item_ids``.
+    # addressed/remaining/disputed partition. Excluded records are never required.
     required_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
@@ -1202,8 +1214,23 @@ def _validate_structured_coder_followup_items(
             "Coder follow-up listed unresolved reviewer item IDs more than once: "
             + ", ".join(duplicates)
         )
-    allowed = set(allowed_ids)
-    droppable = set(resolved_item_ids) - allowed
+    dropped_excluded = tuple(
+        item_id for item_id in (*parsed.addressed_items, *parsed.remaining_items)
+        if item_id in excluded
+    )
+    if dropped_excluded:
+        parsed = replace(
+            parsed,
+            addressed_items=tuple(i for i in parsed.addressed_items if i not in excluded),
+            remaining_items=tuple(i for i in parsed.remaining_items if i not in excluded),
+            addressed_item_notes={i: n for i, n in parsed.addressed_item_notes.items() if i not in excluded},
+            remaining_item_notes={i: n for i, n in parsed.remaining_item_notes.items() if i not in excluded},
+            addressed_sub_items=tuple(i for i in parsed.addressed_sub_items if i.split(".", 1)[0] not in excluded),
+            dropped_excluded_items=dropped_excluded,
+        )
+        listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
+    allowed = set(allowed_ids) - excluded
+    droppable = set(resolved_item_ids) - allowed - excluded
     dropped = tuple(item_id for item_id in parsed.addressed_items if item_id in droppable)
     if dropped:
         dropped_set = set(dropped)
@@ -1256,6 +1283,7 @@ def _validate_coder_followup_response(
     architecture_status_mode: str,
     optional_item_ids: Sequence[str] = (),
     resolved_item_ids: Sequence[str] = (),
+    excluded_item_ids: Sequence[str] = (),
     test_observations_mode: str = "degrade",
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
@@ -1286,6 +1314,7 @@ def _validate_coder_followup_response(
             unresolved_items=unresolved_items,
             optional_item_ids=optional_item_ids,
             resolved_item_ids=resolved_item_ids,
+            excluded_item_ids=excluded_item_ids,
         )
         validate_human_requirement_dispositions(
             structured_followup.human_requirement_dispositions,

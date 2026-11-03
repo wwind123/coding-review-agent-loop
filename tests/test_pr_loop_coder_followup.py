@@ -2797,3 +2797,91 @@ def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monke
     assert len(_m1034_coder_comments(runner)) == 1
     assert len(runner.codex_outputs) == 1
     assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 2
+
+
+@pytest.mark.parametrize("dispatch", ["ordinary", "same-pr", "conflict"])
+@pytest.mark.parametrize("repair_future", [False, True])
+def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatch, dispatch, repair_future):
+    from pr_loop_test_helpers import _evidence_review, _EVIDENCE_TEXT, _pr_records
+    from coding_review_agent_loop.round_state import _serialize_unresolved_item, _deserialize_unresolved_item
+
+    first = _evidence_review(state="blocking", blocking=["Fix src/a.py:10."], evidence=[_EVIDENCE_TEXT])
+    final = _evidence_review(state="blocking", evidence=[_EVIDENCE_TEXT], dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": "Still needs a regression."},
+        {"item_id": "item-2", "disposition": "blocking", "note": "Still required at final head."},
+    ])
+    kwargs = {}
+    if dispatch == "conflict":
+        kwargs["mergeability_payloads"] = [
+            {"mergeable": value, "mergeStateStatus": state,
+             "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"}
+            for value, state in [("MERGEABLE", "CLEAN"), ("CONFLICTING", "DIRTY")]
+        ]
+    coder = structured_coder_followup(
+        addressed_items=["item-1"], remaining_items=["item-2"],
+        remaining_item_notes={"item-2": "Deferred exact-head human evidence."},
+        tests_run=["python -m pytest tests/test_example.py"],
+    )
+    runner = FakeRunner(codex_outputs=[first, final], claude_outputs=[coder, coder], **kwargs)
+    config = make_config(tmp_path, max_rounds=2, approved_followups="fix-and-issue")
+    # Same-PR work takes the dedicated follow-up dispatch.
+    if dispatch == "same-pr":
+        raw = _evidence_review(state="blocking", evidence=[_EVIDENCE_TEXT])
+        end = raw.index("\n<!-- AGENT_STATE:")
+        payload = json.loads(raw[:end])
+        payload["same_pr_followups"] = ["Fix src/a.py:10."]
+        runner.codex_outputs = [json.dumps(payload) + raw[end:], final]
+    logs = []
+    monkeypatch.setattr(pr_loop, "log", lambda config, message: logs.append(message))
+    repair_calls = []
+    if not repair_future:
+        import coding_review_agent_loop.validated_agent as validated_module
+        def unexpected_repair(*args, **kwargs):
+            pytest.fail("Excluded remaining evidence must not invoke repair")
+        monkeypatch.setattr(validated_module, "attempt_repair", unexpected_repair)
+    if repair_future:
+        coder = coder.replace("item-2", "item-3")
+        import coding_review_agent_loop.repair as repair_module
+        import coding_review_agent_loop.validated_agent as validated_module
+        from unittest.mock import patch, MagicMock
+        final = final.replace('"item_id": "item-2", "disposition": "blocking"', '"item_id": "item-2", "disposition": "future"')
+        end = final.index("\n<!-- AGENT_STATE:")
+        payload = json.loads(final[:end])
+        payload["prior_item_dispositions"].append({"item_id": "item-3", "disposition": "blocking", "note": "Evidence still pending."})
+        runner.codex_outputs[1] = json.dumps(payload) + final[end:]
+        raw = runner.codex_outputs[0]
+        end = raw.index("\n<!-- AGENT_STATE:")
+        payload = json.loads(raw[:end])
+        payload["future_followups"] = ["Later cache locking work."]
+        runner.codex_outputs[0] = json.dumps(payload) + raw[end:]
+        end = coder.index("\n<!-- AGENT_STATE:")
+        payload = json.loads(coder[:end])
+        payload["disputed_items"] = ["item-2"]
+        payload["dispute_evidence"] = {"item-2": "Future work is unnecessary."}
+        runner.claude_outputs = [json.dumps(payload) + "\nUnrelated malformed prose.\n" + coder[end:]] * 2
+        real_repair = repair_module.attempt_repair
+
+        def repair(raw, command, **kwargs):
+            repair_calls.append(kwargs)
+            with patch.object(repair_module.subprocess, "run", return_value=MagicMock(returncode=0, stdout=coder)) as call:
+                result = real_repair(raw, command, **kwargs)
+            prompt = call.call_args.args[0]
+            prompt = prompt[prompt.index("--prompt") + 1]
+            assert "## Optional coder follow-up item IDs:" not in prompt
+            assert "complete set of valid IDs" in prompt
+            return result
+        monkeypatch.setattr(validated_module, "attempt_repair", repair)
+    with pytest.raises(AgentLoopError, match="final barrier"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    if repair_future:
+        assert repair_calls and all(call["unresolved_item_ids"] == ("item-1",) for call in repair_calls)
+        assert all(not call.get("optional_item_ids") for call in repair_calls)
+    records = _pr_records(runner)
+    coder_records = [record for record in records if record.metadata.role == "coder"]
+    assert coder_records
+    assert any("python -m pytest tests/test_example.py" in record.body for record in coder_records)
+    evidence = [item for record in records for item in record.metadata.prior_items
+                if item.obligation_kind == "human-exact-head-evidence"]
+    assert evidence and all(item.lifecycle != "cleared" for item in evidence)
+    assert all(_deserialize_unresolved_item(_serialize_unresolved_item(item)) == item for item in evidence)
+    assert "listed excluded ledger item(s) " + ("item-3" if repair_future else "item-2") in "\n".join(logs)

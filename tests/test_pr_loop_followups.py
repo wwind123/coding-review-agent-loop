@@ -2017,8 +2017,8 @@ def test_merge_conflict_handoff_omits_retained_future_followup_and_still_files_i
         # conflict handoff carries item-1 and the retained future item-2.  The
         # coder omits item-2 entirely and the response must validate.
         claude_outputs=[
-            structured_coder_followup(addressed_items=["item-1"]),
-            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
         ],
         mergeability_payloads=[
             {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
@@ -2052,7 +2052,7 @@ def test_merge_conflict_handoff_omits_retained_future_followup_and_still_files_i
     ["general", "same-pr", "merge-conflict"],
 )
 def test_every_coder_handoff_excludes_retained_future_items(dispatch):
-    """One rule for every coder dispatch: future items are optional, never required."""
+    """Ledger-proven future items are dropped on every coder dispatch."""
     from coding_review_agent_loop.unresolved_items import (
         MERGE_CONFLICT_ITEM_ID,
         _validate_structured_coder_followup_items,
@@ -2082,9 +2082,11 @@ def test_every_coder_handoff_excludes_retained_future_items(dispatch):
         )
 
     _validate_structured_coder_followup_items(parsed(["item-1"]), unresolved_items=ledger)
-    _validate_structured_coder_followup_items(
+    normalized = _validate_structured_coder_followup_items(
         parsed(["item-1", "item-2"]), unresolved_items=ledger, optional_item_ids=("item-2",)
     )
+    assert normalized.addressed_items == ("item-1",)
+    assert normalized.dropped_excluded_items == ("item-2",)
 
 
 def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):

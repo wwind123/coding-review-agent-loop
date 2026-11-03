@@ -1531,7 +1531,7 @@ def validate_repair_preservation(
             )
 
     if source["kind"] == "coder_followup":
-        # Required plus retained-future optional IDs are valid (#1388).
+        # Required plus provenance-filtered optional IDs are valid (#1388).
         allowed_item_ids = (
             {*unresolved_item_ids, *optional_item_ids}
             if unresolved_item_ids is not None

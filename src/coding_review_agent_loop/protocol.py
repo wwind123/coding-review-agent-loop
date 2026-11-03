@@ -1309,6 +1309,7 @@ class StructuredCoderFollowup:
     # Orchestrator-derived, never parsed: addressed_items IDs that ledger
     # history proves were already resolved, dropped by validation (#1388).
     dropped_resolved_addressed_items: tuple[str, ...] = ()
+    dropped_excluded_items: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
