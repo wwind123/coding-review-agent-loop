@@ -123,7 +123,7 @@ def test_plain_pr_head_mismatch_keeps_checkout_head(repositories, tmp_path):
     git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "moved")
     git(seed, "push", "-q", str(origin), "HEAD:refs/pull/7/head")
     config = make_config(tmp_path, claude_dir=checkout, trusted_local_origin=origin)
-    with pytest.raises(AgentLoopError, match="advertises head SHA"):
+    with pytest.raises(AgentLoopError, match="stale pull ref"):
         sync_checkout_to_pr(
             config, Runner(), path=checkout, label="Default claude workdir",
             default_owned=True, pr_number=7, pr_metadata=SimpleNamespace(head_sha=previous),

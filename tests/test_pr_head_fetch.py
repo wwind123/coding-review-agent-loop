@@ -22,14 +22,16 @@ def observation():
                 head=dict(repo=dict(full_name="Owner/Repo"), ref="topic", sha=SHA))
 
 
-@pytest.fixture
-def policy(tmp_path, monkeypatch):
+@pytest.fixture(params=["missing", "stale"])
+def policy(tmp_path, monkeypatch, request):
     calls, reads = [], []
     config = SimpleNamespace(repo="OWNER/REPO", gh_cmd="gh", trusted_local_origin=None)
 
     def fetch(destination, source, tracking, **kwargs):
         calls.append((source, kwargs))
         if len(calls) == 1:
+            if request.param == "stale":
+                return "b" * 40
             raise git_transport.TransportFailure("missing", label="remote ref missing")
         return kwargs["expected_sha"]
 
@@ -101,7 +103,10 @@ def test_invalid_review_metadata_refuses_without_api(policy, tmp_path, updates):
     assert not policy.reads and len(policy.calls) == 1
 
 
-def test_optional_metadata_callers_fail_closed(policy, tmp_path):
+def test_optional_metadata_callers_fail_closed(policy, tmp_path, monkeypatch):
+    def missing(*args, **kwargs):
+        raise git_transport.TransportFailure("missing", label="remote ref missing")
+    monkeypatch.setattr(git_transport, "import_ref", missing)
     with pytest.raises(AgentLoopError):
         pr_head_fetch.fetch_pr_head(tmp_path, 7, config=policy.config, runner=Runner())
     assert not policy.reads
@@ -131,3 +136,29 @@ def test_malformed_api_json_refuses(policy, tmp_path, monkeypatch):
         run(policy, tmp_path)
     assert "SECRET" not in str(caught.value)
     assert len(policy.calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "transport", "categorized"])
+def test_stale_recovery_rejection_is_fatal_and_safe(policy, tmp_path, monkeypatch, failure):
+    from coding_review_agent_loop.errors import AgentInvocationError
+
+    def fetch(destination, source, tracking, **kwargs):
+        if source == "refs/pull/7/head":
+            return "b" * 40
+        if failure == "transport":
+            raise git_transport.TransportFailure("SECRET", label="network or timeout")
+        if failure == "categorized":
+            raise AgentInvocationError("safe recovery cause", failure_category="transient")
+        raise AgentLoopError("Trusted fetch differs from expected PR head SHA; refusing import.")
+
+    monkeypatch.setattr(git_transport, "import_ref", fetch)
+    with pytest.raises(AgentLoopError) as caught:
+        run(policy, tmp_path)
+    assert type(caught.value) is AgentLoopError
+    assert getattr(caught.value, "failure_category", None) is None
+    message = str(caught.value)
+    assert f"stale pull ref: refs/pull/7/head at {'b' * 40}, PR head {SHA}" in message
+    assert "branch recovery failed" in message
+    assert "SECRET" not in message
+    assert {"transport": "network or timeout", "categorized": "safe recovery cause",
+            "mismatch": "differs from expected"}[failure] in message

@@ -205,7 +205,8 @@ def prepare(config, runner):
         ensure_agent_workdirs(config, runner)
 
 
-def test_concurrent_default_runs_use_distinct_worktrees(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stale", [False, True])
+def test_concurrent_default_runs_use_distinct_worktrees(tmp_path, monkeypatch, stale):
     env = Env(tmp_path, monkeypatch)
     old_sha = git(env.seed, "rev-parse", "HEAD")
     proc_a, paths_a = env.child()
@@ -251,16 +252,23 @@ def test_concurrent_default_runs_use_distinct_worktrees(tmp_path, monkeypatch):
                     other = run_worktrees.pin_pr_head(store, 7, config=config_b, runner=Runner())
                     assert other == advanced
 
-            env.set_pr_head(7, pinned)
+            env.set_pr_head(7, old_sha if stale else pinned)
+            git(env.bare, "update-ref", "refs/heads/topic", pinned)
+            from coding_review_agent_loop import pr_head_fetch
+            monkeypatch.setattr(pr_head_fetch, "run_gh_read", lambda *a, **kw:
+                SimpleNamespace(returncode=0, stdout=json.dumps(dict(
+                    number=7, state="open", base=dict(ref="main", repo=dict(full_name="OWNER/REPO")),
+                    head=dict(ref="topic", sha=pinned, repo=dict(full_name="OWNER/REPO"))))))
             pausing = RecordingRunner(hook=advance)
             sync_checkout_to_pr(
                 config_b, pausing, path=b_path, label="Default claude workdir",
-                default_owned=True, pr_number=7, pr_metadata=SimpleNamespace(head_sha=pinned),
+                default_owned=True, pr_number=7, pr_metadata=SimpleNamespace(
+                    number=7, repo="OWNER/REPO", head_branch="topic", base_branch="main", head_sha=pinned),
             )
             assert git(b_path, "rev-parse", "HEAD") == pinned
             # Without interleaving, an advertised head that differs from the pin still errors.
             before = git(b_path, "rev-parse", "HEAD")
-            with pytest.raises(AgentLoopError, match="advertises head SHA"):
+            with pytest.raises(AgentLoopError, match="stale pull ref"):
                 sync_checkout_to_pr(
                     config_b, Runner(), path=b_path, label="Default claude workdir",
                     default_owned=True, pr_number=7, pr_metadata=SimpleNamespace(head_sha=pinned),
@@ -1259,8 +1267,9 @@ def test_terminal_salvage_patch_survives_claimed_run_finalizer(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("layout", ["shared", "standalone"])
+@pytest.mark.parametrize("pull_state", ["missing", "stale", "matching"])
 @pytest.mark.parametrize("scenario", ["recover", "fork", "moved", "missing", "base-missing"])
-def test_missing_pull_ref_sync_is_bounded_and_preserves_checkout(tmp_path, monkeypatch, layout, scenario):
+def test_missing_pull_ref_sync_is_bounded_and_preserves_checkout(tmp_path, monkeypatch, layout, scenario, pull_state):
     from coding_review_agent_loop import pr_head_fetch
 
     env = Env(tmp_path, monkeypatch)
@@ -1279,6 +1288,9 @@ def test_missing_pull_ref_sync_is_bounded_and_preserves_checkout(tmp_path, monke
         before = git(path, "rev-parse", "HEAD")
         wanted = env.commit("b.txt", "review")
         git(env.bare, "update-ref", "refs/heads/topic", wanted)
+        if pull_state != "missing":
+            git(env.bare, "update-ref", "refs/pull/7/head",
+                wanted if pull_state == "matching" else before)
         tracking = "refs/remotes/origin/pr/7"
         git(store, "update-ref", tracking, before)
         (path / "sentinel.txt").write_text("keep until authorized")
@@ -1306,16 +1318,19 @@ def test_missing_pull_ref_sync_is_bounded_and_preserves_checkout(tmp_path, monke
         def sync():
             sync_checkout_to_pr(config, Runner(), path=path, label="test checkout",
                                 default_owned=True, pr_number=7, pr_metadata=meta)
-        if scenario == "recover":
+        if scenario == "recover" or (pull_state == "matching" and scenario != "base-missing"):
             sync()
             sync()
             assert git(path, "rev-parse", "HEAD") == wanted
             assert git(store, "rev-parse", tracking) == wanted
             assert not (path / "sentinel.txt").exists()
-            assert len(reads) == 2
+            assert len(reads) == (0 if pull_state == "matching" else 2)
         else:
-            with pytest.raises(AgentLoopError):
+            with pytest.raises(AgentLoopError) as caught:
                 sync()
+            if pull_state == "stale" and scenario != "base-missing":
+                assert f"refs/pull/7/head at {before}, PR head {wanted}" in str(caught.value)
+                assert getattr(caught.value, "failure_category", None) is None
             assert git(path, "rev-parse", "HEAD") == before
             assert git(store, "rev-parse", tracking) == before
             assert (path / "sentinel.txt").read_text() == "keep until authorized"

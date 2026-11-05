@@ -1716,3 +1716,77 @@ def test_candidate_fallback_requires_a_degradable_source_and_the_same_value_1626
         assert record.rule == _AFTER_REPAIR_RULE_1626
     else:
         assert isinstance(outcome, AgentLoopError), outcome
+
+
+@pytest.mark.parametrize("parallel,healthy", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("cause", ["fork", "transport"])
+def test_stale_sync_failure_reaches_cli_and_preserves_healthy_peer(
+    tmp_path, monkeypatch, capsys, parallel, healthy, cause,
+):
+    """Drive the real helper, reviewer settlement and CLI error boundary together."""
+    from coding_review_agent_loop import cli, git_transport, pr_head_fetch
+    from coding_review_agent_loop.errors import AgentInvocationError
+    from pathlib import Path
+
+    old, expected = "a" * 40, "b" * 40
+    runner = FakeRunner(
+        pr_payload={"number": 77, "state": "OPEN", "headRefOid": expected,
+                    "headRefName": "topic", "baseRefName": "main"},
+        git_head=expected,
+        codex_outputs=[structured_pr_review(summary="Recovered seat result.")],
+        gemini_outputs=[structured_pr_review(summary="Healthy peer result.", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
+    launches = []
+
+    def fetch(destination, source, tracking, **kwargs):
+        if source == "refs/pull/77/head":
+            return old
+        raise AgentInvocationError("safe recovery network failure", failure_category="transient")
+
+    real_import = git_transport.import_ref
+    monkeypatch.setattr(git_transport, "import_ref", fetch)
+    monkeypatch.setattr(pr_head_fetch, "run_gh_read", lambda *a, **kw:
+        SimpleNamespace(returncode=0, stdout=json.dumps(dict(
+            number=77, state="open", base=dict(ref="main", repo=dict(full_name=config.repo)),
+            head=dict(ref="topic", sha=expected, repo=dict(
+                full_name="FORK/REPO" if cause == "fork" else config.repo))))))
+
+    def sync(config, runner, reviewer, number, meta):
+        launches.append(reviewer)
+        if healthy and reviewer == "gemini":
+            return
+        pr_head_fetch.fetch_pr_head(Path(tmp_path), number, config=config, runner=runner,
+                                   pr_metadata=meta)
+
+    monkeypatch.setattr(pr_loop, "sync_reviewer_pr_before_review", sync)
+    monkeypatch.setattr(cli, "Runner", lambda **kw: runner)
+    monkeypatch.setattr(cli, "config_from_args", lambda *a, **kw: config)
+    assert cli.main(["pr", "77", "--repo", config.repo]) == 1
+    terminal = capsys.readouterr().err
+    assert f"stale pull ref: refs/pull/77/head at {old}, PR head {expected}" in terminal
+    assert ("could not be verified" if cause == "fork" else "safe recovery network failure") in terminal
+    assert launches == (["codex", "gemini"] if parallel else ["codex"])
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _ in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+    if healthy:
+        assert any(cmd[:1] == ["gemini"] for cmd, _ in runner.commands)
+        import stat
+        from coding_review_agent_loop.review_spool import review_spool_root
+        root = review_spool_root(config.agent_memory_dir)
+        mode = stat.S_IMODE(root.stat().st_mode)
+        root.chmod(0o700)
+        try:
+            assert any("Healthy peer result." in path.read_text() for path in root.rglob("*.json"))
+        finally:
+            root.chmod(mode)
+        assert not any("Healthy peer result." in body for body in runner.comments)
+        peer_calls = sum(cmd[:1] == ["gemini"] for cmd, _ in runner.commands)
+        monkeypatch.setattr(pr_loop, "sync_reviewer_pr_before_review", lambda *a, **kw: None)
+        monkeypatch.setattr(git_transport, "import_ref", real_import)
+        assert run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True) == 0
+        assert sum(cmd[:1] == ["gemini"] for cmd, _ in runner.commands) == peer_calls
+        assert any("Healthy peer result." in body for body in runner.comments)
+    else:
+        assert not any(cmd[:1] == ["gemini"] for cmd, _ in runner.commands)
+        assert not any("**Review verdict:** Approved" in body for body in runner.comments)

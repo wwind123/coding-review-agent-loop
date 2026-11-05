@@ -1115,16 +1115,35 @@ def test_loop_stuck_status_with_genuine_test_failure_routes_to_coder(tmp_path, m
     assert len(runner.claude_calls()) == 1
 
 
-def test_loop_dry_run_preview_never_reruns(tmp_path, monkeypatch, capsys):
-    runner = _approved_runner()
+@pytest.mark.parametrize("runner_factory", [FakeRunner, _approved_runner], ids=["ci-gate", "ci-watch"])
+@pytest.mark.parametrize("auto_merge", [False, True])
+@pytest.mark.parametrize("ci_status", ["success", "failure"])
+def test_loop_dry_run_preview_never_reruns(
+    tmp_path, monkeypatch, capsys, ci_status, auto_merge, runner_factory,
+):
+    runner = runner_factory(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")]
+    )
+    # The CLI sets both flags; preview must bypass real checkout verification.
+    config = _loop_config(tmp_path, dry_run=True, auto_merge=auto_merge)
+    runner.dry_run = config.dry_run
     _install_boards(
-        monkeypatch, snapshot=_board(_tests(), _publisher()), watcher=[_board(_tests(), _publisher())],
+        monkeypatch, snapshot=_board(_tests(), _publisher()),
+        watcher=[_board(_tests(ci_status), _publisher())],
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.pr_head_fetch.fetch_pr_head",
+        lambda *a, **k: pytest.fail("preview must not import or verify a PR head"),
     )
 
-    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path, dry_run=True)) == 0
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert runner.reruns == []
-    assert runner.claude_calls() == []
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert not any(cmd[:1] == ["sleep"] for cmd in commands)
+    assert not any(cmd[:1] == ["claude"] for cmd in commands)
+    assert not any(cmd[:3] == ["gh", "run", "rerun"] for cmd in commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in commands)
+    assert "dry-run preview did not perform live CI watching" in capsys.readouterr().out
 
 
 # -- Round-1 review fixes: job-listing verification, shared rerun budget, reporting --

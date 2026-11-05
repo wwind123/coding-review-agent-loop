@@ -39,17 +39,19 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
 
-**Missing PR head refs (`pr_head_fetch.py`, #1884).** Both sync layouts first
-import the pull head ref. Only `remote ref missing` permits one branch fallback.
-A bounded REST read must confirm an open PR with matching number, base/head
-branches, full review SHA and case-insensitive base/head repository identities.
-The validated branch uses only the configured origin; SHA equality is checked
-privately before object export or tracking-ref CAS. Forks, uncertain or changed
-metadata and metadata-less callers refuse before cleanup or checkout. Locks,
-immutable checkout and outer head checks remain unchanged; no recovery state is
-persisted. Missing-ref hints name only the validated requested ref, never stderr,
-and confirmed missing refs bypass HTTPS token lookup without changing other
-credential retries.
+**Missing or stale PR head refs (`pr_head_fetch.py`, #1884, #1887).** Both sync
+layouts first import the pull ref. Only a missing ref or SHA mismatch permits
+one branch fallback; matching refs need no API read. A bounded REST read must
+confirm an open PR, matching number, branches, full review SHA and
+case-insensitive base/head repository identities. The configured-origin branch
+must equal that SHA privately before export or tracking-ref CAS. Forks and
+uncertain metadata refuse before cleanup or checkout. Locks, immutable pins and
+outer head checks remain; no recovery state is persisted. Rejected stale recovery
+raises fatal `AgentLoopError` without a failure category, retaining the ref,
+observed/advertised SHAs and safe cause even for categorized transport failures.
+Parallel review retains healthy peers for resume before the CLI exits nonzero;
+failed seats never launch. Missing-ref hints name only the requested ref, never
+stderr, and bypass HTTPS token lookup without changing other credential retries.
 
 **Shared link source health (`worktree_link_integrity.py`, #1775).**
 

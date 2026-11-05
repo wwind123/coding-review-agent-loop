@@ -2102,26 +2102,6 @@ def test_watch_budget_exhaustion_stops_before_announcing_new_poll(
     assert sum("CI watch budget was exhausted" in line for line in capsys.readouterr().out.splitlines()) == 1
 
 
-def test_watch_dry_run_previews_without_poll_sleep_coder_or_merge(tmp_path, capsys):
-    runner = FakeRunner(
-        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")]
-    )
-    config = make_config(
-        tmp_path,
-        watch_pending_ci=True,
-        auto_merge=True,
-        dry_run=True,
-    )
-
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    commands = [cmd for cmd, _cwd in runner.commands]
-    assert not any(cmd[:1] == ["sleep"] for cmd in commands)
-    assert not any(cmd[:1] == ["claude"] for cmd in commands)
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in commands)
-    assert "dry-run preview did not perform live CI watching" in capsys.readouterr().out
-
-
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_disabled_watch_mode_preserves_manual_path_and_auto_merge_uses_full_board(
     tmp_path, monkeypatch, auto_merge
