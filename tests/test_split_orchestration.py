@@ -1450,7 +1450,8 @@ def test_plan_first_one_shot_selected_child_stale_canonical_record_raises(tmp_pa
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
-def test_plan_first_one_shot_selected_child_valid_canonical_record_resumes(tmp_path):
+@pytest.mark.parametrize("stale_failure", [False, True])
+def test_plan_first_one_shot_selected_child_valid_canonical_record_resumes(tmp_path, monkeypatch, stale_failure):
     """#589 item-1: a valid canonical record on the selected child resumes PR
     review directly (no coder call), taking priority over a present-but-stale
     old-style one-shot-handoff marker that points at a different PR."""
@@ -1500,6 +1501,19 @@ def test_plan_first_one_shot_selected_child_valid_canonical_record_resumes(tmp_p
         ],
     )
     config = make_config(tmp_path, materialize_split_issues=True)
+
+    if stale_failure:
+        import coding_review_agent_loop.pr_loop as pr_loop
+        message = f"stale pull ref: refs/pull/77/head at {'a' * 40}, PR head {'b' * 40}"
+        def fail_sync(*a, **kw):
+            raise AgentLoopError(message)
+        monkeypatch.setattr(pr_loop, "sync_reviewer_pr_before_review", fail_sync)
+        with pytest.raises(AgentLoopError, match=message):
+            run_issue_loop(runner, issue_number=56, config=config,
+                           plan_first=True, implement_after_approval=True)
+        assert not any(cmd[:1] == ["claude"] or cmd[:2] == ["codex", "exec"]
+                       or cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+        return
 
     assert (
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)

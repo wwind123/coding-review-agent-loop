@@ -55,3 +55,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - Retire Claude Code skill mode and delete its helpers, entry instructions, and exclusive tests; retain the standalone CLI and independently packaged REST shim. The operator owns the `skill-mode-final` archive tag; no old skill-session migration or replacement host backend is introduced (#1834, 2026-11-01).
 
 - Recover absent pull head refs in both pre-review sync layouts only through one same-repository branch import authorized by a bounded REST read and exact review SHA; reject mismatches before export or publication. Classify missing refs with a fixed label and validated-ref hint, bypassing unnecessary HTTPS token lookup; preserve locks, immutable checkout and existing head checks (#1884).
+- A stale pull ref uses the existing same-repository exact-SHA branch recovery; rejected recovery remains a fatal, diagnostic-preserving CLI error while parallel healthy results remain resumable (#1887).

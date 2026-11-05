@@ -8420,16 +8420,22 @@ runs the real Claude and Codex CLIs against these grants when
 
 Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Claude and Gemini prompts include a tool-owned response-file path under `/tmp/coding-review-agent-loop/responses/`; when the file exists and is non-empty, the loop validates and posts that file instead of stdout so CLI diagnostics and tool narration do not leak into GitHub comments. Gemini still supports stdout marker filtering as a fallback. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers when no response file was written. Fallback stdout is never posted unless the required protocol marker validates.
 
-### Missing PR head refs
+### Missing or stale PR head refs
 
 Pre-review sync tries `refs/pull/N/head` first. A `remote ref missing` failure
-names the validated requested ref. For an open same-repository PR only, the loop
+names the validated requested ref. A successful fetch whose SHA differs from the
+advertised PR head is a stale pull ref and uses the same recovery policy.
+For an open same-repository PR only, the loop
 can recover once through the head branch after a fresh API read confirms the
 repository identities, branch and expected review SHA. The fetched branch must
 still equal that SHA before publication. Forks, moved branches, API uncertainty
 and other transport failures stop the sync; retry with current review metadata
 only after resolving the underlying issue. No credential or stderr text is
-included in the diagnostic.
+included in the diagnostic. An unrecoverable stale-ref sync exits nonzero with
+`stale pull ref: refs/pull/N/head at X, PR head Y` and the recovery reason.
+Even if every reviewer fails sync, that terminal error remains visible; healthy
+parallel peer results are retained for resume. An earlier child-work summary
+describes the execution topology and does not indicate successful review.
 
 ### Pre-merge transport smoke check
 
