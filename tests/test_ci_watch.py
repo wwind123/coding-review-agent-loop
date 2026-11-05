@@ -1115,16 +1115,26 @@ def test_loop_stuck_status_with_genuine_test_failure_routes_to_coder(tmp_path, m
     assert len(runner.claude_calls()) == 1
 
 
-def test_loop_dry_run_preview_never_reruns(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("ci_status", ["success", "failure"])
+def test_loop_dry_run_preview_never_reruns(tmp_path, monkeypatch, capsys, ci_status):
     runner = _approved_runner()
+    # The CLI sets both flags; preview must bypass real checkout verification.
+    runner.dry_run = True
     _install_boards(
-        monkeypatch, snapshot=_board(_tests(), _publisher()), watcher=[_board(_tests(), _publisher())],
+        monkeypatch, snapshot=_board(_tests(), _publisher()),
+        watcher=[_board(_tests(ci_status), _publisher())],
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.pr_head_fetch.fetch_pr_head",
+        lambda *a, **k: pytest.fail("preview must not import or verify a PR head"),
     )
 
     assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path, dry_run=True)) == 0
 
     assert runner.reruns == []
     assert runner.claude_calls() == []
+    assert runner.merges() == []
+    assert "dry-run preview did not perform live CI watching" in capsys.readouterr().out
 
 
 # -- Round-1 review fixes: job-listing verification, shared rerun budget, reporting --
