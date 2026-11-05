@@ -2086,7 +2086,9 @@ def sync_checkout_to_pr(
         from . import run_worktrees
 
         # Check out the SHA pinned under the store lock, never the shared mutable ref.
-        pinned = run_worktrees.pin_pr_head(store, pr_number, config=config, runner=runner)
+        pinned = run_worktrees.pin_pr_head(
+            store, pr_number, config=config, runner=runner, pr_metadata=pr_metadata,
+        )
         require_advertised_head(pinned)
         if default_owned:
             _clean_or_reject_checkout(
@@ -2106,13 +2108,10 @@ def sync_checkout_to_pr(
                     ssh_identity=config.git_ssh_identity,
                     forbidden_roots=config.transport_forbidden_roots,
                 )
-            pinned = import_ref(
-                path, f"refs/pull/{pr_number}/head", pr_ref,
-                repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
-                local_origin=config.trusted_local_origin,
-                ssh_identity=config.git_ssh_identity,
-                forbidden_roots=config.transport_forbidden_roots,
-            )
+            from .pr_head_fetch import fetch_pr_head
+
+            pinned = fetch_pr_head(path, pr_number, config=config, runner=runner,
+                                   pr_metadata=pr_metadata)
             compact_packs_if_needed(path, config=config, runner=runner)
             require_advertised_head(pinned)
             if default_owned:

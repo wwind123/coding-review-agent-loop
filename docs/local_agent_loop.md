@@ -8420,6 +8420,17 @@ runs the real Claude and Codex CLIs against these grants when
 
 Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Claude and Gemini prompts include a tool-owned response-file path under `/tmp/coding-review-agent-loop/responses/`; when the file exists and is non-empty, the loop validates and posts that file instead of stdout so CLI diagnostics and tool narration do not leak into GitHub comments. Gemini still supports stdout marker filtering as a fallback. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers when no response file was written. Fallback stdout is never posted unless the required protocol marker validates.
 
+### Missing PR head refs
+
+Pre-review sync tries `refs/pull/N/head` first. A `remote ref missing` failure
+names the validated requested ref. For an open same-repository PR only, the loop
+can recover once through the head branch after a fresh API read confirms the
+repository identities, branch and expected review SHA. The fetched branch must
+still equal that SHA before publication. Forks, moved branches, API uncertainty
+and other transport failures stop the sync; retry with current review metadata
+only after resolving the underlying issue. No credential or stderr text is
+included in the diagnostic.
+
 ### Pre-merge transport smoke check
 
 **Required before merging any change to `git_transport.py`, `secure_git.py`
@@ -8458,7 +8469,7 @@ Output is exactly one line, and the exit status is 0 on pass and 1 on fail:
 
 - `transport-check: pass`
 - `transport-check: fail (<class>)`, where the class is one of `configuration`,
-  `remote not found`, `host-key failure`, `network or timeout`,
+  `remote not found`, `remote ref missing`, `host-key failure`, `network or timeout`,
   `authentication failure`, `local import` or `unclassified`.
 
 Either line may end with ` [ssh-config-warning]` when the transport ignored a

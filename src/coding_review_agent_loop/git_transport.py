@@ -543,6 +543,7 @@ def _transport_env(url: str, gh_cmd: str | None, *, ssh_identity: Path | None = 
 # Most specific evidence first: Git appends its generic "correct access rights"
 # footer to network and not-found failures too, so it is only a fallback.
 _FAILURE_EVIDENCE: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("remote ref missing", ("couldn't find remote ref",)),
     ("remote not found", ("repository not found", "does not appear to be a git repository",
                           "returned error: 404")),
     ("host-key failure", ("host key verification failed",
@@ -573,7 +574,8 @@ class TransportFailure(AgentLoopError):
     """A failed or timed-out transport Git command.
 
     ``label`` is the fixed, non-secret failure class (``remote not found``,
-    ``host-key failure``, ``network or timeout``, ``authentication failure``
+    ``remote ref missing``, ``host-key failure``, ``network or timeout``,
+    ``authentication failure``
     or ``unclassified``), so callers need not parse the message (#1383).
     """
 
@@ -759,11 +761,12 @@ def _imported(private: Path, env: dict[str, str], destination: Path,
 def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
                repo: str, runner: Any, gh_cmd: str | None = None,
                local_origin: Path | None = None, ssh_identity: Path | None = None,
-               forbidden_roots: tuple[Path, ...] = ()) -> str:
+               forbidden_roots: tuple[Path, ...] = (), expected_sha: str | None = None) -> str:
     """Fetch one ref, stream its pack into destination, then CAS tracking_ref.
 
     The pack excludes history reachable from destination ref tips that the
     fetched history also holds, and is skipped when sha is already a ref tip.
+    An optional expected_sha is checked privately before any object export or CAS.
     Every path verifies sha's complete closure before the CAS and falls back
     once to a full export when the incremental import is incomplete.
 
@@ -772,6 +775,8 @@ def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
     """
     if not _REF.fullmatch(source_ref) or not _REF.fullmatch(tracking_ref):
         raise AgentLoopError("Unsafe Git ref for private transport.")
+    if expected_sha is not None and not _SHA.fullmatch(expected_sha):
+        raise AgentLoopError("Invalid expected commit identity for private transport.")
     observed = _origin_from_checkout(destination, runner)
     url = trusted_url(repo, observed, local_origin=local_origin)
     with tempfile.TemporaryDirectory(prefix="agent-loop-transport-") as raw:
@@ -781,10 +786,23 @@ def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
                              forbidden_roots=(*forbidden_roots, destination))
         _private_git(("init", "--bare", "-q"), cwd=private, env=env)
         refspec = f"+{source_ref}:refs/agent-loop/import"
+
+        def fetch() -> None:
+            try:
+                _private_git(("fetch", "--no-tags", "--no-recurse-submodules", url, refspec),
+                             cwd=private, env=env, ssh=is_ssh)
+            except TransportFailure as exc:
+                if exc.label == "remote ref missing":
+                    raise TransportFailure(
+                        f"{exc} Requested ref: {source_ref}.", label=exc.label,
+                    ) from None
+                raise
+
         try:
-            _private_git(("fetch", "--no-tags", "--no-recurse-submodules", url, refspec),
-                         cwd=private, env=env, ssh=is_ssh)
-        except AgentLoopError:
+            fetch()
+        except AgentLoopError as exc:
+            if isinstance(exc, TransportFailure) and exc.label == "remote ref missing":
+                raise
             if not (url.startswith("https://") and gh_cmd):
                 raise
             host = urlsplit(url).hostname
@@ -795,14 +813,15 @@ def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
                 f"x-access-token:{token}".encode()).decode()
             env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0":
                         f"http.{url}.extraheader", "GIT_CONFIG_VALUE_0": header})
-            _private_git(("fetch", "--no-tags", "--no-recurse-submodules", url, refspec),
-                         cwd=private, env=env)
+            fetch()
             for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
                 env.pop(key, None)
         sha = _private_git(("rev-parse", "refs/agent-loop/import^{commit}"),
                            cwd=private, env=env).decode("ascii").strip()
         if not _SHA.fullmatch(sha):
             raise AgentLoopError("Trusted fetch returned an invalid commit identity.")
+        if expected_sha is not None and sha != expected_sha:
+            raise AgentLoopError("Trusted fetch differs from expected PR head SHA; refusing import.")
         tips = _destination_tips(destination, runner)
         # An existing complete ref tip needs no pack; otherwise try a thin
         # pack excluding usable tips, then fall back once to a full export.

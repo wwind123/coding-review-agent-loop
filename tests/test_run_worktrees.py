@@ -1256,3 +1256,80 @@ def test_terminal_salvage_patch_survives_claimed_run_finalizer(tmp_path, monkeyp
     assert (fresh / "new.txt").read_text() == "staged new file\n"
     assert git(fresh, "rev-parse", "HEAD") == head
     assert git(env.bare, "for-each-ref", "--format=%(refname)", "refs/heads") == "refs/heads/main"
+
+
+@pytest.mark.parametrize("layout", ["shared", "standalone"])
+@pytest.mark.parametrize("scenario", ["recover", "fork", "moved", "missing", "base-missing"])
+def test_missing_pull_ref_sync_is_bounded_and_preserves_checkout(tmp_path, monkeypatch, layout, scenario):
+    from coding_review_agent_loop import pr_head_fetch
+
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    reads = []
+    with workdir_claim_scope(command="task"):
+        if layout == "shared":
+            claim_agent_workdirs(config)
+            ensure_agent_workdirs(config, Runner())
+            path = config.claude_dir
+            store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+        else:
+            path = tmp_path / "standalone"
+            subprocess.run(["git", "clone", "-q", str(env.bare), str(path)], check=True)
+            store = path
+        before = git(path, "rev-parse", "HEAD")
+        wanted = env.commit("b.txt", "review")
+        git(env.bare, "update-ref", "refs/heads/topic", wanted)
+        tracking = "refs/remotes/origin/pr/7"
+        git(store, "update-ref", tracking, before)
+        (path / "sentinel.txt").write_text("keep until authorized")
+        # Model an artifact captured after an agent turn, so checkout verification
+        # permits sync to reach the fetch policy while retaining its real gate.
+        from coding_review_agent_loop.checkout_verification import record_checkout_baseline
+        record_checkout_baseline(config, Runner(), path, source="test agent turn")
+        meta = SimpleNamespace(number=7, repo="OWNER/REPO", head_branch="topic",
+                               base_branch="main", head_sha=wanted)
+
+        def observe(*args, **kwargs):
+            reads.append(1)
+            if scenario == "moved":
+                git(env.bare, "update-ref", "refs/heads/topic", before)
+            if scenario == "missing":
+                git(env.bare, "update-ref", "-d", "refs/heads/topic")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(dict(
+                number=7, state="open", base=dict(ref="main", repo=dict(full_name="OWNER/REPO")),
+                head=dict(ref="topic", sha=wanted, repo=dict(
+                    full_name="FORK/REPO" if scenario == "fork" else "owner/repo")))))
+
+        monkeypatch.setattr(pr_head_fetch, "run_gh_read", observe)
+        if scenario == "base-missing":
+            git(env.bare, "update-ref", "-d", "refs/heads/main")
+        def sync():
+            sync_checkout_to_pr(config, Runner(), path=path, label="test checkout",
+                                default_owned=True, pr_number=7, pr_metadata=meta)
+        if scenario == "recover":
+            sync()
+            sync()
+            assert git(path, "rev-parse", "HEAD") == wanted
+            assert git(store, "rev-parse", tracking) == wanted
+            assert not (path / "sentinel.txt").exists()
+            assert len(reads) == 2
+        else:
+            with pytest.raises(AgentLoopError):
+                sync()
+            assert git(path, "rev-parse", "HEAD") == before
+            assert git(store, "rev-parse", tracking) == before
+            assert (path / "sentinel.txt").read_text() == "keep until authorized"
+            assert len(reads) == (0 if scenario == "base-missing" else 1)
+
+
+def test_pr_sync_dry_run_never_fetches_or_reads_api(tmp_path, monkeypatch):
+    from coding_review_agent_loop import git_transport, pr_head_fetch
+    def forbidden(*a, **kw):
+        pytest.fail("dry run must not fetch or read fallback metadata")
+    monkeypatch.setattr(git_transport, "import_ref", forbidden)
+    monkeypatch.setattr(pr_head_fetch, "run_gh_read", forbidden)
+    from agent_loop_helpers import make_config
+    config = make_config(tmp_path)
+    sync_checkout_to_pr(config, Runner(dry_run=True), path=tmp_path / "absent",
+                        label="dry", default_owned=True, pr_number=7,
+                        pr_metadata=SimpleNamespace(head_sha="a" * 40))
