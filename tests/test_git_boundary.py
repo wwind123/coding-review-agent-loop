@@ -1521,3 +1521,51 @@ def test_filesystem_root_is_refused_as_non_regular(ssh_home, capsys, selection, 
     argv = _ssh_argv()
     assert argv[len(_SSH_PREFIX):] == []
     assert f"{key} for trusted Git transport" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("protocol", ["https", "ssh"])
+@pytest.mark.parametrize("footer", ["", "\nPlease make sure you have the correct access rights."])
+def test_missing_ref_diagnostic_uses_requested_ref_only(repositories, monkeypatch, protocol, footer):
+    origin, _, checkout = repositories
+    url = default_origin("OWNER/REPO", protocol=protocol)
+    monkeypatch.setattr(git_transport, "trusted_url", lambda *a, **kw: url)
+    monkeypatch.setattr(git_transport, "_transport_env", lambda *a, **kw: {})
+    real_run = subprocess.run
+
+    def private_run(command, **kwargs):
+        if "fetch" in command:
+            return SimpleNamespace(returncode=128, stdout=b"", stderr=(
+                "fatal: couldn't find remote ref SECRET\nhttps://token:SECRET@evil" + footer
+            ).encode())
+        if "init" in command:
+            return SimpleNamespace(returncode=0, stdout=b"")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", private_run)
+    def no_token(*a, **kw):
+        pytest.fail("missing ref must not acquire a token")
+    monkeypatch.setattr(git_transport, "_token_from_gh", no_token)
+    with pytest.raises(git_transport.TransportFailure) as caught:
+        import_ref(checkout, "refs/pull/7/head", "refs/remotes/origin/pr/7",
+                   repo="OWNER/REPO", runner=Runner(), gh_cmd="gh", local_origin=origin)
+    assert caught.value.label == "remote ref missing"
+    assert "Requested ref: refs/pull/7/head" in str(caught.value)
+    assert "SECRET" not in str(caught.value) and "https://" not in str(caught.value)
+
+
+def test_expected_sha_rejects_before_export_and_ref_publication(repositories, monkeypatch):
+    origin, seed, checkout = repositories
+    old = git(checkout, "rev-parse", "HEAD")
+    tracking = "refs/remotes/origin/pr/7"
+    git(checkout, "update-ref", tracking, old)
+    new = _commit(seed, "new", {"a.txt": "new"})
+    git(seed, "push", "-q", str(origin), "main")
+    def no_export(*a, **kw):
+        pytest.fail("mismatched commit must not be exported")
+    monkeypatch.setattr(git_transport, "_imported", no_export)
+    with pytest.raises(AgentLoopError, match="expected PR head SHA"):
+        import_ref(checkout, "refs/heads/main", tracking, repo="OWNER/REPO",
+                   runner=Runner(), local_origin=origin, expected_sha=old)
+    assert git(checkout, "rev-parse", tracking) == old
+    assert git(checkout, "rev-parse", "HEAD") == old
+    assert git(checkout, "cat-file", "-t", new, check=False) == ""

@@ -638,20 +638,16 @@ def prepare_store(store: Path, *, config: Any, runner: Any) -> str:
         return sha
 
 
-def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any) -> str:
+def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any,
+                pr_metadata: Any = None) -> str:
     """Fetch the PR head under the lock and return its SHA (not the mutable ref)."""
-    pr_ref = f"refs/remotes/origin/pr/{pr_number}"
     with store_lock(store):
-        from .git_transport import import_ref
+        from .pr_head_fetch import fetch_pr_head
 
         if config.base:
             _fetch_and_pin(store, config.base, config=config, runner=runner, free=False)
-        sha = import_ref(
-            store, f"refs/pull/{pr_number}/head", pr_ref,
-            repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
-            local_origin=config.trusted_local_origin,
-            **_transport_options(config),
-        )
+        sha = fetch_pr_head(store, pr_number, config=config, runner=runner,
+                            pr_metadata=pr_metadata)
         compact_packs_if_needed(store, config=config, runner=runner)
         return sha
 

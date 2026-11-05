@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SMOKE = REPO_ROOT / "scripts" / "transport_smoke.sh"
 REPO = "OWNER/REPO"
 SECRET = "SECRETSENTINEL"
-LABELS = ("remote not found", "host-key failure", "network or timeout",
+LABELS = ("remote ref missing", "remote not found", "host-key failure", "network or timeout",
           "authentication failure", "unclassified")
 
 

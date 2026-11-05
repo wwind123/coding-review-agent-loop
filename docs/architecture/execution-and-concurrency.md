@@ -1,8 +1,10 @@
 # Execution and concurrency
 
-How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
+Agent and Git execution: shared-store worktrees, trusted private transport,
+checkout verification, containment, test evidence and worker budgets, quota
+recovery, executable pinning, and internal image capture and transport.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/worktree_pr_env.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_worktree_pr_env.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/worktree_pr_env.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/pr_head_fetch.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`.
 
 ## Execution and Concurrency
 
@@ -36,6 +38,18 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 (identity-verified worktree removal) before releasing claims, on success and
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
+
+**Missing PR head refs (`pr_head_fetch.py`, #1884).** Both sync layouts first
+import the pull head ref. Only `remote ref missing` permits one branch fallback.
+A bounded REST read must confirm an open PR with matching number, base/head
+branches, full review SHA and case-insensitive base/head repository identities.
+The validated branch uses only the configured origin; SHA equality is checked
+privately before object export or tracking-ref CAS. Forks, uncertain or changed
+metadata and metadata-less callers refuse before cleanup or checkout. Locks,
+immutable checkout and outer head checks remain unchanged; no recovery state is
+persisted. Missing-ref hints name only the validated requested ref, never stderr,
+and confirmed missing refs bypass HTTPS token lookup without changing other
+credential retries.
 
 **Shared link source health (`worktree_link_integrity.py`, #1775).**
 
@@ -231,19 +245,14 @@ so evidence from another environment at the same HEAD is neither current-head
 nor able to supersede. With the flag off no record is added and tracked
 digests are unchanged.
 
-**Incremental import.** `import_ref` exports only objects not reachable from
-destination ref tips that the private fetch repository also holds as commits:
-those tips are passed to `pack-objects --revs --thin` as negative revs and the
-confined `index-pack --fix-thin` completes the thin pack. When the fetched
-commit is already a ref tip whose closure is complete, no pack is written.
-Destination tips are exclusion hints only, never proof of completeness: every
-path verifies the fetched commit's full reachable closure in the destination
-(`rev-list --objects --missing=error`, no history excluded, with the
-destination's shallow file, grafts and replace refs ignored) before the
-tracking-ref compare-and-swap, and an incomplete closure or a failed
-incremental export falls back once to a full export, which repairs missing
-history. If that also fails or raises, the fixed import error is raised and
-the ref is not moved. The network fetch into a fresh private repository is unchanged.
+**Incremental import.** `import_ref` treats destination tips as exclusion hints:
+only tips held as commits by the private fetch repository become negative revs
+for `pack-objects --revs --thin`; confined `index-pack --fix-thin` completes the
+pack. An existing complete ref tip needs no pack. Every path verifies the full
+reachable closure with `rev-list --objects --missing=error` before tracking-ref
+CAS, ignoring shallow files, grafts and replace refs. Failed incremental export
+or incomplete closure triggers one full export to repair history. Failure or
+exception there raises the fixed import error without moving the ref.
 
 **Pack compaction.** Each import writes at most one pack and the hardened config keeps
 `gc.auto=0`, so after the last import in each locked fetch (`prepare_store`,
@@ -358,7 +367,7 @@ a 256 KiB bound. An explicit `--git-ssh-identity` / `AGENT_LOOP_GIT_SSH_IDENTITY
 replaces config identities with exactly one `-i` and `IdentitiesOnly=yes`, and
 an untrusted override is a fixed error. Windows does not read the config, keeps
 the previous command byte-for-byte and refuses the override. Transport failures
-report a fixed class chosen by evidence precedence (`remote not found`,
+report a fixed class chosen by evidence precedence (`remote ref missing`, `remote not found`,
 `host-key failure`, `network or timeout`, then `authentication failure` from
 specific evidence before Git's generic access-rights footer, else
 `unclassified`) with no stderr or argv; SSH authentication and host-key
