@@ -72,8 +72,25 @@ def test_round_replay_keeps_consumed_directive_separate_from_prose(
     assert resumed.registry == saved
     assert items == ([item] if target else [])
     assert ('closed' if tracker == 'closed' else 'tracker read failed') in resumed.context()
+    diagnostic, = resumed.diagnostics
+    assert diagnostic.startswith(f"Admitted post-merge obligation {payload['target_id']} retained: ")
+    assert 'does not block merge' in diagnostic
+    assert 'new authorized scheduling request' in diagnostic
+    assert 'rejected:' not in diagnostic and 'remains blocking' not in diagnostic
     assert writes[-1][0][4] == list(saved)
+    assert writes[-1][0][5] == resumed.diagnostics
     assert all('```post-merge-schedule' not in r.body for r in visible)
+    # Repeated replay replaces its own diagnostic and preserves unrelated ones;
+    # a healthy tracker then clears both legacy rejection and retained wording.
+    unrelated = 'Post-merge request unrelated rejected: still needs attention'
+    legacy = f"Post-merge request {payload['target_id']} rejected: old tracker problem"
+    resumed.diagnostics += (unrelated, legacy)
+    resumed.operator_inputs(requirements, items=[item], closing=(), head='b'*40, round_number=3)
+    assert resumed.diagnostics == (unrelated, diagnostic)
+    monkeypatch.setattr(runtime, 'read_api', lambda *args: {'number': 9, 'state': 'open'})
+    resumed.operator_inputs(requirements, items=[item], closing=(), head='b'*40, round_number=4)
+    assert resumed.diagnostics == (unrelated,)
+    assert resumed.registry == saved
 
 
 @pytest.mark.parametrize('tracker', ['closed', 'unreadable'])

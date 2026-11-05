@@ -7,7 +7,7 @@ import json
 from .errors import AgentLoopError
 from .post_merge_obligations import (
     active_registry, authorize, diagnostic, digest, fail, filter_items, make_admission,
-    operator_directive, parse_request, render_context, source_for_item,
+    operator_directive, parse_request, render_context, retained_diagnostic, source_for_item,
     validate_registry, validate_tracker,
 )
 
@@ -123,9 +123,9 @@ class ObligationRun:
                     number, state = validate_tracker(request, repo=self.config.repo, closing_issues=(),
                         read_issue=lambda n: read_api(self.runner, self.config, f'issues/{n}'), allow_closed=True)
                     if state == 'closed':
-                        fail(f'tracker #{number} is closed; admitted obligation retained')
+                        fail(f'tracker #{number} is closed')
                 except AgentLoopError as exc:
-                    replay_diagnostics.append(diagnostic(request.target_id or request.requirement, str(exc)))
+                    replay_diagnostics.append(retained_diagnostic(request.target_id or request.requirement, str(exc)))
                 continue
             validate_tracker(request, repo=self.config.repo, closing_issues=closing,
                 read_issue=lambda n: read_api(self.runner, self.config, f'issues/{n}'))
@@ -140,7 +140,8 @@ class ObligationRun:
         resolved_targets.update(provenance['source_id'] for _, _, provenance in proposals
                                 if provenance.get('kind') == 'operator')
         diagnostics = tuple(d for d in self.diagnostics if not any(
-            d.startswith(f'Post-merge request {target} rejected: ') for target in resolved_targets))
+            d.startswith((f'Post-merge request {target} rejected: ',
+                          f'Admitted post-merge obligation {target} retained: ')) for target in resolved_targets))
         diagnostics = tuple(dict.fromkeys((*diagnostics, *replay_diagnostics)))
         if candidate != list(self.registry) or diagnostics != self.diagnostics:
             if self.config.dry_run:
@@ -305,7 +306,7 @@ def reconcile(runner, config, pr, *, registry=None, required_identities=()):
             admission['state'], admission['receipt'] = 'tracked', receipt
         except AgentLoopError as exc:
             admission['state'], admission['receipt'] = 'tracking-pending', None
-            pending.append(diagnostic(admission['identity'], str(exc)))
+            pending.append(retained_diagnostic(admission['identity'], str(exc)))
     if not config.dry_run and registry:
         try:
             persist(runner, config, pr, merged['head']['sha'], registry, pending)

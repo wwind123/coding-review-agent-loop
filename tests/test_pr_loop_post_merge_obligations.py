@@ -163,7 +163,12 @@ def test_publication_failure_retains_pending_and_recovery(tmp_path, monkeypatch,
     monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', failed)
     assert runtime.reconcile(run.runner, run.config, 1, registry=registry) == 1
     assert registry[0]['state'] == 'tracking-pending' and registry[0]['receipt'] is None
-    assert runtime.recovery_command(1) in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert runtime.recovery_command(1) in output
+    assert 'Admitted post-merge obligation' in output and 'retained:' in output
+    assert 'does not block merge' in output
+    assert 'rejected:' not in output and 'remains blocking' not in output
+    assert writes[-1][0][5] and 'does not block merge' in writes[-1][0][5][0]
     assert writes
 
 

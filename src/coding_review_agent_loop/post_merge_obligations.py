@@ -293,3 +293,10 @@ def diagnostic(target, error):
     return (f'Post-merge request {target} rejected: {error}. Original requirement remains blocking. '
             'Supply a non-empty owner and an existing open same-repository tracking issue outside the PR closing set; '
             'manually create/select a tracker and retry through the requesting reviewers or a verified signed post-merge-schedule directive. No coder is dispatched to obtain trackers.')
+
+
+def retained_diagnostic(target, error):
+    return (f'Admitted post-merge obligation {target} retained: {error}. '
+            'The obligation remains required after merge and does not block merge. '
+            'If needed, select an eligible tracker through a new authorized scheduling request; '
+            'use the requesting reviewers or a verified signed post-merge-schedule directive.')

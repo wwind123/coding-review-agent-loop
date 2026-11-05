@@ -549,6 +549,9 @@ Declaration matching may release only a sole-requester evidence item; shared
 items require explicit target-bound consent from every resolution owner.
 Successful admission clears only diagnostics for its own target, preserving
 unrelated rejection remedies in durable metadata and subsequent prompts.
+Tracker problems after admission use retained-obligation diagnostics: required
+post-merge work stays scheduled and does not become a merge blocker. Replay
+refreshes only its own target diagnostics, clearing them when its tracker recovers.
 
 ## Decisions
 
