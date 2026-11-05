@@ -525,6 +525,26 @@ receipts have already cleared its ledger. Until the terminal release is durable,
 the same-head handoff retains completed code reviews and passes the existing
 machine and signed-input gates before publication-only recovery.
 
+## Post-merge timing
+
+`post_merge_obligations.py` separates strict typed proposals from admission.
+`post_merge_runtime.py` admits selected-reviewer declarations and unanimous
+resolution-owner transitions, or deterministic scheduling directives from
+live-verified signed PR comments. Operator-only converted rows and signed
+requirements cannot obtain authority from model claims or repair output.
+Whole-block validation binds target identity and full requirement text; tracker
+preflight requires an existing open same-repository issue outside the closing
+set. Rejection retains the original evidence barrier and reports a target-bound
+remedy. Owners are free text, without assignment or account validation.
+
+A cumulative admission registry is published and read back before eligibility
+changes. Source-bound unchanged scheduling survives head changes and remains
+visible in reviewer prompts. Unscheduled evidence and machine gates remain
+active; scheduling never means verification or fulfillment. Converted-row
+timing is separate from approved matrix identity and evidence status. Shared
+merge completion publishes tracking records only after confirmed merge; manual
+completion uses the explicit recovery entry described in the CLI guide.
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

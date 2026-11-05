@@ -61,6 +61,8 @@ _SPILL_FIELDS = (
     "raw_patch_provenance",
     "canonical_reviewer_response",
     "screenshot_coverage",
+    "post_merge_registry",
+    "post_merge_publication",
     "raw_structured_coder_response",
     "canonical_plan",
     "round_synthesis",

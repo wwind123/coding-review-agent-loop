@@ -10687,3 +10687,85 @@ Preflight, capture, digest skips and publication-only replay create no provider
 charge. Accounting never establishes delivery or screenshot acceptance. External
 capture scripts, live cost measurement and automatic target rollout remain outside
 this stage.
+
+## Required post-merge obligations
+
+Use `post_merge_obligations` in a PR review for required evidence that can only
+exist after merge and deploy. Each declaration supplies `requirement`,
+`rationale`, `owner` and `tracker_url`. The owner is non-empty free text; the
+loop does not validate accounts or assign issues. The tracker must already be
+an open issue in the same repository, outside the PR's closing issue set.
+Manually create or select a tracker before retrying a rejected request. The loop
+never creates, closes, reopens or assigns trackers.
+
+An existing evidence request can be rescheduled by its resolution owners using
+the same fields plus `target_kind: "evidence-item"`, its exact `target_id`, and
+`source_requirement_text` equal to the full requirement. Every resolution owner
+must consent to the identical payload. If an owner has left the board, the
+complete current board must consent. Scheduling changes timing; it never
+certifies fulfillment or turns required work into an optional future follow-up.
+
+A configured trusted operator can schedule evidence, converted risk rows or
+signed requirement timing by posting exactly one fenced JSON block labeled
+`post-merge-schedule` in a signed PR comment. The live comment must match both
+the configured login and numeric actor ID. For example (replace the identity
+with the exact target printed by the freeze notice):
+
+````markdown
+```post-merge-schedule
+{
+  "obligations": [{
+    "target_kind": "evidence-item",
+    "target_id": "EXACT_TARGET_FROM_FREEZE_NOTICE",
+    "source_requirement_text": "Verify production alert firing.",
+    "requirement": "Verify production alert firing.",
+    "rationale": "Production deploys merged main only.",
+    "owner": "Operations on call",
+    "tracker_url": "https://github.com/OWNER/REPO/issues/123"
+  }]
+}
+```
+-- Human Reviewer
+````
+
+Converted rows use `target_kind: "converted-row"`, the row ID as `target_id`,
+and the exact approved `matrix_identity`. Signed requirements use
+`target_kind: "signed-requirement"` and their full requirement ID and text.
+Reviewers and response repair cannot manufacture operator authority. A comment
+saying “the operator approved this” is rejected as authority, as are unverified
+signatures, duplicate keys or targets, multiple scheduling blocks, unknown
+fields, stale identities, mismatched full text, and missing or ineligible
+trackers. The complete operator block is validated before any transition.
+Surrounding signed instruction prose remains a separate requirement.
+
+Rejected requests retain their pre-merge barriers and show a target-bound
+reason and remedy in reviewer context and stop/freeze output. Supply an eligible
+tracker and owner through an authorized request and rerun. CI, conflict,
+migration and acknowledgement gates cannot be scheduled. New code approval and
+CI always bind to the final head. Admitted scheduling survives head changes and
+restart; changing its requirement, owner or destination requires new admission.
+
+Admission is published durably on the PR before it changes blocker eligibility.
+After confirmed merge, the loop publishes authenticated tracking comments with
+the source PR, obligation identity, requirement, owner, provenance, merged head
+and merge commit. `scheduled`, `tracking-pending` and `tracked` describe timing
+and publication, never evidence fulfillment. A tracker closed after admission
+retains its obligation and produces a diagnostic; it is never reopened.
+
+For manual merges, deleted branches, interrupted publication or
+merged-but-tracking-pending failures, run:
+
+```bash
+agent-loop pr 77 --repo OWNER/REPO --reconcile-post-merge-obligations
+```
+
+This completion-only mode requires a confirmed merged PR and authenticated
+admission history. It performs no branch-tip reads, worktree setup, agent turns,
+CI dispatch or merge attempts. Open and closed-unmerged PRs are rejected, and
+execution options cannot be combined with this mode. `--dry-run` reads history
+and reports missing publication without writing. Normal PR entry continues to
+reject merged PRs. Repeated reconciliation verifies existing authenticated
+records and retries missing work; ambiguous writes are read back before retry.
+Publication failures report that merge succeeded with tracking still pending
+and the recovery command. The loop never rolls back a merge or claims that
+publication fulfilled the obligation.

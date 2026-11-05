@@ -4293,7 +4293,7 @@ def post_verified_trusted_issue_protocol_comment(
                 "--input",
                 "-",
             ],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             input_text=json.dumps({"body": str(body)}, separators=(",", ":")),
             check=False,
         ),

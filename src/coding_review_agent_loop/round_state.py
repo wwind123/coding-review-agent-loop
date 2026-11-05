@@ -352,6 +352,11 @@ class PostedRoundMetadata:
     # The freeze/release payloads and head-scoped clearances ride only on the
     # orchestrator's single freeze or release comment.  All are omitted from
     # the encoding when empty so historical records stay byte-stable.
+    post_merge_authenticated: bool = False
+    post_merge_registry: tuple[dict, ...] = ()
+    post_merge_diagnostics: tuple[str, ...] = ()
+    post_merge_publication: dict | None = None
+    post_merge_requests: tuple[dict, ...] = ()
     screenshot_requests: tuple[dict, ...] = ()
     screenshot_coverage_acceptances: tuple[dict, ...] = ()
     screenshot_coverage: object = None
@@ -1402,7 +1407,7 @@ EVIDENCE_TERMINAL_PHASES = frozenset({EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PH
 # post-conversion ledger and the audit, and is written before any dispatch.
 EVIDENCE_CONVERSION_PHASE = "evidence-conversion"
 EVIDENCE_RELEASE_REASONS = frozenset(
-    {"evidence-cleared", "findings", "machine-gate", "refresh-clean", "screenshot-coverage"}
+    {"evidence-cleared", "findings", "machine-gate", "refresh-clean", "screenshot-coverage", "post-merge-scheduled"}
 )
 
 
@@ -2458,6 +2463,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         )
     from .review_images_coverage_history import encode_fields
     payload.update(encode_fields(metadata))
+    from .post_merge_state import encode_fields as encode_post_merge
+    payload.update(encode_post_merge(metadata))
     if metadata.evidence_requests:
         payload["evidence_requests"] = list(metadata.evidence_requests)
     if metadata.evidence_freeze is not None:
@@ -2857,7 +2864,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             sidecar = payload.get("assembled_plan_sidecar")
             if sidecar is not None and not isinstance(sidecar, dict):
                 raise ValueError("semantic assembled_plan_sidecar must be an object")
+        from .post_merge_state import decode_fields as decode_post_merge
         return PostedRoundMetadata(
+            **decode_post_merge(payload),
             flow=str(payload["flow"]),
             role=str(payload["role"]),
             agent=str(payload["agent"]),
@@ -4048,7 +4057,9 @@ def record_carries_evidence_authority(metadata: PostedRoundMetadata) -> bool:
     """
     stall = metadata.evidence_stall
     return (
-        metadata.phase == EVIDENCE_CONVERSION_PHASE
+        bool(metadata.post_merge_registry)
+        or metadata.post_merge_publication is not None
+        or metadata.phase == EVIDENCE_CONVERSION_PHASE
         or bool(metadata.signed_evidence_references)
         or metadata.risk_test_matrix_capture_classification is not None
         or metadata.evidence_conversion is not None
@@ -4068,6 +4079,9 @@ def strip_evidence_authority(metadata: PostedRoundMetadata) -> PostedRoundMetada
         stall = {key: value for key, value in stall.items() if key != "bound_attempt_round"}
     return replace(
         metadata,
+        post_merge_authenticated=False,
+        post_merge_registry=(),
+        post_merge_publication=None,
         risk_test_matrix_capture_classification=None,
         evidence_conversion=None,
         conversion_stall_snapshot=None,
@@ -4095,6 +4109,8 @@ def admit_evidence_authority_records(
         if not record_carries_evidence_authority(record.metadata) or _recovery_record_admitted(
             record, comments, trusted_actor
         ):
+            if record.metadata.post_merge_registry:
+                record = replace(record, metadata=replace(record.metadata, post_merge_authenticated=True))
             admitted.append(record)
             continue
         rejected += 1

@@ -1620,6 +1620,8 @@ def _build_repair_prompt(
     )
     for placeholder, value in replacements:
         prompt = prompt.replace(placeholder, value, 1)
+    if expected_kind == "pr_review":
+        prompt += "\nPreserve post_merge_obligations exactly, including targets, owner, tracker, rationale and source text. Never invent operator authority or scheduling.\n"
     return prompt
 
 

@@ -1562,6 +1562,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=_PR_SIGNED_REQUIREMENT_EPILOG,
     )
     pr.add_argument("pr_number", type=int)
+    pr.add_argument("--reconcile-post-merge-obligations", action="store_true",
+                    help="Reconcile tracking publication for a merged PR without agents or branch reads.")
     pr.add_argument(
         "--expected-closing-issue",
         action="append",
@@ -2970,6 +2972,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not named_seats and (args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None):
             raise AgentLoopError("A named primary requires --reviewer-seat.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        if getattr(args, "reconcile_post_merge_obligations", False):
+            from .post_merge_runtime import reconcile, validate_recovery_options
+            validate_recovery_options(args, invocation)
+            return reconcile(runner, config, args.pr_number)
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
             # Before claims, sandbox setup and base-branch resolution (#1111).
             tool_provenance.capture_process_provenance(config)

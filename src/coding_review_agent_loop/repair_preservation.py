@@ -1133,6 +1133,10 @@ def validate_repair_preservation(
     Do not heuristically parse broken JSON or interpret prose as item ledgers.
     """
     source, target = _payload(raw), _payload(repaired)
+    from .post_merge_obligations import preserve_fields as preserve_post_merge
+    if source is None and "post_merge_obligations" in raw:
+        raise AgentLoopError("Post-merge classification source cannot be extracted for repair")
+    preserve_post_merge(source, target)
     from .review_images_coverage import preserve_fields
     if source is None and any(field in raw for field in ("screenshot_requests", "screenshot_coverage_acceptances", "screenshot-coverage")):
         raise AgentLoopError("Screenshot authority source cannot be extracted for repair")
