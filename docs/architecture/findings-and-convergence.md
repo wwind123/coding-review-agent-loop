@@ -545,6 +545,11 @@ timing is separate from approved matrix identity and evidence status. Shared
 merge completion publishes tracking records only after confirmed merge; manual
 completion uses the explicit recovery entry described in the CLI guide.
 
+Declaration matching may release only a sole-requester evidence item; shared
+items require explicit target-bound consent from every resolution owner.
+Successful admission clears only diagnostics for its own target, preserving
+unrelated rejection remedies in durable metadata and subsequent prompts.
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

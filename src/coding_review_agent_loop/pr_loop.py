@@ -697,7 +697,7 @@ def run_pr_loop(
 ) -> int:
     from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
     from .workdirs import active_workdir
-    from .post_merge_runtime import ObligationRun, round_start, reviewer_requests, manual_pending, resume_scheduled
+    from .post_merge_runtime import ObligationRun, round_start, reviewer_requests, manual_pending, resume_scheduled, complete_merge
     from .post_merge_obligations import parse_request as parse_post_merge_request
     post_merge_run = ObligationRun(runner, config, pr_number)
     runner._post_merge_run = post_merge_run
@@ -6986,13 +6986,12 @@ def run_pr_loop(
                     )
                     if merged:
                         print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
-                        unresolved_items = _clear_machine_obligations(
-                            unresolved_items, kind="github-pr-checks"
-                        )
+                        unresolved_items = _clear_machine_obligations(unresolved_items, kind="github-pr-checks")
                         _record_staged_parent_completion_after_merge(
                             runner, config=config, issue_context=issue_context,
                             pr_number=pr_number,
                         )
+                        complete_merge(runner, config, pr_number)
                     return 0
                 ordinary_watch_active = (
                     (config.auto_merge or config.watch_pending_ci)
@@ -7473,6 +7472,7 @@ def run_pr_loop(
                                 runner, config=config, issue_context=issue_context,
                                 pr_number=pr_number,
                             )
+                            complete_merge(runner, config, pr_number)
                         else:
                             manual_pending(post_merge_run)
                             final_line = final_context_state_line(watch_outcome.pr_checks)
@@ -8138,6 +8138,7 @@ def run_pr_loop(
                                         runner, config=config, issue_context=issue_context,
                                         pr_number=pr_number,
                                     )
+                                    complete_merge(runner, config, pr_number)
                                 return 0
                             managed_attempts_left = max(
                                 1, config.ci_timeout_seconds // config.ci_poll_interval_seconds
@@ -8409,6 +8410,7 @@ def run_pr_loop(
                                         runner, config=config, issue_context=issue_context,
                                         pr_number=pr_number,
                                     )
+                                    complete_merge(runner, config, pr_number)
                                 else:
                                     manual_pending(post_merge_run)
                                     qualified_head = publish_manual_v2_qualification(
@@ -8710,6 +8712,7 @@ def run_pr_loop(
                                     runner, config=config, issue_context=issue_context,
                                     pr_number=pr_number,
                                 )
+                                complete_merge(runner, config, pr_number)
                             return 0
                         elif config.auto_merge:
                             raise AgentLoopError(

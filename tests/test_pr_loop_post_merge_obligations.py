@@ -212,7 +212,7 @@ def test_authenticated_restore_rejects_foreign_and_mutated_history(tmp_path, mon
 
 
 @pytest.mark.parametrize('source', ['ordinary', 'full-board', 'managed exact-head', 'deliberate recovery'])
-def test_all_exact_head_merge_proofs_run_shared_completion_after_guard(tmp_path, monkeypatch, source):
+def test_all_exact_head_merge_proofs_keep_completion_outside_guard(tmp_path, monkeypatch, source):
     import coding_review_agent_loop.pr_loop_support as support
     run, _ = setup_run(tmp_path, monkeypatch)
     run.registry = (admission(),)
@@ -223,7 +223,9 @@ def test_all_exact_head_merge_proofs_run_shared_completion_after_guard(tmp_path,
     monkeypatch.setattr(runtime, 'reconcile', lambda *args, **kwargs: events.append('publish') or 0)
     support._merge_with_exact_head_proof(run.runner, config=run.config, pr_number=1,
                                         proof=support.ExactHeadCiProof(head_sha='a'*40, source=source))
-    assert events == ['base', ('merge', 'a'*40), 'publish']
+    assert events == ['base', ('merge', 'a'*40)]
+    runtime.complete_merge(run.runner, run.config, 1)
+    assert events[-1] == 'publish'
     events.clear()
     monkeypatch.setattr(support, 'get_pr_head_sha', lambda *args: 'b'*40)
     monkeypatch.setattr(support, 'get_observed_pr_review_context', lambda *args, **kwargs:
@@ -468,3 +470,89 @@ def test_confirmed_merge_does_not_lose_known_admissions_on_empty_history(tmp_pat
     monkeypatch.setattr(runtime, 'restore', lambda *args, **kwargs: ((), ()))
     with pytest.raises(AgentLoopError, match='merged, tracking pending.*durable admission history'):
         runtime.complete_merge(run.runner, run.config, 1)
+
+
+@pytest.mark.parametrize('owners', [(), ('OpenAI Codex',), ('OpenAI Codex', 'Claude'), ('Claude',)])
+def test_declaration_cannot_release_other_resolution_owners(tmp_path, monkeypatch, owners):
+    run, _ = setup_run(tmp_path, monkeypatch)
+    item = replace(evidence(), resolution_owners=owners)
+    review = SimpleNamespace(post_merge_obligations=(parse_request(REQUEST),))
+    remaining = run.reviewer_inputs({'OpenAI Codex': review}, items=[item], closing=(),
+        head='a'*40, round_number=2, board=['OpenAI Codex', 'Claude'])
+    assert remaining == ([item] if set(owners) - {'OpenAI Codex'} else [])
+    if len(owners) == 2:
+        review.post_merge_obligations = (parse_request(transition()),)
+        assert run.reviewer_inputs({'OpenAI Codex': review, 'Claude': review}, items=[item],
+            closing=(), head='a'*40, round_number=3, board=['OpenAI Codex', 'Claude']) == []
+
+
+@pytest.mark.parametrize('mode', ['reviewer', 'operator'])
+@pytest.mark.parametrize('rejection', ['authority', 'tracker'])
+def test_mixed_admissions_preserve_unrelated_diagnostics(tmp_path, monkeypatch, mode, rejection):
+    run, writes = setup_run(tmp_path, monkeypatch)
+    bad = dict(REQUEST, requirement='Rejected check', tracker_url='https://github.com/OWNER/REPO/issues/10')
+    if rejection == 'tracker':
+        monkeypatch.setattr(runtime, 'read_api', lambda runner, config, path:
+            {'number': int(path.rsplit('/', 1)[1]), 'state': 'closed' if path.endswith('/10') else 'open'})
+    if mode == 'reviewer':
+        if rejection == 'authority':
+            bad.update(target_kind='evidence-item', target_id='unknown', source_requirement_text=bad['requirement'])
+        reviews = {'OpenAI Codex': SimpleNamespace(post_merge_obligations=(parse_request(bad), parse_request(REQUEST)))}
+        run.reviewer_inputs(reviews, items=[], closing=(), head='a'*40, round_number=1, board=['OpenAI Codex'])
+    else:
+        bad = signed(transition(tracker_url=bad['tracker_url']), url='bad-comment')
+        if rejection == 'authority':
+            bad = replace(bad, author_verification='unverified')
+        run.operator_inputs([bad, signed()], items=[evidence()], closing=(), head='a'*40, round_number=1)
+    assert len(run.registry) == 1
+    assert len(run.diagnostics) == 1
+    assert 'rejected:' in run.context() and 'manually create/select' in run.context()
+    assert writes[-1][0][5] == run.diagnostics
+
+
+@pytest.mark.parametrize('failure', ['pending', 'exception'])
+@pytest.mark.parametrize('mode', ['full-board', 'managed', 'ordinary-recovery'])
+def test_real_merge_records_completion_before_tracking_failure(tmp_path, monkeypatch, capsys, failure, mode):
+    import coding_review_agent_loop.pr_loop as loop
+    setup_run(tmp_path, monkeypatch)
+    raw = structured_pr_review()
+    payload = json.loads(raw.split('\n')[0])
+    payload['post_merge_obligations'] = [REQUEST]
+    runner = FakeRunner(codex_outputs=[json.dumps(payload) + raw[raw.index('\n'):]])
+    if mode == 'managed':
+        from coding_review_agent_loop.managed_ci import ManagedCiContract, ManagedCiOutcome
+        monkeypatch.setattr(loop, 'activate_managed_ci', lambda *args, **kwargs: ManagedCiContract())
+        monkeypatch.setattr(loop, 'dispatch_final_qualification', lambda *args, **kwargs: None)
+        monkeypatch.setattr(loop, 'wait_for_final_qualification', lambda *args, **kwargs:
+            ManagedCiOutcome(status='passed', head_sha=runner.pr_payload['headRefOid']))
+    if mode == 'ordinary-recovery':
+        from coding_review_agent_loop.managed_ci import ManagedCiContract, ManagedCiOutcome, OrdinaryRecoveryCapability
+        from coding_review_agent_loop import pr_loop_support as support
+        from pr_loop_test_helpers import _watch_check_board
+        capability = OrdinaryRecoveryCapability(pr_number=77, repository='OWNER/REPO',
+            base_ref='main', expected_head_sha=runner.pr_payload['headRefOid'],
+            released_label_event_id=101, released_at=100)
+        monkeypatch.setattr(loop, 'activate_managed_ci', lambda *args, **kwargs:
+            ManagedCiContract(activation_path='ordinary_fallback', ordinary_recovery=capability))
+        monkeypatch.setattr(support, 'refresh_ordinary_recovery_capability', lambda *args, **kwargs: capability)
+        monkeypatch.setattr(support, 'validate_ordinary_recovery_capability', lambda *args, **kwargs: True)
+        monkeypatch.setattr(support, 'wait_for_ordinary_recovery', lambda *args, **kwargs:
+            ManagedCiOutcome(status='passed', checks=_watch_check_board('passing'), head_sha=capability.expected_head_sha))
+    events = []
+    monkeypatch.setattr(loop, '_record_staged_parent_completion_after_merge',
+                        lambda *args, **kwargs: events.append('parent'))
+    def publication(*args, **kwargs):
+        assert events == ['parent']
+        events.append('tracking')
+        if failure == 'exception':
+            raise AgentLoopError('tracker unavailable')
+        return 1
+    monkeypatch.setattr(runtime, 'reconcile', publication)
+    with pytest.raises(AgentLoopError, match='merged, tracking pending'):
+        loop.run_pr_loop(runner, config=make_config(tmp_path, auto_merge=True), pr_number=77)
+    assert events == ['parent', 'tracking']
+    output = capsys.readouterr().out
+    expected = {'full-board': 'merged after CI watch', 'managed': 'approved by',
+                'ordinary-recovery': 'merged after deliberate ordinary recovery'}
+    assert expected[mode] in output
+    assert sum(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands) == 1

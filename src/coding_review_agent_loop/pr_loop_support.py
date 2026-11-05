@@ -305,8 +305,6 @@ def _merge_with_exact_head_proof(
         repository=proof.repository, head_sha=proof.head_sha, action="merge",
     )
     merge_pr(runner, config, pr_number, expected_head_sha=proof.head_sha)
-    from .post_merge_runtime import complete_merge
-    complete_merge(runner, config, pr_number)
 
 
 def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str | None:

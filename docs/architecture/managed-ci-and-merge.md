@@ -516,7 +516,9 @@ unchanged.
 
 The exact-head proof helper retains its final live-head read and GitHub
 head-guarded merge. `post_merge_runtime.complete_merge` runs afterward, outside
-that critical sequence, for each caller of the helper. Confirmed merges
+that critical sequence, at every merge exit after merge-success reporting and
+best-effort staged-parent completion bookkeeping. Publication failures cannot
+be mistaken for merge failures or skip that bookkeeping. Confirmed merges
 publish or verify authenticated per-obligation records on the existing tracking
 issues and persist verified receipts on the source PR. Read-back reconciliation
 handles ambiguous writes and partial success. Failure reports merged with

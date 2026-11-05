@@ -121,12 +121,17 @@ class ObligationRun:
                 continue
             candidate.append(admission)
         validate_registry(candidate, repo=self.config.repo, pr=self.pr)
-        if candidate != list(self.registry):
+        resolved_targets = {request.target_id or request.requirement for request, _, _ in proposals}
+        resolved_targets.update(provenance['source_id'] for _, _, provenance in proposals
+                                if provenance.get('kind') == 'operator')
+        diagnostics = tuple(d for d in self.diagnostics if not any(
+            d.startswith(f'Post-merge request {target} rejected: ') for target in resolved_targets))
+        if candidate != list(self.registry) or diagnostics != self.diagnostics:
             if self.config.dry_run:
                 return
-            persist(self.runner, self.config, self.pr, head, candidate,
+            persist(self.runner, self.config, self.pr, head, candidate, diagnostics,
                     items=items, round_number=round_number)
-            self.registry, self.diagnostics = tuple(candidate), ()
+            self.registry, self.diagnostics = tuple(candidate), diagnostics
 
     def visible_requirements(self, requirements):
         result = []

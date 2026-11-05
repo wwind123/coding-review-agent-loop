@@ -249,7 +249,7 @@ def scheduled_item(item, registry):
                    and a['source']['target_id'] == source['target_id']
                    and a['source'].get('matrix_identity') == source['matrix_identity']
                    for a in active_registry(registry))
-    if any(a['source']['target_kind'] == 'declaration' and a['source'].get('requester') == item.reviewer
+    if set(item.resolution_owners or (item.reviewer,)) == {item.reviewer} and any(a['source']['target_kind'] == 'declaration' and a['source'].get('requester') == item.reviewer
            and a['request']['requirement'] == item.text for a in active_registry(registry)):
         return True
     return any(a['source'] == source for a in active_registry(registry))
