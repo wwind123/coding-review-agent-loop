@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .managed_ci_tuple import MANAGED_LABEL, read_opening_pr, compare_opening_pr
+
 from .review_scope import is_complete_code_review
 
 from .managed_ci_result import VerifiedManagedResult
@@ -121,7 +123,6 @@ from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
 
-MANAGED_LABEL = "agent-loop-managed"
 MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
@@ -1767,50 +1768,16 @@ def _issue_created_tuple(
         managed_ci=True,
     )
 
-    def check_rest(pr: dict[str, object]) -> tuple[str, str]:
-        head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-        base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-        author = pr.get("user") if isinstance(pr.get("user"), dict) else {}
-        head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-        labels = {
-            item.get("name") for item in (pr.get("labels") or [])
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        sha = head.get("sha") if isinstance(head.get("sha"), str) else None
-        branch = head.get("ref") if isinstance(head.get("ref"), str) else None
-        rest_body = pr.get("body") if isinstance(pr.get("body"), str) else ""
-        lifecycle_matches = (
-            pr.get("draft") is True and MANAGED_LABEL in labels
-            if lifecycle == "draft-labeled"
-            else pr.get("draft") is True and MANAGED_LABEL not in labels
-            if lifecycle == "draft-unlabeled"
-            else pr.get("draft") is False and MANAGED_LABEL not in labels
+    def check_rest(phase: str) -> tuple[str, str]:
+        pr = read_opening_pr(runner, config, pr_number, phase=phase)
+        return compare_opening_pr(
+            pr, metadata=metadata, repo=config.repo, base=config.base,
+            branch=expected_branch, actor_login=actor_login, actor_id=actor_id,
+            lifecycle=lifecycle, phase=phase, remediation=remediation,
         )
-        if (
-            pr.get("state") not in {"open", "OPEN"}
-            or not lifecycle_matches
-            or head_repo.get("full_name", "").casefold() != config.repo.casefold()
-            or branch != expected_branch
-            or base.get("ref") != config.base
-            or (lifecycle == "draft-labeled" and MANAGED_LABEL not in labels)
-            or (lifecycle != "draft-labeled" and MANAGED_LABEL in labels)
-            or author.get("login", "").casefold() != actor_login.casefold()
-            or author.get("id") != actor_id
-            or sha != metadata.head_sha
-            or branch != metadata.head_branch
-            or base.get("ref") != metadata.base_branch
-            or rest_body != body
-        ):
-            raise AgentLoopError(
-                "Managed-CI issue-created opening tuple is missing or changed. "
-                f"The PR was left unchanged. Resume with `{remediation}`."
-            )
-        return sha, branch
 
-    first = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
-    sha, branch = check_rest(first)
-    second = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
-    live_sha, live_branch = check_rest(second)
+    sha, branch = check_rest("first-validation")
+    live_sha, live_branch = check_rest("second-validation")
     if (live_sha, live_branch) != (sha, branch):
         raise AgentLoopError(
             "Managed-CI issue-created opening tuple changed during validation. "
@@ -4281,7 +4248,7 @@ def recover_issue_created_handoff(
         record = parse_managed_ci_override_record(
             body, surface=PR_BODY_SURFACE, schema="body", required=True,
         )
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = read_opening_pr(runner, config, pr_number, phase="lifecycle-classification")
     labels = {
         item.get("name") for item in (pr.get("labels") or [])
         if isinstance(item, dict) and isinstance(item.get("name"), str)

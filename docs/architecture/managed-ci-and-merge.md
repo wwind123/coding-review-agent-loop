@@ -2,9 +2,30 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_tuple.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
+
+Issue-created recovery reconstructs the opening tuple from fresh GitHub metadata,
+operator configuration, authenticated actor identity and durable handoff/audit
+records; it never restores process-local creation authority. Raw GraphQL body
+text must agree exactly with both REST validation observations. The scoped
+`managed_ci_tuple.py` helper uses the existing bounded GitHub read retry policy
+for lifecycle classification, first validation and second validation. Failed
+requests and malformed or incomplete objects stop before authorization or PR
+lifecycle writes, with the endpoint and phase named; they are not interpreted
+as tuple changes. Lifecycle classification requires a boolean draft and a list
+of label objects with string names (an empty list is valid).
+
+For successful, structurally complete observations, every opening-tuple
+predicate remains enforced. Refusals identify all differing fields, expected
+sources and the REST observation phase. String diagnostics contain only bounded
+length/digest summaries, including body discrepancies, so raw body text and
+nonces cannot leak. Operators must resolve or recheck the discrepancy before
+using the shell-quoted resume command. These diagnostics address a confirmed
+failure-to-empty-object ambiguity; they do not establish the historical cause
+of an otherwise unreproduced interruption. Other quiet API readers and trusted
+Git transport diagnostics retain their existing behavior.
 
 Recovery command rendering lives in the pure `managed_ci_recovery_commands.py`
 sibling, and workflow-mirrored intent envelope, schema and lifecycle validation
