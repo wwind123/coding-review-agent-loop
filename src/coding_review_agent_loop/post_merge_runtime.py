@@ -139,15 +139,28 @@ class ObligationRun:
         resolved_targets = {request.target_id or request.requirement for request, _, _ in proposals}
         resolved_targets.update(provenance['source_id'] for _, _, provenance in proposals
                                 if provenance.get('kind') == 'operator')
-        diagnostics = tuple(d for d in self.diagnostics if not any(
+        diagnostics = tuple(d for d in self.diagnostics if not d.startswith('Post-merge diagnostic refresh failed: ')
+            and not any(
             d.startswith((f'Post-merge request {target} rejected: ',
                           f'Admitted post-merge obligation {target} retained: ')) for target in resolved_targets))
         diagnostics = tuple(dict.fromkeys((*diagnostics, *replay_diagnostics)))
         if candidate != list(self.registry) or diagnostics != self.diagnostics:
             if self.config.dry_run:
                 return
-            persist(self.runner, self.config, self.pr, head, candidate, diagnostics,
-                    items=items, round_number=round_number)
+            try:
+                persist(self.runner, self.config, self.pr, head, candidate, diagnostics,
+                        items=items, round_number=round_number)
+            except AgentLoopError as exc:
+                if candidate != list(self.registry):
+                    raise
+                # Diagnostic transport cannot revoke an authenticated admission
+                # or turn its consumed control input back into a requirement.
+                problem = (f'Post-merge diagnostic refresh failed: {exc}. '
+                           'Existing admissions remain required after merge and do not block merge; '
+                           'rerun to retry diagnostic publication.')
+                self.diagnostics = (*diagnostics, problem)
+                print(problem)
+                return
             self.registry, self.diagnostics = tuple(candidate), diagnostics
 
     def visible_requirements(self, requirements):

@@ -39,10 +39,11 @@ def test_cli_dry_run_uses_production_runner_for_live_reads(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('tracker', ['closed', 'unreadable'])
+@pytest.mark.parametrize('publication_fails', [False, True])
 @pytest.mark.parametrize('prose', ['', 'Keep the compatibility requirement.'])
 @pytest.mark.parametrize('target_kind', ['evidence-item', 'converted-row', 'signed-requirement'])
 def test_round_replay_keeps_consumed_directive_separate_from_prose(
-        tmp_path, monkeypatch, tracker, prose, target_kind):
+        tmp_path, monkeypatch, capsys, tracker, publication_fails, prose, target_kind):
     run, writes = setup_run(tmp_path, monkeypatch)
     item = evidence()
     target = None
@@ -65,6 +66,11 @@ def test_round_replay_keeps_consumed_directive_separate_from_prose(
             raise AgentLoopError('tracker read failed')
         return {'number': 9, 'state': 'closed'}
     monkeypatch.setattr(runtime, 'read_api', tracker_read)
+    original_persist = runtime.persist
+    if publication_fails:
+        def failed(*args, **kwargs):
+            raise AgentLoopError('diagnostic write failed')
+        monkeypatch.setattr(runtime, 'persist', failed)
     resumed = runtime.ObligationRun(run.runner, run.config, 1)
     items, visible = runtime.round_start(resumed,
         PullRequestReviewContext(metadata('b'*40), (), ()), [item], requirements, 2)
@@ -72,11 +78,18 @@ def test_round_replay_keeps_consumed_directive_separate_from_prose(
     assert resumed.registry == saved
     assert items == ([item] if target else [])
     assert ('closed' if tracker == 'closed' else 'tracker read failed') in resumed.context()
-    diagnostic, = resumed.diagnostics
+    diagnostic = resumed.diagnostics[0]
     assert diagnostic.startswith(f"Admitted post-merge obligation {payload['target_id']} retained: ")
     assert 'does not block merge' in diagnostic
     assert 'new authorized scheduling request' in diagnostic
     assert 'rejected:' not in diagnostic and 'remains blocking' not in diagnostic
+    if publication_fails:
+        assert 'diagnostic write failed' in resumed.diagnostics[1]
+        assert 'diagnostic write failed' in capsys.readouterr().out
+        assert len(writes) == 1  # Only the original admission was published.
+        assert all('rejected:' not in d and 'remains blocking' not in d for d in resumed.diagnostics)
+        monkeypatch.setattr(runtime, 'persist', original_persist)
+        resumed.operator_inputs(requirements, items=[item], closing=(), head='b'*40, round_number=2)
     assert writes[-1][0][4] == list(saved)
     assert writes[-1][0][5] == resumed.diagnostics
     assert all('```post-merge-schedule' not in r.body for r in visible)
@@ -94,7 +107,9 @@ def test_round_replay_keeps_consumed_directive_separate_from_prose(
 
 
 @pytest.mark.parametrize('tracker', ['closed', 'unreadable'])
-def test_frozen_resume_replays_operator_control_without_coder_or_new_freeze(tmp_path, monkeypatch, tracker):
+@pytest.mark.parametrize('publication_fails', [False, True])
+def test_frozen_resume_replays_operator_control_without_coder_or_new_freeze(
+        tmp_path, monkeypatch, tracker, publication_fails):
     from coding_review_agent_loop import pr_loop
     from coding_review_agent_loop.errors import HumanDecisionRequiredError
     from pr_loop_test_helpers import _freeze_records
@@ -121,6 +136,10 @@ def test_frozen_resume_replays_operator_control_without_coder_or_new_freeze(tmp_
             raise AgentLoopError('tracker read failed')
         return {'number': 9, 'state': 'closed'}
     monkeypatch.setattr(runtime, 'read_api', tracker_read)
+    if publication_fails:
+        def failed(*args, **kwargs):
+            raise AgentLoopError('diagnostic write failed')
+        monkeypatch.setattr(runtime, 'persist', failed)
     before = len(runner.commands)
     assert pr_loop.run_pr_loop(runner, config=run.config, pr_number=77) == 0
     assert len(_freeze_records(runner)) == len(freezes)

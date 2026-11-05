@@ -552,6 +552,10 @@ unrelated rejection remedies in durable metadata and subsequent prompts.
 Tracker problems after admission use retained-obligation diagnostics: required
 post-merge work stays scheduled and does not become a merge blocker. Replay
 refreshes only its own target diagnostics, clearing them when its tracker recovers.
+If publishing a diagnostic refresh fails without changing the admission registry,
+the admitted control input stays consumed and surrounding signed prose remains
+visible. The run reports the transport failure and retries on replay; new admissions
+still require verified publication before they can change eligibility.
 
 ## Decisions
 
