@@ -135,6 +135,7 @@ from .validated_agent import (
     _run_validated_agent,
 )
 from .response_validation import (
+    _implementation_terminal_diagnostic,
     _validate_issue_implementation_response,
     _validate_followup_workdir_report,
     _current_test_turn_observations,
@@ -614,6 +615,10 @@ def _implement_approved_issue_unscoped(
                     if isinstance(implementation_result, StructuredIssueImplementation)
                     else f"Coder returned a terminal {implementation_result.state} response without a PR."),
         )
+    if terminal_diagnostic:
+        terminal_diagnostic = _implementation_terminal_diagnostic(
+            implementation_result, coder_output, repo=implementation_config.repo,
+        ) + terminal_diagnostic
     if isinstance(implementation_result, _TerminalIssueImplementationConflict):
         implementation_result = _TerminalIssueImplementationConflict(
             _degrade_out_of_checkout_tests(
@@ -762,6 +767,9 @@ def _implement_approved_issue_unscoped(
                                 agent=implementation_config.coder, run_id=usage_context.run_id,
                                 approved_plan_hash=plan_hash), reason=reask_result.parsed.summary,
                         )
+                        terminal_diagnostic = _implementation_terminal_diagnostic(
+                            reask_result, reask_response.text, repo=implementation_config.repo,
+                        ) + terminal_diagnostic
                         reask_result = _TerminalIssueImplementationConflict(
                             _degrade_out_of_checkout_tests(
                                 reask_result.parsed, config=implementation_config

@@ -2208,3 +2208,67 @@ def test_followup_workdir_composition_preserves_operational_errors(tmp_path, mon
     with pytest.raises(AgentLoopError) as caught:
         response_validation._validate_followup_workdir_report(parsed, config=make_config(tmp_path))
     assert caught.value is failure
+
+
+
+@pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", "PR #77.\n\nPR #78", ""])
+@pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation"])
+@pytest.mark.parametrize("layout", ["structured", "structured-quoted", "structured-fenced", "structured-tilde", "structured-comment", "heading", "paragraphs", "quoted-history", "fenced-history"])
+def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference, scope, layout):
+    summary = f"Capture could not finish. {reference}"
+    if layout.startswith("structured"):
+        history = {"structured": "", "structured-quoted": "> Earlier PR #79",
+                   "structured-fenced": "```text\nPR #79\n```",
+                   "structured-tilde": "~~~text\nPR #79\n~~~",
+                   "structured-comment": "<!-- Earlier PR #79 -->"}[layout]
+        text = structured_issue_implementation(pr_number=None, summary=summary + "\n\n" + history)
+    else:
+        prefix = {"heading": "## Blocking\n\n", "paragraphs": "",
+                  "quoted-history": "> Earlier PR #79\n\n",
+                  "fenced-history": "```text\nPR #79\n```\n\n"}[layout]
+        text = prefix + f"Capture could not finish.\n\n{reference}\n<!-- AGENT_STATE: blocking -->"
+    runner = FakeRunner(claude_outputs=[text])
+    # Exercise actual rejected legacy prose, without the fixture's JSON upgrade.
+    runner._normalize_legacy_agent_output = lambda output, prompt: output
+    config = make_config(tmp_path, agent_max_retries=0)
+    def reject(value):
+        raise AgentLoopError("receipt validation refused")
+    with pytest.raises(AgentInvocationError) as stop:
+        _run_validated_agent(
+            runner, agent="claude", config=config, prompt="Implement issue.",
+            marker_description="structured implementation", validate=reject,
+            role="coder", use_repair=False,
+            salvage_context=SalvageContext(repo=config.repo, issue_number=56,
+                scope=scope, agent="claude"),
+            operation_description="issue implementation",
+        )
+    message = str(stop.value)
+    assert "receipt validation refused" in message
+    assert "Capture could not finish" in message
+    assert ("Reported PR (unverified)" in message) == (reference == "https://github.com/OWNER/REPO/pull/77")
+    assert stop.value.failure_category == "deterministic"
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _ in runner.commands)
+    assert runner.issue_comments == []
+
+
+@pytest.mark.parametrize("role,kind", [("reviewer", "pr_review"), ("planner", "plan_review")])
+@pytest.mark.parametrize("structured", [False, True])
+def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind, structured):
+    text = "Blocked on PR #77."
+    if structured:
+        text = json.dumps({"kind": kind, "summary": text})
+    text += "\n<!-- AGENT_STATE: blocking -->\n-- Reviewer"
+    runner = FakeRunner(claude_outputs=[text])
+    def reject(value):
+        raise AgentLoopError("response validation refused")
+    with pytest.raises(AgentInvocationError) as stop:
+        _run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review.", marker_description="structured review", validate=reject,
+            role=role, use_repair=False)
+    message = str(stop.value)
+    assert "response validation refused" in message
+    assert "Coder terminal context" not in message
+    assert "Reported PR (unverified)" not in message
+    assert stop.value.failure_category == "deterministic"
+    assert runner.issue_comments == []

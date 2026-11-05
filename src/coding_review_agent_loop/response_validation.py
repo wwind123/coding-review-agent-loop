@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .terminal_diagnostics import terminal_response_diagnostic
+
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -141,6 +143,14 @@ def _validate_issue_implementation_contract(
         surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
         requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
     )
+
+
+def _implementation_terminal_diagnostic(result, text: str, *, repo: str) -> str:
+    """Describe an already-selected terminal result without authenticating a PR."""
+    parsed = (result.parsed if isinstance(result, (
+        _TerminalIssueImplementationConflict, _TerminalNoPrImplementation,
+    )) else result)
+    return terminal_response_diagnostic(text, repo=repo, parsed=parsed, terminal=True)
 
 
 def _validate_issue_implementation_response(

@@ -351,6 +351,27 @@ additive diagnostics and preserve the original terminal reason. Valid terminal
 categories use the existing metadata field and breadcrumb schema, while historical
 failed-acquisition records retain their failure semantics.
 
+Terminal diagnostics retain the coder's concise reason before additive local
+salvage details, including when committed work leaves no tracked/staged diff.
+The shared terminal-response diagnostic helper labels a clearly supplied
+same-repository PR as reported and unverified; it does not scan quoted issue
+history or accept invalid, conflicting or foreign-repository identities.
+For legacy replies, concise reason selection is separate from reference scanning:
+ordinary headings and later current-report paragraphs remain available, while
+quoted lines and fenced code are excluded from both. Conflicting references
+across paragraphs suppress advisory PR identity just as conflicts within one do.
+Structured summaries use the same current-prose filter for reference extraction;
+a separately supplied typed PR identity remains available independently of quoted
+lines, fenced examples and HTML comments in the summary.
+Rejected issue and approved-plan implementation acquisitions retain their actual
+rejection or timeout category and recovery guidance, adding available final-response
+context only as advisory information. Other acquisition scopes receive no coder
+terminal context, and structured responses for other roles cannot become legacy
+coder prose through a blocking footer. A structured implementation's blocking state alone is insufficient
+to identify a terminal stop because successful PR envelopes use that state too.
+These diagnostics do not authenticate or adopt a PR, publish a handoff, start
+review/CI/merge, change retry allowances, or extend persisted salvage schemas.
+
 Untracked contents are intentionally excluded; intended new files must be staged
 before required tests. Default relative artifact directories are isolated per run.
 Automatic local issue discovery requires a stable absolute `--log-dir`; distinct

@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .terminal_diagnostics import terminal_response_diagnostic
+
 import datetime
 import json
 import re
@@ -1547,6 +1549,12 @@ def _failed_run_diagnostics(
         failure_reason=failure_reason,
         classification_text=classification_text,
     )
+    if (result is not None and salvage_context is not None
+            and salvage_context.scope in {
+                ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
+                APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+            }):
+        response_line += terminal_response_diagnostic(result.text or result.response_file_text or "", repo=config.repo)
     return _FailedRunDiagnostics(
         patch_salvage=patch_salvage,
         response_line=response_line,

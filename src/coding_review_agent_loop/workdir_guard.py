@@ -893,11 +893,28 @@ def _scratch_option_values(tokens: Sequence[str], head: int | None) -> dict[int,
     return values
 
 
+def _npm_forwarding_separator(tokens: Sequence[str], head: int | None) -> int | None:
+    """Recognize npm run/run-script NAME -- after known wrappers.
+
+    A second separator belongs to the script and keeps terminator semantics.
+    Unrecognized npm layouts and other package managers remain strict.
+    """
+    if head is None or len(tokens) <= head + 3:
+        return None
+    if (_program_basename(tokens[head]) == "npm"
+            and tokens[head + 1] in {"run", "run-script"}
+            and not tokens[head + 2].startswith("-")
+            and tokens[head + 3] == "--"):
+        return head + 3
+    return None
+
+
 def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tuple[str, str]]:
     tokens = clause.tokens
     n = len(tokens)
     program_positions, head = _program_position_indices(tokens)
     grep_patterns = _grep_pattern_indices(tokens, head)
+    forwarding = _npm_forwarding_separator(tokens, head)
 
     first_path_idx = next((i for i, t in enumerate(tokens) if _is_path_shaped(t)), None)
     promoted_idx: int | None = None
@@ -914,6 +931,9 @@ def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tup
     while idx < n:
         token = tokens[idx]
         if idx in grep_patterns:
+            idx += 1
+            continue
+        if idx == forwarding:
             idx += 1
             continue
         if token == "--" and (head is None or idx > head):
@@ -986,13 +1006,13 @@ def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tup
             idx += 2
             continue
 
-        # Generic equals-form values retain their pre-existing strict behavior.
-        # Display-only scratch occurrences were handled above; only known
-        # execution inputs need value extraction here (as in separate form).
-        if token.partition("=")[0] in {
+        # Forwarded options retain strict equals-value extraction after npm's
+        # separator; known destinations were already handled above.
+        if ((forwarding is not None and idx > forwarding and token.startswith("-"))
+                or token.partition("=")[0] in {
             "-c", "--config", "--config-file", "--confcutdir",
             "--ignore", "--ignore-glob", "--cov-config",
-        } and "=" in token:
+        }) and "=" in token:
             value = token.split("=", 1)[1]
             if _is_path_shaped(value):
                 results.append((value, "argument"))
@@ -1445,6 +1465,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
+    forwarding = _npm_forwarding_separator(tokens, head)
     if head_name in {"cd", "pushd", "popd"}:
         moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
         if moved is None or clause.in_subshell or head_name == "popd":
@@ -1462,6 +1483,9 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     index = head + 1
     while index < len(tokens):
         token = tokens[index]
+        if index == forwarding:
+            index += 1
+            continue
         if token == "--":
             break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
@@ -1499,6 +1523,8 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
                     log.inside_target = True
             else:
                 record_relative()
+            continue
+        if index == forwarding:
             continue
         if token == "--":
             terminated = True
@@ -1757,7 +1783,6 @@ def _partition_reported_tests_by_workdir(
 
 
 _PACKAGE_MANAGER_HEADS = frozenset({"npm", "pnpm", "yarn"})
-_ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
@@ -1770,16 +1795,27 @@ def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
 
 
 def is_package_manager_command(argv: Sequence[str] | str) -> bool:
-    """Whether ``argv`` (after an optional ``env NAME=VALUE`` prefix) is npm/pnpm/yarn."""
-    tokens = _argv_tokens(argv)
-    index = 0
-    if tokens and Path(tokens[0]).name == "env":
-        index = 1
-        while index < len(tokens) and (
-            tokens[index] == "--" or _ENV_ASSIGNMENT_TOKEN_RE.match(tokens[index])
-        ):
-            index += 1
-    return index < len(tokens) and Path(tokens[index]).name in _PACKAGE_MANAGER_HEADS
+    """Find npm/pnpm/yarn through the same wrappers as checkout validation."""
+    command = argv if isinstance(argv, str) else shlex.join(_argv_tokens(argv))
+    try:
+        clauses = _clauses_for_entry(command, "structured")
+    except AgentLoopError:
+        # The path guard independently refuses unvalidatable shell syntax.
+        return False
+    for clause in clauses:
+        tokens = clause.tokens
+        try:
+            managed = parse_managed_test_command(tokens, allow_command_name_launcher=True)
+        except TestRuntimeConfigurationError:
+            managed = None
+        if managed is not None:
+            if is_package_manager_command(managed.inner_argv):
+                return True
+            continue
+        head = _effective_head_index(tokens)
+        if head is not None and _program_basename(tokens[head]) in _PACKAGE_MANAGER_HEADS:
+            return True
+    return False
 
 
 def command_is_admissible_evidence(

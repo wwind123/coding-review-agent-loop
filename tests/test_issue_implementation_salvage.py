@@ -600,7 +600,7 @@ def test_terminal_issue_degradation_preserves_reason(tmp_path, monkeypatch, caps
     import coding_review_agent_loop.salvage as salvage
     from agent_loop_helpers import structured_issue_implementation
     config = make_config(tmp_path, quiet=False, salvage_comments=policy != "disabled", dry_run=policy == "dry-run")
-    runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=None)],
+    runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=None, summary="Required test timed out; PR https://github.com/OWNER/REPO/pull/77 was reported.")],
                         post_agent_git_diff="" if policy in {"clean", "untracked"} else TERMINAL_PATCH,
                         post_agent_git_status="?? ignored.txt\n" if policy == "untracked" else "")
     def fail(*args, **kwargs):
@@ -612,6 +612,8 @@ def test_terminal_issue_degradation_preserves_reason(tmp_path, monkeypatch, caps
     with pytest.raises(AgentLoopError, match="implementation is blocking") as stop:
         _run_terminal(runner, config, approved)
     message = str(stop.value) + capsys.readouterr().err
+    assert "Required test timed out" in str(stop.value)
+    assert "Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in str(stop.value)
     if policy == "capture-error":
         assert "capture failed" in message
     elif policy in {"clean", "untracked"}:
@@ -660,3 +662,56 @@ def test_terminal_issue_rerun_prompt_discovery(tmp_path, monkeypatch, approved, 
         assert "The previous attempt failed." not in prompt
     else:
         assert "valid terminal response without an accepted PR handoff" not in prompt
+
+
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("reference", [
+    "https://github.com/OWNER/REPO/pull/77", "PR #77", "", "PR #0",
+    "https://github.com/OTHER/REPO/pull/77", "https://github.com/OWNER/REPO/pull/nope",
+    "PR #77 and PR #78", "PR #77.\n\nI also opened PR #78.",
+])
+@pytest.mark.parametrize("history", ["", "> Earlier PR #79", "```text\nPR #79\n```", "~~~text\nPR #79\n~~~", "<!-- Earlier PR #79 -->"])
+@pytest.mark.parametrize("layout", ["flat", "heading", "paragraphs"])
+def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path, approved, reference, layout, history):
+    from agent_loop_helpers import structured_issue_implementation
+    summary = {
+        "flat": f"Required capture timed out. {reference}",
+        "heading": f"## Blocking\n\nRequired capture timed out. {reference}",
+        "paragraphs": f"Required capture timed out.\n\nI opened {reference}",
+    }[layout]
+    text = structured_issue_implementation(pr_number=None, summary=summary + "\n\n" + history)
+    runner = FakeRunner(claude_outputs=[text], post_agent_git_diff="", post_agent_git_status="")
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError) as stop:
+        _run_terminal(runner, config, approved)
+    message = str(stop.value)
+    assert "Required capture timed out" in message
+    valid = reference in {"https://github.com/OWNER/REPO/pull/77", "PR #77"}
+    assert ("Reported PR (unverified)" in message) == valid
+    assert message.index("Required capture timed out") < message.index("No eligible tracked/staged diff")
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _ in runner.commands)
+    from coding_review_agent_loop.issue_pr_handoff import AGENT_ISSUE_PR_HANDOFF_RE
+    assert not any(AGENT_ISSUE_PR_HANDOFF_RE.search(c["body"]) for c in runner.issue_comments)
+    assert not any(cmd[:3] in (["gh", "pr", "merge"], ["gh", "workflow", "run"])
+                   for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("layout", ["heading", "heading-reason", "paragraphs", "quoted-history", "fenced-history"])
+@pytest.mark.parametrize("reference, reported", [("PR #77", True), ("PR #77.\n\nPR #78", False), ("", False)])
+def test_legacy_terminal_adapter_keeps_current_report_context(layout, reference, reported):
+    from coding_review_agent_loop.response_validation import _implementation_terminal_diagnostic
+    from coding_review_agent_loop.architecture_contract import _TerminalNoPrImplementation
+    prefix = {
+        "heading": "## Blocking\n\n",
+        "heading-reason": "",
+        "paragraphs": "",
+        "quoted-history": "> Previously opened PR #79\n\n",
+        "fenced-history": "```text\nPR #79\n```\n\n",
+    }[layout]
+    text = (f"## Capture timed out.\n\n{reference}" if layout == "heading-reason"
+            else prefix + f"Capture timed out.\n\n{reference}")
+    text += "\n<!-- AGENT_STATE: blocking -->"
+    message = _implementation_terminal_diagnostic(_TerminalNoPrImplementation("blocking"), text, repo="OWNER/REPO")
+    assert "Capture timed out" in message
+    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == reported
+    assert "PR #79" not in message

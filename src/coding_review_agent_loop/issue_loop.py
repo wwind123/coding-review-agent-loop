@@ -131,6 +131,7 @@ from .validated_agent import (
     _run_validated_agent,
 )
 from .response_validation import (
+    _implementation_terminal_diagnostic,
     ResolvedExecution,
     _validate_issue_implementation_response,
     _derive_authenticated_risk_evidence_for_coder,
@@ -970,6 +971,10 @@ def run_issue_loop(
                     if isinstance(implementation_result, StructuredIssueImplementation)
                     else f"Coder returned a terminal {implementation_result.state} response without a PR."),
             )
+        if terminal_diagnostic:
+            terminal_diagnostic = _implementation_terminal_diagnostic(
+                implementation_result, coder_output, repo=config.repo,
+            ) + terminal_diagnostic
         if isinstance(implementation_result, _TerminalIssueImplementationConflict):
             implementation_result = _TerminalIssueImplementationConflict(
                 _degrade_out_of_checkout_tests(implementation_result.parsed, config=config)
