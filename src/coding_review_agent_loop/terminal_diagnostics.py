@@ -6,7 +6,7 @@ import json
 import re
 
 
-def _current_legacy_prose(text: str) -> str:
+def _current_report_prose(text: str) -> str:
     """Exclude quoted history and fenced code, retaining later report paragraphs."""
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     lines = []
@@ -59,7 +59,7 @@ def terminal_response_diagnostic(
         )
         if not footer:
             return ""
-        prose = _current_legacy_prose(text[:footer.start()])
+        prose = _current_report_prose(text[:footer.start()])
         reference_text = prose
         # Select a concise reason independently of the complete reference scan.
         body = re.sub(
@@ -73,7 +73,7 @@ def terminal_response_diagnostic(
     if not terminal and not re.search(r"\b(?:blocking|blocked|cannot proceed)\b", summary, re.I):
         return ""
     if reference_text is None:
-        reference_text = summary
+        reference_text = _current_report_prose(summary)
     summary = " ".join(summary.split())[:700]
     refs: set[int] = set()
     invalid = False

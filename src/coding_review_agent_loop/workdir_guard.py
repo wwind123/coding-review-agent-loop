@@ -1796,17 +1796,25 @@ def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
 
 def is_package_manager_command(argv: Sequence[str] | str) -> bool:
     """Find npm/pnpm/yarn through the same wrappers as checkout validation."""
-    tokens = _argv_tokens(argv)
-    while tokens:
+    command = argv if isinstance(argv, str) else shlex.join(_argv_tokens(argv))
+    try:
+        clauses = _clauses_for_entry(command, "structured")
+    except AgentLoopError:
+        # The path guard independently refuses unvalidatable shell syntax.
+        return False
+    for clause in clauses:
+        tokens = clause.tokens
         try:
             managed = parse_managed_test_command(tokens, allow_command_name_launcher=True)
         except TestRuntimeConfigurationError:
             managed = None
         if managed is not None:
-            tokens = managed.inner_argv
+            if is_package_manager_command(managed.inner_argv):
+                return True
             continue
         head = _effective_head_index(tokens)
-        return head is not None and _program_basename(tokens[head]) in _PACKAGE_MANAGER_HEADS
+        if head is not None and _program_basename(tokens[head]) in _PACKAGE_MANAGER_HEADS:
+            return True
     return False
 
 

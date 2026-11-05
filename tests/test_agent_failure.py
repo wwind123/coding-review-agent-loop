@@ -124,3 +124,20 @@ def test_terminal_diagnostic_does_not_scan_quoted_history():
     message = terminal_response_diagnostic(text, repo="OWNER/REPO")
     assert "Cannot proceed" in message
     assert "Reported PR" not in message
+
+
+@pytest.mark.parametrize("parsed", [False, True])
+@pytest.mark.parametrize("number,current,reported", [(None, "", False), (None, "PR #77", True), (77, "", True), (77, "PR #77", True)])
+@pytest.mark.parametrize("history", ["> Earlier PR #79", "```text\nPR #79\n```", "~~~text\nPR #79\n~~~", "<!-- Earlier PR #79 -->"])
+def test_structured_terminal_filters_history_preserving_typed_identity(parsed, number, current, reported, history):
+    from types import SimpleNamespace
+    from agent_loop_helpers import structured_issue_implementation
+    from coding_review_agent_loop.terminal_diagnostics import terminal_response_diagnostic
+    summary = f"Blocked: capture timed out. {current}\n\n{history}"
+    message = terminal_response_diagnostic(
+        structured_issue_implementation(pr_number=number, summary=summary), repo="OWNER/REPO",
+        parsed=SimpleNamespace(summary=summary, pr_number=number) if parsed else None,
+        terminal=True)
+    assert "capture timed out" in message
+    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == reported
+    assert "Reported PR (unverified): https://github.com/OWNER/REPO/pull/79" not in message

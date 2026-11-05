@@ -7795,6 +7795,12 @@ def test_projection_uses_frozen_acquisition_not_latest_repair_turn_1758(tmp_path
     "agent-loop run-tests --timeout-seconds 60 -- {}",
     "timeout 30 agent-loop run-tests -- env MODE=review {}",
     "agent-loop run-tests -- timeout 30 env MODE=review {}",
+    'bash -c "{}"', 'sh -c "{}"', 'zsh -c "{}"',
+    'bash -c "true && {}"', 'true && {}', '{} ; true',
+    'agent-loop run-tests -- bash -c "{}"',
+    'agent-loop run-tests -- sh -c "true && {}"',
+    'bash -c "agent-loop run-tests -- {}"',
+    "nested-shell",
 ])
 def test_forwarded_output_receipt_authority_and_failure_attribution(tmp_path, outcome, resolution, wrapper):
     import dataclasses
@@ -7803,6 +7809,9 @@ def test_forwarded_output_receipt_authority_and_failure_attribution(tmp_path, ou
     from coding_review_agent_loop.local_test_evidence import mark_out_of_checkout_context, OUT_OF_CHECKOUT_CONTEXT_CAVEAT
     from coding_review_agent_loop.response_validation import _admissible_evidence_observations
     command = wrapper.format("npm run capture -- --output '/outside/artifacts with spaces'")
+    if wrapper == "nested-shell":
+        script = "npm run capture -- --output '/outside/artifacts with spaces'"
+        command = shlex.join(["bash", "-c", shlex.join(["sh", "-c", script])])
     executed = ["node", "--test", "tests/capture.js", "--output", "/outside/artifacts with spaces"]
     if resolution == "outside-config":
         executed += ["--config", "/outside/config.js"]

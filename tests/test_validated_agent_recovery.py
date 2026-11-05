@@ -2213,11 +2213,15 @@ def test_followup_workdir_composition_preserves_operational_errors(tmp_path, mon
 
 @pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", "PR #77.\n\nPR #78", ""])
 @pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation"])
-@pytest.mark.parametrize("layout", ["structured", "heading", "paragraphs", "quoted-history", "fenced-history"])
+@pytest.mark.parametrize("layout", ["structured", "structured-quoted", "structured-fenced", "structured-tilde", "structured-comment", "heading", "paragraphs", "quoted-history", "fenced-history"])
 def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference, scope, layout):
     summary = f"Capture could not finish. {reference}"
-    if layout == "structured":
-        text = structured_issue_implementation(pr_number=None, summary=summary)
+    if layout.startswith("structured"):
+        history = {"structured": "", "structured-quoted": "> Earlier PR #79",
+                   "structured-fenced": "```text\nPR #79\n```",
+                   "structured-tilde": "~~~text\nPR #79\n~~~",
+                   "structured-comment": "<!-- Earlier PR #79 -->"}[layout]
+        text = structured_issue_implementation(pr_number=None, summary=summary + "\n\n" + history)
     else:
         prefix = {"heading": "## Blocking\n\n", "paragraphs": "",
                   "quoted-history": "> Earlier PR #79\n\n",

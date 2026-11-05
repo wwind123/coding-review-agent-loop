@@ -360,6 +360,9 @@ For legacy replies, concise reason selection is separate from reference scanning
 ordinary headings and later current-report paragraphs remain available, while
 quoted lines and fenced code are excluded from both. Conflicting references
 across paragraphs suppress advisory PR identity just as conflicts within one do.
+Structured summaries use the same current-prose filter for reference extraction;
+a separately supplied typed PR identity remains available independently of quoted
+lines, fenced examples and HTML comments in the summary.
 Rejected issue and approved-plan implementation acquisitions retain their actual
 rejection or timeout category and recovery guidance, adding available final-response
 context only as advisory information. Other acquisition scopes receive no coder

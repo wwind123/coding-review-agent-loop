@@ -670,15 +670,16 @@ def test_terminal_issue_rerun_prompt_discovery(tmp_path, monkeypatch, approved, 
     "https://github.com/OTHER/REPO/pull/77", "https://github.com/OWNER/REPO/pull/nope",
     "PR #77 and PR #78", "PR #77.\n\nI also opened PR #78.",
 ])
+@pytest.mark.parametrize("history", ["", "> Earlier PR #79", "```text\nPR #79\n```", "~~~text\nPR #79\n~~~", "<!-- Earlier PR #79 -->"])
 @pytest.mark.parametrize("layout", ["flat", "heading", "paragraphs"])
-def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path, approved, reference, layout):
+def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path, approved, reference, layout, history):
     from agent_loop_helpers import structured_issue_implementation
     summary = {
         "flat": f"Required capture timed out. {reference}",
         "heading": f"## Blocking\n\nRequired capture timed out. {reference}",
         "paragraphs": f"Required capture timed out.\n\nI opened {reference}",
     }[layout]
-    text = structured_issue_implementation(pr_number=None, summary=summary)
+    text = structured_issue_implementation(pr_number=None, summary=summary + "\n\n" + history)
     runner = FakeRunner(claude_outputs=[text], post_agent_git_diff="", post_agent_git_status="")
     config = make_config(tmp_path)
     with pytest.raises(AgentLoopError) as stop:
