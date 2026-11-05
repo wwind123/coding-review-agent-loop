@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .managed_ci_tuple import read_opening_pr, compare_opening_pr
+from .managed_ci_tuple import MANAGED_LABEL, read_opening_pr, compare_opening_pr
 
 from .review_scope import is_complete_code_review
 
@@ -123,7 +123,6 @@ from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
 
-MANAGED_LABEL = "agent-loop-managed"
 MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
