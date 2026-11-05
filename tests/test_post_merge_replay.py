@@ -194,3 +194,44 @@ def test_authorized_payload_restoration_survives_restart_and_publishes_final(
     assert active['identity'] in published[0]
     assert active['request']['owner'] in published[0]
     assert writes
+
+
+@pytest.mark.parametrize('requester', ['OpenAI Codex', 'Claude'])
+@pytest.mark.parametrize('failure', ['closed', 'unreadable', 'durable-write'])
+def test_declaration_fallback_is_bound_to_requester(tmp_path, monkeypatch, requester, failure):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.post_merge_obligations import parse_request
+    from coding_review_agent_loop.pr_loop_support import _partition_unresolved_items
+    from test_post_merge_obligations import REQUEST
+
+    run, writes = setup_run(tmp_path, monkeypatch)
+    review = SimpleNamespace(post_merge_obligations=(parse_request(REQUEST),))
+    board = ['OpenAI Codex', 'Claude']
+    items, next_number = runtime.reviewer_requests(run, {'OpenAI Codex': review},
+        items=[], metadata=metadata(), round_number=1, board=board)
+    assert items == [] and len(writes) == 1
+    admitted = run.registry
+    assert admitted[0]['source']['requester'] == 'OpenAI Codex'
+
+    def failed(*args, **kwargs):
+        raise AgentLoopError(failure)
+    if failure == 'durable-write':
+        monkeypatch.setattr(runtime, 'persist', failed)
+    elif failure == 'unreadable':
+        monkeypatch.setattr(runtime, 'read_api', failed)
+    else:
+        monkeypatch.setattr(runtime, 'read_api', lambda *args: {'number': 9, 'state': 'closed'})
+
+    items, _ = runtime.reviewer_requests(run, {requester: review}, items=items,
+        metadata=metadata('b'*40), round_number=2, board=board, next_number=next_number)
+    assert run.registry == admitted  # A's scheduling remains; B has no admission.
+    parts = _partition_unresolved_items(items, current_head_sha='b'*40)
+    assert not parts['coder_blockers']
+    if requester == 'Claude':
+        assert len(parts['evidence_obligations']) == 1
+        barrier = parts['evidence_obligations'][0]
+        assert barrier.reviewer == requester and barrier.text == REQUEST['requirement']
+        assert run.apply([barrier]) == [barrier]
+        assert ('open' if failure == 'closed' else failure) in run.context()
+    else:
+        assert not parts['evidence_obligations']  # An admitted replay stays scheduled.

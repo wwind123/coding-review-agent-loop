@@ -367,7 +367,10 @@ def reviewer_requests(run, reviews, *, items, metadata, round_number, board, nex
                        if i.item_id.startswith('item-') and i.item_id[5:].isdigit()), default=0) + 1
     for reviewer, review in reviews.items():
         for request in review.post_merge_obligations:
-            if request.target_id is None and not any(a['request'] == request.payload()
+            if request.target_id is None and not any(
+                    a['source']['target_kind'] == 'declaration'
+                    and a['source'].get('requester') == reviewer
+                    and a['request'] == request.payload()
                     for a in active_registry(run.registry)):
                 result, consumed = _upsert_evidence_obligation(result, item_number=next_number,
                     reviewer=reviewer, text=request.requirement, source_round=round_number,

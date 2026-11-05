@@ -546,7 +546,10 @@ merge completion publishes tracking records only after confirmed merge; manual
 completion uses the explicit recovery entry described in the CLI guide.
 
 Declaration matching may release only a sole-requester evidence item; shared
-items require explicit target-bound consent from every resolution owner.
+items require explicit target-bound consent from every resolution owner. Rejected
+new declarations retain a fallback evidence barrier unless that same requester
+has an active declaration admission for the exact payload; another requester
+with identical text and tracking details cannot suppress the barrier.
 Successful admission clears only diagnostics for its own target, preserving
 unrelated rejection remedies in durable metadata and subsequent prompts.
 Tracker problems after admission use retained-obligation diagnostics: required
