@@ -893,11 +893,28 @@ def _scratch_option_values(tokens: Sequence[str], head: int | None) -> dict[int,
     return values
 
 
+def _npm_forwarding_separator(tokens: Sequence[str], head: int | None) -> int | None:
+    """Recognize npm run/run-script NAME -- after known wrappers.
+
+    A second separator belongs to the script and keeps terminator semantics.
+    Unrecognized npm layouts and other package managers remain strict.
+    """
+    if head is None or len(tokens) <= head + 3:
+        return None
+    if (_program_basename(tokens[head]) == "npm"
+            and tokens[head + 1] in {"run", "run-script"}
+            and not tokens[head + 2].startswith("-")
+            and tokens[head + 3] == "--"):
+        return head + 3
+    return None
+
+
 def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tuple[str, str]]:
     tokens = clause.tokens
     n = len(tokens)
     program_positions, head = _program_position_indices(tokens)
     grep_patterns = _grep_pattern_indices(tokens, head)
+    forwarding = _npm_forwarding_separator(tokens, head)
 
     first_path_idx = next((i for i, t in enumerate(tokens) if _is_path_shaped(t)), None)
     promoted_idx: int | None = None
@@ -914,6 +931,9 @@ def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tup
     while idx < n:
         token = tokens[idx]
         if idx in grep_patterns:
+            idx += 1
+            continue
+        if idx == forwarding:
             idx += 1
             continue
         if token == "--" and (head is None or idx > head):
@@ -1445,6 +1465,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
+    forwarding = _npm_forwarding_separator(tokens, head)
     if head_name in {"cd", "pushd", "popd"}:
         moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
         if moved is None or clause.in_subshell or head_name == "popd":
@@ -1462,6 +1483,9 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     index = head + 1
     while index < len(tokens):
         token = tokens[index]
+        if index == forwarding:
+            index += 1
+            continue
         if token == "--":
             break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
@@ -1499,6 +1523,8 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
                     log.inside_target = True
             else:
                 record_relative()
+            continue
+        if index == forwarding:
             continue
         if token == "--":
             terminated = True

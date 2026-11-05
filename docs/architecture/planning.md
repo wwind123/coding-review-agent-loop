@@ -248,6 +248,16 @@ validated acquisition, including normalized and repaired candidates. Only their
 typed report refusals join the re-askable reasons; operational and authorization
 errors retain existing handling. A scratch-input receipt remains inadmissible:
 feedback requests admissible replacement evidence without hiding failures.
+The report, citation and receipt-admission guards share output-destination
+interpretation: explicit long output options may point outside the checkout.
+For recognized `npm run NAME --` and `npm run-script NAME --` commands, the
+first separator forwards script options; a later `--` still makes subsequent
+values positional inputs. Known execution wrappers retain this interpretation.
+Outside config, ignore, working-directory and test inputs remain confined;
+unknown options and ambiguous `-o` meanings gain no exemption. Other package
+manager forwarding layouts remain strict. Npm evidence still requires the
+runner-frozen resolved command, which is independently checked. An output
+destination alone neither degrades evidence to context nor hides failures.
 Guard and selector refusals share one allowance in either order, outside ordinary
 retries. A repair-surfaced refusal stops repair and spends only an unused
 allowance. A semantic refusal exposed by the post-repair observation-field

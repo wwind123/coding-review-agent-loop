@@ -983,3 +983,20 @@ def test_fallback_workdir_refusal_shares_semantic_allowance(
     assert invoke.call_args_list[1].kwargs["prompt"].startswith("Address PR feedback.")
     assert fallback_seen == [(second,)]
     assert repair_calls == ["model-a"]
+
+
+
+def test_forwarded_output_does_not_spend_evidence_correction(tmp_path, monkeypatch):
+    command = "agent-loop run-tests --timeout-seconds 60 -- npm run capture -- --output /outside/artifacts"
+    text = structured_issue_implementation(pr_number=None, tests_run=[command], summary="Capture failed; implementation blocked.")
+    config = make_config(tmp_path)
+    def validate(candidate):
+        parsed = validate_structured_issue_implementation(candidate)
+        return response_validation._degrade_out_of_checkout_tests(parsed, config=config)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result",
+                         return_value=AgentResult(text=text, returncode=0)) as invoke:
+        accepted = _run(tmp_path, text, validate)
+    assert invoke.call_count == 1
+    assert accepted.marker_value.tests_run == (command,)
+    assert not accepted.marker_value.out_of_checkout_tests_run

@@ -2208,3 +2208,29 @@ def test_followup_workdir_composition_preserves_operational_errors(tmp_path, mon
     with pytest.raises(AgentLoopError) as caught:
         response_validation._validate_followup_workdir_report(parsed, config=make_config(tmp_path))
     assert caught.value is failure
+
+
+
+@pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", ""])
+def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference):
+    text = structured_issue_implementation(pr_number=None, summary=f"Capture could not finish. {reference}")
+    runner = FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+    def reject(value):
+        raise AgentLoopError("receipt validation refused")
+    with pytest.raises(AgentInvocationError) as stop:
+        _run_validated_agent(
+            runner, agent="claude", config=config, prompt="Implement issue.",
+            marker_description="structured implementation", validate=reject,
+            role="coder", use_repair=False,
+            salvage_context=SalvageContext(repo=config.repo, issue_number=56,
+                scope="issue-implementation", agent="claude"),
+            operation_description="issue implementation",
+        )
+    message = str(stop.value)
+    assert "receipt validation refused" in message
+    assert "Capture could not finish" in message
+    assert ("Reported PR (unverified)" in message) == (reference == "https://github.com/OWNER/REPO/pull/77")
+    assert stop.value.failure_category == "deterministic"
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _ in runner.commands)
+    assert runner.issue_comments == []

@@ -59,3 +59,35 @@ def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
 
     assert runner.comments == []
     assert runner.issue_comments == []
+
+
+
+def test_invalid_response_error_retains_timeout_and_advisory_pr(tmp_path):
+    from coding_review_agent_loop.agents.base import AgentResult
+    from agent_loop_helpers import structured_issue_implementation
+    result = AgentResult(text=structured_issue_implementation(
+        pr_number=None, summary="Capture timed out; reported PR https://github.com/OWNER/REPO/pull/77."))
+    message = agent_failure._format_invalid_agent_response_error(
+        agent_name="Codex", marker_description="implementation result", reason="watchdog expired",
+        result=result, log_paths=[], category="timeout", config=make_config(tmp_path))
+    assert "Failure category: timeout" in message
+    assert "watchdog expired" in message
+    assert "Capture timed out" in message
+    assert "Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message
+
+
+def test_success_state_alone_does_not_establish_terminal_diagnostic():
+    from coding_review_agent_loop.terminal_diagnostics import terminal_response_diagnostic
+    from agent_loop_helpers import structured_issue_implementation
+    assert terminal_response_diagnostic(
+        structured_issue_implementation(pr_number=77, summary="Implemented the plan."),
+        repo="OWNER/REPO") == ""
+
+
+def test_terminal_diagnostic_does_not_scan_quoted_history():
+    from coding_review_agent_loop.terminal_diagnostics import terminal_response_diagnostic
+    text = ("Cannot proceed.\n\n> Previously opened PR https://github.com/OWNER/REPO/pull/77\n"
+            "<!-- AGENT_STATE: blocking -->")
+    message = terminal_response_diagnostic(text, repo="OWNER/REPO")
+    assert "Cannot proceed" in message
+    assert "Reported PR" not in message
