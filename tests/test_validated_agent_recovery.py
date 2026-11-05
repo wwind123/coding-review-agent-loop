@@ -2211,11 +2211,21 @@ def test_followup_workdir_composition_preserves_operational_errors(tmp_path, mon
 
 
 
-@pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", ""])
+@pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", "PR #77.\n\nPR #78", ""])
 @pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation"])
-def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference, scope):
-    text = structured_issue_implementation(pr_number=None, summary=f"Capture could not finish. {reference}")
+@pytest.mark.parametrize("layout", ["structured", "heading", "paragraphs", "quoted-history", "fenced-history"])
+def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference, scope, layout):
+    summary = f"Capture could not finish. {reference}"
+    if layout == "structured":
+        text = structured_issue_implementation(pr_number=None, summary=summary)
+    else:
+        prefix = {"heading": "## Blocking\n\n", "paragraphs": "",
+                  "quoted-history": "> Earlier PR #79\n\n",
+                  "fenced-history": "```text\nPR #79\n```\n\n"}[layout]
+        text = prefix + f"Capture could not finish.\n\n{reference}\n<!-- AGENT_STATE: blocking -->"
     runner = FakeRunner(claude_outputs=[text])
+    # Exercise actual rejected legacy prose, without the fixture's JSON upgrade.
+    runner._normalize_legacy_agent_output = lambda output, prompt: output
     config = make_config(tmp_path, agent_max_retries=0)
     def reject(value):
         raise AgentLoopError("receipt validation refused")

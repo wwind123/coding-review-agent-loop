@@ -6,6 +6,26 @@ import json
 import re
 
 
+def _current_legacy_prose(text: str) -> str:
+    """Exclude quoted history and fenced code, retaining later report paragraphs."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    lines = []
+    fence = None
+    for line in text.splitlines():
+        if line.lstrip().startswith(">"):
+            continue
+        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence is not None:
+            if re.fullmatch(r"\s{0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*", line):
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def terminal_response_diagnostic(
     text: str, *, repo: str, parsed: object = None, terminal: bool = False,
 ) -> str:
@@ -16,6 +36,7 @@ def terminal_response_diagnostic(
     a null PR, rather than trusting that state alone.
     """
     payload = None
+    reference_text = None
     try:
         payload, _ = json.JSONDecoder().raw_decode(text.lstrip())
     except (ValueError, TypeError):
@@ -38,18 +59,21 @@ def terminal_response_diagnostic(
         )
         if not footer:
             return ""
-        prose = text[:footer.start()].strip()
-        # Quoted history and code blocks are not the agent's current report.
-        prose = re.split(r"(?m)^\s*(?:>|```|#{1,6} )", prose, maxsplit=1)[0]
-        summary = re.split(r"\n\s*\n", prose, maxsplit=1)[0]
-        summary = re.sub(r"<!--.*?-->", "", summary, flags=re.S).strip()
+        prose = _current_legacy_prose(text[:footer.start()])
+        reference_text = prose
+        # Select a concise reason independently of the complete reference scan.
+        body = re.sub(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+([^\n]*)(?:\n[ \t]*)*", r"\1 ", prose,
+        ).strip()
+        summary = re.split(r"\n\s*\n", body or prose, maxsplit=1)[0]
         number = None
         terminal = True
     if not isinstance(summary, str) or not summary.strip():
         return ""
     if not terminal and not re.search(r"\b(?:blocking|blocked|cannot proceed)\b", summary, re.I):
         return ""
-    reference_text = summary
+    if reference_text is None:
+        reference_text = summary
     summary = " ".join(summary.split())[:700]
     refs: set[int] = set()
     invalid = False

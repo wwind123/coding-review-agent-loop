@@ -257,7 +257,8 @@ Outside config, ignore, working-directory and test inputs remain confined;
 unknown options (including forwarded equals-form path values) and ambiguous
 `-o` meanings gain no exemption. Other package
 manager forwarding layouts remain strict. Npm evidence still requires the
-runner-frozen resolved command, which is independently checked. An output
+runner-frozen resolved command, which is independently checked, including behind
+execution prefixes and managed `run-tests` wrappers. An output
 destination alone neither degrades evidence to context nor hides failures.
 Guard and selector refusals share one allowance in either order, outside ordinary
 retries. A repair-surfaced refusal stops repair and spends only an unused

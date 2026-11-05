@@ -665,16 +665,20 @@ def test_terminal_issue_rerun_prompt_discovery(tmp_path, monkeypatch, approved, 
 
 
 @pytest.mark.parametrize("approved", [False, True])
-@pytest.mark.parametrize("format", ["structured", "legacy"])
 @pytest.mark.parametrize("reference", [
     "https://github.com/OWNER/REPO/pull/77", "PR #77", "", "PR #0",
     "https://github.com/OTHER/REPO/pull/77", "https://github.com/OWNER/REPO/pull/nope",
-    "PR #77 and PR #78",
+    "PR #77 and PR #78", "PR #77.\n\nI also opened PR #78.",
 ])
-def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path, approved, reference, format):
+@pytest.mark.parametrize("layout", ["flat", "heading", "paragraphs"])
+def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path, approved, reference, layout):
     from agent_loop_helpers import structured_issue_implementation
-    text = (structured_issue_implementation(pr_number=None, summary=f"Required capture timed out. {reference}")
-            if format == "structured" else f"Required capture timed out. {reference}\n<!-- AGENT_PR: 0 -->\n<!-- AGENT_STATE: blocking -->")
+    summary = {
+        "flat": f"Required capture timed out. {reference}",
+        "heading": f"## Blocking\n\nRequired capture timed out. {reference}",
+        "paragraphs": f"Required capture timed out.\n\nI opened {reference}",
+    }[layout]
+    text = structured_issue_implementation(pr_number=None, summary=summary)
     runner = FakeRunner(claude_outputs=[text], post_agent_git_diff="", post_agent_git_status="")
     config = make_config(tmp_path)
     with pytest.raises(AgentLoopError) as stop:
@@ -689,3 +693,24 @@ def test_terminal_clean_head_preserves_reported_context_without_handoff(tmp_path
     assert not any(AGENT_ISSUE_PR_HANDOFF_RE.search(c["body"]) for c in runner.issue_comments)
     assert not any(cmd[:3] in (["gh", "pr", "merge"], ["gh", "workflow", "run"])
                    for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("layout", ["heading", "heading-reason", "paragraphs", "quoted-history", "fenced-history"])
+@pytest.mark.parametrize("reference, reported", [("PR #77", True), ("PR #77.\n\nPR #78", False), ("", False)])
+def test_legacy_terminal_adapter_keeps_current_report_context(layout, reference, reported):
+    from coding_review_agent_loop.response_validation import _implementation_terminal_diagnostic
+    from coding_review_agent_loop.architecture_contract import _TerminalNoPrImplementation
+    prefix = {
+        "heading": "## Blocking\n\n",
+        "heading-reason": "",
+        "paragraphs": "",
+        "quoted-history": "> Previously opened PR #79\n\n",
+        "fenced-history": "```text\nPR #79\n```\n\n",
+    }[layout]
+    text = (f"## Capture timed out.\n\n{reference}" if layout == "heading-reason"
+            else prefix + f"Capture timed out.\n\n{reference}")
+    text += "\n<!-- AGENT_STATE: blocking -->"
+    message = _implementation_terminal_diagnostic(_TerminalNoPrImplementation("blocking"), text, repo="OWNER/REPO")
+    assert "Capture timed out" in message
+    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == reported
+    assert "PR #79" not in message

@@ -7790,13 +7790,19 @@ def test_projection_uses_frozen_acquisition_not_latest_repair_turn_1758(tmp_path
 
 @pytest.mark.parametrize("outcome", ["passed", "failed"])
 @pytest.mark.parametrize("resolution", ["valid", "missing", "outside-config"])
-def test_forwarded_output_receipt_authority_and_failure_attribution(tmp_path, outcome, resolution):
+@pytest.mark.parametrize("wrapper", [
+    "{}", "timeout 30 {}", "env MODE=review {}", "env MODE=review timeout 30 {}",
+    "agent-loop run-tests --timeout-seconds 60 -- {}",
+    "timeout 30 agent-loop run-tests -- env MODE=review {}",
+    "agent-loop run-tests -- timeout 30 env MODE=review {}",
+])
+def test_forwarded_output_receipt_authority_and_failure_attribution(tmp_path, outcome, resolution, wrapper):
     import dataclasses
     import shlex
     import coding_review_agent_loop.workdir_guard as guard
     from coding_review_agent_loop.local_test_evidence import mark_out_of_checkout_context, OUT_OF_CHECKOUT_CONTEXT_CAVEAT
     from coding_review_agent_loop.response_validation import _admissible_evidence_observations
-    command = "npm run capture -- --output '/outside/artifacts with spaces'"
+    command = wrapper.format("npm run capture -- --output '/outside/artifacts with spaces'")
     executed = ["node", "--test", "tests/capture.js", "--output", "/outside/artifacts with spaces"]
     if resolution == "outside-config":
         executed += ["--config", "/outside/config.js"]

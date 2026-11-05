@@ -65,12 +65,22 @@ def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
 
 
 @pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation", "task-implementation", "pr-followup", None])
-def test_failed_run_retains_timeout_and_advisory_pr(tmp_path, scope):
+@pytest.mark.parametrize("legacy, reported", [
+    (None, True),
+    ("## Blocking\n\nCapture timed out.\n\nI opened PR #77.", True),
+    ("Capture timed out.\n\nI opened https://github.com/OWNER/REPO/pull/77.", True),
+    ("Capture timed out. PR #77.\n\nI also opened PR #78.", False),
+    ("Capture timed out.\n\n> Earlier PR #78\n\n```text\nPR #79\n```\n\nI opened PR #77.", True),
+    ("Capture timed out.\n\n~~~text\nPR #79\n~~~\n\nI opened PR #77.", True),
+])
+def test_failed_run_retains_timeout_and_advisory_pr(tmp_path, scope, legacy, reported):
     from coding_review_agent_loop.agents.base import AgentResult
     from agent_loop_helpers import structured_issue_implementation
     config = make_config(tmp_path)
     result = AgentResult(text=structured_issue_implementation(
         pr_number=None, summary="Capture timed out; reported PR https://github.com/OWNER/REPO/pull/77."))
+    if legacy is not None:
+        result = AgentResult(text=legacy + "\n<!-- AGENT_STATE: blocking -->")
     diagnostics = agent_failure._failed_run_diagnostics(
         runner=FakeRunner(), config=config, agent_name="Codex",
         salvage_context=(SalvageContext(repo=config.repo, issue_number=56, scope=scope, agent="codex")
@@ -85,7 +95,7 @@ def test_failed_run_retains_timeout_and_advisory_pr(tmp_path, scope):
     assert "watchdog expired" in message
     expected = scope in {"issue-implementation", "approved-plan-implementation"}
     assert message.count("Coder terminal context") == int(expected)
-    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == expected
+    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == (expected and reported)
     if expected:
         assert "Capture timed out" in message
 

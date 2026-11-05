@@ -356,6 +356,10 @@ salvage details, including when committed work leaves no tracked/staged diff.
 The shared terminal-response diagnostic helper labels a clearly supplied
 same-repository PR as reported and unverified; it does not scan quoted issue
 history or accept invalid, conflicting or foreign-repository identities.
+For legacy replies, concise reason selection is separate from reference scanning:
+ordinary headings and later current-report paragraphs remain available, while
+quoted lines and fenced code are excluded from both. Conflicting references
+across paragraphs suppress advisory PR identity just as conflicts within one do.
 Rejected issue and approved-plan implementation acquisitions retain their actual
 rejection or timeout category and recovery guidance, adding available final-response
 context only as advisory information. Other acquisition scopes receive no coder

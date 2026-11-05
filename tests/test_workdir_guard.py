@@ -1818,6 +1818,8 @@ def test_forwarded_output_guard_and_receipt_agree(tmp_path, wrapper, option, npm
     workdir_guard.validate_response_tests_within_workdir(f"Tests: `{command}`", assigned_workdir=tmp_path)
     workdir_guard.validate_test_observation_citations_within_workdir(
         [SimpleNamespace(command=command)], assigned_workdir=tmp_path)
+    assert workdir_guard.is_package_manager_command(command)
+    assert not workdir_guard.command_is_admissible_evidence(command, assigned_workdir=tmp_path)
     resolved = f"node --test tests/test_capture.js {option}"
     assert workdir_guard.command_is_admissible_evidence(
         command, assigned_workdir=tmp_path, executed_argv=shlex.split(resolved))

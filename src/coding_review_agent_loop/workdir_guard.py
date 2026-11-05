@@ -1783,7 +1783,6 @@ def _partition_reported_tests_by_workdir(
 
 
 _PACKAGE_MANAGER_HEADS = frozenset({"npm", "pnpm", "yarn"})
-_ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
@@ -1796,16 +1795,19 @@ def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
 
 
 def is_package_manager_command(argv: Sequence[str] | str) -> bool:
-    """Whether ``argv`` (after an optional ``env NAME=VALUE`` prefix) is npm/pnpm/yarn."""
+    """Find npm/pnpm/yarn through the same wrappers as checkout validation."""
     tokens = _argv_tokens(argv)
-    index = 0
-    if tokens and Path(tokens[0]).name == "env":
-        index = 1
-        while index < len(tokens) and (
-            tokens[index] == "--" or _ENV_ASSIGNMENT_TOKEN_RE.match(tokens[index])
-        ):
-            index += 1
-    return index < len(tokens) and Path(tokens[index]).name in _PACKAGE_MANAGER_HEADS
+    while tokens:
+        try:
+            managed = parse_managed_test_command(tokens, allow_command_name_launcher=True)
+        except TestRuntimeConfigurationError:
+            managed = None
+        if managed is not None:
+            tokens = managed.inner_argv
+            continue
+        head = _effective_head_index(tokens)
+        return head is not None and _program_basename(tokens[head]) in _PACKAGE_MANAGER_HEADS
+    return False
 
 
 def command_is_admissible_evidence(
