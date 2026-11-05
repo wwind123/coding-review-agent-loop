@@ -7259,6 +7259,16 @@ searched and the issue-scoped resume command: `agent-loop issue <child>`, or the
 `--plan-first --plan-execution-mode auto` form for a planning-routed fresh
 child.
 
+Fresh managed resume reauthenticates the raw PR body, repository, branch, base,
+head, actor and admitted lifecycle against two independent REST reads.
+Opening-tuple refusals name each changed field, its expected source and whether
+it failed first or second validation. String values use length/digest summaries;
+the body and authorization nonces are never printed. Resolve or recheck the
+reported discrepancy before retrying the suggested command. An unavailable or
+malformed observation instead names its endpoint and read phase (including the
+preceding lifecycle classification). Recheck GitHub availability or the malformed
+state; an unreadable response is not evidence that the PR was changed.
+
 When an issue-created managed run is interrupted and the suppression label is
 retained, the log line names the resume command. With an authenticated or
 explicit issue scope it is the same command the decomposition relaunch list

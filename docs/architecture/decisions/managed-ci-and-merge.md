@@ -40,3 +40,5 @@ never rewritten or deleted. The detail doc describes the current design.
   | 6 | [41417759212](https://github.com/wwind123/coding-review-agent-loop/actions/runs/41417759212) | 7.1 | 6.7 | 36.6 |
 
   These samples showed roughly 40% lower wall time, from about 12 minutes to about 7.5 minutes, with broadly similar runner minutes. They do not guarantee a universal speedup or runner cost and do not directly benchmark managed dispatch. Reusable single-shard defaults, budgets, routing, authorization, permissions, aggregate names, manifest formats and duration data remain unchanged. No further timing trials are needed; #1847 remains reference-only, and the operator closes #1851 after merge.
+
+- Issue-created opening-tuple recovery distinguishes bounded unavailable or malformed PR observations from safe phase-specific field mismatches while retaining exact raw-body authentication (#1882).
