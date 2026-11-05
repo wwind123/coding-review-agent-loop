@@ -2266,3 +2266,12 @@ and unrelated obligations remain pending. Text-only coverage has a separate
 one-attempt-per-seat/head budget; it cannot approve code or trigger another image
 assessment. See [requester coverage](docs/local_agent_loop.md#requester-owned-screenshot-coverage).
 Visual image assessment and requester coverage appear separately in usage summaries.
+
+Required work that can only happen after merge can be recorded as a post-merge
+obligation with an owner and an existing same-repository tracking issue.
+Scheduling survives head changes without weakening current-head review or CI.
+After a manual merge or interrupted tracking publication, use
+`agent-loop pr <number> --repo OWNER/REPO --reconcile-post-merge-obligations`
+(add `--dry-run` to inspect without writing). See
+[required post-merge obligations](docs/local_agent_loop.md#required-post-merge-obligations)
+for reviewer declarations, verified operator directives and recovery.

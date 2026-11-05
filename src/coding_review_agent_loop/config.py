@@ -2422,7 +2422,8 @@ def config_from_args(
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
     validate_sandboxed_args(args, configured_reviewers, named_seats=named_seats)
-    preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
+    if not getattr(args, "reconcile_post_merge_obligations", False):
+        preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
     repo = args.repo or detect_repo(runner, detect_dir, args.gh_cmd)

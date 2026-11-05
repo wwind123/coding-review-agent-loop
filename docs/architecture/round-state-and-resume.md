@@ -573,6 +573,25 @@ of durable visual findings and consumed budgets. Coverage publication recovery
 never authorizes another provider call. A verified screenshot coverage release
 preserves signed baselines and receipt references before same-head validation.
 
+## Post-merge admission registry
+
+`post_merge_state.py` extends authenticated round metadata with a cumulative
+post-merge registry, admission provenance, rejection diagnostics and publication
+receipts. The registry is separate from active finding filtering and survives
+head changes and terminal records. Operator provenance retains the exact
+verified directive, actor and locator. Legacy absence grants no exemption;
+malformed, mutated or unreconstructible registries fail closed. Authorship is
+checked using the live REST comment identities against the invocation actor.
+Large registry payloads use existing verified round transport sidecars.
+States are scheduled, tracking-pending and tracked; tracked means verified
+publication, not fulfilled evidence. Supersession retains original admissions.
+New supersession identities bind the payload to its provenance and predecessor,
+so a fresh authorized directive can restore a historical owner or tracker.
+Historical directive replay is idempotent even for superseded admissions: it
+remains control input without repeating admission preflight. Later tracker
+closure or read failures retain the scheduling and surface diagnostics; any
+surrounding signed instruction prose remains a separate requirement.
+
 ## Decisions
 
 [Decision log](decisions/round-state-and-resume.md)

@@ -495,6 +495,9 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     # The named-board legacy PR entry check (#1365) reads the actor-bound
     # comment view, and only the reader itself; it consumes no v2 record.
     allowed = {("pr_board_state.py", "read_authenticated_protocol_comments")}
+    # Post-merge admission replay and publication consume only the actor-bound
+    # reader, with no transaction or v2 contract authority (#1873).
+    allowed.add(("post_merge_runtime.py", "read_authenticated_protocol_comments"))
     # The read-only history export (#1433) derives rows from the actor-bound
     # comment views and the reader itself; it consumes no v2 record either.
     allowed |= {

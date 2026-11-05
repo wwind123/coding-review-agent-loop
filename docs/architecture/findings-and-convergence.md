@@ -525,6 +525,41 @@ receipts have already cleared its ledger. Until the terminal release is durable,
 the same-head handoff retains completed code reviews and passes the existing
 machine and signed-input gates before publication-only recovery.
 
+## Post-merge timing
+
+`post_merge_obligations.py` separates strict typed proposals from admission.
+`post_merge_runtime.py` admits selected-reviewer declarations and unanimous
+resolution-owner transitions, or deterministic scheduling directives from
+live-verified signed PR comments. Operator-only converted rows and signed
+requirements cannot obtain authority from model claims or repair output.
+Whole-block validation binds target identity and full requirement text; tracker
+preflight requires an existing open same-repository issue outside the closing
+set. Rejection retains the original evidence barrier and reports a target-bound
+remedy. Owners are free text, without assignment or account validation.
+
+A cumulative admission registry is published and read back before eligibility
+changes. Source-bound unchanged scheduling survives head changes and remains
+visible in reviewer prompts. Unscheduled evidence and machine gates remain
+active; scheduling never means verification or fulfillment. Converted-row
+timing is separate from approved matrix identity and evidence status. Shared
+merge completion publishes tracking records only after confirmed merge; manual
+completion uses the explicit recovery entry described in the CLI guide.
+
+Declaration matching may release only a sole-requester evidence item; shared
+items require explicit target-bound consent from every resolution owner. Rejected
+new declarations retain a fallback evidence barrier unless that same requester
+has an active declaration admission for the exact payload; another requester
+with identical text and tracking details cannot suppress the barrier.
+Successful admission clears only diagnostics for its own target, preserving
+unrelated rejection remedies in durable metadata and subsequent prompts.
+Tracker problems after admission use retained-obligation diagnostics: required
+post-merge work stays scheduled and does not become a merge blocker. Replay
+refreshes only its own target diagnostics, clearing them when its tracker recovers.
+If publishing a diagnostic refresh fails without changing the admission registry,
+the admitted control input stays consumed and surrounding signed prose remains
+visible. The run reports the transport failure and retries on replay; new admissions
+still require verified publication before they can change eligibility.
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

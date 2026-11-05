@@ -573,28 +573,13 @@ def _entry_plan_handoff_board(
     approved_plan_context: ApprovedPlanContext | None,
     managed_ci_issue_number: int | None,
 ) -> PlanHandoffBoard | None:
-    """Read-only handoff board of the exact approved plan bound to this PR.
-
-    Runs before the first PR write, so it uses only authoritative scope from
-    :func:`resolve_pr_owning_issue`, shared with the named legacy entry check:
-    the caller's issue, else an explicit managed-CI issue scope, else the
-    PR-side contract's primary issue, else the managed branch's issue during
-    managed-CI recovery, else the single linked issue.  The plan identity
-    comes from the caller's approved plan or the issue-side handoff that names
-    this PR, and the board
-    is taken from the issue (child, else staged parent) holding exactly that
-    plan, the same selection the handoff seam applies.  ``None`` means no
-    plan is bound, so no plan authorization applies.
-    """
+    """Resolve the exact approved-plan board read-only before any PR write."""
     def recorded_primary_issue_number() -> int | None:
         recorded = find_latest_pr_contract(
             pr_context.comments, repository=config.repo, pr_number=pr_number,
         )
         return recorded.primary_issue_number if recorded is not None else None
 
-    # The same owning-issue resolution the named legacy entry check uses
-    # (#1418); ordinary managed-CI recovery binds the managed branch's issue
-    # exactly as recover_issue_created_handoff does.
     resolved = resolve_pr_owning_issue(
         config,
         caller_issue_number=issue_context.number if issue_context is not None else None,
@@ -609,10 +594,7 @@ def _entry_plan_handoff_board(
     owning_number = resolved.owning_issue_number
     if owning_number is None:
         return None
-    # Only the managed-CI recovery paths bind an issue's canonical plan when
-    # no handoff record names this PR (#1378 review items 10-12).  Whether
-    # they run depends on the invocation's managed-CI scope and the managed
-    # branch, never on which lookup above supplied the owning issue.
+    # Canonical-plan recovery requires managed-CI scope.
     canonical_recovery_scope = (
         config.managed_ci_fresh_authorization and fresh_scope_number == owning_number
     ) or (ordinary_managed_recovery and branch_number == owning_number)
@@ -694,7 +676,6 @@ def _entry_plan_handoff_board(
             return None
     return None
 
-
 @claimed_run("pr", "pr_number")
 def run_pr_loop(
     runner: Runner,
@@ -716,6 +697,10 @@ def run_pr_loop(
 ) -> int:
     from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
     from .workdirs import active_workdir
+    from .post_merge_runtime import ObligationRun, round_start, reviewer_requests, manual_pending, resume_scheduled, complete_merge
+    from .post_merge_obligations import parse_request as parse_post_merge_request
+    post_merge_run = ObligationRun(runner, config, pr_number)
+    runner._post_merge_run = post_merge_run
     visual_startup(config)
     visual_run = VisualRun(runner)
     runner._screenshot_coverage_pr = pr_number
@@ -2245,6 +2230,8 @@ def run_pr_loop(
                 fields["capture_review_binding"] = capture_binding
             if fields.get("role") == "summary" and capture_scopes:
                 fields["review_scope"] = {"kind": "capture-reconciliation", "assignments": capture_scopes}
+            fields["post_merge_registry"] = post_merge_run.registry
+            fields["post_merge_diagnostics"] = post_merge_run.diagnostics
             metadata = PostedRoundMetadata(**fields)
             return (
                 dataclasses_replace(metadata, seat_binding=seat_binding)
@@ -2307,6 +2294,8 @@ def run_pr_loop(
         def stop_for_human_decision(
             exc: HumanDecisionRequiredError, *, round_number: int
         ) -> NoReturn:
+            if post_merge_run.diagnostics:
+                exc = HumanDecisionRequiredError(str(exc) + "\n" + post_merge_run.context())
             _stop_for_human_decision(
                 runner, config=config, pr_number=pr_number, exc=exc,
                 round_number=round_number, post_comment=post_pr_comment,
@@ -3018,11 +3007,11 @@ def run_pr_loop(
                 else None
             )
             return _reviewer_requirement_identity_ids(
-                _build_requirements_context(
+                post_merge_run.visible_requirements(_build_requirements_context(
                     target_issue_context=live_issue,
                     pr_context=context,
                     parent_issue_context=live_parent,
-                ).effective_requirements
+                ).effective_requirements)
             )
 
         # The two independent one-shot watcher allowances below can extend the
@@ -3298,7 +3287,7 @@ def run_pr_loop(
                 pr_context=pr_context,
                 parent_issue_context=parent_issue_context,
             )
-            human_requirements = requirements_context.effective_requirements
+            unresolved_items, human_requirements = round_start(post_merge_run, pr_context, unresolved_items, requirements_context.effective_requirements, round_number)
             if qualification_checkpoint is not None and qualification_checkpoint.valid:
                 checkpoint_plan = (
                     approved_plan_context.plan_hash
@@ -3454,6 +3443,7 @@ def run_pr_loop(
             # unnecessary coder round.
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
                 runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
+            unresolved_items = post_merge_run.apply(unresolved_items)
             round_start_mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
             latest_mergeability = round_start_mergeability
             unresolved_items = _reconcile_merge_conflict_item(
@@ -3631,7 +3621,8 @@ def run_pr_loop(
                         new_signed_ids = set(
                             _reviewer_requirement_identity_ids(human_requirements)
                         ) - set(freeze_payload.signed_requirement_ids_at_freeze)
-                        coverage_released = not new_signed_ids and screenshot_coverage.resume_frozen(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, round_number=round_number, baseline=freeze_payload, clearances=evidence_clearances, references=current_signed_references(), collect_requirement_ids=collect_live_requirement_ids)
+                        coverage_released = not new_signed_ids and resume_scheduled(post_merge_run, config=config, head=pr_metadata.head_sha, items=unresolved_items, round_number=round_number, baseline=freeze_payload, collect_requirement_ids=collect_live_requirement_ids, clearances=evidence_clearances, references=current_signed_references())
+                        coverage_released = coverage_released or (not new_signed_ids and screenshot_coverage.resume_frozen(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, round_number=round_number, baseline=freeze_payload, clearances=evidence_clearances, references=current_signed_references(), collect_requirement_ids=collect_live_requirement_ids))
                         if screenshot_coverage.stage_transition(coverage_released,
                             refresh=lambda context: stage_same_head_evidence_pass(context, current_round=round_number),
                             head_changed=stage_evidence_head_change):
@@ -3650,7 +3641,7 @@ def run_pr_loop(
                                 )
                             ), round_number=round_number)
                         if coverage_released:
-                            round_number = coverage_released.round_number
+                            round_number = getattr(coverage_released, "round_number", round_number)
                             evidence_skip_reviewers = True
                         else:
                             evidence_pass = "response"
@@ -4943,7 +4934,7 @@ def run_pr_loop(
                             ),
                             phase=phase,
                             evidence_requests=parsed.exact_head_evidence_requests,
-                            screenshot_requests=parsed.screenshot_requests, screenshot_coverage_acceptances=parsed.screenshot_coverage_acceptances,
+                            screenshot_requests=parsed.screenshot_requests, screenshot_coverage_acceptances=parsed.screenshot_coverage_acceptances, post_merge_requests=tuple(r.payload() for r in parsed.post_merge_obligations),
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
                             reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
@@ -5323,7 +5314,7 @@ def run_pr_loop(
                                 config,
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
-                                screenshot_context=screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else "",
+                                screenshot_context=post_merge_run.context() + screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else post_merge_run.context(),
                                 pr_metadata=pr_metadata,
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
@@ -5572,6 +5563,7 @@ def run_pr_loop(
                         architecture_impact_degradations=resumed_records,
                         exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
                         screenshot_requests=resumed_record.metadata.screenshot_requests, screenshot_coverage_acceptances=resumed_record.metadata.screenshot_coverage_acceptances,
+                        post_merge_obligations=tuple(parse_post_merge_request(r) for r in resumed_record.metadata.post_merge_requests),
                         sub_item_degradations=resumed_record.metadata.sub_item_degradations,
                     )
                     review_state = parsed_review.state
@@ -5700,7 +5692,7 @@ def run_pr_loop(
                                 config,
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
-                                screenshot_context=screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else "",
+                                screenshot_context=post_merge_run.context() + screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else post_merge_run.context(),
                                 pr_metadata=pr_metadata,
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
@@ -6244,6 +6236,8 @@ def run_pr_loop(
                         next_unresolved_item_number += 1
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
                 runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
+            unresolved_items, post_merge_next = reviewer_requests(post_merge_run, accepted_review_carriers, items=unresolved_items, metadata=pr_metadata, round_number=round_number, board=tuple(agent_display_name(r) for r in configured_reviewers), next_number=next_unresolved_item_number)
+            next_unresolved_item_number = max(next_unresolved_item_number, post_merge_next)
             if round_evidence_clearances:
                 evidence_revalidation_required = True
                 log(
@@ -6992,13 +6986,12 @@ def run_pr_loop(
                     )
                     if merged:
                         print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
-                        unresolved_items = _clear_machine_obligations(
-                            unresolved_items, kind="github-pr-checks"
-                        )
+                        unresolved_items = _clear_machine_obligations(unresolved_items, kind="github-pr-checks")
                         _record_staged_parent_completion_after_merge(
                             runner, config=config, issue_context=issue_context,
                             pr_number=pr_number,
                         )
+                        complete_merge(runner, config, pr_number)
                     return 0
                 ordinary_watch_active = (
                     (config.auto_merge or config.watch_pending_ci)
@@ -7479,7 +7472,9 @@ def run_pr_loop(
                                 runner, config=config, issue_context=issue_context,
                                 pr_number=pr_number,
                             )
+                            complete_merge(runner, config, pr_number)
                         else:
+                            manual_pending(post_merge_run)
                             final_line = final_context_state_line(watch_outcome.pr_checks)
                             print(
                                 f"PR #{pr_number} is merge-ready after CI watch completed."
@@ -8143,6 +8138,7 @@ def run_pr_loop(
                                         runner, config=config, issue_context=issue_context,
                                         pr_number=pr_number,
                                     )
+                                    complete_merge(runner, config, pr_number)
                                 return 0
                             managed_attempts_left = max(
                                 1, config.ci_timeout_seconds // config.ci_poll_interval_seconds
@@ -8414,7 +8410,9 @@ def run_pr_loop(
                                         runner, config=config, issue_context=issue_context,
                                         pr_number=pr_number,
                                     )
+                                    complete_merge(runner, config, pr_number)
                                 else:
+                                    manual_pending(post_merge_run)
                                     qualified_head = publish_manual_v2_qualification(
                                         runner,
                                         config=config,
@@ -8714,6 +8712,7 @@ def run_pr_loop(
                                     runner, config=config, issue_context=issue_context,
                                     pr_number=pr_number,
                                 )
+                                complete_merge(runner, config, pr_number)
                             return 0
                         elif config.auto_merge:
                             raise AgentLoopError(
@@ -8767,6 +8766,7 @@ def run_pr_loop(
                             observations=finalization_observations,
                             config=config,
                         )
+                        manual_pending(post_merge_run)
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
                             + announce_reduced_board_completion()

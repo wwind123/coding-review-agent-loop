@@ -13,6 +13,7 @@ from types import MappingProxyType
 import dataclasses
 from dataclasses import dataclass, field
 
+from .post_merge_obligations import ObligationRequest
 from .errors import (
     AgentLoopError,
     IssueImplementationConflictError,
@@ -111,7 +112,6 @@ HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE = re.compile(
     re.I,
 )
 
-
 def _followup_heading_re(title: str) -> re.Pattern[str]:
     title_with_punctuation = rf"{title}[:.]?"
     return re.compile(
@@ -120,7 +120,6 @@ def _followup_heading_re(title: str) -> re.Pattern[str]:
         rf"\s*$",
         re.I,
     )
-
 
 SAME_PR_FOLLOWUP_HEADING_RE = _followup_heading_re(r"same[- ]pr follow[- ]ups")
 FUTURE_FOLLOWUP_HEADING_RE = _followup_heading_re(r"future follow[- ]ups")
@@ -144,11 +143,9 @@ THEMATIC_BREAK_RE = re.compile(r"^\s*(?:([-*_])\s*){3,}\s*$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HUMAN_REQUIREMENT_STABLE_ID_RE = re.compile(r"^hr-[0-9a-f]{64}$", re.I)
 
-
 def _empty_placeholder_re(*phrases: str) -> re.Pattern[str]:
     joined = "|".join(phrases)
     return re.compile(rf"^\(?\s*(?:none|n/a|{joined})\s*\)?\.?$", re.I)
-
 
 EMPTY_FOLLOWUP_RE = _empty_placeholder_re(
     r"no follow[- ]?ups?",
@@ -160,7 +157,6 @@ EMPTY_PLAN_SECTION_RE = _empty_placeholder_re(
     r"no same[- ]plan follow[- ]?ups?",
     r"no future follow[- ]?ups?",
 )
-
 
 @dataclass(frozen=True)
 class ApprovedFollowup:
@@ -182,19 +178,16 @@ class ApprovedFollowup:
     # the finding text and never an input to classification or approval.
     provenance: str | None = None
 
-
 # Allowed values of the optional plan review finding ``provenance`` key (#1505).
 PROVENANCE_REVISION_INTRODUCED = "revision_introduced"
 PROVENANCE_PRE_EXISTING = "pre_existing"
 PLAN_REVIEW_PROVENANCE_VALUES = frozenset({PROVENANCE_REVISION_INTRODUCED, PROVENANCE_PRE_EXISTING})
 PLAN_REVIEW_FINDING_PROVENANCE_FIELD = "provenance"
 
-
 @dataclass(frozen=True)
 class ApprovedFollowups:
     same_pr: tuple[ApprovedFollowup, ...]
     future: tuple[ApprovedFollowup, ...]
-
 
 @dataclass(frozen=True)
 class ReviewItemDisposition:
@@ -204,7 +197,6 @@ class ReviewItemDisposition:
     note: str | None = None
     # (sub_item_id, "resolved" | "unresolved") pairs in reviewer order (#958).
     sub_item_dispositions: tuple[tuple[str, str], ...] = ()
-
 
 # Machine-owned obligations are deliberately distinct from reviewer findings.
 # These values are persisted in round metadata, so changing one is a protocol
@@ -251,12 +243,10 @@ CI_MACHINE_OBLIGATION_KINDS = frozenset(
     {"managed-exact-head-ci", "github-pr-checks"}
 )
 
-
 SUB_ITEM_MIN_COUNT = 2
 SUB_ITEM_MAX_COUNT = 12
 SUB_ITEM_STATUSES = frozenset({"open", "resolved"})
 SUB_ITEM_DISPOSITIONS = frozenset({"resolved", "unresolved"})
-
 
 @dataclass(frozen=True)
 class ReviewSubItem:
@@ -266,7 +256,6 @@ class ReviewSubItem:
     text: str
     status: str = "open"
     resolved_round: int | None = None
-
 
 @dataclass(frozen=True)
 class UnresolvedReviewItem:
@@ -443,6 +432,7 @@ class ParsedReview:
     screenshot_coverage_acceptances: tuple[dict, ...] = ()
     exact_head_evidence_requests: tuple[str, ...] = ()
     sub_item_degradations: tuple["ParseDegradation", ...] = ()
+    post_merge_obligations: tuple[ObligationRequest, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -7351,6 +7341,7 @@ def parse_structured_pr_review(
             "future_followups",
             "architecture_impact",
             "exact_head_evidence_requests", "screenshot_requests", "screenshot_coverage_acceptances",
+            "post_merge_obligations",
         },
     )
     state = _expect_state(payload["state"], context="pr_review.state")  # shape-check: fatal:no-conservative-reading
@@ -7408,10 +7399,13 @@ def parse_structured_pr_review(
         architecture_impact_degradations=architecture_impact_degradations,
         sub_item_degradations=tuple(sub_item_degradations),
     )
+    from .post_merge_obligations import parse_review_fields
+    obligations = parse_review_fields(payload)
     from .review_images_coverage import parse_fields
     typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
     return dataclasses.replace(parsed, exact_head_evidence_requests=evidence_requests,
-                               screenshot_requests=typed, screenshot_coverage_acceptances=votes)
+                               screenshot_requests=typed, screenshot_coverage_acceptances=votes,
+                               post_merge_obligations=obligations)
 
 
 def _expect_evidence_request_list(

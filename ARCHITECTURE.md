@@ -6,10 +6,8 @@ into a bounded code-review loop with explicit evidence, resumable state, and
 optional CI qualification and merge. It is not a hosted agent service or a
 model API gateway.
 
-This overview links the component details under `docs/architecture/`. See the
-[README](README.md) for installation and the [CLI guide](docs/local_agent_loop.md)
-for options, schemas and recovery. Diagrams show responsibility and data flow,
-not enforced Python import hierarchy.
+See [README](README.md) for installation, the [CLI guide](docs/local_agent_loop.md)
+for options and recovery, and `docs/architecture/` for component details.
 
 ## Component map
 
@@ -45,6 +43,7 @@ document holds the full description.
   protocol records. A marker or model signature alone is not authentication.
 - Approvals and CI are head-bound. Every required reviewer must approve the
   exact final head, and merges are head-guarded.
+- Durable post-merge admission changes evidence timing, never fulfillment.
 - Missing input, interrupted commands, and infrastructure failures are never
   equated with approval.
 - Architecture text is advisory orientation, never a permission channel or a
@@ -64,7 +63,8 @@ document holds the full description.
 - **PR loop.** Reviewers inspect the verified head, the orchestrator
   reconciles findings, and the coder addresses feedback and CI failures until
   the required reviews are satisfied or a bounded stop applies. See
-  [findings and convergence](docs/architecture/findings-and-convergence.md).
+  [findings and convergence](docs/architecture/findings-and-convergence.md). After merge,
+  reconcile required tracking records; manual merges use completion-only recovery.
 - **Screenshot coverage.** Bounded requester acceptance binds screenshot obligations to current-head visual reports. See [evidence](docs/architecture/findings-and-convergence.md).
 - **Managed CI.** A reviewed candidate receives an authenticated exact-head
   workflow dispatch, and qualification requires correlated exact-head evidence

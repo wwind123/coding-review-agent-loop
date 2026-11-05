@@ -7,6 +7,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .post_merge_runtime import scheduling_guidance
+
 from .pr_head_sync import get_observed_pr_review_context, observe_pr_head
 
 from .managed_ci_result import VerifiedManagedResult
@@ -1912,6 +1914,7 @@ def _evidence_freeze_diagnostic(
         "exactly this head, or withdraw the request, in a PR comment whose last line is "
         f"exactly `-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`. Pushing a new "
         "commit breaks the freeze and the new head needs full review and fresh evidence."
+        + "\n" + scheduling_guidance(evidence)
     )
 
 
@@ -1948,12 +1951,14 @@ def _render_evidence_freeze_notice(
             "reviewer re-reviews this same head. Pushing a new commit breaks the freeze; the "
             "new head then needs full review and fresh evidence.",
             "",
+            scheduling_guidance(evidence),
             "-- coding-review-agent-loop",
         ]
     )
 
 
 _EVIDENCE_RELEASE_MESSAGES = {
+    "post-merge-scheduled": "the admitted source is scheduled as required post-merge work. Its evidence remains unverified; all other gates remain active.",
     "screenshot-coverage": "the requesting reviewers explicitly accepted current-head screenshot coverage. The PR proceeds to final validation at the same head.",
     "machine-gate": (
         "a machine gate failed at the frozen head ({detail}). The requested evidence returns "
@@ -1998,6 +2003,7 @@ def _publish_evidence_freeze(
     comment body is the human notice and its round metadata is the only
     persistence.  A failed write therefore leaves no freeze behind.
     """
+    post_merge = getattr(runner, "_post_merge_run", None)
     frozen = freeze_evidence_obligations(items, head_sha=head_sha)
     identities = tuple(
         item.obligation_identity or item.item_id for item in _frozen_evidence_obligations(frozen)
@@ -2012,7 +2018,7 @@ def _publish_evidence_freeze(
                 head_sha=head_sha,
                 items=frozen,
                 still_frozen=still_frozen,
-            ),
+            ) + (post_merge.context() if post_merge else ""),
             PostedRoundMetadata(
                 flow="pr",
                 role="summary",
@@ -2023,6 +2029,8 @@ def _publish_evidence_freeze(
                 prior_items=tuple(frozen),
                 state="blocking",
                 phase=EVIDENCE_FREEZE_PHASE,
+                post_merge_registry=post_merge.registry if post_merge else (),
+                post_merge_diagnostics=post_merge.diagnostics if post_merge else (),
                 evidence_freeze=EvidenceFreezeRecord(
                     frozen_head=head_sha,
                     evidence_identities=identities,
@@ -4355,12 +4363,17 @@ def _head_bound_unsatisfied_rows(
     bound = _head_bound_coder_record(records, head_sha)
     if bound is None:
         return None
+    from .post_merge_obligations import scheduled_rows
+    timing_rows = set(excluded_row_ids)
+    for record in records:
+        if record.metadata.post_merge_authenticated:
+            timing_rows.update(scheduled_rows(record.metadata.post_merge_registry, approved_plan_context.risk_test_matrix_identity))
     return _evidence_stall.unsatisfied_rows(
         bound.metadata.risk_test_matrix_evidence,
         bound.metadata.risk_test_matrix_diagnostics,
         approved_plan_context.risk_test_matrix_expected_row_ids or (),
         approved_plan_context.risk_test_matrix_identity,
-        excluded_row_ids=excluded_row_ids,
+        excluded_row_ids=timing_rows,
         signed_references=signed_references,
         head_sha=head_sha,
     )
@@ -4656,7 +4669,7 @@ def _reconcile_converted_evidence(
             "Converted-evidence history is unavailable; keeping every converted obligation "
             "already in the ledger",
         )
-    return _evidence_conversion.reconcile_converted_obligations(
+    result = _evidence_conversion.reconcile_converted_obligations(
         ledger,
         live_head=head_sha,
         matrix_identity=approved_plan_context.risk_test_matrix_identity,
@@ -4667,6 +4680,9 @@ def _reconcile_converted_evidence(
             records, head_sha, approved_plan_context
         ),
     )
+
+    post_merge = getattr(runner, "_post_merge_run", None)
+    return post_merge.apply(result) if post_merge else result
 
 
 @dataclass(frozen=True)
@@ -4684,6 +4700,7 @@ class EvidenceStallOutcome:
 
     snapshot: dict[str, object] | None
     conversion: EvidenceConversionOutcome | None = None
+
 
 
 def _render_evidence_conversion_notice(

@@ -533,6 +533,26 @@ it. Gating keeps excluding such runs as
 ad hoc diagnostics, and the workflow and its `unlabeled` recovery are
 unchanged.
 
+## Post-merge completion
+
+The exact-head proof helper retains its final live-head read and GitHub
+head-guarded merge. `post_merge_runtime.complete_merge` runs afterward, outside
+that critical sequence, at every merge exit after merge-success reporting and
+best-effort staged-parent completion bookkeeping. Publication failures cannot
+be mistaken for merge failures or skip that bookkeeping. Confirmed merges
+publish or verify authenticated per-obligation records on the existing tracking
+issues and persist verified receipts on the source PR. Read-back reconciliation
+handles ambiguous writes and partial success. Failure reports merged with
+tracking pending and returns a non-success outcome; it cannot roll back merge.
+Manual merge readiness reports pending obligations and the completion command.
+
+`agent-loop pr <number> --reconcile-post-merge-obligations` dispatches before
+normal PR/worktree startup, using plain merged context and authenticated
+admission history. It never reads branch tips, runs agents, dispatches CI or
+attempts a merge. Open and closed-unmerged inputs and execution options are
+rejected. Dry-run writes nothing. Closed trackers retain their obligations and
+produce diagnostics, with publication attempted where possible.
+
 ## Decisions
 
 [Decision log](decisions/managed-ci-and-merge.md)
