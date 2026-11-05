@@ -110,10 +110,25 @@ class ObligationRun:
     def admit(self, proposals, *, sources, closing, head, items, round_number):
         """Preflight the complete batch before publishing or releasing any source."""
         candidate = list(self.registry)
+        replay_diagnostics = []
         for request, source, provenance in proposals:
+            # An authenticated directive remains consumed even after its payload
+            # is superseded or its tracker stops accepting new admissions.
+            replay = any(a['source'] == source and a['request'] == request.payload()
+                         and a['provenance'] == provenance for a in candidate)
+            previous = next((a for a in active_registry(candidate) if a['source'] == source), None)
+            if replay or (provenance.get('kind') == 'reviewer' and previous
+                          and previous['request'] == request.payload()):
+                try:
+                    number, state = validate_tracker(request, repo=self.config.repo, closing_issues=(),
+                        read_issue=lambda n: read_api(self.runner, self.config, f'issues/{n}'), allow_closed=True)
+                    if state == 'closed':
+                        fail(f'tracker #{number} is closed; admitted obligation retained')
+                except AgentLoopError as exc:
+                    replay_diagnostics.append(diagnostic(request.target_id or request.requirement, str(exc)))
+                continue
             validate_tracker(request, repo=self.config.repo, closing_issues=closing,
                 read_issue=lambda n: read_api(self.runner, self.config, f'issues/{n}'))
-            previous = next((a for a in active_registry(candidate) if a['source'] == source), None)
             admission = make_admission(request, repo=self.config.repo, pr=self.pr,
                 source=source, provenance=provenance,
                 supersedes=previous['identity'] if previous else None)
@@ -126,6 +141,7 @@ class ObligationRun:
                                 if provenance.get('kind') == 'operator')
         diagnostics = tuple(d for d in self.diagnostics if not any(
             d.startswith(f'Post-merge request {target} rejected: ') for target in resolved_targets))
+        diagnostics = tuple(dict.fromkeys((*diagnostics, *replay_diagnostics)))
         if candidate != list(self.registry) or diagnostics != self.diagnostics:
             if self.config.dry_run:
                 return

@@ -180,7 +180,10 @@ def authorize(request, *, sources, reviewer=None, voters=(), board=(), operator=
 
 def make_admission(request, *, repo, pr, source, provenance, supersedes=None):
     payload = request.payload()
-    return {'identity': 'post-merge:' + digest([repo, pr, source, payload]),
+    identity_payload = [repo, pr, source, payload]
+    if supersedes is not None:
+        identity_payload.extend([provenance, supersedes])
+    return {'identity': 'post-merge:' + digest(identity_payload),
             'repo': repo, 'pr': pr, 'source': source, 'request': payload,
             'provenance': provenance, 'supersedes': supersedes,
             'state': 'scheduled', 'receipt': None}
@@ -201,9 +204,17 @@ def validate_registry(value, *, repo=None, pr=None):
             fail('unreconstructible admission provenance')
         if source.get('requirement') != request.requirement:
             fail('admission source text mismatch')
-        if admission['identity'] != make_admission(request, repo=admission['repo'], pr=admission['pr'],
-                source=source, provenance=provenance)['identity'] or admission['identity'] in seen:
+        # Retain authenticated legacy payload identities while binding new
+        # supersessions to their authority and predecessor (including A-B-A).
+        identities = {make_admission(request, repo=admission['repo'], pr=admission['pr'],
+                source=source, provenance=provenance, supersedes=predecessor)['identity']
+                for predecessor in (None, admission['supersedes'])}
+        if admission['identity'] not in identities or admission['identity'] in seen:
             fail('mutated or duplicated admission identity')
+        if admission['supersedes'] is not None and not any(
+                old['identity'] == admission['supersedes'] and old['source'] == source
+                for old in value[:len(seen)]):
+            fail('supersession requires an earlier admission for the same source')
         if repo is not None and (admission['repo'] != repo or admission['pr'] != pr):
             fail('foreign PR admission')
         if provenance.get('kind') == 'operator':

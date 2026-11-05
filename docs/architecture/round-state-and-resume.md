@@ -564,6 +564,12 @@ checked using the live REST comment identities against the invocation actor.
 Large registry payloads use existing verified round transport sidecars.
 States are scheduled, tracking-pending and tracked; tracked means verified
 publication, not fulfilled evidence. Supersession retains original admissions.
+New supersession identities bind the payload to its provenance and predecessor,
+so a fresh authorized directive can restore a historical owner or tracker.
+Historical directive replay is idempotent even for superseded admissions: it
+remains control input without repeating admission preflight. Later tracker
+closure or read failures retain the scheduling and surface diagnostics; any
+surrounding signed instruction prose remains a separate requirement.
 
 ## Decisions
 

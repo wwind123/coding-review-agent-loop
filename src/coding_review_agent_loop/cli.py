@@ -2975,7 +2975,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "reconcile_post_merge_obligations", False):
             from .post_merge_runtime import reconcile, validate_recovery_options
             validate_recovery_options(args, invocation)
-            return reconcile(runner, config, args.pr_number)
+            # Recovery dry-run still inspects live merged state and receipts;
+            # reconcile uses config.dry_run to suppress every write explicitly.
+            return reconcile(Runner(dry_run=False) if args.dry_run else runner,
+                             config, args.pr_number)
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
             # Before claims, sandbox setup and base-branch resolution (#1111).
             tool_provenance.capture_process_provenance(config)
