@@ -3459,7 +3459,6 @@ def _run_validated_agent_in_scope(
         config=config,
         role=role,
         classification_text=last_classification_text,
-        include_terminal_context=False,
     )
     if repair_expected_kind == "issue_implementation" and config.managed_ci:
         message += " The implementation response was rejected before a PR number was accepted."

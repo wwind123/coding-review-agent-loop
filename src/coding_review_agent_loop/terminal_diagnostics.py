@@ -28,6 +28,9 @@ def terminal_response_diagnostic(
         number = payload.get("pr_number")
         terminal = terminal or number is None
     else:
+        if payload is not None:
+            # Other structured roles are never legacy coder prose.
+            return ""
         # Only a terminal footer in this response establishes legacy blocking.
         footer = re.search(
             r"(?m)^<!--\s*AGENT_(?:STATE:\s*blocking|CLARIFY)\s*-->\s*(?:\n--[^\n]*)?\s*\Z",

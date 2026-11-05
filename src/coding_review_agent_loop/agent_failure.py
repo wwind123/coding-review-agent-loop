@@ -1186,7 +1186,6 @@ def _format_invalid_agent_response_error(
     config: AgentLoopConfig | None = None,
     role: str | None = None,
     classification_text: str = "",
-    include_terminal_context: bool = True,
 ) -> str:
     exit_context = ""
     if result is not None and result.returncode not in (0, None):
@@ -1265,8 +1264,6 @@ def _format_invalid_agent_response_error(
         f"{category_hint}"
         f"{log_context}"
         f"{suggestion_line}"
-        + (terminal_response_diagnostic(result.text or result.response_file_text or "", repo=config.repo)
-           if include_terminal_context and result is not None and config is not None else "")
     )
 
 
@@ -1552,7 +1549,11 @@ def _failed_run_diagnostics(
         failure_reason=failure_reason,
         classification_text=classification_text,
     )
-    if result is not None:
+    if (result is not None and salvage_context is not None
+            and salvage_context.scope in {
+                ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
+                APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+            }):
         response_line += terminal_response_diagnostic(result.text or result.response_file_text or "", repo=config.repo)
     return _FailedRunDiagnostics(
         patch_salvage=patch_salvage,

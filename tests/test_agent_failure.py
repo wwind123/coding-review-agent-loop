@@ -1,5 +1,7 @@
 """Agent-failure tests: failure suggestions and validated responses (#1543)."""
 
+import pytest
+
 import coding_review_agent_loop.agent_failure as agent_failure
 from issue_loop_test_helpers import FakeRunner, _TRANSIENT_REPAIR_SUGGESTION
 from coding_review_agent_loop.salvage import SalvageContext
@@ -62,18 +64,39 @@ def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
 
 
 
-def test_invalid_response_error_retains_timeout_and_advisory_pr(tmp_path):
+@pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation", "task-implementation", "pr-followup", None])
+def test_failed_run_retains_timeout_and_advisory_pr(tmp_path, scope):
     from coding_review_agent_loop.agents.base import AgentResult
     from agent_loop_helpers import structured_issue_implementation
+    config = make_config(tmp_path)
     result = AgentResult(text=structured_issue_implementation(
         pr_number=None, summary="Capture timed out; reported PR https://github.com/OWNER/REPO/pull/77."))
+    diagnostics = agent_failure._failed_run_diagnostics(
+        runner=FakeRunner(), config=config, agent_name="Codex",
+        salvage_context=(SalvageContext(repo=config.repo, issue_number=56, scope=scope, agent="codex")
+                         if scope is not None else None),
+        operation_description="issue implementation", failure_category="timeout",
+        failure_reason="watchdog expired", classification_text="", marker_description="implementation result",
+        result=result)
     message = agent_failure._format_invalid_agent_response_error(
         agent_name="Codex", marker_description="implementation result", reason="watchdog expired",
-        result=result, log_paths=[], category="timeout", config=make_config(tmp_path))
+        result=result, log_paths=[], category="timeout", config=config) + diagnostics.response_line
     assert "Failure category: timeout" in message
     assert "watchdog expired" in message
-    assert "Capture timed out" in message
-    assert "Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message
+    expected = scope in {"issue-implementation", "approved-plan-implementation"}
+    assert message.count("Coder terminal context") == int(expected)
+    assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == expected
+    if expected:
+        assert "Capture timed out" in message
+
+
+@pytest.mark.parametrize("kind", ["pr_review", "plan_review", "coder_followup"])
+def test_other_structured_roles_never_become_legacy_coder_context(kind):
+    import json
+    from coding_review_agent_loop.terminal_diagnostics import terminal_response_diagnostic
+    text = json.dumps({"kind": kind, "summary": "Blocked on PR #77"})
+    text += "\n<!-- AGENT_STATE: blocking -->\n-- Reviewer"
+    assert terminal_response_diagnostic(text, repo="OWNER/REPO") == ""
 
 
 def test_success_state_alone_does_not_establish_terminal_diagnostic():

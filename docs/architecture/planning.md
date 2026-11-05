@@ -254,7 +254,8 @@ For recognized `npm run NAME --` and `npm run-script NAME --` commands, the
 first separator forwards script options; a later `--` still makes subsequent
 values positional inputs. Known execution wrappers retain this interpretation.
 Outside config, ignore, working-directory and test inputs remain confined;
-unknown options and ambiguous `-o` meanings gain no exemption. Other package
+unknown options (including forwarded equals-form path values) and ambiguous
+`-o` meanings gain no exemption. Other package
 manager forwarding layouts remain strict. Npm evidence still requires the
 runner-frozen resolved command, which is independently checked. An output
 destination alone neither degrades evidence to context nor hides failures.

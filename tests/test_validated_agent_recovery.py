@@ -2212,7 +2212,8 @@ def test_followup_workdir_composition_preserves_operational_errors(tmp_path, mon
 
 
 @pytest.mark.parametrize("reference", ["https://github.com/OWNER/REPO/pull/77", "https://github.com/OTHER/REPO/pull/77", "PR #77 and PR #78", ""])
-def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference):
+@pytest.mark.parametrize("scope", ["issue-implementation", "approved-plan-implementation"])
+def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, reference, scope):
     text = structured_issue_implementation(pr_number=None, summary=f"Capture could not finish. {reference}")
     runner = FakeRunner(claude_outputs=[text])
     config = make_config(tmp_path, agent_max_retries=0)
@@ -2224,7 +2225,7 @@ def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, refere
             marker_description="structured implementation", validate=reject,
             role="coder", use_repair=False,
             salvage_context=SalvageContext(repo=config.repo, issue_number=56,
-                scope="issue-implementation", agent="claude"),
+                scope=scope, agent="claude"),
             operation_description="issue implementation",
         )
     message = str(stop.value)
@@ -2233,4 +2234,27 @@ def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, refere
     assert ("Reported PR (unverified)" in message) == (reference == "https://github.com/OWNER/REPO/pull/77")
     assert stop.value.failure_category == "deterministic"
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _ in runner.commands)
+    assert runner.issue_comments == []
+
+
+@pytest.mark.parametrize("role,kind", [("reviewer", "pr_review"), ("planner", "plan_review")])
+@pytest.mark.parametrize("structured", [False, True])
+def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind, structured):
+    text = "Blocked on PR #77."
+    if structured:
+        text = json.dumps({"kind": kind, "summary": text})
+    text += "\n<!-- AGENT_STATE: blocking -->\n-- Reviewer"
+    runner = FakeRunner(claude_outputs=[text])
+    def reject(value):
+        raise AgentLoopError("response validation refused")
+    with pytest.raises(AgentInvocationError) as stop:
+        _run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review.", marker_description="structured review", validate=reject,
+            role=role, use_repair=False)
+    message = str(stop.value)
+    assert "response validation refused" in message
+    assert "Coder terminal context" not in message
+    assert "Reported PR (unverified)" not in message
+    assert stop.value.failure_category == "deterministic"
     assert runner.issue_comments == []

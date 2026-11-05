@@ -1807,7 +1807,7 @@ def test_unknown_boolean_outside_cwd_is_never_checkout_evidence(tmp_path, wrappe
 
 
 @pytest.mark.parametrize("wrapper", ["{}", "env MODE=review timeout 30 {}", "agent-loop run-tests --timeout-seconds 60 -- {}"])
-@pytest.mark.parametrize("option", ["--output /outside/artifacts", "--output='/outside/artifacts with spaces'", "--output-dir /outside/first --output-dir=/outside/second", "--junitxml=/outside/results.xml"])
+@pytest.mark.parametrize("option", ["--output /outside/artifacts", "--output='/outside/artifacts with spaces'", "--output-dir /outside/first --output-dir=/outside/second", "--output-file=/outside/results.xml", "--report /outside/report", "--report-file=/outside/report.xml"])
 @pytest.mark.parametrize("npm", ["npm run capture", "npm run-script capture"])
 def test_forwarded_output_guard_and_receipt_agree(tmp_path, wrapper, option, npm):
     command = wrapper.format(f"{npm} -- {option}")
@@ -1827,12 +1827,16 @@ def test_forwarded_output_guard_and_receipt_agree(tmp_path, wrapper, option, npm
 @pytest.mark.parametrize("operand", [
     "--config /outside/config.js", "--config=/outside/config.js", "--ignore /outside/ignore",
     "--ignore=/outside/ignore", "--cwd /outside", "--unknown /outside/input",
+    "--unknown=/outside/input", "--setup=/outside/input.js", "--junitxml=/outside/results.xml",
+    "--rootDir=/outside", "--require=/outside/shim.js",
     "-o /outside/input", "/outside/test.js", "-- /outside/test.js",
     "-- --output=/outside/positional", "; node --test tests/a.js --config /outside/config",
     "&& /outside/custom-runner tests/a.js",
 ])
-def test_forwarded_output_does_not_exempt_inputs(tmp_path, operand):
-    command = f"npm run capture -- --output /outside/artifacts {operand}"
+@pytest.mark.parametrize("wrapper", ["{}", "env MODE=review timeout 30 {}", "agent-loop run-tests -- {}"])
+@pytest.mark.parametrize("npm", ["npm run capture", "npm run-script capture"])
+def test_forwarded_output_does_not_exempt_inputs(tmp_path, operand, wrapper, npm):
+    command = wrapper.format(f"{npm} -- --output /outside/artifacts {operand}")
     with pytest.raises(AgentLoopError):
         validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
     if operand == "--cwd /outside":
@@ -1841,6 +1845,11 @@ def test_forwarded_output_does_not_exempt_inputs(tmp_path, operand):
     else:
         with pytest.raises(AgentLoopError):
             workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=tmp_path)
+    with pytest.raises(AgentLoopError):
+        workdir_guard.validate_response_tests_within_workdir(f"Tests: `{command}`", assigned_workdir=tmp_path)
+    with pytest.raises(AgentLoopError):
+        workdir_guard.validate_test_observation_citations_within_workdir(
+            [SimpleNamespace(command=command)], assigned_workdir=tmp_path)
     assert not workdir_guard.command_is_admissible_evidence(
         command, assigned_workdir=tmp_path, executed_argv=["node", "--test", "tests/a.js"])
     assert workdir_guard.command_targets_outside_workdir(

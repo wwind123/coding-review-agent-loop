@@ -356,9 +356,11 @@ salvage details, including when committed work leaves no tracked/staged diff.
 The shared terminal-response diagnostic helper labels a clearly supplied
 same-repository PR as reported and unverified; it does not scan quoted issue
 history or accept invalid, conflicting or foreign-repository identities.
-Rejected acquisitions retain their actual rejection or timeout category and
-recovery guidance, adding available final-response context only as advisory
-information. A structured implementation's blocking state alone is insufficient
+Rejected issue and approved-plan implementation acquisitions retain their actual
+rejection or timeout category and recovery guidance, adding available final-response
+context only as advisory information. Other acquisition scopes receive no coder
+terminal context, and structured responses for other roles cannot become legacy
+coder prose through a blocking footer. A structured implementation's blocking state alone is insufficient
 to identify a terminal stop because successful PR envelopes use that state too.
 These diagnostics do not authenticate or adopt a PR, publish a handoff, start
 review/CI/merge, change retry allowances, or extend persisted salvage schemas.
