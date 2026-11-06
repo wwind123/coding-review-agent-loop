@@ -55,8 +55,16 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from .workdir_guard import validate_checkout_inspected_evidence
-from .protocol import (
+from .protocol_risk import (
     SignedEvidenceReference,
+    RiskTestMatrix,
+    RiskTestMatrixChange,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
+    risk_test_matrix_identity,
+    sanitize_risk_test_matrix,
+)
+from .protocol import (
     ReviewItemDisposition,
     ReviewSubItem,
     SUB_ITEM_STATUSES,
@@ -70,12 +78,6 @@ from .protocol import (
     PLAN_REVIEW_PROVENANCE_VALUES,
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
-    RiskTestMatrix,
-    RiskTestMatrixChange,
-    parse_risk_test_matrix,
-    parse_risk_test_matrix_changes,
-    risk_test_matrix_identity,
-    sanitize_risk_test_matrix,
     parse_plan_revision_patch,
     StructuredCoderFollowup,
     StructuredIssueImplementation,

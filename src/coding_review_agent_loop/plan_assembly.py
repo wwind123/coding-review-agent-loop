@@ -16,8 +16,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .errors import AgentLoopError
-from .protocol import (
+from .protocol_risk import (
     RISK_MATRIX_MAX_ROWS,
+    RiskTestMatrix,
+    RiskTestMatrixChange,
+    RiskTestMatrixMetadata,
+    RiskTestMatrixRow,
+    _parse_risk_test_matrix_contract_fields,
+    parse_risk_test_matrix,
+    validate_risk_test_matrix_revision,
+)
+from .protocol import (
     ArchitectureImpact,
     DeferredStage,
     ExecutionStrategyRecommendation,
@@ -26,10 +35,6 @@ from .protocol import (
     PLAN_REVISION_PATCH_CLEARABLE_FIELDS,
     PlanRevisionPatch,
     PlanRevisionPatchOperation,
-    RiskTestMatrix,
-    RiskTestMatrixChange,
-    RiskTestMatrixMetadata,
-    RiskTestMatrixRow,
     StructuredPlanRevision,
     StructuredPlanState,
     TypedPlanStages,
@@ -42,10 +47,7 @@ from .protocol import (
     _parse_architecture_impact,
     _expect_deferred_stage_list,
     _extract_structured_plan_revision_payload,
-    _parse_risk_test_matrix_contract_fields,
     parse_plan_revision_patch,
-    parse_risk_test_matrix,
-    validate_risk_test_matrix_revision,
     validate_structured_plan_revision,
     validate_structured_plan_state,
 )

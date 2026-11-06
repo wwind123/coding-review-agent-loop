@@ -1339,7 +1339,7 @@ from coding_review_agent_loop.architecture_contract import (  # noqa: E402
     _architecture_and_test_observation_mode_validators as _observation_validators_1626,
 )
 from coding_review_agent_loop.local_test_evidence import LocalTestObservation as _Observation_1626  # noqa: E402
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE as _AFTER_REPAIR_RULE_1626,
 )
 from coding_review_agent_loop.unresolved_items import (  # noqa: E402

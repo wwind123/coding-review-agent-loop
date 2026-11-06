@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageGap,
 )

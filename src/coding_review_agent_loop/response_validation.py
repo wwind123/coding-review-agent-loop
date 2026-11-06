@@ -46,11 +46,6 @@ from .protocol import (
     ReviewItemDisposition,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
-    DerivedRiskEvidenceResult,
-    PostAuthClaimDiagnostic,
-    SemanticRiskCoverageClaims,
-    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
-    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -70,6 +65,13 @@ from .protocol import (
     validate_structured_plan_revision,
     validate_structured_plan_revision_patch,
     validate_structured_task_result,
+)
+from .protocol_risk import (
+    DerivedRiskEvidenceResult,
+    PostAuthClaimDiagnostic,
+    SemanticRiskCoverageClaims,
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     derive_risk_test_matrix_evidence,
     semantic_risk_claim_schema_text,
 )
@@ -715,7 +717,9 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_diagnostics=raced_result.diagnostics,
                     )
                 if raced_result is not None:
-                    from .protocol import disqualify_capture_classification
+                    from .protocol_risk import (
+                        disqualify_capture_classification,
+                    )
 
                     # Evidence rebuilt after a head race never counts as a
                     # capture-limited conversion attempt (#1325).

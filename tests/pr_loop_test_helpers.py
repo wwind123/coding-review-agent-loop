@@ -25,6 +25,8 @@ from coding_review_agent_loop.local_test_evidence import (
 from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
+)
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
 )

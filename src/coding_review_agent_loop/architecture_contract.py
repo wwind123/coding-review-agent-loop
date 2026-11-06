@@ -26,9 +26,11 @@ from .decomposition import PlanDecomposition
 from .errors import AgentInvocationError, AgentLoopError
 from .github import PullRequestMetadata, post_issue_comment
 from .logging import log
-from .protocol import (
+from .protocol_risk import (
     EVIDENCE_REASK_MAX_CHARS,
     render_evidence_rejection_detail,
+)
+from .protocol import (
     ParsedPlanReview,
     ParsedReview,
     StructuredCoderFollowup,

@@ -38,18 +38,20 @@ from .protocol import (
     ExecutionDisposition,
     ExecutionScopeItem,
     ExecutionStrategyRecommendation,
-    RiskTestMatrix,
     ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     ArchitectureImpactContract,
     architecture_impact_contract_for,
-    RiskTestMatrixRow,
     parse_architecture_impact,
     parse_architecture_impact_degradable,
-    parse_risk_test_matrix,
     parse_execution_recommendation_payload,
     parse_signed_human_requirement_body,
     sanitize_architecture_impact,
     validate_direct_readiness,
+)
+from .protocol_risk import (
+    RiskTestMatrix,
+    RiskTestMatrixRow,
+    parse_risk_test_matrix,
 )
 from .protocol_common import (
     ParseDegradation,

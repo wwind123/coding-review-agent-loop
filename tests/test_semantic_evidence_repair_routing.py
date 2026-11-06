@@ -715,7 +715,7 @@ def _followup_with_claim() -> str:
 
 
 def _derive_for_row_1(claims, catalog):
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         derive_risk_test_matrix_evidence,
         parse_risk_test_matrix,
         risk_test_matrix_identity,

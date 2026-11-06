@@ -22,6 +22,8 @@ from .errors import AgentLoopError
 from .protocol import (
     EVIDENCE_OBLIGATION_KIND,
     UnresolvedReviewItem,
+)
+from .protocol_risk import (
     apply_signed_evidence_references,
     parse_risk_test_matrix_evidence,
 )

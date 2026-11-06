@@ -52,6 +52,8 @@ from .protocol import (
     MACHINE_AUTHORITY,
     UnresolvedReviewItem,
     is_failed_discuss_response,
+)
+from .protocol_risk import (
     RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS,
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_OPTIONAL_KEYS,

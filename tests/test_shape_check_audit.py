@@ -12,6 +12,8 @@ classifies every site as handled or propagating inside its own unit's
 
 from __future__ import annotations
 
+from coding_review_agent_loop import protocol_risk as _risk_owner
+
 import ast
 import builtins
 import io
@@ -965,11 +967,13 @@ def test_render_limit_is_shared_and_bounds_citation_drops():
     from coding_review_agent_loop import comment_rendering, protocol, protocol_common
 
     assert comment_rendering.PARSE_DEGRADATION_RENDER_LIMIT is protocol_common.PARSE_DEGRADATION_RENDER_LIMIT
-    assert protocol.CITATION_DEGRADATION_MAX_DROPS <= protocol_common.PARSE_DEGRADATION_RENDER_LIMIT
+    assert _risk_owner.CITATION_DEGRADATION_MAX_DROPS <= protocol_common.PARSE_DEGRADATION_RENDER_LIMIT
 
 
 def test_reserved_authority_keys_are_exact():
-    from coding_review_agent_loop.protocol import CLAIM_RESERVED_AUTHORITY_KEYS
+    from coding_review_agent_loop.protocol_risk import (
+        CLAIM_RESERVED_AUTHORITY_KEYS,
+    )
 
     assert CLAIM_RESERVED_AUTHORITY_KEYS == frozenset(
         {

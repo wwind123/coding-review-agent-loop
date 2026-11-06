@@ -95,24 +95,26 @@ from .managed_ci import (
 )
 from .protocol import (
     ReviewItemDisposition,
-    DerivedRiskEvidenceResult,
-    CITATION_DROPPED_OUTCOME,
-    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
-    TEST_OBSERVATIONS_NOT_ARRAY_RULES,
     ApprovedFollowup,
     ParsedReview,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
+    MACHINE_OBLIGATION_KINDS,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
+)
+from .protocol_risk import (
+    DerivedRiskEvidenceResult,
+    CITATION_DROPPED_OUTCOME,
+    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+    TEST_OBSERVATIONS_NOT_ARRAY_RULES,
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
     EVIDENCE_SOURCE_TOOL_CAPTURED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
     parse_risk_test_matrix_evidence,
-    MACHINE_OBLIGATION_KINDS,
-    parse_historical_structured_coder_followup,
-    parse_historical_structured_issue_implementation,
 )
 from .runner import Runner
 from . import review_step_back as _step_back

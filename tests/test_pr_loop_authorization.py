@@ -44,6 +44,8 @@ from coding_review_agent_loop.prompts import (
 import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
+)
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
 )

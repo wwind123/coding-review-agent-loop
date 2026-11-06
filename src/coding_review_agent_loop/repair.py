@@ -38,10 +38,8 @@ from .repair_preservation import (
 )
 from .protocol_markers import sanitize_historical_text, scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
-from .protocol import (
+from .protocol_risk import (
     normalize_risk_test_matrix_string_lists,
-    STATE_RE,
-    parse_execution_recommendation_payload,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
     RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS,
@@ -52,6 +50,10 @@ from .protocol import (
     risk_test_matrix_prompt_examples,
     semantic_risk_claim_example_json,
     semantic_risk_claim_schema_text,
+)
+from .protocol import (
+    STATE_RE,
+    parse_execution_recommendation_payload,
 )
 from .protocol_common import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,

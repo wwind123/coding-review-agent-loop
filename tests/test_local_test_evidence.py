@@ -1,3 +1,5 @@
+
+from coding_review_agent_loop import protocol_risk as _risk_owner
 import json
 import os
 import hashlib
@@ -5019,7 +5021,7 @@ from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
     decode_fixture_record,
     observation_from_mapping,
 )
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     _authoritative_receipt_passes,
     _receipt_expected_status,
 )
@@ -5949,7 +5951,7 @@ def test_superseding_pass_keeps_protocol_receipt_pass_authority():
     passing = _by_receipt(evidence)["run-b-pass"]
     assert passing.environment_state == "not-compared"
     assert ENVIRONMENT_NOT_COMPARED_CAVEAT not in passing.caveats
-    assert _protocol._authoritative_receipt_passes(
+    assert _risk_owner._authoritative_receipt_passes(
         passing.public_projection(), claim="current-result"
     ) is True
 
@@ -7198,7 +7200,9 @@ def test_restored_evidence_from_another_registration_never_matches_a_fresh_build
 
 def test_broker_persists_the_unrecognized_reason_on_the_row_response_and_notice_1661(tmp_path):
     """`reason-fresh-unrecognized`: result, journaled row and receipt notice agree."""
-    from coding_review_agent_loop.protocol import _authoritative_receipt_passes
+    from coding_review_agent_loop.protocol_risk import (
+        _authoritative_receipt_passes,
+    )
 
     _git_checkout(tmp_path)
     script = tmp_path / "check.py"
@@ -7217,7 +7221,9 @@ def test_broker_persists_the_unrecognized_reason_on_the_row_response_and_notice_
 def test_broker_persists_the_probe_unavailable_reason_1661(tmp_path, monkeypatch):
     """`reason-probe-unavailable`: a recognized launcher is never called unrecognized."""
     from coding_review_agent_loop import test_runtime as runtime
-    from coding_review_agent_loop.protocol import _authoritative_receipt_passes
+    from coding_review_agent_loop.protocol_risk import (
+        _authoritative_receipt_passes,
+    )
 
     _git_checkout(tmp_path)
     (tmp_path / "test_ok_1661.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")

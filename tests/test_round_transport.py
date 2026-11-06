@@ -31,8 +31,10 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
-    parse_risk_test_matrix,
     validate_structured_plan_state,
+)
+from coding_review_agent_loop.protocol_risk import (
+    parse_risk_test_matrix,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
@@ -2976,7 +2978,7 @@ def test_normalization_record_renders_beside_all_eight_drop_records_1626():
 @pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
 def test_resume_reparse_of_a_posted_prose_payload_keeps_todays_records_1626(kind):
     """Matrix row `resume-legacy-reparse`: default degrade mode, never newly fatal."""
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
         TEST_OBSERVATIONS_NOT_ARRAY_RULE,
     )

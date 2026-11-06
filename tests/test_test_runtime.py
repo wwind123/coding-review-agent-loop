@@ -5165,7 +5165,7 @@ def test_no_advisory_cases_through_the_runner_leave_the_launch_unchanged(tmp_pat
 from coding_review_agent_loop import fixture_runtime as fx_runtime  # noqa: E402
 from coding_review_agent_loop import fixture_supervisor as fx_supervisor  # noqa: E402
 from coding_review_agent_loop import local_test_evidence as fx_evidence  # noqa: E402
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     _authoritative_receipt_passes,
     _receipt_expected_status,
 )

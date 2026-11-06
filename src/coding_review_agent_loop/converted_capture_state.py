@@ -69,7 +69,10 @@ def evidence_review_boundary(records, *, head, matrix_identity=None):
     Replacement evidence in the same recovery episode needs review too.
     Neither an obligation digest nor a round number establishes freshness.
     """
-    from .protocol import EVIDENCE_SOURCE_TOOL_CAPTURED, parse_risk_test_matrix_evidence
+    from .protocol_risk import (
+        EVIDENCE_SOURCE_TOOL_CAPTURED,
+        parse_risk_test_matrix_evidence,
+    )
     from .errors import AgentLoopError
 
     records = authority_records(records)

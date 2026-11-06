@@ -226,13 +226,13 @@ from .protocol import (
     ParsedReview,
     ReviewItemDisposition,
     StructuredCoderFollowup,
-    SignedEvidenceReference,
     UnresolvedReviewItem,
     human_requirements_resolved,
     parse_agent_state,
     parse_structured_pr_review,
     review_freeform_summary_text,
 )
+from .protocol_risk import SignedEvidenceReference
 from .protocol import parse_review
 from .runner import Runner
 from .salvage import SalvageContext

@@ -23,7 +23,9 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import HumanReviewRequirement, IssueComment, IssueContext
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
-from coding_review_agent_loop.protocol import parse_risk_test_matrix
+from coding_review_agent_loop.protocol_risk import (
+    parse_risk_test_matrix,
+)
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.execution_policy as execution_policy
@@ -2258,7 +2260,9 @@ def _m976_full_plan_state():
     # A maximal 24-row matrix crosses the plan-growth matrix-rows signal
     # (#886); tests built on it run with --plan-growth-gate off because they
     # exercise assembly and replan routing, not the growth gate.
-    from coding_review_agent_loop.protocol import RISK_MATRIX_MAX_ROWS
+    from coding_review_agent_loop.protocol_risk import (
+        RISK_MATRIX_MAX_ROWS,
+    )
 
     payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
     payload["risk_test_matrix"] = _matrix(*[

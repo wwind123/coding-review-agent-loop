@@ -24,15 +24,17 @@ from coding_review_agent_loop.pr_loop_support import (
     evidence_authority_from_records,
 )
 from coding_review_agent_loop.review_rounds import PartialReviewRoundError
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
     SignedEvidenceReference,
-    UnresolvedReviewItem,
-    ReviewItemDisposition,
     derive_risk_test_matrix_evidence,
     parse_risk_test_matrix,
     risk_test_matrix_identity,
+)
+from coding_review_agent_loop.protocol import (
+    UnresolvedReviewItem,
+    ReviewItemDisposition,
 )
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,

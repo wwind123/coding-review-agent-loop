@@ -12,6 +12,8 @@ from coding_review_agent_loop.github import IssueContext
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.protocol import (
     validate_structured_issue_implementation,
+)
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
 )

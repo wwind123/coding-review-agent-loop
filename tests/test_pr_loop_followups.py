@@ -40,9 +40,11 @@ from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    validate_structured_coder_followup,
+)
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
-    validate_structured_coder_followup,
 )
 from agent_loop_helpers import (
     FakeRunner,

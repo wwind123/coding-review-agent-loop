@@ -26,17 +26,19 @@ from dataclasses import dataclass, replace
 
 from .errors import AgentLoopError
 from .evidence_stall import StallRoundSnapshot, stall_snapshot_is_consistent
-from .protocol import (
+from .protocol_risk import (
     CAPTURE_DISQUALIFIERS,
     CAPTURE_LIMITED,
     CAPTURE_OBSERVATION_CLASSES,
-    EVIDENCE_OBLIGATION_KIND,
-    MACHINE_AUTHORITY,
     NOT_CAPTURE_LIMITED,
     DerivedRiskEvidenceResult,
     SignedEvidenceReference,
-    UnresolvedReviewItem,
     disqualify_capture_classification,
+)
+from .protocol import (
+    EVIDENCE_OBLIGATION_KIND,
+    MACHINE_AUTHORITY,
+    UnresolvedReviewItem,
 )
 from .unresolved_items import (
     converted_evidence_obligation_identity,

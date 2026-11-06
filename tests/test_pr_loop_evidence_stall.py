@@ -10,7 +10,10 @@ from coding_review_agent_loop.cli import build_parser, run_pr_loop
 from coding_review_agent_loop.config import config_from_args
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.github import get_pr_review_context
-from coding_review_agent_loop.protocol import parse_risk_test_matrix, risk_test_matrix_identity
+from coding_review_agent_loop.protocol_risk import (
+    parse_risk_test_matrix,
+    risk_test_matrix_identity,
+)
 from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
@@ -363,7 +366,7 @@ import dataclasses  # noqa: E402
 
 import coding_review_agent_loop.evidence_stall as evidence_stall_module  # noqa: E402
 import coding_review_agent_loop.pr_loop as pr_loop_module  # noqa: E402
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     PostAuthClaimDiagnostic,
 )
 from coding_review_agent_loop.protocol_common import (

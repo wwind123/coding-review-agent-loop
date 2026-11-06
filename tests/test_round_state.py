@@ -1479,7 +1479,12 @@ def _conversion_fixtures():
         ConversionAuditRow,
         EvidenceConversionAudit,
     )
-    from coding_review_agent_loop.protocol import SignedEvidenceReference, UnresolvedReviewItem
+    from coding_review_agent_loop.protocol_risk import (
+        SignedEvidenceReference,
+    )
+    from coding_review_agent_loop.protocol import (
+        UnresolvedReviewItem,
+    )
     from coding_review_agent_loop.unresolved_items import (
         _upsert_converted_evidence_obligation,
         converted_evidence_obligation_identity,

@@ -1044,13 +1044,15 @@ from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
     TreeAttribution as _Attribution,
 )
 from coding_review_agent_loop.execution_policy import make_approved_plan_context as _plan_context  # noqa: E402
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     SemanticRiskCoverageClaim as _Claim,
     SemanticRiskCoverageClaims as _Claims,
-    StructuredHumanRequirementsPayload as _HumanPayload,
-    StructuredIssueImplementation as _Implementation,
     parse_risk_test_matrix as _parse_matrix,
     risk_test_matrix_identity as _matrix_identity,
+)
+from coding_review_agent_loop.protocol import (
+    StructuredHumanRequirementsPayload as _HumanPayload,
+    StructuredIssueImplementation as _Implementation,
 )
 
 

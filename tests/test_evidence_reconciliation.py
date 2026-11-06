@@ -95,7 +95,7 @@ from coding_review_agent_loop.local_test_evidence import (
     reconcile_test_observations,
 )
 import coding_review_agent_loop.local_test_evidence as evidence_module
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
     _receipt_expected_status,
@@ -425,7 +425,9 @@ def _restored_base_pass(receipt, *, digest, head):
 
 def _base_citation_outcome(observations, receipt, status):
     """Validate a ``base-reproduction`` citation the way published evidence is checked."""
-    from coding_review_agent_loop.protocol import parse_risk_test_matrix_evidence
+    from coding_review_agent_loop.protocol_risk import (
+        parse_risk_test_matrix_evidence,
+    )
 
     matrix = _matrix()
     payload = {

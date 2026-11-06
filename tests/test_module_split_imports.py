@@ -1,4 +1,4 @@
-"""Symbol-specific guards for the cleaned protocol support surface."""
+"""Symbol-specific guards for the cleaned protocol support and risk surfaces."""
 from __future__ import annotations
 
 import ast
@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location('support_rewrite', ROOT / 'scripts/rewrite_protocol_support_imports.py')
 _REWRITE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_REWRITE)
-OWNERS = _REWRITE.symbol_owners()
+_RISK_SPEC = importlib.util.spec_from_file_location('risk_rewrite', ROOT / 'scripts/rewrite_protocol_risk_imports.py')
+_RISK_REWRITE = importlib.util.module_from_spec(_RISK_SPEC)
+_RISK_SPEC.loader.exec_module(_RISK_REWRITE)
+RISK_OWNERS = _RISK_REWRITE.symbol_owners()
+OWNERS = {**_REWRITE.symbol_owners(), **RISK_OWNERS}
 OLD = 'coding_review_agent_loop.protocol'
 
 
@@ -135,3 +139,36 @@ def test_discussion_dependency_patch_intercepts_real_lookup(monkeypatch):
     with pytest.raises(RuntimeError, match='lookup intercepted'):
         protocol_discuss.parse_structured_discuss_answer('{}', reviewer='probe')
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('name', sorted(RISK_OWNERS))
+@pytest.mark.parametrize('template', [
+    'from coding_review_agent_loop.protocol import {name} as moved',
+    'from . import protocol as p\nq = p\nq.{name}',
+    'import coding_review_agent_loop.protocol as p\np.{name}',
+    'patch("coding_review_agent_loop.protocol.{name}")',
+    'prefix = "coding_review_agent_loop.protocol"\npatch(f"{{prefix}}.{name}")',
+    'from coding_review_agent_loop import protocol as p\nmonkeypatch.setattr(p, "{name}", fake)',
+    'from coding_review_agent_loop import protocol as p\npatch.object(p, "{name}", fake)',
+])
+def test_guard_rejects_every_old_risk_symbol(name, template):
+    assert ownership_problems(template.format(name=name))
+
+
+@pytest.mark.parametrize('name', sorted(RISK_OWNERS))
+def test_guard_rejects_risk_compatibility_export(name):
+    assert ownership_problems(f'from .protocol_risk import {name}', driver=True)
+    assert not ownership_problems(f'from .protocol_risk import {name}\nx = {name}', driver=True)
+
+
+def test_risk_rewrite_handles_qualified_aliases_and_object_patches():
+    source = ('from coding_review_agent_loop import protocol as p\n'
+              'from coding_review_agent_loop.protocol import RiskTestMatrix as Matrix, ParsedPrReview\n'
+              'p.risk_test_matrix_identity(matrix)\n'
+              'monkeypatch.setattr(p, "_parse_risk_evidence_citations", fake)\n'
+              'patch("coding_review_agent_loop.protocol.parse_risk_test_matrix")\n')
+    rewritten = _RISK_REWRITE.rewrite(source, RISK_OWNERS)
+    assert not ownership_problems(rewritten)
+    assert 'RiskTestMatrix as Matrix' in rewritten
+    assert 'ParsedPrReview' in rewritten
+    assert _RISK_REWRITE.rewrite(rewritten, RISK_OWNERS) == rewritten

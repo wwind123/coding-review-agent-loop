@@ -169,9 +169,8 @@ from .protocol import (
     parse_structured_plan_review,
     review_freeform_summary_text,
     validate_structured_plan_state,
-    validate_risk_test_matrix_revision,
-    risk_test_matrix_identity,
 )
+from .protocol_risk import validate_risk_test_matrix_revision, risk_test_matrix_identity
 from .runner import Runner
 from .usage import RunUsageContext
 from .comment_rendering import (

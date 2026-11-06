@@ -15,7 +15,7 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.local_test_evidence import LocalTestObservation, TreeAttribution
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     RiskTestMatrixChange,
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
@@ -23,9 +23,11 @@ from coding_review_agent_loop.protocol import (
     parse_risk_test_matrix,
     parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
+    validate_risk_test_matrix_revision,
+)
+from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_plan_state,
-    validate_risk_test_matrix_revision,
 )
 from coding_review_agent_loop.decomposition import validate_risk_matrix_ownership
 from coding_review_agent_loop.round_state import (
@@ -400,7 +402,9 @@ def _derive_for_claims(matrix, claims):
 
 def test_builder_keeps_empty_facts_for_present_incomplete_claim() -> None:
     """#849: an all-empty present claim fails closed without copying approved-row text."""
-    from coding_review_agent_loop.protocol import SEMANTIC_RISK_CLAIM_FACT_KEYS
+    from coding_review_agent_loop.protocol_risk import (
+        SEMANTIC_RISK_CLAIM_FACT_KEYS,
+    )
 
     matrix = parse_risk_test_matrix(_matrix())
     approved = matrix.rows[0]
@@ -2894,10 +2898,12 @@ def test_unapproved_embedded_substring_row_id_keeps_exact_attribution_1016(row_i
 # ---------------------------------------------------------------------------
 
 from coding_review_agent_loop.errors import NonRepairableEvidenceRejection  # noqa: E402
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     DROPPED_VALUE_MAX_BYTES,
-    NonRepairableEvidenceRejection as _ProtocolNonRepairable,
     _parse_semantic_risk_coverage_claims,
+)
+from coding_review_agent_loop.protocol import (
+    NonRepairableEvidenceRejection as _ProtocolNonRepairable,
 )
 
 _CATALOG_927 = (
@@ -3253,7 +3259,7 @@ def test_row_id_only_drop_still_bounds_a_truncated_fact_tail_927(duplicate):
 
 # --- #1229: lossless normalization of lone-string list fields ---------------
 
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     normalize_risk_test_matrix_string_lists,
     parse_risk_test_matrix_changes,
 )
@@ -3331,7 +3337,9 @@ def _coverage_claim_payload(**extra) -> dict[str, object]:
 
 
 def _parse_claims_1290(claims: list[object]):
-    from coding_review_agent_loop.protocol import _parse_semantic_risk_coverage_claims
+    from coding_review_agent_loop.protocol_risk import (
+        _parse_semantic_risk_coverage_claims,
+    )
 
     return _parse_semantic_risk_coverage_claims(
         claims, context="issue_implementation.risk_test_matrix_claims", expected_row_ids=["row-a", "row-b"]
@@ -3442,7 +3450,7 @@ def test_coverage_gaps_parse_on_coder_followup() -> None:
 
 
 def test_default_claim_schema_text_and_example_are_unchanged_by_coverage_keys() -> None:
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         semantic_risk_claim_example,
         semantic_risk_claim_schema_text,
     )
@@ -3509,7 +3517,7 @@ def test_non_evidence_launch_failure_does_not_block_matrix_evidence() -> None:
 
 import logging  # noqa: E402
 
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS,
     semantic_risk_claim_schema_text,
 )
@@ -3715,7 +3723,7 @@ def test_schema_text_states_execution_ref_bound_1300(kwargs):
 
 # --- Operator-signed evidence overlay and parse contract (#1325) ------------
 
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
