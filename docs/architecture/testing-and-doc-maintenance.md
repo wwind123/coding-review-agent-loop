@@ -223,8 +223,11 @@ fresh import orders, source sizes and interception at the moved citation lookup;
 the linked shape audit includes the risk owner and tests missing annotations there.
 
 
-The optional PR-review `requirement_evidence` field records semantic signed-source
-classification (#1922). Entries contain requirement_id, role (code, human-only,
+The PR-review `requirement_evidence` field records semantic signed-source
+classification (#1922). Every surfaced signed source must be classified whenever
+the review does not acknowledge it as resolved, including ordinary work with role
+`code`. Missing classification triggers one bounded reviewer continuation; a
+repeated omission stops the run before coder dispatch. Entries contain requirement_id, role (code, human-only,
 evidence-only, mixed), request, answered_item_ids and leftover_instructions.
 The parser checks shape; routing checks surfaced source identity, native target
 existence and requester ownership. Repair preserves the entire field exactly,

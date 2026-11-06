@@ -145,3 +145,24 @@ def test_conflicting_classification_gets_one_real_continuation(resolved):
         with pytest.raises(HumanDecisionRequiredError, match="classification remained conflicting"):
             run()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+@pytest.mark.parametrize("classified", [False, True])
+def test_ordinary_code_requirement_classification_matches_prompt(acknowledged, classified):
+    from agent_loop_helpers import structured_pr_review
+    from pr_loop_test_helpers import _with_code_classification
+    text = structured_pr_review(human_requirements_resolved=acknowledged)
+    code_text = _with_code_classification(text, [SOURCE])
+    if classified:
+        text = code_text
+    parse = lambda value: parse_structured_pr_review(value, reviewer="Codex", architecture_status_mode="legacy")
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(marker_value=parse(code_text), text=code_text)
+    parsed, _ = classify_review(parse(text), text, requirements=[SOURCE], items=[],
+                               reviewer_name="Codex", invoke=invoke)
+    assert len(calls) == (0 if classified or acknowledged else 1)
+    # Classification routes ordinary instructions to the coder without waiving them.
+    assert project([SOURCE], {"Codex": parsed}, []) == (SOURCE,)

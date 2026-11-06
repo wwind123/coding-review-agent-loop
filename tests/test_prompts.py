@@ -3099,6 +3099,10 @@ def test_blocking_followup_prompt_includes_human_requirements_before_ai_feedback
             "reviews": [],
         },
     )
+    from pr_loop_test_helpers import _with_code_classification
+    runner.codex_outputs[0] = _with_code_classification(
+        structured_pr_review(state="blocking", blocking_items=["Needs a fix."]),
+        (requirement,))
     config = make_config(tmp_path)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -7282,3 +7286,15 @@ def test_unconditional_test_guidance_survives_pin_install_failure(tmp_path, monk
         env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert result.stdout == ("pinned" if pin else "fallback")
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_signed_source_classification_guidance_covers_ordinary_work(tmp_path, compact):
+    prompt = build_review_prompt(77, 1, make_config(tmp_path), reviewer="codex",
+                                 compact_context=compact)
+    assert "Classify every surfaced signed source whenever the" in prompt
+    assert "review does not acknowledge it as resolved" in prompt
+    assert "including ordinary work with role\n`code`" in prompt
+    assert "repeated omission stops the run before coder dispatch" in prompt
+    assert "optionally include `requirement_evidence`" not in prompt
+    assert "when human-only\nevidence is involved" not in prompt

@@ -1454,10 +1454,12 @@ fulfills evidence. Preserve admitted scheduling shown below across heads; do not
 unchanged source as pre-merge work. Owners are free text, without assignment or account validation.
 """
 
-PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """Signed-source classification: optionally include `requirement_evidence`, an array
+PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """Signed-source classification: include `requirement_evidence`, an array
 of objects with exactly `requirement_id`, `role`, `request`, `answered_item_ids`
-and `leftover_instructions`. Classify each surfaced signed source when human-only
-evidence is involved. Roles: `code` (ordinary code requirement), `human-only`
+and `leftover_instructions`. Classify every surfaced signed source whenever the
+review does not acknowledge it as resolved, including ordinary work with role
+`code`. Missing classification triggers one bounded reviewer continuation; a
+repeated omission stops the run before coder dispatch. Roles: `code` (ordinary code requirement), `human-only`
 (link `request` to a string in your exact_head_evidence_requests), `evidence-only`
 (answered prior item IDs, no remaining instructions), or `mixed` (answered prior
 item IDs plus explicit leftover code instruction text). Use empty strings/lists

@@ -46,6 +46,7 @@ from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
 )
+from pr_loop_test_helpers import _with_code_classification
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
@@ -2152,6 +2153,10 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
         ],
         claude_outputs=[ack_markdown, ack_markdown, resolved_claim],
     )
+    runner.codex_outputs = [
+        _with_code_classification(output, (first,) if index < 2 else (first, second))
+        for index, output in enumerate(runner.codex_outputs)
+    ]
     runner.pr_payload["headRefName"] = "feature/x"
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
