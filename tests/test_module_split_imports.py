@@ -21,6 +21,31 @@ OLD = 'coding_review_agent_loop.protocol'
 
 def ownership_problems(source, *, driver=False):
     tree = ast.parse(source)
+    # Quoted forward references are executable type dependencies too. Expand
+    # annotation strings (including nested tuple/list references), but never
+    # count an unrelated string literal as an internal use of an import.
+    nodes = list(ast.walk(tree))
+    for node in list(nodes):
+        annotations = []
+        if isinstance(node, (ast.AnnAssign, ast.arg)):
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations.append(node.returns)
+        for annotation in annotations:
+            pending = list(ast.walk(annotation)) if annotation is not None else []
+            while pending:
+                child = pending.pop()
+                if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                    try:
+                        expanded = ast.parse(child.value, mode='eval')
+                    except SyntaxError:
+                        continue
+                    expanded_nodes = list(ast.walk(expanded))
+                    for expanded_node in expanded_nodes:
+                        if hasattr(expanded_node, 'lineno'):
+                            expanded_node.lineno = child.lineno
+                    nodes.extend(expanded_nodes)
+                    pending.extend(expanded_nodes)
     bindings = {}
     problems = []
 
@@ -39,7 +64,7 @@ def ownership_problems(source, *, driver=False):
         return ''
 
     # Source order also handles local imports, module aliases and patch-prefix variables.
-    for node in sorted(ast.walk(tree), key=lambda n: (getattr(n, 'lineno', 0), getattr(n, 'col_offset', 0))):
+    for node in sorted(nodes, key=lambda n: (getattr(n, 'lineno', 0), getattr(n, 'col_offset', 0))):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bindings[alias.asname or alias.name.split('.')[0]] = alias.name if alias.asname else alias.name.split('.')[0]
@@ -68,7 +93,7 @@ def ownership_problems(source, *, driver=False):
             if len(node.args) >= 2 and resolve(node.args[0]) == OLD and resolve(node.args[1]) in OWNERS:
                 problems.append(f'{node.lineno}: old object patch')
     if driver:
-        loads = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+        loads = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
@@ -145,6 +170,8 @@ def test_discussion_dependency_patch_intercepts_real_lookup(monkeypatch):
 @pytest.mark.parametrize('template', [
     'from coding_review_agent_loop.protocol import {name} as moved',
     'from . import protocol as p\nq = p\nq.{name}',
+    'from . import protocol as p\nvalue: "p.{name} | None"',
+    'from . import protocol as p\nvalue: tuple["p.{name}", ...]',
     'import coding_review_agent_loop.protocol as p\np.{name}',
     'patch("coding_review_agent_loop.protocol.{name}")',
     'prefix = "coding_review_agent_loop.protocol"\npatch(f"{{prefix}}.{name}")',
@@ -172,3 +199,27 @@ def test_risk_rewrite_handles_qualified_aliases_and_object_patches():
     assert 'RiskTestMatrix as Matrix' in rewritten
     assert 'ParsedPrReview' in rewritten
     assert _RISK_REWRITE.rewrite(rewritten, RISK_OWNERS) == rewritten
+
+
+@pytest.mark.parametrize('annotation', [
+    'value: {name}',
+    'value: "{name} | None"',
+    'value: tuple["{name}", ...]',
+    'value: "tuple[\'{name}\', ...]"',
+    'def consumer(value: "{name}"): pass',
+    'def consumer() -> "{name}": pass',
+    'async def consumer() -> "{name}": pass',
+])
+@pytest.mark.parametrize('aliased', [False, True])
+@pytest.mark.parametrize('name', ['RiskTestMatrixEvidence', 'RiskTestMatrixChange'])
+def test_guard_allows_annotation_dependencies(name, aliased, annotation):
+    binding = 'MovedType' if aliased else name
+    imported = f'{name} as {binding}' if aliased else name
+    source = f'from .protocol_risk import {imported}\n' + annotation.format(name=binding)
+    assert not ownership_problems(source, driver=True)
+
+
+@pytest.mark.parametrize('name', ['RiskTestMatrixEvidence', 'RiskTestMatrixChange'])
+def test_guard_does_not_count_unrelated_strings_as_annotation_dependencies(name):
+    source = f'from .protocol_risk import {name}\nvalue = "{name}"'
+    assert ownership_problems(source, driver=True)

@@ -69,3 +69,18 @@ def test_risk_citation_patch_intercepts_actual_lookup(monkeypatch):
     monkeypatch.setattr(protocol_risk, "_expect_test_observations", citations)
     assert protocol_risk._parse_risk_evidence_citations([], context="evidence") is sentinel
     assert calls == [([], "evidence")]
+
+
+@pytest.mark.parametrize('class_name, field_name, type_name, collection', [
+    ('StructuredCoderFollowup', 'risk_test_matrix_evidence', 'RiskTestMatrixEvidence', False),
+    ('StructuredIssueImplementation', 'risk_test_matrix_evidence', 'RiskTestMatrixEvidence', False),
+    ('StructuredPlanRevision', 'risk_test_matrix_changes', 'RiskTestMatrixChange', True),
+    ('StructuredPlanState', 'risk_test_matrix_changes', 'RiskTestMatrixChange', True),
+])
+def test_response_risk_annotations_resolve(class_name, field_name, type_name, collection):
+    from typing import get_type_hints
+    from coding_review_agent_loop import protocol, protocol_risk
+
+    risk_type = getattr(protocol_risk, type_name)
+    expected = tuple[risk_type, ...] if collection else risk_type | None
+    assert get_type_hints(getattr(protocol, class_name))[field_name] == expected

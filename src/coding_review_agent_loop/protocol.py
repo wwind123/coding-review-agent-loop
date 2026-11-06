@@ -73,6 +73,8 @@ from .protocol_risk import (
     PostAuthClaimDiagnostic,
     RISK_MATRIX_MAX_CHANGES,
     RiskTestMatrix,
+    RiskTestMatrixChange,
+    RiskTestMatrixEvidence,
     RiskTestMatrixMetadata,
     RiskTestMatrixRow,
     SemanticRiskCoverageClaims,
