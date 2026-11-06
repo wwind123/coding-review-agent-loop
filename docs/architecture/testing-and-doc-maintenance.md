@@ -2,7 +2,7 @@
 
 How the test suite exercises the orchestrator, when the architecture set must change, how architecture context is injected, and how semantic-claim validation degrades the narrowest offending element: architecture-impact parser modes and canonicalization, the reviewer status re-ask, `test_observations` citation degradation, and the `protocol.py` shape-check audit.
 
-Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
+Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/protocol_risk.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
 
 ## Tests and Document Maintenance
 
@@ -179,7 +179,7 @@ candidate must also pass the unflagged preservation rules against the source,
 it inherits the source's architecture near-miss record, and it is accepted
 only with the after-repair drop record.
 
-Every function, method and nested def in `protocol.py`, `protocol_common.py` and `protocol_discuss.py` that can still reach
+Every function, method and nested def in `protocol.py`, `protocol_common.py`, `protocol_discuss.py` and `protocol_risk.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
 `fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site
 carries an inline annotation. A propagating site names one clause from a
@@ -207,6 +207,19 @@ discussion parser and discussion type symbols against old imports, aliases,
 qualified accesses, patch strings and compatibility-only driver exports. A
 consumer regression patches the dependency at the discussion parser lookup.
 Necessary internal imports remain permitted; downstream consumers use the owners.
+
+`protocol_risk.py` owns risk matrix records, identities and revisions, semantic
+claims/gaps, test-observation citation parsing and canonical evidence derivation,
+including signed-reference handling and matrix row/metadata patch parsing.
+`protocol.py` retains response-composition adapters and temporary identity-preserving
+risk exports for the move window. The new owner imports shared support directly
+and never imports the response driver. Bounds, diagnostics and evidence authority
+are unchanged. `tests/fixtures/protocol_risk_move.json` records original symbol
+bodies, global references, decorators and consumer/patch candidates for the paired
+cleanup. `tests/test_protocol_risk_move.py` checks body hashes, export identity,
+fresh import orders, source sizes and interception at the moved citation lookup;
+the linked shape audit includes the risk owner and tests missing annotations there.
+
 
 ## Decisions
 

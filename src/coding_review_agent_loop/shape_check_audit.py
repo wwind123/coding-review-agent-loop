@@ -1957,4 +1957,4 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
 }
 
 # All definition owners participate in the linked AST inventory.
-PARSER_OWNERS = ("protocol_common", "protocol_discuss", "protocol")
+PARSER_OWNERS = ("protocol_common", "protocol_discuss", "protocol_risk", "protocol")

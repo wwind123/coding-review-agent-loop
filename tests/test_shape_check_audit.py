@@ -1393,7 +1393,7 @@ def parse(value):
     assert "parse: registered fatal but has a degradation path" in problems
 
 
-@pytest.mark.parametrize("owner", ["protocol_common", "protocol_discuss"])
+@pytest.mark.parametrize("owner", ["protocol_common", "protocol_discuss", "protocol_risk"])
 def test_moved_owner_missing_annotation_is_detected(owner):
     source = (PACKAGE_DIR / f"{owner}.py").read_text(encoding="utf-8")
     source = source.replace("# shape-check: fatal:", "# removed: fatal:", 1)
