@@ -1,5 +1,7 @@
 """Later-attempt repair recovery through real activation and PR reconstruction."""
 
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
+
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 import copy
 import dataclasses
@@ -41,7 +43,7 @@ class RecoveryRunner(ManualQualificationRunner):
             rest_pr={'draft': True, 'body': body,
                      'head': {'sha': V2_HEAD, 'ref': 'agent-loop/managed-643',
                               'repo': {'full_name': 'OWNER/REPO'}}},
-            issue_events=[label_event()], pr_branch_protection_payload={'contexts': [ci.FINAL_CONTEXT]},
+            issue_events=[label_event()], pr_branch_protection_payload={'contexts': [_managed_ci_status.FINAL_CONTEXT]},
             **kwargs,
         )
         self.run_error = False
@@ -86,7 +88,7 @@ class RecoveryRunner(ManualQualificationRunner):
 
 
 def _status(attempt=2, state='success'):
-    return {'context': ci.FINAL_CONTEXT, 'state': state,
+    return {'context': _managed_ci_status.FINAL_CONTEXT, 'state': state,
             'description': f'nonce={V2_NONCE};run_id=100;attempt={attempt};result={state}',
             'creator': {'login': 'github-actions[bot]', 'id': 41898282},
             'target_url': 'https://github.com/OWNER/REPO/actions/runs/100'}

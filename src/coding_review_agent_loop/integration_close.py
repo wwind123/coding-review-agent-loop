@@ -66,7 +66,7 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
     trusting a later ``--base`` or the PR's current base.
     """
     from .github import read_rest_issue_comments
-    from .managed_ci import (
+    from .managed_ci_intent_validation import (
         IntentBinding,
         match_intent_envelope,
         validate_intent_record,

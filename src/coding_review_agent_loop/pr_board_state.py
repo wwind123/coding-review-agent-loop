@@ -367,7 +367,9 @@ def resolve_pr_owning_issue(
     Performs no I/O.
     """
     from .github import parse_linked_issue_numbers
-    from .managed_ci import managed_branch_issue_number
+    from .managed_ci_authorization import (
+        managed_branch_issue_number,
+    )
 
     fresh_scope_number = managed_ci_issue_number or getattr(
         config, "managed_ci_issue_number", None

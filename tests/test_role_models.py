@@ -11,7 +11,9 @@ from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.comment_rendering import _format_unresolved_item_label
 from coding_review_agent_loop.config import config_from_args, resolve_invocation
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.managed_ci import _render_recovery_command
+from coding_review_agent_loop.managed_ci_recovery_commands import (
+    _render_recovery_command,
+)
 from coding_review_agent_loop.issue_implementation import _approved_implementation_config
 from coding_review_agent_loop.agent_failure import _build_unsupported_model_diagnostic
 from coding_review_agent_loop.discuss_loop import _run_discuss_analyzer

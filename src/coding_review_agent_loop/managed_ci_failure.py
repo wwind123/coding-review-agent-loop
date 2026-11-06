@@ -1,6 +1,9 @@
 """Attempt-bound live failure evidence, separate from historical qualification."""
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
+
 from coding_review_agent_loop import managed_ci_api as _managed_ci_api
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 
@@ -138,7 +141,7 @@ def live_authority(runner, *, config, pr_number, metadata, contract):
             return False
     resume = contract.authenticated_resume
     if resume is not None and resume.issue_created_handoff is not None:
-        ci.revalidate_issue_created_handoff(runner, config=config, metadata=metadata,
+        _managed_ci_authorization.revalidate_issue_created_handoff(runner, config=config, metadata=metadata,
                                             handoff=resume.issue_created_handoff)
     ci.require_recorded_base(runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
                              repository=config.repo, head_sha=metadata.head_sha, action='live failure observation')
@@ -218,19 +221,19 @@ def require_live_failure(runner, *, config, pr_number, metadata, contract, check
                                 and snapshot.conclusion in {'failure', 'timed_out', 'cancelled'}) else None
         if terminal() is None:
             return False
-        final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+        final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
         if final is not None and final.status in _managed_ci_types._TERMINAL_CI_STATUSES:
             if final.status == 'success':
                 return False
         else:
             # The existing terminal-without-status rule requires a reread and
             # a second poll, leaving the active publisher's attachment intact.
-            final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+            final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
             if final is None or final.status not in _managed_ci_types._TERMINAL_CI_STATUSES:
                 runner.run(['sleep', str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
                 if terminal() is None:
                     return False
-                final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+                final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
                 if final is None or final.status not in _managed_ci_types._TERMINAL_CI_STATUSES:
                     view.terminal_run_id, view.terminal_run_attempt = ref.run_id, ref.failed_attempt
                     view.terminal_attempts += ((ref.run_id, ref.failed_attempt),)

@@ -40,15 +40,18 @@ formatting/parsing, chain validation, continuity publication, fresh resume, reco
 and record matching. It imports lower-level support directly, never the driver.
 The shared comment-ingestion helper lives in `managed_ci_api.py`. Activation,
 creation preflight, fallback, dispatch, qualification and merge remain in the driver.
-Temporary explicit driver imports preserve the moved bindings' object identity
-until the paired authorization cleanup. The pre-move symbol/body/reference and
-patch inventory is `tests/fixtures/managed_ci_authorization_move.json`;
-`scripts/rewrite_managed_authorization_patches.py` retargets moved patch lookups.
-Body-hash and fresh-interpreter identity checks protect this move window. The body hashes,
+Consumers import authorization and extracted helper symbols directly from their
+owners; the driver retains only imports used by its gates. The pre-move
+symbol/body/reference and patch inventory is
+`tests/fixtures/managed_ci_authorization_move.json`.
+`scripts/rewrite_managed_authorization_imports.py` uses that manifest and the
+recovery-command, intent-validation, tuple/result, reconciliation, status and
+failure inventories to migrate imports, aliases and patch lookups. Body hashes
+and fresh-interpreter import checks protect the final ownership graph. The body hashes,
 original references, consumer candidates and immediate patch retargets are
 recorded in `tests/fixtures/managed_ci_support_move.json` and drive
-`scripts/rewrite_managed_support_imports.py`. Driver API JSON lookups resolve
-through the API module so dependency patches intercept the live lookup. The symbol-specific
+`scripts/rewrite_managed_support_imports.py`. Driver API JSON and correlated-status lookups resolve
+through their owner modules so dependency patches intercept the live lookup. The symbol-specific
 guard in `tests/test_module_split_imports.py` rejects old driver imports, aliases,
 patch targets and compatibility-only exports. Fresh-interpreter import checks
 cover driver-first and support/helper-first orders.
@@ -58,9 +61,9 @@ Recovery command rendering lives in the pure `managed_ci_recovery_commands.py`
 sibling, and workflow-mirrored intent envelope, schema and lifecycle validation
 lives in the pure `managed_ci_intent_validation.py` sibling. Both import
 independently without a back-reference to `managed_ci.py` or the orchestrator.
-`managed_ci.py` explicitly re-exports their definitions and catalogs, retains
-all GitHub I/O, freshness and dispatch authorization gates, and keeps callers
-of patched names in their original namespace. Persistence formats and
+`managed_ci.py` retains only imports needed by its GitHub I/O, freshness and
+dispatch authorization gates. Consumers and patches use the defining or actual
+lookup owner; compatibility-only exports are removed. Persistence formats and
 authorization decisions are unchanged by this pure move (#1692).
 
 Ordinary CI observes the current-head check board. Known failures can join
@@ -69,7 +72,7 @@ and automatic merging use bounded gates, including infrastructure-failure
 classification and fresh mergeability checks.
 
 Post-approval failures are classified before any coder routing (#1477). The
-plumbing catalog lives once in `managed_ci.py` (`MANAGED_PLUMBING_JOB_NAMES`
+plumbing catalog lives once in `managed_ci_types.py` (`MANAGED_PLUMBING_JOB_NAMES`
 plus `final-ci/exact-head`, extended only by `--ci-plumbing-check`). Matching
 is by exact whole name or final ` / ` segment; a workflow-contract test pins
 the job names to the managed workflows. `ci_health.classify_watch_failure` is

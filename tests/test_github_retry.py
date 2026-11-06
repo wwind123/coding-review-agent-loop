@@ -1,5 +1,7 @@
 """Stage 1 of #510: shared transient GitHub policy and read-only retry (#1257)."""
 
+from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
+
 from coding_review_agent_loop import managed_ci_api as _managed_ci_api
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 
@@ -304,7 +306,7 @@ def test_managed_ci_list_failure_reason_reaches_callers(tmp_path, sleeps):
     config = make_config(tmp_path)
     runner = ScriptedRunner([(1, "", "HTTP 503 list-final")])
     with pytest.raises(AgentLoopError) as info:
-        managed_ci._authorization_comment_records(
+        _managed_ci_authorization._authorization_comment_records(
             runner, config=config, pr_number=4, actor_login="bot", actor_id=7
         )
     message = str(info.value)
@@ -349,7 +351,7 @@ def test_managed_ci_event_and_timeline_failure_reasons(tmp_path, sleeps):
     assert "events-final" in _managed_ci_api._last_list_failure()
     assert "attempt 3:" in _managed_ci_api._last_list_failure()
 
-    ids = managed_ci._actor_owned_label_event_ids(
+    ids = _managed_ci_authorization._actor_owned_label_event_ids(
         runner, config=config, pr_number=4, actor_login="bot", actor_id=7
     )
     assert ids is None
@@ -407,7 +409,7 @@ def test_issue_created_authorization_publish_keeps_active_label_diagnostics(tmp_
     metadata = github.PullRequestMetadata(7, "OWNER/REPO", "t", "head", "main", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "u")
     runner = _exhausted_managed_runner()
     with pytest.raises(AgentLoopError) as info:
-        managed_ci.publish_issue_created_authorization(
+        _managed_ci_authorization.publish_issue_created_authorization(
             runner, config=config, handoff=handoff, metadata=metadata
         )
     assert "actor-owned managed-label event" in str(info.value)
@@ -437,7 +439,7 @@ def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
     )
     runner = _exhausted_managed_runner()
     with pytest.raises(AgentLoopError) as info:
-        managed_ci.publish_issue_created_continuity_authorization(
+        _managed_ci_authorization.publish_issue_created_continuity_authorization(
             runner,
             config=config,
             handoff=handoff,

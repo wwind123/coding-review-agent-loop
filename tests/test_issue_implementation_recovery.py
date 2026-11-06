@@ -21,7 +21,7 @@ from coding_review_agent_loop.managed_ci_types import (
     ManagedCiCreationIntent,
     UNPROTECTED_OVERRIDE_TRAILER,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_authorization import (
     parse_issue_created_authorization_comment,
 )
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject

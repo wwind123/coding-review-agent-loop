@@ -75,7 +75,9 @@ def test_budget_flag_reaches_the_config_from_the_cli(tmp_path):
 
 
 def test_budget_flag_is_a_recovery_value_option():
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+    )
 
     assert FLAG in _RECOVERY_VALUE_OPTIONS
 
@@ -309,7 +311,9 @@ def test_invalid_retention_fails_config_before_any_pruning(tmp_path, monkeypatch
 
 
 def test_retention_flag_is_a_recovery_value_option():
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+    )
 
     assert RETENTION_FLAG in _RECOVERY_VALUE_OPTIONS
 
@@ -337,7 +341,9 @@ def test_invalid_quota_wait_duration_names_the_option(value):
 def test_quota_wait_option_reaches_config_and_defaults_off(tmp_path):
     from coding_review_agent_loop.cli import build_parser
     from coding_review_agent_loop.config import config_from_args
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+    )
 
     base_argv = [
         "pr", "77", "--repo", "OWNER/REPO", "--reviewer", "codex",

@@ -55,6 +55,8 @@ def test_the_two_pr_gates_have_independent_flags(tmp_path):
 
 
 def test_managed_ci_recovery_parses_the_flag_value():
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+    )
 
     assert "--pr-non-convergence-rounds" in _RECOVERY_VALUE_OPTIONS

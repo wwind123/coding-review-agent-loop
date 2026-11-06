@@ -5,6 +5,8 @@ attachment, dispatch or rerun is performed by this module.
 """
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
+
 from coding_review_agent_loop import managed_ci_api as _managed_ci_api
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 
@@ -157,13 +159,13 @@ def observe_repair_result(runner, *, config, pr_number, metadata, contract, chec
             or snapshot.conclusion != 'success'):
             return None
         view.run_attempt = snapshot.run_attempt
-        final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+        final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
         if (final is None or final.status != 'success' or not final.url
             or urlparse(final.url)._replace(query='', fragment='').geturl().rstrip('/')
             != f'https://github.com/{ref.repository}/actions/runs/{ref.run_id}'):
             return None
         board = ci.get_pr_checks(runner, config=config, metadata=metadata)
-        if not (ci.complete_managed_board(board) and not board.check_query_errors and not board.failing):
+        if not (_managed_ci_status.complete_managed_board(board) and not board.check_query_errors and not board.failing):
             return None
         mergeability = ci.get_pr_mergeability(runner, config=config, pr_number=pr_number)
         if mergeability.state == 'conflicted' or ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha:
@@ -283,7 +285,7 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
         if (snapshot is not None and snapshot.live_run_attempt == ref.failed_attempt
             and snapshot.run_attempt == ref.failed_attempt and snapshot.status == 'in_progress'
             and snapshot.conclusion is None):
-            final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+            final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
             if (final is not None and final.status in {'failure', 'error', 'timed_out', 'cancelled'}
                 and final.url and urlparse(final.url)._replace(query='', fragment='').geturl().rstrip('/')
                 == f'https://github.com/{ref.repository}/actions/runs/{ref.run_id}'):
@@ -294,7 +296,7 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
             if snapshot.run_attempt == ref.failed_attempt:
                 return  # durable failure baseline, including terminal-without-status
             view.run_attempt = snapshot.run_attempt
-            final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+            final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
             if final is not None and final.status in {'failure', 'error', 'timed_out', 'cancelled'}:
                 return
     except (KeyError, TypeError, ValueError) as exc:

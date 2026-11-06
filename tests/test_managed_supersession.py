@@ -5,7 +5,7 @@ import pytest
 
 from coding_review_agent_loop.ci_health import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.github import PullRequestMergeability
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_status import (
     FINAL_CONTEXT,
 )
 from coding_review_agent_loop.managed_ci_types import (

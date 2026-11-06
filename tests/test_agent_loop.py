@@ -5404,7 +5404,9 @@ def test_plan_resume_keep_on_issue_edit_flag_parses_and_requires_plan_first(caps
 
 def test_plan_resume_keep_on_issue_edit_is_reset_in_derived_configs(tmp_path):
     """`flag-not-inherited`: approving-board, isolated-provider and recovery configs."""
-    from coding_review_agent_loop.managed_ci import _render_recovery_command
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _render_recovery_command,
+    )
     from coding_review_agent_loop.plan_verification import PlanVerificationContext
     from coding_review_agent_loop.semantic_dedupe import _isolated_provider_config
     from coding_review_agent_loop.reviewer_floor import BoardSeat
@@ -5795,7 +5797,9 @@ def test_recovery_commands_preserve_worktree_setup_pr_local(tmp_path):
     from agent_loop_helpers import make_config
 
     from coding_review_agent_loop.cli import build_parser
-    from coding_review_agent_loop.managed_ci import _render_recovery_command
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _render_recovery_command,
+    )
 
     config = make_config(tmp_path, invocation_argv=(
         "agent-loop", "issue", "123", "--repo", "OWNER/REPO", *_PR_LOCAL_COMPANIONS,

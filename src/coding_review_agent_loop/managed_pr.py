@@ -12,11 +12,15 @@ from urllib.parse import quote
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .logging import log
-from .managed_ci import (
+from .managed_ci_tuple import (
     MANAGED_LABEL,
+)
+from .managed_ci import (
     ensure_managed_label,
-    parse_managed_ci_override_record,
     preflight_managed_ci_creation,
+)
+from .managed_ci_authorization import (
+    parse_managed_ci_override_record,
 )
 from .managed_ci_types import (
     UNPROTECTED_OVERRIDE_TRAILER,

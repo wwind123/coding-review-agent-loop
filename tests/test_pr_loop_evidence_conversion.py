@@ -463,7 +463,9 @@ def test_operator_conversion_persists_an_audit_and_reaches_the_freeze(tmp_path, 
     assert freeze.phase == "evidence-freeze"
     assert sorted(item.converted_row_id for item in _evidence_items(freeze.prior_items)) == ["row-a", "row-b"]
     # The rerun command never replays the one-shot flag.
-    from coding_review_agent_loop.managed_ci import _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS,
+    )
 
     assert "--pr-convert-evidence-rows" in _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS
 

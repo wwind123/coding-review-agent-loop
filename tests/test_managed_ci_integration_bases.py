@@ -25,10 +25,12 @@ from coding_review_agent_loop.managed_ci_types import (
 )
 from coding_review_agent_loop.managed_ci import (
     _contract_dispatch_ref,
-    _is_v2_intent_run,
     enforce_trusted_base_at_startup,
     require_recorded_base,
     trusted_base_problem,
+)
+from coding_review_agent_loop.managed_ci_failure import (
+    _is_v2_intent_run,
 )
 from coding_review_agent_loop.runner import CommandResult, Runner
 

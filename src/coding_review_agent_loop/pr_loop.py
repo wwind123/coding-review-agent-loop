@@ -168,29 +168,22 @@ from .split_materialization import (
 from .logging import log
 from .memory import prepare_agent_memory
 from .managed_ci_types import AuthenticatedManagedResume, AuthenticatedIssueCreatedHandoff, OrdinaryRecoveryCapability
+from .managed_ci_status import FINAL_CONTEXT
+from .managed_ci_tuple import MANAGED_LABEL
 from .managed_ci import (
-    FINAL_CONTEXT,
-    MANAGED_LABEL,
     activate_managed_ci,
     managed_ci_attachment_matches_head,
     release_stale_managed_ci_attachment,
-    authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
-    find_actor_round_metadata_comment_ids,
-    publish_issue_created_continuity_authorization,
     publish_manual_v2_qualification,
-    rejected_recovery_correlation_inputs,
     prepare_v2_merge,
     publish_round_readiness,
     release_adopted_managed_ci,
     release_retained_managed_label,
     revalidate_adopted_managed_ci,
-    revalidate_issue_created_handoff,
-    recover_issue_created_handoff,
-    render_managed_ci_resume_command,
     wait_for_final_qualification,
     classify_managed_board,
     classify_managed_jobs,
@@ -199,6 +192,15 @@ from .managed_ci import (
     plumbing_check_names,
     rerun_managed_attempt,
 )
+from .managed_ci_authorization import (
+    authorize_fresh_issue_created_resume,
+    find_actor_round_metadata_comment_ids,
+    publish_issue_created_continuity_authorization,
+    rejected_recovery_correlation_inputs,
+    revalidate_issue_created_handoff,
+    recover_issue_created_handoff,
+)
+from .managed_ci_recovery_commands import render_managed_ci_resume_command
 from .managed_pr import (
     recover_managed_pr_origin,
     validate_managed_pr_body,

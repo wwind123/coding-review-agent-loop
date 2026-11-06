@@ -54,7 +54,7 @@ from coding_review_agent_loop.managed_ci_types import (
     ManagedCiIssueAuthorization,
     UNPROTECTED_OVERRIDE_TRAILER,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_authorization import (
     format_issue_created_authorization_comment,
 )
 import coding_review_agent_loop.child_plan_binding as child_plan_binding

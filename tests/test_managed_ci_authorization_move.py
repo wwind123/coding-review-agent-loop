@@ -1,4 +1,4 @@
-"""Authorization move parity, compatibility identity and acyclic import order."""
+"""Authorization body parity, final ownership and acyclic import order."""
 from __future__ import annotations
 
 import ast
@@ -17,8 +17,7 @@ PACKAGE = ROOT / 'src/coding_review_agent_loop'
 MANIFEST = json.loads((ROOT / 'tests/fixtures/managed_ci_authorization_move.json').read_text())
 
 
-def test_authorization_bodies_and_compatibility_identity():
-    driver = importlib.import_module('coding_review_agent_loop.managed_ci')
+def test_authorization_bodies_and_dependencies():
     for owner, records in MANIFEST['owners'].items():
         module = importlib.import_module('coding_review_agent_loop.' + owner)
         source = (PACKAGE / (owner + '.py')).read_text()
@@ -34,7 +33,7 @@ def test_authorization_bodies_and_compatibility_identity():
             elif isinstance(node, ast.ImportFrom):
                 definitions.update((a.asname or a.name, node) for a in node.names)
         for name, record in records.items():
-            assert getattr(driver, name) is getattr(module, name), name
+            assert getattr(module, name) is not None, name
             node = definitions[name]
             first = min([node.lineno] + [d.lineno for d in getattr(node, 'decorator_list', [])])
             body = ''.join(lines[first - 1:node.end_lineno])
@@ -56,8 +55,7 @@ def test_authorization_fresh_import_orders(first):
                                     'managed_ci_api', 'managed_ci_protection'] if m != first]
     code = '\n'.join('import coding_review_agent_loop.' + m for m in modules)
     code += '\nfrom coding_review_agent_loop import managed_ci, managed_ci_authorization, managed_ci_api\n'
-    code += 'assert managed_ci.recover_issue_created_handoff is managed_ci_authorization.recover_issue_created_handoff\n'
-    code += 'assert managed_ci.recover_issue_created_handoff.__globals__["_LIST_FAILURE"] is managed_ci_api._LIST_FAILURE\n'
+    code += 'assert managed_ci_authorization.recover_issue_created_handoff.__globals__["_LIST_FAILURE"] is managed_ci_api._LIST_FAILURE\n'
     subprocess.run([sys.executable, '-c', code], check=True, timeout=30, cwd=ROOT,
                    env={**os.environ, 'PYTHONPATH': str(PACKAGE.parent)})
 

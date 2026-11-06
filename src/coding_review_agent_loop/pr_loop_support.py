@@ -86,14 +86,18 @@ from .managed_ci_types import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
 )
-from .managed_ci import (
+from .managed_ci_status import (
     FINAL_CONTEXT,
+)
+from .managed_ci import (
     refresh_ordinary_recovery_capability,
     require_recorded_base,
-    render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
     verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
+)
+from .managed_ci_recovery_commands import (
+    render_managed_ci_resume_command,
 )
 from .protocol import (
     ReviewItemDisposition,

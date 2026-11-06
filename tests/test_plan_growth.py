@@ -21,7 +21,9 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.config import _arg_or_default
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+from coding_review_agent_loop.managed_ci_recovery_commands import (
+    _RECOVERY_VALUE_OPTIONS,
+)
 from coding_review_agent_loop.plan_assembly import (
     AuthenticatedPlanState,
     aggregate_plan_identity,

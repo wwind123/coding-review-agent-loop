@@ -4974,7 +4974,9 @@ def test_resolve_pr_owning_issue_order_and_recovery_fields(
 )
 def test_resolve_pr_owning_issue_uses_the_shared_managed_branch_parser(tmp_path, branch):
     """#1513: the owning-issue branch number is the shared parser's result."""
-    from coding_review_agent_loop.managed_ci import managed_branch_issue_number
+    from coding_review_agent_loop.managed_ci_authorization import (
+        managed_branch_issue_number,
+    )
     from coding_review_agent_loop.pr_board_state import resolve_pr_owning_issue
 
     config = make_config(tmp_path, managed_ci_pr_mode=True)
