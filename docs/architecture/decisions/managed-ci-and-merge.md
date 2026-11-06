@@ -44,3 +44,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Issue-created opening-tuple recovery distinguishes bounded unavailable or malformed PR observations from safe phase-specific field mismatches while retaining exact raw-body authentication (#1882).
 
 - Managed-CI support consumers now import their definition owners directly; only internally used driver imports remain. Manifest-driven rewriting, symbol/patch guards and fresh-process imports protect the support cleanup without changing runtime or authority (#1906).
+
+- Issue-created authorization, continuity and recovery now live in an acyclic authorization owner with temporary identity-preserving driver imports. Comment ingestion is shared through the API owner; body hashes and import-order checks protect the move window (#1907).

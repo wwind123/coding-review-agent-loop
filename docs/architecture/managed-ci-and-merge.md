@@ -2,7 +2,7 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_types.py`, `src/coding_review_agent_loop/managed_ci_api.py`, `src/coding_review_agent_loop/managed_ci_protection.py`, `src/coding_review_agent_loop/managed_ci_tuple.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_types.py`, `src/coding_review_agent_loop/managed_ci_api.py`, `src/coding_review_agent_loop/managed_ci_protection.py`, `src/coding_review_agent_loop/managed_ci_authorization.py`, `src/coding_review_agent_loop/managed_ci_tuple.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
 
@@ -35,8 +35,16 @@ collector and its decorator. Retained driver gates use that same collector.
 reconciliation, importing API helpers and shared types. None of these support
 owners imports the driver or authorization owner. Consumers import support
 symbols directly from these owners; `managed_ci.py` retains only support imports
-used by its gates. Activation, issue authorization,
-dispatch, qualification and merge remain in the driver. The body hashes,
+used by its gates. `managed_ci_authorization.py` owns issue-created authorization
+formatting/parsing, chain validation, continuity publication, fresh resume, recovery
+and record matching. It imports lower-level support directly, never the driver.
+The shared comment-ingestion helper lives in `managed_ci_api.py`. Activation,
+creation preflight, fallback, dispatch, qualification and merge remain in the driver.
+Temporary explicit driver imports preserve the moved bindings' object identity
+until the paired authorization cleanup. The pre-move symbol/body/reference and
+patch inventory is `tests/fixtures/managed_ci_authorization_move.json`;
+`scripts/rewrite_managed_authorization_patches.py` retargets moved patch lookups.
+Body-hash and fresh-interpreter identity checks protect this move window. The body hashes,
 original references, consumer candidates and immediate patch retargets are
 recorded in `tests/fixtures/managed_ci_support_move.json` and drive
 `scripts/rewrite_managed_support_imports.py`. Driver API JSON lookups resolve
