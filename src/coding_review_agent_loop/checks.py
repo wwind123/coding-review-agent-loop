@@ -9,7 +9,9 @@ from .ci_health import CiInfrastructureStall, PullRequestCheck, partition_exclus
 from .config import AgentLoopConfig
 from .github import PullRequestChecks
 from .logging import log
-from .managed_ci import FINAL_CONTEXT
+from .managed_ci_status import (
+    FINAL_CONTEXT,
+)
 from .errors import AgentLoopError
 from .runner import Runner
 from .test_runtime import launch_integrity_state, launch_state_fields, record_launcher_health, record_test_observation

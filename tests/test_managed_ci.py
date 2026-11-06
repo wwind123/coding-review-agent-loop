@@ -1,4 +1,9 @@
 
+from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
+from coding_review_agent_loop import managed_ci_intent_validation as _managed_ci_intent_validation
+from coding_review_agent_loop import managed_ci_recovery_commands as _managed_ci_recovery_commands
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
+
 from coding_review_agent_loop import managed_ci_authorization
 
 from coding_review_agent_loop import managed_ci_api as _managed_ci_api
@@ -44,32 +49,25 @@ from coding_review_agent_loop.managed_ci_types import (
     UNPROTECTED_OVERRIDE_TRAILER,
     OrdinaryRecoveryCapability,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_status import (
     FINAL_CONTEXT,
+    _v2_correlated_status,
+    _v2_terminal_attempt_excluded,
+)
+from coding_review_agent_loop.managed_ci_tuple import (
     MANAGED_LABEL,
+)
+from coding_review_agent_loop.managed_ci import (
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _intent_body,
     _patch_intent,
     _v2_failed_jobs,
-    _v2_correlated_status,
-    _v2_terminal_attempt_excluded,
     activate_managed_ci,
-    authenticate_issue_created_handoff,
-    authorize_fresh_issue_created_resume,
-    format_issue_created_authorization_comment,
-    parse_issue_created_authorization_comment,
-    publish_issue_created_continuity_authorization,
-    publish_issue_created_authorization,
     dispatch_final_qualification,
     evaluate_managed_ci_readiness,
     intermediate_managed_checks,
     preflight_managed_ci_creation,
-    parse_managed_ci_override_record,
-    render_managed_ci_resume_command,
-    _render_recovery_command,
-    recover_issue_created_handoff,
-    revalidate_issue_created_handoff,
     prepare_v2_merge,
     publish_manual_v2_qualification,
     publish_round_readiness,
@@ -81,6 +79,21 @@ from coding_review_agent_loop.managed_ci import (
     _find_resume_audit,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+)
+from coding_review_agent_loop.managed_ci_authorization import (
+    authenticate_issue_created_handoff,
+    authorize_fresh_issue_created_resume,
+    format_issue_created_authorization_comment,
+    parse_issue_created_authorization_comment,
+    publish_issue_created_continuity_authorization,
+    publish_issue_created_authorization,
+    parse_managed_ci_override_record,
+    recover_issue_created_handoff,
+    revalidate_issue_created_handoff,
+)
+from coding_review_agent_loop.managed_ci_recovery_commands import (
+    render_managed_ci_resume_command,
+    _render_recovery_command,
 )
 from coding_review_agent_loop.managed_ci_protection import (
     assess_exact_head_protection,
@@ -513,7 +526,7 @@ class ManualQualificationRunner(V2ManagedRunner):
 )
 def test_managed_branch_issue_number_parses_only_canonical_issue_branches(branch, expected):
     """#1513: one shared parser accepts only a whole canonical managed issue branch."""
-    assert managed_ci.managed_branch_issue_number(branch) == expected
+    assert _managed_ci_authorization.managed_branch_issue_number(branch) == expected
 
 
 def test_managed_branch_issue_pattern_is_defined_once_in_source():
@@ -1402,7 +1415,7 @@ def test_conflict_resolution_round_grants_continuity_without_a_reviewer_pair(tmp
     )
     config = make_config(tmp_path)
 
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
         predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
@@ -1419,7 +1432,7 @@ def test_head_advance_without_review_or_conflict_obligation_still_fails(tmp_path
     config = make_config(tmp_path)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
             predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
             after_comment_id=50,
@@ -1615,13 +1628,13 @@ _REJECTED_RAW_CONFLICT_PAYLOADS = {
 @pytest.mark.parametrize("case", sorted(_ACCEPTED_RAW_CONFLICT_PAYLOADS))
 def test_m1057_conflict_predicate_accepts_open_live_machine_obligation(case):
     payload = _ACCEPTED_RAW_CONFLICT_PAYLOADS[case]
-    assert managed_ci._records_merge_conflict_obligation(payload) is True
+    assert _managed_ci_authorization._records_merge_conflict_obligation(payload) is True
 
 
 @pytest.mark.parametrize("case", sorted(_REJECTED_RAW_CONFLICT_PAYLOADS))
 def test_m1057_conflict_predicate_rejects_stale_forged_or_malformed_items(case):
     payload = _REJECTED_RAW_CONFLICT_PAYLOADS[case]
-    assert managed_ci._records_merge_conflict_obligation(payload) is False
+    assert _managed_ci_authorization._records_merge_conflict_obligation(payload) is False
 
 
 def test_m1057_malformed_conflict_record_does_not_abort_decoding_other_records():
@@ -1639,7 +1652,7 @@ def test_m1057_malformed_conflict_record_does_not_abort_decoding_other_records()
     )
     good = _conflict_item_round_comment(61, _conflict_item())
 
-    records = managed_ci._continuity_round_records([bad, good])
+    records = _managed_ci_authorization._continuity_round_records([bad, good])
 
     assert records[0]["resolves_merge_conflict"] is False
     assert records[1]["resolves_merge_conflict"] is True
@@ -1659,19 +1672,19 @@ def _stale_conflict_items():
 @pytest.mark.parametrize("case", sorted(_stale_conflict_items()))
 def test_m1057_stale_or_non_machine_conflict_item_denies_continuity(tmp_path, case):
     comment = _conflict_item_round_comment(61, _stale_conflict_items()[case])
-    records = managed_ci._continuity_round_records([comment])
+    records = _managed_ci_authorization._continuity_round_records([comment])
     assert records[0]["resolves_merge_conflict"] is False
     assert records[0]["ci_repair_transitions"] == frozenset()
 
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.append(comment)
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
             after_comment_id=50,
         )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_conflict_continuity()
     ) is False
 
@@ -1718,16 +1731,16 @@ def test_m1057_orchestrator_minted_conflict_shapes_still_grant_continuity(
     assert item.lifecycle == expected_lifecycle
     comment = _conflict_item_round_comment(61, item)
 
-    assert managed_ci._continuity_round_records([comment])[0]["resolves_merge_conflict"] is True
+    assert _managed_ci_authorization._continuity_round_records([comment])[0]["resolves_merge_conflict"] is True
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.append(comment)
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
         actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
     )
     assert selected == (61,)
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_conflict_continuity()
     ) is True
 
@@ -1788,14 +1801,14 @@ def test_ci_repair_round_grants_continuity_without_a_reviewer_pair(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.append(_ci_repair_round_comment(61))
 
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
         actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
     )
 
     assert selected == (61,)
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [_ci_repair_round_comment(61)], authorization=_ci_repair_continuity()
     ) is True
 
@@ -1850,12 +1863,12 @@ def test_ci_repair_continuity_refuses_an_unbound_ci_obligation(tmp_path, case):
     runner.intent_comments.append(comment)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_ci_repair_continuity()
     ) is False
 
@@ -1866,13 +1879,13 @@ def test_ci_repair_continuity_refuses_two_coder_records(tmp_path):
     runner.intent_comments.extend(comments)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     two = replace(_ci_repair_continuity(), round_comment_ids=(61, 62))
-    assert managed_ci._continuity_round_metadata_is_valid(comments, authorization=two) is False
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(comments, authorization=two) is False
 
 
 def test_ci_repair_continuity_refuses_a_foreign_actor(tmp_path):
@@ -1881,12 +1894,12 @@ def test_ci_repair_continuity_refuses_a_foreign_actor(tmp_path):
     runner.intent_comments.append(comment)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_ci_repair_continuity()
     ) is False
 
@@ -1897,12 +1910,12 @@ def test_ci_repair_continuity_refuses_a_record_older_than_the_predecessor(tmp_pa
     runner.intent_comments.append(comment)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_ci_repair_continuity(41)
     ) is False
 
@@ -1998,18 +2011,18 @@ def test_m1370_wrongly_typed_ci_obligation_fields_never_crash_continuity(
     tmp_path, author, field, value,
 ):
     comment = _hostile_ci_repair_round_comment(61, field=field, value=value, author=author)
-    by_index = managed_ci._continuity_round_records([comment])
+    by_index = _managed_ci_authorization._continuity_round_records([comment])
     assert by_index[0]["ci_repair_transitions"] == frozenset()
 
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.append(comment)
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [comment], authorization=_ci_repair_continuity()
     ) is False
 
@@ -2052,14 +2065,14 @@ def test_m1370_hostile_foreign_ci_record_does_not_block_a_valid_repair_round(
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend([hostile, valid])
 
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
         actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
     )
 
     assert selected == (61,)
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         [hostile, valid], authorization=_ci_repair_continuity()
     ) is True
 
@@ -2175,7 +2188,7 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
         comment for comment in runner.intent_comments
         if comment["id"] == grant.round_comment_ids[0]
     )
-    decoded = managed_ci._continuity_round_records([coder_comment])[0]
+    decoded = _managed_ci_authorization._continuity_round_records([coder_comment])[0]
     assert decoded["role"] == "coder"
     assert decoded["ci_repair_transitions"] == frozenset({("6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82")})
     assert handoffs[0][1].authorization_comment_id == grant_id
@@ -2470,7 +2483,7 @@ def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
     config = make_config(tmp_path)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
             predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=1,
             after_comment_id=50,
@@ -5121,7 +5134,7 @@ def test_issue_authorization_parser_enforces_kind_specific_schema(tmp_path, kind
     )
     payload = record.to_payload()
     payload.update(changes)
-    encoded = managed_ci._encode_issue_authorization_payload(payload)
+    encoded = _managed_ci_authorization._encode_issue_authorization_payload(payload)
     body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
     with pytest.raises(AgentLoopError, match="continuity|continuity fields"):
@@ -5155,7 +5168,7 @@ def test_issue_authorization_parser_rejects_noncanonical_fresh_schema(changes):
     )
     payload = record.to_payload()
     payload.update(changes)
-    encoded = managed_ci._encode_issue_authorization_payload(payload)
+    encoded = _managed_ci_authorization._encode_issue_authorization_payload(payload)
     body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
     with pytest.raises(AgentLoopError, match="fresh authorization|protection or waiver"):
@@ -5178,7 +5191,7 @@ def test_activation_rejects_malformed_fresh_authorization_before_label_or_dispat
         label_event_id=101,
         predecessor_head="old-head",
     )
-    encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
+    encoded = _managed_ci_authorization._encode_issue_authorization_payload(record.to_payload())
     malformed_body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
     runner = V2ManagedRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,
@@ -5356,17 +5369,17 @@ def test_recovery_value_option_table_covers_all_recovery_subparsers():
             for option in action.option_strings
             if option.startswith("--")
         }
-        assert value_options <= managed_ci._RECOVERY_VALUE_OPTIONS, (
+        assert value_options <= _managed_ci_recovery_commands._RECOVERY_VALUE_OPTIONS, (
             f"{command} value-taking recovery options are not classified: "
-            f"{sorted(value_options - managed_ci._RECOVERY_VALUE_OPTIONS)}"
+            f"{sorted(value_options - _managed_ci_recovery_commands._RECOVERY_VALUE_OPTIONS)}"
         )
 
-    assert "--ci-check-name" not in managed_ci._RECOVERY_VALUE_OPTIONS
+    assert "--ci-check-name" not in _managed_ci_recovery_commands._RECOVERY_VALUE_OPTIONS
     assert {
         "--ci-timeout-seconds",
         "--ci-poll-interval-seconds",
         "--ci-startup-timeout-seconds",
-    } <= managed_ci._RECOVERY_VALUE_OPTIONS
+    } <= _managed_ci_recovery_commands._RECOVERY_VALUE_OPTIONS
 
 
 def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tmp_path):
@@ -7257,7 +7270,7 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
         pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     monkeypatch.setattr(
-        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None
+        _managed_ci_status, "_v2_correlated_status", lambda *args, **kwargs: None
     )
 
     outcome = wait_for_final_qualification(
@@ -7316,7 +7329,7 @@ def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(
         attached_run_id=100, run_attempt=1, intent_comment_id=17,
         pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
-    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_managed_ci_status, "_v2_correlated_status", lambda *args, **kwargs: None)
 
     outcome = wait_for_final_qualification(
         runner, config=config, pr_number=7, metadata=metadata(), contract=contract
@@ -7492,7 +7505,7 @@ def test_v2_completed_run_failure_race_accepts_late_correlated_status(tmp_path, 
     )
     responses = iter([None, failure])
     monkeypatch.setattr(
-        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: next(responses)
+        _managed_ci_status, "_v2_correlated_status", lambda *args, **kwargs: next(responses)
     )
 
     outcome = wait_for_final_qualification(
@@ -8415,7 +8428,7 @@ def _authorization_record(kind, *, head="6367c48dd193d56ea7b0baad25b19455e529f5e
 
 
 def _authorization_marker(record):
-    encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
+    encoded = _managed_ci_authorization._encode_issue_authorization_payload(record.to_payload())
     return f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
 
@@ -8933,15 +8946,15 @@ def _spilled_conflict_continuity():
 def test_m953_spilled_conflict_obligation_grants_continuity(tmp_path):
     comments, anchor_id, authorization = _spilled_conflict_continuity()
 
-    records = managed_ci._continuity_round_records(comments)
+    records = _managed_ci_authorization._continuity_round_records(comments)
     assert records[len(comments) - 1]["resolves_merge_conflict"] is True
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         comments, authorization=authorization
     ) is True
 
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend(comments)
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
         actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
@@ -8963,16 +8976,16 @@ def test_m953_legacy_reader_declines_spilled_conflict_continuity(tmp_path, monke
         ),
     )
 
-    records = managed_ci._continuity_round_records(comments)
+    records = _managed_ci_authorization._continuity_round_records(comments)
     assert records[len(comments) - 1]["resolves_merge_conflict"] is False
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         comments, authorization=authorization
     ) is False
 
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend(comments)
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head",
             round_number=12, after_comment_id=50,
@@ -9014,17 +9027,17 @@ def _spilled_ci_repair_continuity():
 def test_m1024_spilled_ci_obligation_grants_continuity(tmp_path):
     comments, anchor_id, authorization = _spilled_ci_repair_continuity()
 
-    records = managed_ci._continuity_round_records(comments)
+    records = _managed_ci_authorization._continuity_round_records(comments)
     assert records[len(comments) - 1]["ci_repair_transitions"] == frozenset(
         {("6367c48dd193d56ea7b0baad25b19455e529f5ee", "ci-fix-head")}
     )
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         comments, authorization=authorization
     ) is True
 
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend(comments)
-    selected = managed_ci.find_actor_round_metadata_comment_ids(
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
         actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
@@ -9046,15 +9059,15 @@ def test_m1024_legacy_reader_declines_spilled_ci_repair_continuity(tmp_path, mon
         ),
     )
 
-    records = managed_ci._continuity_round_records(comments)
+    records = _managed_ci_authorization._continuity_round_records(comments)
     assert records[len(comments) - 1]["ci_repair_transitions"] == frozenset()
-    assert managed_ci._continuity_round_metadata_is_valid(
+    assert _managed_ci_authorization._continuity_round_metadata_is_valid(
         comments, authorization=authorization
     ) is False
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend(comments)
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
             actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
@@ -9313,7 +9326,7 @@ def test_asserted_actor_that_disagrees_with_login_fails_closed(tmp_path):
         preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
     config = _cloud_config(tmp_path)
     with pytest.raises(AgentLoopError, match="must|match"):
-        managed_ci._authorization_actor(runner, config=config)
+        _managed_ci_authorization._authorization_actor(runner, config=config)
     assert managed_ci._adoption_identity(runner, config=config) is None
     assert _mutations(runner) == []
 
@@ -9349,7 +9362,7 @@ def test_readable_differing_variable_fails_closed_at_every_identity_site(tmp_pat
     with pytest.raises(AgentLoopError, match="no PR was created"):
         preflight_managed_ci_creation(runner, config=config, issue_number=643)
     with pytest.raises(AgentLoopError, match="AGENT_LOOP_MANAGED_ACTOR"):
-        managed_ci._authorization_actor(runner, config=config)
+        _managed_ci_authorization._authorization_actor(runner, config=config)
     assert managed_ci._adoption_identity(runner, config=config) is None
     with pytest.raises(AgentLoopError, match="AGENT_LOOP_MANAGED_ACTOR=`someone-else`"):
         authenticate_issue_created_handoff(
@@ -9378,7 +9391,7 @@ def test_asserted_actor_is_accepted_at_every_identity_site(tmp_path):
     )
     config = _cloud_config(tmp_path)
 
-    assert managed_ci._authorization_actor(runner, config=config) == ("agent-loop", 1)
+    assert _managed_ci_authorization._authorization_actor(runner, config=config) == ("agent-loop", 1)
     assert managed_ci._adoption_identity(runner, config=config) == ("agent-loop", 1)
     handoff = authenticate_issue_created_handoff(
         runner,
@@ -9864,7 +9877,7 @@ def _unreadable_record(**overrides):
 
 
 def _encoded_authorization(payload):
-    encoded = managed_ci._encode_issue_authorization_payload(payload)
+    encoded = _managed_ci_authorization._encode_issue_authorization_payload(payload)
     return f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
 
@@ -10117,7 +10130,7 @@ def _predicate(record, comment=None, *, config, **overrides):
         plan_scope_authenticated=True,
     )
     arguments.update(overrides)
-    return managed_ci._authorization_record_valid_for_handoff(
+    return _managed_ci_authorization._authorization_record_valid_for_handoff(
         record, comment or _predicate_comment(), **arguments
     )
 
@@ -10565,7 +10578,7 @@ def _footer_authorization_comment(body, *, comment_id=31):
 
 def _read_authorization_records(tmp_path, comments):
     runner = V2ManagedRunner(intent_comments=comments)
-    return managed_ci._authorization_comment_records(
+    return _managed_ci_authorization._authorization_comment_records(
         runner, config=make_config(tmp_path, managed_ci_trusted_actor="agent-loop"),
         pr_number=7, actor_login="agent-loop", actor_id=1,
     )
@@ -10975,7 +10988,7 @@ def test_prepared_intent_is_recovered_in_place_then_authorized_at_the_gate(tmp_p
     prepared_id, nonce = contract.intent_comment_id, contract.nonce
     with pytest.raises(ValueError, match="prepared intent is not a dispatch authorization"):
         _route(runner, nonce)
-    verdict = managed_ci.classify_intent_page(
+    verdict = _managed_ci_intent_validation.classify_intent_page(
         list(runner.intent_comments), requested_nonce=nonce, trusted_login="agent-loop",
         trusted_id=1, visible_capable=False, host_footer_capable=False,
         binding=managed_ci._intent_binding(contract, nonce=nonce),
@@ -11573,12 +11586,12 @@ def test_m1065_supersession_is_scoped_to_earlier_same_scope_records():
     fresh = replace(
         base, kind="fresh", nonce="fresh", superseded_comment_ids=(41, 42, 44),
     )
-    ids = managed_ci._superseded_authorization_ids(
+    ids = _managed_ci_authorization._superseded_authorization_ids(
         [(41, base), (42, foreign), (43, fresh), (44, later)]
     )
     assert ids == frozenset({41})
     # A creation checkpoint never supersedes.
-    assert managed_ci._superseded_authorization_ids(
+    assert _managed_ci_authorization._superseded_authorization_ids(
         [(41, base), (43, replace(fresh, kind="creation"))]
     ) == frozenset()
 
@@ -11735,7 +11748,7 @@ def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, m
     assert second_record.predecessor_comment_id == first.authorization_comment_id
     assert second_record.superseded_comment_ids == ()
 
-    live = managed_ci._authorization_comment_records(
+    live = _managed_ci_authorization._authorization_comment_records(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
     )
     assert [comment_id for comment_id, _record in live] == [
@@ -11899,7 +11912,7 @@ def test_m1069_continuity_supersession_is_honored_and_round_trips():
     assert parse_issue_created_authorization_comment(
         str(format_issue_created_authorization_comment(continuity))
     ) == continuity
-    assert managed_ci._superseded_authorization_ids(
+    assert _managed_ci_authorization._superseded_authorization_ids(
         [(40, base), (41, replace(base, head_sha="stray")), (43, continuity)]
     ) == frozenset({41})
 
@@ -14633,11 +14646,11 @@ def _runner_1367(chain, *, runner_class=AuthorizationCommentRunner):
 
 
 def _correlate_1367(runner, config, handoff, *, round_number=1):
-    return managed_ci.find_actor_round_metadata_comment_ids(
+    return _managed_ci_authorization.find_actor_round_metadata_comment_ids(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
         predecessor_head=_H1_1367, new_head=_H2_1367, round_number=round_number,
         after_comment_id=handoff.authorization_comment_id,
-        **managed_ci.rejected_recovery_correlation_inputs(
+        **_managed_ci_authorization.rejected_recovery_correlation_inputs(
             runner, config=config, handoff=handoff
         ),
     )
@@ -14695,7 +14708,7 @@ def test_m1367_recovery_chain_correlates_publishes_and_reauthenticates(
 
     # The ordinary cutoff alone still refuses: the review predates the grant.
     with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
             predecessor_head=_H1_1367, new_head=_H2_1367, round_number=round_number,
             after_comment_id=60,
@@ -15259,7 +15272,7 @@ def test_m1367_wrongly_typed_round_fields_never_crash_continuity(
     _plan_binding_1367(published, config)
     # The ordinary cutoff path refuses with the controlled error, not a crash.
     with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
-        managed_ci.find_actor_round_metadata_comment_ids(
+        _managed_ci_authorization.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
             predecessor_head=_H1_1367, new_head=_H2_1367, round_number=1,
             after_comment_id=60,
@@ -15270,24 +15283,24 @@ def test_m1367_identical_stranded_and_original_heads_never_open_recovery():
     """Edge case (13): the recovery shape requires H0 != H1 != H2."""
     chain, _round = _recovery_chain_1367()
     comments = sorted(chain.values(), key=lambda comment: comment["id"])
-    by_index = managed_ci._continuity_round_records(comments)
+    by_index = _managed_ci_authorization._continuity_round_records(comments)
     common = dict(
         actor_login="agent-loop", actor_id=1, root_comment_id=41, fresh_comment_id=60,
         round_number=1, expected_seat_binding=None,
     )
-    assert managed_ci._rejected_recovery_round_ids(
+    assert _managed_ci_authorization._rejected_recovery_round_ids(
         comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
         predecessor_head=_H1_1367, new_head=_H2_1367, **common,
     ) == _RECOVERY_IDS_1367
-    assert managed_ci._rejected_recovery_round_ids(
+    assert _managed_ci_authorization._rejected_recovery_round_ids(
         comments, by_index, root_head=_H1_1367, fresh_head=_H1_1367,
         predecessor_head=_H1_1367, new_head=_H2_1367, **common,
     ) is None
-    assert managed_ci._rejected_recovery_round_ids(
+    assert _managed_ci_authorization._rejected_recovery_round_ids(
         comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
         predecessor_head=_H1_1367, new_head=_H0_1367, **common,
     ) is None
-    assert managed_ci._rejected_recovery_round_ids(
+    assert _managed_ci_authorization._rejected_recovery_round_ids(
         comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
         predecessor_head="5e6741348108b11e3f3ef936c335b1967d17ac6c", new_head=_H2_1367, **common,
     ) is None
@@ -15300,7 +15313,7 @@ def test_m1367_identical_stranded_and_original_heads_never_open_recovery():
 def test_m1367_pending_continuity_fields_are_checked_without_a_comment(tmp_path, field):
     """Row pending-record-field-check."""
     config = _config_1367(tmp_path)
-    context = managed_ci.chain_auth_context_for_handoff(
+    context = _managed_ci_authorization.chain_auth_context_for_handoff(
         config=config, handoff=_fresh_handoff_1367(), valid_label_event_ids={101},
     )
     predecessor = _fresh_record_1367()
@@ -15309,7 +15322,7 @@ def test_m1367_pending_continuity_fields_are_checked_without_a_comment(tmp_path,
         predecessor_head=_H1_1367, predecessor_comment_id=60,
         round_comment_ids=_RECOVERY_IDS_1367,
     )
-    assert managed_ci._pending_authorization_fields_admissible(
+    assert _managed_ci_authorization._pending_authorization_fields_admissible(
         pending, context, predecessor=predecessor,
     )
     mutated = {
@@ -15329,7 +15342,7 @@ def test_m1367_pending_continuity_fields_are_checked_without_a_comment(tmp_path,
         context = replace(
             context, config=_config_1367(tmp_path, allow_unprotected_managed_ci=False),
         )
-    assert not managed_ci._pending_authorization_fields_admissible(
+    assert not _managed_ci_authorization._pending_authorization_fields_admissible(
         mutated, context, predecessor=predecessor,
     )
 
@@ -15489,7 +15502,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     assert fresh_record.predecessor_comment_id == root.authorization_comment_id
     review_ids = [
         comment["id"] for comment in runner.intent_comments
-        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        if (decoded := _managed_ci_authorization._continuity_round_records([comment]).get(0)) is not None
         and decoded["role"] == "reviewer"
     ]
     assert len(review_ids) == 1 and review_ids[0] < fresh.authorization_comment_id
@@ -15531,7 +15544,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     assert recovered not in {"6367c48dd193d56ea7b0baad25b19455e529f5ee", stranded}
     dispatches = [
         decoded["recovery"] for comment in runner.intent_comments
-        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        if (decoded := _managed_ci_authorization._continuity_round_records([comment]).get(0)) is not None
         and decoded["phase"] == "coder-dispatch"
     ]
     assert [record.dispatch_attempt for record in dispatches] == [1, 2]
@@ -15742,7 +15755,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
 
     (review_id,) = [
         comment["id"] for comment in runner.intent_comments
-        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        if (decoded := _managed_ci_authorization._continuity_round_records([comment]).get(0)) is not None
         and decoded["role"] == "reviewer"
         and comment["id"] < fresh.authorization_comment_id
     ]
@@ -15993,7 +16006,7 @@ def test_wait_for_final_qualification_ignores_the_pre_rerun_attempt(tmp_path, mo
         state = "failure" if contract.run_attempt == 1 else "success"
         return PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status=state)
 
-    monkeypatch.setattr(managed_ci, "_v2_correlated_status", correlated)
+    monkeypatch.setattr(_managed_ci_status, "_v2_correlated_status", correlated)
 
     outcome = wait_for_final_qualification(
         runner, config=config, pr_number=7,
@@ -16374,7 +16387,7 @@ def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_
     contract = _no_status_contract(terminal_run_id=None, terminal_run_attempt=None,
                                    terminal_attempts=(), terminal_outcome=None)
     reads = iter([None, PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status=reread_state)])
-    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *a, **k: next(reads, None))
+    monkeypatch.setattr(_managed_ci_status, "_v2_correlated_status", lambda *a, **k: next(reads, None))
 
     outcome = wait_for_final_qualification(
         _waiter_runner(), config=config, pr_number=7,
@@ -16390,7 +16403,7 @@ def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_
 
 def test_waiter_stops_at_the_shared_deadline_while_polls_remain(tmp_path, monkeypatch):
     config = make_config(tmp_path, managed_ci=True, ci_timeout_seconds=600, ci_poll_interval_seconds=30)
-    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *a, **k: None)
+    monkeypatch.setattr(_managed_ci_status, "_v2_correlated_status", lambda *a, **k: None)
     runner = _waiter_runner()
 
     outcome = wait_for_final_qualification(

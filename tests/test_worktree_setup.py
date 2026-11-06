@@ -669,7 +669,10 @@ def test_setup_ignored_without_default_per_run_worktree(tmp_path, monkeypatch, c
 def test_recovery_commands_preserve_setup_flags(tmp_path):
     from agent_loop_helpers import make_config
 
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS, _render_recovery_command
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+        _render_recovery_command,
+    )
 
     assert {"--worktree-setup", "--worktree-setup-key"} <= _RECOVERY_VALUE_OPTIONS
     config = make_config(tmp_path, invocation_argv=(
@@ -1447,7 +1450,10 @@ def test_recovery_commands_preserve_worktree_setup_timeout(tmp_path):
     """timeout-recovery."""
     from agent_loop_helpers import make_config
 
-    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS, _render_recovery_command
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _RECOVERY_VALUE_OPTIONS,
+        _render_recovery_command,
+    )
 
     assert "--worktree-setup-timeout" in _RECOVERY_VALUE_OPTIONS
     config = make_config(tmp_path, invocation_argv=(

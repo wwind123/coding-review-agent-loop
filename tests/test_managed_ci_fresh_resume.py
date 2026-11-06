@@ -1,4 +1,6 @@
 """Opening-tuple recovery rejects unavailable state without inventing tampering."""
+
+from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
 import copy
 import json
 
@@ -32,7 +34,7 @@ class TupleRunner(V2ManagedRunner):
 
 
 def recover(runner, tmp_path):
-    return managed_ci.recover_issue_created_handoff(
+    return _managed_ci_authorization.recover_issue_created_handoff(
         runner, config=make_config(tmp_path, managed_ci=True, managed_ci_pr_mode=True,
                                    managed_ci_trusted_actor="agent-loop"),
         pr_number=7, metadata=_ready_issue_metadata(), issue_number=643,

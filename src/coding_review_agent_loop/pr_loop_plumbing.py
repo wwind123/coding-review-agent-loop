@@ -2,7 +2,9 @@
 from __future__ import annotations
 from .runner import Runner
 from .config import AgentLoopConfig
-from .managed_ci import FINAL_CONTEXT
+from .managed_ci_status import (
+    FINAL_CONTEXT,
+)
 
 # --- Post-approval plumbing routing (#1477) ---------------------------------
 

@@ -66,8 +66,10 @@ from .memory import prepare_agent_memory
 from .managed_ci_types import (
     AuthenticatedIssueCreatedHandoff,
 )
-from .managed_ci import (
+from .managed_ci_authorization import (
     authenticate_issue_created_handoff,
+)
+from .managed_ci import (
     preflight_managed_ci_creation,
 )
 from .prompts import (

@@ -11,7 +11,7 @@ from coding_review_agent_loop.managed_ci_types import (
     ManagedCiOutcome,
     UNPROTECTED_OVERRIDE_TRAILER,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_authorization import (
     parse_managed_ci_override_record,
 )
 from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope

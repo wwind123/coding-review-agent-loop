@@ -76,10 +76,14 @@ from .evidence_conversion import capture_classification_payload
 from .managed_ci_types import (
     AuthenticatedIssueCreatedHandoff,
 )
-from .managed_ci import (
+from .managed_ci_authorization import (
     authenticate_issue_created_handoff,
-    preflight_managed_ci_creation,
     publish_issue_created_authorization,
+)
+from .managed_ci import (
+    preflight_managed_ci_creation,
+)
+from .managed_ci_recovery_commands import (
     render_managed_ci_resume_command,
 )
 from .prompts import (

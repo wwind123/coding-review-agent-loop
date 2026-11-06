@@ -1,4 +1,6 @@
 """Current-attempt watch and real PR-loop early-failure handoff regressions."""
+
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
 import copy
 import dataclasses
 import json
@@ -317,7 +319,7 @@ def test_watch_budget_reaches_both_watchers_and_slow_success(tmp_path, monkeypat
         return real(args, **kwargs)
     monkeypatch.setattr(runner, '_run_locked', run)
     def board(*a, **k):
-        final = PullRequestCheck(ci.FINAL_CONTEXT, 'status_context', 'success' if clock[0] >= 1800 else 'pending',
+        final = PullRequestCheck(_managed_ci_status.FINAL_CONTEXT, 'status_context', 'success' if clock[0] >= 1800 else 'pending',
                                  url='https://github.com/OWNER/REPO/actions/runs/100')
         return _watch_check_board('passing', passing=(final,)) if clock[0] >= 1800 else _watch_check_board('pending', pending=(final,))
     monkeypatch.setattr(ci, 'get_pr_checks', board)
@@ -326,9 +328,9 @@ def test_watch_budget_reaches_both_watchers_and_slow_success(tmp_path, monkeypat
     runner.pr_status_payload['statuses'] = []
     def status(*a, **k):
         if clock[0] >= 1800:
-            return PullRequestCheck(ci.FINAL_CONTEXT, 'status_context', 'success', url='https://github.com/OWNER/REPO/actions/runs/100')
+            return PullRequestCheck(_managed_ci_status.FINAL_CONTEXT, 'status_context', 'success', url='https://github.com/OWNER/REPO/actions/runs/100')
         return None
-    monkeypatch.setattr(ci, '_v2_correlated_status', status)
+    monkeypatch.setattr(_managed_ci_status, '_v2_correlated_status', status)
     if managed:
         outcome, _ = watch(fixture, deadline=budget)
     else:

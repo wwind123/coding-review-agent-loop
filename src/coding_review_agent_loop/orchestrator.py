@@ -246,22 +246,21 @@ from .managed_ci_types import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
 )
-from .managed_ci import (
+from .managed_ci_status import (
     FINAL_CONTEXT,
+)
+from .managed_ci_tuple import (
     MANAGED_LABEL,
+)
+from .managed_ci import (
     activate_managed_ci,
     managed_ci_attachment_matches_head,
     release_stale_managed_ci_attachment,
-    authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
-    authenticate_issue_created_handoff,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
     preflight_managed_ci_creation,
-    find_actor_round_metadata_comment_ids,
-    publish_issue_created_continuity_authorization,
-    publish_issue_created_authorization,
     publish_manual_v2_qualification,
     prepare_v2_merge,
     publish_round_readiness,
@@ -269,13 +268,22 @@ from .managed_ci import (
     release_adopted_managed_ci,
     release_retained_managed_label,
     revalidate_adopted_managed_ci,
-    revalidate_issue_created_handoff,
-    recover_issue_created_handoff,
-    render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
     verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+)
+from .managed_ci_authorization import (
+    authorize_fresh_issue_created_resume,
+    authenticate_issue_created_handoff,
+    find_actor_round_metadata_comment_ids,
+    publish_issue_created_continuity_authorization,
+    publish_issue_created_authorization,
+    revalidate_issue_created_handoff,
+    recover_issue_created_handoff,
+)
+from .managed_ci_recovery_commands import (
+    render_managed_ci_resume_command,
 )
 from .managed_ci_protection import (
     waivable_protection_states,

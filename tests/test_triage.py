@@ -922,7 +922,9 @@ def test_triage_flags_parse_into_config_and_require_triage(tmp_path, capsys):
 
 
 def test_recovery_commands_never_replay_the_one_shot_triage_flags(tmp_path):
-    from coding_review_agent_loop.managed_ci import _render_recovery_command
+    from coding_review_agent_loop.managed_ci_recovery_commands import (
+        _render_recovery_command,
+    )
 
     config = make_config(
         tmp_path, triage=True, triage_model="gpt-triage",

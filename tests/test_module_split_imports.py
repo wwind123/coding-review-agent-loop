@@ -228,7 +228,11 @@ def test_guard_does_not_count_unrelated_strings_as_annotation_dependencies(name)
 _MANAGED_SPEC = importlib.util.spec_from_file_location('managed_rewrite', ROOT / 'scripts/rewrite_managed_support_imports.py')
 _MANAGED_REWRITE = importlib.util.module_from_spec(_MANAGED_SPEC)
 _MANAGED_SPEC.loader.exec_module(_MANAGED_REWRITE)
-MANAGED_OWNERS = _MANAGED_REWRITE.symbol_owners()
+_AUTH_SPEC = importlib.util.spec_from_file_location('authorization_rewrite', ROOT / 'scripts/rewrite_managed_authorization_imports.py')
+_AUTH_REWRITE = importlib.util.module_from_spec(_AUTH_SPEC)
+_AUTH_SPEC.loader.exec_module(_AUTH_REWRITE)
+AUTHORIZATION_OWNERS = _AUTH_REWRITE.symbol_owners()
+MANAGED_OWNERS = {**_MANAGED_REWRITE.symbol_owners(), **AUTHORIZATION_OWNERS}
 MANAGED_OLD = 'coding_review_agent_loop.managed_ci'
 
 
@@ -284,6 +288,8 @@ def test_managed_rewrite_preserves_aliases_local_imports_and_real_patch_owners()
 @pytest.mark.parametrize('first', [
     'managed_ci', 'managed_ci_types', 'managed_ci_api', 'managed_ci_protection',
     'managed_ci_failure', 'managed_ci_status', 'managed_ci_reconciliation',
+    'managed_ci_authorization', 'managed_ci_recovery_commands', 'managed_ci_intent_validation',
+    'managed_ci_tuple', 'managed_ci_result',
 ])
 def test_managed_support_fresh_import_orders(first):
     import os
@@ -293,6 +299,8 @@ def test_managed_support_fresh_import_orders(first):
     modules = [first] + [name for name in [
         'managed_ci', 'managed_ci_types', 'managed_ci_api', 'managed_ci_protection',
         'managed_ci_failure', 'managed_ci_status', 'managed_ci_reconciliation',
+    'managed_ci_authorization', 'managed_ci_recovery_commands', 'managed_ci_intent_validation',
+    'managed_ci_tuple', 'managed_ci_result',
     ] if name != first]
     code = '\n'.join('import coding_review_agent_loop.' + name for name in modules)
     subprocess.run([sys.executable, '-c', code], check=True, timeout=30, cwd=ROOT,
@@ -323,7 +331,7 @@ def test_managed_helper_dependency_patch_intercepts_real_lookup(monkeypatch, tmp
 
 
 def test_managed_driver_api_patch_intercepts_real_lookup(monkeypatch, tmp_path):
-    from coding_review_agent_loop import managed_ci, managed_ci_api
+    from coding_review_agent_loop import managed_ci_authorization, managed_ci_api
     from agent_loop_helpers import make_config
 
     calls = []
@@ -335,10 +343,36 @@ def test_managed_driver_api_patch_intercepts_real_lookup(monkeypatch, tmp_path):
     monkeypatch.setattr(managed_ci_api, '_api_json', stop_at_lookup)
     config = make_config(tmp_path)
     with pytest.raises(RuntimeError, match='driver API lookup intercepted'):
-        managed_ci._github_proves_descendant(
+        managed_ci_authorization._github_proves_descendant(
             None, config=config, predecessor_head='a' * 40, live_head='b' * 40,
         )
     assert len(calls) == 1
     assert calls[0][0] == (
         None, config, f'repos/{config.repo}/compare/' + 'a' * 40 + '...' + 'b' * 40,
     )
+
+
+def test_authorization_rewrite_migrates_helpers_and_is_idempotent():
+    source = ('from coding_review_agent_loop import managed_ci as ci\n'
+              'def consumer():\n    from .managed_ci import recover_issue_created_handoff as recover, activate_managed_ci\n'
+              'ci.recover_issue_created_handoff(runner)\n'
+              'monkeypatch.setattr(ci, "_authorization_matches", fake)\n'
+              'patch("coding_review_agent_loop.managed_ci.render_managed_ci_resume_command")\n')
+    rewritten = _AUTH_REWRITE.rewrite(source, AUTHORIZATION_OWNERS)
+    assert not managed_ownership_problems(rewritten)
+    assert 'recover_issue_created_handoff as recover' in rewritten
+    assert 'activate_managed_ci' in rewritten
+    assert _AUTH_REWRITE.rewrite(rewritten, AUTHORIZATION_OWNERS) == rewritten
+
+
+def test_final_managed_and_protocol_sizes_and_allowlist():
+    import runpy
+
+    size_guard = runpy.run_path(str(ROOT / 'tests/test_source_file_size.py'))
+    modules = {'managed_ci', 'protocol', 'protocol_common', 'protocol_discuss',
+               'protocol_discuss_types', 'protocol_risk', *MANAGED_OWNERS.values()}
+    for module in modules:
+        path = ROOT / 'src/coding_review_agent_loop' / (module + '.py')
+        assert len(path.read_text().splitlines()) <= size_guard['DEFAULT_LIMIT']
+    for module in ('managed_ci', 'protocol'):
+        assert f'src/coding_review_agent_loop/{module}.py' not in size_guard['ALLOWLIST']

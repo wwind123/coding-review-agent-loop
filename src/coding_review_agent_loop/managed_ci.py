@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .managed_ci_tuple import MANAGED_LABEL, read_opening_pr, compare_opening_pr
+from .managed_ci_tuple import (
+    MANAGED_LABEL,
+)
 
 from .review_scope import is_complete_code_review
 
@@ -60,39 +62,13 @@ from .github import (
 from .logging import log
 from .managed_ci_bases import base_is_trusted
 from .managed_ci_recovery_commands import (
-    _RECOVERY_VALUE_OPTIONS,
-    _RECOVERY_NARGS_VALUE_OPTIONS,
-    _ISSUE_ONLY_RECOVERY_OPTIONS,
-    _PR_ONLY_RECOVERY_OPTIONS,
-    _MANAGED_PR_ONLY_RECOVERY_OPTIONS,
-    _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS,
-    _MANAGED_RECOVERY_OPTIONS,
-    _option_name,
-    _recovery_option_end,
-    _find_recovery_positional_index,
-    _strip_recovery_options,
-    _has_option,
-    _human_reviewer_trust_args,
-    _ci_plumbing_check_args,
-    _render_recovery_command,
     render_managed_ci_resume_command,
 )
 from .managed_ci_intent_validation import (
-    INTENT_REQUIRED_KEYS,
-    INTENT_ALLOWED_STATES,
-    INTENT_SHA_PATTERN,
     INTENT_NONCE_PATTERN,
-    _INTENT_VISIBLE_LINE,
-    _INTENT_RECORD,
-    _INTENT_ENVELOPE_RE,
-    _INTENT_FOOTERED_ENVELOPE_RE,
     IntentBinding,
-    IntentPageVerdict,
     match_intent_envelope,
-    _exact_int,
-    _exact_string,
     validate_intent_record,
-    _walk_intent_page,
     intent_page_pre_nonce_fatal,
     classify_intent_page,
 )
@@ -120,7 +96,7 @@ from .protocol_markers import (
 from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 from .managed_ci_status import FINAL_CONTEXT
-from . import managed_ci_api
+from . import managed_ci_api, managed_ci_status
 
 
 # Support imports used by the retained driver gates.
@@ -191,62 +167,20 @@ from .managed_ci_protection import (
 )
 
 
-# Temporary identity-preserving authorization exports for the move window.
+# Authorization imports used by the retained driver gates.
 from .managed_ci_authorization import (
-    _encode_issue_authorization_payload,
-    format_issue_created_authorization_comment,
     parse_issue_created_authorization_comment,
     parse_managed_ci_override_record,
     _opening_override_nonce,
-    _issue_created_tuple,
-    authenticate_issue_created_handoff,
-    _authorization_actor,
-    _authorization_comment_records,
     _superseded_authorization_ids,
     _superseded_authorization_comment_ids,
-    _github_proves_descendant,
-    find_actor_round_metadata_comment_ids,
-    _continuity_round_records,
-    _records_merge_conflict_obligation,
-    _records_ci_repair_transitions,
-    _continuity_round_metadata_is_valid,
-    _continuity_link_shape,
-    _ordinary_continuity_round_metadata_is_valid,
-    _CONTINUITY_REJECTED_PHASE,
-    _CONTINUITY_DISPATCH_PHASE,
-    _CONTINUITY_RECOVERY_PHASES,
-    PlanPolicy,
     ChainAuthContext,
-    chain_auth_context_for_handoff,
-    load_actor_authorization_records,
     load_actor_label_event_ids,
-    rejected_recovery_correlation_inputs,
     _comments_by_id,
-    _chain_record_admissible,
-    _pending_authorization_fields_admissible,
-    _recovery_context,
     _authenticate_authorization_chain,
-    _authenticated_recovery_root,
-    _decode_recovery_round_record,
-    _seat_binding_key,
-    _historical_bindings_match,
-    _rejected_recovery_round_ids,
-    _correlate_rejected_recovery,
-    _recovery_continuity_is_valid,
-    publish_issue_created_authorization,
-    _continuity_live_pr_tuple,
-    _stranded_continuity_comment_ids,
-    publish_issue_created_continuity_authorization,
-    _timeline_source_repository,
-    authorize_fresh_issue_created_resume,
-    revalidate_issue_created_handoff,
-    _MANAGED_ISSUE_BRANCH_RE,
     managed_branch_issue_number,
-    recover_issue_created_handoff,
-    _recover_issue_created_protection,
     _is_retired_plan_history,
     _actor_owned_label_event_ids,
-    _authorization_matches,
     _authorization_record_valid_for_handoff,
 )
 from .managed_ci_api import _normalized_comment_body
@@ -4876,7 +4810,7 @@ def wait_for_final_qualification(
                     contract.run_attempt = run_snapshot.run_attempt
                     contract.terminal_outcome = None
                     _patch_intent(runner, config=config, contract=contract, state="attached")
-            final = _v2_correlated_status(
+            final = managed_ci_status._v2_correlated_status(
                 runner, config=config, expected_head=expected_head, contract=contract
             )
             if run_snapshot is not None and not _v2_attempt_is_correlatable(run_snapshot.run_attempt):
@@ -4920,7 +4854,7 @@ def wait_for_final_qualification(
                 terminal_confirmation_seen = False
                 # A publisher may race the workflow's completed transition. Re-read
                 # immediately before starting the bounded confirmation window.
-                final = _v2_correlated_status(
+                final = managed_ci_status._v2_correlated_status(
                     runner, config=config, expected_head=expected_head, contract=contract
                 )
                 if final is not None:
@@ -5006,8 +4940,9 @@ def wait_for_final_qualification(
 
 
 from .managed_ci_status import (
-    _v2_correlated_status, _decode_paginated_json, complete_managed_board,
-    _v2_terminal_attempt_excluded, _v2_attempt_is_correlatable,
+    complete_managed_board,
+    _v2_terminal_attempt_excluded,
+    _v2_attempt_is_correlatable,
 )
 
 

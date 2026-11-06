@@ -12,7 +12,9 @@ from coding_review_agent_loop.round_state import (
 from coding_review_agent_loop.review_scope import is_complete_code_review, valid_evidence_scope
 from coding_review_agent_loop.panel_evidence import _derive_pr_panel_evidence, _pr_record_is_panel_qualified
 from coding_review_agent_loop.review_step_back import pr_reviews_for, effective_new_items
-from coding_review_agent_loop.managed_ci import _continuity_round_records
+from coding_review_agent_loop.managed_ci_authorization import (
+    _continuity_round_records,
+)
 
 SCOPE = {"version": 1, "kind": "capture-evidence", "capture": "capture", "head": "head",
          "matrix": "matrix", "rows": ["row-a"], "contract": "contract"}

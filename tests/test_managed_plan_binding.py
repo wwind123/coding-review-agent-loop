@@ -14,8 +14,10 @@ from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.managed_ci_types import (
     ManagedCiIssueAuthorization,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_authorization import (
     format_issue_created_authorization_comment,
+)
+from coding_review_agent_loop.managed_ci import (
     verify_managed_pr_plan_binding,
 )
 from coding_review_agent_loop.round_state import (

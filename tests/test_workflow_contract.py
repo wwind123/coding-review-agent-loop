@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_intent_validation as _managed_ci_intent_validation
+from coding_review_agent_loop import managed_ci_status as _managed_ci_status
+
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 
 import ast
@@ -825,14 +828,14 @@ def test_agent_freshness_constants_mirror_the_dispatch_validator():
 
 
 def _classify(page, nonce="n" * 32):
-    return managed_ci.classify_intent_page(
+    return _managed_ci_intent_validation.classify_intent_page(
         page,
         requested_nonce=nonce,
         trusted_login="agent-loop",
         trusted_id=7,
         visible_capable=True,
         host_footer_capable=True,
-        binding=managed_ci.IntentBinding(
+        binding=_managed_ci_intent_validation.IntentBinding(
             repository="OWNER/REPO", pr=7, expected_head_sha="b" * 40, base_ref="main",
             workflow_revision="a" * 40, nonce=nonce,
         ),
@@ -859,7 +862,7 @@ def _assert_parity(page, nonce="n" * 32):
         assert verdict.outcome == "recoverable", verdict
     else:
         assert verdict.outcome == "fail", (reason, verdict)
-    fatal = managed_ci.intent_page_pre_nonce_fatal(
+    fatal = _managed_ci_intent_validation.intent_page_pre_nonce_fatal(
         page, trusted_login="agent-loop", trusted_id=7,
         visible_capable=True, host_footer_capable=True,
     )
@@ -965,10 +968,10 @@ def test_parity_corpus_exercises_every_outcome():
 
 def test_agent_envelope_admits_footer_only_when_the_workflow_advertises_it():
     body = _record_text(_record()) + FOOTER
-    assert managed_ci.match_intent_envelope(body, visible_capable=True, host_footer_capable=True)
-    assert managed_ci.match_intent_envelope(body, visible_capable=True, host_footer_capable=False) is None
+    assert _managed_ci_intent_validation.match_intent_envelope(body, visible_capable=True, host_footer_capable=True)
+    assert _managed_ci_intent_validation.match_intent_envelope(body, visible_capable=True, host_footer_capable=False) is None
     visible = VISIBLE + _record_text(_record())
-    assert managed_ci.match_intent_envelope(visible, visible_capable=False, host_footer_capable=True) is None
+    assert _managed_ci_intent_validation.match_intent_envelope(visible, visible_capable=False, host_footer_capable=True) is None
 
 
 def _job_text(text: str, job_id: str) -> str:
@@ -2346,7 +2349,7 @@ def test_plumbing_catalog_job_names_appear_in_the_managed_workflows():
         if isinstance(job, dict)
     }
     assert _managed_ci_types.MANAGED_PLUMBING_JOB_NAMES <= job_names
-    assert _managed_ci_types.PLUMBING_STATUS_CONTEXTS == {managed_ci.FINAL_CONTEXT}
+    assert _managed_ci_types.PLUMBING_STATUS_CONTEXTS == {_managed_ci_status.FINAL_CONTEXT}
     # The test jobs are never catalogued, and matching is exact, not substring.
     assert not managed_ci.is_plumbing_check("Test validated exact head")
     assert not managed_ci.is_plumbing_check("Publish final exact-head status (retry)")

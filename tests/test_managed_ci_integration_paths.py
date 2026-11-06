@@ -10,8 +10,10 @@ from dataclasses import replace
 
 import pytest
 
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_status import (
     FINAL_CONTEXT,
+)
+from coding_review_agent_loop.managed_ci import (
     _dispatch_v2_qualification,
     activate_managed_ci,
     evaluate_managed_ci_readiness,

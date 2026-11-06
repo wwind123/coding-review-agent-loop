@@ -716,7 +716,9 @@ def test_fresh_authorization_below_the_floor_publishes_nothing(
     tmp_path, monkeypatch, lifecycle, board, refusal
 ):
     """item-9: the floor runs before managed-CI fresh authorization, whatever the label state."""
-    from coding_review_agent_loop.managed_ci import parse_issue_created_authorization_comment
+    from coding_review_agent_loop.managed_ci_authorization import (
+        parse_issue_created_authorization_comment,
+    )
     from test_managed_ci import _workflow_runner_for_issue_authorization
 
     runner = _workflow_runner_for_issue_authorization(None, labeled=lifecycle == "draft-labeled")
