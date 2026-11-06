@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -84,6 +84,34 @@ or merge runs while it stands. A signed human response re-runs the full board
 at H inside the same round, so it spends no round budget. Only the requester
 can clear its evidence there. New findings or a failing machine gate release
 the freeze with one release comment, and an external push breaks it.
+
+Native obligations also admit pre-supplied evidence at the final gate. A
+same-round, same-head requester resolution cites `evidence_requirement_ids` from
+that reviewer's surfaced signed input and attests adequate acceptance for H.
+The gate uses the live effective signed objects, checks content-bound IDs and
+unambiguous complete 7–40 character head references against current/admitted PR
+head history, and publishes a single evidence-cleared release without a freeze.
+Changed/new input refreshes the same round; missing input cannot authorize
+clearance. Partial acceptance rides on the remaining freeze. A removed requester
+requires every current reviewer. Head changes invalidate the acceptance.
+
+`native_evidence.py` shares conservative matching and alias logic with live
+request upserts and reviewer-record replay. Only recognized commit tokens are
+normalized for contextual equivalence; arbitrary hex and complete digests remain
+significant. Valid affirmative consolidation clauses may name only the owner's
+open native items. The earliest persisted identity and item ID survive, with
+optional historical aliases for disposition routing and head-scoped clearance.
+Conflicting alias votes cannot clear an obligation. Legacy records default to
+empty citation/alias fields. Replay uses admitted heads available at each ingestion
+boundary, never later records retroactively. Push recovery replays requester
+requests after each round's snapshots to retain consolidation text and aliases
+even when the same response clears the survivor before another snapshot. Recovery
+uses the authenticated subset for both request head recognition and ledger
+consolidation; retained foreign ordinary records cannot introduce known heads.
+Frozen-response ingestion retains pre-clearance targets to validate consolidation
+reemissions, suppressing them only when every native target belongs to the
+requester and has an authorized clearance at the current head.
+Converted rows and screenshot requests remain separate channels.
 
 Risk-matrix rows whose evidence cannot be tool-captured are converted into the
 same obligation kind, keyed by (row, approved matrix identity) and owned

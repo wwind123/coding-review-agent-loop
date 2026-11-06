@@ -1599,6 +1599,9 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         "obligation_identity": item.obligation_identity,
     }
     payload.update({key: value for key, value in machine_fields.items() if value is not None})
+    if item.alias_item_ids or item.alias_obligation_identities:
+        payload["alias_item_ids"] = list(item.alias_item_ids)
+        payload["alias_obligation_identities"] = list(item.alias_obligation_identities)
     if item.sub_items:
         payload["sub_items"] = [_serialize_sub_item(sub) for sub in item.sub_items]
     if item.evidence_row_ids:
@@ -1825,6 +1828,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
             failed_head_sha=payload.get("failed_head_sha"),
             candidate_head_sha=payload.get("candidate_head_sha"),
             obligation_identity=payload.get("obligation_identity"),
+            **_deserialize_evidence_aliases(payload),
         )
         try:
             item = UnresolvedReviewItem(**core, **machine, **_deserialize_converted_row(payload),
@@ -1864,6 +1868,17 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
     )
 
 
+def _deserialize_evidence_aliases(payload):
+    aliases = {}
+    for key, pattern in (("alias_item_ids", r"item-\d+"),
+                         ("alias_obligation_identities", r"human-exact-head-evidence:[0-9a-f]{24}")):
+        value = payload.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, str) or not re.fullmatch(pattern, v) for v in value):
+            raise AgentLoopError("Invalid persisted evidence aliases")
+        aliases[key] = tuple(dict.fromkeys(value))
+    return aliases
+
+
 def _serialize_disposition(disposition: ReviewItemDisposition) -> dict[str, object]:
     payload: dict[str, object] = {
         "item_id": disposition.item_id,
@@ -1871,6 +1886,8 @@ def _serialize_disposition(disposition: ReviewItemDisposition) -> dict[str, obje
         "disposition": disposition.disposition,
         "note": disposition.note,
     }
+    if disposition.evidence_requirement_ids:
+        payload["evidence_requirement_ids"] = list(disposition.evidence_requirement_ids)
     if disposition.sub_item_dispositions:
         payload["sub_item_dispositions"] = [
             list(pair) for pair in disposition.sub_item_dispositions
@@ -1881,7 +1898,9 @@ def _serialize_disposition(disposition: ReviewItemDisposition) -> dict[str, obje
 def _deserialize_disposition(payload: object) -> ReviewItemDisposition:
     if not isinstance(payload, dict):
         raise AgentLoopError("Invalid round metadata disposition payload.")
+    from .native_evidence import citation_ids
     return ReviewItemDisposition(
+        evidence_requirement_ids=citation_ids(payload.get("evidence_requirement_ids", [])),
         item_id=str(payload["item_id"]),
         reviewer=str(payload["reviewer"]),
         disposition=str(payload["disposition"]),
@@ -3363,6 +3382,8 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.failed_head_sha,
             item.candidate_head_sha,
             item.obligation_identity,
+            *((("evidence_aliases", item.alias_item_ids, item.alias_obligation_identities),)
+              if item.alias_item_ids or item.alias_obligation_identities else ()),
             # Preserve legacy digests while distinguishing visual ownership.
             *((('origin_scope', item.origin_scope),) if item.origin_scope is not None else ()),
             *((('screenshot_request', repr(item.screenshot_request)),) if item.screenshot_request is not None else ()),
@@ -3610,9 +3631,9 @@ def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord
     for record in records:
         max_number = max(max_number, record.original_item_number_high_water)
         for item in (*record.metadata.prior_items, *record.metadata.new_items):
-            match = re.fullmatch(r"item-(\d+)", item.item_id)
-            if match:
-                max_number = max(max_number, int(match.group(1)))
+            for item_id in (item.item_id, *item.alias_item_ids):
+                if match := re.fullmatch(r"item-(\d+)", item_id):
+                    max_number = max(max_number, int(match.group(1)))
     return max_number
 
 
@@ -3640,42 +3661,7 @@ def _append_active_pr_new_items(
             seen_item_ids.add(item.item_id)
 
 
-def _append_recorded_evidence_requests(
-    active_items: list[UnresolvedReviewItem],
-    reviewer_records: Sequence[PostedRoundRecord],
-    *,
-    records: Sequence[PostedRoundRecord],
-) -> None:
-    """Re-derive deferred evidence from the reviewer records that requested it.
-
-    Applied after dispositions and new items, in the same order as the live
-    loop, so a deferred request is durable from the moment its reviewer record
-    was posted (#1068).
-    """
-    next_number = max(
-        _max_unresolved_item_number_from_records(records),
-        max(
-            (
-                int(match.group(1))
-                for item in active_items
-                if (match := re.fullmatch(r"item-(\d+)", item.item_id))
-            ),
-            default=0,
-        ),
-    ) + 1
-    for record in reviewer_records:
-        for request in record.metadata.evidence_requests:
-            updated, consumed = _upsert_evidence_obligation(
-                active_items,
-                item_number=next_number,
-                reviewer=record.metadata.agent,
-                text=request,
-                source_round=record.metadata.round_number,
-                current_head_sha=record.metadata.subject,
-            )
-            active_items[:] = updated
-            if consumed:
-                next_number += 1
+from .native_evidence import _append_recorded_evidence_requests
 
 
 def _aggregate_record_dispositions(
@@ -4514,6 +4500,9 @@ def _recover_unrecorded_pr_head_advance(
         # evidence returns to deferred and the new head needs full review.
         boundary = latest_prior_record.metadata
         ledger = _evidence_boundary_ledger(latest_prior_record, records=records)
+        from .native_evidence import reopen_cleared_requests
+        ledger = reopen_cleared_requests(ledger, latest_prior_record, records, head_sha,
+            admitted_records=[r for r in records if _recovery_record_admitted(r, comments, trusted_actor)])
         broken_head = (
             boundary.evidence_freeze.frozen_head
             if boundary.phase == EVIDENCE_FREEZE_PHASE
@@ -4587,7 +4576,8 @@ def _recover_unrecorded_pr_head_advance(
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, new_item_records_after_coder)
         _append_recorded_evidence_requests(
-            recovered_items, reviewer_records_after_coder, records=records
+            recovered_items, reviewer_records_after_coder, records=records,
+            admitted_records=[r for r in records if _recovery_record_admitted(r, comments, trusted_actor)]
         )
         coder_output = latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body
         compact_prior_summaries = latest_coder_record.metadata.compact_prior_summaries
@@ -4603,7 +4593,8 @@ def _recover_unrecorded_pr_head_advance(
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, all_new_item_records)
         _append_recorded_evidence_requests(
-            recovered_items, all_reviewer_records, records=records
+            recovered_items, all_reviewer_records, records=records,
+            admitted_records=[r for r in records if _recovery_record_admitted(r, comments, trusted_actor)]
         )
         coder_output = None
         compact_prior_summaries = ()

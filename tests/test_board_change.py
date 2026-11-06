@@ -1752,10 +1752,11 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     _qualify(runner, swapped)
 
 
+@pytest.mark.parametrize("mode", ["compact", "full"])
 @pytest.mark.parametrize("activation", ["immediate", "after-crash"])
 @pytest.mark.parametrize("head", ["same-head", "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"])
 def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
-    tmp_path, monkeypatch, activation, head
+    tmp_path, monkeypatch, activation, head, mode
 ):
     """Item-9.s1 (row pr-remove-with-blocker), driven by the live loop.
 
@@ -1770,7 +1771,8 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     qualifies.  (Rebuilding an unreconciled anchor round's requests against
     the accumulated clearances is pinned by
     test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances.)  At a different head the retained requester's same request is a
-    new obligation and freezes that head.
+    reopened obligation and freezes that head, including the removed owner's
+    request, whose clearance also belonged only to the old head.
     """
     from pr_loop_test_helpers import _evidence_review, _signed
 
@@ -1778,7 +1780,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         codex_outputs=[_evidence_review(evidence=[_LIVE_LOG])],
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
     )
-    original = make_config(tmp_path, reviewer=("codex", "gemini"))
+    original = make_config(tmp_path, reviewer=("codex", "gemini"), pr_review_context_mode=mode)
     with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=original)
     runner.pr_payload["comments"].append(
@@ -1818,7 +1820,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         and r.metadata.dispositions and r.metadata.evidence_requests == (_LIVE_SUITE,)
         for r in _records(runner)
     )
-    swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
+    swapped = make_config(tmp_path, reviewer=("codex", "antigravity"), pr_review_context_mode=mode)
     if head == "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6":
         runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     if activation == "after-crash":
@@ -1833,9 +1835,14 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         assert run_pr_loop(runner, pr_number=77, config=swapped) == 0
         assert "gemini" not in _agents(runner, start)
     else:
-        # At 0b3d8b29493059afd7f9912106279c4643ac4939 Codex, the retained requester, asks for its evidence again.
-        runner.codex_outputs.append(_evidence_review(evidence=[_LIVE_LOG], hr=True))
-        runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True))
+        # Push recovery restores both owners' requests before the new board reviews.
+        pending = [{"item_id": item_id, "disposition": "blocking",
+                    "note": "Acceptance is still needed at the new head."}
+                   for item_id in ("item-1", "item-2")]
+        runner.codex_outputs.append(_evidence_review(
+            state="blocking", evidence=[_LIVE_LOG], dispositions=pending, hr=True))
+        runner.antigravity_outputs.append(_evidence_review(
+            state="blocking", reviewer="Antigravity", dispositions=pending, hr=True))
         with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head 0b3d8b29493059afd7f9912106279c4643ac4939"):
             run_pr_loop(runner, pr_number=77, config=swapped)
     (payload,) = _link_payloads(runner)
@@ -1845,10 +1852,10 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     assert after and all(
         m.reviewer_board_change_digest == board_change_link_digest(payload) for m in after
     )
-    # Nothing the anchor round cleared is carried as an obligation.
+    # Same-head clearance survives the board change; a push restores both owners.
     carried = [item for m in after if m.role == "reviewer" for item in m.prior_items
                if item.obligation_kind and item.obligation_identity in cleared]
-    assert carried == []
+    assert {item.obligation_identity for item in carried} == (set() if head == "same-head" else cleared)
     freezes = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-freeze"]
     if head == "same-head":
         assert [m.subject for m in freezes] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
@@ -1859,9 +1866,12 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         owed = [item for item in freezes[-1].prior_items if item.obligation_kind]
         # The same obligation identity, cleared only at 6367c48dd193d56ea7b0baad25b19455e529f5ee, is owed at 0b3d8b29493059afd7f9912106279c4643ac4939.
         assert [(item.text, item.reviewer, item.candidate_head_sha) for item in owed] == [
-            (_LIVE_LOG, "Codex", "0b3d8b29493059afd7f9912106279c4643ac4939")
+            (_LIVE_LOG, "Codex", "0b3d8b29493059afd7f9912106279c4643ac4939"),
+            (_LIVE_SUITE, "Gemini", "0b3d8b29493059afd7f9912106279c4643ac4939"),
         ]
-        assert owed[0].obligation_identity in cleared
+        assert {item.obligation_identity for item in owed} == cleared
+        assert {item.item_id for item in owed} == {"item-1", "item-2"}
+        assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
 
 
 def _staged_panel_history(tmp_path, monkeypatch):

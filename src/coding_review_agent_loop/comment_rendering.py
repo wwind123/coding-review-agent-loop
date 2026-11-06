@@ -529,7 +529,8 @@ def _render_prior_dispositions_section(
     dispositions: Sequence[ReviewItemDisposition],
     config: AgentLoopConfig | None = None,
 ) -> str:
-    item_by_id = {item.item_id: item for item in prior_items}
+    item_by_id = {key: item for item in prior_items
+                  for key in (item.item_id, *getattr(item, "alias_item_ids", ()))}
     lines = [heading]
     for disposition in dispositions:
         item = item_by_id.get(disposition.item_id)

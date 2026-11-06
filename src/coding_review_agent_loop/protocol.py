@@ -195,8 +195,8 @@ class ReviewItemDisposition:
     reviewer: str
     disposition: str
     note: str | None = None
-    # (sub_item_id, "resolved" | "unresolved") pairs in reviewer order (#958).
     sub_item_dispositions: tuple[tuple[str, str], ...] = ()
+    evidence_requirement_ids: tuple[str, ...] = ()
 
 # Machine-owned obligations are deliberately distinct from reviewer findings.
 # These values are persisted in round metadata, so changing one is a protocol
@@ -214,9 +214,6 @@ MACHINE_OBLIGATION_KINDS = frozenset(
         "unknown",
     }
 )
-# Human-only exact-head evidence (#1068) is a final barrier with its own
-# lifecycle: deferred while any other must-fix work remains, frozen at the
-# clean head H once it is the only open item, and cleared by its requester.
 EVIDENCE_OBLIGATION_KIND = "human-exact-head-evidence"
 EVIDENCE_LIFECYCLE_STATES = frozenset({"evidence_deferred", "evidence_frozen"})
 MACHINE_LIFECYCLE_STATES = frozenset(
@@ -289,6 +286,8 @@ class UnresolvedReviewItem:
     failed_head_sha: str | None = None
     candidate_head_sha: str | None = None
     obligation_identity: str | None = None
+    alias_item_ids: tuple[str, ...] = ()
+    alias_obligation_identities: tuple[str, ...] = ()
     # Reviewer-declared sub-items; never carried by machine obligations.
     sub_items: tuple[ReviewSubItem, ...] = ()
     # Evidence-only tag fixed when the orchestrator mints the item (#1324).
@@ -7063,7 +7062,7 @@ def _parse_review_item_disposition_payload(
         payload,
         context=field_name,
         required={"item_id", "disposition"},
-        optional={"note"} if is_plan_review else {"note", "sub_item_dispositions"},
+        optional={"note"} if is_plan_review else {"note", "sub_item_dispositions", "evidence_requirement_ids"},
     )
     item_id = _expect_item_id(payload["item_id"], context=f"{field_name}.item_id")  # shape-check: fatal:no-conservative-reading
     disposition = _expect_non_empty_string(payload["disposition"], context=f"{field_name}.disposition")  # shape-check: fatal:no-conservative-reading
@@ -7091,7 +7090,9 @@ def _parse_review_item_disposition_payload(
             context=f"{field_name}.sub_item_dispositions",
             degradations=degradations,
         )
+    from .native_evidence import citation_ids
     return ReviewItemDisposition(
+        evidence_requirement_ids=citation_ids(payload.get("evidence_requirement_ids", [])),
         item_id=item_id,
         reviewer=reviewer,
         disposition=disposition,

@@ -161,7 +161,8 @@ def _normalize_evidence_only_approval(
 
     if parsed.state != "blocking" or parsed.blocking_items or parsed.followups.same_pr:
         return parsed
-    evidence_ids = {item.item_id for item in prior_items if _is_evidence_obligation(item)}
+    evidence_ids = {key for item in prior_items if _is_evidence_obligation(item)
+                    for key in (item.item_id, *getattr(item, "alias_item_ids", ()))}
     active = {d.item_id for d in parsed.dispositions if d.disposition in {"blocking", "same-pr"}}
     if not active.issubset(evidence_ids) or not (active or parsed.exact_head_evidence_requests or parsed.screenshot_requests):
         return parsed

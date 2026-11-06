@@ -942,6 +942,37 @@ and that reviewer, so repeating the request updates one obligation. The request
 is persisted on the reviewer's own round record, so it survives a restart even
 when the run stops cleanly for pending checks.
 
+Repeated native requests from the same reviewer also update one obligation when
+only recognized commit references change, with or without a word such as `head`.
+References are complete hexadecimal tokens of 7–40 characters that uniquely
+prefix the current full head or an admitted historical PR head. Unrecognized or
+ambiguous tokens and complete image/manifest digests (including 64-character
+values sharing a commit prefix) remain significant. For explicit consolidation,
+use an affirmative clause such as “Consolidate item-3 and item-5 into this existing
+human-only obligation.” Every target must be that requester's open native
+obligation. The earliest item ID and persisted identity survive; historical item
+IDs and identities remain aliases. Foreign-owner, converted-row and screenshot
+requests cannot be consolidated this way.
+
+Signed acceptance may arrive **before a freeze**. For example, a human can post
+“Screenshots accepted for b7d37cf2; manifest and image digests verified”, ending
+with `-- Human Reviewer`. In the current round at that head, the requester can
+resolve its carried native item with `evidence_requirement_ids` listing the
+surfaced signed requirement ID. That disposition attests the evidence is adequate
+for the reviewed head; merely mentioning a commit or voting resolved without a
+citation cannot authorize early acceptance. A full head or an unambiguous
+reference of at least seven characters is required (six is insufficient).
+
+After all normal gates, the finalization gate re-reads the head and signed input.
+It accepts only still-live, unchanged citations actually surfaced to the requester
+this round. New or edited input triggers the existing same-round refresh. If all
+requests qualify, one evidence-cleared release is published without an initial
+freeze or a second human comment. Partial acceptance is persisted with the
+remaining freeze; one requester cannot waive another's request. When a requester
+has left the board, every current reviewer must resolve with eligible citations.
+A later push invalidates acceptance: evidence for H cannot finalize H2.
+Converted matrix rows and screenshot coverage retain their separate rules.
+
 The obligation is a final barrier:
 
 1. **Deferred.** While any reviewer finding, same-PR follow-up, CI, migration,

@@ -5,6 +5,7 @@ orchestrator re-exports every name defined here.
 """
 
 from __future__ import annotations
+from .native_evidence import known_pr_heads, restore_for_new_input, publication_dispositions, native_history
 
 from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, observe_pr_head, explain_pr_head_recovery, diagnostic_origin
 
@@ -2301,7 +2302,11 @@ def run_pr_loop(
                 round_number=round_number, post_comment=post_pr_comment,
             )
 
+        live_evidence_requirements = []
+
         def evidence_freeze_gate(*args, round_number: int, **kwargs):
+            kwargs["live_requirements"] = live_evidence_requirements
+            kwargs["configured_reviewers"] = tuple(agent_display_name(r) for r in configured_reviewers)
             try:
                 return _evidence_freeze_gate(*args, round_number=round_number, **kwargs)
             except HumanDecisionRequiredError as exc:
@@ -2995,7 +3000,6 @@ def run_pr_loop(
             )
 
         def collect_live_requirement_ids(context: PullRequestReviewContext) -> tuple[str, ...]:
-            """Re-collect signed requirement identities for the final revalidation."""
             live_issue = (
                 get_issue_context(runner, config=config, issue_number=issue_context.number)
                 if issue_context is not None
@@ -3006,20 +3010,12 @@ def run_pr_loop(
                 if parent_issue_context is not None
                 else None
             )
-            return _reviewer_requirement_identity_ids(
-                post_merge_run.visible_requirements(_build_requirements_context(
-                    target_issue_context=live_issue,
-                    pr_context=context,
-                    parent_issue_context=live_parent,
-                ).effective_requirements)
-            )
+            live_evidence_requirements[:] = post_merge_run.visible_requirements(
+                _build_requirements_context(target_issue_context=live_issue, pr_context=context,
+                    parent_issue_context=live_parent).effective_requirements)
+            return _reviewer_requirement_identity_ids(live_evidence_requirements)
 
-        # The two independent one-shot watcher allowances below can extend the
-        # effective ceiling by two rounds in one invocation. Keep the static
-        # range large enough to reach both; ``allowed_rounds`` remains the
-        # authoritative guard and prevents either slot from being used unless
-        # its corresponding watcher transition grants it.  An evidence pass
-        # re-runs the current round number without advancing it.
+        # Both one-shot watcher extensions fit; evidence refresh repeats the round.
         round_sequence = _RepeatableRoundSequence(start_round_number, config.max_rounds + 3)
 
         def stage_same_head_evidence_pass(
@@ -3701,10 +3697,11 @@ def run_pr_loop(
                                       diagnostic=lambda message: log(config, message))
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
+            unresolved_items, next_unresolved_item_number = restore_for_new_input(unresolved_items, current_resume, human_requirements, native_history(runner, config, pr_number, pr_comments), next_unresolved_item_number)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
-                item.item_id: [] for item in prior_unresolved_items
+                key: [] for item in prior_unresolved_items for key in (item.item_id, *item.alias_item_ids)
             }
             round_new_unresolved_items: list[UnresolvedReviewItem] = []
             # (reviewer, requests) pairs from this round's reviews (#1068).
@@ -4842,6 +4839,8 @@ def run_pr_loop(
                             source_round=review.metadata.round_number,
                             current_head_sha=review.metadata.subject,
                             clearances=evidence_clearances,
+                            pre_clearance_items=closed_reconciliation.prior_items,
+                            known_heads=known_pr_heads(native_history(runner, config, pr_number, pr_comments), review.metadata.subject),
                         )
                         if consumed_item_number:
                             next_unresolved_item_number += 1
@@ -4889,13 +4888,11 @@ def run_pr_loop(
                 new_items: tuple[UnresolvedReviewItem, ...] = (),
                 phase: str | None = None,
             ) -> None:
-                """Post one PR review using the same rendering and durable record."""
                 if phase is None:
                     phase = (
                         EVIDENCE_RESPONSE_PHASE if evidence_pass is not None else "authoritative"
                     )
-                # A spooled reviewer's bodies are frozen before the first post so
-                # a rerun after an outage resumes them verbatim (#1258).
+                # Freeze spooled publications for verbatim recovery (#1258).
                 publication_hook = (
                     {"publication": _pr_publication(reviewer_name)}
                     if phase == "publication" and identity is not None
@@ -4914,7 +4911,7 @@ def run_pr_loop(
                         bound_pr_metadata(
                             flow="pr", role="reviewer", agent=reviewer_name,
                             round_number=round_number, subject=current_pr_subject,
-                            prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
+                            prior_items=prior_unresolved_items, dispositions=publication_dispositions(parsed, review_output, reviewer_name, prior_unresolved_items),
                             new_items=new_items, state=parsed.state, model_used=model_used,
                             sub_item_degradations=tuple(parsed.sub_item_degradations),
                             **(_metadata_identity_fields(identity) if identity is not None else {}),
@@ -6231,6 +6228,8 @@ def run_pr_loop(
                         source_round=round_number,
                         current_head_sha=pr_metadata.head_sha,
                         clearances=evidence_clearances,
+                        pre_clearance_items=prior_unresolved_items,
+                        known_heads=known_pr_heads(native_history(runner, config, pr_number, pr_comments), pr_metadata.head_sha),
                     )
                     if consumed_item_number:
                         next_unresolved_item_number += 1

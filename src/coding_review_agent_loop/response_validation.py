@@ -1032,6 +1032,8 @@ def _surfaced_reviewer_requirement_ids(
     ).surfaced_requirement_ids
 
 
+# Native evidence citations use these same content-bound IDs, per review carrier;
+# only the live finalization gate can authorize early clearance from a citation.
 def _reviewer_requirement_identity_ids(
     human_requirements: Sequence[HumanReviewRequirement],
 ) -> tuple[str, ...]:

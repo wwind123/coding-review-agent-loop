@@ -2175,6 +2175,8 @@ def _evidence_freeze_gate(
     signed_evidence_references: Sequence[SignedEvidenceReference] = (),
     approved_plan_context: ApprovedPlanContext | None = None,
     in_process_audits: Sequence[EvidenceConversionAudit] = (),
+    live_requirements: Sequence = (),
+    configured_reviewers: Sequence[str] = (),
 ) -> _EvidenceGateOutcome:
     """Final revalidation and, when evidence is pending, the single freeze write.
 
@@ -2220,6 +2222,23 @@ def _evidence_freeze_gate(
     fresh = transition.context or fresh
     if transition.action in {'head_changed', 'refresh'}:
         return _EvidenceGateOutcome(transition.action, fresh)
+    from .native_evidence import provisional_clearances, consolidate_ledger, known_pr_heads, native_history
+    records = native_history(runner, config, pr_number, fresh.comments)
+    items[:] = consolidate_ledger(items, known_pr_heads(records, head_sha))
+    kept, early_clearances = provisional_clearances(
+        items, records, live_requirements,
+        head=head_sha, round_number=round_number, board=configured_reviewers)
+    clearances = tuple(dict.fromkeys((*clearances, *early_clearances)))
+    if early_clearances:
+        items[:] = kept
+        if not _pending_evidence_obligations(items):
+            items[:] = _publish_evidence_release(
+                runner, config=config, pr_number=pr_number, round_number=round_number,
+                head_sha=head_sha, items=items, reason="evidence-cleared",
+                surfaced_requirement_ids=live_ids, allowed_rounds=allowed_rounds,
+                watch_failure_extension_used=watch_failure_extension_used,
+                watch_head_extension_used=watch_head_extension_used, clearances=clearances,
+                signed_evidence_references=signed_evidence_references)
     if not _pending_evidence_obligations(items):
         return _EvidenceGateOutcome("coverage_satisfied" if transition.action == "coverage_satisfied" else "proceed", fresh)
     still_frozen = bool(_frozen_evidence_obligations(items))
@@ -2279,7 +2298,8 @@ def _is_evidence_only_blocking_review(
     """
     if parsed.state != "blocking" or parsed.blocking_items or parsed.followups.same_pr:
         return False
-    evidence_ids = {item.item_id for item in prior_items if _is_evidence_obligation(item)}
+    evidence_ids = {key for item in prior_items if _is_evidence_obligation(item)
+                    for key in (item.item_id, *getattr(item, "alias_item_ids", ()))}
     active = [
         disposition
         for disposition in parsed.dispositions
@@ -2307,8 +2327,12 @@ def _evidence_review_context(
         lines.append(f"- [{item.item_id}] {_evidence_requester(item)}; {state}: {item.text}")
     lines.append(
         "These are machine-owned records. Disposition each one: `blocking` with a short "
-        "note keeps a request that is still needed; `resolved` is only a note unless the "
-        "response rule below applies. A review whose only open items are kept evidence "
+        "note keeps a request that is still needed. For a native request you own, "
+        "`resolved` with `evidence_requirement_ids` citing the surfaced signed input "
+        "attests that it supplies adequate acceptance for this reviewed head. The input "
+        "must explicitly name this head (an unambiguous 7-40 character commit reference); "
+        "the final gate revalidates it live. Bare resolved votes remain notes unless the "
+        "frozen response rule below applies. A review whose only open items are kept evidence "
         "requests uses `state: blocking` with empty `blocking_items` and is treated as "
         "approving the code. Never list missing human evidence in `blocking_items`."
     )
