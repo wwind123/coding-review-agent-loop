@@ -239,14 +239,16 @@ from .evidence_reconciliation import (
     reconcile_evidence,
 )
 from .memory import AgentMemoryContext, prepare_agent_memory
-from .managed_ci import (
+from .managed_ci_types import (
     AuthenticatedManagedResume,
     AuthenticatedIssueCreatedHandoff,
-    FINAL_CONTEXT,
-    MANAGED_LABEL,
     ManagedCiContract,
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
+)
+from .managed_ci import (
+    FINAL_CONTEXT,
+    MANAGED_LABEL,
     activate_managed_ci,
     managed_ci_attachment_matches_head,
     release_stale_managed_ci_attachment,
@@ -274,6 +276,8 @@ from .managed_ci import (
     verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+)
+from .managed_ci_protection import (
     waivable_protection_states,
     waiver_flags_for_protection,
 )

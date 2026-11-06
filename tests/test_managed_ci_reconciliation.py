@@ -1,4 +1,6 @@
 """Later-attempt repair recovery through real activation and PR reconstruction."""
+
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 import copy
 import dataclasses
 import json
@@ -128,7 +130,7 @@ def recovery(tmp_path, *, legacy=False, auto_merge=True):
                             subject=V2_HEAD, prior_items=(item,), state='blocking', phase='qualification-checkpoint',
                             qualification_checkpoint=checkpoint, architecture_contract_version=1)), 18)
     metadata = PullRequestMetadata(7, 'OWNER/REPO', 'Managed CI', 'agent-loop/managed-643', 'main', V2_HEAD, None)
-    contract = ci.ManagedCiContract(protocol_version=2, base_ref='main', dispatch_ref='main', repository='OWNER/REPO',
+    contract = _managed_ci_types.ManagedCiContract(protocol_version=2, base_ref='main', dispatch_ref='main', repository='OWNER/REPO',
                                     pr_number=7, trusted_actor_login='agent-loop', trusted_actor_id=1,
                                     workflow_revision=V2_REVISION, intent_generation='fresh-generation',
                                     active_label_event_id=101)
@@ -602,7 +604,7 @@ def test_baseline_race_requires_explicit_live_attempt(tmp_path, attempt):
     expected_live = attempt if type(attempt) is int and attempt > 0 else None
     assert snapshot.live_run_attempt == expected_live
     assert snapshot.run_attempt == (attempt if isinstance(attempt, int) else 1)
-    assert ci.ManagedCiRunSnapshot(100, 1, 'completed', 'failure').live_run_attempt is None
+    assert _managed_ci_types.ManagedCiRunSnapshot(100, 1, 'completed', 'failure').live_run_attempt is None
     runner.run_reads = 0
     before = dataclasses.asdict(contract)
     if type(attempt) is int and attempt == 1:

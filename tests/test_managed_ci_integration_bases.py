@@ -1,5 +1,7 @@
 """Tool-side trusted integration bases (#1285)."""
 
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 import json
 from pathlib import Path
 
@@ -13,11 +15,15 @@ from coding_review_agent_loop.integration_close import (
     close_child_after_integration_merge,
     require_child_closed_or_report,
 )
-from coding_review_agent_loop.managed_ci import QUALIFICATION_MARKER as QUALIFICATION_MARKER_TEXT
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
+    QUALIFICATION_MARKER as QUALIFICATION_MARKER_TEXT,
+)
+from coding_review_agent_loop.managed_ci_types import (
     QUALIFIED_LABEL,
     TRUSTED_BASES_MARKER,
     ManagedCiContract,
+)
+from coding_review_agent_loop.managed_ci import (
     _contract_dispatch_ref,
     _is_v2_intent_run,
     enforce_trusted_base_at_startup,
@@ -376,7 +382,7 @@ def test_failed_close_is_reported_unresolved_and_never_replays_the_merge(tmp_pat
 
 def test_preflight_reports_the_same_refusal_read_only(tmp_path):
     runner = ScriptRunner(variable="other/*")
-    context = managed_ci.ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
+    context = _managed_ci_types.ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
     result = managed_ci.evaluate_managed_ci_readiness(
         runner, context=context, base="refactor/1181", trusted_actor="agent-loop"
     )

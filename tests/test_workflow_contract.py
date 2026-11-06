@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 import ast
 import hashlib
 import io
@@ -759,7 +761,7 @@ def _comment(body, *, login="agent-loop", actor_id=7, comment_id=1):
 
 
 def test_workflow_advertises_host_footer_capability():
-    assert f"{managed_ci.HOST_FOOTER_INTENT_MARKER}: enabled" in _caller_text()
+    assert f"{_managed_ci_types.HOST_FOOTER_INTENT_MARKER}: enabled" in _caller_text()
 
 
 def test_workflow_host_footer_literal_is_the_agent_constant():
@@ -1124,9 +1126,9 @@ def test_caller_still_advertises_every_literal_the_driver_gates_on():
     """The driver reads only the caller ci.yml; the reusable workflow is invisible to it."""
     caller = _caller_text()
     required = (
-        *managed_ci.V2_FEATURE_MARKERS,
-        managed_ci.RECOVERY_MARKER, "unlabeled",
-        managed_ci.VISIBLE_INTENT_MARKER, managed_ci.HOST_FOOTER_INTENT_MARKER,
+        *_managed_ci_types.V2_FEATURE_MARKERS,
+        _managed_ci_types.RECOVERY_MARKER, "unlabeled",
+        _managed_ci_types.VISIBLE_INTENT_MARKER, _managed_ci_types.HOST_FOOTER_INTENT_MARKER,
     )
     assert [marker for marker in required if marker not in caller] == []
 
@@ -2343,8 +2345,8 @@ def test_plumbing_catalog_job_names_appear_in_the_managed_workflows():
         for job in _load(path)["jobs"].values()
         if isinstance(job, dict)
     }
-    assert managed_ci.MANAGED_PLUMBING_JOB_NAMES <= job_names
-    assert managed_ci.PLUMBING_STATUS_CONTEXTS == {managed_ci.FINAL_CONTEXT}
+    assert _managed_ci_types.MANAGED_PLUMBING_JOB_NAMES <= job_names
+    assert _managed_ci_types.PLUMBING_STATUS_CONTEXTS == {managed_ci.FINAL_CONTEXT}
     # The test jobs are never catalogued, and matching is exact, not substring.
     assert not managed_ci.is_plumbing_check("Test validated exact head")
     assert not managed_ci.is_plumbing_check("Publish final exact-head status (retry)")
@@ -2374,7 +2376,7 @@ def _written_record(contract, state):
     body = managed_ci._intent_body(
         contract, pr_number=7, expected_head_sha="b" * 40, state=state,
     )
-    payload = str(body).split(managed_ci.INTENT_MARKER, 1)[1].rsplit("-->", 1)[0]
+    payload = str(body).split(_managed_ci_types.INTENT_MARKER, 1)[1].rsplit("-->", 1)[0]
     return json.loads(payload)
 
 
@@ -2386,7 +2388,7 @@ def _terminal_contract(**overrides):
         "attached_run_id": 200, "run_attempt": 1,
     }
     fields.update(overrides)
-    return managed_ci.ManagedCiContract(**fields)
+    return _managed_ci_types.ManagedCiContract(**fields)
 
 
 def test_dispatch_validator_accepts_the_rerun_attempt_before_and_after_the_watcher_refresh():

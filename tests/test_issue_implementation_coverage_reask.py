@@ -21,7 +21,7 @@ import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from agent_loop_helpers import patch_attr_in
 import json
 from dataclasses import replace
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiCreationIntent,
     UNPROTECTED_OVERRIDE_TRAILER,
 )
@@ -352,7 +352,9 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
     import datetime
 
     from coding_review_agent_loop import github as github_module
-    from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedCiCreationIntent,
+    )
 
     h = CoverageHarness(
         tmp_path, monkeypatch, managed_ci=True, managed_ci_trusted_actor="agent-loop",

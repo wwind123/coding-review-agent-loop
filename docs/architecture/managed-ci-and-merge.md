@@ -33,12 +33,18 @@ live in `managed_ci_api.py`, together with the single thread-local failure
 collector and its decorator. Retained driver gates use that same collector.
 `managed_ci_protection.py` owns protection assessment and explicit waiver
 reconciliation, importing API helpers and shared types. None of these support
-owners imports the driver or authorization owner. `managed_ci.py` temporarily
-re-exports the moved objects unchanged; activation, issue authorization,
+owners imports the driver or authorization owner. Consumers import support
+symbols directly from these owners; `managed_ci.py` retains only support imports
+used by its gates. Activation, issue authorization,
 dispatch, qualification and merge remain in the driver. The body hashes,
 original references, consumer candidates and immediate patch retargets are
-recorded in `tests/fixtures/managed_ci_support_move.json` for the paired cleanup.
-This ownership split changes no runtime flow, persistence or authority (#1905).
+recorded in `tests/fixtures/managed_ci_support_move.json` and drive
+`scripts/rewrite_managed_support_imports.py`. Driver API JSON lookups resolve
+through the API module so dependency patches intercept the live lookup. The symbol-specific
+guard in `tests/test_module_split_imports.py` rejects old driver imports, aliases,
+patch targets and compatibility-only exports. Fresh-interpreter import checks
+cover driver-first and support/helper-first orders.
+This ownership split changes no runtime flow, persistence or authority (#1905, #1906).
 
 Recovery command rendering lives in the pure `managed_ci_recovery_commands.py`
 sibling, and workflow-mirrored intent envelope, schema and lifecycle validation

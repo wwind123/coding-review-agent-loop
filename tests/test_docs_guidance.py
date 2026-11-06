@@ -1,3 +1,5 @@
+
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 import re
 import subprocess
 from pathlib import Path
@@ -1277,12 +1279,12 @@ def test_split_template_satisfies_driver_readiness_and_run_name_contract():
         LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8"), "split-caller-template"
     )
     for marker in (
-        *mc._CONTRACT_MARKERS,
-        *mc.V2_FEATURE_MARKERS,
-        mc.RECOVERY_MARKER,
-        mc.VISIBLE_INTENT_MARKER,
-        mc.HOST_FOOTER_INTENT_MARKER,
-        mc.TRUSTED_BASES_MARKER,
+        *_managed_ci_types._CONTRACT_MARKERS,
+        *_managed_ci_types.V2_FEATURE_MARKERS,
+        _managed_ci_types.RECOVERY_MARKER,
+        _managed_ci_types.VISIBLE_INTENT_MARKER,
+        _managed_ci_types.HOST_FOOTER_INTENT_MARKER,
+        _managed_ci_types.TRUSTED_BASES_MARKER,
     ):
         assert marker in template, marker
     assert "pull_request" in template and "unlabeled" in template

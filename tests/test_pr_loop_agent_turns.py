@@ -17,7 +17,7 @@ from coding_review_agent_loop.github import (
     PullRequestMetadata,
     PullRequestReviewContext,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
 from coding_review_agent_loop.round_state import (

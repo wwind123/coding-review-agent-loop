@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_loop
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )
@@ -851,7 +851,9 @@ def test_1133_post_panel_latch_original_and_reduced_boards_are_equivalent(tmp_pa
 
 def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ordinary"):
     """Managed-CI entry (ordinary resume or fresh authorization) of an issue-created strict PR."""
-    from coding_review_agent_loop.managed_ci import AuthenticatedIssueCreatedHandoff
+    from coding_review_agent_loop.managed_ci_types import (
+        AuthenticatedIssueCreatedHandoff,
+    )
 
     runner = _m943_partial_pr_round(
         tmp_path,

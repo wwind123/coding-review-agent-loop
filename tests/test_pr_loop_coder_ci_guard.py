@@ -1,5 +1,7 @@
 """PR-loop tests for coder_ci_guard: the coder CI-dispatch guard (#1542)."""
 
+from coding_review_agent_loop import managed_ci_api as _managed_ci_api
+
 import datetime
 import json
 from types import SimpleNamespace
@@ -17,7 +19,7 @@ from coding_review_agent_loop.github import (
 from coding_review_agent_loop.local_test_evidence import (
     LocalTestObservation,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )
@@ -182,9 +184,9 @@ def _install_v2_dispatch_boundary(monkeypatch):
     )
     discovered = []
     monkeypatch.setattr(managed_ci_module, "_contract_dispatch_ref", lambda *_a, **_k: "main")
-    real_api_json = managed_ci_module._api_json
+    real_api_json = _managed_ci_api._api_json
     monkeypatch.setattr(
-        managed_ci_module, "_api_json",
+        _managed_ci_api, "_api_json",
         lambda runner, config, path, **kw: (
             {} if path.endswith("/commits/main") else real_api_json(runner, config, path, **kw)
         ),
@@ -454,7 +456,9 @@ def _at(clock):
 
 
 def _v1_record(requested, returned, *, head="456745060d954108b6edfaece222bfae8564cf3e", workflow_file="ci.yml"):
-    from coding_review_agent_loop.managed_ci import ManagedV1DispatchRecord
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedV1DispatchRecord,
+    )
 
     return ManagedV1DispatchRecord(
         workflow_file=workflow_file, ref="agent-loop/managed-77", pr_number=77,

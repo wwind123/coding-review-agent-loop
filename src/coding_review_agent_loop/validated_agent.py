@@ -42,7 +42,10 @@ from .github import (
 )
 from . import tool_provenance
 from .logging import log, new_run_id, run_usage_summary_path
-from .managed_ci import waivable_protection_states, waiver_flags_for_protection
+from .managed_ci_protection import (
+    waivable_protection_states,
+    waiver_flags_for_protection,
+)
 from .prompts import build_completion_recovery_prompt
 from .protocol_risk import (
     TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,

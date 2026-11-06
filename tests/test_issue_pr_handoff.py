@@ -2125,8 +2125,10 @@ def _real_staged_plan_comments(tmp_path, *, gemini_state="approved"):
 def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_outputs):
     """A strictly protected managed PR resumed by board B, driven to the merge gate."""
     from coding_review_agent_loop.cli import run_pr_loop
-    from coding_review_agent_loop.managed_ci import (
-        AuthenticatedIssueCreatedHandoff, ManagedCiContract, ManagedCiOutcome,
+    from coding_review_agent_loop.managed_ci_types import (
+        AuthenticatedIssueCreatedHandoff,
+        ManagedCiContract,
+        ManagedCiOutcome,
     )
 
     handoff = AuthenticatedIssueCreatedHandoff(

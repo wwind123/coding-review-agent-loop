@@ -7,7 +7,13 @@ import pytest
 from coding_review_agent_loop.ci_health import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import PullRequestMergeability, get_pr_checks
-from coding_review_agent_loop.managed_ci import FINAL_CONTEXT, ManagedCiContract, ManagedCiOutcome
+from coding_review_agent_loop.managed_ci import (
+    FINAL_CONTEXT,
+)
+from coding_review_agent_loop.managed_ci_types import (
+    ManagedCiContract,
+    ManagedCiOutcome,
+)
 from coding_review_agent_loop.pr_loop import run_pr_loop
 
 from coding_review_agent_loop.round_state import _extract_round_metadata_records

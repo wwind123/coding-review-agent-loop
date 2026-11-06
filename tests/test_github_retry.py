@@ -1,5 +1,8 @@
 """Stage 1 of #510: shared transient GitHub policy and read-only retry (#1257)."""
 
+from coding_review_agent_loop import managed_ci_api as _managed_ci_api
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 import json
 import re
 from pathlib import Path
@@ -307,7 +310,7 @@ def test_managed_ci_list_failure_reason_reaches_callers(tmp_path, sleeps):
     message = str(info.value)
     assert "could not be inspected" in message
     assert "list-final" in message and "attempt 3:" in message
-    assert managed_ci._api_list(runner, config, "repos/o/r/issues/4/comments") is None
+    assert _managed_ci_api._api_list(runner, config, "repos/o/r/issues/4/comments") is None
 
 
 # --- round 2: branch protection and managed-CI list consumers ---------------------
@@ -339,22 +342,22 @@ def test_managed_ci_event_and_timeline_failure_reasons(tmp_path, sleeps):
 
     config = make_config(tmp_path)
     runner = ScriptedRunner([(1, "", "HTTP 503 events-final")])
-    history = managed_ci._managed_label_event_history(
+    history = _managed_ci_api._managed_label_event_history(
         runner, config=config, pr_number=4, actor_login="bot", actor_id=7
     )
     assert history is None
-    assert "events-final" in managed_ci._last_list_failure()
-    assert "attempt 3:" in managed_ci._last_list_failure()
+    assert "events-final" in _managed_ci_api._last_list_failure()
+    assert "attempt 3:" in _managed_ci_api._last_list_failure()
 
     ids = managed_ci._actor_owned_label_event_ids(
         runner, config=config, pr_number=4, actor_login="bot", actor_id=7
     )
     assert ids is None
-    assert "events-final" in managed_ci._last_list_failure()
+    assert "events-final" in _managed_ci_api._last_list_failure()
 
     ok = ScriptedRunner([(0, "[]", "")])
-    assert managed_ci._api_list(ok, config, "repos/o/r/issues/4/events") == []
-    assert managed_ci._last_list_failure() == ""
+    assert _managed_ci_api._api_list(ok, config, "repos/o/r/issues/4/events") == []
+    assert _managed_ci_api._last_list_failure() == ""
 
 
 def test_fresh_authorization_event_history_failure_reaches_error(tmp_path, sleeps):
@@ -362,9 +365,9 @@ def test_fresh_authorization_event_history_failure_reaches_error(tmp_path, sleep
 
     config = make_config(tmp_path)
     runner = ScriptedRunner([(1, "", "HTTP 503 fresh-final")])
-    events, reason = managed_ci._api_list_detailed(runner, config, "repos/o/r/issues/4/timeline")
+    events, reason = _managed_ci_api._api_list_detailed(runner, config, "repos/o/r/issues/4/timeline")
     assert events is None and "fresh-final" in reason and "attempt 3:" in reason
-    message = managed_ci._with_reason("requires an association", reason)
+    message = _managed_ci_api._with_reason("requires an association", reason)
     assert "requires an association" in message and "fresh-final" in message
 
 
@@ -389,7 +392,7 @@ def test_issue_created_authorization_publish_keeps_active_label_diagnostics(tmp_
         managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
-    handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
+    handoff = _managed_ci_types.AuthenticatedIssueCreatedHandoff(
         pr_number=7,
         issue_number=643,
         repository="OWNER/REPO",
@@ -420,7 +423,7 @@ def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
         managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
-    handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
+    handoff = _managed_ci_types.AuthenticatedIssueCreatedHandoff(
         pr_number=7,
         issue_number=643,
         repository="OWNER/REPO",
@@ -490,16 +493,16 @@ def test_release_for_ordinary_recovery_surfaces_list_failure(tmp_path, sleeps):
 def test_surface_decorator_is_scoped_and_does_not_leak(tmp_path, sleeps):
     from coding_review_agent_loop import managed_ci
 
-    @managed_ci._surfaces_list_failures
+    @_managed_ci_api._surfaces_list_failures
     def failing():
-        managed_ci._api_list_detailed(
+        _managed_ci_api._api_list_detailed(
             ScriptedRunner([(1, "", "HTTP 503 scoped-final")]),
             make_config(tmp_path),
             "repos/o/r/issues/1/events",
         )
         raise AgentLoopError("generic refusal")
 
-    @managed_ci._surfaces_list_failures
+    @_managed_ci_api._surfaces_list_failures
     def unrelated():
         raise AgentLoopError("other refusal")
 

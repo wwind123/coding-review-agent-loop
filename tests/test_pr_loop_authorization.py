@@ -28,7 +28,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
 from coding_review_agent_loop.round_state import (

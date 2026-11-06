@@ -8,7 +8,9 @@ import pytest
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
-from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
+from coding_review_agent_loop.managed_ci_types import (
+    ManagedCiCreationIntent,
+)
 from coding_review_agent_loop.round_state import (
     PlanValidationDiagnosticPayload,
     PlanValidationDiagnosticTransport,

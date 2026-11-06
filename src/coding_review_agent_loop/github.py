@@ -97,7 +97,9 @@ from .workdirs import active_workdir, github_api_cwd
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
-    from .managed_ci import ManagedV1DispatchRecord
+    from .managed_ci_types import (
+        ManagedV1DispatchRecord,
+    )
 
 # PullRequestCheck/PullRequestChecks/StalledCheck/CiInfrastructureStall are
 # defined in ci_health.py (kept dependency-free of this module's live GitHub

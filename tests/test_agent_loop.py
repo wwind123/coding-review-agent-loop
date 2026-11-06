@@ -42,7 +42,10 @@ from coding_review_agent_loop.config import (
 )
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import IssueComment
-from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
+from coding_review_agent_loop.managed_ci_types import (
+    ManagedCiReadiness,
+    ProtectionAssessment,
+)
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import ExecutableIdentity
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject

@@ -39,3 +39,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Retire mandatory registration for new package modules in the finished split registry; keep its historical ordering and coherence checks, discover ordinary modules for fresh-interpreter facade protection, and statically protect the two non-importable standalone helpers (#1806).
 
 - Preserve static facade protection for the standalone `review_images_worker.py` sandbox supervisor when merging the package import guard with its sealed `/trusted` execution layout (#1806).
+
+- Managed-CI support bindings are consumed directly from types, API and protection owners; compatibility-only driver exports are removed while required internal imports remain (#1906).

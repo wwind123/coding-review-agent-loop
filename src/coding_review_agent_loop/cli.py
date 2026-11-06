@@ -56,11 +56,13 @@ from .errors import (
     HumanDecisionRequiredError,
     QuotaResetExceededError,
 )
-from .managed_ci import (
+from .managed_ci_types import (
     PREFLIGHT_INDETERMINATE,
     PREFLIGHT_KNOWN_NOT_READY,
     PREFLIGHT_STRICT_READY,
     ManagedCiProbeContext,
+)
+from .managed_ci import (
     evaluate_managed_ci_readiness,
     render_managed_ci_preflight,
 )

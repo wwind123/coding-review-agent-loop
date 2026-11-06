@@ -1,3 +1,7 @@
+
+from coding_review_agent_loop import managed_ci_api as _managed_ci_api
+from coding_review_agent_loop import managed_ci_protection as _managed_ci_protection
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 import ast
 import copy
 import json
@@ -27,10 +31,8 @@ from coding_review_agent_loop.github import (
     PullRequestMetadata,
     merge_pr,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     AuthenticatedManagedResume,
-    FINAL_CONTEXT,
-    MANAGED_LABEL,
     MANAGED_OPT_OUT_LABEL,
     QUALIFICATION_MARKER,
     READINESS_CONTEXT,
@@ -38,7 +40,11 @@ from coding_review_agent_loop.managed_ci import (
     ManagedCiProbeContext,
     ManagedCiIssueAuthorization,
     UNPROTECTED_OVERRIDE_TRAILER,
-    assess_exact_head_protection,
+    OrdinaryRecoveryCapability,
+)
+from coding_review_agent_loop.managed_ci import (
+    FINAL_CONTEXT,
+    MANAGED_LABEL,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _intent_body,
@@ -46,7 +52,6 @@ from coding_review_agent_loop.managed_ci import (
     _v2_failed_jobs,
     _v2_correlated_status,
     _v2_terminal_attempt_excluded,
-    _api_list,
     activate_managed_ci,
     authenticate_issue_created_handoff,
     authorize_fresh_issue_created_resume,
@@ -69,12 +74,17 @@ from coding_review_agent_loop.managed_ci import (
     release_adopted_managed_ci,
     release_retained_managed_label,
     revalidate_adopted_managed_ci,
-    OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
     _release_for_ordinary_recovery,
     _find_resume_audit,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+)
+from coding_review_agent_loop.managed_ci_protection import (
+    assess_exact_head_protection,
+)
+from coding_review_agent_loop.managed_ci_api import (
+    _api_list,
 )
 from coding_review_agent_loop.protocol_markers import (
     PR_BODY_SURFACE,
@@ -973,7 +983,7 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
 
 
 def _authorization_handoff(*, head="6367c48dd193d56ea7b0baad25b19455e529f5ee"):
-    return managed_ci.AuthenticatedIssueCreatedHandoff(
+    return _managed_ci_types.AuthenticatedIssueCreatedHandoff(
         pr_number=7,
         issue_number=643,
         repository="OWNER/REPO",
@@ -2109,7 +2119,7 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
         url="https://github.com/OWNER/REPO/actions/runs/555",
     )
     outcomes = iter([
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
@@ -2117,7 +2127,7 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(status="passed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82"),
+        _managed_ci_types.ManagedCiOutcome(status="passed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82"),
     ])
     qualified_heads = []
     merges = []
@@ -2235,7 +2245,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
         url="https://github.com/OWNER/REPO/actions/runs/777",
     )
     outcomes = iter([
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
@@ -2243,7 +2253,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="failed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
@@ -2251,7 +2261,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(status="passed", head_sha="e0ce9a0e6346d339a1d547903f1600244fe31b35"),
+        _managed_ci_types.ManagedCiOutcome(status="passed", head_sha="e0ce9a0e6346d339a1d547903f1600244fe31b35"),
     ])
     qualified_heads = []
     merges = []
@@ -2371,7 +2381,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
         url="https://github.com/OWNER/REPO/actions/runs/777",
     )
     outcomes = iter([
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
@@ -2379,7 +2389,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="failed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
@@ -2387,7 +2397,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(
+        _managed_ci_types.ManagedCiOutcome(
             status="passed", head_sha="fa0338def2a61b1065c3d0a5057896a71aa9aaa2"
         ),
     ])
@@ -4509,7 +4519,7 @@ def test_issue_created_handoff_authenticates_override_before_any_remote_write(tm
         url="https://github.com/OWNER/REPO/pull/7",
         body=body,
     )
-    intent = managed_ci.ManagedCiCreationIntent(
+    intent = _managed_ci_types.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
         protection_mode="voluntary",
@@ -5110,7 +5120,7 @@ def test_issue_authorization_parser_enforces_kind_specific_schema(tmp_path, kind
     payload = record.to_payload()
     payload.update(changes)
     encoded = managed_ci._encode_issue_authorization_payload(payload)
-    body = f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
     with pytest.raises(AgentLoopError, match="continuity|continuity fields"):
         parse_issue_created_authorization_comment(body)
@@ -5144,7 +5154,7 @@ def test_issue_authorization_parser_rejects_noncanonical_fresh_schema(changes):
     payload = record.to_payload()
     payload.update(changes)
     encoded = managed_ci._encode_issue_authorization_payload(payload)
-    body = f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
     with pytest.raises(AgentLoopError, match="fresh authorization|protection or waiver"):
         parse_issue_created_authorization_comment(body)
@@ -5167,7 +5177,7 @@ def test_activation_rejects_malformed_fresh_authorization_before_label_or_dispat
         predecessor_head="old-head",
     )
     encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
-    malformed_body = f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    malformed_body = f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
     runner = V2ManagedRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,
         rest_pr={"state": "open", "draft": True, "labels": []},
@@ -5366,7 +5376,7 @@ def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tm
     )
     runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
     metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
-    intent = managed_ci.ManagedCiCreationIntent(
+    intent = _managed_ci_types.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
         protection_mode="voluntary",
@@ -5397,7 +5407,7 @@ def test_issue_created_tuple_actor_refusal_replaces_existing_trusted_actor(tmp_p
     )
     runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
     metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
-    intent = managed_ci.ManagedCiCreationIntent(
+    intent = _managed_ci_types.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
         protection_mode="voluntary",
@@ -5442,7 +5452,7 @@ def test_issue_created_tuple_mismatch_includes_shell_quoted_resume_command(tmp_p
         }},
     )
     metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
-    intent = managed_ci.ManagedCiCreationIntent(
+    intent = _managed_ci_types.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
         protection_mode="voluntary",
@@ -7272,7 +7282,7 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
 def test_orchestrator_terminal_without_status_posts_resumable_diagnostic(tmp_path, capsys):
     config = make_config(tmp_path, auto_merge=True)
     runner = V2ManagedRunner()
-    outcome = managed_ci.ManagedCiOutcome(
+    outcome = _managed_ci_types.ManagedCiOutcome(
         status="terminal_without_status",
         run_id=100,
         run_attempt=1,
@@ -8404,7 +8414,7 @@ def _authorization_record(kind, *, head="6367c48dd193d56ea7b0baad25b19455e529f5e
 
 def _authorization_marker(record):
     encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
-    return f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    return f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
 
 def test_authorization_bodies_are_labeled_per_kind_without_touching_the_marker():
@@ -8528,10 +8538,10 @@ def test_intent_body_stays_marker_only_for_the_base_workflow_validator(tmp_path)
         if comment["id"] == contract.intent_comment_id
     )
     body = stored["body"]
-    assert body.startswith(f"<!-- {managed_ci.INTENT_MARKER} ")
+    assert body.startswith(f"<!-- {_managed_ci_types.INTENT_MARKER} ")
     # The exact envelope the base workflow applies, anchored and fullmatch.
     envelope = re.compile(
-        rf"^<!-- {managed_ci.INTENT_MARKER} (?P<payload>.*?) -->$", re.S
+        rf"^<!-- {_managed_ci_types.INTENT_MARKER} (?P<payload>.*?) -->$", re.S
     )
     assert envelope.match(body) is not None
 
@@ -9161,7 +9171,7 @@ def test_http_status_reads_only_gh_trailing_stderr_status(
 ):
     result = CommandResult(["gh", "api", "repos/OWNER/REPO"], tmp_path, stdout, stderr, returncode)
 
-    assert managed_ci._http_status(result) == expected
+    assert _managed_ci_api._http_status(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -9183,25 +9193,25 @@ def test_actor_variable_read_is_asserted_only_for_a_strict_403(
 ):
     runner = CloudSessionRunner(scripted={_VARIABLE: (stdout, stderr, returncode)})
 
-    variable = managed_ci._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
+    variable = _managed_ci_api._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
 
     assert variable.status == status
     expected = {
         "readable": ("agent-loop", "variable"),
         "unreadable": ("agent-loop", "asserted"),
     }.get(status, (None, None))
-    assert managed_ci._resolve_advertised_actor(variable, " agent-loop ") == expected
+    assert _managed_ci_api._resolve_advertised_actor(variable, " agent-loop ") == expected
     # Without a trusted actor nothing can stand in for the refused read.
     if status == "unreadable":
-        assert managed_ci._resolve_advertised_actor(variable, "") == (None, None)
+        assert _managed_ci_api._resolve_advertised_actor(variable, "") == (None, None)
 
 
 def test_readable_variable_is_never_replaced_by_the_trusted_actor(tmp_path):
     runner = CloudSessionRunner(scripted={_VARIABLE: ('{"value": "someone-else"}', "", 0)})
 
-    variable = managed_ci._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
+    variable = _managed_ci_api._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
 
-    assert managed_ci._resolve_advertised_actor(variable, "agent-loop") == (
+    assert _managed_ci_api._resolve_advertised_actor(variable, "agent-loop") == (
         "someone-else", "variable",
     )
 
@@ -9343,7 +9353,7 @@ def test_readable_differing_variable_fails_closed_at_every_identity_site(tmp_pat
         authenticate_issue_created_handoff(
             runner,
             config=config,
-            intent=managed_ci.ManagedCiCreationIntent(
+            intent=_managed_ci_types.ManagedCiCreationIntent(
                 branch="agent-loop/managed-643", trusted_actor="agent-loop",
                 protection_mode="unreadable", audit_nonce="fresh",
             ),
@@ -9371,7 +9381,7 @@ def test_asserted_actor_is_accepted_at_every_identity_site(tmp_path):
     handoff = authenticate_issue_created_handoff(
         runner,
         config=config,
-        intent=managed_ci.ManagedCiCreationIntent(
+        intent=_managed_ci_types.ManagedCiCreationIntent(
             branch="agent-loop/managed-643", trusted_actor="agent-loop",
             protection_mode="unreadable", audit_nonce="fresh",
         ),
@@ -9474,7 +9484,7 @@ def test_readable_classic_no_rules_response_keeps_existing_classification(tmp_pa
 
     protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
 
-    assert protection == managed_ci.ProtectionAssessment(
+    assert protection == _managed_ci_types.ProtectionAssessment(
         "voluntary", "none", "final-ci/exact-head is not independently required"
     )
 
@@ -9599,7 +9609,7 @@ def test_classic_403_with_malformed_rules_stays_indeterminate(tmp_path, effectiv
     assert protection.source == "rulesets"
     assert "effective branch rules were malformed" in protection.detail
     if ruleset is not None:
-        assert managed_ci._ruleset_detail_well_formed(ruleset) is False
+        assert _managed_ci_protection._ruleset_detail_well_formed(ruleset) is False
     readiness = evaluate_managed_ci_readiness(
         runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
     )
@@ -9622,7 +9632,7 @@ def test_classic_403_with_malformed_rules_stays_indeterminate(tmp_path, effectiv
     ],
 )
 def test_classic_403_with_well_formed_non_enforcing_ruleset_is_unreadable(tmp_path, ruleset):
-    assert managed_ci._ruleset_detail_well_formed(ruleset) is True
+    assert _managed_ci_protection._ruleset_detail_well_formed(ruleset) is True
     runner = CloudSessionRunner(
         scripted=_cloud_scripts(variable=False),
         pr_effective_rules_payload=[{"ruleset_id": 8}],
@@ -9635,20 +9645,20 @@ def test_classic_403_with_well_formed_non_enforcing_ruleset_is_unreadable(tmp_pa
 
 
 def test_ruleset_bypass_state_distinguishes_hidden_empty_and_present():
-    assert managed_ci._ruleset_bypass_state({"rules": []}) == "unknown"
-    assert managed_ci._ruleset_bypass_state({"bypass_actors": []}) == "none"
-    assert managed_ci._ruleset_bypass_state({"bypass_actors": [_VALID_TEAM_BYPASS]}) == "present"
+    assert _managed_ci_protection._ruleset_bypass_state({"rules": []}) == "unknown"
+    assert _managed_ci_protection._ruleset_bypass_state({"bypass_actors": []}) == "none"
+    assert _managed_ci_protection._ruleset_bypass_state({"bypass_actors": [_VALID_TEAM_BYPASS]}) == "present"
 
 
 def test_final_context_requires_exact_required_status_checks_match():
-    assert managed_ci._ruleset_requires_final_context(_final_rules()) is True
-    assert managed_ci._ruleset_requires_final_context(
+    assert _managed_ci_protection._ruleset_requires_final_context(_final_rules()) is True
+    assert _managed_ci_protection._ruleset_requires_final_context(
         _final_rules("final-ci/exact-head-extra")
     ) is False
-    assert managed_ci._ruleset_requires_final_context(
+    assert _managed_ci_protection._ruleset_requires_final_context(
         [{"type": "pull_request", "parameters": {"note": FINAL_CONTEXT}}]
     ) is False
-    assert managed_ci._ruleset_requires_final_context("rules") is False
+    assert _managed_ci_protection._ruleset_requires_final_context("rules") is False
 
 
 @pytest.mark.parametrize(
@@ -9730,15 +9740,15 @@ def test_waivable_protection_states_require_each_explicit_flag(tmp_path):
     # The unreadable flag alone never waives anything.
     unreadable_only = make_config(tmp_path, allow_unreadable_protection=True)
 
-    assert managed_ci.waivable_protection_states(neither) == frozenset()
-    assert managed_ci.waivable_protection_states(unreadable_only) == frozenset()
-    assert managed_ci.waivable_protection_states(companion) == {"voluntary", "plan_limited"}
-    assert managed_ci.waivable_protection_states(both) == {"voluntary", "plan_limited", "unreadable"}
-    assert managed_ci.waiver_flags_for_protection("voluntary") == "--allow-unprotected-managed-ci"
-    assert managed_ci.waiver_flags_for_protection("unreadable") == _BOTH_WAIVERS
-    assert managed_ci._waiver_for_protection("plan_limited") == "allow-unprotected-managed-ci"
-    assert managed_ci._waiver_for_protection("unreadable") == "allow-unreadable-protection"
-    assert managed_ci._waiver_for_protection("strict") is None
+    assert _managed_ci_protection.waivable_protection_states(neither) == frozenset()
+    assert _managed_ci_protection.waivable_protection_states(unreadable_only) == frozenset()
+    assert _managed_ci_protection.waivable_protection_states(companion) == {"voluntary", "plan_limited"}
+    assert _managed_ci_protection.waivable_protection_states(both) == {"voluntary", "plan_limited", "unreadable"}
+    assert _managed_ci_protection.waiver_flags_for_protection("voluntary") == "--allow-unprotected-managed-ci"
+    assert _managed_ci_protection.waiver_flags_for_protection("unreadable") == _BOTH_WAIVERS
+    assert _managed_ci_protection._waiver_for_protection("plan_limited") == "allow-unprotected-managed-ci"
+    assert _managed_ci_protection._waiver_for_protection("unreadable") == "allow-unreadable-protection"
+    assert _managed_ci_protection._waiver_for_protection("strict") is None
 
 
 @pytest.mark.parametrize(
@@ -9792,7 +9802,7 @@ def test_cloud_session_shape_creates_reserved_managed_pr_only_with_both_waivers(
 
     intent = preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=1040)
 
-    assert intent == managed_ci.ManagedCiCreationIntent(
+    assert intent == _managed_ci_types.ManagedCiCreationIntent(
         branch="agent-loop/managed-1040",
         trusted_actor="agent-loop",
         protection_mode="unreadable",
@@ -9853,7 +9863,7 @@ def _unreadable_record(**overrides):
 
 def _encoded_authorization(payload):
     encoded = managed_ci._encode_issue_authorization_payload(payload)
-    return f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    return f"<!-- {_managed_ci_types.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
 
 
 @pytest.mark.parametrize(
@@ -11166,7 +11176,7 @@ def test_older_workflow_guard_stops_before_dispatch(tmp_path, monkeypatch, foote
         )
 
     assert raised.value.phase == "pre-dispatch"
-    assert managed_ci.HOST_FOOTER_INTENT_MARKER in str(raised.value)
+    assert _managed_ci_types.HOST_FOOTER_INTENT_MARKER in str(raised.value)
     assert "No managed-CI run was dispatched" in str(raised.value)
     assert runner.dispatch_count == 0
     assert contract.dispatch_issued is False
@@ -13391,7 +13401,9 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     import dataclasses
     from pr_loop_test_helpers import _carried_ci_obligations, _carried_ci_review_comment
     from coding_review_agent_loop.github import PullRequestMergeability
-    from coding_review_agent_loop.managed_ci import ManagedCiOutcome
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedCiOutcome,
+    )
 
     item = dataclasses.replace(
         _carried_ci_obligations()[1], text="Failing checks: Python 3.12 full suite (failure)"
@@ -13623,7 +13635,7 @@ def test_api_json_runs_from_a_directory_that_is_not_an_agent_checkout(tmp_path):
     config = make_config(tmp_path)
     config.antigravity_dir.mkdir(parents=True, exist_ok=True)
 
-    managed_ci._api_json(runner, config, "repos/OWNER/REPO/pulls/7", quiet=True)
+    _managed_ci_api._api_json(runner, config, "repos/OWNER/REPO/pulls/7", quiet=True)
 
     (command, cwd), = [
         item for item in runner.commands if item[0][:2] == ["gh", "api"]
@@ -13642,17 +13654,21 @@ from types import SimpleNamespace as _NS510
 
 import coding_review_agent_loop.github as _github510
 from coding_review_agent_loop.github import reconciled_pr_ready as _reconciled_ready
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     CompleteLabelHistory as _Complete,
     ManagedCiContract as _Contract510,
     UnknownLabelHistory as _Unknown,
+)
+from coding_review_agent_loop.managed_ci import (
     _label_add,
     _label_remove,
-    label_event_history as _label_history,
     release_adopted_managed_ci as _release510,
 )
+from coding_review_agent_loop.managed_ci_api import (
+    label_event_history as _label_history,
+)
 
-QUALIFIED_LABEL = managed_ci.QUALIFIED_LABEL
+QUALIFIED_LABEL = _managed_ci_types.QUALIFIED_LABEL
 _BOT = ("agent-bot", 11)
 _STRANGER = ("someone", 22)
 
@@ -14405,7 +14421,7 @@ def test_prepare_v2_merge_ready_503_with_head_drift_refuses_with_one_ready_and_n
 ):
     hub = _ReadyFlowHub(drift_after_ready=True)
     hub.ready_script = ["fail"]
-    contract = managed_ci.ManagedCiContract(protocol_version=2)
+    contract = _managed_ci_types.ManagedCiContract(protocol_version=2)
 
     with pytest.raises(AgentLoopError, match="Unable to mark qualified PR #7 ready") as raised:
         managed_ci.prepare_v2_merge(
@@ -14422,7 +14438,7 @@ def test_prepare_v2_merge_same_head_accepted_ready_reaches_post_write_verificati
 ):
     hub = _ReadyFlowHub()
     hub.ready_script = ["accepted"]
-    contract = managed_ci.ManagedCiContract(protocol_version=2)
+    contract = _managed_ci_types.ManagedCiContract(protocol_version=2)
 
     managed_ci.prepare_v2_merge(
         hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40, contract=contract,
@@ -14449,7 +14465,7 @@ def test_prepare_v2_merge_post_write_verification_still_refuses_a_later_head_cha
     with pytest.raises(AgentLoopError, match="head changed while it was being readied"):
         managed_ci.prepare_v2_merge(
             hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40,
-            contract=managed_ci.ManagedCiContract(protocol_version=2),
+            contract=_managed_ci_types.ManagedCiContract(protocol_version=2),
         )
 
 
@@ -15710,7 +15726,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     )]
     monkeypatch.setattr(
         pr_loop, "wait_for_final_qualification",
-        lambda *_a, metadata, **_k: managed_ci.ManagedCiOutcome(
+        lambda *_a, metadata, **_k: _managed_ci_types.ManagedCiOutcome(
             status="passed", head_sha=metadata.head_sha,
         ),
     )
@@ -15811,8 +15827,10 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
 
 import coding_review_agent_loop.pr_loop as pr_loop_module  # noqa: E402
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck  # noqa: E402
-from coding_review_agent_loop.managed_ci import (  # noqa: E402
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiOutcome,
+)
+from coding_review_agent_loop.managed_ci import (
     ManagedRerunResult,
     classify_managed_jobs,
     plumbing_check_names,
@@ -16538,7 +16556,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     def wait(*_args, **kwargs):
         contract = kwargs["contract"]
         events.append(("wait", contract.attached_run_id, contract.run_attempt))
-        return managed_ci.ManagedCiOutcome(
+        return _managed_ci_types.ManagedCiOutcome(
             status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="passing", required_checks=(FINAL_CONTEXT,),

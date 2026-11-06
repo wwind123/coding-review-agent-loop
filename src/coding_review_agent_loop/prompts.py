@@ -38,7 +38,10 @@ from .ci_health import partition_exclusion_notes
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
 from .memory import AgentMemoryContext, format_agent_memory_context
-from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
+from .managed_ci_types import (
+    ManagedCiCreationIntent,
+    UNPROTECTED_OVERRIDE_TRAILER,
+)
 from .salvage import AGENT_SALVAGE_MARKER_RE
 from .round_transport import (
     MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,

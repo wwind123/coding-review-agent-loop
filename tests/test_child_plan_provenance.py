@@ -1478,7 +1478,9 @@ def test_interrupted_issue_created_managed_run_logs_issue_resume_command(
     tmp_path, monkeypatch
 ):
     """#1662: the retaining-label line names the relaunch-list command."""
-    from coding_review_agent_loop.managed_ci import ManagedCiContract
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedCiContract,
+    )
 
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan)

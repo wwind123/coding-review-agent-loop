@@ -1001,9 +1001,11 @@ def test_operator_early_ci_dispatch_stays_diagnostic_and_never_qualifies(tmp_pat
 # --- Post-approval plumbing classification (#1477) --------------------------
 
 from coding_review_agent_loop.ci_health import check_name_matches, classify_watch_failure
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     MANAGED_PLUMBING_JOB_NAMES,
     PLUMBING_STATUS_CONTEXTS,
+)
+from coding_review_agent_loop.managed_ci import (
     is_plumbing_check,
     plumbing_check_names,
 )

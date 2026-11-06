@@ -6,7 +6,10 @@ from unittest.mock import patch
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
+from coding_review_agent_loop.managed_ci_types import (
+    ManagedCiCreationIntent,
+    UNPROTECTED_OVERRIDE_TRAILER,
+)
 from coding_review_agent_loop.managed_pr import (
     SOURCE_MARKER,
     _compose_body,

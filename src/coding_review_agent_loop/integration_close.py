@@ -68,11 +68,13 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
     from .github import read_rest_issue_comments
     from .managed_ci import (
         IntentBinding,
+        match_intent_envelope,
+        validate_intent_record,
+    )
+    from .managed_ci_api import (
         _api_json,
         _read_managed_actor_variable,
         _resolve_advertised_actor,
-        match_intent_envelope,
-        validate_intent_record,
     )
 
     try:

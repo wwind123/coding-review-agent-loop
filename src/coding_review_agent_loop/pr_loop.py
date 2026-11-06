@@ -167,12 +167,10 @@ from .split_materialization import (
 )
 from .logging import log
 from .memory import prepare_agent_memory
+from .managed_ci_types import AuthenticatedManagedResume, AuthenticatedIssueCreatedHandoff, OrdinaryRecoveryCapability
 from .managed_ci import (
-    AuthenticatedManagedResume,
-    AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
     MANAGED_LABEL,
-    OrdinaryRecoveryCapability,
     activate_managed_ci,
     managed_ci_attachment_matches_head,
     release_stale_managed_ci_attachment,

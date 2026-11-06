@@ -16,7 +16,9 @@ from .workdirs import active_workdir
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
     from .runner import Runner
-    from .managed_ci import ManagedCiContract
+    from .managed_ci_types import (
+        ManagedCiContract,
+    )
 
 
 class PrHeadObservationError(AgentLoopError):
