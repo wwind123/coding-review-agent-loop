@@ -47,6 +47,13 @@ import coding_review_agent_loop.response_validation as response_validation
 from agent_loop_helpers import patch_attr_in
 
 
+def _code_requirement_review(payload=None, **kwargs):
+    """Script a code classification independently from acknowledgement success."""
+    from pr_loop_test_helpers import _with_code_classification
+    return _with_code_classification(structured_pr_review(**kwargs),
+        _parse_pr_human_requirements(payload or ack_pr_payload()))
+
+
 def test_pr_loop_reinjects_blocking_item_when_human_requirement_marker_missing(tmp_path):
     # Reviewer approves without HUMAN_REQUIREMENTS_RESOLVED → synthetic blocking item,
     # loop hits max_rounds (set to 1) instead of a terminal deadlock.
@@ -71,6 +78,7 @@ def test_pr_loop_reinjects_blocking_item_when_human_requirement_marker_missing(t
             "reviews": [],
         },
     )
+    runner.codex_outputs[0] = _code_requirement_review(runner.pr_payload)
     config = make_config(
         tmp_path,
         auto_merge=True,
@@ -128,6 +136,7 @@ def test_pr_loop_recovers_when_second_reviewer_includes_human_requirement_marker
         ],
         pr_payload=pr_payload,
     )
+    runner.codex_outputs[0] = _code_requirement_review(runner.pr_payload)
     config = make_config(tmp_path, max_rounds=2)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -419,6 +428,7 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
         },
         advance_pr_head_on_coder_followup=False,
     )
+    runner.codex_outputs[0] = _code_requirement_review(runner.pr_payload, state="blocking", blocking_items=["Blocking issue."])
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
     metadata = PullRequestMetadata(
         number=77,
@@ -950,7 +960,7 @@ def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tm
     requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
     runner = FakeRunner(
         pr_payload=ack_pr_payload(),
-        codex_outputs=[structured_pr_review(), structured_pr_review(), structured_pr_review(human_requirements_resolved=True)],
+        codex_outputs=[_code_requirement_review(), _code_requirement_review(), _code_requirement_review(human_requirements_resolved=True)],
         claude_outputs=[structured_coder_followup(human_requirement_ids=[requirement_id])] * 2,
     )
     clears = []
@@ -980,7 +990,7 @@ def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_pat
     calls = _exhaust_ack_repair(monkeypatch)
     runner = FakeRunner(
         pr_payload=ack_pr_payload(ack_resume_history(promoted=True, coder_ack=True, unrelated=False)),
-        gemini_outputs=[structured_pr_review(reviewer="Google Gemini")],
+        gemini_outputs=[_code_requirement_review(reviewer="Google Gemini")],
     )
     with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
@@ -1004,7 +1014,7 @@ def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monke
     prior = (future,)
     history = [durable_record((high_item,), round_number=1),
                durable_record(prior, round_number=round_number)]
-    runner = FakeRunner(pr_payload=ack_pr_payload(history), codex_outputs=[structured_pr_review(
+    runner = FakeRunner(pr_payload=ack_pr_payload(history), codex_outputs=[_code_requirement_review(
         prior_item_dispositions=[{"item_id": "item-7", "disposition": "future", "note": "Keep deferred."}],
     )])
     with pytest.raises(AgentLoopError, match=f"blocking issues after round {round_number}"):
@@ -1029,8 +1039,8 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     calls = _exhaust_ack_repair(monkeypatch)
     runner = FakeRunner(
         pr_payload=ack_pr_payload(),
-        codex_outputs=[structured_pr_review(human_requirements_resolved=False)],
-        gemini_outputs=[structured_pr_review(reviewer="Google Gemini")],
+        codex_outputs=[_code_requirement_review(human_requirements_resolved=False)],
+        gemini_outputs=[_code_requirement_review(reviewer="Google Gemini")],
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
@@ -1047,8 +1057,8 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     publications = [r for r in before if r.metadata.phase == "publication"]
     assert {r.metadata.agent for r in publications} == {"Codex", "Gemini"}
     assert len(calls) == 2
-    runner.codex_outputs.append(structured_pr_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
-    runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
+    runner.codex_outputs.append(_code_requirement_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
+    runner.gemini_outputs.append(_code_requirement_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     if not fresh_read:
         real_context = runner.run
         monkeypatch.setattr("coding_review_agent_loop.github_retry._sleep", lambda _: None)
@@ -1088,7 +1098,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("mode", ["compact", "full"])
-@pytest.mark.parametrize("classification_pass", [False, True])
+@pytest.mark.parametrize("classification_pass", ["classified", "request-only", "standalone"])
 @pytest.mark.parametrize("resumed", [False, True])
 def test_human_only_signed_requirement_freezes_without_coder(tmp_path, capsys, mode, classification_pass, resumed):
     from pr_loop_test_helpers import (_classified_review, _association, _evidence_review,
@@ -1104,9 +1114,12 @@ def test_human_only_signed_requirement_freezes_without_coder(tmp_path, capsys, m
     pending = [{"item_id": "item-1", "disposition": "blocking", "note": "Human acceptance remains pending."}] if resumed else []
     review_args = {"state": "blocking" if resumed else "approved", "dispositions": pending, "evidence": [_EVIDENCE_TEXT]}
     classified = _classified_review([_association(rid, "human-only", request=_EVIDENCE_TEXT)], **review_args)
-    runner.codex_outputs = ([_evidence_review(**review_args)] if classification_pass else []) + [classified]
+    initial_args = {**review_args, "evidence": []} if classification_pass == "standalone" else review_args
+    runner.codex_outputs = ([_evidence_review(**initial_args)] if classification_pass != "classified" else []) + [classified]
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_freeze_records(runner)) == 1
+    assert not runner.codex_outputs
     freeze = _freeze_records(runner)[-1].metadata
     assert len(freeze.prior_items) == 1
     assert freeze.prior_items[0].text == _EVIDENCE_TEXT
@@ -1173,3 +1186,47 @@ def test_legacy_ack_gate_clears_after_real_evidence_classification(tmp_path, rol
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
         assert not _freeze_records(runner)
     assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+@pytest.mark.parametrize("fault", ["absent", "role", "leftover"])
+def test_unsettled_signed_routing_stops_before_coder(tmp_path, capsys, mode, fault):
+    from pr_loop_test_helpers import (_classified_review, _association, _evidence_review,
+        _signed, _EVIDENCE_TEXT, _pr_records)
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy. Also fix retries.", 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    if fault == "absent":
+        runner.codex_outputs = [_evidence_review(), _evidence_review()]
+        reviewers = "codex"
+    else:
+        # Publish the requester's pending human evidence before another seat
+        # disagrees, then leave that disagreement intact in its real continuation.
+        first = _association(rid, "human-only", request=_EVIDENCE_TEXT)
+        second = _association(rid, "code")
+        if fault == "leftover":
+            from test_pr_loop_early_evidence import deferred
+            runner, _ = deferred(tmp_path, mode=mode, two_owners=True)
+            runner.pr_payload["comments"].append(_signed("Accepted. Also fix retries.", 1))
+            rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+            first = _association(rid, "mixed", answers=["item-1"], leftover="Fix retries.")
+            second = _association(rid, "mixed", answers=["item-2"], leftover="Repair retries.")
+        dispositions = [{"item_id": f"item-{i}", "disposition": "blocking", "note": "Human acceptance remains pending."}
+            for i in (1, 2)] if fault == "leftover" else []
+        runner.codex_outputs = [_classified_review([first], evidence=[_EVIDENCE_TEXT],
+            dispositions=dispositions, state="blocking" if dispositions else "approved")]
+        disagreeing = _classified_review([second], reviewer="Google Gemini",
+            dispositions=dispositions, state="blocking" if dispositions else "approved")
+        runner.gemini_outputs = [disagreeing, disagreeing]
+        reviewers = ("codex", "gemini")
+    config = make_config(tmp_path, pr_review_context_mode=mode, reviewer=reviewers, review_parallel=False)
+    with pytest.raises(HumanDecisionRequiredError, match="classification remained"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    assert "re-injecting as blocking item" not in capsys.readouterr().err
+    assert _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id == rid
+    if fault != "absent":
+        assert any(r.metadata.evidence_requests for r in _pr_records(runner))

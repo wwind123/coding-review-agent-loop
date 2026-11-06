@@ -260,6 +260,14 @@ def _classified_review(associations, **kwargs):
     return json.dumps(payload) + "\n<!--" + footer
 
 
+
+def _with_code_classification(output, requirements):
+    """Keep acknowledgement fixtures code-actionable without inventing a re-ask."""
+    raw, footer = output.split("\n<!--", 1)
+    payload = json.loads(raw)
+    payload["requirement_evidence"] = [_association(r.requirement_id, "code") for r in requirements]
+    return json.dumps(payload) + "\n<!--" + footer
+
 def _signed(body, index):
     return {
         "author": {"login": "maintainer"},

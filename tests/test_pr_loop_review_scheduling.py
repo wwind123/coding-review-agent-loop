@@ -1614,6 +1614,8 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         gemini_outputs=[_staged_review(reviewer="Google Gemini")],
         antigravity_outputs=[_staged_review(reviewer="Antigravity", resolved=True)],
     )
+    from pr_loop_test_helpers import _with_code_classification
+    runner.gemini_outputs[0] = _with_code_classification(runner.gemini_outputs[0], [requirement])
     config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
     monkeypatch.setattr(
         pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with an unacknowledged requirement")

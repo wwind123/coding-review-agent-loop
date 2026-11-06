@@ -113,18 +113,18 @@ def project(requirements, reviews, items):
 
 
 def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke, previous=None):
-    """One bounded semantic continuation when evidence lacks source classification."""
+    """Settle unacknowledged source routing with one bounded semantic continuation."""
     from .protocol import human_requirements_resolved
-    from .native_evidence import open_native
     classified = {e["requirement_id"] for e in parsed.requirement_evidence}
     missing = {r.requirement_id for r in requirements} - classified
     previous_entries = [e for review in (previous or {}).values() for e in review.requirement_evidence]
-    conflicts = [e for e in parsed.requirement_evidence if any(
-        p["requirement_id"] == e["requirement_id"] and
-        (p["role"], p["leftover_instructions"]) != (e["role"], e["leftover_instructions"])
-        for p in previous_entries)]
-    evidence_context = parsed.exact_head_evidence_requests or any(open_native(i) for i in items)
-    if conflicts or (requirements and missing and evidence_context
+    def conflicts_with_previous(review):
+        return [e for e in review.requirement_evidence if any(
+            p["requirement_id"] == e["requirement_id"] and
+            (p["role"], p["leftover_instructions"]) != (e["role"], e["leftover_instructions"])
+            for p in previous_entries)]
+
+    if conflicts_with_previous(parsed) or (requirements and missing
             and (parsed.requirement_evidence or not human_requirements_resolved(text))):
         import json
         from .errors import HumanDecisionRequiredError
@@ -142,6 +142,8 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
         parsed, text = response.marker_value, response.text
         if {r.requirement_id for r in requirements} - {e["requirement_id"] for e in parsed.requirement_evidence}:
             raise HumanDecisionRequiredError("Signed-source classification remained absent; no coder was dispatched for human evidence.")
+        if conflicts_with_previous(parsed):
+            raise HumanDecisionRequiredError("Signed-source classification remained conflicting; retained signed sources and pending evidence require reviewer agreement or a human decision before coder dispatch.")
     # Live turns validate associations before publication. Legacy replay may carry
     # invalid entries; project retains their full source rather than aborting.
     return parsed, text

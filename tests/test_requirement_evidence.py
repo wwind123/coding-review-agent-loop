@@ -127,14 +127,21 @@ def test_invalid_association_shape(field, value):
         parse_associations([entry])
 
 
-def test_conflicting_classification_gets_one_real_continuation():
+@pytest.mark.parametrize("resolved", [False, True])
+def test_conflicting_classification_gets_one_real_continuation(resolved):
     items, entry, text, parsed = setup_role()
     previous = {"Gemini": dataclasses.replace(parsed, requirement_evidence=(_association(SOURCE.requirement_id, "code"),))}
     calls = []
     def invoke(prompt):
         calls.append(prompt)
-        return SimpleNamespace(marker_value=parsed, text=text)
-    result, _ = classify_review(parsed, text, requirements=[SOURCE], items=items,
-        reviewer_name="Codex", invoke=invoke, previous=previous)
+        return SimpleNamespace(marker_value=previous["Gemini"] if resolved else parsed, text=text)
+    def run():
+        return classify_review(parsed, text, requirements=[SOURCE], items=items,
+            reviewer_name="Codex", invoke=invoke, previous=previous)
+    if resolved:
+        result, _ = run()
+        assert project([SOURCE], {**previous, "Codex": result}, items) == (SOURCE,)
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match="classification remained conflicting"):
+            run()
     assert len(calls) == 1
-    assert project([SOURCE], {**previous, "Codex": result}, items) == (SOURCE,)
