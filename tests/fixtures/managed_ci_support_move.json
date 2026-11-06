@@ -1,0 +1,2708 @@
+{
+  "source_revision": "b9be4e0fc2a6147f03def6234e188adfc5e30264",
+  "owners": {
+    "managed_ci_types": {
+      "MANAGED_OPT_OUT_LABEL": {
+        "sha256": "fa587efc57a70f70cf056dc4fbcd1380f5d6917f40a72dd575b696e72b2f94ba",
+        "original_lines": [
+          126,
+          126
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:32",
+          "tests/test_managed_ci.py:7868"
+        ]
+      },
+      "QUALIFIED_LABEL": {
+        "sha256": "6ea8b43a041105fdac035059d64c292ad7043c2c10d6c1445efdb083871b0e0c",
+        "original_lines": [
+          127,
+          127
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci_integration_paths.py:158",
+          "tests/test_managed_ci_integration_paths.py:177",
+          "tests/test_managed_ci_integration_bases.py:18",
+          "tests/test_managed_ci_integration_bases.py:207",
+          "tests/test_managed_ci_integration_bases.py:591",
+          "tests/test_managed_ci.py:13653",
+          "tests/test_managed_ci.py:13763",
+          "tests/test_managed_ci.py:13983",
+          "tests/test_managed_ci.py:14266",
+          "tests/test_managed_ci.py:14376",
+          "tests/test_managed_ci.py:14389",
+          "tests/test_pr_loop_managed_ci.py:1372"
+        ]
+      },
+      "QUALIFICATION_MARKER": {
+        "sha256": "956c118f4a6453e34c7c9ec0eb41a4270507c7c0c5d5c6b55c149bb8f6fb9f2d",
+        "original_lines": [
+          128,
+          128
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci_integration_bases.py:16",
+          "tests/test_managed_ci_integration_bases.py:609",
+          "tests/test_managed_ci.py:33",
+          "tests/test_managed_ci.py:6138",
+          "tests/test_managed_ci.py:6150",
+          "tests/test_managed_ci.py:6153",
+          "tests/test_managed_ci.py:6179",
+          "tests/test_managed_ci.py:6204",
+          "tests/test_managed_ci.py:6230",
+          "tests/test_managed_ci.py:6328",
+          "tests/test_managed_ci.py:8728"
+        ]
+      },
+      "MANAGED_PLUMBING_JOB_NAMES": {
+        "sha256": "df0a0b93606d7b42a4e466fd05de3c670edb126f585812cea34b11a3cfdbee15",
+        "original_lines": [
+          134,
+          138
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:28",
+          "tests/test_ci_health.py:1005",
+          "tests/test_ci_health.py:1011",
+          "tests/test_workflow_contract.py:2346"
+        ]
+      },
+      "PLUMBING_STATUS_CONTEXTS": {
+        "sha256": "67e24626c103b59d5010f6385f543ee940d4f862e9d05a40ad8f52644c84e109",
+        "original_lines": [
+          139,
+          139
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:35",
+          "tests/test_ci_health.py:1006",
+          "tests/test_ci_health.py:1011",
+          "tests/test_workflow_contract.py:2347"
+        ]
+      },
+      "READINESS_CONTEXT": {
+        "sha256": "0c54f6d5ef83136fc8a1087bf2485cd078d406b3ae4aab0fb017d79450745984",
+        "original_lines": [
+          140,
+          140
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:38",
+          "tests/test_managed_ci.py:34",
+          "tests/test_managed_ci.py:6996",
+          "tests/test_managed_ci.py:11443"
+        ]
+      },
+      "WORKFLOW_FILE": {
+        "sha256": "8b4bff4f559e7fcf2e3ed286e5dbb3403d122d7ed7dadc737d51753fcadce81a",
+        "original_lines": [
+          141,
+          141
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:41",
+          "src/coding_review_agent_loop/managed_ci_types.py:204",
+          "src/coding_review_agent_loop/managed_ci_api.py:37",
+          "src/coding_review_agent_loop/managed_ci_api.py:243",
+          "src/coding_review_agent_loop/managed_ci_failure.py:25"
+        ]
+      },
+      "_CONTRACT_MARKERS": {
+        "sha256": "9fa1a9b224d6f8ede71e8054c5ed6cce365a6001049ecb9ff64059d0ea156d4c",
+        "original_lines": [
+          142,
+          142
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:44",
+          "tests/test_docs_guidance.py:1280"
+        ]
+      },
+      "V2_MARKER": {
+        "sha256": "6cbb7f116c4a986b7d7ba4e9ca08a79f21f8ecebddd7a17b87724774aef72bea",
+        "original_lines": [
+          143,
+          143
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:47",
+          "src/coding_review_agent_loop/managed_ci_types.py:53"
+        ]
+      },
+      "INTENT_MARKER": {
+        "sha256": "4fecfaa7d367511c5abfe094bd4ab101f5387d7935073483c08851c6f0d17726",
+        "original_lines": [
+          144,
+          144
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:50",
+          "src/coding_review_agent_loop/managed_ci_types.py:70",
+          "src/coding_review_agent_loop/managed_ci_types.py:76",
+          "tests/test_docs_guidance.py:1283",
+          "tests/test_docs_guidance.py:1284",
+          "tests/test_workflow_contract.py:762",
+          "tests/test_workflow_contract.py:1129",
+          "tests/test_workflow_contract.py:2377",
+          "tests/test_managed_ci.py:8529",
+          "tests/test_managed_ci.py:8532",
+          "tests/test_managed_ci.py:11167"
+        ]
+      },
+      "V2_FEATURE_MARKERS": {
+        "sha256": "a1b202115111d7938be045fcf02e05d212257e9d44936cb10d159a24c8e26d17",
+        "original_lines": [
+          145,
+          145
+        ],
+        "same_module_references": [
+          "V2_MARKER"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:53",
+          "tests/test_docs_guidance.py:1281",
+          "tests/test_workflow_contract.py:1127"
+        ]
+      },
+      "V2_ADOPTION_MARKER": {
+        "sha256": "d343719845b79dca0eeeea6c296c52059b1ecc6326fd687a0646d936112997c2",
+        "original_lines": [
+          149,
+          149
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:59",
+          "src/coding_review_agent_loop/managed_ci_types.py:62"
+        ]
+      },
+      "V2_ADOPTION_FEATURE_MARKERS": {
+        "sha256": "3c2d0a88758e7f5774c910e9e41c854bec64b93853d17f054cfd745b71b5715e",
+        "original_lines": [
+          150,
+          150
+        ],
+        "same_module_references": [
+          "V2_ADOPTION_MARKER"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:62"
+        ]
+      },
+      "RECOVERY_MARKER": {
+        "sha256": "aecf3ffd3feaf91fec1445377796fce2e07ed35a4c52e6d1b78e226ce5cf0ec5",
+        "original_lines": [
+          151,
+          151
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:65",
+          "tests/test_docs_guidance.py:1282",
+          "tests/test_workflow_contract.py:1128"
+        ]
+      },
+      "VISIBLE_INTENT_MARKER": {
+        "sha256": "8f82566f1021a88b634088d6858195be9d834be59e4b35508c74fad72e10c5db",
+        "original_lines": [
+          154,
+          154
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:70",
+          "tests/test_docs_guidance.py:1283",
+          "tests/test_workflow_contract.py:1129"
+        ]
+      },
+      "HOST_FOOTER_INTENT_MARKER": {
+        "sha256": "96cadcf628f1689a3e9c0ed91fcff93dd0f6e150660fe6aaffcf7850f33b1452",
+        "original_lines": [
+          158,
+          158
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:76",
+          "tests/test_docs_guidance.py:1284",
+          "tests/test_workflow_contract.py:762",
+          "tests/test_workflow_contract.py:1129",
+          "tests/test_managed_ci.py:11167"
+        ]
+      },
+      "UNPROTECTED_OVERRIDE_TRAILER": {
+        "sha256": "9ecbfe1b3df2ceb72f63cd19f32247d881f3dcec50835defae24d6a387dc5d9c",
+        "original_lines": [
+          159,
+          159
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:79",
+          "src/coding_review_agent_loop/managed_pr.py:17",
+          "src/coding_review_agent_loop/managed_pr.py:105",
+          "src/coding_review_agent_loop/managed_pr.py:106",
+          "src/coding_review_agent_loop/managed_pr.py:168",
+          "src/coding_review_agent_loop/managed_pr.py:170",
+          "src/coding_review_agent_loop/managed_pr.py:207",
+          "src/coding_review_agent_loop/prompts.py:41",
+          "src/coding_review_agent_loop/prompts.py:2454",
+          "tests/test_managed_plan_binding.py:472",
+          "tests/test_managed_plan_binding.py:498",
+          "tests/test_issue_implementation_coverage_reask.py:26",
+          "tests/test_issue_implementation_coverage_reask.py:510",
+          "tests/test_issue_implementation_coverage_reask.py:713",
+          "tests/test_managed_ci.py:38",
+          "tests/test_managed_ci.py:600",
+          "tests/test_managed_ci.py:611",
+          "tests/test_managed_ci.py:772",
+          "tests/test_managed_ci.py:832",
+          "tests/test_managed_ci.py:4351",
+          "tests/test_managed_ci.py:4364",
+          "tests/test_managed_ci.py:4368",
+          "tests/test_managed_ci.py:4427",
+          "tests/test_managed_ci.py:4429",
+          "tests/test_managed_ci.py:4434",
+          "tests/test_managed_ci.py:4435",
+          "tests/test_managed_ci.py:4436",
+          "tests/test_managed_ci.py:4496",
+          "tests/test_managed_ci.py:4538",
+          "tests/test_managed_ci.py:4580",
+          "tests/test_managed_ci.py:4687",
+          "tests/test_managed_ci.py:4691",
+          "tests/test_managed_ci.py:5359",
+          "tests/test_managed_ci.py:5386",
+          "tests/test_managed_ci.py:5426",
+          "tests/test_managed_ci.py:5491",
+          "tests/test_managed_ci.py:8642",
+          "tests/test_managed_ci.py:8660",
+          "tests/test_managed_ci.py:8691",
+          "tests/test_managed_ci.py:8821",
+          "tests/test_managed_ci.py:9321",
+          "tests/test_managed_ci.py:9360",
+          "tests/test_managed_ci.py:9944",
+          "tests/test_managed_ci.py:9964",
+          "tests/test_managed_ci.py:10158",
+          "tests/test_managed_ci.py:10458",
+          "tests/test_issue_implementation_managed_pr.py:12",
+          "tests/test_issue_implementation_managed_pr.py:88",
+          "tests/test_issue_implementation_managed_pr.py:283",
+          "tests/test_issue_implementation_managed_pr.py:351",
+          "tests/test_issue_implementation_managed_pr.py:429",
+          "tests/test_managed_pr.py:9",
+          "tests/test_managed_pr.py:121",
+          "tests/test_managed_pr.py:272",
+          "tests/test_plan_first_loop_issue_scope.py:17",
+          "tests/test_plan_first_loop_issue_scope.py:1198",
+          "tests/test_issue_implementation_recovery.py:22",
+          "tests/test_issue_implementation_recovery.py:891",
+          "tests/issue_loop_test_helpers.py:30",
+          "tests/issue_loop_test_helpers.py:488",
+          "tests/test_pr_loop_managed_ci.py:53",
+          "tests/test_pr_loop_managed_ci.py:1102"
+        ]
+      },
+      "TRUSTED_BASES_MARKER": {
+        "sha256": "39de17ae66d02b7e30ef24a4fa3817f6f5c4472c4301652fa77ab045c34319ab",
+        "original_lines": [
+          163,
+          163
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:85",
+          "tests/test_managed_ci_integration_paths.py:15",
+          "tests/test_managed_ci_integration_paths.py:44",
+          "tests/test_managed_ci_integration_bases.py:19",
+          "tests/test_managed_ci_integration_bases.py:31",
+          "tests/test_managed_ci_integration_bases.py:141",
+          "tests/test_managed_ci_integration_bases.py:142",
+          "tests/test_docs_guidance.py:1285"
+        ]
+      },
+      "TRUSTED_BASES_VARIABLE": {
+        "sha256": "64b312035d3bf21ba4e79626c9e484cd7e468c8307b86cefc545ccc07734d0d7",
+        "original_lines": [
+          164,
+          164
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:88"
+        ]
+      },
+      "ISSUE_AUTHORIZATION_MARKER": {
+        "sha256": "d4ad342af15a39e825111dd7f77296077b13b5d264ac126a8c621dd3a46d8ff5",
+        "original_lines": [
+          165,
+          165
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:91",
+          "tests/test_managed_ci.py:5111",
+          "tests/test_managed_ci.py:5145",
+          "tests/test_managed_ci.py:5168",
+          "tests/test_managed_ci.py:8405",
+          "tests/test_managed_ci.py:9854"
+        ]
+      },
+      "_TERMINAL_CI_STATUSES": {
+        "sha256": "b4cbcd6cf2f8338f32b3021745604bfc367f22c4cd96577604bd8a630f156b29",
+        "original_lines": [
+          166,
+          169
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:94",
+          "src/coding_review_agent_loop/managed_ci_failure.py:220",
+          "src/coding_review_agent_loop/managed_ci_failure.py:227",
+          "src/coding_review_agent_loop/managed_ci_failure.py:232",
+          "src/coding_review_agent_loop/managed_ci_failure.py:245"
+        ]
+      },
+      "ManagedCiProbeContext": {
+        "sha256": "5f6c4d6f347f4fe0e8b097a7d2836cf7a09669b81a5ef8d38af373b844746953",
+        "original_lines": [
+          213,
+          219
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:101",
+          "src/coding_review_agent_loop/cli.py:63",
+          "src/coding_review_agent_loop/cli.py:2910",
+          "src/coding_review_agent_loop/managed_ci_api.py:35",
+          "src/coding_review_agent_loop/managed_ci_api.py:82",
+          "src/coding_review_agent_loop/managed_ci_api.py:89",
+          "src/coding_review_agent_loop/managed_ci_api.py:101",
+          "src/coding_review_agent_loop/managed_ci_api.py:239",
+          "src/coding_review_agent_loop/managed_ci_protection.py:18",
+          "src/coding_review_agent_loop/managed_ci_protection.py:195",
+          "tests/test_managed_ci_integration_paths.py:16",
+          "tests/test_managed_ci_integration_paths.py:96",
+          "tests/test_managed_ci_integration_bases.py:379",
+          "tests/test_managed_ci.py:36",
+          "tests/test_managed_ci.py:524",
+          "tests/test_managed_ci.py:543",
+          "tests/test_managed_ci.py:554",
+          "tests/test_managed_ci.py:585",
+          "tests/test_managed_ci.py:4248",
+          "tests/test_managed_ci.py:4271",
+          "tests/test_managed_ci.py:4292",
+          "tests/test_managed_ci.py:9124"
+        ]
+      },
+      "ProtectionAssessment": {
+        "sha256": "a3f1fb7997873f40cbe1358c4e346daf30a6ada404153bda4e76492c5328db2c",
+        "original_lines": [
+          222,
+          228
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:110",
+          "src/coding_review_agent_loop/managed_ci_types.py:128",
+          "src/coding_review_agent_loop/managed_ci_protection.py:19",
+          "src/coding_review_agent_loop/managed_ci_protection.py:62",
+          "src/coding_review_agent_loop/managed_ci_protection.py:63",
+          "src/coding_review_agent_loop/managed_ci_protection.py:196",
+          "src/coding_review_agent_loop/managed_ci_protection.py:240",
+          "src/coding_review_agent_loop/managed_ci_protection.py:259",
+          "src/coding_review_agent_loop/managed_ci_protection.py:263",
+          "src/coding_review_agent_loop/managed_ci_protection.py:264",
+          "src/coding_review_agent_loop/managed_ci_protection.py:266",
+          "src/coding_review_agent_loop/managed_ci_protection.py:267",
+          "src/coding_review_agent_loop/managed_ci_protection.py:284",
+          "src/coding_review_agent_loop/managed_ci_protection.py:304",
+          "src/coding_review_agent_loop/managed_ci_protection.py:307",
+          "src/coding_review_agent_loop/managed_ci_protection.py:312",
+          "src/coding_review_agent_loop/managed_ci_protection.py:317",
+          "src/coding_review_agent_loop/managed_ci_protection.py:319",
+          "src/coding_review_agent_loop/managed_ci_protection.py:320",
+          "tests/test_agent_loop.py:45",
+          "tests/test_agent_loop.py:1039",
+          "tests/test_agent_loop.py:1052",
+          "tests/test_managed_ci.py:9475"
+        ]
+      },
+      "ManagedCiReadiness": {
+        "sha256": "a0a01f384846ae814db1cfb0ecda85d84c3ab61ef1b6b4929ae9c7130bd27fc4",
+        "original_lines": [
+          231,
+          250
+        ],
+        "same_module_references": [
+          "ProtectionAssessment"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:119",
+          "tests/test_agent_loop.py:45",
+          "tests/test_agent_loop.py:1037",
+          "tests/test_agent_loop.py:1050"
+        ]
+      },
+      "ManagedActorVariable": {
+        "sha256": "1f4486113078f5b97248a732f975f45539e48cbe99d478a653866a9e5471cc4f",
+        "original_lines": [
+          253,
+          259
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:141",
+          "src/coding_review_agent_loop/managed_ci_api.py:34",
+          "src/coding_review_agent_loop/managed_ci_api.py:153",
+          "src/coding_review_agent_loop/managed_ci_api.py:160",
+          "src/coding_review_agent_loop/managed_ci_api.py:175",
+          "src/coding_review_agent_loop/managed_ci_api.py:179",
+          "src/coding_review_agent_loop/managed_ci_api.py:180",
+          "src/coding_review_agent_loop/managed_ci_api.py:182",
+          "src/coding_review_agent_loop/managed_ci_api.py:186",
+          "src/coding_review_agent_loop/managed_ci_api.py:188",
+          "src/coding_review_agent_loop/managed_ci_api.py:195"
+        ]
+      },
+      "_UNPROTECTED_WAIVER": {
+        "sha256": "2a028fc0d8732f5c20e3baea451eca60de9f73097fa1e4efe953a62c0bd0f654",
+        "original_lines": [
+          264,
+          264
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:151",
+          "src/coding_review_agent_loop/managed_ci_protection.py:22",
+          "src/coding_review_agent_loop/managed_ci_protection.py:55"
+        ]
+      },
+      "_UNREADABLE_WAIVER": {
+        "sha256": "899d75c0f8533fd68ec57e3bc156964c851de5f341926d20ec170ace77412f55",
+        "original_lines": [
+          265,
+          265
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:154",
+          "src/coding_review_agent_loop/managed_ci_protection.py:24",
+          "src/coding_review_agent_loop/managed_ci_protection.py:57"
+        ]
+      },
+      "_OVERRIDE_PROTECTION_STATES": {
+        "sha256": "e8c8c5434e7315689b112a8197843aebdbad85d25c2319a5ec79c69fe2cbba65",
+        "original_lines": [
+          266,
+          266
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:157",
+          "src/coding_review_agent_loop/managed_ci_protection.py:21",
+          "src/coding_review_agent_loop/managed_ci_protection.py:41"
+        ]
+      },
+      "_UNREADABLE_PROTECTION_DETAIL": {
+        "sha256": "f39c43c1f0d18b59d5e19515167a05f5efeb31f79a15c2af2c859b6872e1ea8c",
+        "original_lines": [
+          267,
+          270
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:160",
+          "src/coding_review_agent_loop/managed_ci_protection.py:23",
+          "src/coding_review_agent_loop/managed_ci_protection.py:263",
+          "src/coding_review_agent_loop/managed_ci_protection.py:314"
+        ]
+      },
+      "_HIDDEN_BYPASS_DETAIL": {
+        "sha256": "c81fd1a10d502a730df615fa5aa38c01748e5c56b2ba8a02b7f0d0d435f90470",
+        "original_lines": [
+          271,
+          273
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:166",
+          "src/coding_review_agent_loop/managed_ci_protection.py:20",
+          "src/coding_review_agent_loop/managed_ci_protection.py:314"
+        ]
+      },
+      "PREFLIGHT_STRICT_READY": {
+        "sha256": "8d09b41bac3d3a71121af17c6399ef90beb5baabe0f02da9b8c37d096590cc32",
+        "original_lines": [
+          326,
+          326
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:171",
+          "src/coding_review_agent_loop/cli.py:62",
+          "src/coding_review_agent_loop/cli.py:2916"
+        ]
+      },
+      "PREFLIGHT_KNOWN_NOT_READY": {
+        "sha256": "b4e76422daa9db997f35fe8827fbb8a269c712632baa66d58d895fe1f86b755e",
+        "original_lines": [
+          327,
+          327
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:174",
+          "src/coding_review_agent_loop/cli.py:61",
+          "src/coding_review_agent_loop/cli.py:2919"
+        ]
+      },
+      "PREFLIGHT_INDETERMINATE": {
+        "sha256": "1fa9ec49e69b74d6da01ec1cbdc713fe7c4a64a1852a482c1197946a1fa4d733",
+        "original_lines": [
+          328,
+          328
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:177",
+          "src/coding_review_agent_loop/cli.py:60",
+          "src/coding_review_agent_loop/cli.py:2918",
+          "src/coding_review_agent_loop/cli.py:2922"
+        ]
+      },
+      "V1_DISPATCH_RECORD_LIMIT": {
+        "sha256": "291c6c1c61f95f5c125dcdbac456ec099fa32ba8856f4973b906a5e46b6fe763",
+        "original_lines": [
+          332,
+          332
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:181"
+        ]
+      },
+      "ManagedV1DispatchRecord": {
+        "sha256": "52cae1ff44f704d425de547a43050466b5c789992729ab4c7293cd36809f96e6",
+        "original_lines": [
+          335,
+          350
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/github.py:100",
+          "src/coding_review_agent_loop/github.py:1658",
+          "src/coding_review_agent_loop/github.py:1677",
+          "src/coding_review_agent_loop/github.py:1868",
+          "src/coding_review_agent_loop/github.py:1895",
+          "src/coding_review_agent_loop/managed_ci_types.py:185",
+          "src/coding_review_agent_loop/managed_ci_types.py:273",
+          "tests/test_pr_loop_coder_ci_guard.py:457",
+          "tests/test_pr_loop_coder_ci_guard.py:459"
+        ]
+      },
+      "ManagedCiContract": {
+        "sha256": "39bc23bd19bec9ffbae8fc2a603a2ba921481560b6883ffe66fcfb225e7af36a",
+        "original_lines": [
+          353,
+          424
+        ],
+        "same_module_references": [
+          "ManagedV1DispatchRecord",
+          "WORKFLOW_FILE"
+        ],
+        "decorators": [
+          "dataclass"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_status.py:13",
+          "src/coding_review_agent_loop/orchestrator.py:247",
+          "src/coding_review_agent_loop/managed_ci_types.py:203",
+          "src/coding_review_agent_loop/pr_loop_support.py:86",
+          "src/coding_review_agent_loop/pr_loop_support.py:1263",
+          "src/coding_review_agent_loop/pr_loop_support.py:1337",
+          "src/coding_review_agent_loop/pr_loop_support.py:3814",
+          "src/coding_review_agent_loop/pr_head_sync.py:19",
+          "src/coding_review_agent_loop/pr_head_sync.py:52",
+          "src/coding_review_agent_loop/managed_ci_failure.py:15",
+          "tests/test_child_plan_provenance.py:1481",
+          "tests/test_child_plan_provenance.py:1489",
+          "tests/test_issue_pr_handoff.py:2129",
+          "tests/test_issue_pr_handoff.py:2140",
+          "tests/test_pr_loop_post_merge_obligations.py:528",
+          "tests/test_pr_loop_post_merge_obligations.py:529",
+          "tests/test_pr_loop_post_merge_obligations.py:534",
+          "tests/test_pr_loop_post_merge_obligations.py:541",
+          "tests/test_managed_ci_integration_bases.py:20",
+          "tests/test_managed_ci_integration_bases.py:228",
+          "tests/test_managed_ci_integration_bases.py:259",
+          "tests/test_managed_ci_integration_bases.py:263",
+          "tests/test_managed_ci_integration_bases.py:266",
+          "tests/test_managed_ci_integration_bases.py:271",
+          "tests/test_managed_ci_integration_bases.py:395",
+          "tests/test_managed_ci_integration_bases.py:596",
+          "tests/test_pr_loop_authorization.py:32",
+          "tests/test_pr_loop_authorization.py:74",
+          "tests/test_pr_loop_authorization.py:87",
+          "tests/test_pr_loop_authorization.py:314",
+          "tests/test_managed_ci_reconciliation.py:131",
+          "tests/test_pr_loop_merge.py:17",
+          "tests/test_pr_loop_merge.py:357",
+          "tests/test_pr_loop_merge.py:490",
+          "tests/test_pr_loop_review_scheduling.py:24",
+          "tests/test_pr_loop_review_scheduling.py:928",
+          "tests/test_pr_loop_review_scheduling.py:2923",
+          "tests/test_managed_supersession_loop.py:10",
+          "tests/test_managed_supersession_loop.py:90",
+          "tests/test_pr_loop_ci_gate.py:24",
+          "tests/test_pr_loop_ci_gate.py:559",
+          "tests/test_pr_loop_ci_gate.py:1127",
+          "tests/test_pr_loop_ci_gate.py:1475",
+          "tests/test_pr_loop_coder_ci_guard.py:21",
+          "tests/test_pr_loop_coder_ci_guard.py:179",
+          "tests/test_pr_loop_coder_ci_guard.py:250",
+          "tests/test_pr_loop_coder_ci_guard.py:254",
+          "tests/test_pr_loop_coder_ci_guard.py:670",
+          "tests/test_pr_loop_coder_ci_guard.py:682",
+          "tests/test_pr_loop_coder_ci_guard.py:760",
+          "tests/test_pr_loop_coder_ci_guard.py:1071",
+          "tests/test_workflow_contract.py:2389",
+          "tests/test_pr_loop_evidence_freeze.py:10",
+          "tests/test_pr_loop_evidence_freeze.py:305",
+          "tests/test_managed_ci.py:35",
+          "tests/test_managed_ci.py:2126",
+          "tests/test_managed_ci.py:2260",
+          "tests/test_managed_ci.py:2398",
+          "tests/test_managed_ci.py:6090",
+          "tests/test_managed_ci.py:6862",
+          "tests/test_managed_ci.py:6899",
+          "tests/test_managed_ci.py:6966",
+          "tests/test_managed_ci.py:7104",
+          "tests/test_managed_ci.py:7144",
+          "tests/test_managed_ci.py:12507",
+          "tests/test_managed_ci.py:12512",
+          "tests/test_managed_ci.py:13645",
+          "tests/test_managed_ci.py:14405",
+          "tests/test_managed_ci.py:14422",
+          "tests/test_managed_ci.py:14449",
+          "tests/test_managed_ci.py:15376",
+          "tests/test_managed_ci.py:15999",
+          "tests/test_managed_ci.py:16495",
+          "tests/test_pr_loop_coder_followup.py:22",
+          "tests/test_pr_loop_coder_followup.py:1439",
+          "tests/test_pr_loop_coder_followup.py:2760",
+          "tests/test_issue_implementation_managed_pr.py:9",
+          "tests/test_issue_implementation_managed_pr.py:155",
+          "tests/test_plan_first_loop_issue_scope.py:14",
+          "tests/test_plan_first_loop_issue_scope.py:1214",
+          "tests/test_pr_head_sync.py:282",
+          "tests/test_pr_head_sync.py:283",
+          "tests/test_pr_loop_review_ledger.py:14",
+          "tests/test_pr_loop_review_ledger.py:1087",
+          "tests/test_pr_loop_agent_turns.py:21",
+          "tests/test_pr_loop_agent_turns.py:992",
+          "tests/test_pr_loop_reviewer_boards.py:12",
+          "tests/test_pr_loop_reviewer_boards.py:178",
+          "tests/test_pr_loop_reviewer_boards.py:226",
+          "tests/test_pr_loop_reviewer_boards.py:285",
+          "tests/test_pr_loop_reviewer_boards.py:602",
+          "tests/test_pr_loop_reviewer_boards.py:906",
+          "tests/test_pr_loop_managed_ci.py:18",
+          "tests/test_pr_loop_managed_ci.py:76",
+          "tests/test_pr_loop_managed_ci.py:144",
+          "tests/test_pr_loop_managed_ci.py:239",
+          "tests/test_pr_loop_managed_ci.py:344",
+          "tests/test_pr_loop_managed_ci.py:382",
+          "tests/test_pr_loop_managed_ci.py:389",
+          "tests/test_pr_loop_managed_ci.py:393",
+          "tests/test_pr_loop_managed_ci.py:397",
+          "tests/test_pr_loop_managed_ci.py:474",
+          "tests/test_pr_loop_managed_ci.py:642",
+          "tests/test_pr_loop_managed_ci.py:677",
+          "tests/test_pr_loop_managed_ci.py:697",
+          "tests/test_pr_loop_managed_ci.py:720",
+          "tests/test_pr_loop_managed_ci.py:776",
+          "tests/test_pr_loop_managed_ci.py:807",
+          "tests/test_pr_loop_managed_ci.py:851",
+          "tests/test_pr_loop_managed_ci.py:887",
+          "tests/test_pr_loop_managed_ci.py:981",
+          "tests/test_pr_loop_managed_ci.py:1050",
+          "tests/test_pr_loop_managed_ci.py:1078",
+          "tests/test_pr_loop_managed_ci.py:1251",
+          "tests/test_pr_loop_managed_ci.py:1663",
+          "tests/test_pr_loop_review_images.py:670",
+          "tests/test_pr_loop_review_images.py:672",
+          "tests/test_pr_loop_review_images.py:1122",
+          "tests/test_pr_loop_review_images.py:1141"
+        ]
+      },
+      "ManagedCiCreationIntent": {
+        "sha256": "c5143ea6f29ecd1a6398e451097ded9db6c3811c3d6d9ad9a1c8f374b1747562",
+        "original_lines": [
+          427,
+          434
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:277",
+          "src/coding_review_agent_loop/prompts.py:41",
+          "src/coding_review_agent_loop/prompts.py:2444",
+          "src/coding_review_agent_loop/prompts.py:2479",
+          "src/coding_review_agent_loop/prompts.py:3700",
+          "tests/test_issue_implementation_coverage_reask.py:25",
+          "tests/test_issue_implementation_coverage_reask.py:355",
+          "tests/test_issue_implementation_coverage_reask.py:361",
+          "tests/test_issue_implementation_coverage_reask.py:506",
+          "tests/test_issue_implementation_coverage_reask.py:546",
+          "tests/test_issue_implementation_coverage_reask.py:721",
+          "tests/test_issue_implementation_coverage_reask.py:762",
+          "tests/test_issue_implementation_coverage_reask.py:1097",
+          "tests/test_prompts.py:11",
+          "tests/test_prompts.py:3991",
+          "tests/test_prompts.py:4016",
+          "tests/test_managed_ci.py:4510",
+          "tests/test_managed_ci.py:5367",
+          "tests/test_managed_ci.py:5398",
+          "tests/test_managed_ci.py:5443",
+          "tests/test_managed_ci.py:9344",
+          "tests/test_managed_ci.py:9372",
+          "tests/test_managed_ci.py:9793",
+          "tests/test_issue_implementation_managed_pr.py:10",
+          "tests/test_issue_implementation_managed_pr.py:89",
+          "tests/test_issue_implementation_managed_pr.py:352",
+          "tests/test_issue_implementation_managed_pr.py:427",
+          "tests/test_managed_pr.py:9",
+          "tests/test_managed_pr.py:82",
+          "tests/test_plan_first_loop_issue_scope.py:15",
+          "tests/test_plan_first_loop_issue_scope.py:1174",
+          "tests/test_issue_implementation_recovery.py:21",
+          "tests/test_issue_implementation_recovery.py:296",
+          "tests/test_issue_implementation_recovery.py:384",
+          "tests/test_issue_implementation_recovery.py:503",
+          "tests/test_issue_implementation_recovery.py:561",
+          "tests/test_issue_implementation_recovery.py:642",
+          "tests/test_issue_implementation_recovery.py:743",
+          "tests/test_issue_implementation_recovery.py:813",
+          "tests/test_issue_implementation_recovery.py:1036",
+          "tests/test_issue_implementation_recovery.py:1397"
+        ]
+      },
+      "ManagedCiOverrideRecord": {
+        "sha256": "c917257e36c511d48d820311fd8822285576f90c4a9486e080c0919308133769",
+        "original_lines": [
+          437,
+          450
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:287"
+        ]
+      },
+      "AuthenticatedIssueCreatedHandoff": {
+        "sha256": "48dd0001c40b261ee7a48f5c19e9d84cc2557befb8f6df1f88468b795f682303",
+        "original_lines": [
+          453,
+          481
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/issue_implementation.py:77",
+          "src/coding_review_agent_loop/issue_implementation.py:209",
+          "src/coding_review_agent_loop/issue_implementation.py:213",
+          "src/coding_review_agent_loop/issue_implementation.py:677",
+          "src/coding_review_agent_loop/issue_loop.py:67",
+          "src/coding_review_agent_loop/issue_loop.py:1047",
+          "src/coding_review_agent_loop/orchestrator.py:244",
+          "src/coding_review_agent_loop/pr_loop.py:172",
+          "src/coding_review_agent_loop/pr_loop.py:695",
+          "src/coding_review_agent_loop/managed_ci_types.py:303",
+          "src/coding_review_agent_loop/managed_ci_types.py:401",
+          "src/coding_review_agent_loop/pr_loop_support.py:84",
+          "src/coding_review_agent_loop/pr_loop_support.py:3366",
+          "src/coding_review_agent_loop/pr_loop_support.py:3373",
+          "tests/test_child_plan_provenance.py:1141",
+          "tests/test_child_plan_provenance.py:4539",
+          "tests/test_issue_pr_handoff.py:775",
+          "tests/test_issue_pr_handoff.py:876",
+          "tests/test_issue_pr_handoff.py:2129",
+          "tests/test_issue_pr_handoff.py:2132",
+          "tests/test_pr_loop_authorization.py:171",
+          "tests/test_pr_loop_authorization.py:302",
+          "tests/test_pr_loop_authorization.py:838",
+          "tests/test_pr_loop_authorization.py:839",
+          "tests/test_github_retry.py:394",
+          "tests/test_github_retry.py:425",
+          "tests/test_pr_loop_review_scheduling.py:2908",
+          "tests/test_issue_implementation_coverage_reask.py:365",
+          "tests/test_managed_ci.py:974",
+          "tests/test_handoff_growth_verdict.py:315",
+          "tests/issue_loop_test_helpers.py:29",
+          "tests/issue_loop_test_helpers.py:271",
+          "tests/issue_loop_test_helpers.py:272",
+          "tests/test_pr_loop_reviewer_boards.py:854",
+          "tests/test_pr_loop_reviewer_boards.py:894",
+          "tests/test_pr_loop_managed_ci.py:1650"
+        ]
+      },
+      "ManagedCiIssueAuthorization": {
+        "sha256": "c434707ba9fb9137b801f976eb26043a6b6f53dad8146ecf43e97139bb356454",
+        "original_lines": [
+          484,
+          536
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:334",
+          "tests/test_managed_plan_binding.py:15",
+          "tests/test_managed_plan_binding.py:57",
+          "tests/test_managed_ci.py:37",
+          "tests/test_managed_ci.py:768",
+          "tests/test_managed_ci.py:807",
+          "tests/test_managed_ci.py:1003",
+          "tests/test_managed_ci.py:1120",
+          "tests/test_managed_ci.py:1158",
+          "tests/test_managed_ci.py:1196",
+          "tests/test_managed_ci.py:1282",
+          "tests/test_managed_ci.py:1288",
+          "tests/test_managed_ci.py:1536",
+          "tests/test_managed_ci.py:1764",
+          "tests/test_managed_ci.py:2467",
+          "tests/test_managed_ci.py:2473",
+          "tests/test_managed_ci.py:2499",
+          "tests/test_managed_ci.py:2505",
+          "tests/test_managed_ci.py:2545",
+          "tests/test_managed_ci.py:2551",
+          "tests/test_managed_ci.py:2582",
+          "tests/test_managed_ci.py:2588",
+          "tests/test_managed_ci.py:2963",
+          "tests/test_managed_ci.py:3068",
+          "tests/test_managed_ci.py:3433",
+          "tests/test_managed_ci.py:3456",
+          "tests/test_managed_ci.py:3462",
+          "tests/test_managed_ci.py:3487",
+          "tests/test_managed_ci.py:3524",
+          "tests/test_managed_ci.py:3566",
+          "tests/test_managed_ci.py:3626",
+          "tests/test_managed_ci.py:3644",
+          "tests/test_managed_ci.py:3718",
+          "tests/test_managed_ci.py:3774",
+          "tests/test_managed_ci.py:3838",
+          "tests/test_managed_ci.py:3907",
+          "tests/test_managed_ci.py:4198",
+          "tests/test_managed_ci.py:4217",
+          "tests/test_managed_ci.py:4223",
+          "tests/test_managed_ci.py:4716",
+          "tests/test_managed_ci.py:4869",
+          "tests/test_managed_ci.py:5091",
+          "tests/test_managed_ci.py:5128",
+          "tests/test_managed_ci.py:5152",
+          "tests/test_managed_ci.py:5515",
+          "tests/test_managed_ci.py:8386",
+          "tests/test_managed_ci.py:8769",
+          "tests/test_managed_ci.py:8909",
+          "tests/test_managed_ci.py:9849",
+          "tests/test_managed_ci.py:11540",
+          "tests/test_managed_ci.py:12708",
+          "tests/test_managed_ci.py:13522",
+          "tests/test_managed_ci.py:14474",
+          "tests/test_pr_loop_managed_ci.py:52",
+          "tests/test_pr_loop_managed_ci.py:1104"
+        ]
+      },
+      "AuthenticatedManagedResume": {
+        "sha256": "d7cc054d498c5c9027d47947e0a7be8c08496d993a60c3116bdbbec7ec81f604",
+        "original_lines": [
+          539,
+          556
+        ],
+        "same_module_references": [
+          "AuthenticatedIssueCreatedHandoff"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:243",
+          "src/coding_review_agent_loop/pr_loop.py:171",
+          "src/coding_review_agent_loop/pr_loop.py:717",
+          "src/coding_review_agent_loop/pr_loop.py:1002",
+          "src/coding_review_agent_loop/pr_loop.py:1015",
+          "src/coding_review_agent_loop/pr_loop.py:1164",
+          "src/coding_review_agent_loop/pr_loop.py:9766",
+          "src/coding_review_agent_loop/managed_ci_types.py:263",
+          "src/coding_review_agent_loop/managed_ci_types.py:389",
+          "tests/test_managed_ci.py:29",
+          "tests/test_managed_ci.py:3337",
+          "tests/test_managed_ci.py:3608",
+          "tests/test_managed_ci.py:3696",
+          "tests/test_managed_ci.py:3748",
+          "tests/test_managed_ci.py:3820",
+          "tests/test_managed_ci.py:3889",
+          "tests/test_managed_ci.py:3941",
+          "tests/test_managed_ci.py:4057",
+          "tests/test_managed_ci.py:4115",
+          "tests/test_managed_ci.py:4179",
+          "tests/test_managed_ci.py:4659",
+          "tests/test_managed_ci.py:4743",
+          "tests/test_managed_ci.py:4788",
+          "tests/test_managed_ci.py:4852",
+          "tests/test_managed_ci.py:4906",
+          "tests/test_managed_ci.py:4937",
+          "tests/test_managed_ci.py:5218",
+          "tests/test_managed_ci.py:5535",
+          "tests/test_managed_ci.py:8792",
+          "tests/test_managed_ci.py:9989",
+          "tests/test_managed_ci.py:10526",
+          "tests/test_managed_ci.py:10693",
+          "tests/test_managed_ci.py:12148",
+          "tests/test_managed_ci.py:12534",
+          "tests/test_managed_ci.py:12571",
+          "tests/test_managed_ci.py:12586",
+          "tests/test_managed_ci.py:12652",
+          "tests/test_managed_ci.py:12732",
+          "tests/test_managed_ci.py:13002"
+        ]
+      },
+      "_SUPERSEDING_AUTHORIZATION_KINDS": {
+        "sha256": "236df9a4e83812e70d97608029f9c8c5431d9916963168f974e9b5195967c885",
+        "original_lines": [
+          562,
+          562
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:411"
+        ]
+      },
+      "OrdinaryRecoveryCapability": {
+        "sha256": "97827972b778ff744fc8603498c753b80c465406099b578b1c8dc6aec3d8615f",
+        "original_lines": [
+          837,
+          847
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:249",
+          "src/coding_review_agent_loop/pr_loop.py:175",
+          "src/coding_review_agent_loop/pr_loop.py:713",
+          "src/coding_review_agent_loop/managed_ci_types.py:242",
+          "src/coding_review_agent_loop/managed_ci_types.py:415",
+          "src/coding_review_agent_loop/pr_loop_support.py:88",
+          "src/coding_review_agent_loop/pr_loop_support.py:720",
+          "src/coding_review_agent_loop/pr_loop_support.py:2370",
+          "tests/test_pr_loop_post_merge_obligations.py:534",
+          "tests/test_pr_loop_post_merge_obligations.py:537",
+          "tests/test_pr_loop_merge.py:19",
+          "tests/test_pr_loop_merge.py:71",
+          "tests/test_pr_loop_merge.py:123",
+          "tests/test_pr_loop_merge.py:188",
+          "tests/test_pr_loop_merge.py:210",
+          "tests/test_pr_loop_merge.py:251",
+          "tests/test_pr_loop_merge.py:386",
+          "tests/test_pr_loop_merge.py:440",
+          "tests/test_pr_loop_merge.py:534",
+          "tests/test_pr_loop_ci_gate.py:26",
+          "tests/test_pr_loop_ci_gate.py:1467",
+          "tests/test_managed_ci.py:70",
+          "tests/test_managed_ci.py:5724",
+          "tests/test_managed_ci.py:5781",
+          "tests/test_managed_ci.py:5842",
+          "tests/test_managed_ci.py:5875",
+          "tests/test_managed_ci.py:5923",
+          "tests/test_managed_ci.py:5964",
+          "tests/test_managed_ci.py:5997",
+          "tests/test_managed_ci.py:6033",
+          "tests/test_managed_ci.py:6058",
+          "tests/test_managed_ci.py:12827"
+        ]
+      },
+      "ManagedCiOutcome": {
+        "sha256": "1860b524781ae43d9c8125ea82f090b0f175ea0d0d44dd950adfd734838a3811",
+        "original_lines": [
+          850,
+          877
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:248",
+          "src/coding_review_agent_loop/managed_ci_types.py:428",
+          "src/coding_review_agent_loop/pr_loop_support.py:87",
+          "src/coding_review_agent_loop/pr_loop_support.py:908",
+          "src/coding_review_agent_loop/pr_loop_support.py:2512",
+          "src/coding_review_agent_loop/managed_ci_reconciliation.py:244",
+          "tests/test_issue_pr_handoff.py:2129",
+          "tests/test_issue_pr_handoff.py:2145",
+          "tests/test_pr_loop_post_merge_obligations.py:528",
+          "tests/test_pr_loop_post_merge_obligations.py:532",
+          "tests/test_pr_loop_post_merge_obligations.py:534",
+          "tests/test_pr_loop_post_merge_obligations.py:545",
+          "tests/test_pr_loop_merge.py:18",
+          "tests/test_pr_loop_merge.py:81",
+          "tests/test_pr_loop_merge.py:146",
+          "tests/test_pr_loop_merge.py:196",
+          "tests/test_pr_loop_merge.py:219",
+          "tests/test_pr_loop_merge.py:259",
+          "tests/test_pr_loop_merge.py:363",
+          "tests/test_pr_loop_merge.py:393",
+          "tests/test_pr_loop_merge.py:447",
+          "tests/test_pr_loop_merge.py:542",
+          "tests/test_pr_loop_review_scheduling.py:25",
+          "tests/test_pr_loop_review_scheduling.py:964",
+          "tests/test_managed_supersession_loop.py:10",
+          "tests/test_managed_supersession_loop.py:132",
+          "tests/test_managed_supersession_loop.py:185",
+          "tests/test_managed_supersession_loop.py:321",
+          "tests/test_pr_loop_ci_gate.py:25",
+          "tests/test_pr_loop_ci_gate.py:570",
+          "tests/test_pr_loop_ci_gate.py:1133",
+          "tests/test_pr_loop_coder_ci_guard.py:22",
+          "tests/test_pr_loop_coder_ci_guard.py:260",
+          "tests/test_pr_loop_coder_ci_guard.py:767",
+          "tests/test_pr_loop_coder_ci_guard.py:771",
+          "tests/test_pr_loop_coder_ci_guard.py:1074",
+          "tests/test_pr_loop_evidence_freeze.py:11",
+          "tests/test_pr_loop_evidence_freeze.py:331",
+          "tests/test_pr_loop_evidence_freeze.py:354",
+          "tests/test_managed_ci.py:2110",
+          "tests/test_managed_ci.py:2118",
+          "tests/test_managed_ci.py:2236",
+          "tests/test_managed_ci.py:2244",
+          "tests/test_managed_ci.py:2252",
+          "tests/test_managed_ci.py:2372",
+          "tests/test_managed_ci.py:2380",
+          "tests/test_managed_ci.py:2388",
+          "tests/test_managed_ci.py:7273",
+          "tests/test_managed_ci.py:13392",
+          "tests/test_managed_ci.py:13434",
+          "tests/test_managed_ci.py:15710",
+          "tests/test_managed_ci.py:15812",
+          "tests/test_managed_ci.py:16054",
+          "tests/test_managed_ci.py:16062",
+          "tests/test_managed_ci.py:16118",
+          "tests/test_managed_ci.py:16141",
+          "tests/test_managed_ci.py:16178",
+          "tests/test_managed_ci.py:16228",
+          "tests/test_managed_ci.py:16255",
+          "tests/test_managed_ci.py:16263",
+          "tests/test_managed_ci.py:16290",
+          "tests/test_managed_ci.py:16538",
+          "tests/test_pr_loop_coder_followup.py:23",
+          "tests/test_pr_loop_coder_followup.py:1436",
+          "tests/test_issue_implementation_managed_pr.py:11",
+          "tests/test_issue_implementation_managed_pr.py:172",
+          "tests/test_plan_first_loop_issue_scope.py:16",
+          "tests/test_plan_first_loop_issue_scope.py:1225",
+          "tests/test_managed_supersession.py:8",
+          "tests/test_managed_supersession.py:39",
+          "tests/test_managed_supersession.py:98",
+          "tests/test_pr_loop_reviewer_boards.py:13",
+          "tests/test_pr_loop_reviewer_boards.py:184",
+          "tests/test_pr_loop_reviewer_boards.py:233",
+          "tests/test_pr_loop_reviewer_boards.py:293",
+          "tests/test_pr_loop_reviewer_boards.py:608",
+          "tests/test_pr_loop_reviewer_boards.py:912",
+          "tests/test_pr_loop_managed_ci.py:19",
+          "tests/test_pr_loop_managed_ci.py:87",
+          "tests/test_pr_loop_managed_ci.py:119",
+          "tests/test_pr_loop_managed_ci.py:120",
+          "tests/test_pr_loop_managed_ci.py:256",
+          "tests/test_pr_loop_managed_ci.py:359",
+          "tests/test_pr_loop_managed_ci.py:650",
+          "tests/test_pr_loop_managed_ci.py:730",
+          "tests/test_pr_loop_managed_ci.py:731",
+          "tests/test_pr_loop_managed_ci.py:755",
+          "tests/test_pr_loop_managed_ci.py:760",
+          "tests/test_pr_loop_managed_ci.py:813",
+          "tests/test_pr_loop_managed_ci.py:862",
+          "tests/test_pr_loop_managed_ci.py:899",
+          "tests/test_pr_loop_managed_ci.py:988",
+          "tests/test_pr_loop_managed_ci.py:1042",
+          "tests/test_pr_loop_managed_ci.py:1046",
+          "tests/test_pr_loop_managed_ci.py:1084",
+          "tests/test_pr_loop_managed_ci.py:1456"
+        ]
+      },
+      "ManagedCiRunSnapshot": {
+        "sha256": "d2f60af386106c2f969c23c4eadf506afed2c8d261fac071a7d032bc1b2467ee",
+        "original_lines": [
+          880,
+          886
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:458",
+          "tests/test_managed_ci_reconciliation.py:605"
+        ]
+      },
+      "LabelEvent": {
+        "sha256": "76b063e3b8d5322f293a4bc3a0d897956883ecd215ab9a8f1f4a262507d30b67",
+        "original_lines": [
+          6994,
+          6999
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:467",
+          "src/coding_review_agent_loop/managed_ci_types.py:478",
+          "src/coding_review_agent_loop/managed_ci_api.py:33",
+          "src/coding_review_agent_loop/managed_ci_api.py:363",
+          "src/coding_review_agent_loop/managed_ci_api.py:392"
+        ]
+      },
+      "CompleteLabelHistory": {
+        "sha256": "8f9c237d4e2fe3f72a53ef44218c1a362db097393bb3a959cdeee17f42532854",
+        "original_lines": [
+          7002,
+          7006
+        ],
+        "same_module_references": [
+          "LabelEvent"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:475",
+          "src/coding_review_agent_loop/managed_ci_api.py:32",
+          "src/coding_review_agent_loop/managed_ci_api.py:352",
+          "src/coding_review_agent_loop/managed_ci_api.py:393",
+          "src/coding_review_agent_loop/managed_ci_api.py:407",
+          "tests/test_managed_ci.py:13644"
+        ]
+      },
+      "UnknownLabelHistory": {
+        "sha256": "97d4034c147a3b316932aeee23e9e3d7f01abeadca2ab081b704efc4081c4462",
+        "original_lines": [
+          7009,
+          7011
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:482",
+          "src/coding_review_agent_loop/managed_ci_api.py:36",
+          "src/coding_review_agent_loop/managed_ci_api.py:352",
+          "src/coding_review_agent_loop/managed_ci_api.py:362",
+          "src/coding_review_agent_loop/managed_ci_api.py:369",
+          "src/coding_review_agent_loop/managed_ci_api.py:377",
+          "src/coding_review_agent_loop/managed_ci_api.py:389",
+          "src/coding_review_agent_loop/managed_ci_api.py:391",
+          "tests/test_managed_ci.py:13646"
+        ]
+      },
+      "ReconciledLabelWrite": {
+        "sha256": "98305df9febc9de3436db5f39f01297cb08f412b49bb1bf385fb1e3023194482",
+        "original_lines": [
+          7079,
+          7091
+        ],
+        "same_module_references": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_types.py:487"
+        ]
+      }
+    },
+    "managed_ci_api": {
+      "_LIST_FAILURE": {
+        "sha256": "4db29ecae07d1efd77d1e04693475001f407f763a5dd2e2d4f0c6d8f3777b47a",
+        "original_lines": [
+          172,
+          172
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:41",
+          "src/coding_review_agent_loop/managed_ci_api.py:46",
+          "src/coding_review_agent_loop/managed_ci_api.py:61",
+          "src/coding_review_agent_loop/managed_ci_api.py:63",
+          "src/coding_review_agent_loop/managed_ci_api.py:64",
+          "src/coding_review_agent_loop/managed_ci_api.py:68",
+          "src/coding_review_agent_loop/managed_ci_api.py:75",
+          "src/coding_review_agent_loop/managed_ci_api.py:77",
+          "src/coding_review_agent_loop/managed_ci_api.py:304",
+          "src/coding_review_agent_loop/managed_ci_api.py:306"
+        ]
+      },
+      "_last_list_failure": {
+        "sha256": "4efba5f211183364fdaf762433db8ef0e8cbb96ddf37dd26686ca448bedb899a",
+        "original_lines": [
+          175,
+          177
+        ],
+        "same_module_references": [
+          "_LIST_FAILURE"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:44",
+          "tests/test_github_retry.py:348",
+          "tests/test_github_retry.py:349",
+          "tests/test_github_retry.py:355",
+          "tests/test_github_retry.py:359"
+        ]
+      },
+      "_surfaces_list_failures": {
+        "sha256": "39fb0393f664fffd7ddc7cc56de7c11f2c5b33c8c60dec0507d1e1a0acadc7e1",
+        "original_lines": [
+          180,
+          210
+        ],
+        "same_module_references": [
+          "_LIST_FAILURE"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:49",
+          "tests/test_github_retry.py:495",
+          "tests/test_github_retry.py:504"
+        ]
+      },
+      "_probe": {
+        "sha256": "b1cd351bd0a2f95ac504b9750bd30f697104e384ccca60b15dbcd9470fc217f3",
+        "original_lines": [
+          1072,
+          1076
+        ],
+        "same_module_references": [
+          "ManagedCiProbeContext"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/workdir_guard.py:83",
+          "src/coding_review_agent_loop/workdir_guard.py:114",
+          "src/coding_review_agent_loop/workdir_guard.py:120",
+          "src/coding_review_agent_loop/workdir_guard.py:145",
+          "src/coding_review_agent_loop/workdir_guard.py:204",
+          "src/coding_review_agent_loop/workdir_guard.py:233",
+          "src/coding_review_agent_loop/local_test_evidence.py:3960",
+          "src/coding_review_agent_loop/local_test_evidence.py:3979",
+          "src/coding_review_agent_loop/local_test_evidence.py:3980",
+          "src/coding_review_agent_loop/cli.py:2389",
+          "src/coding_review_agent_loop/cli.py:2401",
+          "src/coding_review_agent_loop/runner.py:49",
+          "src/coding_review_agent_loop/runner.py:260",
+          "src/coding_review_agent_loop/runner.py:549",
+          "src/coding_review_agent_loop/runner.py:956",
+          "src/coding_review_agent_loop/runner.py:957",
+          "src/coding_review_agent_loop/runner.py:988",
+          "src/coding_review_agent_loop/runner.py:990",
+          "src/coding_review_agent_loop/runner.py:1000",
+          "src/coding_review_agent_loop/runner.py:1018",
+          "src/coding_review_agent_loop/runner.py:1019",
+          "src/coding_review_agent_loop/runner.py:1021",
+          "src/coding_review_agent_loop/runner.py:1035",
+          "src/coding_review_agent_loop/runner.py:1043",
+          "src/coding_review_agent_loop/runner.py:1049",
+          "src/coding_review_agent_loop/runner.py:1055",
+          "src/coding_review_agent_loop/runner.py:1065",
+          "src/coding_review_agent_loop/runner.py:1066",
+          "src/coding_review_agent_loop/runner.py:1071",
+          "src/coding_review_agent_loop/runner.py:1072",
+          "src/coding_review_agent_loop/runner.py:1075",
+          "src/coding_review_agent_loop/runner.py:1080",
+          "src/coding_review_agent_loop/runner.py:1081",
+          "src/coding_review_agent_loop/runner.py:1161",
+          "src/coding_review_agent_loop/runner.py:1169",
+          "src/coding_review_agent_loop/runner.py:1299",
+          "src/coding_review_agent_loop/runner.py:1306",
+          "src/coding_review_agent_loop/runner.py:1392",
+          "src/coding_review_agent_loop/runner.py:1637",
+          "src/coding_review_agent_loop/runner.py:1687",
+          "src/coding_review_agent_loop/runner.py:1694",
+          "src/coding_review_agent_loop/runner.py:1712",
+          "src/coding_review_agent_loop/runner.py:1715",
+          "src/coding_review_agent_loop/github_transport.py:102",
+          "src/coding_review_agent_loop/github_transport.py:129",
+          "src/coding_review_agent_loop/managed_ci_api.py:82",
+          "src/coding_review_agent_loop/managed_ci_api.py:89",
+          "src/coding_review_agent_loop/managed_ci_api.py:90",
+          "src/coding_review_agent_loop/managed_ci_api.py:100",
+          "src/coding_review_agent_loop/managed_ci_api.py:104",
+          "src/coding_review_agent_loop/managed_ci_api.py:238",
+          "src/coding_review_agent_loop/managed_ci_api.py:241",
+          "src/coding_review_agent_loop/worktree_hints.py:193",
+          "src/coding_review_agent_loop/worktree_hints.py:196",
+          "src/coding_review_agent_loop/worktree_hints.py:201",
+          "src/coding_review_agent_loop/worktree_hints.py:209",
+          "src/coding_review_agent_loop/worktree_hints.py:212",
+          "src/coding_review_agent_loop/lifecycle_probe.py:8",
+          "src/coding_review_agent_loop/lifecycle_probe.py:40",
+          "src/coding_review_agent_loop/lifecycle_probe.py:251",
+          "src/coding_review_agent_loop/lifecycle_probe.py:253",
+          "src/coding_review_agent_loop/lifecycle_probe.py:319",
+          "src/coding_review_agent_loop/lifecycle_probe.py:383",
+          "src/coding_review_agent_loop/containment.py:621",
+          "src/coding_review_agent_loop/containment.py:724",
+          "src/coding_review_agent_loop/checkout_verification.py:395",
+          "src/coding_review_agent_loop/checkout_verification.py:397",
+          "src/coding_review_agent_loop/checkout_verification.py:500",
+          "src/coding_review_agent_loop/checkout_verification.py:502",
+          "src/coding_review_agent_loop/checkout_verification.py:507",
+          "src/coding_review_agent_loop/checkout_verification.py:634",
+          "src/coding_review_agent_loop/checkout_verification.py:637",
+          "src/coding_review_agent_loop/checkout_verification.py:640",
+          "src/coding_review_agent_loop/checkout_verification.py:644",
+          "src/coding_review_agent_loop/checkout_verification.py:761",
+          "src/coding_review_agent_loop/agent_permissions.py:1259",
+          "src/coding_review_agent_loop/agent_permissions.py:1292",
+          "src/coding_review_agent_loop/agent_permissions.py:1295",
+          "src/coding_review_agent_loop/review_images_worker.py:24",
+          "src/coding_review_agent_loop/review_images_worker.py:170",
+          "src/coding_review_agent_loop/test_runtime.py:135",
+          "src/coding_review_agent_loop/test_runtime.py:1872",
+          "src/coding_review_agent_loop/test_runtime.py:1886",
+          "src/coding_review_agent_loop/test_runtime.py:1894",
+          "src/coding_review_agent_loop/test_runtime.py:2074",
+          "src/coding_review_agent_loop/test_runtime.py:2102",
+          "src/coding_review_agent_loop/test_runtime.py:2151",
+          "src/coding_review_agent_loop/test_runtime.py:2199",
+          "src/coding_review_agent_loop/test_runtime.py:2206",
+          "src/coding_review_agent_loop/test_runtime.py:2231",
+          "src/coding_review_agent_loop/test_runtime.py:2232",
+          "src/coding_review_agent_loop/test_runtime.py:2233",
+          "src/coding_review_agent_loop/test_runtime.py:2234",
+          "src/coding_review_agent_loop/test_runtime.py:2240",
+          "src/coding_review_agent_loop/test_runtime.py:2241",
+          "src/coding_review_agent_loop/test_runtime.py:2248",
+          "src/coding_review_agent_loop/test_runtime.py:2249",
+          "src/coding_review_agent_loop/test_runtime.py:2257",
+          "src/coding_review_agent_loop/test_runtime.py:2295",
+          "src/coding_review_agent_loop/test_runtime.py:2308",
+          "src/coding_review_agent_loop/test_runtime.py:2336",
+          "src/coding_review_agent_loop/test_runtime.py:2474",
+          "src/coding_review_agent_loop/test_runtime.py:2502",
+          "src/coding_review_agent_loop/test_runtime.py:2974",
+          "src/coding_review_agent_loop/test_runtime.py:2992",
+          "src/coding_review_agent_loop/test_runtime.py:3018",
+          "src/coding_review_agent_loop/test_runtime.py:3025",
+          "src/coding_review_agent_loop/test_runtime.py:3032",
+          "src/coding_review_agent_loop/test_runtime.py:3189",
+          "src/coding_review_agent_loop/test_runtime.py:3230",
+          "src/coding_review_agent_loop/test_runtime.py:3241",
+          "src/coding_review_agent_loop/test_runtime.py:3246",
+          "src/coding_review_agent_loop/test_runtime.py:3258",
+          "src/coding_review_agent_loop/test_runtime.py:3294",
+          "src/coding_review_agent_loop/test_runtime.py:3328",
+          "src/coding_review_agent_loop/test_runtime.py:3411",
+          "src/coding_review_agent_loop/test_runtime.py:3633",
+          "src/coding_review_agent_loop/test_runtime.py:3673",
+          "src/coding_review_agent_loop/test_runtime.py:3697",
+          "src/coding_review_agent_loop/test_runtime.py:3714",
+          "src/coding_review_agent_loop/managed_ci_protection.py:31",
+          "src/coding_review_agent_loop/managed_ci_protection.py:32",
+          "src/coding_review_agent_loop/managed_ci_protection.py:210",
+          "src/coding_review_agent_loop/managed_ci_protection.py:236",
+          "src/coding_review_agent_loop/managed_ci_protection.py:253",
+          "src/coding_review_agent_loop/managed_ci_protection.py:282",
+          "src/coding_review_agent_loop/prompts.py:803",
+          "src/coding_review_agent_loop/pytest_plugin/_agent_loop_lifecycle_probe.py:30",
+          "src/coding_review_agent_loop/agents/claude.py:212",
+          "src/coding_review_agent_loop/agents/claude.py:282",
+          "tests/test_orchestrator_split.py:47",
+          "tests/test_orchestrator_split.py:51",
+          "tests/test_orchestrator_split.py:55",
+          "tests/test_orchestrator_split.py:57",
+          "tests/test_orchestrator_split.py:59",
+          "tests/test_orchestrator_split.py:60",
+          "tests/test_orchestrator_split.py:65",
+          "tests/test_orchestrator_split.py:68",
+          "tests/test_host_worker_capacity.py:565",
+          "tests/test_host_worker_capacity.py:630",
+          "tests/test_discuss_loop.py:3473",
+          "tests/test_run_worktrees.py:778",
+          "tests/test_run_worktrees.py:1112",
+          "tests/test_run_worktrees.py:1114",
+          "tests/test_run_worktrees.py:1117",
+          "tests/test_run_worktrees.py:1119",
+          "tests/test_backends.py:116",
+          "tests/test_backends.py:122",
+          "tests/test_backends.py:145",
+          "tests/test_backends.py:165",
+          "tests/test_backends.py:175",
+          "tests/test_backends.py:184",
+          "tests/test_backends.py:191",
+          "tests/test_private_directory_cleanup.py:178",
+          "tests/test_private_directory_cleanup.py:186",
+          "tests/test_private_directory_cleanup.py:194",
+          "tests/test_local_test_evidence.py:2766",
+          "tests/test_local_test_evidence.py:2772",
+          "tests/test_local_test_evidence.py:2777",
+          "tests/test_local_test_evidence.py:2933",
+          "tests/test_local_test_evidence.py:2940",
+          "tests/test_local_test_evidence.py:3351",
+          "tests/test_local_test_evidence.py:3356",
+          "tests/test_local_test_evidence.py:3502",
+          "tests/test_local_test_evidence.py:3509",
+          "tests/test_local_test_evidence.py:3523",
+          "tests/test_local_test_evidence.py:3527",
+          "tests/test_local_test_evidence.py:3542",
+          "tests/test_local_test_evidence.py:3720",
+          "tests/test_local_test_evidence.py:3727",
+          "tests/test_local_test_evidence.py:3740",
+          "tests/test_local_test_evidence.py:3749",
+          "tests/test_local_test_evidence.py:3757",
+          "tests/test_local_test_evidence.py:7221",
+          "tests/test_agent_loop.py:5708",
+          "tests/test_agent_loop.py:5726",
+          "tests/test_agent_loop.py:5728",
+          "tests/test_agent_executable.py:138",
+          "tests/test_agent_executable.py:166",
+          "tests/test_agent_executable.py:183",
+          "tests/test_proc_probe.py:13",
+          "tests/test_proc_probe.py:14",
+          "tests/test_proc_probe.py:45",
+          "tests/test_proc_probe.py:55",
+          "tests/test_proc_probe.py:64",
+          "tests/test_proc_probe.py:195",
+          "tests/test_proc_probe.py:214",
+          "tests/test_proc_probe.py:216",
+          "tests/test_proc_probe.py:222",
+          "tests/test_proc_probe.py:228",
+          "tests/test_proc_probe.py:233",
+          "tests/test_checkout_verification.py:224",
+          "tests/test_checkout_verification.py:325",
+          "tests/test_checkout_verification.py:339",
+          "tests/test_checkout_verification.py:689",
+          "tests/test_checkout_verification.py:722",
+          "tests/test_checkout_verification.py:750",
+          "tests/test_checkout_verification.py:752",
+          "tests/test_checkout_verification.py:755",
+          "tests/test_checkout_verification.py:1327",
+          "tests/test_checkout_verification.py:1330",
+          "tests/test_checkout_verification.py:1333",
+          "tests/test_test_workers.py:213",
+          "tests/test_test_workers.py:871",
+          "tests/test_git_boundary.py:93",
+          "tests/test_git_boundary.py:783",
+          "tests/test_tool_provenance.py:513",
+          "tests/test_prompts.py:6183",
+          "tests/test_prompts.py:6188",
+          "tests/test_prompts.py:6214",
+          "tests/test_prompts.py:6220",
+          "tests/test_prompts.py:6983",
+          "tests/test_prompts.py:7173",
+          "tests/test_prompts.py:7176",
+          "tests/test_prompts.py:7189",
+          "tests/test_prompts.py:7190",
+          "tests/test_test_interpreter.py:13",
+          "tests/test_test_interpreter.py:16",
+          "tests/test_test_interpreter.py:42",
+          "tests/test_test_interpreter.py:44",
+          "tests/test_test_interpreter.py:48",
+          "tests/test_test_interpreter.py:52",
+          "tests/test_test_interpreter.py:59",
+          "tests/test_test_interpreter.py:69",
+          "tests/test_test_interpreter.py:75",
+          "tests/test_test_interpreter.py:80",
+          "tests/test_test_interpreter.py:83",
+          "tests/test_test_interpreter.py:85",
+          "tests/test_test_interpreter.py:86",
+          "tests/test_test_interpreter.py:90",
+          "tests/test_test_interpreter.py:94",
+          "tests/test_worktree_link_integrity.py:62",
+          "tests/test_worktree_link_integrity.py:65",
+          "tests/test_worktree_link_integrity.py:78",
+          "tests/test_worktree_link_integrity.py:79",
+          "tests/test_worktree_link_integrity.py:196",
+          "tests/test_worktree_link_integrity.py:241",
+          "tests/test_worktree_link_integrity.py:253",
+          "tests/test_worktree_link_integrity.py:457",
+          "tests/test_worktree_setup.py:1465",
+          "tests/test_review_images_config.py:88",
+          "tests/test_workdir_guard.py:290",
+          "tests/test_workdir_guard.py:292",
+          "tests/test_workdir_guard.py:303",
+          "tests/test_workdir_guard.py:311",
+          "tests/test_workdir_guard.py:317",
+          "tests/test_workdir_guard.py:331",
+          "tests/test_workdir_guard.py:366",
+          "tests/test_workdir_guard.py:375",
+          "tests/test_workdir_guard.py:377",
+          "tests/test_workdir_guard.py:410",
+          "tests/test_workdir_guard.py:411",
+          "tests/test_workdir_guard.py:416",
+          "tests/test_workdir_guard.py:422",
+          "tests/test_workdir_guard.py:423",
+          "tests/test_workdir_guard.py:427",
+          "tests/test_workdir_guard.py:430",
+          "tests/test_workdir_guard.py:431",
+          "tests/test_inspect_tool.py:585",
+          "tests/test_inspect_tool.py:604",
+          "tests/test_workdir_claims.py:587",
+          "tests/test_managed_ci.py:9123",
+          "tests/test_managed_ci.py:9227",
+          "tests/test_managed_ci.py:9257",
+          "tests/test_managed_ci.py:9273",
+          "tests/test_managed_ci.py:9293",
+          "tests/test_managed_ci.py:9330",
+          "tests/test_managed_ci.py:9393",
+          "tests/test_managed_ci.py:9399",
+          "tests/test_managed_ci.py:9411",
+          "tests/test_managed_ci.py:9432",
+          "tests/test_managed_ci.py:9449",
+          "tests/test_managed_ci.py:9464",
+          "tests/test_managed_ci.py:9473",
+          "tests/test_managed_ci.py:9487",
+          "tests/test_managed_ci.py:9507",
+          "tests/test_managed_ci.py:9530",
+          "tests/test_managed_ci.py:9538",
+          "tests/test_managed_ci.py:9594",
+          "tests/test_managed_ci.py:9602",
+          "tests/test_managed_ci.py:9630",
+          "tests/test_managed_ci.py:9668",
+          "tests/test_managed_ci.py:9677",
+          "tests/test_managed_ci.py:9698",
+          "tests/test_managed_ci.py:9713",
+          "tests/test_managed_ci.py:9751",
+          "tests/test_containment.py:15",
+          "tests/test_containment.py:1034",
+          "tests/test_review_parallel.py:1261",
+          "tests/test_review_parallel.py:2639",
+          "tests/test_pytest_worker_cap_plugin.py:670",
+          "tests/test_pytest_worker_cap_plugin.py:694",
+          "tests/test_pytest_worker_cap_plugin.py:716",
+          "tests/test_pytest_worker_cap_plugin.py:805",
+          "tests/test_pytest_worker_cap_plugin.py:830",
+          "tests/test_pytest_worker_cap_plugin.py:856",
+          "tests/test_pytest_worker_cap_plugin.py:883",
+          "tests/test_pytest_worker_cap_plugin.py:892",
+          "tests/test_pytest_worker_cap_plugin.py:954",
+          "tests/agent_loop_helpers.py:261",
+          "tests/agent_loop_helpers.py:262",
+          "tests/agent_loop_helpers.py:393",
+          "tests/agent_loop_helpers.py:394",
+          "tests/agent_loop_helpers.py:419",
+          "tests/agent_loop_helpers.py:420",
+          "tests/agent_loop_helpers.py:421",
+          "tests/agent_loop_helpers.py:972",
+          "tests/agent_loop_helpers.py:974",
+          "tests/agent_loop_helpers.py:1120",
+          "tests/agent_loop_helpers.py:1121",
+          "tests/agent_loop_helpers.py:1122",
+          "tests/agent_loop_helpers.py:1123",
+          "tests/agent_loop_helpers.py:1638",
+          "tests/agent_loop_helpers.py:1639",
+          "tests/agent_loop_helpers.py:1640",
+          "tests/agent_loop_helpers.py:1641",
+          "tests/agent_loop_helpers.py:1642",
+          "tests/agent_loop_helpers.py:1707",
+          "tests/agent_loop_helpers.py:1708",
+          "tests/agent_loop_helpers.py:1709",
+          "tests/agent_loop_helpers.py:1710",
+          "tests/agent_loop_helpers.py:1711",
+          "tests/test_agent_permissions.py:1446",
+          "tests/test_agent_permissions.py:1451",
+          "tests/test_agent_permissions.py:1464",
+          "tests/test_agent_permissions.py:1484",
+          "tests/test_agent_permissions.py:1486",
+          "tests/test_agent_permissions.py:1506",
+          "tests/test_agent_permissions.py:1508",
+          "tests/test_ci_watch.py:251",
+          "tests/test_gh_rest_shim.py:194",
+          "tests/test_gh_rest_shim.py:203",
+          "tests/test_gh_rest_shim.py:225",
+          "tests/test_gh_rest_shim.py:246",
+          "tests/test_test_runtime.py:18",
+          "tests/test_test_runtime.py:810",
+          "tests/test_test_runtime.py:817",
+          "tests/test_test_runtime.py:848",
+          "tests/test_test_runtime.py:855",
+          "tests/test_test_runtime.py:875",
+          "tests/test_test_runtime.py:881",
+          "tests/test_test_runtime.py:888",
+          "tests/test_test_runtime.py:920",
+          "tests/test_test_runtime.py:932",
+          "tests/test_test_runtime.py:958",
+          "tests/test_test_runtime.py:996",
+          "tests/test_test_runtime.py:997",
+          "tests/test_test_runtime.py:1003",
+          "tests/test_test_runtime.py:1010",
+          "tests/test_test_runtime.py:1038",
+          "tests/test_test_runtime.py:1041",
+          "tests/test_test_runtime.py:1043",
+          "tests/test_test_runtime.py:1078",
+          "tests/test_test_runtime.py:1126",
+          "tests/test_test_runtime.py:1127",
+          "tests/test_test_runtime.py:1168",
+          "tests/test_test_runtime.py:1170",
+          "tests/test_test_runtime.py:1178",
+          "tests/test_test_runtime.py:1181",
+          "tests/test_test_runtime.py:1187",
+          "tests/test_test_runtime.py:1196",
+          "tests/test_test_runtime.py:1198",
+          "tests/test_test_runtime.py:1219",
+          "tests/test_test_runtime.py:1227",
+          "tests/test_test_runtime.py:1228",
+          "tests/test_test_runtime.py:1236",
+          "tests/test_test_runtime.py:1270",
+          "tests/test_test_runtime.py:1273",
+          "tests/test_test_runtime.py:1275",
+          "tests/test_test_runtime.py:1281",
+          "tests/test_test_runtime.py:1289",
+          "tests/test_test_runtime.py:1366",
+          "tests/test_test_runtime.py:1375",
+          "tests/test_test_runtime.py:1382",
+          "tests/test_test_runtime.py:1397",
+          "tests/test_test_runtime.py:1427",
+          "tests/test_test_runtime.py:1436",
+          "tests/test_test_runtime.py:1445",
+          "tests/test_test_runtime.py:1506",
+          "tests/test_test_runtime.py:1509",
+          "tests/test_test_runtime.py:1533",
+          "tests/test_test_runtime.py:1550",
+          "tests/test_test_runtime.py:1569",
+          "tests/test_test_runtime.py:1579",
+          "tests/test_test_runtime.py:1592",
+          "tests/test_test_runtime.py:1613",
+          "tests/test_test_runtime.py:1629",
+          "tests/test_test_runtime.py:1643",
+          "tests/test_test_runtime.py:1678",
+          "tests/test_test_runtime.py:1710",
+          "tests/test_test_runtime.py:1725",
+          "tests/test_test_runtime.py:1740",
+          "tests/test_test_runtime.py:1752",
+          "tests/test_test_runtime.py:1759",
+          "tests/test_test_runtime.py:1782",
+          "tests/test_test_runtime.py:1792",
+          "tests/test_test_runtime.py:1810",
+          "tests/test_test_runtime.py:1822",
+          "tests/test_test_runtime.py:1834",
+          "tests/test_test_runtime.py:1844",
+          "tests/test_test_runtime.py:1852",
+          "tests/test_test_runtime.py:1953",
+          "tests/test_test_runtime.py:1963",
+          "tests/test_test_runtime.py:1975",
+          "tests/test_test_runtime.py:1984",
+          "tests/test_test_runtime.py:2008",
+          "tests/test_test_runtime.py:2027",
+          "tests/test_test_runtime.py:2045",
+          "tests/test_test_runtime.py:2060",
+          "tests/test_test_runtime.py:2083",
+          "tests/test_test_runtime.py:2095",
+          "tests/test_test_runtime.py:2107",
+          "tests/test_test_runtime.py:2129",
+          "tests/test_test_runtime.py:2145",
+          "tests/test_test_runtime.py:2194",
+          "tests/test_test_runtime.py:2737",
+          "tests/test_test_runtime.py:2743",
+          "tests/test_test_runtime.py:2760",
+          "tests/test_test_runtime.py:2771",
+          "tests/test_test_runtime.py:2777",
+          "tests/test_test_runtime.py:2783",
+          "tests/test_test_runtime.py:2807",
+          "tests/test_test_runtime.py:2811",
+          "tests/test_test_runtime.py:2813",
+          "tests/test_test_runtime.py:2853",
+          "tests/test_test_runtime.py:2857",
+          "tests/test_test_runtime.py:2860",
+          "tests/test_test_runtime.py:2863",
+          "tests/test_test_runtime.py:2953",
+          "tests/test_test_runtime.py:2963",
+          "tests/test_test_runtime.py:3031",
+          "tests/test_test_runtime.py:3067",
+          "tests/test_test_runtime.py:3155",
+          "tests/test_test_runtime.py:3187",
+          "tests/test_test_runtime.py:3193",
+          "tests/test_test_runtime.py:3296",
+          "tests/test_test_runtime.py:3413",
+          "tests/test_test_runtime.py:3422",
+          "tests/test_test_runtime.py:3436",
+          "tests/test_test_runtime.py:3438",
+          "tests/test_test_runtime.py:3440",
+          "tests/test_test_runtime.py:3442",
+          "tests/test_test_runtime.py:3444",
+          "tests/test_test_runtime.py:3446",
+          "tests/test_test_runtime.py:3476",
+          "tests/test_test_runtime.py:3484",
+          "tests/test_test_runtime.py:3514",
+          "tests/test_test_runtime.py:3515",
+          "tests/test_test_runtime.py:3529",
+          "tests/test_test_runtime.py:3530",
+          "tests/test_test_runtime.py:3596",
+          "tests/test_test_runtime.py:3604",
+          "tests/test_test_runtime.py:3612",
+          "tests/test_test_runtime.py:3627",
+          "tests/test_test_runtime.py:3637",
+          "tests/test_test_runtime.py:3640",
+          "tests/test_test_runtime.py:3667",
+          "tests/test_test_runtime.py:3728",
+          "tests/test_test_runtime.py:3864",
+          "tests/test_test_runtime.py:3865",
+          "tests/test_test_runtime.py:3884",
+          "tests/test_test_runtime.py:4024",
+          "tests/test_test_runtime.py:4041",
+          "tests/test_test_runtime.py:4047",
+          "tests/test_test_runtime.py:4052",
+          "tests/test_test_runtime.py:4060",
+          "tests/test_test_runtime.py:4062",
+          "tests/test_test_runtime.py:4310",
+          "tests/test_test_runtime.py:4313",
+          "tests/test_test_runtime.py:4323",
+          "tests/test_test_runtime.py:4326",
+          "tests/test_test_runtime.py:4360",
+          "tests/test_test_runtime.py:4361",
+          "tests/test_test_runtime.py:4364",
+          "tests/test_test_runtime.py:4365",
+          "tests/test_test_runtime.py:4383",
+          "tests/test_test_runtime.py:4402",
+          "tests/test_test_runtime.py:4406",
+          "tests/test_test_runtime.py:4410",
+          "tests/test_test_runtime.py:4412",
+          "tests/test_test_runtime.py:4415",
+          "tests/test_test_runtime.py:4422",
+          "tests/test_test_runtime.py:4425",
+          "tests/test_test_runtime.py:4450",
+          "tests/test_test_runtime.py:4458",
+          "tests/test_test_runtime.py:5066",
+          "tests/test_test_runtime.py:5094",
+          "tests/test_test_runtime.py:5098",
+          "tests/test_test_runtime.py:5105",
+          "tests/test_test_runtime.py:5111",
+          "tests/test_test_runtime.py:5112",
+          "tests/test_test_runtime.py:5118",
+          "tests/test_test_runtime.py:5121",
+          "tests/test_test_runtime.py:5123",
+          "tests/test_test_runtime.py:5124",
+          "tests/test_test_runtime.py:5846",
+          "tests/test_test_runtime.py:5849",
+          "tests/test_test_runtime.py:5856",
+          "tests/test_test_runtime.py:6185",
+          "tests/test_test_runtime.py:6190",
+          "tests/test_test_runtime.py:6194",
+          "tests/test_test_runtime.py:6211",
+          "tests/test_test_runtime.py:6213",
+          "tests/test_test_runtime.py:6215",
+          "tests/test_test_runtime.py:6219",
+          "tests/test_test_runtime.py:6238",
+          "tests/test_test_runtime.py:6240",
+          "tests/test_test_runtime.py:6298",
+          "tests/test_test_runtime.py:6302",
+          "tests/test_test_runtime.py:6320",
+          "tests/test_test_runtime.py:6323",
+          "tests/test_test_runtime.py:6327",
+          "tests/test_test_runtime.py:6676",
+          "tests/test_test_runtime.py:6714",
+          "tests/test_test_runtime.py:6763",
+          "tests/test_test_runtime.py:6765",
+          "tests/test_test_runtime.py:7146",
+          "tests/test_test_runtime.py:7148",
+          "tests/test_test_runtime.py:7153",
+          "tests/test_test_runtime.py:7166",
+          "tests/test_test_runtime.py:7169",
+          "tests/test_test_runtime.py:7170",
+          "tests/test_test_runtime.py:7174",
+          "tests/test_test_runtime.py:7182",
+          "tests/test_test_runtime.py:7189",
+          "tests/test_test_runtime.py:7202",
+          "tests/test_test_runtime.py:7304",
+          "tests/test_test_runtime.py:7314",
+          "tests/test_test_runtime.py:7320",
+          "tests/test_test_runtime.py:7332",
+          "tests/test_test_runtime.py:7335",
+          "tests/test_test_runtime.py:7337",
+          "tests/test_test_runtime.py:7341",
+          "tests/test_test_runtime.py:7348",
+          "tests/test_test_runtime.py:7358",
+          "tests/test_test_runtime.py:7366",
+          "tests/test_test_runtime.py:7367",
+          "tests/test_test_runtime.py:7845",
+          "tests/test_test_runtime.py:7847",
+          "tests/test_test_runtime.py:7850",
+          "tests/test_test_runtime.py:7852",
+          "tests/test_test_runtime.py:7874",
+          "tests/test_test_runtime.py:7914",
+          "tests/test_test_runtime.py:7945",
+          "tests/test_test_runtime.py:7955",
+          "tests/test_test_runtime.py:7958",
+          "tests/test_test_runtime.py:7971",
+          "tests/test_test_runtime.py:7974",
+          "tests/test_test_runtime.py:7977",
+          "tests/test_test_runtime.py:7978",
+          "tests/test_pytest_timeout.py:32",
+          "tests/test_pytest_timeout.py:39",
+          "tests/test_pytest_timeout.py:73",
+          "tests/test_pytest_timeout.py:195",
+          "tests/test_pytest_timeout.py:207",
+          "tests/test_pytest_timeout.py:213",
+          "tests/test_pytest_timeout.py:268",
+          "tests/test_antigravity.py:958",
+          "tests/test_antigravity.py:975",
+          "tests/test_antigravity.py:988",
+          "tests/test_antigravity.py:1127",
+          "tests/test_antigravity.py:1135",
+          "tests/test_antigravity.py:1137",
+          "tests/test_antigravity.py:1142",
+          "tests/test_antigravity.py:1143",
+          "tests/test_antigravity.py:1148",
+          "tests/test_antigravity.py:1150",
+          "tests/test_antigravity.py:1186",
+          "tests/test_antigravity.py:1209",
+          "tests/test_antigravity.py:1223",
+          "tests/test_antigravity.py:1224",
+          "tests/test_antigravity.py:1226",
+          "tests/test_antigravity.py:1913",
+          "tests/test_antigravity.py:1994"
+        ]
+      },
+      "_probe_json": {
+        "sha256": "46be7f0aa192f25aafd9b99b475a6520b9f750fb7e60743639b2dd7b9bee7165",
+        "original_lines": [
+          1079,
+          1087
+        ],
+        "same_module_references": [
+          "ManagedCiProbeContext",
+          "_probe"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:89",
+          "src/coding_review_agent_loop/managed_ci_api.py:100",
+          "src/coding_review_agent_loop/managed_ci_protection.py:31",
+          "src/coding_review_agent_loop/managed_ci_protection.py:32",
+          "src/coding_review_agent_loop/managed_ci_protection.py:210",
+          "src/coding_review_agent_loop/managed_ci_protection.py:236",
+          "src/coding_review_agent_loop/managed_ci_protection.py:253",
+          "src/coding_review_agent_loop/managed_ci_protection.py:282"
+        ]
+      },
+      "_probe_json_list": {
+        "sha256": "9089cfa89c5581d41d062b16778df423ce6aeab7a346754756baf235b1f7dccf",
+        "original_lines": [
+          1090,
+          1101
+        ],
+        "same_module_references": [
+          "ManagedCiProbeContext",
+          "_probe"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:100",
+          "src/coding_review_agent_loop/managed_ci_protection.py:32",
+          "src/coding_review_agent_loop/managed_ci_protection.py:253"
+        ]
+      },
+      "_is_http_error": {
+        "sha256": "b3e18505e8936c6fcecbac64cc35951cdd6399c3d4d905c00b9d672e34b1a723",
+        "original_lines": [
+          1104,
+          1109
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:114",
+          "src/coding_review_agent_loop/managed_ci_api.py:185",
+          "src/coding_review_agent_loop/managed_ci_protection.py:29",
+          "src/coding_review_agent_loop/managed_ci_protection.py:229",
+          "src/coding_review_agent_loop/managed_ci_protection.py:265"
+        ]
+      },
+      "_is_plan_limited_error": {
+        "sha256": "f964b04dda61e0abf008e7ec3a4f30afdefb968686f72c5aad406dc18458fca8",
+        "original_lines": [
+          1112,
+          1117
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:122",
+          "src/coding_review_agent_loop/managed_ci_protection.py:30",
+          "src/coding_review_agent_loop/managed_ci_protection.py:217"
+        ]
+      },
+      "_GH_HTTP_STATUS_LINE": {
+        "sha256": "5e2a137c49a6ef893fa11686445ae8cb210797f16618db9418b4b70765377b86",
+        "original_lines": [
+          1120,
+          1120
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:130",
+          "src/coding_review_agent_loop/managed_ci_api.py:145"
+        ]
+      },
+      "_http_status": {
+        "sha256": "b4bda3313edbba0c4403a25d14c018975adee82a63befec7bfb6d77c877bd2a0",
+        "original_lines": [
+          1123,
+          1138
+        ],
+        "same_module_references": [
+          "_GH_HTTP_STATUS_LINE"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:133",
+          "src/coding_review_agent_loop/managed_ci_api.py:181",
+          "src/coding_review_agent_loop/managed_ci_api.py:187",
+          "src/coding_review_agent_loop/managed_ci_protection.py:28",
+          "src/coding_review_agent_loop/managed_ci_protection.py:220",
+          "src/coding_review_agent_loop/managed_ci_protection.py:247",
+          "src/coding_review_agent_loop/managed_ci_protection.py:262",
+          "tests/test_managed_ci.py:9157",
+          "tests/test_managed_ci.py:9162"
+        ]
+      },
+      "_read_managed_actor_variable": {
+        "sha256": "3da461598d1dae9ac949e13dfa4bd6dbdd37c0d7fd9db74dc6283f507376e94b",
+        "original_lines": [
+          1141,
+          1145
+        ],
+        "same_module_references": [
+          "ManagedActorVariable",
+          "_read_actions_variable"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:151",
+          "src/coding_review_agent_loop/managed_ci_api.py:229",
+          "src/coding_review_agent_loop/integration_close.py:72",
+          "src/coding_review_agent_loop/integration_close.py:93",
+          "tests/test_managed_ci.py:9184",
+          "tests/test_managed_ci.py:9200"
+        ]
+      },
+      "_read_actions_variable": {
+        "sha256": "1dc9bfbefea0aeafbdefb406498d3720bb3960beaf8d6dba7f525cb811a1d814",
+        "original_lines": [
+          1148,
+          1181
+        ],
+        "same_module_references": [
+          "ManagedActorVariable",
+          "_http_status",
+          "_is_http_error"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:155",
+          "src/coding_review_agent_loop/managed_ci_api.py:158"
+        ]
+      },
+      "_resolve_advertised_actor": {
+        "sha256": "cad31d471bdb7f735b4bb5c40da882a710d0017d14f3619614cba68424d2d3f4",
+        "original_lines": [
+          1184,
+          1197
+        ],
+        "same_module_references": [
+          "ManagedActorVariable"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:194",
+          "src/coding_review_agent_loop/managed_ci_api.py:232",
+          "src/coding_review_agent_loop/integration_close.py:73",
+          "src/coding_review_agent_loop/integration_close.py:99",
+          "tests/test_managed_ci.py:9191",
+          "tests/test_managed_ci.py:9194",
+          "tests/test_managed_ci.py:9202"
+        ]
+      },
+      "_ASSERTED_ACTOR_LOGGED": {
+        "sha256": "da1c361c5edad08647495b0ac57042e6f461fe0fae6829863fe04c92737f27d1",
+        "original_lines": [
+          1200,
+          1200
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:210",
+          "src/coding_review_agent_loop/managed_ci_api.py:215",
+          "src/coding_review_agent_loop/managed_ci_api.py:217",
+          "tests/test_managed_ci.py:9219",
+          "tests/test_managed_ci.py:9780"
+        ]
+      },
+      "_log_asserted_actor": {
+        "sha256": "9ee934f8ea178ab6f3069a2bb3051b0c6bca4810b4f05d88bd093d30e5029db6",
+        "original_lines": [
+          1203,
+          1214
+        ],
+        "same_module_references": [
+          "_ASSERTED_ACTOR_LOGGED"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:213",
+          "src/coding_review_agent_loop/managed_ci_api.py:234"
+        ]
+      },
+      "_advertised_managed_actor": {
+        "sha256": "0761a5f546b36cd58948a33030c7d5c4002e5b347928e698fb15922714df65b0",
+        "original_lines": [
+          1217,
+          1225
+        ],
+        "same_module_references": [
+          "_log_asserted_actor",
+          "_read_managed_actor_variable",
+          "_resolve_advertised_actor"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:227",
+          "src/coding_review_agent_loop/managed_ci_reconciliation.py:137",
+          "src/coding_review_agent_loop/managed_ci_reconciliation.py:272",
+          "src/coding_review_agent_loop/managed_ci_failure.py:128"
+        ]
+      },
+      "_probe_raw_workflow": {
+        "sha256": "85379fc67086598ff8ebc72919f2290763e99e312cd14e29f92c454348b38011",
+        "original_lines": [
+          1228,
+          1235
+        ],
+        "same_module_references": [
+          "ManagedCiProbeContext",
+          "WORKFLOW_FILE",
+          "_probe"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:238"
+        ]
+      },
+      "_historical_managed_label_event": {
+        "sha256": "3c4c372b889fa560e8fc05c564ae3464e2116da5075e5f9bb336f0b71a0e06a8",
+        "original_lines": [
+          3617,
+          3632
+        ],
+        "same_module_references": [
+          "_managed_label_event_history"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:248"
+        ]
+      },
+      "_managed_label_event_history": {
+        "sha256": "ecc77fcfbe8523984d27c916d97f123037848c1ec3a0b96a8eece40eeecf8716",
+        "original_lines": [
+          3635,
+          3666
+        ],
+        "same_module_references": [
+          "_api_list"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:256",
+          "src/coding_review_agent_loop/managed_ci_api.py:266",
+          "tests/test_github_retry.py:344"
+        ]
+      },
+      "_api_list_detailed": {
+        "sha256": "5027c25f816fc7be5fb0b89c9f4999dcbe5a5bd95a3b8030e8b4d82083430308",
+        "original_lines": [
+          6926,
+          6935
+        ],
+        "same_module_references": [
+          "_LIST_FAILURE",
+          "_api_list_detailed_inner"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:300",
+          "src/coding_review_agent_loop/managed_ci_api.py:303",
+          "src/coding_review_agent_loop/managed_ci_api.py:312",
+          "src/coding_review_agent_loop/managed_ci_api.py:347",
+          "src/coding_review_agent_loop/managed_ci_api.py:358",
+          "tests/test_github_retry.py:367",
+          "tests/test_github_retry.py:497"
+        ]
+      },
+      "_api_list_detailed_inner": {
+        "sha256": "52ae61b03eb5b3720f133ec31695b123af3ccef612e612c3f4c2460d1ef66fff",
+        "original_lines": [
+          6938,
+          6964
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:303",
+          "src/coding_review_agent_loop/managed_ci_api.py:312"
+        ]
+      },
+      "_with_reason": {
+        "sha256": "15843f551469ecf70f1115305e0484445f99e687fe474b030d30b9c9e72b2e4a",
+        "original_lines": [
+          6967,
+          6968
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:341",
+          "tests/test_github_retry.py:369",
+          "tests/test_agent_permissions.py:1178"
+        ]
+      },
+      "_api_list": {
+        "sha256": "fd366437957d30b2ac8ac01333c508826b5afa1b55cc9644d00ca3ea1f362515",
+        "original_lines": [
+          6971,
+          6973
+        ],
+        "same_module_references": [
+          "_api_list_detailed"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:45",
+          "src/coding_review_agent_loop/managed_ci_api.py:275",
+          "src/coding_review_agent_loop/managed_ci_api.py:300",
+          "src/coding_review_agent_loop/managed_ci_api.py:303",
+          "src/coding_review_agent_loop/managed_ci_api.py:312",
+          "src/coding_review_agent_loop/managed_ci_api.py:345",
+          "src/coding_review_agent_loop/managed_ci_api.py:347",
+          "src/coding_review_agent_loop/managed_ci_api.py:358",
+          "tests/test_github_retry.py:312",
+          "tests/test_github_retry.py:358",
+          "tests/test_github_retry.py:367",
+          "tests/test_github_retry.py:497",
+          "tests/test_managed_ci.py:47",
+          "tests/test_managed_ci.py:8317",
+          "tests/test_managed_ci.py:8319",
+          "tests/test_managed_ci.py:10929",
+          "tests/test_managed_ci.py:10931"
+        ]
+      },
+      "label_event_history": {
+        "sha256": "963e3374192426e3d812a9ef09a670f5fe6f672f68cf4d645612c03623a6c486",
+        "original_lines": [
+          7014,
+          7057
+        ],
+        "same_module_references": [
+          "CompleteLabelHistory",
+          "LabelEvent",
+          "UnknownLabelHistory",
+          "_api_list_detailed"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:256",
+          "src/coding_review_agent_loop/managed_ci_api.py:266",
+          "src/coding_review_agent_loop/managed_ci_api.py:350",
+          "src/coding_review_agent_loop/managed_ci_api.py:404",
+          "tests/test_github_retry.py:344",
+          "tests/test_managed_ci.py:13649"
+        ]
+      },
+      "_active_managed_label_event": {
+        "sha256": "3b3bca78dd91d02278d9c9113160b72c3b5c9303742b3a4b0037aebc340d874b",
+        "original_lines": [
+          7060,
+          7076
+        ],
+        "same_module_references": [
+          "CompleteLabelHistory",
+          "label_event_history"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:396",
+          "src/coding_review_agent_loop/managed_ci_failure.py:134"
+        ]
+      },
+      "_read_repo_default_branch": {
+        "sha256": "f7f06051ad14e4c9b4bd86c542949fc06e37c1b4ef752d110563adad0330231a",
+        "original_lines": [
+          7940,
+          7950
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_api.py:415"
+        ]
+      },
+      "_api_json": {
+        "sha256": "52a674a019a9f133a70fc9741f2dafa00af02564248520ab4114a57c4a2ad67e",
+        "original_lines": [
+          8096,
+          8108
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/github.py:2793",
+          "src/coding_review_agent_loop/github.py:2835",
+          "src/coding_review_agent_loop/github.py:2892",
+          "src/coding_review_agent_loop/managed_ci_api.py:428",
+          "src/coding_review_agent_loop/integration_close.py:71",
+          "src/coding_review_agent_loop/integration_close.py:100",
+          "tests/test_github_retry.py:13",
+          "tests/test_github_retry.py:193",
+          "tests/test_github_retry.py:197",
+          "tests/test_github_retry.py:203",
+          "tests/test_pr_loop_coder_ci_guard.py:185",
+          "tests/test_pr_loop_coder_ci_guard.py:187",
+          "tests/test_pr_loop_coder_ci_guard.py:189",
+          "tests/test_managed_ci.py:13619",
+          "tests/test_managed_ci.py:13624",
+          "tests/test_pr_head_fetch.py:132"
+        ]
+      }
+    },
+    "managed_ci_protection": {
+      "waivable_protection_states": {
+        "sha256": "35eb933b79aa484a43efd994aba44ddcc2a9a5366f03128a1a72390bbc2cee35",
+        "original_lines": [
+          276,
+          282
+        ],
+        "same_module_references": [
+          "_OVERRIDE_PROTECTION_STATES"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:277",
+          "src/coding_review_agent_loop/validated_agent.py:45",
+          "src/coding_review_agent_loop/validated_agent.py:3469",
+          "src/coding_review_agent_loop/managed_ci_protection.py:36",
+          "src/coding_review_agent_loop/managed_ci_protection.py:76",
+          "tests/test_managed_ci.py:9722",
+          "tests/test_managed_ci.py:9731",
+          "tests/test_managed_ci.py:9732",
+          "tests/test_managed_ci.py:9733",
+          "tests/test_managed_ci.py:9734"
+        ]
+      },
+      "waiver_flags_for_protection": {
+        "sha256": "607d74ce6b7f5488f744507d6317d87e2bac0eb5646278b273ab550c9db4dbf2",
+        "original_lines": [
+          285,
+          289
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:278",
+          "src/coding_review_agent_loop/validated_agent.py:45",
+          "src/coding_review_agent_loop/validated_agent.py:3485",
+          "src/coding_review_agent_loop/managed_ci_protection.py:45",
+          "tests/test_managed_ci.py:9735",
+          "tests/test_managed_ci.py:9736"
+        ]
+      },
+      "_waiver_for_protection": {
+        "sha256": "cfabdde6848f4368360942a8fdf32150f93c283ce2e437968fcd3f695d48a3d5",
+        "original_lines": [
+          292,
+          298
+        ],
+        "same_module_references": [
+          "_UNPROTECTED_WAIVER",
+          "_UNREADABLE_WAIVER"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:52",
+          "tests/test_managed_ci.py:9737",
+          "tests/test_managed_ci.py:9738",
+          "tests/test_managed_ci.py:9739"
+        ]
+      },
+      "reconcile_live_protection": {
+        "sha256": "85d577b7fc1fac502a7243c10d02e2704d99397262a55c55b965984d5be0e66c",
+        "original_lines": [
+          301,
+          323
+        ],
+        "same_module_references": [
+          "ProtectionAssessment",
+          "waivable_protection_states"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:61"
+        ]
+      },
+      "_has_final_context": {
+        "sha256": "5b379fb1fa19083708cc7a12d6ec6565f085b59f5441cefe78522d49660f6a3c",
+        "original_lines": [
+          1238,
+          1246
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:86",
+          "src/coding_review_agent_loop/managed_ci_protection.py:235"
+        ]
+      },
+      "_RULESET_ENFORCEMENT_VALUES": {
+        "sha256": "bce9165ee57cc537ca26e5743e98080e466b5ba1c4b37f3473f503823f50bc05",
+        "original_lines": [
+          1249,
+          1249
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:97",
+          "src/coding_review_agent_loop/managed_ci_protection.py:134"
+        ]
+      },
+      "_BYPASS_ACTOR_TYPES": {
+        "sha256": "238d37e1ef7610b84a7463cb188ddb3b12ffc737fe918d193337ddd4dee96573",
+        "original_lines": [
+          1250,
+          1252
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:100",
+          "src/coding_review_agent_loop/managed_ci_protection.py:105",
+          "src/coding_review_agent_loop/managed_ci_protection.py:145",
+          "src/coding_review_agent_loop/managed_ci_protection.py:149"
+        ]
+      },
+      "_BYPASS_ACTOR_TYPES_WITHOUT_ID": {
+        "sha256": "7f59f744517235ece556ee5c4c754d3727a586624c1d7de17281ec97fb6a3d9f",
+        "original_lines": [
+          1253,
+          1253
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:105",
+          "src/coding_review_agent_loop/managed_ci_protection.py:149"
+        ]
+      },
+      "_BYPASS_MODES": {
+        "sha256": "aaf8dcdcaf87140407454e0d4ee6e227e18e004164d965c1b3e0445dcf9b7b90",
+        "original_lines": [
+          1254,
+          1254
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:108",
+          "src/coding_review_agent_loop/managed_ci_protection.py:154"
+        ]
+      },
+      "_ruleset_detail_problem": {
+        "sha256": "ea87bfd9e6decce74f856d620653ab351630818c299c9022e2b9a6d4219a4e75",
+        "original_lines": [
+          1257,
+          1303
+        ],
+        "same_module_references": [
+          "_BYPASS_ACTOR_TYPES",
+          "_BYPASS_ACTOR_TYPES_WITHOUT_ID",
+          "_BYPASS_MODES",
+          "_RULESET_ENFORCEMENT_VALUES"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:111",
+          "src/coding_review_agent_loop/managed_ci_protection.py:161",
+          "src/coding_review_agent_loop/managed_ci_protection.py:285"
+        ]
+      },
+      "_ruleset_detail_well_formed": {
+        "sha256": "2cee418cdd44cba5b24b84dd7f62c50dc2d01a11ab38158c4cacfc17c4dda2a8",
+        "original_lines": [
+          1306,
+          1307
+        ],
+        "same_module_references": [
+          "_ruleset_detail_problem"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:160",
+          "tests/test_managed_ci.py:9600",
+          "tests/test_managed_ci.py:9623"
+        ]
+      },
+      "_ruleset_bypass_state": {
+        "sha256": "d91db1881c92db08c7acc0ca7c7cf0281abfd6286dacc2bef6f626ded48c8344",
+        "original_lines": [
+          1310,
+          1321
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:164",
+          "src/coding_review_agent_loop/managed_ci_protection.py:294",
+          "tests/test_managed_ci.py:9635",
+          "tests/test_managed_ci.py:9636",
+          "tests/test_managed_ci.py:9637",
+          "tests/test_managed_ci.py:9638"
+        ]
+      },
+      "_ruleset_requires_final_context": {
+        "sha256": "ab6fe9b8f6ff675967f69bbac063a718d02fbaf360737023b332b55d01fb0dbd",
+        "original_lines": [
+          1324,
+          1337
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:178",
+          "src/coding_review_agent_loop/managed_ci_protection.py:291",
+          "tests/test_managed_ci.py:9642",
+          "tests/test_managed_ci.py:9643",
+          "tests/test_managed_ci.py:9646",
+          "tests/test_managed_ci.py:9649"
+        ]
+      },
+      "assess_exact_head_protection": {
+        "sha256": "4d60964b304c0490cde32e9d44f9188b76fc1467e1788c2f6eebd270a36340cf",
+        "original_lines": [
+          1340,
+          1469
+        ],
+        "same_module_references": [
+          "ManagedCiProbeContext",
+          "ProtectionAssessment",
+          "_HIDDEN_BYPASS_DETAIL",
+          "_UNREADABLE_PROTECTION_DETAIL",
+          "_has_final_context",
+          "_http_status",
+          "_is_http_error",
+          "_is_plan_limited_error",
+          "_probe_json",
+          "_probe_json_list",
+          "_ruleset_bypass_state",
+          "_ruleset_detail_problem",
+          "_ruleset_requires_final_context"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_protection.py:194",
+          "tests/test_managed_ci.py:39",
+          "tests/test_managed_ci.py:522",
+          "tests/test_managed_ci.py:561",
+          "tests/test_managed_ci.py:568",
+          "tests/test_managed_ci.py:575",
+          "tests/test_managed_ci.py:583",
+          "tests/test_managed_ci.py:9393",
+          "tests/test_managed_ci.py:9411",
+          "tests/test_managed_ci.py:9432",
+          "tests/test_managed_ci.py:9449",
+          "tests/test_managed_ci.py:9464",
+          "tests/test_managed_ci.py:9473",
+          "tests/test_managed_ci.py:9487",
+          "tests/test_managed_ci.py:9507",
+          "tests/test_managed_ci.py:9529",
+          "tests/test_managed_ci.py:9537",
+          "tests/test_managed_ci.py:9594",
+          "tests/test_managed_ci.py:9630",
+          "tests/test_managed_ci.py:9667",
+          "tests/test_managed_ci.py:9676",
+          "tests/test_managed_ci.py:9697",
+          "tests/test_managed_ci.py:9713"
+        ]
+      }
+    }
+  },
+  "compatibility_exports": {
+    "MANAGED_OPT_OUT_LABEL": "managed_ci_types",
+    "QUALIFIED_LABEL": "managed_ci_types",
+    "QUALIFICATION_MARKER": "managed_ci_types",
+    "MANAGED_PLUMBING_JOB_NAMES": "managed_ci_types",
+    "PLUMBING_STATUS_CONTEXTS": "managed_ci_types",
+    "READINESS_CONTEXT": "managed_ci_types",
+    "WORKFLOW_FILE": "managed_ci_types",
+    "_CONTRACT_MARKERS": "managed_ci_types",
+    "V2_MARKER": "managed_ci_types",
+    "INTENT_MARKER": "managed_ci_types",
+    "V2_FEATURE_MARKERS": "managed_ci_types",
+    "V2_ADOPTION_MARKER": "managed_ci_types",
+    "V2_ADOPTION_FEATURE_MARKERS": "managed_ci_types",
+    "RECOVERY_MARKER": "managed_ci_types",
+    "VISIBLE_INTENT_MARKER": "managed_ci_types",
+    "HOST_FOOTER_INTENT_MARKER": "managed_ci_types",
+    "UNPROTECTED_OVERRIDE_TRAILER": "managed_ci_types",
+    "TRUSTED_BASES_MARKER": "managed_ci_types",
+    "TRUSTED_BASES_VARIABLE": "managed_ci_types",
+    "ISSUE_AUTHORIZATION_MARKER": "managed_ci_types",
+    "_TERMINAL_CI_STATUSES": "managed_ci_types",
+    "ManagedCiProbeContext": "managed_ci_types",
+    "ProtectionAssessment": "managed_ci_types",
+    "ManagedCiReadiness": "managed_ci_types",
+    "ManagedActorVariable": "managed_ci_types",
+    "_UNPROTECTED_WAIVER": "managed_ci_types",
+    "_UNREADABLE_WAIVER": "managed_ci_types",
+    "_OVERRIDE_PROTECTION_STATES": "managed_ci_types",
+    "_UNREADABLE_PROTECTION_DETAIL": "managed_ci_types",
+    "_HIDDEN_BYPASS_DETAIL": "managed_ci_types",
+    "PREFLIGHT_STRICT_READY": "managed_ci_types",
+    "PREFLIGHT_KNOWN_NOT_READY": "managed_ci_types",
+    "PREFLIGHT_INDETERMINATE": "managed_ci_types",
+    "V1_DISPATCH_RECORD_LIMIT": "managed_ci_types",
+    "ManagedV1DispatchRecord": "managed_ci_types",
+    "ManagedCiContract": "managed_ci_types",
+    "ManagedCiCreationIntent": "managed_ci_types",
+    "ManagedCiOverrideRecord": "managed_ci_types",
+    "AuthenticatedIssueCreatedHandoff": "managed_ci_types",
+    "ManagedCiIssueAuthorization": "managed_ci_types",
+    "AuthenticatedManagedResume": "managed_ci_types",
+    "_SUPERSEDING_AUTHORIZATION_KINDS": "managed_ci_types",
+    "OrdinaryRecoveryCapability": "managed_ci_types",
+    "ManagedCiOutcome": "managed_ci_types",
+    "ManagedCiRunSnapshot": "managed_ci_types",
+    "LabelEvent": "managed_ci_types",
+    "CompleteLabelHistory": "managed_ci_types",
+    "UnknownLabelHistory": "managed_ci_types",
+    "ReconciledLabelWrite": "managed_ci_types",
+    "_LIST_FAILURE": "managed_ci_api",
+    "_last_list_failure": "managed_ci_api",
+    "_surfaces_list_failures": "managed_ci_api",
+    "_probe": "managed_ci_api",
+    "_probe_json": "managed_ci_api",
+    "_probe_json_list": "managed_ci_api",
+    "_is_http_error": "managed_ci_api",
+    "_is_plan_limited_error": "managed_ci_api",
+    "_GH_HTTP_STATUS_LINE": "managed_ci_api",
+    "_http_status": "managed_ci_api",
+    "_read_managed_actor_variable": "managed_ci_api",
+    "_read_actions_variable": "managed_ci_api",
+    "_resolve_advertised_actor": "managed_ci_api",
+    "_ASSERTED_ACTOR_LOGGED": "managed_ci_api",
+    "_log_asserted_actor": "managed_ci_api",
+    "_advertised_managed_actor": "managed_ci_api",
+    "_probe_raw_workflow": "managed_ci_api",
+    "_historical_managed_label_event": "managed_ci_api",
+    "_managed_label_event_history": "managed_ci_api",
+    "_api_list_detailed": "managed_ci_api",
+    "_api_list_detailed_inner": "managed_ci_api",
+    "_with_reason": "managed_ci_api",
+    "_api_list": "managed_ci_api",
+    "label_event_history": "managed_ci_api",
+    "_active_managed_label_event": "managed_ci_api",
+    "_read_repo_default_branch": "managed_ci_api",
+    "_api_json": "managed_ci_api",
+    "waivable_protection_states": "managed_ci_protection",
+    "waiver_flags_for_protection": "managed_ci_protection",
+    "_waiver_for_protection": "managed_ci_protection",
+    "reconcile_live_protection": "managed_ci_protection",
+    "_has_final_context": "managed_ci_protection",
+    "_RULESET_ENFORCEMENT_VALUES": "managed_ci_protection",
+    "_BYPASS_ACTOR_TYPES": "managed_ci_protection",
+    "_BYPASS_ACTOR_TYPES_WITHOUT_ID": "managed_ci_protection",
+    "_BYPASS_MODES": "managed_ci_protection",
+    "_ruleset_detail_problem": "managed_ci_protection",
+    "_ruleset_detail_well_formed": "managed_ci_protection",
+    "_ruleset_bypass_state": "managed_ci_protection",
+    "_ruleset_requires_final_context": "managed_ci_protection",
+    "assess_exact_head_protection": "managed_ci_protection"
+  },
+  "patch_retargets": [
+    {
+      "path": "tests/test_managed_ci.py",
+      "symbols": [
+        "_ASSERTED_ACTOR_LOGGED",
+        "log"
+      ],
+      "owner": "managed_ci_api",
+      "reason": "Actor-read log capture must patch the moved function globals; driver lookups remain unchanged."
+    }
+  ]
+}

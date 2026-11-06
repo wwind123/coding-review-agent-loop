@@ -10,12 +10,10 @@ from .managed_ci_result import VerifiedManagedResult
 from .managed_ci_reconciliation import require_verified_result, historical_qualification_fields
 
 import base64
-import functools
 import json
 import re
 import secrets
 import shlex
-import threading
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -121,445 +119,106 @@ from .protocol_markers import (
 )
 from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
-
-
-MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
-QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
-QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
 from .managed_ci_status import FINAL_CONTEXT
-# Plumbing job identity (#1477): the exact managed workflow job names that
-# validate, attest and publish rather than test.  A contract test pins each
-# name to a ``name:`` in the managed workflows; callers extend the catalog
-# only with explicit --ci-plumbing-check names, never by substring.
-MANAGED_PLUMBING_JOB_NAMES = frozenset({
-    "Validate managed exact-head dispatch",
-    "Verify split attestations",
-    "Publish final exact-head status",
-})
-PLUMBING_STATUS_CONTEXTS = frozenset({FINAL_CONTEXT})
-READINESS_CONTEXT = "agent-loop/round-readiness"
-WORKFLOW_FILE = "ci.yml"
-_CONTRACT_MARKERS = (MANAGED_LABEL, FINAL_CONTEXT, "expected_head_sha")
-V2_MARKER = "AGENT_LOOP_MANAGED_CI_V2"
-INTENT_MARKER = "AGENT_MANAGED_CI_INTENT_V2"
-V2_FEATURE_MARKERS = (V2_MARKER, "workflow_dispatch", "managed_nonce", FINAL_CONTEXT)
-# Adoption is deliberately not a v2 feature marker: repositories which have
-# deployed the safe issue-created draft flow do not implicitly opt in to
-# suppressing CI for existing PRs.
-V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
-V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
-RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
-# Advertised by a base workflow whose intent validator admits the fixed
-# visible authorization line ahead of the record (#935).
-VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
-# Advertised by a base workflow whose intent validator admits the record
-# followed by exactly the known host comment footer, matched against the raw
-# comment body (#1043).
-HOST_FOOTER_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1"
-UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
-# Default-branch workflows advertise trusted integration-base support with this
-# literal; the allow-list itself is the AGENT_LOOP_TRUSTED_BASES repository
-# variable, which a PR cannot change (#1285).
-TRUSTED_BASES_MARKER = "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1"
-TRUSTED_BASES_VARIABLE = "AGENT_LOOP_TRUSTED_BASES"
-ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
-_TERMINAL_CI_STATUSES = frozenset({
-    "success", "failure", "error", "cancelled", "timed_out",
-    "action_required", "startup_failure", "stale",
-})
 
 
-_LIST_FAILURE = threading.local()
-
-
-def _last_list_failure() -> str:
-    """Reason of the most recent ``_api_list`` failure on this thread ('' if it succeeded)."""
-    return getattr(_LIST_FAILURE, "reason", "")
-
-
-def _surfaces_list_failures(func):
-    """Append GitHub list-read failure diagnostics to terminal errors.
-
-    Many managed-CI gates fail closed on an unreadable list and later raise a
-    generic refusal.  Within one outermost gate call, every list failure is
-    remembered, so the terminal ``AgentLoopError`` carries the final stderr and
-    retry attempt history even when the failing read was consumed by a helper
-    that only returns ``None``.  Existing fail-closed decisions are unchanged.
-    """
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        outermost = getattr(_LIST_FAILURE, "depth", 0) == 0
-        if outermost:
-            _LIST_FAILURE.failures = []
-        _LIST_FAILURE.depth = getattr(_LIST_FAILURE, "depth", 0) + 1
-        try:
-            return func(*args, **kwargs)
-        except AgentLoopError as exc:
-            failures = list(getattr(_LIST_FAILURE, "failures", ()) or ())
-            missing = [reason for reason in failures if reason not in str(exc)]
-            if missing and type(exc) in (AgentLoopError,):
-                detail = "\n".join(f"GitHub list read failure: {reason}" for reason in missing)
-                raise AgentLoopError(f"{exc}\n{detail}") from exc
-            raise
-        finally:
-            _LIST_FAILURE.depth -= 1
-            if outermost:
-                _LIST_FAILURE.failures = None
-
-    return wrapper
-
-
-@dataclass(frozen=True)
-class ManagedCiProbeContext:
-    """The deliberately small, read-only context used by standalone preflight."""
-
-    repo: str
-    gh_cmd: str
-    cwd: Path
-
-
-@dataclass(frozen=True)
-class ProtectionAssessment:
-    """Whether GitHub, rather than this process, enforces the final context."""
-
-    state: Literal["strict", "voluntary", "plan_limited", "unreadable", "indeterminate"]
-    source: str
-    detail: str
-
-
-@dataclass(frozen=True)
-class ManagedCiReadiness:
-    """Stable, non-mutating readiness result consumed by CLI and runtime gates."""
-
-    state: Literal["strict_ready", "override_eligible", "ordinary_fallback", "invalid", "indeterminate"]
-    repo_visibility: str | None
-    actor: str | None
-    advertised_actor: str | None
-    workflow_v2: bool
-    recovery_capable: bool
-    protection: ProtectionAssessment
-    reasons: tuple[str, ...]
-    remediation: tuple[str, ...]
-    # The evaluator resolves the repository default before it probes the
-    # workflow.  Keep that value so preflight reports the branch it assessed.
-    base: str | None = None
-    # ``asserted`` means the Actions variable read was refused with HTTP 403
-    # and ``--managed-ci-trusted-actor`` stood in for it.  The value is then
-    # unverified locally; the workflow still enforces the real variable.
-    advertised_actor_source: Literal["variable", "asserted"] | None = None
-
-
-@dataclass(frozen=True)
-class ManagedActorVariable:
-    """One classified read of the ``AGENT_LOOP_MANAGED_ACTOR`` variable."""
-
-    value: str | None
-    status: Literal["readable", "absent", "unreadable", "error"]
-    detail: str
-
-
-# The explicit per-invocation waivers.  ``unreadable`` protection is never
-# implied by --allow-unprotected-managed-ci alone (#1040).
-_UNPROTECTED_WAIVER = "allow-unprotected-managed-ci"
-_UNREADABLE_WAIVER = "allow-unreadable-protection"
-_OVERRIDE_PROTECTION_STATES = frozenset({"voluntary", "plan_limited", "unreadable"})
-_UNREADABLE_PROTECTION_DETAIL = (
-    "classic branch protection is not readable by this token (HTTP 403); "
-    "effective rules show no strict final-ci/exact-head enforcement"
+# Temporary identity-preserving exports for the support move (#1905).
+from .managed_ci_types import (
+    MANAGED_OPT_OUT_LABEL,
+    QUALIFIED_LABEL,
+    QUALIFICATION_MARKER,
+    MANAGED_PLUMBING_JOB_NAMES,
+    PLUMBING_STATUS_CONTEXTS,
+    READINESS_CONTEXT,
+    WORKFLOW_FILE,
+    _CONTRACT_MARKERS,
+    V2_MARKER,
+    INTENT_MARKER,
+    V2_FEATURE_MARKERS,
+    V2_ADOPTION_MARKER,
+    V2_ADOPTION_FEATURE_MARKERS,
+    RECOVERY_MARKER,
+    VISIBLE_INTENT_MARKER,
+    HOST_FOOTER_INTENT_MARKER,
+    UNPROTECTED_OVERRIDE_TRAILER,
+    TRUSTED_BASES_MARKER,
+    TRUSTED_BASES_VARIABLE,
+    ISSUE_AUTHORIZATION_MARKER,
+    _TERMINAL_CI_STATUSES,
+    ManagedCiProbeContext,
+    ProtectionAssessment,
+    ManagedCiReadiness,
+    ManagedActorVariable,
+    _UNPROTECTED_WAIVER,
+    _UNREADABLE_WAIVER,
+    _OVERRIDE_PROTECTION_STATES,
+    _UNREADABLE_PROTECTION_DETAIL,
+    _HIDDEN_BYPASS_DETAIL,
+    PREFLIGHT_STRICT_READY,
+    PREFLIGHT_KNOWN_NOT_READY,
+    PREFLIGHT_INDETERMINATE,
+    V1_DISPATCH_RECORD_LIMIT,
+    ManagedV1DispatchRecord,
+    ManagedCiContract,
+    ManagedCiCreationIntent,
+    ManagedCiOverrideRecord,
+    AuthenticatedIssueCreatedHandoff,
+    ManagedCiIssueAuthorization,
+    AuthenticatedManagedResume,
+    _SUPERSEDING_AUTHORIZATION_KINDS,
+    OrdinaryRecoveryCapability,
+    ManagedCiOutcome,
+    ManagedCiRunSnapshot,
+    LabelEvent,
+    CompleteLabelHistory,
+    UnknownLabelHistory,
+    ReconciledLabelWrite,
 )
-_HIDDEN_BYPASS_DETAIL = (
-    "; a ruleset requiring final-ci/exact-head does not expose its bypass actors to this token"
+from .managed_ci_api import (
+    _LIST_FAILURE,
+    _last_list_failure,
+    _surfaces_list_failures,
+    _probe,
+    _probe_json,
+    _probe_json_list,
+    _is_http_error,
+    _is_plan_limited_error,
+    _GH_HTTP_STATUS_LINE,
+    _http_status,
+    _read_managed_actor_variable,
+    _read_actions_variable,
+    _resolve_advertised_actor,
+    _ASSERTED_ACTOR_LOGGED,
+    _log_asserted_actor,
+    _advertised_managed_actor,
+    _probe_raw_workflow,
+    _historical_managed_label_event,
+    _managed_label_event_history,
+    _api_list_detailed,
+    _api_list_detailed_inner,
+    _with_reason,
+    _api_list,
+    label_event_history,
+    _active_managed_label_event,
+    _read_repo_default_branch,
+    _api_json,
 )
-
-
-def waivable_protection_states(config: AgentLoopConfig) -> frozenset[str]:
-    """Return the non-strict protection states this invocation explicitly waives."""
-    if not config.allow_unprotected_managed_ci:
-        return frozenset()
-    if config.allow_unreadable_protection:
-        return _OVERRIDE_PROTECTION_STATES
-    return frozenset({"voluntary", "plan_limited"})
-
-
-def waiver_flags_for_protection(state: str) -> str:
-    """Render the CLI flags needed to waive ``state`` explicitly."""
-    if state == "unreadable":
-        return "--allow-unprotected-managed-ci --allow-unreadable-protection"
-    return "--allow-unprotected-managed-ci"
-
-
-def _waiver_for_protection(state: str) -> str | None:
-    """Map a persisted protection state to its persisted waiver value."""
-    if state in {"voluntary", "plan_limited"}:
-        return _UNPROTECTED_WAIVER
-    if state == "unreadable":
-        return _UNREADABLE_WAIVER
-    return None
-
-
-def reconcile_live_protection(
-    persisted: str | None, live: ProtectionAssessment, *, config: AgentLoopConfig
-) -> ProtectionAssessment:
-    """Continue a persisted ``unreadable`` PR on a host that reads ``voluntary`` (#1063).
-
-    ``unreadable`` already waives an unknown, non-strict base, so a live
-    ``voluntary`` reading (this host can see more, and it is still not strict)
-    is covered by the same explicit waivers.  The PR keeps its persisted
-    state so every authorization and resume record stays consistent.  Every
-    other disagreement, notably a base that became strict, is returned as-is
-    and still refuses.
-    """
-    if (
-        persisted == "unreadable"
-        and live.state == "voluntary"
-        and "unreadable" in waivable_protection_states(config)
-    ):
-        return replace(
-            live,
-            state="unreadable",
-            detail=f"persisted unreadable; live assessment is voluntary ({live.detail})",
-        )
-    return live
-
-
-PREFLIGHT_STRICT_READY = 0
-PREFLIGHT_KNOWN_NOT_READY = 10
-PREFLIGHT_INDETERMINATE = 11
-
-
-# Only the newest records matter to the post-coder-turn audit's skew window.
-V1_DISPATCH_RECORD_LIMIT = 8
-
-
-@dataclass(frozen=True)
-class ManagedV1DispatchRecord:
-    """One successful managed-CI v1 dispatch made by this process (#1414).
-
-    A v1 run's name is the plain workflow name and GitHub's run listing omits
-    dispatch inputs, so the post-coder-turn audit correlates these fields
-    with listed runs to avoid attributing the orchestrator's own dispatch to
-    the coder.  In-process only: never serialized into any durable record.
-    """
-
-    workflow_file: str
-    ref: str
-    pr_number: int
-    expected_head_sha: str
-    requested_at: datetime
-    returned_at: datetime
-
-
-@dataclass
-class ManagedCiContract:
-    workflow_file: str = WORKFLOW_FILE
-    protocol_version: int = 1
-    base_ref: str | None = None
-    # The managed workflow is always read, revision-bound and dispatched on the
-    # default branch; ``base_ref`` is the PR's real (possibly integration) base.
-    dispatch_ref: str | None = None
-    trusted_actor_login: str | None = None
-    trusted_actor_id: int | None = None
-    workflow_revision: str | None = None
-    intent_comment_id: int | None = None
-    nonce: str | None = None
-    attached_run_id: int | None = None
-    run_attempt: int | None = None
-    pr_number: int | None = None
-    expected_head_sha: str | None = None
-    repository: str | None = None
-    created_at: int | None = None
-    adopted_existing_pr: bool = False
-    issue_created_pr: bool = False
-    guard_head_sha: str | None = None
-    active_label_event_id: int | None = None
-    invocation_applied_label: bool = False
-    protection_mode: str | None = None
-    audit_nonce: str | None = None
-    audit_comment_id: int | None = None
-    # A resumed invocation always gets a new generation. Historical intent
-    # comments remain diagnostic history and are never adopted as this run's
-    # dispatch authorization.
-    intent_generation: str | None = None
-    intent_state: str | None = None
-    terminal_run_id: int | None = None
-    terminal_run_attempt: int | None = None
-    terminal_attempts: tuple[tuple[int, int | None], ...] = ()
-    # ``completed`` is the only router-compatible terminal lifecycle state.
-    # Keep the no-status result as separate round metadata so older routers do
-    # not have to parse a producer-only lifecycle value.
-    terminal_outcome: Literal["no-status"] | None = None
-    activation_path: Literal["managed", "ordinary_fallback"] = "managed"
-    ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
-    # Derived from the exact base workflow at activation. Retain it for a
-    # delayed dispatch-time fallback so a suppressed draft is released only
-    # when that same workflow advertises an unlabeled CI route.
-    ordinary_recovery_capable: bool = False
-    # Derived from the same base workflow. Only a workflow that advertises
-    # the visible-intent envelope may receive the prefixed intent body.
-    visible_intent_capable: bool = False
-    # Derived from the same base workflow. Only a workflow that advertises
-    # the host-footer envelope can find an intent a footering host stored.
-    host_footer_capable: bool = False
-    # True once this generation issued a workflow dispatch or attached an
-    # existing run.  The ``dispatch-requested`` lifecycle state is never
-    # evidence of a dispatch.
-    dispatch_issued: bool = False
-    # Explicit lifecycle provenance.  These fields are intentionally not
-    # inferred from public mode flags after activation.
-    origin: Literal["issue-created", "source-managed"] | None = None
-    lifecycle: Literal[
-        "creation", "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
-    ] | None = None
-    authenticated_resume: "AuthenticatedManagedResume | None" = None
-    # Measured before/now report for a non-raising activation fallback that
-    # followed a mutation by this run (#1067).  Callers print it instead of a
-    # hard-coded post-state sentence.
-    state_report: str | None = None
-    # Final write diagnostic and attempt history of the last failed
-    # release_adopted_managed_ci removal (empty when it succeeded).
-    release_diagnostic: str = ""
-    # Successful v1 dispatches of this process, newest last, for the
-    # post-coder-turn dispatch audit (#1414).  Never persisted.
-    v1_dispatch_records: tuple[ManagedV1DispatchRecord, ...] = ()
-
-
-@dataclass(frozen=True)
-class ManagedCiCreationIntent:
-    """Instructions that make the opened event atomically recognizable as v2."""
-
-    branch: str
-    trusted_actor: str
-    protection_mode: str = "strict"
-    audit_nonce: str | None = None
-
-
-@dataclass(frozen=True)
-class ManagedCiOverrideRecord:
-    """Canonical override record parsed from one trusted PR surface.
-
-    The same marker has deliberately different schemas on a PR body and on
-    an actor-authored audit comment.  Keeping that distinction here prevents
-    one consumer from accepting a permissive form that another rejects.
-    """
-
-    nonce: str
-    fields: tuple[tuple[str, str], ...]
-
-    def field_map(self) -> dict[str, str]:
-        return dict(self.fields)
-
-
-@dataclass(frozen=True)
-class AuthenticatedIssueCreatedHandoff:
-    """Read-only proof for the issue-created draft -> PR-loop transition."""
-
-    pr_number: int
-    issue_number: int
-    repository: str
-    base_ref: str
-    head_sha: str
-    branch: str
-    trusted_actor_login: str
-    trusted_actor_id: int
-    protection_mode: str
-    override_nonce: str | None
-    # The nonce carried by the authenticated PR-opening body, when present.
-    # Fresh operator grants have their own nonce and retain this separately so
-    # resume validation can distinguish historical opening provenance from the
-    # grant that is being activated.
-    opening_override_nonce: str | None = None
-    active_label_event_id: int | None = None
-    lifecycle: Literal[
-        "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
-    ] = "draft-labeled"
-    authorization_kind: Literal["creation", "fresh", "continuity"] = "creation"
-    authorization_comment_id: int | None = None
-    approved_plan_hash: str | None = None
-    # Approved plans a verified signed child-plan supersession retired (#993).
-    # Carried so a fresh re-validation treats their authorizations as history.
-    retired_plan_hashes: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class ManagedCiIssueAuthorization:
-    """Canonical PR-comment authorization for an issue-created managed PR."""
-
-    kind: Literal["creation", "fresh", "continuity"]
-    repository: str
-    issue_number: int
-    pr_number: int
-    base_ref: str
-    head_sha: str
-    actor_login: str
-    actor_id: int
-    protection: str
-    waiver: str
-    nonce: str
-    label_event_id: int
-    predecessor_head: str | None = None
-    predecessor_comment_id: int | None = None
-    round_comment_ids: tuple[int, ...] = ()
-    approved_plan_hash: str | None = None
-    # Earlier actor-owned records this fresh grant (#1065) or continuity
-    # record (#1069) retires.  A superseded record is history: it is neither
-    # a competing grant nor a predecessor, so accumulated unbound records
-    # cannot wedge a PR.
-    superseded_comment_ids: tuple[int, ...] = ()
-
-    def to_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "version": 1,
-            "kind": self.kind,
-            "repository": self.repository,
-            "issue": self.issue_number,
-            "pr": self.pr_number,
-            "base": self.base_ref,
-            "head": self.head_sha,
-            "actor": self.actor_login,
-            "actor_id": self.actor_id,
-            "protection": self.protection,
-            "waiver": self.waiver,
-            "nonce": self.nonce,
-            "label_event_id": self.label_event_id,
-        }
-        if self.predecessor_head is not None:
-            payload["predecessor_head"] = self.predecessor_head
-        if self.predecessor_comment_id is not None:
-            payload["predecessor_comment_id"] = self.predecessor_comment_id
-        if self.round_comment_ids:
-            payload["round_comment_ids"] = list(self.round_comment_ids)
-        if self.approved_plan_hash is not None:
-            payload["approved_plan_hash"] = self.approved_plan_hash
-        if self.superseded_comment_ids:
-            payload["superseded_comment_ids"] = list(self.superseded_comment_ids)
-        return payload
-
-
-@dataclass(frozen=True)
-class AuthenticatedManagedResume:
-    """Read-only authority for a managed-CI resume.
-
-    A resume is distinct from a just-created handoff.  The latter authorizes
-    the first activation only; this record is minted by re-reading a durable
-    PR and carries the lifecycle state that was actually authenticated.
-    """
-
-    origin: Literal["issue-created", "source-managed"]
-    lifecycle: Literal[
-        "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
-    ]
-    issue_created_handoff: AuthenticatedIssueCreatedHandoff | None = None
-    source_branch: str | None = None
-    source_sha: str | None = None
-    managed_branch: str | None = None
-    override_nonce: str | None = None
-
-
-# Record kinds that may retire earlier records: the explicit fresh grant
-# (#1065) and the ordinary path's continuity record (#1069).  A creation
-# checkpoint is the PR's first record and never supersedes.
-_SUPERSEDING_AUTHORIZATION_KINDS = frozenset({"fresh", "continuity"})
+from .managed_ci_protection import (
+    waivable_protection_states,
+    waiver_flags_for_protection,
+    _waiver_for_protection,
+    reconcile_live_protection,
+    _has_final_context,
+    _RULESET_ENFORCEMENT_VALUES,
+    _BYPASS_ACTOR_TYPES,
+    _BYPASS_ACTOR_TYPES_WITHOUT_ID,
+    _BYPASS_MODES,
+    _ruleset_detail_problem,
+    _ruleset_detail_well_formed,
+    _ruleset_bypass_state,
+    _ruleset_requires_final_context,
+    assess_exact_head_protection,
+)
 
 
 def _encode_issue_authorization_payload(payload: dict[str, object]) -> str:
@@ -833,58 +492,6 @@ def _opening_override_nonce(body: str | None) -> str | None:
     )
     return record.nonce if record is not None else None
 
-
-@dataclass(frozen=True)
-class OrdinaryRecoveryCapability:
-    """Invocation-owned proof that this run deliberately released managed CI."""
-
-    pr_number: int
-    repository: str
-    base_ref: str
-    expected_head_sha: str
-    released_label_event_id: int | None
-    released_at: int
-    prior_run_ids: frozenset[int] = frozenset()
-
-
-@dataclass(frozen=True)
-class ManagedCiOutcome:
-    status: Literal[
-        "passed",
-        "failed",
-        "timeout",
-        "head_changed",
-        "merge_conflict",
-        "infrastructure_stall",
-        "terminal_without_status",
-        "not_started",
-        "protection_unreadable",
-    ]
-    checks: PullRequestChecks | None = None
-    mergeability: PullRequestMergeability | None = None
-    head_sha: str | None = None
-    stall: CiInfrastructureStall | None = None
-    failure_details: tuple[str, ...] = ()
-    run_id: int | None = None
-    run_attempt: int | None = None
-    workflow_status: str | None = None
-    workflow_conclusion: str | None = None
-    # Structured job listing of the attached run (#1477): (name, conclusion,
-    # url) per job; ``None`` when the listing was not read or was unreadable.
-    jobs: tuple[tuple[str, str, str], ...] | None = None
-    attempts_used: int = 0
-    # Last observed correlated final-ci/exact-head state, for terminal reports.
-    final_status: str | None = None
-
-
-@dataclass(frozen=True)
-class ManagedCiRunSnapshot:
-    run_id: int
-    run_attempt: int | None
-    status: str | None
-    conclusion: str | None
-    live_run_attempt: int | None = None
-
 @_surfaces_list_failures
 def activate_managed_ci(
     runner: Runner,
@@ -1067,406 +674,6 @@ def activate_managed_ci(
             raise
     log(config, f"PR #{pr_number}: activated managed exact-head CI")
     return ManagedCiContract()
-
-
-def _probe(runner: Runner, context: ManagedCiProbeContext, endpoint: str, *, raw: bool = False):
-    command = [context.gh_cmd, "api", endpoint]
-    if raw:
-        command.extend(["-H", "Accept: application/vnd.github.raw+json"])
-    return runner.run(command, cwd=context.cwd, check=False)
-
-
-def _probe_json(runner: Runner, context: ManagedCiProbeContext, endpoint: str) -> tuple[dict[str, object] | None, object]:
-    result = _probe(runner, context, endpoint)
-    if result.returncode != 0:
-        return None, result
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None, result
-    return (payload if isinstance(payload, dict) else None), result
-
-
-def _probe_json_list(
-    runner: Runner, context: ManagedCiProbeContext, endpoint: str
-) -> tuple[list[object] | None, object]:
-    """Read a GitHub list response without treating a valid array as malformed."""
-    result = _probe(runner, context, endpoint)
-    if result.returncode != 0:
-        return None, result
-    try:
-        payload = json.loads(result.stdout or "")
-    except json.JSONDecodeError:
-        return None, result
-    return (payload if isinstance(payload, list) else None), result
-
-
-def _is_http_error(result: object, *statuses: int) -> bool:
-    """`gh api` uses exit 1 for HTTP errors, so inspect its diagnostic text."""
-    combined = " ".join(
-        str(getattr(result, field, "") or "") for field in ("stdout", "stderr")
-    ).casefold()
-    return any(str(status) in combined for status in statuses)
-
-
-def _is_plan_limited_error(result: object) -> bool:
-    """Recognize GitHub's plan restriction independently of endpoint wording."""
-    combined = " ".join(
-        str(getattr(result, field, "") or "") for field in ("stdout", "stderr")
-    ).casefold()
-    return "upgrade to github pro" in combined or "make this repository public" in combined
-
-
-_GH_HTTP_STATUS_LINE = re.compile(r"^gh: .*\(HTTP (\d{3})\)[ \t\r]*$", re.MULTILINE)
-
-
-def _http_status(result: object) -> int | None:
-    """Return the HTTP status from gh's own stderr diagnostic, strictly.
-
-    ``gh api`` writes the API response body to stdout, and that body may quote
-    arbitrary text, so stdout is never inspected.  Only stderr lines shaped
-    like ``gh: <message> (HTTP 403)`` count, and every such line must agree.
-    A missing, mid-line, or conflicting status yields ``None`` so no
-    status-specific fallback applies.
-    """
-    if getattr(result, "returncode", 0) == 0:
-        return None
-    stderr = str(getattr(result, "stderr", "") or "")
-    statuses = {int(match) for match in _GH_HTTP_STATUS_LINE.findall(stderr)}
-    if len(statuses) != 1:
-        return None
-    return next(iter(statuses))
-
-
-def _read_managed_actor_variable(
-    runner: Runner, gh_cmd: str, repo: str, cwd: Path
-) -> ManagedActorVariable:
-    """Classify the ``AGENT_LOOP_MANAGED_ACTOR`` read for every identity check."""
-    return _read_actions_variable(runner, gh_cmd, repo, cwd, "AGENT_LOOP_MANAGED_ACTOR")
-
-
-def _read_actions_variable(
-    runner: Runner, gh_cmd: str, repo: str, cwd: Path, name: str
-) -> ManagedActorVariable:
-    """Classify one repository Actions variable read.
-
-    A strict HTTP 403 is checked before the legacy 404 text match, so a
-    refused read whose body happens to mention 404 is never "absent".
-    """
-    endpoint = f"repos/{repo}/actions/variables/{name}"
-    result = runner.run([gh_cmd, "api", endpoint], cwd=cwd, check=False)
-    if result.returncode == 0:
-        try:
-            payload = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            payload = None
-        value = payload.get("value") if isinstance(payload, dict) else None
-        if isinstance(value, str):
-            return ManagedActorVariable(value, "readable", f"{endpoint} is readable")
-        if isinstance(payload, dict):
-            # Historically a readable response without a value advertises no
-            # actor (an identity mismatch), not an unreadable probe.
-            return ManagedActorVariable(None, "absent", f"{endpoint} has no string value")
-        return ManagedActorVariable(None, "error", f"{endpoint} returned a malformed response")
-    if _http_status(result) == 403:
-        return ManagedActorVariable(
-            None, "unreadable", f"{endpoint} is not readable by this token (HTTP 403)"
-        )
-    if _is_http_error(result, 404):
-        return ManagedActorVariable(None, "absent", f"{endpoint} is not configured")
-    status = _http_status(result)
-    return ManagedActorVariable(
-        None, "error",
-        f"{endpoint} could not be read" + (f" (HTTP {status})" if status is not None else ""),
-    )
-
-
-def _resolve_advertised_actor(
-    variable: ManagedActorVariable, configured: str | None
-) -> tuple[str | None, Literal["variable", "asserted"] | None]:
-    """Return the advertised actor and where it came from.
-
-    Only a strict 403 lets the operator's trusted actor stand in.  A readable
-    variable always wins, and absence or any other error yields no actor.
-    """
-    if variable.status == "readable":
-        return variable.value, "variable"
-    configured = (configured or "").strip()
-    if variable.status == "unreadable" and configured:
-        return configured, "asserted"
-    return None, None
-
-
-_ASSERTED_ACTOR_LOGGED: set[tuple[str, str]] = set()
-
-
-def _log_asserted_actor(config: AgentLoopConfig, actor: str) -> None:
-    key = (config.repo.casefold(), actor.casefold())
-    if key in _ASSERTED_ACTOR_LOGGED:
-        return
-    _ASSERTED_ACTOR_LOGGED.add(key)
-    log(
-        config,
-        "AGENT_LOOP_MANAGED_ACTOR is not readable by this token (HTTP 403); "
-        f"--managed-ci-trusted-actor={actor} is asserted and unverified locally. "
-        "The workflow enforces vars.AGENT_LOOP_MANAGED_ACTOR server-side: a mismatch leaves "
-        "ordinary PR CI unsuppressed and fails managed dispatch validation.",
-    )
-
-
-def _advertised_managed_actor(runner: Runner, config: AgentLoopConfig) -> str | None:
-    """Resolve the advertised actor for a config-bearing identity check."""
-    variable = _read_managed_actor_variable(
-        runner, config.gh_cmd, config.repo, github_api_cwd()
-    )
-    advertised, source = _resolve_advertised_actor(variable, config.managed_ci_trusted_actor)
-    if source == "asserted" and advertised is not None:
-        _log_asserted_actor(config, advertised)
-    return advertised
-
-
-def _probe_raw_workflow(
-    runner: Runner, context: ManagedCiProbeContext, base: str
-) -> tuple[str | None, object]:
-    result = _probe(
-        runner, context,
-        f"repos/{context.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={base}", raw=True,
-    )
-    return ((result.stdout or "") if result.returncode == 0 else None), result
-
-
-def _has_final_context(payload: dict[str, object]) -> bool:
-    contexts = payload.get("contexts")
-    checks = payload.get("checks")
-    return (
-        isinstance(contexts, list) and FINAL_CONTEXT in contexts
-    ) or (
-        isinstance(checks, list)
-        and any(isinstance(check, dict) and check.get("context") == FINAL_CONTEXT for check in checks)
-    )
-
-
-_RULESET_ENFORCEMENT_VALUES = frozenset({"active", "evaluate", "disabled"})
-_BYPASS_ACTOR_TYPES = frozenset({
-    "Integration", "OrganizationAdmin", "RepositoryRole", "Team", "DeployKey",
-})
-_BYPASS_ACTOR_TYPES_WITHOUT_ID = frozenset({"OrganizationAdmin", "DeployKey"})
-_BYPASS_MODES = frozenset({"always", "pull_request"})
-
-
-def _ruleset_detail_problem(ruleset: Mapping[str, object]) -> str | None:
-    """Return why a decoded ruleset detail is malformed, or ``None``.
-
-    This is an allowlist: anything it does not recognize is malformed, so an
-    unexpected shape can never be read as "no enforcement".
-    """
-    rules = ruleset.get("rules")
-    if not isinstance(rules, list):
-        return "'rules' is not a list"
-    for rule in rules:
-        if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
-            return "a rule entry has no string 'type'"
-        if rule["type"] == "required_status_checks":
-            parameters = rule.get("parameters")
-            checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
-            if not isinstance(checks, list) or any(
-                not isinstance(check, dict) or not isinstance(check.get("context"), str)
-                for check in checks
-            ):
-                return "a required_status_checks rule has malformed 'required_status_checks'"
-    # Every set membership test first requires a string: JSON lists and
-    # objects are unhashable and must be reported as malformed, not raise.
-    enforcement = ruleset.get("enforcement")
-    if not isinstance(enforcement, str) or enforcement not in _RULESET_ENFORCEMENT_VALUES:
-        return "'enforcement' is not a known value"
-    if "bypass_actors" in ruleset:
-        actors = ruleset["bypass_actors"]
-        if not isinstance(actors, list):
-            return "'bypass_actors' is not a list"
-        for actor in actors:
-            if not isinstance(actor, dict):
-                return "a bypass actor is not an object"
-            actor_type = actor.get("actor_type")
-            actor_id = actor.get("actor_id")
-            if not isinstance(actor_type, str) or actor_type not in _BYPASS_ACTOR_TYPES:
-                return "a bypass actor has an unknown 'actor_type'"
-            id_valid = (
-                isinstance(actor_id, int) and not isinstance(actor_id, bool) and actor_id > 0
-            ) or (actor_id is None and actor_type in _BYPASS_ACTOR_TYPES_WITHOUT_ID)
-            if not id_valid:
-                return "a bypass actor has an invalid 'actor_id'"
-            if "bypass_mode" in actor and (
-                not isinstance(actor["bypass_mode"], str)
-                or actor["bypass_mode"] not in _BYPASS_MODES
-            ):
-                return "a bypass actor has an unknown 'bypass_mode'"
-    return None
-
-
-def _ruleset_detail_well_formed(ruleset: Mapping[str, object]) -> bool:
-    return _ruleset_detail_problem(ruleset) is None
-
-
-def _ruleset_bypass_state(ruleset: Mapping[str, object]) -> Literal["none", "present", "unknown"]:
-    """Whether the ruleset's bypass actors are visibly empty, present, or hidden.
-
-    GitHub returns ``bypass_actors`` only to callers with write/admin access to
-    the ruleset, so an absent key does not prove the ruleset is unbypassable.
-    """
-    if "bypass_actors" not in ruleset:
-        return "unknown"
-    actors = ruleset["bypass_actors"]
-    if isinstance(actors, list) and not actors:
-        return "none"
-    return "present"
-
-
-def _ruleset_requires_final_context(rules: object) -> bool:
-    """Exact match on a required_status_checks context; no substring search."""
-    if not isinstance(rules, list):
-        return False
-    for rule in rules:
-        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
-            continue
-        parameters = rule.get("parameters")
-        checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
-        if isinstance(checks, list) and any(
-            isinstance(check, dict) and check.get("context") == FINAL_CONTEXT for check in checks
-        ):
-            return True
-    return False
-
-
-def assess_exact_head_protection(
-    runner: Runner, *, context: ManagedCiProbeContext, base: str
-) -> ProtectionAssessment:
-    """Classify GitHub enforcement conservatively.
-
-    A required context alone is voluntary when administrators can bypass it.
-    Rulesets are inspected as an additional independent enforcement source;
-    evaluate-mode and bypass actors are deliberately not strict.
-
-    When the classic protection endpoint refuses this token with a strict
-    HTTP 403 (#1040), protection is indeterminate rather than absent.  It is
-    classified as the distinct ``unreadable`` state only when the effective
-    rules were fully inspected and show no strict enforcement; after such a
-    403 a ruleset proves strict only when its bypass actors are visible and
-    empty.  Every other failure on that path stays ``indeterminate``.
-    """
-    required, required_result = _probe_json(
-        runner, context, f"repos/{context.repo}/branches/{base}/protection/required_status_checks"
-    )
-    classic_state: Literal["voluntary", "plan_limited", "indeterminate"] | None = None
-    classic_detail = "final-ci/exact-head is not independently required"
-    classic_forbidden = False
-    if required is None:
-        if _is_plan_limited_error(required_result):
-            classic_state = "plan_limited"
-            classic_detail = "GitHub plan/API does not permit branch protection"
-        elif _http_status(required_result) == 403:
-            # Checked before the legacy 404 text match, so a refused read
-            # whose body mentions 404 is never mistaken for "not configured".
-            classic_forbidden = True
-            classic_state = "indeterminate"
-            classic_detail = (
-                "required-status protection could not be inspected "
-                f"(repos/{context.repo}/branches/{base}/protection/required_status_checks: HTTP 403)"
-            )
-        elif _is_http_error(required_result, 404):
-            classic_state = "voluntary"
-            classic_detail = "required status protection is not configured"
-        else:
-            classic_state = "indeterminate"
-            classic_detail = "required-status protection could not be inspected"
-    elif _has_final_context(required):
-        admins, admins_result = _probe_json(
-            runner, context, f"repos/{context.repo}/branches/{base}/protection/enforce_admins"
-        )
-        if admins is not None and admins.get("enabled") is True:
-            return ProtectionAssessment("strict", "classic", "final-ci/exact-head is required and admins are enforced")
-        if admins is not None and admins.get("enabled") is False:
-            classic_state = "voluntary"
-            classic_detail = "administrators can bypass required status checks"
-        elif admins_result.returncode != 0:
-            classic_state = "indeterminate"
-            classic_detail = "admin enforcement could not be inspected"
-            if _http_status(admins_result) == 403:
-                classic_forbidden = True
-        else:
-            classic_state = "indeterminate"
-            classic_detail = "admin enforcement response was malformed"
-
-    rules, rules_result = _probe_json_list(runner, context, f"repos/{context.repo}/rules/branches/{base}")
-    if rules is None:
-        # A private-Free repository can reject both protection APIs.  The
-        # ruleset probe cannot turn an already known plan restriction into an
-        # unknown result, so retain the actionable classification.
-        if classic_state == "plan_limited":
-            return ProtectionAssessment("plan_limited", "classic", classic_detail)
-        if classic_forbidden:
-            # Only gh's own strict 404/422 status proves "no rules" here.
-            if _http_status(rules_result) in {404, 422}:
-                return ProtectionAssessment("unreadable", "classic", _UNREADABLE_PROTECTION_DETAIL)
-            return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
-        if _is_http_error(rules_result, 404, 422):
-            return ProtectionAssessment(classic_state or "voluntary", "classic" if classic_state else "none", classic_detail)
-        return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
-    voluntary = False
-    hidden_bypass = False
-    rules_fully_inspected = True
-    malformed_detail: str | None = None
-    for entry in rules:
-        if not isinstance(entry, dict):
-            rules_fully_inspected = False
-            malformed_detail = malformed_detail or "an effective rule entry is not an object"
-            continue
-        ruleset_id = entry.get("ruleset_id") or entry.get("id")
-        if not isinstance(ruleset_id, int):
-            rules_fully_inspected = False
-            malformed_detail = malformed_detail or "an effective rule entry has no integer ruleset id"
-            continue
-        ruleset, ignored = _probe_json(runner, context, f"repos/{context.repo}/rulesets/{ruleset_id}")
-        if ruleset is None:
-            return ProtectionAssessment("indeterminate", "rulesets", "an applicable ruleset could not be inspected")
-        problem = _ruleset_detail_problem(ruleset)
-        if problem is not None:
-            rules_fully_inspected = False
-            malformed_detail = malformed_detail or f"ruleset {ruleset_id}: {problem}"
-            if classic_forbidden:
-                continue
-        if not _ruleset_requires_final_context(ruleset.get("rules")):
-            continue
-        if classic_forbidden:
-            bypass_state = _ruleset_bypass_state(ruleset)
-            non_bypassable = bypass_state == "none"
-        else:
-            bypass_state = None
-            non_bypassable = not ruleset.get("bypass_actors")
-        if ruleset.get("enforcement") != "active" or not non_bypassable:
-            voluntary = True
-            if ruleset.get("enforcement") == "active" and bypass_state == "unknown":
-                hidden_bypass = True
-            continue
-        return ProtectionAssessment("strict", "ruleset", "active ruleset requires final-ci/exact-head without bypass actors")
-    if classic_forbidden:
-        if not rules_fully_inspected:
-            return ProtectionAssessment(
-                "indeterminate", "rulesets",
-                f"effective branch rules were malformed ({malformed_detail}); "
-                "applicable enforcement could not be inspected",
-            )
-        return ProtectionAssessment(
-            "unreadable", "classic",
-            _UNREADABLE_PROTECTION_DETAIL + (_HIDDEN_BYPASS_DETAIL if hidden_bypass else ""),
-        )
-    if classic_state == "indeterminate":
-        return ProtectionAssessment("indeterminate", "classic", classic_detail)
-    if classic_state == "plan_limited":
-        return ProtectionAssessment("plan_limited", "classic", classic_detail)
-    return ProtectionAssessment(
-        "voluntary", "rulesets" if voluntary else ("classic" if classic_state else "none"),
-        "matching ruleset is bypassable/evaluate-mode" if voluntary else classic_detail,
-    )
 
 
 def evaluate_managed_ci_readiness(
@@ -3612,58 +2819,6 @@ def publish_issue_created_continuity_authorization(
         authorization_comment_id=comment_id,
         override_nonce=authorization.nonce,
     )
-
-
-def _historical_managed_label_event(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    pr_number: int,
-    actor_login: str,
-    actor_id: int,
-) -> tuple[int, str, int] | None:
-    events = _managed_label_event_history(
-        runner,
-        config=config,
-        pr_number=pr_number,
-        actor_login=actor_login,
-        actor_id=actor_id,
-    )
-    return events[-1] if events else None
-
-
-def _managed_label_event_history(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    pr_number: int,
-    actor_login: str,
-    actor_id: int,
-) -> list[tuple[int, str, int]] | None:
-    """Return every actor-owned managed-label application in timeline order."""
-    events = _api_list(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
-    )
-    if events is None:
-        return None
-    candidates: list[tuple[int, str, int]] = []
-    for event in events:
-        label = event.get("label") if isinstance(event.get("label"), dict) else {}
-        actor = event.get("actor") if isinstance(event.get("actor"), dict) else {}
-        event_id = event.get("id")
-        login = actor.get("login")
-        identity = actor.get("id")
-        if (
-            label.get("name") == MANAGED_LABEL
-            and event.get("event") == "labeled"
-            and isinstance(event_id, int)
-            and isinstance(login, str)
-            and isinstance(identity, int)
-            and login.casefold() == actor_login.casefold()
-            and identity == actor_id
-        ):
-            candidates.append((event_id, login, identity))
-    return sorted(candidates, key=lambda item: item[0])
 
 
 def _timeline_source_repository(source_issue: dict[str, object]) -> str | None:
@@ -6923,56 +6078,6 @@ def _activate_v2_managed_ci(
         )
 
 
-def _api_list_detailed(
-    runner: Runner, config: AgentLoopConfig, endpoint: str
-) -> tuple[list[dict[str, object]] | None, str]:
-    payload, reason = _api_list_detailed_inner(runner, config, endpoint)
-    _LIST_FAILURE.reason = reason if payload is None else ""
-    if payload is None and reason:
-        failures = getattr(_LIST_FAILURE, "failures", None)
-        if failures is not None and reason not in failures:
-            failures.append(reason)
-    return payload, reason
-
-
-def _api_list_detailed_inner(
-    runner: Runner, config: AgentLoopConfig, endpoint: str
-) -> tuple[list[dict[str, object]] | None, str]:
-    """Fetch a paginated GitHub list; on failure return ``(None, reason)``.
-
-    ``reason`` carries the final stderr and retry attempt history so raising
-    callers can include it while keeping their fail-closed behavior.
-    """
-    result = run_gh_read(
-        runner, [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
-    )
-    if result.returncode != 0:
-        reason = describe_gh_failure(result)
-        log(config, f"GitHub list read of {endpoint} failed: {reason}")
-        return None, reason
-    try:
-        payload = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return None, f"{endpoint} returned malformed JSON"
-    if not isinstance(payload, list):
-        return None, f"{endpoint} returned a non-list payload"
-    # GitHub CLI 2.45 emits one flat array for paginated array endpoints.
-    # Never silently discard malformed entries: doing so could turn an
-    # incomplete timeline into an apparently complete ownership record.
-    if not all(isinstance(item, dict) for item in payload):
-        return None, f"{endpoint} returned malformed entries"
-    return payload, ""
-
-
-def _with_reason(message: str, reason: str) -> str:
-    return f"{message}\n{reason}" if reason else message
-
-
-def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
-    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
-    return _api_list_detailed(runner, config, endpoint)[0]
-
-
 def _normalized_comment_body(
     comment: Mapping[str, object], *, config: AgentLoopConfig | None
 ) -> str:
@@ -6989,106 +6094,6 @@ def _normalized_comment_body(
     if footered:
         note_host_footer_observed(config, "managed-CI record re-read")
     return body
-
-
-@dataclass(frozen=True)
-class LabelEvent:
-    event_id: int
-    kind: str
-    actor_login: str
-    actor_id: int
-
-
-@dataclass(frozen=True)
-class CompleteLabelHistory:
-    """Complete event history of one label: its latest event, or ``None``."""
-
-    latest: LabelEvent | None
-
-
-@dataclass(frozen=True)
-class UnknownLabelHistory:
-    reason: str
-
-
-def label_event_history(
-    runner: Runner, *, config: AgentLoopConfig, pr_number: int, label_name: str
-) -> CompleteLabelHistory | UnknownLabelHistory:
-    """Read one label's latest labeled/unlabeled event completely, or ``Unknown``.
-
-    Missing actor IDs, malformed pagination and a malformed latest event are
-    unreadable, never an empty history.
-    """
-    events, reason = _api_list_detailed(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
-    )
-    if events is None:
-        return UnknownLabelHistory(reason or "event list unreadable")
-    latest: LabelEvent | None = None
-    for event in events:
-        kind = event.get("event")
-        if not isinstance(kind, str) or not kind:
-            # An envelope without a usable discriminator could be a label
-            # transition; the history is unreadable, never merely filtered.
-            return UnknownLabelHistory("a timeline event lacked an event kind")
-        if kind not in {"labeled", "unlabeled"}:
-            continue
-        # A label transition whose label cannot be identified might belong to
-        # this label; the history is then unreadable, never merely absent.
-        label = event.get("label")
-        name = label.get("name") if isinstance(label, dict) else None
-        if not isinstance(name, str) or not name:
-            return UnknownLabelHistory("a label transition event lacked a label name")
-        if name != label_name:
-            continue
-        actor = event.get("actor")
-        event_id = event.get("id")
-        login = actor.get("login") if isinstance(actor, dict) else None
-        actor_id = actor.get("id") if isinstance(actor, dict) else None
-        if (
-            isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1
-            or not isinstance(login, str) or not login
-            or isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id < 1
-        ):
-            return UnknownLabelHistory(f"a `{label_name}` event lacked an id or actor")
-        if latest is not None and event_id <= latest.event_id:
-            return UnknownLabelHistory(f"`{label_name}` event ids were not strictly increasing")
-        latest = LabelEvent(event_id, str(event["event"]), login, actor_id)
-    return CompleteLabelHistory(latest)
-
-
-def _active_managed_label_event(
-    runner: Runner, *, config: AgentLoopConfig, pr_number: int
-) -> tuple[int, str, int] | None:
-    """Return the last label application, but only while it remains active.
-
-    Timeline provenance is an enforcement input for adoption.  Treat missing
-    actor IDs, malformed pagination, and an intervening unlabel as untrusted.
-    """
-    history = label_event_history(
-        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
-    )
-    if not isinstance(history, CompleteLabelHistory):
-        return None
-    latest = history.latest
-    if latest is None or latest.kind != "labeled":
-        return None
-    return latest.event_id, latest.actor_login, latest.actor_id
-
-
-@dataclass(frozen=True)
-class ReconciledLabelWrite:
-    """Outcome of a reconciled label write.
-
-    ``result`` keeps the callers' ``returncode`` contract: success (possibly
-    synthesized after the history proved the write landed) or the failed result
-    that sends the caller down its existing refusal path.  ``event_id`` is the
-    adopted ``labeled`` event id when a transient failure was proven accepted.
-    """
-
-    result: CommandResult
-    event_id: int | None = None
-    outcome: str = "direct"
 
 
 def _live_label_presence(
@@ -7937,19 +6942,6 @@ def _contract_dispatch_ref(runner: Runner, config: AgentLoopConfig, contract: Ma
     return default_branch
 
 
-def _read_repo_default_branch(runner: Runner, gh_cmd: str, repo: str, cwd: Path) -> str | None:
-    """The live default branch, or ``None`` when it cannot be established."""
-    result = runner.run([gh_cmd, "api", f"repos/{repo}"], cwd=cwd, check=False)
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    value = payload.get("default_branch") if isinstance(payload, dict) else None
-    return value if isinstance(value, str) and value else None
-
-
 def trusted_base_problem(
     runner: Runner,
     *,
@@ -8091,21 +7083,6 @@ def require_recorded_base(
         f"PR #{pr_number} {action} refused: {problem}. Qualification is invalidated; "
         f"re-qualify the exact head before merging.{suffix}"
     )
-
-
-def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:
-    result = runner.run(
-        [config.gh_cmd, "api", endpoint], cwd=github_api_cwd(), check=False
-    )
-    if result.returncode != 0:
-        if quiet:
-            return {}
-        raise AgentLoopError(f"Managed-CI API request failed: {endpoint}.")
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError(f"Managed-CI API response was invalid JSON: {endpoint}.") from exc
-    return payload if isinstance(payload, dict) else {}
 
 
 def managed_label_present(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> bool | None:

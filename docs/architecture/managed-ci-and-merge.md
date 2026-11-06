@@ -2,7 +2,7 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_tuple.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_types.py`, `src/coding_review_agent_loop/managed_ci_api.py`, `src/coding_review_agent_loop/managed_ci_protection.py`, `src/coding_review_agent_loop/managed_ci_tuple.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
 
@@ -26,6 +26,19 @@ using the shell-quoted resume command. These diagnostics address a confirmed
 failure-to-empty-object ambiguity; they do not establish the historical cause
 of an otherwise unreproduced interruption. Other quiet API readers and trusted
 Git transport diagnostics retain their existing behavior.
+
+Shared records and constants live in `managed_ci_types.py`. Read probes,
+Actions-variable and actor reads, paginated API diagnostics and label history
+live in `managed_ci_api.py`, together with the single thread-local failure
+collector and its decorator. Retained driver gates use that same collector.
+`managed_ci_protection.py` owns protection assessment and explicit waiver
+reconciliation, importing API helpers and shared types. None of these support
+owners imports the driver or authorization owner. `managed_ci.py` temporarily
+re-exports the moved objects unchanged; activation, issue authorization,
+dispatch, qualification and merge remain in the driver. The body hashes,
+original references, consumer candidates and immediate patch retargets are
+recorded in `tests/fixtures/managed_ci_support_move.json` for the paired cleanup.
+This ownership split changes no runtime flow, persistence or authority (#1905).
 
 Recovery command rendering lives in the pure `managed_ci_recovery_commands.py`
 sibling, and workflow-mirrored intent envelope, schema and lifecycle validation

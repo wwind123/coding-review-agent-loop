@@ -14,7 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 import orchestrator_split_guard
+from managed_ci_call_guard import managed_ci_source_paths
 import coding_review_agent_loop.managed_ci as managed_ci
+from coding_review_agent_loop import managed_ci_api
 from coding_review_agent_loop.workdirs import github_api_cwd
 
 from coding_review_agent_loop.errors import AgentLoopError
@@ -8343,7 +8345,7 @@ def test_managed_ci_gh_invocations_obey_the_245_floor():
         "--silent", "--verbose",
     }
     # Follow orchestrator code into the modules extracted from it (#1181).
-    paths = [orchestrator_split_guard.module_path("managed_ci"), *orchestrator_split_guard.split_source_paths()]
+    paths = sorted(set(managed_ci_source_paths()) | set(orchestrator_split_guard.split_source_paths()))
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -9216,8 +9218,8 @@ def test_variable_403_asserts_trusted_actor_in_readiness_and_creation(
     tmp_path, monkeypatch, variable
 ):
     messages = []
-    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
-    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    monkeypatch.setattr(managed_ci_api, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci_api, "log", lambda _config, message: messages.append(message))
     runner = CloudSessionRunner(
         scripted={_VARIABLE: variable},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
@@ -9777,8 +9779,8 @@ def test_cloud_session_shape_creates_reserved_managed_pr_only_with_both_waivers(
     tmp_path, monkeypatch
 ):
     messages = []
-    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
-    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    monkeypatch.setattr(managed_ci_api, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci_api, "log", lambda _config, message: messages.append(message))
     runner = CloudSessionRunner(scripted=_cloud_scripts())
 
     with pytest.raises(AgentLoopError, match="--allow-unreadable-protection") as exc_info:
@@ -13752,6 +13754,7 @@ class _LabelHub:
 def label_env(monkeypatch):
     monkeypatch.setattr(_github510, "log", lambda _c, _m: None)
     monkeypatch.setattr(managed_ci, "log", lambda _c, _m: None)
+    monkeypatch.setattr(managed_ci_api, "log", lambda _c, _m: None)
     monkeypatch.setattr(_github510, "active_workdir", lambda config: None)
     monkeypatch.setattr(managed_ci, "active_workdir", lambda config: None)
 
