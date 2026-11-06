@@ -1,5 +1,7 @@
 """PR-loop tests for managed_ci: exact-head qualification in the PR loop (#1542)."""
 
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 import dataclasses
 
 import pytest
@@ -14,7 +16,7 @@ from coding_review_agent_loop.github import (
     PullRequestCheck,
     PullRequestMergeability,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )
@@ -48,9 +50,11 @@ import json
 from types import SimpleNamespace
 
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiIssueAuthorization,
     UNPROTECTED_OVERRIDE_TRAILER,
+)
+from coding_review_agent_loop.managed_ci import (
     format_issue_created_authorization_comment,
 )
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
@@ -1369,7 +1373,7 @@ def test_m1047_entry_normalization_leaves_other_pr_states_untouched(tmp_path, mo
 
 
 def test_m1047_failed_automerge_ready_labeled_pr_is_normalized_on_retry(tmp_path, monkeypatch):
-    qualified = _m1047_managed_ci.QUALIFIED_LABEL
+    qualified = _managed_ci_types.QUALIFIED_LABEL
     runner = _M1047LivePrRunner(labels=("agent-loop-managed", qualified))
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     seen = []

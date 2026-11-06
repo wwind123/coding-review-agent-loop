@@ -63,8 +63,10 @@ from .pr_contract import (
 )
 from .logging import log
 from .memory import prepare_agent_memory
-from .managed_ci import (
+from .managed_ci_types import (
     AuthenticatedIssueCreatedHandoff,
+)
+from .managed_ci import (
     authenticate_issue_created_handoff,
     preflight_managed_ci_creation,
 )

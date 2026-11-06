@@ -525,13 +525,20 @@ def test_real_merge_records_completion_before_tracking_failure(tmp_path, monkeyp
     payload['post_merge_obligations'] = [REQUEST]
     runner = FakeRunner(codex_outputs=[json.dumps(payload) + raw[raw.index('\n'):]])
     if mode == 'managed':
-        from coding_review_agent_loop.managed_ci import ManagedCiContract, ManagedCiOutcome
+        from coding_review_agent_loop.managed_ci_types import (
+            ManagedCiContract,
+            ManagedCiOutcome,
+        )
         monkeypatch.setattr(loop, 'activate_managed_ci', lambda *args, **kwargs: ManagedCiContract())
         monkeypatch.setattr(loop, 'dispatch_final_qualification', lambda *args, **kwargs: None)
         monkeypatch.setattr(loop, 'wait_for_final_qualification', lambda *args, **kwargs:
             ManagedCiOutcome(status='passed', head_sha=runner.pr_payload['headRefOid']))
     if mode == 'ordinary-recovery':
-        from coding_review_agent_loop.managed_ci import ManagedCiContract, ManagedCiOutcome, OrdinaryRecoveryCapability
+        from coding_review_agent_loop.managed_ci_types import (
+            ManagedCiContract,
+            ManagedCiOutcome,
+            OrdinaryRecoveryCapability,
+        )
         from coding_review_agent_loop import pr_loop_support as support
         from pr_loop_test_helpers import _watch_check_board
         capability = OrdinaryRecoveryCapability(pr_number=77, repository='OWNER/REPO',

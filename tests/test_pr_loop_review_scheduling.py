@@ -20,7 +20,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
 )
 from coding_review_agent_loop.migrations import MigrationValidationResult
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )

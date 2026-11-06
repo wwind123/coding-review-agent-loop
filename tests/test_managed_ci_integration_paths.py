@@ -12,12 +12,14 @@ import pytest
 
 from coding_review_agent_loop.managed_ci import (
     FINAL_CONTEXT,
-    TRUSTED_BASES_MARKER,
-    ManagedCiProbeContext,
     _dispatch_v2_qualification,
     activate_managed_ci,
     evaluate_managed_ci_readiness,
     preflight_managed_ci_creation,
+)
+from coding_review_agent_loop.managed_ci_types import (
+    TRUSTED_BASES_MARKER,
+    ManagedCiProbeContext,
 )
 from coding_review_agent_loop.runner import CommandResult
 
@@ -155,7 +157,9 @@ def test_existing_pr_adoption_and_resume_read_main_only(tmp_path, fresh_resume):
 
 from agent_loop_helpers import FakeRunner  # noqa: E402
 from coding_review_agent_loop.errors import AgentLoopError  # noqa: E402
-from coding_review_agent_loop.managed_ci import QUALIFIED_LABEL  # noqa: E402
+from coding_review_agent_loop.managed_ci_types import (
+    QUALIFIED_LABEL,
+)  # noqa: E402
 from test_managed_ci import PublicationRunner, _audit_posted, _publish  # noqa: E402
 
 

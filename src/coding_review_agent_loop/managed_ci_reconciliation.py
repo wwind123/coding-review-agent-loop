@@ -5,6 +5,9 @@ attachment, dispatch or rerun is performed by this module.
 """
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_api as _managed_ci_api
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 from .review_scope import is_complete_code_review
 
 from dataclasses import replace
@@ -134,7 +137,7 @@ def observe_repair_result(runner, *, config, pr_number, metadata, contract, chec
                 if (other.get('repository'), other.get('pr'), other.get('expected_head_sha'), other.get('base_ref')) == (
                     ref.repository, ref.pr_number, ref.head_sha, ref.base_ref):
                     return None
-        if (ci._advertised_managed_actor(runner, config) != contract.trusted_actor_login
+        if (_managed_ci_api._advertised_managed_actor(runner, config) != contract.trusted_actor_login
             or ci.managed_label_present(runner, config=config, pr_number=pr_number) is not True):
             return None
         if not ci.revalidate_adopted_managed_ci(runner, config=config, pr_number=pr_number,
@@ -241,7 +244,7 @@ def historical_outcome(runner, *, config, pr_number, metadata, contract, result)
     from . import managed_ci as ci
     require_verified_result(runner, config=config, pr_number=pr_number,
                             expected_head_sha=metadata.head_sha, contract=contract, result=result)
-    return ci.ManagedCiOutcome(status='passed', head_sha=metadata.head_sha,
+    return _managed_ci_types.ManagedCiOutcome(status='passed', head_sha=metadata.head_sha,
                                checks=ci.get_pr_checks(runner, config=config, metadata=metadata))
 
 
@@ -269,7 +272,7 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
     try:
         page = ci._read_intent_comment_page(runner, config, pr_number)
         record = _record(page, contract, ref)
-        if record is None or ci._advertised_managed_actor(runner, config) != contract.trusted_actor_login:
+        if record is None or _managed_ci_api._advertised_managed_actor(runner, config) != contract.trusted_actor_login:
             raise AgentLoopError(message)
         # Completed historical baselines retain their existing authentication;
         # a newer live intent does not revoke their repair obligation.

@@ -1,4 +1,4 @@
-"""Symbol-specific guards for the cleaned protocol support and risk surfaces."""
+"""Symbol-specific guards for cleaned protocol and managed-CI support surfaces."""
 from __future__ import annotations
 
 import ast
@@ -19,7 +19,7 @@ OWNERS = {**_REWRITE.symbol_owners(), **RISK_OWNERS}
 OLD = 'coding_review_agent_loop.protocol'
 
 
-def ownership_problems(source, *, driver=False):
+def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS):
     tree = ast.parse(source)
     # Quoted forward references are executable type dependencies too. Expand
     # annotation strings (including nested tuple/list references), but never
@@ -70,13 +70,13 @@ def ownership_problems(source, *, driver=False):
                 bindings[alias.asname or alias.name.split('.')[0]] = alias.name if alias.asname else alias.name.split('.')[0]
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ''
-            if node.level and module == 'protocol':
-                module = OLD
+            if node.level and module == old.rsplit('.', 1)[1]:
+                module = old
             elif node.level and not module:
                 module = 'coding_review_agent_loop'
             for alias in node.names:
                 bindings[alias.asname or alias.name] = module + '.' + alias.name
-                if module == OLD and (alias.name in OWNERS or alias.name == '*'):
+                if module == old and (alias.name in owners or alias.name == '*'):
                     problems.append(f'{node.lineno}: old import {alias.name}')
         elif isinstance(node, ast.Assign):
             for target in node.targets:
@@ -84,20 +84,20 @@ def ownership_problems(source, *, driver=False):
                     bindings[target.id] = resolve(node.value)
         if isinstance(node, (ast.Attribute, ast.Constant, ast.BinOp, ast.JoinedStr)):
             value = resolve(node)
-            if value.startswith(OLD + '.') and value[len(OLD)+1:].split('.')[0] in OWNERS:
+            if value.startswith(old + '.') and value[len(old)+1:].split('.')[0] in owners:
                 problems.append(f'{node.lineno}: old access or patch {value}')
         if isinstance(node, ast.Call) and (
             isinstance(node.func, ast.Attribute) and node.func.attr in ('setattr', 'object')
             or isinstance(node.func, ast.Name) and node.func.id in ('getattr', 'setattr')
         ):
-            if len(node.args) >= 2 and resolve(node.args[0]) == OLD and resolve(node.args[1]) in OWNERS:
+            if len(node.args) >= 2 and resolve(node.args[0]) == old and resolve(node.args[1]) in owners:
                 problems.append(f'{node.lineno}: old object patch')
     if driver:
         loads = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    if alias.name in OWNERS and (alias.asname or alias.name) not in loads:
+                    if alias.name in owners and (alias.asname or alias.name) not in loads:
                         problems.append(f'{node.lineno}: compatibility-only export {alias.name}')
     return problems
 
@@ -223,3 +223,122 @@ def test_guard_allows_annotation_dependencies(name, aliased, annotation):
 def test_guard_does_not_count_unrelated_strings_as_annotation_dependencies(name):
     source = f'from .protocol_risk import {name}\nvalue = "{name}"'
     assert ownership_problems(source, driver=True)
+
+
+_MANAGED_SPEC = importlib.util.spec_from_file_location('managed_rewrite', ROOT / 'scripts/rewrite_managed_support_imports.py')
+_MANAGED_REWRITE = importlib.util.module_from_spec(_MANAGED_SPEC)
+_MANAGED_SPEC.loader.exec_module(_MANAGED_REWRITE)
+MANAGED_OWNERS = _MANAGED_REWRITE.symbol_owners()
+MANAGED_OLD = 'coding_review_agent_loop.managed_ci'
+
+
+def managed_ownership_problems(source, *, driver=False):
+    return ownership_problems(source, driver=driver, old=MANAGED_OLD, owners=MANAGED_OWNERS)
+
+
+def test_consumers_use_managed_support_owners():
+    problems = []
+    for folder in ('src', 'tests'):
+        for path in (ROOT / folder).rglob('*.py'):
+            problems.extend(f'{path.relative_to(ROOT)}: {problem}' for problem in
+                            managed_ownership_problems(path.read_text(), driver=path.name == 'managed_ci.py'))
+    assert problems == []
+
+
+@pytest.mark.parametrize('name', sorted(MANAGED_OWNERS))
+@pytest.mark.parametrize('template', [
+    'from coding_review_agent_loop.managed_ci import {name} as moved',
+    'from .managed_ci import {name}',
+    'from . import managed_ci as ci\nq = ci\nq.{name}',
+    'import coding_review_agent_loop.managed_ci as ci\nci.{name}',
+    'import coding_review_agent_loop.managed_ci\ncoding_review_agent_loop.managed_ci.{name}',
+    'from coding_review_agent_loop import managed_ci as ci\nvalue: "ci.{name} | None"',
+    'patch("coding_review_agent_loop.managed_ci.{name}")',
+    'prefix = "coding_review_agent_loop.managed_ci"\npatch(f"{{prefix}}.{name}")',
+    'from coding_review_agent_loop import managed_ci as ci\nmonkeypatch.setattr(ci, "{name}", fake)',
+    'from coding_review_agent_loop import managed_ci as ci\npatch.object(ci, "{name}", fake)',
+])
+def test_guard_rejects_every_old_managed_support_symbol(name, template):
+    assert managed_ownership_problems(template.format(name=name))
+
+
+@pytest.mark.parametrize('name,owner', sorted(MANAGED_OWNERS.items()))
+def test_guard_rejects_managed_support_compatibility_export(name, owner):
+    assert managed_ownership_problems(f'from .{owner} import {name}', driver=True)
+    assert not managed_ownership_problems(f'from .{owner} import {name}\nx = {name}', driver=True)
+
+
+def test_managed_rewrite_preserves_aliases_local_imports_and_real_patch_owners():
+    source = ('from coding_review_agent_loop import managed_ci as ci\n'
+              'def consumer():\n    from .managed_ci import ManagedCiContract as Contract, activate_managed_ci\n'
+              'ci._api_list(runner, config, endpoint)\n'
+              'monkeypatch.setattr(ci, "_api_list", fake)\n'
+              'patch("coding_review_agent_loop.managed_ci.assess_exact_head_protection")\n')
+    rewritten = _MANAGED_REWRITE.rewrite(source, MANAGED_OWNERS)
+    assert not managed_ownership_problems(rewritten)
+    assert 'ManagedCiContract as Contract' in rewritten
+    assert 'activate_managed_ci' in rewritten
+    assert _MANAGED_REWRITE.rewrite(rewritten, MANAGED_OWNERS) == rewritten
+
+
+@pytest.mark.parametrize('first', [
+    'managed_ci', 'managed_ci_types', 'managed_ci_api', 'managed_ci_protection',
+    'managed_ci_failure', 'managed_ci_status', 'managed_ci_reconciliation',
+])
+def test_managed_support_fresh_import_orders(first):
+    import os
+    import subprocess
+    import sys
+
+    modules = [first] + [name for name in [
+        'managed_ci', 'managed_ci_types', 'managed_ci_api', 'managed_ci_protection',
+        'managed_ci_failure', 'managed_ci_status', 'managed_ci_reconciliation',
+    ] if name != first]
+    code = '\n'.join('import coding_review_agent_loop.' + name for name in modules)
+    subprocess.run([sys.executable, '-c', code], check=True, timeout=30, cwd=ROOT,
+                   env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+
+
+def test_managed_helper_dependency_patch_intercepts_real_lookup(monkeypatch, tmp_path):
+    import importlib
+    from types import SimpleNamespace
+    from coding_review_agent_loop import managed_ci_api, managed_ci_types
+    from agent_loop_helpers import make_config
+
+    calls = []
+
+    def stop_at_lookup(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError('support lookup intercepted')
+
+    monkeypatch.setattr(managed_ci_api, '_advertised_managed_actor', stop_at_lookup)
+    module = importlib.import_module('coding_review_agent_loop.managed_ci_failure')
+    config = make_config(tmp_path)
+    contract = managed_ci_types.ManagedCiContract()
+    metadata = SimpleNamespace(head_sha='a' * 40)
+    with pytest.raises(RuntimeError, match='support lookup intercepted'):
+        module.live_authority(None, config=config, pr_number=7, metadata=metadata, contract=contract)
+    assert len(calls) == 1
+
+
+
+def test_managed_driver_api_patch_intercepts_real_lookup(monkeypatch, tmp_path):
+    from coding_review_agent_loop import managed_ci, managed_ci_api
+    from agent_loop_helpers import make_config
+
+    calls = []
+
+    def stop_at_lookup(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError('driver API lookup intercepted')
+
+    monkeypatch.setattr(managed_ci_api, '_api_json', stop_at_lookup)
+    config = make_config(tmp_path)
+    with pytest.raises(RuntimeError, match='driver API lookup intercepted'):
+        managed_ci._github_proves_descendant(
+            None, config=config, predecessor_head='a' * 40, live_head='b' * 40,
+        )
+    assert len(calls) == 1
+    assert calls[0][0] == (
+        None, config, f'repos/{config.repo}/compare/' + 'a' * 40 + '...' + 'b' * 40,
+    )

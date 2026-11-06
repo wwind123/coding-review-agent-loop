@@ -11,8 +11,10 @@ from agent_loop_helpers import make_config
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiIssueAuthorization,
+)
+from coding_review_agent_loop.managed_ci import (
     format_issue_created_authorization_comment,
     verify_managed_pr_plan_binding,
 )
@@ -469,7 +471,9 @@ def test_strict_qualification_checks_the_plan_against_the_supplied_board_not_the
 
 # --- Rejected-coder recovery chains (#1367) -----------------------------------
 
-from coding_review_agent_loop.managed_ci import UNPROTECTED_OVERRIDE_TRAILER  # noqa: E402
+from coding_review_agent_loop.managed_ci_types import (
+    UNPROTECTED_OVERRIDE_TRAILER,
+)  # noqa: E402
 from coding_review_agent_loop.round_state import RecoveryRoundBudget  # noqa: E402
 
 

@@ -667,7 +667,9 @@ def test_amended_visual_owner_cannot_reopen_spent_head(visual_setup, monkeypatch
 def test_managed_root_path_captures_before_approval_without_final_ci(visual_setup, monkeypatch):
     from coding_review_agent_loop import pr_loop, github
     from coding_review_agent_loop.github import PullRequestChecks
-    from coding_review_agent_loop.managed_ci import ManagedCiContract
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedCiContract,
+    )
     config, calls, _ = visual_setup
     monkeypatch.setattr(pr_loop,'activate_managed_ci',lambda *a, **kw: ManagedCiContract(protocol_version=2))
     monkeypatch.setattr(pr_loop,'revalidate_adopted_managed_ci',lambda *a, **kw: True)
@@ -1119,7 +1121,9 @@ def test_new_head_reuse_mismatch_assesses_once_and_never_searches_older_sources(
 def test_recovery_checkpoint_validates_lifecycle_without_opening_execution(visual_setup, monkeypatch, tmp_path, lifecycle, history):
     from test_pr_loop_managed_ci import _managed_qualifying_resume
     from coding_review_agent_loop import pr_loop
-    from coding_review_agent_loop.managed_ci import ManagedCiContract
+    from coding_review_agent_loop.managed_ci_types import (
+        ManagedCiContract,
+    )
     from coding_review_agent_loop.round_state import _attach_round_metadata
     visual_config,calls,_=visual_setup
     config,runner=_managed_qualifying_resume(tmp_path,reviewer_codex_model='gpt-6.1-sol')

@@ -14,10 +14,12 @@ from .errors import AgentLoopError
 from .logging import log
 from .managed_ci import (
     MANAGED_LABEL,
-    UNPROTECTED_OVERRIDE_TRAILER,
     ensure_managed_label,
     parse_managed_ci_override_record,
     preflight_managed_ci_creation,
+)
+from .managed_ci_types import (
+    UNPROTECTED_OVERRIDE_TRAILER,
 )
 from .runner import CommandResult, Runner
 from .workdirs import active_workdir

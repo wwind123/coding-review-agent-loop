@@ -18,7 +18,7 @@ from coding_review_agent_loop.github import (
     IssueComment,
     PullRequestCheck,
 )
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )

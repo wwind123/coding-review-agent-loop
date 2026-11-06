@@ -120,9 +120,10 @@ from .protocol_markers import (
 from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 from .managed_ci_status import FINAL_CONTEXT
+from . import managed_ci_api
 
 
-# Temporary identity-preserving exports for the support move (#1905).
+# Support imports used by the retained driver gates.
 from .managed_ci_types import (
     MANAGED_OPT_OUT_LABEL,
     QUALIFIED_LABEL,
@@ -135,7 +136,6 @@ from .managed_ci_types import (
     V2_MARKER,
     INTENT_MARKER,
     V2_FEATURE_MARKERS,
-    V2_ADOPTION_MARKER,
     V2_ADOPTION_FEATURE_MARKERS,
     RECOVERY_MARKER,
     VISIBLE_INTENT_MARKER,
@@ -148,15 +148,7 @@ from .managed_ci_types import (
     ManagedCiProbeContext,
     ProtectionAssessment,
     ManagedCiReadiness,
-    ManagedActorVariable,
-    _UNPROTECTED_WAIVER,
-    _UNREADABLE_WAIVER,
     _OVERRIDE_PROTECTION_STATES,
-    _UNREADABLE_PROTECTION_DETAIL,
-    _HIDDEN_BYPASS_DETAIL,
-    PREFLIGHT_STRICT_READY,
-    PREFLIGHT_KNOWN_NOT_READY,
-    PREFLIGHT_INDETERMINATE,
     V1_DISPATCH_RECORD_LIMIT,
     ManagedV1DispatchRecord,
     ManagedCiContract,
@@ -169,54 +161,36 @@ from .managed_ci_types import (
     OrdinaryRecoveryCapability,
     ManagedCiOutcome,
     ManagedCiRunSnapshot,
-    LabelEvent,
     CompleteLabelHistory,
     UnknownLabelHistory,
     ReconciledLabelWrite,
 )
 from .managed_ci_api import (
-    _LIST_FAILURE,
     _last_list_failure,
     _surfaces_list_failures,
-    _probe,
     _probe_json,
-    _probe_json_list,
     _is_http_error,
-    _is_plan_limited_error,
-    _GH_HTTP_STATUS_LINE,
     _http_status,
     _read_managed_actor_variable,
     _read_actions_variable,
     _resolve_advertised_actor,
-    _ASSERTED_ACTOR_LOGGED,
     _log_asserted_actor,
     _advertised_managed_actor,
     _probe_raw_workflow,
     _historical_managed_label_event,
     _managed_label_event_history,
     _api_list_detailed,
-    _api_list_detailed_inner,
     _with_reason,
     _api_list,
     label_event_history,
     _active_managed_label_event,
     _read_repo_default_branch,
-    _api_json,
 )
 from .managed_ci_protection import (
     waivable_protection_states,
     waiver_flags_for_protection,
     _waiver_for_protection,
     reconcile_live_protection,
-    _has_final_context,
-    _RULESET_ENFORCEMENT_VALUES,
-    _BYPASS_ACTOR_TYPES,
-    _BYPASS_ACTOR_TYPES_WITHOUT_ID,
-    _BYPASS_MODES,
-    _ruleset_detail_problem,
-    _ruleset_detail_well_formed,
-    _ruleset_bypass_state,
-    _ruleset_requires_final_context,
     assess_exact_head_protection,
 )
 
@@ -855,7 +829,7 @@ def preflight_managed_ci_creation(
         )
         return None
     if readiness.state == "indeterminate":
-        who = _api_json(runner, config, "user", quiet=True)
+        who = managed_ci_api._api_json(runner, config, "user", quiet=True)
         advertised = _advertised_managed_actor(runner, config)
         actor = who.get("login") if isinstance(who.get("login"), str) else None
         if not isinstance(actor, str) or not isinstance(advertised, str) or (
@@ -934,7 +908,7 @@ def _issue_created_tuple(
     linked = parse_strong_issue_reference_evidence(body, repo=config.repo, issue_number=issue_number)
     if len(linked) != 1:
         raise AgentLoopError("Managed-CI issue handoff requires one canonical closing reference to its issue.")
-    who = _api_json(runner, config, "user", quiet=True)
+    who = managed_ci_api._api_json(runner, config, "user", quiet=True)
     actor_login = who.get("login") if isinstance(who.get("login"), str) else None
     actor_id = who.get("id") if isinstance(who.get("id"), int) else None
     advertised = _advertised_managed_actor(runner, config)
@@ -1039,7 +1013,7 @@ def _authorization_actor(
     config: AgentLoopConfig,
 ) -> tuple[str, int]:
     """Authenticate the CLI actor against both GitHub identity sources."""
-    who = _api_json(runner, config, "user", quiet=True)
+    who = managed_ci_api._api_json(runner, config, "user", quiet=True)
     login = who.get("login") if isinstance(who.get("login"), str) else None
     actor_id = who.get("id") if isinstance(who.get("id"), int) else None
     advertised = _advertised_managed_actor(runner, config)
@@ -1171,7 +1145,7 @@ def _github_proves_descendant(
     live_head: str,
 ) -> bool:
     """Return whether GitHub proves that live_head descends from predecessor_head."""
-    comparison = _api_json(
+    comparison = managed_ci_api._api_json(
         runner,
         config,
         (
@@ -2373,7 +2347,7 @@ def _continuity_live_pr_tuple(
     new_head: str,
 ) -> tuple[object, ...]:
     """Read the immutable PR tuple used by a continuity publication."""
-    live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{handoff.pr_number}")
+    live_pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{handoff.pr_number}")
     live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
     live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
     live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
@@ -2902,7 +2876,7 @@ def authorize_fresh_issue_created_resume(
         raise AgentLoopError("Managed-CI fresh authorization does not match the selected base branch.")
     if metadata.head_sha is None or metadata.repo.casefold() != config.repo.casefold():
         raise AgentLoopError("Managed-CI fresh authorization requires a same-repository exact live head.")
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
@@ -2942,7 +2916,7 @@ def authorize_fresh_issue_created_resume(
     valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
 
     def revalidate_live_authorization_tuple() -> None:
-        live_pr = _api_json(
+        live_pr = managed_ci_api._api_json(
             runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True
         )
         live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
@@ -3677,7 +3651,7 @@ def authenticate_source_managed_resume(
     override_nonce: str | None,
 ) -> AuthenticatedManagedResume:
     """Authenticate the durable lifecycle of a recovered managed-pr origin."""
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     labels = {
         item.get("name") for item in (pr.get("labels") or [])
         if isinstance(item, dict) and isinstance(item.get("name"), str)
@@ -4662,7 +4636,7 @@ def refresh_ordinary_recovery_capability(
     newer than this invocation's release observation, so its run baseline
     starts empty and only runs observed for that exact head are eligible.
     """
-    pr = _api_json(
+    pr = managed_ci_api._api_json(
         runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True,
     )
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -4821,7 +4795,7 @@ def verify_managed_pr_plan_binding(
             actor_id=next(iter(actor_ids)),
         )
         try:
-            live_pr = _api_json(
+            live_pr = managed_ci_api._api_json(
                 runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True
             )
             opening_override_nonce = _opening_override_nonce(
@@ -5383,7 +5357,7 @@ def _activate_v2_managed_ci(
     configured = (config.managed_ci_trusted_actor or "").strip()
     if not configured:
         return None
-    who = _api_json(runner, config, "user")
+    who = managed_ci_api._api_json(runner, config, "user")
     actor_login = who.get("login") if isinstance(who.get("login"), str) else None
     actor_id = _strict_int(who.get("id"))
     if not actor_login or actor_id is None or actor_login.casefold() != configured.casefold():
@@ -5426,7 +5400,7 @@ def _activate_v2_managed_ci(
     visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
     host_footer_capable = HOST_FOOTER_INTENT_MARKER in workflow_text
 
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     author = pr.get("user") if isinstance(pr.get("user"), dict) else {}
@@ -5744,7 +5718,7 @@ def _activate_v2_managed_ci(
                 context.drafted_by_this_run = True
             else:
                 context.ready_undo_ambiguous = True
-            refreshed = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+            refreshed = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
             refreshed_labels = _strict_label_names(refreshed)
             if (
                 undo.returncode != 0
@@ -5971,7 +5945,7 @@ def _activate_v2_managed_ci(
             # Re-read both the PR and the active timeline event immediately before
             # the audit write. A successful earlier probe cannot authorize a raced
             # head/base/draft/label transition.
-            live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+            live_pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
             live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
             live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
             live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
@@ -6043,7 +6017,7 @@ def _activate_v2_managed_ci(
                     return _ordinary_fallback_contract(runner, config=config, pr_number=pr_number, context=context, recovery=recovery)
             else:
                 audit_id = None
-        workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True)
+        workflow_revision = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True)
         revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
         # Every v2 activation is generation-scoped.  ``auto_merge`` is an implicit
         # managed-CI request, so it must mint the same producer field as explicit
@@ -6317,7 +6291,7 @@ def _adoption_identity(
     configured = (config.managed_ci_trusted_actor or "").strip()
     if not configured:
         return None
-    who = _api_json(runner, config, "user", quiet=True)
+    who = managed_ci_api._api_json(runner, config, "user", quiet=True)
     login, actor_id = who.get("login"), who.get("id")
     advertised = _advertised_managed_actor(runner, config)
     if (
@@ -6369,7 +6343,7 @@ def _activate_v2_existing_pr_adoption(
         default_branch=dispatch_ref, workflow_text=source,
     ) is not None:
         return None
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
@@ -6436,7 +6410,7 @@ def _activate_v2_existing_pr_adoption(
                 + provisional.release_diagnostic
             )
         return None
-    revision = _api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True).get("sha")
+    revision = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True).get("sha")
     log(config, f"PR #{pr_number}: activated authenticated managed exact-head CI v2 adoption")
     return ManagedCiContract(
         protocol_version=2, base_ref=base_ref, dispatch_ref=dispatch_ref, trusted_actor_login=actor_login,
@@ -6460,7 +6434,7 @@ def revalidate_adopted_managed_ci(
     """Recheck adoption security inputs before filtering or final dispatch."""
     if not contract.adopted_existing_pr or not contract.base_ref:
         return True
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     labels = {
         item.get("name") for item in (pr.get("labels") or [])
@@ -6735,7 +6709,7 @@ def _publish_manual_v2_qualification(
 
     # The bare qualified label is intentionally not used for a manual result.
     # Remove a historical copy if one exists so it cannot outlive its SHA.
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     labels = {
         item.get("name") for item in (pr.get("labels") or [])
         if isinstance(item, dict) and isinstance(item.get("name"), str)
@@ -6753,7 +6727,7 @@ def _publish_manual_v2_qualification(
         f"PR #{pr_number} changed before manual qualification publication; "
         "its exact head is not safely published."
     )
-    guard = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    guard = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     guard_head = guard.get("head") if isinstance(guard.get("head"), dict) else {}
     if (
         guard_head.get("sha") != expected_head_sha
@@ -6783,7 +6757,7 @@ def _publish_manual_v2_qualification(
         changed = (
             f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
         )
-    after = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    after = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     after_head = after.get("head") if isinstance(after.get("head"), dict) else {}
     after_labels = _label_names_or_none(after)
     if (
@@ -7043,7 +7017,7 @@ def require_recorded_base(
     """
     if not base_ref:
         return
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -7087,7 +7061,7 @@ def require_recorded_base(
 
 def managed_label_present(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> bool | None:
     """Return None when label state cannot be proven, never treating it as safe."""
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     if not pr:
         return None
     labels = pr.get("labels")
@@ -7250,7 +7224,7 @@ def _dispatch_v2_qualification(
     if not contract.base_ref or not contract.trusted_actor_login or contract.trusted_actor_id is None:
         raise AgentLoopError("Managed-CI v2 contract is missing authenticated dispatch provenance.")
     dispatch_ref = _contract_dispatch_ref(runner, config, contract)
-    current_base = _api_json(
+    current_base = managed_ci_api._api_json(
         runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True
     ).get("sha")
     if (
@@ -8474,7 +8448,7 @@ def prepare_v2_merge(
         raise AgentLoopError(
             f"Unable to apply `{QUALIFIED_LABEL}` before readying PR #{pr_number}.{failure_suffix(labelled)}"
         )
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     if pr.get("draft") is True:
         require_recorded_base(
             runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
@@ -8642,7 +8616,7 @@ def validate_ordinary_recovery_capability(
     require_draft: bool | None = True,
 ) -> bool:
     """Revalidate the invocation-owned fallback tuple before readiness/merge."""
-    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True)
+    pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True)
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}

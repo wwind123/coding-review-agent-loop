@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.errors import HumanDecisionRequiredError
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
 from coding_review_agent_loop.round_state import (

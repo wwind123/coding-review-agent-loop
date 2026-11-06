@@ -46,7 +46,7 @@ def test_gh_call_guards_reject_violations_in_every_owner(
         guard()
 
 
-def test_support_bodies_identity_and_dependencies():
+def test_support_bodies_and_dependencies():
     for owner, records in MANIFEST['owners'].items():
         module = importlib.import_module('coding_review_agent_loop.' + owner)
         source = (PACKAGE / (owner + '.py')).read_text()
@@ -60,7 +60,7 @@ def test_support_bodies_identity_and_dependencies():
             elif isinstance(node, ast.AnnAssign):
                 definitions[node.target.id] = node
         for name, record in records.items():
-            assert getattr(managed_ci, name) is getattr(module, name), name
+            assert getattr(module, name) is not None, name
             node = definitions[name]
             first = min([node.lineno] + [d.lineno for d in getattr(node, 'decorator_list', [])])
             body = ''.join(lines[first - 1:node.end_lineno])
@@ -80,7 +80,7 @@ def test_support_fresh_import_orders(first):
     modules = [first] + [m for m in ['managed_ci', *MANIFEST['owners']] if m != first]
     code = '\n'.join('import coding_review_agent_loop.' + m for m in modules)
     code += '\nfrom coding_review_agent_loop import managed_ci, managed_ci_api\n'
-    code += 'assert managed_ci._LIST_FAILURE is managed_ci_api._LIST_FAILURE\n'
+    code += 'assert managed_ci.activate_managed_ci.__globals__["_LIST_FAILURE"] is managed_ci_api._LIST_FAILURE\n'
     subprocess.run([sys.executable, '-c', code], check=True, timeout=30, cwd=ROOT,
                    env={**os.environ, 'PYTHONPATH': str(PACKAGE.parent)})
 
@@ -102,16 +102,16 @@ def test_retained_gate_and_extracted_read_share_failure_state(tmp_path, payload)
 
     runner = ReadRunner()
 
-    @managed_ci._surfaces_list_failures
+    @managed_ci_api._surfaces_list_failures
     def retained_gate():
         assert managed_ci_api._active_managed_label_event(
             runner, config=config, pr_number=7) is None
-        reason = managed_ci._last_list_failure()
+        reason = managed_ci_api._last_list_failure()
         # A later successful read must not erase an earlier failure in this gate.
         class SuccessRunner:
             def run(self, command, **kwargs):
                 return CommandResult(tuple(command), kwargs['cwd'], '[]', '', 0)
-        assert managed_ci._api_list(SuccessRunner(), config, 'repos/OWNER/REPO/issues') == []
+        assert managed_ci_api._api_list(SuccessRunner(), config, 'repos/OWNER/REPO/issues') == []
         assert managed_ci_api._last_list_failure() == ''
         raise AgentLoopError('gate refused: ' + str(bool(reason)))
 

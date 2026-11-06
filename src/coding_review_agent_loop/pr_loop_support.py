@@ -80,12 +80,14 @@ from .evidence_conversion import (
     ConversionAuditRow,
     EvidenceConversionAudit,
 )
-from .managed_ci import (
+from .managed_ci_types import (
     AuthenticatedIssueCreatedHandoff,
-    FINAL_CONTEXT,
     ManagedCiContract,
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
+)
+from .managed_ci import (
+    FINAL_CONTEXT,
     refresh_ordinary_recovery_capability,
     require_recorded_base,
     render_managed_ci_resume_command,

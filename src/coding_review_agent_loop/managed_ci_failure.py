@@ -1,6 +1,9 @@
 """Attempt-bound live failure evidence, separate from historical qualification."""
 from __future__ import annotations
 
+from coding_review_agent_loop import managed_ci_api as _managed_ci_api
+from coding_review_agent_loop import managed_ci_types as _managed_ci_types
+
 from dataclasses import replace
 import json
 from urllib.parse import urlparse
@@ -15,14 +18,13 @@ def _is_v2_intent_run(
     run: dict[str, object], *, contract: ManagedCiContract, run_name: str
 ) -> bool:
     """Validate the API fields available for a dispatched base workflow."""
-    from . import managed_ci as ci
     if (
         run_name not in (run.get("name"), run.get("display_title"))
         or run.get("event") != "workflow_dispatch"
     ):
         return False
     path = run.get("path")
-    if isinstance(path, str) and f".github/workflows/{ci.WORKFLOW_FILE}" not in path:
+    if isinstance(path, str) and f".github/workflows/{_managed_ci_types.WORKFLOW_FILE}" not in path:
         return False
     run_ref = contract.dispatch_ref or contract.base_ref
     if isinstance(run.get("head_branch"), str) and run_ref and run["head_branch"] != run_ref:
@@ -125,13 +127,13 @@ def live_authority(runner, *, config, pr_number, metadata, contract):
     from . import managed_ci as ci
     if contract.adopted_existing_pr and contract.guard_head_sha != metadata.head_sha:
         return False  # observation must not publish an adoption guard
-    if (ci._advertised_managed_actor(runner, config) != contract.trusted_actor_login
+    if (_managed_ci_api._advertised_managed_actor(runner, config) != contract.trusted_actor_login
         or ci.managed_label_present(runner, config=config, pr_number=pr_number) is not True
         or not ci.revalidate_adopted_managed_ci(runner, config=config, pr_number=pr_number,
                                                metadata=metadata, contract=contract)):
         return False
     if contract.active_label_event_id is not None:
-        event = ci._active_managed_label_event(runner, config=config, pr_number=pr_number)
+        event = _managed_ci_api._active_managed_label_event(runner, config=config, pr_number=pr_number)
         if event != (contract.active_label_event_id, contract.trusted_actor_login, contract.trusted_actor_id):
             return False
     resume = contract.authenticated_resume
@@ -217,19 +219,19 @@ def require_live_failure(runner, *, config, pr_number, metadata, contract, check
         if terminal() is None:
             return False
         final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
-        if final is not None and final.status in ci._TERMINAL_CI_STATUSES:
+        if final is not None and final.status in _managed_ci_types._TERMINAL_CI_STATUSES:
             if final.status == 'success':
                 return False
         else:
             # The existing terminal-without-status rule requires a reread and
             # a second poll, leaving the active publisher's attachment intact.
             final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
-            if final is None or final.status not in ci._TERMINAL_CI_STATUSES:
+            if final is None or final.status not in _managed_ci_types._TERMINAL_CI_STATUSES:
                 runner.run(['sleep', str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
                 if terminal() is None:
                     return False
                 final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
-                if final is None or final.status not in ci._TERMINAL_CI_STATUSES:
+                if final is None or final.status not in _managed_ci_types._TERMINAL_CI_STATUSES:
                     view.terminal_run_id, view.terminal_run_attempt = ref.run_id, ref.failed_attempt
                     view.terminal_attempts += ((ref.run_id, ref.failed_attempt),)
                     view.terminal_outcome = 'no-status'
@@ -242,7 +244,7 @@ def require_live_failure(runner, *, config, pr_number, metadata, contract, check
         original = original_view(ci._read_intent_comment_page(runner, config, pr_number), contract, ref)
         if original != original_binding:
             return False
-        if final is not None and final.status in ci._TERMINAL_CI_STATUSES and (
+        if final is not None and final.status in _managed_ci_types._TERMINAL_CI_STATUSES and (
             not final.url or urlparse(final.url)._replace(query='', fragment='').geturl().rstrip('/')
             != f'https://github.com/{ref.repository}/actions/runs/{ref.run_id}'
         ):

@@ -10,7 +10,7 @@ import pytest
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.github import IssueContext, get_issue_context
-from coding_review_agent_loop.managed_ci import (
+from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiCreationIntent,
     ManagedCiOutcome,
