@@ -370,6 +370,7 @@ class PostedRoundMetadata:
     screenshot_coverage: object = None
     screenshot_receipt_refs: tuple[int, ...] = ()
     evidence_requests: tuple[str, ...] = ()
+    requirement_evidence: tuple[dict, ...] = ()
     evidence_freeze: "EvidenceFreezeRecord | None" = None
     evidence_release: "EvidenceReleaseRecord | None" = None
     evidence_clearances: tuple[tuple[str, str], ...] = ()
@@ -2492,6 +2493,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     payload.update(encode_fields(metadata))
     from .post_merge_state import encode_fields as encode_post_merge
     payload.update(encode_post_merge(metadata))
+    if metadata.requirement_evidence:
+        payload["requirement_evidence"] = list(metadata.requirement_evidence)
     if metadata.evidence_requests:
         payload["evidence_requests"] = list(metadata.evidence_requests)
     if metadata.evidence_freeze is not None:
@@ -2787,6 +2790,8 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
     fields: dict[str, object] = {}
     from .review_images_coverage_history import decode_fields
     fields.update(decode_fields(payload))
+    from .requirement_evidence import decode_associations
+    fields["requirement_evidence"] = decode_associations(payload)
     if "evidence_requests" in payload:
         requests = _decode_string_list(payload["evidence_requests"])
         if requests is None:

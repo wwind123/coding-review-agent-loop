@@ -247,6 +247,19 @@ def _evidence_review(
     )
 
 
+def _association(requirement_id, role, *, request="", answers=(), leftover=""):
+    return {"requirement_id": requirement_id, "role": role, "request": request,
+            "answered_item_ids": list(answers), "leftover_instructions": leftover}
+
+
+def _classified_review(associations, **kwargs):
+    output = _evidence_review(**kwargs)
+    raw, footer = output.split("\n<!--", 1)
+    payload = json.loads(raw)
+    payload["requirement_evidence"] = associations
+    return json.dumps(payload) + "\n<!--" + footer
+
+
 def _signed(body, index):
     return {
         "author": {"login": "maintainer"},

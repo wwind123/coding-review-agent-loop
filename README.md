@@ -2275,3 +2275,8 @@ After a manual merge or interrupted tracking publication, use
 (add `--dry-run` to inspect without writing). See
 [required post-merge obligations](docs/local_agent_loop.md#required-post-merge-obligations)
 for reviewer declarations, verified operator directives and recovery.
+
+Within coder sessions, use `"$AGENT_LOOP_EXECUTABLE" run-tests -- <test command>`
+to keep receipts bound to the running orchestrator release across shell PATH or
+release-symlink changes. See the [CLI guide](docs/local_agent_loop.md) for signed
+requirement routing and exact-head human evidence.

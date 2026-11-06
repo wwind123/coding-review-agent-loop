@@ -1,6 +1,6 @@
 """Pin every agent subprocess to the orchestrator's own ``agent-loop`` (#1632).
 
-Agents are told to run ``agent-loop run-tests -- <command>``.  Without a pin
+Agents invoke the exported executable explicitly for ``run-tests``.  Without a pin
 their shell resolves the first ``agent-loop`` on its inherited ``PATH``, which
 can be a different, stale install whose receipts the running orchestrator then
 judges.  This module installs a private, content-addressed ``agent-loop``
@@ -55,8 +55,8 @@ def _frozen_import_path() -> list[str]:
     first = str(package_path().parent)
     frozen = [first]
     for entry in sys.path:
-        if entry and os.path.isabs(entry) and entry not in frozen:
-            frozen.append(entry)
+        if entry and os.path.isabs(entry) and str(Path(entry).resolve()) not in frozen:
+            frozen.append(str(Path(entry).resolve()))
     return frozen
 
 
@@ -68,9 +68,9 @@ def launcher_text() -> str:
         "from coding_review_agent_loop.cli import main; "
         "sys.exit(main())"
     )
-    # The lexical interpreter keeps a virtualenv's ``bin/python`` symlink, so
-    # anything run-tests spawns through ``sys.executable`` stays in the venv.
-    return f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I -c {shlex.quote(code)} \"$@\"\n"
+    # Resolve the containing directory, preserving the final bin/python name:
+    # resolving that final symlink would discard the virtualenv identity.
+    return f"#!/bin/sh\nexec {shlex.quote(str(Path(sys.executable).parent.resolve() / Path(sys.executable).name))} -I -c {shlex.quote(code)} \"$@\"\n"
 
 
 def expected_launcher_path(root: Path | None = None) -> Path:

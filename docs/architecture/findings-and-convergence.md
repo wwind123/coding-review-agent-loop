@@ -588,6 +588,19 @@ the admitted control input stays consumed and surrounding signed prose remains
 visible. The run reports the transport failure and retries on replay; new admissions
 still require verified publication before they can change eligibility.
 
+Signed-source routing (#1922) is owned by `requirement_evidence.py`. Validated
+reviewer associations link surfaced signed IDs to that requester's native
+human-only requests or classify answers as evidence-only/mixed. The shared
+projection precedes acknowledgement repair and coder prompt/validation. Human-only
+requirements remain pending evidence; evidence-only answers leave coder work;
+mixed answers keep their original ID with only explicit leftover instructions.
+Every validated review contributes, including a blocking review with code work.
+Missing evidence classification receives one real semantic continuation, never
+format repair. Conflicting classifications stop conservatively. Classification
+cannot authorize acceptance: native requester citations and final live head/source
+reads retain that authority before and after freeze.
+
+
 ## Decisions
 
 [Decision log](decisions/findings-and-convergence.md)

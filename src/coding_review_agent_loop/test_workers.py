@@ -2355,7 +2355,7 @@ def render_interpreter_guidance(guidance: InterpreterGuidance) -> str:
         else:
             use = (
                 "use it (also `$AGENT_LOOP_TEST_PYTHON`) for broad and full-suite runs through "
-                f"`agent-loop run-tests`, for example `agent-loop run-tests -- {path} -m pytest`"
+                f'`"$AGENT_LOOP_EXECUTABLE" run-tests`, for example `"$AGENT_LOOP_EXECUTABLE" run-tests -- {path} -m pytest`'
             )
         sentence = (
             "Configured test interpreter: the parent's import check found pytest and pytest-xdist "

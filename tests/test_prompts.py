@@ -6195,10 +6195,10 @@ def test_configured_interpreter_guidance_states_only_what_the_check_established(
     assert f"`{python}`" in text
     assert calls == [((str(python),), config.claude_dir)]
     if state == 0:
-        assert f"agent-loop run-tests -- {python} -m pytest" in text
+        assert f'"$AGENT_LOOP_EXECUTABLE" run-tests -- {python} -m pytest' in text
         assert "use the same interpreter consistently because supersession compares exact commands" in text
     else:
-        assert f"agent-loop run-tests -- {python} -m pytest" not in text
+        assert f'"$AGENT_LOOP_EXECUTABLE" run-tests -- {python} -m pytest' not in text
     # Never claims complete dev extras or that the suite fits the caps.
     assert "dev extras" not in text and "will fit" not in text
     assert "PEP 668" in text and "reported as not run, never as passed" in text
@@ -7237,3 +7237,16 @@ def test_salvage_wrapper_is_outcome_neutral(tmp_path, source, outcome):
         assert "Previous implementation attempt salvage:" in prompt
         assert "Stage intended new files before required tests" in prompt
         assert "Default managed checkouts are removed" in prompt
+
+
+def test_coder_test_invocations_explicitly_use_exported_executable(tmp_path, monkeypatch):
+    wrapper = runtime.LauncherProbeResult(("/opt/release-A/agent-loop", "run-tests"), "verified", "verified")
+    monkeypatch.setattr(prompts_module, "preflight_wrapper_candidates", lambda **kwargs: (wrapper,))
+    config = make_config(tmp_path)
+    memory = AgentMemoryContext(memory_dir=tmp_path / "memory", current_commit=None,
+        last_analyzed_commit=None, changed_files=(), repo_summary=None, architecture_map=None,
+        test_profile=None, toolchain=None)
+    prompt = build_issue_prompt(1922, config, memory=memory)
+    assert 'Invocation guidance: "$AGENT_LOOP_EXECUTABLE" run-tests' in prompt
+    assert '"$AGENT_LOOP_EXECUTABLE" run-tests --fixture <script>' in prompt
+    assert '/opt/release-A/agent-loop run-tests --' not in prompt

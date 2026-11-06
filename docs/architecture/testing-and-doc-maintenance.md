@@ -223,6 +223,19 @@ fresh import orders, source sizes and interception at the moved citation lookup;
 the linked shape audit includes the risk owner and tests missing annotations there.
 
 
+The optional PR-review `requirement_evidence` field records semantic signed-source
+classification (#1922). Entries contain requirement_id, role (code, human-only,
+evidence-only, mixed), request, answered_item_ids and leftover_instructions.
+The parser checks shape; routing checks surfaced source identity, native target
+existence and requester ownership. Repair preserves the entire field exactly,
+including its absence; a real bounded reviewer continuation owns missing
+classification. Mixed-source prompt and disposition validation use the original
+signed ID with explicit leftover scope. Classification is separate from native
+evidence authorization and does not waive live citation validation. Report-side
+command parsing recognizes the exported executable spelling while continuing to
+validate inner test targets against the assigned checkout.
+
+
 ## Decisions
 
 [Decision log](decisions/testing-and-doc-maintenance.md)

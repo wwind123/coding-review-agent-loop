@@ -1085,3 +1085,91 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     assert all(r.metadata.round_number == 1 for r in after)
     assert not any(cmd[:3] == ["gh", "api", "--method"] and "DELETE" in cmd
                    for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+@pytest.mark.parametrize("classification_pass", [False, True])
+@pytest.mark.parametrize("resumed", [False, True])
+def test_human_only_signed_requirement_freezes_without_coder(tmp_path, capsys, mode, classification_pass, resumed):
+    from pr_loop_test_helpers import (_classified_review, _association, _evidence_review,
+        _signed, _EVIDENCE_TEXT, _freeze_records)
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    if resumed:
+        from test_pr_loop_early_evidence import deferred
+        runner, config = deferred(tmp_path, mode=mode)
+    else:
+        runner, config = FakeRunner(), make_config(tmp_path, pr_review_context_mode=mode)
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy at this exact head.", 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    pending = [{"item_id": "item-1", "disposition": "blocking", "note": "Human acceptance remains pending."}] if resumed else []
+    review_args = {"state": "blocking" if resumed else "approved", "dispositions": pending, "evidence": [_EVIDENCE_TEXT]}
+    classified = _classified_review([_association(rid, "human-only", request=_EVIDENCE_TEXT)], **review_args)
+    runner.codex_outputs = ([_evidence_review(**review_args)] if classification_pass else []) + [classified]
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    freeze = _freeze_records(runner)[-1].metadata
+    assert len(freeze.prior_items) == 1
+    assert freeze.prior_items[0].text == _EVIDENCE_TEXT
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    assert "re-injecting as blocking item" not in capsys.readouterr().err
+    count = len(_freeze_records(runner))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_freeze_records(runner)) == count
+
+
+def test_mixed_code_work_keeps_human_requirement_out_of_coder_prompt(tmp_path):
+    from pr_loop_test_helpers import (_classified_review, _association, _signed, _EVIDENCE_TEXT, _freeze_records)
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    runner = FakeRunner()
+    runner.pr_payload["comments"].extend([_signed("A human must accept the policy.", 1), _signed("Fix the retry bound.", 2)])
+    human, code = _parse_pr_human_requirements(runner.pr_payload)
+    entries = [_association(human.requirement_id, "human-only", request=_EVIDENCE_TEXT), _association(code.requirement_id, "code")]
+    runner.codex_outputs = [_classified_review(entries, state="blocking", evidence=[_EVIDENCE_TEXT], blocking=["Fix the retry bound."]),
+        _classified_review(entries, state="blocking", evidence=[_EVIDENCE_TEXT], hr=True,
+            dispositions=[{"item_id": "item-1", "disposition": "resolved"},
+                {"item_id": "item-2", "disposition": "blocking", "note": "Human acceptance remains pending."}])]
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-1"],
+        human_requirement_ids=[code.requirement_id], human_requirement_dispositions=[{
+            "requirement_id": code.requirement_id, "disposition": "addressed", "evidence": "Retry bound fixed."}])]
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=2))
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    assert len(prompts) == 1
+    assert f"Requirement {code.requirement_id}:" in prompts[0]
+    assert f"Requirement {human.requirement_id}:" not in prompts[0]
+    assert len(_freeze_records(runner)[-1].metadata.prior_items) == 1
+
+
+@pytest.mark.parametrize("role", ["human-only", "evidence-only"])
+def test_legacy_ack_gate_clears_after_real_evidence_classification(tmp_path, role):
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _append_recorded_evidence_requests
+    from coding_review_agent_loop import pr_loop_support as support
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT, _freeze_records, _pr_records
+    from test_pr_loop_early_evidence import deferred, HEAD
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    runner, config = deferred(tmp_path, mode="full")
+    body = "Human acceptance is required." if role == "human-only" else "Accepted for " + HEAD
+    runner.pr_payload["comments"].append(_signed(body, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    records = _pr_records(runner)
+    items = []
+    _append_recorded_evidence_requests(items, [r for r in records if r.metadata.role == "reviewer"], records=records)
+    support._record_failed_acknowledgement(runner, config=config, pr_number=77, items=items,
+        source_round=2, missing_reviewers=["Codex"], subject=HEAD,
+        bound_metadata=PostedRoundMetadata, post_comment=support.post_pr_comment)
+    entry = _association(rid, role, request=_EVIDENCE_TEXT) if role == "human-only" else _association(rid, role, answers=["item-1"])
+    evidence_vote = {"item_id": "item-1", "disposition": "blocking", "note": "Human acceptance remains pending."} if role == "human-only" else {
+        "item_id": "item-1", "disposition": "resolved", "evidence_requirement_ids": [rid]}
+    runner.codex_outputs = [_classified_review([entry], state="blocking" if role == "human-only" else "approved",
+        evidence=[_EVIDENCE_TEXT] if role == "human-only" else [], dispositions=[evidence_vote,
+            {"item_id": HUMAN_REQUIREMENTS_ACK_ITEM_ID, "disposition": "resolved"}])]
+    if role == "human-only":
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert [i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items] == ["item-1"]
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert not _freeze_records(runner)
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)

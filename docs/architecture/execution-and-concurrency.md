@@ -579,46 +579,37 @@ no run boundary, so their callers call `reset_wait_state()` themselves.
 
 ### Agent-loop executable pin
 
-Agents are told to run `agent-loop run-tests -- <command>`, so every agent
-subprocess must resolve the orchestrator's own install, not the first
-`agent-loop` on its inherited `PATH` (#1632). `agent_executable.py` writes a
-private, content-addressed POSIX `sh` launcher named `agent-loop` under
-`<scratch>/agent-loop-exe/<digest>/`, using the same atomic-replace pattern as
-the coder `gh` guard; both write through a unique `mkstemp` staging file, and
-a process-wide lock lets parallel reviewer turns share one first install. It execs the lexical `sys.executable` with `-I` and
-prepends the orchestrator's effective import path, frozen at install time
-without empty or relative entries, so a coder's `PYTHONPATH`, its cwd and
-user-site installs cannot select other code. Both launch-environment sites in
-`runner.py` (pipe and PTY) apply `agent_executable_environment` after the
-backend env merge and before the broker environment and containment
-preparation. The two direct agent spawns outside the runner, the Gemini
-repair backend and the legacy repair pass in `repair.py`, build their whole
-environment with `pinned_agent_environment`, which merges the guard
-environment and then applies the same pin. It puts only the launcher
-directory first on `PATH` (never the whole venv `bin`), removes only earlier
-copies of that directory so launches never stack it, keeps every other
-inherited entry in order (including empty current-directory entries), and
-exports the launcher path as `AGENT_LOOP_EXECUTABLE`. Because the pin is
-applied last it composes with the coder CI-dispatch guard: the final `PATH`
-is `<launcher dir>:<guard dir>:<pre-guard PATH>`, and the guard still strips
-only its own directory. The read-only inspector builds its own closed `PATH`
-and is unchanged. Installation is fail-soft: an `OSError` logs one warning
-and the agent keeps its inherited `PATH`. Windows is out of scope.
+Agents invoke `"$AGENT_LOOP_EXECUTABLE" run-tests -- <command>` explicitly,
+including fixture invocations, so later shell PATH changes cannot select another
+release (#1632, #1922). `agent_executable.py` installs a private, content-addressed
+POSIX `sh` launcher under `<scratch>/agent-loop-exe/<digest>/`. Like the coder
+`gh` guard it uses unique `mkstemp` staging and atomic replacement; a process-wide
+lock shares first installation across parallel turns. The interpreter's containing
+directory is resolved to its physical release while the final `bin/python` name
+is retained to preserve virtualenv identity. Every retained absolute import path
+is resolved at construction; empty and relative entries are excluded. The
+launcher uses `-I` and prepends these paths, preventing cwd, `PYTHONPATH`, user-site
+or a retargeted startup `current` symlink from changing its code or dependencies.
 
-The launcher is the only run-tests wrapper candidate. `_wrapper_candidates` and
-`resolve_wrapper_prefix` in `test_runtime.py` return neither an ambient-`PATH`
-`agent-loop` nor the unpinned `sys.executable -m coding_review_agent_loop.cli`
-spelling. When the launcher is unavailable or fails its `run-tests --preflight`
-probe, the sandboxed coder grant is omitted with the existing warning and no
-wrapper is rendered. Report-side parsing still recognizes coder-typed `-m` and
-bare spellings. At startup, issue, task, pr, discuss and managed-pr log a
-warning naming both paths when the agent-visible `agent-loop` is not the
-launcher, and an informational line when the inherited `PATH` holds another
-`agent-loop`. Neither line blocks the run. The preflight is read-only: it
-computes the content-addressed launcher path and checks that it is installed
-or installable without writing to the scratch root, because a run writes
-nothing there before it needs to; the first agent launch installs the
-launcher.
+Both `runner.py` launch paths (pipe and PTY) apply `agent_executable_environment`
+after backend merging and before broker/containment preparation. Direct Gemini
+repair and legacy `repair.py` spawns use `pinned_agent_environment` to merge guards
+before pinning. Only the launcher directory is prepended, never the venv `bin`;
+prior copies are removed without changing other entries, including empty cwd
+entries. The exported `AGENT_LOOP_EXECUTABLE` composes with the coder guard:
+`<launcher dir>:<guard dir>:<pre-guard PATH>`. The guard strips only its directory;
+the read-only inspector retains its closed PATH. Installation stays fail-soft:
+an `OSError` warns once and preserves inherited PATH. Windows is out of scope.
+
+The launcher is the only candidate for `_wrapper_candidates` and
+`resolve_wrapper_prefix` in `test_runtime.py`; neither ambient `agent-loop` nor
+unpinned `sys.executable -m coding_review_agent_loop.cli` qualifies. Unavailable
+launchers or failed `run-tests --preflight` probes omit the sandboxed test grant
+and rendered wrapper, with a warning. Report parsing still recognizes bare and
+module spellings. Startup preflight for issue, task, pr, discuss and managed-pr
+names both paths in a warning for a different agent-visible client, or an
+informational line for another inherited-PATH client; neither blocks. It checks
+installation/installability read-only, and the first agent launch installs.
 
 **Receipt tool identity.** The `run-tests` client captures its own tool
 commit, dirty flag and package path (bounded at 3 s, never raising, and
