@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 
-from ..protocol import PUBLIC_RESPONSE_MARKER
+from ..protocol_common import (
+    PUBLIC_RESPONSE_MARKER,
+)
 from ..runner import CommandResult, executable_identity_changed, strip_ansi
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, gate_workdir_replay
 

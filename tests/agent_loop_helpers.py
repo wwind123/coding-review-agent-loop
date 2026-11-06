@@ -165,16 +165,12 @@ from coding_review_agent_loop.prompts import (
 )
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
-    DiscussEvidenceClaim,
     ExecutionAllocation,
-    _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
     _extract_structured_plan_revision_payload,
     _extract_structured_pr_review_payload,
-    normalize_response_file_structured_text,
     parse_approved_followups,
-    parse_human_requirements_acknowledgement,
     parse_pr_review,
     parse_plan_item_dispositions,
     parse_plan_review,
@@ -194,6 +190,14 @@ from coding_review_agent_loop.protocol import (
     validate_structured_human_requirements_acknowledgement,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+)
+from coding_review_agent_loop.protocol_discuss_types import (
+    DiscussEvidenceClaim,
+)
+from coding_review_agent_loop.protocol_common import (
+    _expect_string_list,
+    normalize_response_file_structured_text,
+    parse_human_requirements_acknowledgement,
 )
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.workdir_guard import (

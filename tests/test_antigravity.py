@@ -525,7 +525,9 @@ def test_antigravity_backend_git_lock_path_follows_linked_worktree(tmp_path):
 
 def test_antigravity_backend_strips_public_response_marker(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
-    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    from coding_review_agent_loop.protocol_common import (
+        PUBLIC_RESPONSE_MARKER,
+    )
     agy_dir = tmp_path / "antigravity"
     agy_dir.mkdir(parents=True, exist_ok=True)
     stdout = (
@@ -1860,7 +1862,9 @@ def test_antigravity_semantic_dedupe_runs_isolated_classification_turn(tmp_path,
         _REPAIR_SETTINGS_INJECTION,
         _SEMANTIC_DEDUPE_GEMINI_MD,
     )
-    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    from coding_review_agent_loop.protocol_common import (
+        PUBLIC_RESPONSE_MARKER,
+    )
     from coding_review_agent_loop.semantic_dedupe import parse_semantic_match
 
     workdir, settings_file, config = _semantic_dedupe_setup(tmp_path, monkeypatch)
@@ -1916,7 +1920,9 @@ def test_antigravity_semantic_dedupe_ignores_response_files(tmp_path, monkeypatc
     """`agy-dedupe-stale-response-file` (#1472): only stdout is the answer."""
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.agents.base import public_response_path
-    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    from coding_review_agent_loop.protocol_common import (
+        PUBLIC_RESPONSE_MARKER,
+    )
 
     _workdir, _settings_file, config = _semantic_dedupe_setup(tmp_path, monkeypatch)
     stale_path = public_response_path(config, "antigravity")
@@ -2047,7 +2053,9 @@ def _record_holder_publications(harness, monkeypatch):
 
 def test_semantic_dedupe_holder_publishes_its_runner_timeout(tmp_path, monkeypatch):
     """`dedupe-holder-publishes-runner-timeout` (#1508)."""
-    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    from coding_review_agent_loop.protocol_common import (
+        PUBLIC_RESPONSE_MARKER,
+    )
 
     harness = _SettingsLockHarness(tmp_path, monkeypatch)
     Runner, published, order = _record_holder_publications(harness, monkeypatch)

@@ -47,8 +47,10 @@ from .prompts import build_completion_recovery_prompt
 from .protocol import (
     TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
     AgentUnavailable,
-    ParseDegradation,
     parse_agent_unavailable,
+)
+from .protocol_common import (
+    ParseDegradation,
 )
 from .repair import (
     CandidateDecision,

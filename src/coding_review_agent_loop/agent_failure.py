@@ -22,13 +22,15 @@ from .errors import AgentInvocationError, AgentLoopError
 from .logging import log
 from .protocol import (
     AgentUnavailable,
+    validate_human_requirements_acknowledgement,
+    validate_human_requirement_dispositions,
+    validate_structured_plan_revision,
+)
+from .protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     PUBLIC_RESPONSE_MARKER,
     parse_human_requirements_acknowledgement,
     normalize_response_file_structured_text,
-    validate_human_requirements_acknowledgement,
-    validate_human_requirement_dispositions,
-    validate_structured_plan_revision,
 )
 from .reset_parsing import (
     _ABSOLUTE_RESET_TIME_RE,

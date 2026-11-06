@@ -17,8 +17,12 @@ from .errors import (
 )
 from .github import PullRequestMergeability
 from .prompts import render_coder_human_requirements_prompt_context
-from .protocol import (
+from .protocol_common import (
     ParseDegradation,
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    parse_human_requirements_acknowledgement,
+)
+from .protocol import (
     ParsedPlanReview,
     ParsedReview,
     ReviewItemDisposition,
@@ -31,10 +35,8 @@ from .protocol import (
     MACHINE_AUTHORITY,
     MACHINE_OBLIGATION_KINDS,
     UNKNOWN_MACHINE_AUTHORITY,
-    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     parse_plan_review,
     parse_pr_review,
-    parse_human_requirements_acknowledgement,
     parse_historical_structured_coder_followup,
     parse_historical_structured_issue_implementation,
     validate_human_requirements_acknowledgement,

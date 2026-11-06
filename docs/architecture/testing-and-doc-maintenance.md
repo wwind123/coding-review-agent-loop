@@ -200,8 +200,13 @@ links internal imports to their definitions while retaining external imported-ra
 verification, degradation coverage and the closed fatal-clause set.
 `tests/fixtures/protocol_support_move.json` records moved symbols, original
 body hashes, global references, decorators and consumer/lookup candidates for
-the following cleanup phase. `tests/test_protocol_support_move.py` checks
-verbatim bodies, temporary object identity and fresh-process import orders.
+the cleanup rewrite in `scripts/rewrite_protocol_support_imports.py`.
+`tests/test_protocol_support_move.py` checks verbatim bodies and fresh-process
+import orders. `tests/test_module_split_imports.py` guards the cleaned support,
+discussion parser and discussion type symbols against old imports, aliases,
+qualified accesses, patch strings and compatibility-only driver exports. A
+consumer regression patches the dependency at the discussion parser lookup.
+Necessary internal imports remain permitted; downstream consumers use the owners.
 
 ## Decisions
 

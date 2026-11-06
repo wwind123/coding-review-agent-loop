@@ -57,16 +57,6 @@ from .protocol_markers import (
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     SignedEvidenceReference,
-    HTML_COMMENT_RE,
-    SIGNATURE_RE,
-    ParseDegradation,
-    parse_degradation_payload,
-    ParsedDiscussAgenda,
-    ParsedDiscussAnswer,
-    ParsedDiscussFinalSynthesis,
-    ParsedDiscussRoundSynthesis,
-    ParsedDiscussResponse,
-    ParsedDiscussReview,
     ReviewItemDisposition,
     ReviewSubItem,
     SUB_ITEM_STATUSES,
@@ -80,12 +70,6 @@ from .protocol import (
     PLAN_REVIEW_PROVENANCE_VALUES,
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
-    parse_structured_discuss_agenda,
-    parse_canonical_discuss_final_synthesis,
-    parse_canonical_discuss_round_synthesis,
-    parse_structured_discuss_review,
-    parse_structured_discuss_answer,
-    parse_legacy_structured_discuss_answer,
     RiskTestMatrix,
     RiskTestMatrixChange,
     parse_risk_test_matrix,
@@ -97,6 +81,28 @@ from .protocol import (
     StructuredIssueImplementation,
     parse_historical_structured_coder_followup,
     parse_historical_structured_issue_implementation,
+)
+from .protocol_common import (
+    HTML_COMMENT_RE,
+    SIGNATURE_RE,
+    ParseDegradation,
+    parse_degradation_payload,
+)
+from .protocol_discuss_types import (
+    ParsedDiscussAgenda,
+    ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedDiscussRoundSynthesis,
+    ParsedDiscussResponse,
+    ParsedDiscussReview,
+)
+from .protocol_discuss import (
+    parse_structured_discuss_agenda,
+    parse_canonical_discuss_final_synthesis,
+    parse_canonical_discuss_round_synthesis,
+    parse_structured_discuss_review,
+    parse_structured_discuss_answer,
+    parse_legacy_structured_discuss_answer,
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES

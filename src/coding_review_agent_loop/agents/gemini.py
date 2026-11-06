@@ -20,7 +20,14 @@ from .base import (
 from .replacement import classify_provider_executable_replacement_interruption
 from ..worktree_hints import dependency_hint_environment
 from ..logging import agent_log_path, log
-from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
+from ..protocol import (
+    CLARIFY_RE,
+    STATE_RE,
+)
+from ..protocol_common import (
+    PLAN_STATE_RE,
+    PUBLIC_RESPONSE_MARKER,
+)
 from ..runner import CommandResult, Runner
 from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment

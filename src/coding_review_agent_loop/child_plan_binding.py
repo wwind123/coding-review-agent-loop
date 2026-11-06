@@ -52,12 +52,14 @@ from .issue_pr_handoff import (
     resolve_issue_pr_handoff_lineage,
 )
 from .logging import log
-from .protocol import (
+from .protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    parse_human_requirements_acknowledgement,
+)
+from .protocol import (
     StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
-    parse_human_requirements_acknowledgement,
     validate_human_requirements_acknowledgement,
 )
 from .runner import Runner

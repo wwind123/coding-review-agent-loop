@@ -8,7 +8,9 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
-from .protocol import ParsedDiscussResponse
+from .protocol_discuss_types import (
+    ParsedDiscussResponse,
+)
 
 MAX_RECONCILIATION_CANDIDATES = 64
 MAX_RECONCILIATION_BYTES = 24_000

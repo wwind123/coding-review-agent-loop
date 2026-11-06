@@ -31,7 +31,7 @@ from coding_review_agent_loop.comment_rendering import (
     render_typed_plan_stages_section,
     render_execution_recommendation_section,
 )
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_discuss_types import (
     DiscussSynthesisConsensus,
     DiscussSynthesisDisagreement,
     DiscussSynthesisPosition,
@@ -1559,7 +1559,7 @@ def test_render_public_discuss_review_comment_includes_rebuttal_and_split_propos
 
 # --- analyzer agenda rendering tests (#467) ---
 
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_discuss_types import (
     DiscussAgendaDisagreement,
     ParsedDiscussAgenda,
 )
@@ -1888,7 +1888,9 @@ def test_render_public_discuss_comment_without_framing_is_unchanged():
 
 # --- discuss research policy rendering tests (#477) ---
 
-from coding_review_agent_loop.protocol import DiscussSourcedFact
+from coding_review_agent_loop.protocol_discuss_types import (
+    DiscussSourcedFact,
+)
 
 
 def _discuss_research_vote(
@@ -2403,7 +2405,9 @@ def test_degraded_review_carriers_reach_round_metadata_and_summary():
 
 def test_parse_degradation_section_is_bounded_sanitized_and_empty_without_records():
     from coding_review_agent_loop.comment_rendering import render_parse_degradations_section
-    from coding_review_agent_loop.protocol import ParseDegradation
+    from coding_review_agent_loop.protocol_common import (
+        ParseDegradation,
+    )
 
     assert render_parse_degradations_section(()) is None
     hostile = ParseDegradation(

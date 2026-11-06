@@ -824,6 +824,8 @@ import json, sys
 from pathlib import Path
 from types import SimpleNamespace
 sys.path.insert(0, sys.argv[4])
+# Pytest's source path is not inherited by a fresh Python interpreter.
+sys.path.insert(0, str(Path(sys.argv[4]).resolve().parents[0] / "src"))
 from agent_loop_helpers import make_config
 from coding_review_agent_loop import cli, workdir_claims as w
 w._set_claim_root_for_tests(Path(sys.argv[1]))

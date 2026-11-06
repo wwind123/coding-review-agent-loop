@@ -60,7 +60,7 @@ from .prompts import (
     build_discuss_semantic_comparison_prompt,
     build_discuss_review_prompt,
 )
-from .protocol import (
+from .protocol_discuss_types import (
     DISCUSS_RESEARCH_TARGET_VALUES,
     DISCUSS_SYNTHESIS_MAX_ENTRIES,
     DISCUSS_SYNTHESIS_MAX_TEXT_BYTES,
@@ -77,10 +77,14 @@ from .protocol import (
     ParsedDiscussSemanticComparison,
     ParsedDiscussResponse,
     ParsedDiscussReview,
+)
+from .protocol import (
     failed_discuss_review_category,
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     is_failed_discuss_response,
+)
+from .protocol_discuss import (
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
     validate_structured_discuss_final_synthesis,

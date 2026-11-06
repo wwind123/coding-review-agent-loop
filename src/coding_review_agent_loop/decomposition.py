@@ -41,7 +41,6 @@ from .protocol import (
     RiskTestMatrix,
     ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     ArchitectureImpactContract,
-    ParseDegradation,
     architecture_impact_contract_for,
     RiskTestMatrixRow,
     parse_architecture_impact,
@@ -51,6 +50,9 @@ from .protocol import (
     parse_signed_human_requirement_body,
     sanitize_architecture_impact,
     validate_direct_readiness,
+)
+from .protocol_common import (
+    ParseDegradation,
 )
 from .issue_body_limits import (
     BODY_SAFETY_MARGIN,

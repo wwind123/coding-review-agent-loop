@@ -27,7 +27,7 @@ from coding_review_agent_loop.response_validation import render_public_agent_com
 from coding_review_agent_loop.comment_rendering import render_discuss_round_summary_comment
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_discuss_types import (
     DiscussAgendaDisagreement,
     DiscussSourcedFact,
     ParsedDiscussAgenda,
@@ -42,6 +42,8 @@ from coding_review_agent_loop.protocol import (
     ParsedDiscussRoundSynthesis,
     ParsedDiscussFinalSynthesis,
     ParsedFailedDiscussResponse,
+)
+from coding_review_agent_loop.protocol_discuss import (
     serialize_discuss_final_synthesis,
     serialize_discuss_round_synthesis,
 )

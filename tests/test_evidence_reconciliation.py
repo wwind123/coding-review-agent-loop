@@ -2,10 +2,12 @@ from coding_review_agent_loop.evidence_reconciliation import (
     MAX_RENDERED_EVIDENCE_ENTRIES,
     reconcile_evidence,
 )
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_discuss_types import (
     DiscussEvidenceClaim,
     DiscussEvidenceUpdate,
     ParsedDiscussReview,
+)
+from coding_review_agent_loop.protocol_discuss import (
     parse_structured_discuss_review,
 )
 

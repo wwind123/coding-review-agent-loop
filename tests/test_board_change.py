@@ -3296,7 +3296,9 @@ def _signed_requirement():
 
 
 def _approved_plain_plan(tmp_path, *, requirement=None):
-    from coding_review_agent_loop.protocol import HUMAN_REQUIREMENTS_ADDRESSED_MARKER
+    from coding_review_agent_loop.protocol_common import (
+        HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    )
 
     plan = structured_v1_plan_state()
     reviews = {"codex": structured_plan_review(state="approved"),

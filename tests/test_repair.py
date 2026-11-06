@@ -21,9 +21,11 @@ from coding_review_agent_loop.protocol import (
     RISK_TEST_MATRIX_ROW_KEYS,
     parse_plan_revision_patch,
     validate_human_requirement_dispositions,
-    validate_structured_discuss_answer,
     validate_structured_coder_followup,
     validate_structured_plan_state,
+)
+from coding_review_agent_loop.protocol_discuss import (
+    validate_structured_discuss_answer,
 )
 from coding_review_agent_loop.validated_agent import _new_usage_context
 from coding_review_agent_loop.agent_failure import _structured_response_candidates
@@ -4377,7 +4379,9 @@ def test_envelope_normalization_discuss_agenda_reversed_footer_and_signature():
     normalized = attempt_envelope_normalization(raw, expected_kind="discuss_agenda")
 
     assert normalized is not None
-    from coding_review_agent_loop.protocol import parse_structured_discuss_agenda
+    from coding_review_agent_loop.protocol_discuss import (
+        parse_structured_discuss_agenda,
+    )
 
     parsed = parse_structured_discuss_agenda(normalized)
     assert parsed is not None

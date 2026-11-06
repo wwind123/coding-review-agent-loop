@@ -3539,7 +3539,7 @@ from coding_review_agent_loop.prompts import (
     build_discuss_round_fallback_prompt,
     build_discuss_review_prompt,
 )
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_discuss_types import (
     DiscussAgendaDisagreement,
     DiscussSynthesisConsensus,
     DiscussSynthesisResponseReference,
