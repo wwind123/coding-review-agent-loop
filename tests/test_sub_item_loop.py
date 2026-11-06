@@ -25,6 +25,7 @@ import coding_review_agent_loop.round_state as round_state
 import coding_review_agent_loop.triage as triage
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in
+from pr_loop_test_helpers import _with_code_classification
 
 ACTOR = ("coding-review-agent-loop", 4242)
 PATHS = [
@@ -249,7 +250,8 @@ def test_stall_check_can_be_disabled(tmp_path):
     assert not _progress_comments(runner)
 
 
-def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_repair_path_keeps_sub_items(tmp_path, monkeypatch, mode):
     import dataclasses
 
     from coding_review_agent_loop.github import (
@@ -266,14 +268,16 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
         authenticated_actor=ACTOR,
         # Approves without acknowledging the signed requirement, so the run
         # repairs; the repaired response (scripted below) is blocking.
-        codex_outputs=[structured_pr_review(state="approved")],
+        codex_outputs=[_with_code_classification(
+            structured_pr_review(state="approved"), (requirement,)
+        )],
         claude_outputs=[_coder(remaining=("item-1", "item-2"))],
     )
-    repaired_text = structured_pr_review(
+    repaired_text = _with_code_classification(structured_pr_review(
         state="blocking",
         blocking_items=[_finding(PATHS[:3])],
         same_pr_followups=[{"text": "Docs lag.", "sub_items": ["readme", "guide"]}],
-    )
+    ), (requirement,))
     patch_attr_in(monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
         lambda *_a, **_k: (
             repaired_text,
@@ -303,7 +307,9 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
 
     patch_attr_in(monkeypatch, (pr_loop, plan_first_loop), "_next_unresolved_item", spy)
     with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=1))
+        run_pr_loop(runner, pr_number=77, config=make_config(
+            tmp_path, max_rounds=1, pr_review_context_mode=mode
+        ))
 
     by_id = {item.item_id: item for item in minted}
     assert [sub.sub_item_id for sub in by_id["item-1"].sub_items] == [
