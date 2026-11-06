@@ -15,6 +15,7 @@ import pytest
 
 import orchestrator_split_guard
 import coding_review_agent_loop.managed_ci as managed_ci
+from coding_review_agent_loop import managed_ci_api
 from coding_review_agent_loop.workdirs import github_api_cwd
 
 from coding_review_agent_loop.errors import AgentLoopError
@@ -9216,8 +9217,8 @@ def test_variable_403_asserts_trusted_actor_in_readiness_and_creation(
     tmp_path, monkeypatch, variable
 ):
     messages = []
-    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
-    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    monkeypatch.setattr(managed_ci_api, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci_api, "log", lambda _config, message: messages.append(message))
     runner = CloudSessionRunner(
         scripted={_VARIABLE: variable},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
@@ -9777,8 +9778,8 @@ def test_cloud_session_shape_creates_reserved_managed_pr_only_with_both_waivers(
     tmp_path, monkeypatch
 ):
     messages = []
-    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
-    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    monkeypatch.setattr(managed_ci_api, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci_api, "log", lambda _config, message: messages.append(message))
     runner = CloudSessionRunner(scripted=_cloud_scripts())
 
     with pytest.raises(AgentLoopError, match="--allow-unreadable-protection") as exc_info:
