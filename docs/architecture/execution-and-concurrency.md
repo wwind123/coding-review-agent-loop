@@ -601,6 +601,8 @@ entries. The exported `AGENT_LOOP_EXECUTABLE` composes with the coder guard:
 the read-only inspector retains its closed PATH. Installation stays fail-soft:
 an `OSError` warns once and preserves inherited PATH. Windows is out of scope.
 
+Unconditional test guidance uses `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests`: when launcher installation fails, the shell uses the unpinned inherited PATH command and the existing warning and mismatch diagnostics remain active.
+
 The launcher is the only candidate for `_wrapper_candidates` and
 `resolve_wrapper_prefix` in `test_runtime.py`; neither ambient `agent-loop` nor
 unpinned `sys.executable -m coding_review_agent_loop.cli` qualifies. Unavailable

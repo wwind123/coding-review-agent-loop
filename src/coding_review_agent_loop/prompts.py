@@ -597,7 +597,7 @@ MANAGED_RECEIPT_REVIEWER_GUIDANCE = (
     "inner command against the rule."
 )
 PRE_COLLECTION_CODER_GUIDANCE = (
-    'Invoke tests with `"$AGENT_LOOP_EXECUTABLE" run-tests` so shell PATH changes cannot select another release. '
+    'Invoke tests with `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests` to select the pinned release. If the pin could not be installed, this falls back to the unpinned inherited PATH command. '
     "If `agent-loop run-tests` reports a pre-collection launch failure (no test ran, so the run "
     "is not evidence), fix the interpreter or flags and rerun; do not argue the receipt. A "
     "genuine test failure is still cleared only by a passing rerun of the same command. Only a "
@@ -609,7 +609,7 @@ PRE_COLLECTION_CODER_GUIDANCE = (
 )
 FIXTURE_CODER_GUIDANCE = (
     "When a suite needs long-lived helper processes, put them in a committed executable "
-    'fixture script and run `"$AGENT_LOOP_EXECUTABLE" run-tests --fixture <script> -- <recognized test '
+    'fixture script and run `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --fixture <script> -- <recognized test '
     "command>` (timeout at least 30s): the broker runs `<script> setup` and `<script> "
     "teardown` around the unchanged test command, and only a clean fixture lifecycle is "
     "citable; never wrap the test command in a script."

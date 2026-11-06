@@ -1,7 +1,7 @@
 """Reviewer-owned signed-source routing; classification never grants acceptance."""
 from dataclasses import dataclass
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, MissingJudgementFieldError
 from .github import HumanReviewRequirement
 
 
@@ -43,17 +43,23 @@ def decode_associations(payload):
 
 
 def validate_associations(parsed, requirements, items, reviewer):
+    def invalid(message):
+        # Reuse the bounded semantic-judgement re-ask, never format repair.
+        return MissingJudgementFieldError(message, field_path="requirement_evidence",
+            allowed_values=("surfaced sources with linked emitted requests and requester-owned native answers",),
+            observed_preview=message)
+
     live = {r.requirement_id for r in requirements}
     for entry in parsed.requirement_evidence:
         if entry["requirement_id"] not in live:
-            raise AgentLoopError("Requirement/evidence association names an unsurfaced source")
+            raise invalid("Requirement/evidence association names an unsurfaced source")
         if entry["role"] == "human-only" and entry["request"] not in parsed.exact_head_evidence_requests:
-            raise AgentLoopError("Human-only association must name this requester's emitted evidence request")
+            raise invalid("Human-only association must name this requester's emitted evidence request")
         for item_id in entry["answered_item_ids"]:
             targets = [i for i in items if item_id in (i.item_id, *i.alias_item_ids)]
             from .native_evidence import native
             if len(targets) != 1 or not native(targets[0]) or targets[0].reviewer != reviewer:
-                raise AgentLoopError("Evidence response must name an existing item owned by this requester")
+                raise invalid("Evidence response must name an existing item owned by this requester")
     return parsed
 
 
@@ -73,19 +79,27 @@ def project(requirements, reviews, items):
     Absence of a classification never consumes a signed source.
     """
     by_source = {}
+    invalid_sources = set()
     for reviewer, parsed in reviews.items():
-        validate_associations(parsed, requirements, items, reviewer)
+        from types import SimpleNamespace
         for entry in parsed.requirement_evidence:
+            try:
+                validate_associations(SimpleNamespace(requirement_evidence=(entry,),
+                    exact_head_evidence_requests=parsed.exact_head_evidence_requests), requirements, items, reviewer)
+            except AgentLoopError:
+                invalid_sources.add(entry["requirement_id"])
+                continue
             by_source.setdefault(entry["requirement_id"], []).append(entry)
     result = []
     for source in requirements:
         entries = by_source.get(source.requirement_id, [])
-        if not entries:
+        if not entries or source.requirement_id in invalid_sources:
             result.append(source)
             continue
         signatures = {(e["role"], e["leftover_instructions"]) for e in entries}
         if len(signatures) != 1:
-            raise AgentLoopError("Conflicting signed-source classification; a fresh requester classification is required")
+            result.append(source)
+            continue
         entry = entries[0]
         if entry["role"] in {"human-only", "evidence-only"}:
             continue
@@ -128,7 +142,8 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
         parsed, text = response.marker_value, response.text
         if {r.requirement_id for r in requirements} - {e["requirement_id"] for e in parsed.requirement_evidence}:
             raise HumanDecisionRequiredError("Signed-source classification remained absent; no coder was dispatched for human evidence.")
-    validate_associations(parsed, requirements, items, reviewer_name)
+    # Live turns validate associations before publication. Legacy replay may carry
+    # invalid entries; project retains their full source rather than aborting.
     return parsed, text
 
 

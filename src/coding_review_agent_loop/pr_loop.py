@@ -563,7 +563,7 @@ from .pr_board_entry import _enforce_pr_board_floor
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
-from .requirement_evidence import historical_projection, classify_review, project
+from .requirement_evidence import historical_projection, classify_review, project, validate_associations
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -4145,7 +4145,7 @@ def run_pr_loop(
                         )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
-                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: validate_associations(_validate_review_response(
                     text,
                     reviewer=reviewer_name,
                     unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
@@ -4156,7 +4156,7 @@ def run_pr_loop(
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
-                ), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
+                ), human_requirements, prior_unresolved_items, reviewer_name), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
 
             def _pr_publication(reviewer_name: str):
                 return round_publication(
@@ -5785,7 +5785,7 @@ def run_pr_loop(
                     invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config,
                         prompt=prompt, marker_description="structured PR review classification",
                         **_pr_review_validators(reviewer_name), usage_context=usage_context,
-                        role="reviewer", operation_description="Signed-source classification"))
+                        role="reviewer", operation_description="Signed-source classification", reask_on_missing_judgement_field=True))
                 review_state = parsed_review.state
                 if review_output != classification_input: early_published_pr_reviewers.discard(reviewer)
                 classified_review_carriers[reviewer_name] = parsed_review

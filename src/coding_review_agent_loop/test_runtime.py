@@ -401,7 +401,7 @@ def parse_managed_test_invocation(
         )
         and (Path(tokens[0]).name == "agent-loop" or (
             allow_command_name_launcher
-            and tokens[0] in {"$AGENT_LOOP_EXECUTABLE", "${AGENT_LOOP_EXECUTABLE}"}
+            and tokens[0] in {"$AGENT_LOOP_EXECUTABLE", "${AGENT_LOOP_EXECUTABLE}", "${AGENT_LOOP_EXECUTABLE:-agent-loop}"}
         ))
     ):
         if tokens[1] != "run-tests":

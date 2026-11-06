@@ -2276,7 +2276,8 @@ After a manual merge or interrupted tracking publication, use
 [required post-merge obligations](docs/local_agent_loop.md#required-post-merge-obligations)
 for reviewer declarations, verified operator directives and recovery.
 
-Within coder sessions, use `"$AGENT_LOOP_EXECUTABLE" run-tests -- <test command>`
+Within coder sessions, use `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests -- <test command>`
 to keep receipts bound to the running orchestrator release across shell PATH or
-release-symlink changes. See the [CLI guide](docs/local_agent_loop.md) for signed
+release-symlink changes. If launcher installation fails, the command falls back to
+the unpinned inherited PATH and the existing warning remains visible. See the [CLI guide](docs/local_agent_loop.md) for signed
 requirement routing and exact-head human evidence.

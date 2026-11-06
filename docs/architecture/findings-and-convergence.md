@@ -596,7 +596,7 @@ requirements remain pending evidence; evidence-only answers leave coder work;
 mixed answers keep their original ID with only explicit leftover instructions.
 Every validated review contributes, including a blocking review with code work.
 Missing evidence classification receives one real semantic continuation, never
-format repair. Conflicting classifications stop conservatively. Classification
+format repair. Conflicting classifications retain the complete signed source as coder-actionable work after the bounded continuation. Invalid associations are semantic judgement errors re-asked within validated reviewer turns; replay conservatively retains the complete source. Classification
 cannot authorize acceptance: native requester citations and final live head/source
 reads retain that authority before and after freeze.
 

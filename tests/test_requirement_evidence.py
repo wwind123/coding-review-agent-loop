@@ -6,7 +6,7 @@ import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.github import HumanReviewRequirement
-from coding_review_agent_loop.protocol import parse_structured_pr_review
+from coding_review_agent_loop.protocol import UnresolvedReviewItem, parse_structured_pr_review
 from coding_review_agent_loop.requirement_evidence import parse_associations, project, historical_projection, classify_review
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _encode_round_metadata, _decode_round_metadata
@@ -33,8 +33,9 @@ def test_mixed_projection_preserves_original_identity_and_source():
     assert action.url == SOURCE.url
 
 
-@pytest.mark.parametrize("fault", ["unsurfaced", "foreign", "missing", "conflict"])
-def test_associations_fail_closed(fault):
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("fault", ["unsurfaced", "foreign", "missing", "nonnative", "ambiguous", "unlinked", "conflict", "wording"])
+def test_associations_fail_closed(fault, replay):
     items, entry, text, parsed = setup_role()
     requirements = [SOURCE]
     reviews = {"Codex": parsed}
@@ -44,11 +45,28 @@ def test_associations_fail_closed(fault):
         items = [dataclasses.replace(items[0], reviewer="Gemini")]
     elif fault == "missing":
         items = []
+    elif fault == "nonnative":
+        items = [UnresolvedReviewItem(item_id="item-1", reviewer="Codex", text="Code work", source_round=1, status="blocking")]
+    elif fault == "ambiguous":
+        items = [*items, dataclasses.replace(items[0], item_id="item-2", alias_item_ids=("item-1",))]
+    elif fault == "unlinked":
+        reviews["Codex"] = dataclasses.replace(parsed, requirement_evidence=(
+            _association(SOURCE.requirement_id, "human-only", request="Unemitted request"),))
     else:
-        other = dataclasses.replace(parsed, requirement_evidence=(_association(SOURCE.requirement_id, "code"),))
+        other_entry = _association(SOURCE.requirement_id, "code") if fault == "conflict" else {**entry, "leftover_instructions": "Repair retries."}
+        other = dataclasses.replace(parsed, requirement_evidence=(other_entry,))
+        if fault == "wording":
+            items = [*items, dataclasses.replace(items[0], item_id="item-2", reviewer="Gemini")]
+            other = dataclasses.replace(other, requirement_evidence=({**other_entry, "answered_item_ids": ["item-2"]},))
         reviews["Gemini"] = other
-    with pytest.raises(AgentLoopError):
-        project(requirements, reviews, items)
+    if replay:
+        records = [SimpleNamespace(metadata=PostedRoundMetadata(flow="pr", role="reviewer", agent=name,
+            round_number=index + 1, subject=("a" if index else "b") * 40, prior_items=tuple(items),
+            requirement_evidence=review.requirement_evidence, evidence_requests=review.exact_head_evidence_requests))
+            for index, (name, review) in enumerate(reviews.items())]
+        assert historical_projection(requirements, records) == tuple(requirements)
+    else:
+        assert project(requirements, reviews, items) == tuple(requirements)
 
 
 @pytest.mark.parametrize("change", ["add", "remove", "role", "leftover", "target"])
@@ -119,5 +137,4 @@ def test_conflicting_classification_gets_one_real_continuation():
     result, _ = classify_review(parsed, text, requirements=[SOURCE], items=items,
         reviewer_name="Codex", invoke=invoke, previous=previous)
     assert len(calls) == 1
-    with pytest.raises(AgentLoopError, match="Conflicting"):
-        project([SOURCE], {**previous, "Codex": result}, items)
+    assert project([SOURCE], {**previous, "Codex": result}, items) == (SOURCE,)

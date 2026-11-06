@@ -6195,10 +6195,10 @@ def test_configured_interpreter_guidance_states_only_what_the_check_established(
     assert f"`{python}`" in text
     assert calls == [((str(python),), config.claude_dir)]
     if state == 0:
-        assert f'"$AGENT_LOOP_EXECUTABLE" run-tests -- {python} -m pytest' in text
+        assert f'"${{AGENT_LOOP_EXECUTABLE:-agent-loop}}" run-tests -- {python} -m pytest' in text
         assert "use the same interpreter consistently because supersession compares exact commands" in text
     else:
-        assert f'"$AGENT_LOOP_EXECUTABLE" run-tests -- {python} -m pytest' not in text
+        assert f'"${{AGENT_LOOP_EXECUTABLE:-agent-loop}}" run-tests -- {python} -m pytest' not in text
     # Never claims complete dev extras or that the suite fits the caps.
     assert "dev extras" not in text and "will fit" not in text
     assert "PEP 668" in text and "reported as not run, never as passed" in text
@@ -7248,5 +7248,37 @@ def test_coder_test_invocations_explicitly_use_exported_executable(tmp_path, mon
         test_profile=None, toolchain=None)
     prompt = build_issue_prompt(1922, config, memory=memory)
     assert 'Invocation guidance: "$AGENT_LOOP_EXECUTABLE" run-tests' in prompt
-    assert '"$AGENT_LOOP_EXECUTABLE" run-tests --fixture <script>' in prompt
+    assert '"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --fixture <script>' in prompt
     assert '/opt/release-A/agent-loop run-tests --' not in prompt
+
+
+@pytest.mark.parametrize("pin", [False, True])
+@pytest.mark.parametrize("guidance", ["PRE_COLLECTION_CODER_GUIDANCE", "FIXTURE_CODER_GUIDANCE", "interpreter"])
+def test_unconditional_test_guidance_survives_pin_install_failure(tmp_path, monkeypatch, pin, guidance):
+    import os
+    import re
+    import subprocess
+    from coding_review_agent_loop import agent_executable as ae, test_workers
+    monkeypatch.setattr(ae, "agent_loop_launcher", lambda root=None: None)
+    environment = dict(os.environ)
+    environment.pop(ae.EXECUTABLE_ENV, None)
+    assert ae.agent_executable_environment(environment) == {}
+    fallback = tmp_path / "agent-loop"
+    fallback.write_text("#!/bin/sh\nprintf 'fallback'\n")
+    fallback.chmod(0o700)
+    pinned = tmp_path / "pinned"
+    pinned.write_text("#!/bin/sh\nprintf 'pinned'\n")
+    pinned.chmod(0o700)
+    environment["PATH"] = str(tmp_path)
+    if pin:
+        environment[ae.EXECUTABLE_ENV] = str(pinned)
+    if guidance == "interpreter":
+        text = test_workers.render_interpreter_guidance(test_workers.InterpreterGuidance(
+            path="/usr/bin/python3", state=0, recommend=True))
+    else:
+        text = getattr(prompts_module, guidance)
+    command = next(c for c in re.findall(r"`([^`]+)`", text) if c.startswith('"${AGENT_LOOP_EXECUTABLE:-agent-loop}"'))
+    result = subprocess.run(["/bin/sh", "-c", command.split(" run-tests")[0] + " run-tests"],
+        env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+    assert result.stdout == ("pinned" if pin else "fallback")

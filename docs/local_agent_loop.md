@@ -2070,6 +2070,8 @@ frozen; the final `bin/python` name is retained to preserve virtualenv identity.
 If pin installation fails, the existing warning and inherited-PATH fallback
 remain visible; fallback is not a successful pin.
 
+Test guidance uses `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests` when the executable pin may be unavailable. With no exported pin this uses the unpinned inherited PATH command; the launcher warning and receipt mismatch diagnostics still apply.
+
 
 Test commands are also subject to the
 [parallel test-worker budget](#parallel-test-worker-budget).
