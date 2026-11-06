@@ -16,10 +16,34 @@ from coding_review_agent_loop import managed_ci, managed_ci_api
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.runner import CommandResult
 from agent_loop_helpers import make_config
+from managed_ci_call_guard import managed_ci_source_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'src/coding_review_agent_loop'
 MANIFEST = json.loads((ROOT / 'tests/fixtures/managed_ci_support_move.json').read_text())
+
+
+@pytest.mark.parametrize('path', managed_ci_source_paths(), ids=lambda path: path.stem)
+@pytest.mark.parametrize('guard_module, guard_name, violation', [
+    ('test_github_retry', 'test_run_gh_read_call_sites_are_read_only',
+     'run_gh_read(runner, ["gh", "api", "--method", "POST"], cwd=path)'),
+    ('test_managed_ci', 'test_managed_ci_gh_invocations_obey_the_245_floor',
+     'runner.run([gh_cmd, "api", "--unsupported-api-flag"])'),
+])
+def test_gh_call_guards_reject_violations_in_every_owner(
+    monkeypatch, path, guard_module, guard_name, violation,
+):
+    guard = getattr(importlib.import_module(guard_module), guard_name)
+    original_read_text = Path.read_text
+
+    def read_text(candidate, *args, **kwargs):
+        if candidate == path:
+            return violation
+        return original_read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    with pytest.raises(AssertionError):
+        guard()
 
 
 def test_support_bodies_identity_and_dependencies():

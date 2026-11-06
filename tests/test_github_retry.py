@@ -1,11 +1,11 @@
 """Stage 1 of #510: shared transient GitHub policy and read-only retry (#1257)."""
 
-import inspect
 import json
 import re
 from pathlib import Path
 
 import pytest
+from managed_ci_call_guard import managed_ci_source_paths
 
 from coding_review_agent_loop import github, github_retry
 from coding_review_agent_loop.errors import AgentLoopError
@@ -228,11 +228,9 @@ _WRITE_TOKENS = re.compile(
 
 
 def test_run_gh_read_call_sites_are_read_only():
-    import coding_review_agent_loop.managed_ci as managed_ci
-
     checked = 0
-    for module in (github, managed_ci):
-        source = inspect.getsource(module)
+    for path in (Path(github.__file__), *managed_ci_source_paths()):
+        source = path.read_text(encoding="utf-8")
         for match in re.finditer(r"run_gh_read\(", source):
             # Examine the call's argument list up to its closing cwd= keyword.
             end = source.find("cwd=", match.end())
