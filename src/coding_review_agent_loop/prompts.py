@@ -1413,6 +1413,12 @@ obligations; never decompose a single-obligation finding, and never put
 optional `sub_item_dispositions` object to its `prior_item_dispositions` entry
 mapping each sub-item ID you checked to `resolved` or `unresolved`, for example
 `{"item_id": "item-1", "disposition": "blocking", "note": "...", "sub_item_dispositions": {"item-1.s1": "resolved", "item-1.s2": "unresolved"}}`.
+For a native human evidence obligation, `resolved` may include the optional
+`evidence_requirement_ids` array of surfaced signed requirement IDs. This attests
+that the cited signed input supplies adequate acceptance for the reviewed head;
+the final gate verifies live content, head binding and requester ownership. Bare
+resolved votes remain notes outside a frozen-head evidence-response pass.
+
 Disposition every sub-item you checked and verify each coder sub-item claim
 with a sub-item disposition. While any sub-item remains open, keep the
 item-level `blocking`/`same-pr` with the usual actionable note. When you

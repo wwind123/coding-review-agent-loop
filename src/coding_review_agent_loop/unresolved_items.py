@@ -279,6 +279,7 @@ def _upsert_evidence_obligation(
     source_round: int,
     current_head_sha: str | None,
     clearances: Sequence[tuple[str, str]] = (),
+    known_heads: Sequence[str] = (),
 ) -> tuple[list[UnresolvedReviewItem], bool]:
     """Upsert one reviewer's evidence request by identity.
 
@@ -287,23 +288,27 @@ def _upsert_evidence_obligation(
     re-emission in the same response that cleared it cannot recreate it; at
     any other head the same request is a new deferred obligation.
     """
+    from .native_evidence import (consolidate_ledger, consolidation_targets, identities,
+                                  merge_items, native, request_key, contextual_identity)
+    heads = tuple(dict.fromkeys((*known_heads, *([current_head_sha] if current_head_sha else []))))
+    unresolved_items = consolidate_ledger(unresolved_items, heads)
     identity = evidence_obligation_identity(text, reviewer)
-    if current_head_sha and (identity, current_head_sha) in set(clearances):
+    context_identity = contextual_identity(text, reviewer, heads)
+    if current_head_sha and any((i, current_head_sha) in set(clearances) for i in (identity, context_identity)):
         return list(unresolved_items), False
-    for index, existing in enumerate(unresolved_items):
-        if _is_evidence_obligation(existing) and existing.obligation_identity == identity:
-            result = list(unresolved_items)
-            if existing.status not in {"blocking", "same-pr"} or existing.lifecycle not in {
-                "evidence_deferred", "evidence_frozen"
-            }:
-                result[index] = replace(
-                    existing,
-                    status="blocking",
-                    source_status="blocking",
-                    lifecycle="evidence_deferred",
-                    candidate_head_sha=None,
-                )
-            return result, False
+    matches = consolidation_targets(text, unresolved_items, reviewer)
+    if not matches:
+        matches = [i for i in unresolved_items if native(i) and i.reviewer == reviewer and (
+            identity in identities(i) or request_key(i.text, heads) == request_key(text, heads))]
+    if matches:
+        survivor = merge_items(matches, text=text, identity=identity)
+        if current_head_sha and any((i, current_head_sha) in set(clearances) for i in identities(survivor)):
+            return list(unresolved_items), False
+        if survivor.status not in {"blocking", "same-pr"} or survivor.lifecycle not in {"evidence_deferred", "evidence_frozen"}:
+            survivor = replace(survivor, status="blocking", source_status="blocking",
+                               lifecycle="evidence_deferred", candidate_head_sha=None)
+        return [survivor if i.item_id == survivor.item_id else i for i in unresolved_items
+                if i not in matches or i.item_id == survivor.item_id], False
     item = UnresolvedReviewItem(
         item_id=f"item-{item_number}",
         reviewer=reviewer,
@@ -317,6 +322,7 @@ def _upsert_evidence_obligation(
         obligation_kind=EVIDENCE_OBLIGATION_KIND,
         lifecycle="evidence_deferred",
         obligation_identity=identity,
+        alias_obligation_identities=(context_identity,) if context_identity != identity else (),
     )
     return [*unresolved_items, item], True
 
@@ -870,7 +876,8 @@ def _validate_review_response(
         raise AgentLoopError(
             "Review listed prior unresolved items more than once: " + ", ".join(duplicates)
         )
-    unknown = sorted(set(disposition_ids) - set(unresolved_by_id))
+    aliases = {alias: item for item in unresolved_items for alias in getattr(item, "alias_item_ids", ())}
+    unknown = sorted(set(disposition_ids) - set(unresolved_by_id) - set(aliases))
     if unknown:
         _raise_unknown_prior_item_disposition(
             unknown,
@@ -878,7 +885,8 @@ def _validate_review_response(
             current_round_items=current_round_items,
         )
     if unresolved_items:
-        missing = sorted(set(unresolved_by_id) - set(disposition_ids) - set(optional_item_ids))
+        covered = {aliases[i].item_id if i in aliases else i for i in disposition_ids}
+        missing = sorted(set(unresolved_by_id) - covered - set(optional_item_ids))
         if missing:
             raise MissingPriorItemDispositionError(tuple(missing))
     # Sub-item keys must name sub-items of that entry's carried item; anything
@@ -889,7 +897,7 @@ def _validate_review_response(
     validated: list[ReviewItemDisposition] = []
     for disposition in dispositions:
         if disposition.sub_item_dispositions:
-            carried = unresolved_by_id[disposition.item_id]
+            carried = unresolved_by_id.get(disposition.item_id) or aliases[disposition.item_id]
             allowed = (
                 set()
                 if _is_machine_obligation(carried)
@@ -916,7 +924,7 @@ def _validate_review_response(
     for disposition in dispositions:
         if disposition.disposition not in {"blocking", "same-pr"}:
             continue
-        carried = unresolved_by_id[disposition.item_id]
+        carried = unresolved_by_id.get(disposition.item_id) or aliases[disposition.item_id]
         if carried.sub_items and _entry_completes_sub_items(
             disposition,
             {sub.sub_item_id for sub in carried.sub_items if sub.status == "open"},
@@ -1368,7 +1376,8 @@ def _apply_unresolved_item_dispositions(
     next_unresolved: list[UnresolvedReviewItem] = []
     future_items: list[UnresolvedReviewItem] = []
     for item in unresolved_items:
-        dispositions = dispositions_by_item.get(item.item_id, [])
+        dispositions = [d for key in (item.item_id, *item.alias_item_ids)
+                        for d in dispositions_by_item.get(key, [])]
         if not dispositions or item.is_inert_ledger_record:
             # Converted findings and cleared row tombstones (#1325) are inert:
             # reviewer dispositions never change them.
@@ -1397,9 +1406,8 @@ def _apply_unresolved_item_dispositions(
                 )
             ):
                 if evidence_clearances is not None and item.obligation_identity:
-                    evidence_clearances.append(
-                        (item.obligation_identity, evidence_response_head)
-                    )
+                    from .native_evidence import identities
+                    evidence_clearances.extend((i, evidence_response_head) for i in identities(item) if i)
                 if _is_row_converted_obligation(item):
                     # A durable tombstone (#1325): it keeps its item ID and
                     # identity so a head change can reopen it in place.
@@ -1849,10 +1857,11 @@ def _evidence_clearance_authorized(
     resolve it, so a board change can never strand it.
     """
     owner = item.reviewer
+    conflicting = {d.reviewer for d in dispositions if d.disposition != "resolved"}
     resolved_by = {
         disposition.reviewer
         for disposition in dispositions
-        if disposition.disposition == "resolved"
+        if disposition.disposition == "resolved" and disposition.reviewer not in conflicting
     }
     if item.converted_row_id is not None:
         owners = tuple(item.resolution_owners) or (item.reviewer,)
