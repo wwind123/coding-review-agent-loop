@@ -230,12 +230,26 @@ def restore_for_new_input(items, resume, requirements, records, next_number):
 
 
 def publication_dispositions(parsed, text, reviewer, items):
-    """Code-approval normalization must not erase native blocking/alias votes."""
-    from .protocol import parse_review
-    allowed = {key for i in items if native(i) for key in (i.item_id, *i.alias_item_ids)}
-    raw = parse_review(text, reviewer=reviewer).dispositions
-    retained = {d.item_id for d in parsed.dispositions}
-    return (*parsed.dispositions, *(d for d in raw if d.item_id in allowed and d.item_id not in retained))
+    """Keep code approval normalized, but revoke conflicting alias attestations.
+
+    Native blocking votes remain in the reconciled ledger's notes. They must
+    not turn the durable code approval into a contradictory approval carrier.
+    A conflicting resolved citation loses its authorization on publication.
+    """
+    from .protocol import parse_review, parse_structured_pr_review
+    carrier = parse_structured_pr_review(text, reviewer=reviewer, architecture_status_mode="legacy")
+    raw = (carrier or parse_review(text, reviewer=reviewer)).dispositions
+    conflicts = set()
+    for item in items:
+        if not native(item):
+            continue
+        keys = {item.item_id, *item.alias_item_ids}
+        votes = [d for d in raw if d.item_id in keys]
+        if any(d.disposition == "resolved" for d in votes) and any(d.disposition != "resolved" for d in votes):
+            conflicts.update(keys)
+    return tuple(replace(d, evidence_requirement_ids=(),
+                         note=(d.note or "") + " Conflicting native alias votes do not authorize acceptance.")
+                 if d.item_id in conflicts else d for d in parsed.dispositions)
 
 
 def reopen_cleared_requests(items, boundary, records, head):

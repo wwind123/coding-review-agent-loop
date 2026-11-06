@@ -233,3 +233,39 @@ def test_foreign_historical_subject_cannot_change_head_binding(tmp_path):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert not _freeze_records(runner)
     assert _release_records(runner)[-1].metadata.evidence_release.reason == "evidence-cleared"
+
+
+@pytest.mark.parametrize("vote_kind", ["keep", "resolve", "conflict"])
+def test_alias_dispositions_in_real_loop(tmp_path, vote_kind):
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+    runner, config = deferred(tmp_path)
+    items = list(_release_records(runner)[-1].metadata.prior_items)
+    items, _ = _upsert_evidence_obligation(items, item_number=2, reviewer="Codex",
+        text="Second operator screenshot acceptance", source_round=2, current_head_sha=HEAD)
+    items, consumed = _upsert_evidence_obligation(items, item_number=3, reviewer="Codex",
+        text="Consolidate item-1 and item-2 into this existing acceptance request.",
+        source_round=2, current_head_sha=HEAD)
+    assert not consumed and items[0].alias_item_ids == ("item-2",)
+    support._publish_evidence_release(runner, config=config, pr_number=77, round_number=2,
+        head_sha=HEAD, items=items, reason="refresh-clean", surfaced_requirement_ids=(),
+        allowed_rounds=config.max_rounds, watch_failure_extension_used=False,
+        watch_head_extension_used=False)
+    runner.pr_payload["comments"].append(_signed("Accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    votes = [{"item_id": "item-2", "disposition": "resolved" if vote_kind == "resolve" else "blocking",
+              "note": "The historical alias still names this acceptance request.",
+              "evidence_requirement_ids": [rid]}]
+    if vote_kind == "conflict":
+        votes.append({**_resolve(), "evidence_requirement_ids": [rid]})
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=votes,
+        state="approved" if vote_kind == "resolve" else "blocking"))
+    if vote_kind == "resolve":
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert not _freeze_records(runner)
+        assert len(_release_records(runner)[-1].metadata.evidence_clearances) >= 2
+    else:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert [i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items] == ["item-1"]
+        assert not _freeze_records(runner)[-1].metadata.evidence_clearances
+    assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)

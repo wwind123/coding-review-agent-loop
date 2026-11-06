@@ -2298,7 +2298,8 @@ def _is_evidence_only_blocking_review(
     """
     if parsed.state != "blocking" or parsed.blocking_items or parsed.followups.same_pr:
         return False
-    evidence_ids = {item.item_id for item in prior_items if _is_evidence_obligation(item)}
+    evidence_ids = {key for item in prior_items if _is_evidence_obligation(item)
+                    for key in (item.item_id, *getattr(item, "alias_item_ids", ()))}
     active = [
         disposition
         for disposition in parsed.dispositions

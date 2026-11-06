@@ -3701,7 +3701,7 @@ def run_pr_loop(
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
-                item.item_id: [] for item in prior_unresolved_items
+                key: [] for item in prior_unresolved_items for key in (item.item_id, *item.alias_item_ids)
             }
             round_new_unresolved_items: list[UnresolvedReviewItem] = []
             # (reviewer, requests) pairs from this round's reviews (#1068).
