@@ -2656,8 +2656,10 @@ from coding_review_agent_loop.comment_rendering import (
     _render_risk_test_matrix_evidence,
     resolve_matrix_evidence_render,
 )
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix_evidence as _parse_evidence_959,
+)
+from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup as _validate_followup_959,
 )
 from coding_review_agent_loop.round_state import PostedRoundMetadata as _Meta959
@@ -2943,7 +2945,9 @@ def test_959_delta_render_escapes_wrapper_tags_in_row_text():
 
 
 def test_920_dropped_unapproved_claim_renders_outside_the_wrapper():
-    from coding_review_agent_loop.protocol import PostAuthClaimDiagnostic
+    from coding_review_agent_loop.protocol_risk import (
+        PostAuthClaimDiagnostic,
+    )
 
     rendered = _render_risk_test_matrix_evidence(
         _evidence_959(_rows_959(1)),
@@ -3237,7 +3241,10 @@ def _comment_rendering_source_1230() -> str:
 
 def test_rendered_plan_identifier_keys_are_classified_1230():
     from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
-    from coding_review_agent_loop.protocol import RiskTestMatrixChange, parse_risk_test_matrix
+    from coding_review_agent_loop.protocol_risk import (
+        RiskTestMatrixChange,
+        parse_risk_test_matrix,
+    )
 
     payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
     rendered = [

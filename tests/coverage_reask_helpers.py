@@ -16,9 +16,11 @@ from agent_loop_helpers import FakeRunner, make_config, structured_issue_impleme
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
 from coding_review_agent_loop.github import IssueContext
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
+)
+from coding_review_agent_loop.protocol import (
     validate_structured_issue_implementation,
 )
 from coding_review_agent_loop.round_state import make_approved_plan_context

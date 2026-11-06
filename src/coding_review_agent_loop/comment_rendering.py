@@ -21,10 +21,19 @@ from .decomposition import _decode_json_payload, _encode_json_payload
 from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
-from .protocol import (
+from .protocol_risk import (
     CITATIONS_DECODED_FROM_STRING_OUTCOME,
     DEGRADED_ROW_CLAIM_DIAGNOSTIC,
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+    RiskTestMatrix,
+    RiskTestMatrixChange,
+    RiskTestMatrixEvidence,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
+    parse_risk_test_matrix_evidence,
+    risk_test_matrix_identity,
+)
+from .protocol import (
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE,
     PRIOR_UNRESOLVED_ITEM_DISPOSITIONS_HEADING_RE,
     PRIOR_UNRESOLVED_PLAN_ITEM_DISPOSITIONS_HEADING_RE,
@@ -42,13 +51,6 @@ from .protocol import (
     StructuredPlanState,
     OneShotGrowthJustification,
     StructuredPlanRevision,
-    RiskTestMatrix,
-    RiskTestMatrixChange,
-    RiskTestMatrixEvidence,
-    parse_risk_test_matrix,
-    parse_risk_test_matrix_changes,
-    parse_risk_test_matrix_evidence,
-    risk_test_matrix_identity,
     ExecutionStrategyRecommendation,
     EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,

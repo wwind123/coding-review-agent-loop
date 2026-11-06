@@ -48,7 +48,7 @@ from coding_review_agent_loop.comment_rendering import render_public_agent_comme
 from coding_review_agent_loop.protocol import (
     validate_structured_plan_state as _m948_validate_state,
 )
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix_evidence as _parse_evidence_959,
 )
 

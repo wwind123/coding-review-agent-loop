@@ -23,17 +23,19 @@ from coding_review_agent_loop.evidence_stall import (
     UnsatisfiedRows,
     classify_round,
 )
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     CAPTURE_LIMITED,
     NOT_CAPTURE_LIMITED,
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
     SignedEvidenceReference,
-    UnresolvedReviewItem,
     derive_risk_test_matrix_evidence,
     disqualify_capture_classification,
     parse_risk_test_matrix,
     risk_test_matrix_identity,
+)
+from coding_review_agent_loop.protocol import (
+    UnresolvedReviewItem,
 )
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,

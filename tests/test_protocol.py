@@ -3,6 +3,8 @@
 Tests for parse_agent_state, parse_plan_state, parse_review, parse_plan_review,
 structured response parsing and validation, and related protocol functions.
 """
+
+from coding_review_agent_loop import protocol_risk as _risk_owner
 import json
 
 import pytest
@@ -32,8 +34,6 @@ from coding_review_agent_loop.protocol import (
     parse_plan_review,
     parse_plan_review_items,
     parse_plan_state,
-    parse_risk_test_matrix,
-    parse_risk_test_matrix_changes,
     parse_structured_plan_review,
     parse_structured_pr_review,
     parse_review,
@@ -49,6 +49,10 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
     sanitize_architecture_impact,
+)
+from coding_review_agent_loop.protocol_risk import (
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
     RISK_MATRIX_MAX_LIST_ITEMS,
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
@@ -2924,7 +2928,9 @@ def test_semantic_matrix_claim_selector_size_boundaries_with_catalog(size, in_ca
 
 
 def test_semantic_matrix_claim_dropped_ref_caveat_stays_bounded():
-    from coding_review_agent_loop.protocol import SEMANTIC_RISK_CLAIMS_MAX_CAVEATS
+    from coding_review_agent_loop.protocol_risk import (
+        SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
+    )
 
     claim = _complete_semantic_claim()
     claim["execution_refs"] = [f"{i}-" + "zé" * 3_000 for i in range(8)]
@@ -3024,9 +3030,12 @@ def test_reconciled_codex_rerun_matrix_admission(environment_change, expected_st
         EnvironmentIdentityRegistry, LocalTestObservation, TreeAttribution,
         reconcile_test_observations,
     )
-    from coding_review_agent_loop.protocol import (
-        SemanticRiskCoverageClaim, SemanticRiskCoverageClaims,
-        derive_risk_test_matrix_evidence, parse_risk_test_matrix, risk_test_matrix_identity,
+    from coding_review_agent_loop.protocol_risk import (
+        SemanticRiskCoverageClaim,
+        SemanticRiskCoverageClaims,
+        derive_risk_test_matrix_evidence,
+        parse_risk_test_matrix,
+        risk_test_matrix_identity,
     )
 
     registry = EnvironmentIdentityRegistry()
@@ -3097,7 +3106,7 @@ def test_reconciled_codex_rerun_matrix_admission(environment_change, expected_st
 def _derive_1659(observation):
     from types import SimpleNamespace
 
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         SemanticRiskCoverageClaim,
         SemanticRiskCoverageClaims,
         derive_risk_test_matrix_evidence,
@@ -3145,7 +3154,9 @@ def _derive_1659(observation):
 
 def test_sole_unverified_suite_start_is_refused_after_authentication_with_runner_advice_1659():
     """`no-authority-granted`: unverified row, no citation, an explanatory diagnostic."""
-    from coding_review_agent_loop.protocol import capture_observation_class
+    from coding_review_agent_loop.protocol_risk import (
+        capture_observation_class,
+    )
     from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
 
     derived = _derive_1659({})
@@ -3178,7 +3189,7 @@ def test_other_unauthoritative_pass_keeps_the_plain_diagnostic_and_capture_class
 def test_post_auth_unverified_suite_diagnostic_keeps_the_node_test_hint_1659():
     """A plain ``node <file>`` keeps its #1294 rerun hint, now in the non-terminal diagnostic."""
     from coding_review_agent_loop.local_test_evidence import LocalTestObservation
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         SemanticRiskCoverageClaim,
         SemanticRiskCoverageClaims,
         derive_risk_test_matrix_evidence,
@@ -3386,7 +3397,9 @@ def test_semantic_matrix_claim_duplicate_selector_within_one_row_drops_the_claim
 
 
 def test_semantic_matrix_claims_without_catalog_keep_selectors_verbatim():
-    from coding_review_agent_loop.protocol import _parse_semantic_risk_coverage_claims
+    from coding_review_agent_loop.protocol_risk import (
+        _parse_semantic_risk_coverage_claims,
+    )
 
     parsed = _parse_semantic_risk_coverage_claims(
         [{"row_id": "row-1", "execution_refs": [_COMMAND_REF, "anything"]}],
@@ -3409,7 +3422,7 @@ def test_semantic_matrix_claims_without_catalog_keep_selectors_verbatim():
 
 
 def test_shared_semantic_claim_example_parses_through_claim_parser():
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         SEMANTIC_RISK_CLAIM_KEYS,
         _parse_semantic_risk_coverage_claims,
         semantic_risk_claim_example,
@@ -6260,7 +6273,9 @@ def test_non_list_test_observations_counts_as_one_field_drop_927(value):
 
 
 def test_over_bound_dropped_citation_values_reject_927():
-    from coding_review_agent_loop.protocol import DROPPED_VALUE_MAX_BYTES
+    from coding_review_agent_loop.protocol_risk import (
+        DROPPED_VALUE_MAX_BYTES,
+    )
 
     huge = {"command": "x" * DROPPED_VALUE_MAX_BYTES, "receipt_id": "r", "claim": "bad"}
     with pytest.raises(AgentLoopError, match="bound for a dropped value"):
@@ -6302,17 +6317,17 @@ from coding_review_agent_loop import protocol as protocol_1016  # noqa: E402
 
 
 def _valid_row_id_1016(value: str) -> bool:
-    return protocol_1016._is_valid_risk_row_id(value)
+    return _risk_owner._is_valid_risk_row_id(value)
 
 
 def _neutralize_1016(value: str) -> str:
-    return protocol_1016._neutralize_identifier_like(value)
+    return _risk_owner._neutralize_identifier_like(value)
 
 
 def _reserved_output_spans_1016(text: str) -> list[str]:
     return [
-        span for span in protocol_1016._IDENTIFIER_LIKE_SPAN_RE.findall(text)
-        if protocol_1016._has_reserved_namespace(span)
+        span for span in _risk_owner._IDENTIFIER_LIKE_SPAN_RE.findall(text)
+        if _risk_owner._has_reserved_namespace(span)
     ]
 
 
@@ -6332,7 +6347,7 @@ def test_reserved_row_id_namespaces_are_refused_in_every_case_1016(row_id):
     """Row namespace-boundaries: capitalization no longer bypasses the refusal."""
     assert not _valid_row_id_1016(row_id)
     with pytest.raises(AgentLoopError, match="may not resemble a reviewer finding ID"):
-        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+        _risk_owner._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
     assert _neutralize_1016(row_id) != row_id
 
 
@@ -6350,14 +6365,14 @@ def test_reserved_row_id_namespaces_are_refused_in_every_case_1016(row_id):
 def test_legal_row_ids_pass_and_are_not_neutralized_1016(row_id):
     """Row namespace-boundaries: embedded substrings and unrelated mixed case stay legal."""
     assert _valid_row_id_1016(row_id)
-    assert protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id") == row_id
+    assert _risk_owner._validate_risk_row_id(row_id, context="matrix.rows[0].row_id") == row_id
     assert _neutralize_1016(row_id) == row_id
 
 
 @pytest.mark.parametrize("row_id", ["-row", "bad row id", "row/1", "ïtem-3", "x" * 129, ""])
 def test_row_id_syntax_and_byte_bound_are_unchanged_1016(row_id):
     with pytest.raises(AgentLoopError):
-        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+        _risk_owner._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
 
 
 @pytest.mark.parametrize(
@@ -6486,7 +6501,7 @@ def test_reserved_case_variant_claim_degrades_as_malformed_in_both_envelopes_101
     assert [item.row_id for item in claims.claims] == ["row-2"]
     [record] = claims.degradations
     assert record.element_path == f"{kind}.risk_test_matrix_claims[0].row_id"
-    assert record.rule == protocol_1016.CLAIM_ROW_ID_MALFORMED_RULE
+    assert record.rule == _risk_owner.CLAIM_ROW_ID_MALFORMED_RULE
     assert record.observed_preview == preview
     assert claims.dropped_row_ids == ()
     assert claims.unapproved_claim_row_ids == ()
@@ -6516,18 +6531,18 @@ def test_unknown_key_preview_neutralizes_reserved_keys_only_1016(kind):
     parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
 
     [record] = parsed.risk_test_matrix_claims.degradations
-    assert record.rule == protocol_1016.CLAIM_UNKNOWN_KEYS_RULE
+    assert record.rule == _risk_owner.CLAIM_UNKNOWN_KEYS_RULE
     assert record.observed_preview == "Finding·3, subitem-3"
 
 
 def test_citation_key_and_claim_previews_neutralize_reserved_tokens_only_1016():
-    observed = protocol_1016._citation_defect_observed(
-        {"HR-2": 1, "chr-1": 2, "item-4": 3}, protocol_1016.CITATION_KEYS_RULE
+    observed = _risk_owner._citation_defect_observed(
+        {"HR-2": 1, "chr-1": 2, "item-4": 3}, _risk_owner.CITATION_KEYS_RULE
     )
     assert observed == "keys HR·2, chr-1, item·4"
-    observed_claim = protocol_1016._citation_defect_observed(
+    observed_claim = _risk_owner._citation_defect_observed(
         {"command": "c", "receipt_id": "r", "claim": "see Review-7 and planreview-2"},
-        protocol_1016.CITATION_CLAIM_RULE,
+        _risk_owner.CITATION_CLAIM_RULE,
     )
     assert observed_claim == "see Review·7 and planreview-2"
 
@@ -7135,7 +7150,9 @@ def test_plain_node_hint_is_omitted_when_it_could_be_wrong_or_leak(command, reda
 def test_plain_node_hint_requires_a_verbatim_projection_signal():
     message = _node_hint_rejection(("node", "tests/test_x.js"))
     assert "node --test" in message
-    from coding_review_agent_loop.protocol import _node_test_hint
+    from coding_review_agent_loop.protocol_risk import (
+        _node_test_hint,
+    )
 
     assert _node_test_hint({"command": "node tests/test_x.js", "caveats": []}) == ""
     assert _node_test_hint({"command": "node tests/test_x.js", "command_verbatim": False}) == ""
@@ -7172,7 +7189,9 @@ def test_plain_node_hint_never_reaches_the_coder_truncated_or_altered(length):
 
 
 def test_plain_node_hint_is_omitted_when_the_whole_message_would_exceed_the_reask_cap():
-    from coding_review_agent_loop.protocol import EVIDENCE_REASK_MAX_CHARS
+    from coding_review_agent_loop.protocol_risk import (
+        EVIDENCE_REASK_MAX_CHARS,
+    )
 
     # A verbatim, relative, test-like path long enough that the message plus the
     # hint cannot fit the cap: no hint and no truncated rerun command.
@@ -8129,7 +8148,7 @@ def test_non_array_raises_a_repairable_shape_error_in_repair_first_mode_1626(kin
 
 @pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
 def test_degrade_after_repair_records_that_repair_was_attempted_1626(kind):
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
         TEST_OBSERVATIONS_NOT_ARRAY_RULE,
     )
@@ -8202,7 +8221,7 @@ def test_wrapped_citation_matches_only_exact_inner_journal_argv(launcher):
     from coding_review_agent_loop.protocol_common import (
         TestObservationCitation,
     )
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         _citation_matches_observation,
     )
     inner = "python -m pytest 'tests/test_a.py::test_x[value with spaces]'"

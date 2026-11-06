@@ -16,7 +16,9 @@ from coding_review_agent_loop.round_state import (
 )
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
-from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
+from coding_review_agent_loop.protocol_risk import (
+    semantic_risk_claim_example_json,
+)
 from coding_review_agent_loop.prompts import (
     build_followup_prompt,
     build_issue_implementation_prompt,
@@ -32,6 +34,8 @@ from coding_review_agent_loop.comment_rendering import render_canonical_plan_sta
 from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
+)
+from coding_review_agent_loop.protocol_risk import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_OPTIONAL_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
@@ -4152,7 +4156,7 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
     from types import SimpleNamespace as _Namespace
 
     import coding_review_agent_loop.repair as repair_module
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         SEMANTIC_RISK_CLAIM_KEYS,
         _parse_semantic_risk_coverage_claims,
         semantic_risk_claim_example,
@@ -4214,7 +4218,9 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
     """#859: execution_refs are run-tests selectors only; omit rather than invent."""
     from types import SimpleNamespace as _Namespace
 
-    from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
+    from coding_review_agent_loop.protocol_risk import (
+        semantic_risk_claim_example_json,
+    )
 
     context = prompts_module.CoderHumanRequirementsPromptContext(
         block="", surfaced_requirement_ids=(), requires_direct_discussion_ack=False
@@ -5615,7 +5621,7 @@ def test_phased_delivery_guard_predicate_agrees_with_the_prompt_guard(tmp_path):
 
 def _coverage_plan_context(*, applicability: str = "applicable", pending: bool = False):
     from dataclasses import replace as _replace
-    from coding_review_agent_loop.protocol import (
+    from coding_review_agent_loop.protocol_risk import (
         parse_risk_test_matrix,
         risk_test_matrix_identity,
     )

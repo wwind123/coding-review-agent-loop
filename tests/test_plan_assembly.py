@@ -18,9 +18,11 @@ from coding_review_agent_loop.plan_assembly import (
 from coding_review_agent_loop.protocol import (
     PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS,
     PLAN_REVISION_PATCH_OPERATION_KEYS,
-    RISK_MATRIX_MAX_ROWS,
     parse_plan_revision_patch,
     validate_structured_plan_revision_patch,
+)
+from coding_review_agent_loop.protocol_risk import (
+    RISK_MATRIX_MAX_ROWS,
 )
 from coding_review_agent_loop.round_state import (
     _attach_round_metadata,

@@ -211,12 +211,14 @@ Necessary internal imports remain permitted; downstream consumers use the owners
 `protocol_risk.py` owns risk matrix records, identities and revisions, semantic
 claims/gaps, test-observation citation parsing and canonical evidence derivation,
 including signed-reference handling and matrix row/metadata patch parsing.
-`protocol.py` retains response-composition adapters and temporary identity-preserving
-risk exports for the move window. The new owner imports shared support directly
+`protocol.py` retains response-composition adapters and only their necessary
+risk imports; all risk consumers use the definition owner directly. The new owner imports shared support directly
 and never imports the response driver. Bounds, diagnostics and evidence authority
 are unchanged. `tests/fixtures/protocol_risk_move.json` records original symbol
 bodies, global references, decorators and consumer/patch candidates for the paired
-cleanup. `tests/test_protocol_risk_move.py` checks body hashes, export identity,
+cleanup via `scripts/rewrite_protocol_risk_imports.py`. The symbol guard covers
+all risk names, including aliases, patch strings and compatibility-only exports.
+`tests/test_protocol_risk_move.py` checks body hashes, definition ownership,
 fresh import orders, source sizes and interception at the moved citation lookup;
 the linked shape audit includes the risk owner and tests missing annotations there.
 

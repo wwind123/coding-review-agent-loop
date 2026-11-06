@@ -8,7 +8,12 @@ from agent_loop_helpers import FakeRunner, make_config as _make_config, structur
 from issue_loop_test_helpers import _fresh_staged_plan_for_recovery, _PlanDiagnosticRunner
 from coding_review_agent_loop.cli import run_issue_loop
 from coding_review_agent_loop.errors import AgentInvocationError, AgentLoopError
-from coding_review_agent_loop.protocol import validate_structured_plan_state, risk_test_matrix_identity
+from coding_review_agent_loop.protocol import (
+    validate_structured_plan_state,
+)
+from coding_review_agent_loop.protocol_risk import (
+    risk_test_matrix_identity,
+)
 from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
 from coding_review_agent_loop.decomposition import validate_risk_matrix_ownership, RiskMatrixOwnershipError
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata

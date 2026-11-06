@@ -9,14 +9,16 @@ import re
 from .errors import AgentLoopError
 from .protocol import (
     _normalized_review_item_text,
-    CITATION_DEGRADATION_MAX_DROPS,
-    _decode_test_observations_string,
-    _test_observation_item_defect,
     _flatten_plan_review_finding,
     PLAN_REVIEW_PROVENANCE_VALUES,
     classify_architecture_status_near_miss,
     parse_plan_revision_patch,
     render_architecture_list_entry,
+)
+from .protocol_risk import (
+    CITATION_DEGRADATION_MAX_DROPS,
+    _decode_test_observations_string,
+    _test_observation_item_defect,
 )
 from .protocol_common import (
     ParseDegradation,

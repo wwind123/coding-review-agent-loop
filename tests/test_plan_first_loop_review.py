@@ -24,6 +24,8 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     parse_plan_revision_patch,
     validate_structured_plan_state,
+)
+from coding_review_agent_loop.protocol_risk import (
     risk_test_matrix_prompt_examples,
 )
 import coding_review_agent_loop.agent_failure as agent_failure

@@ -15,10 +15,12 @@ from coding_review_agent_loop.repair import (
 )
 from coding_review_agent_loop.errors import AgentLoopError, FreshContractIntegrityError
 from coding_review_agent_loop.validated_agent import _run_structured_repair
-from coding_review_agent_loop.protocol import (
+from coding_review_agent_loop.protocol_risk import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
     RISK_TEST_MATRIX_ROW_KEYS,
+)
+from coding_review_agent_loop.protocol import (
     parse_plan_revision_patch,
     validate_human_requirement_dispositions,
     validate_structured_coder_followup,
@@ -5049,7 +5051,9 @@ def test_plan_review_repair_prompt_names_requirement_id_with_example():
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 def test_repair_prompts_describe_test_level_and_gaps_as_preserve_only(kind):
     from coding_review_agent_loop.repair import _build_repair_prompt
-    from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
+    from coding_review_agent_loop.protocol_risk import (
+        semantic_risk_claim_example_json,
+    )
 
     prompt = _build_repair_prompt("malformed", expected_kind=kind)
     assert "optional `test_level` key" in prompt
