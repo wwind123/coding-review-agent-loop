@@ -56,3 +56,7 @@ never rewritten or deleted. The detail doc describes the current design.
 
 - Recover absent pull head refs in both pre-review sync layouts only through one same-repository branch import authorized by a bounded REST read and exact review SHA; reject mismatches before export or publication. Classify missing refs with a fixed label and validated-ref hint, bypassing unnecessary HTTPS token lookup; preserve locks, immutable checkout and existing head checks (#1884).
 - A stale pull ref uses the existing same-repository exact-SHA branch recovery; rejected recovery remains a fatal, diagnostic-preserving CLI error while parallel healthy results remain resumable (#1887).
+
+- 2026-11-06: The executable pin freezes the physical containing directory of the running interpreter, retaining its final `bin/python` basename so virtualenv identity is preserved. Every retained absolute import-path entry is resolved when the launcher is constructed. Retargeting a startup `current` symlink therefore cannot switch either the interpreter environment or dependencies. Coder prompts and generated invocation guidance use `"$AGENT_LOOP_EXECUTABLE" run-tests`, including fixture invocations, so later shell PATH changes cannot bypass the launcher. Installation failure remains fail-soft with a warning; receipt producer mismatch and unknown-client diagnostics remain unchanged (#1922).
+
+- 2026-11-06: Unconditional test guidance defaults to the inherited agent-loop command when no pinned executable is exported, preserving the warned fail-soft fallback. (#1922, #1924).

@@ -33,6 +33,8 @@ from coding_review_agent_loop.protocol import (
     parse_unresolved_item_dispositions,
     validate_structured_coder_followup,
 )
+from coding_review_agent_loop.github import _parse_pr_human_requirements
+from pr_loop_test_helpers import _with_code_classification
 from agent_loop_helpers import (
     FakeRunner,
     blocking_issues,
@@ -1467,6 +1469,10 @@ def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypat
         )],
         pr_payload=ack_pr_payload(history), advance_pr_head_on_coder_followup=False,
     )
+    runner.gemini_outputs = [
+        _with_code_classification(output, _parse_pr_human_requirements(runner.pr_payload))
+        for output in runner.gemini_outputs
+    ]
     config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
     with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
         run_pr_loop(runner, pr_number=77, config=config)

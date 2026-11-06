@@ -936,6 +936,23 @@ code finding and is never sent to the coder. Listing the same text as both a
 request and a finding is invalid and goes through the bounded format repair,
 which must keep the typed request.
 
+Reviewers link signed requirements using the optional `requirement_evidence`
+entries in their structured review. A `human-only` entry names the original
+signed ID and one of that reviewer's evidence requests. The requirement remains
+pending at the evidence barrier; it does not require coder acknowledgement and
+cannot by itself dispatch a coder. Ordinary code requirements still do.
+
+For a signed answer, the requester records `evidence-only` or `mixed`, with its
+answered prior item IDs. Evidence-only sources create no coder acknowledgement
+obligation. A mixed source keeps its original signed ID, but the coder receives
+only the reviewer's explicit `leftover_instructions`; accepting human evidence
+is never coder work. Classification alone cannot clear evidence. The requester
+must also attest adequacy through live signed citations and exact-head binding,
+before or after a freeze. Missing classification triggers one real reviewer
+continuation when evidence is involved; absent or conflicting classification
+cannot silently discard instructions. Format repair cannot invent these roles,
+links or leftover instructions.
+
 Each request becomes a `human-exact-head-evidence` obligation owned by the
 reviewer that asked for it. Its identity comes from the normalized request text
 and that reviewer, so repeating the request updates one obligation. The request
@@ -2043,6 +2060,18 @@ profiles, reviewer turns get no budget, and the `test-gate` profile only sizes a
 standalone managed `run-tests`.
 
 ### Local test evidence
+
+Inside an agent session, invoke the exported pinned executable explicitly:
+`"$AGENT_LOOP_EXECUTABLE" run-tests -- <recognized test command>`, including
+`--fixture <script>` when needed. This remains bound to the orchestrator's
+physical release even if a shell startup file changes PATH or a `current`
+release symlink moves. The interpreter directory and absolute import paths are
+frozen; the final `bin/python` name is retained to preserve virtualenv identity.
+If pin installation fails, the existing warning and inherited-PATH fallback
+remain visible; fallback is not a successful pin.
+
+Test guidance uses `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests` when the executable pin may be unavailable. With no exported pin this uses the unpinned inherited PATH command; the launcher warning and receipt mismatch diagnostics still apply.
+
 
 Test commands are also subject to the
 [parallel test-worker budget](#parallel-test-worker-budget).
@@ -8941,6 +8970,13 @@ those reviewer-item fields. Merge conflicts retain their dedicated conflict
 resolution prompt. Coder classifications are evidence of intent only: they
 cannot clear a CI or other source-authoritative machine gate before that
 authority revalidates the repaired head.
+
+In PR review, human-only signed requirements are routed to linked deferred
+evidence, while signed answers classified as evidence-only have no separate
+coder acknowledgement obligation. Mixed answers retain the original source ID
+for their explicit remaining code instructions. This projection preserves the
+full signed source for reviewer context and final live-input validation. See
+[the exact-head evidence freeze](#exact-head-human-evidence-freeze).
 
 Signed human reviewer comments are requirements when the comment body ends with
 a standalone `-- Human Reviewer` signature. Issue comments become signed

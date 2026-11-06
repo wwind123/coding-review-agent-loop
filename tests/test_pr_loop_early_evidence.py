@@ -127,9 +127,15 @@ def test_partial_acceptance_persists_remaining_owner(tmp_path):
 
 
 @pytest.mark.parametrize("change", ["edit", "delete", "new", "push"])
-def test_live_gate_races(tmp_path, monkeypatch, change):
+@pytest.mark.parametrize("classified", [False, True])
+def test_live_gate_races(tmp_path, monkeypatch, change, classified):
     runner, config = deferred(tmp_path)
     acceptance(runner, "Accepted for " + HEAD)
+    if classified:
+        from pr_loop_test_helpers import _classified_review, _association
+        rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+        runner.codex_outputs[-1] = _classified_review([_association(rid, "evidence-only", answers=["item-1"])],
+            dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}])
     real_gate = pr_loop._evidence_freeze_gate
     changed = []
     def racing_gate(*args, **kwargs):
@@ -160,9 +166,15 @@ def test_live_gate_races(tmp_path, monkeypatch, change):
 
 
 @pytest.mark.parametrize("stop", ["before-release", "after-release"])
-def test_early_release_publication_resume(tmp_path, monkeypatch, stop):
+@pytest.mark.parametrize("classified", [False, True])
+def test_early_release_publication_resume(tmp_path, monkeypatch, stop, classified):
     runner, config = deferred(tmp_path)
     acceptance(runner, "Accepted for " + HEAD)
+    if classified:
+        from pr_loop_test_helpers import _classified_review, _association
+        rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+        runner.codex_outputs[-1] = _classified_review([_association(rid, "evidence-only", answers=["item-1"])],
+            dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}])
     real_publish = support._publish_evidence_release
     stopped = []
     def interrupt(*args, **kwargs):
@@ -367,3 +379,108 @@ def test_push_restart_preserves_distinct_requests_with_foreign_heads(tmp_path, m
     assert [(i.item_id, i.text, i.obligation_identity, i.alias_item_ids) for i in reopened] == [
         (i.item_id, i.text, i.obligation_identity, ()) for i in items]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_classified_evidence_only_needs_no_generic_ack(tmp_path, mode, frozen):
+    from pr_loop_test_helpers import _classified_review, _association
+    runner, config = deferred(tmp_path, mode=mode)
+    if frozen:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    before = len(_freeze_records(runner))
+    rid = acceptance(runner, "Accepted for " + HEAD)
+    runner.codex_outputs[-1] = _classified_review([_association(rid, "evidence-only", answers=["item-1"])],
+        dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}])
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_freeze_records(runner)) == before
+    assert _release_records(runner)[-1].metadata.evidence_release.reason == "evidence-cleared"
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_freeze_records(runner)) == before
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_classified_partial_answer_preserves_other_owner(tmp_path, valid):
+    from pr_loop_test_helpers import _classified_review, _association
+    runner, config = deferred(tmp_path, two_owners=True)
+    rid = acceptance(runner, "Accepted for " + (HEAD if valid else "a" * 40), two_owners=True)
+    runner.codex_outputs[-1] = _classified_review([_association(rid, "evidence-only", answers=["item-1"])],
+        state="blocking", dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]},
+            {"item_id": "item-2", "disposition": "blocking", "note": "Other owner pending."}])
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    ids = {i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items}
+    assert ids == ({"item-2"} if valid else {"item-1", "item-2"})
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+def test_classified_mixed_answer_keeps_original_id_and_only_leftover_code(tmp_path):
+    from pr_loop_test_helpers import _classified_review, _association
+    from agent_loop_helpers import structured_coder_followup
+    runner, config = deferred(tmp_path)
+    runner.advance_pr_head_on_coder_followup = False
+    rid = acceptance(runner, "Accepted for " + HEAD + ". Also fix the retry bound.")
+    runner.codex_outputs[-1] = _classified_review([_association(rid, "mixed", answers=["item-1"], leftover="Fix the retry bound.")],
+        state="blocking", blocking=["Fix the retry bound."],
+        dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}])
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-2"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed", "evidence": "Retry bound fixed; human answer is supplied separately."}])]
+    # A follow-up reviewer retains the source classification and confirms code.
+    runner.codex_outputs.append(_classified_review([_association(rid, "mixed", answers=["item-1"], leftover="Fix the retry bound.")], hr=True,
+        dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}, _resolve("item-2")]))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    assert len(prompts) == 1
+    assert f"Requirement {rid}:" in prompts[0]
+    assert "Fix the retry bound." in prompts[0]
+    # The requirement block's body contains only the explicit leftover instruction.
+    assert "Accepted for" not in prompts[0].split(f"Requirement {rid}:", 1)[1].split("Agent memory context:")[0]
+
+
+@pytest.mark.parametrize("fault", ["foreign-owner", "cross-round-conflict"])
+def test_invalid_classification_can_reach_fresh_review(tmp_path, monkeypatch, fault):
+    from pr_loop_test_helpers import _association, _classified_review
+    from coding_review_agent_loop.round_state import _strip_round_metadata
+    runner, config = deferred(tmp_path, mode="full", two_owners=True)
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy.", 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    if fault == "cross-round-conflict":
+        # Durable latest records from distinct rounds must not poison resume.
+        records = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+        for index, record in enumerate(records):
+            entry = _association(rid, "code") if index else _association(rid, "human-only", request=_EVIDENCE_TEXT)
+            metadata = dataclasses.replace(record.metadata, round_number=index + 1,
+                requirement_evidence=(entry,))
+            runner.pr_payload["comments"].append({"author": {"login": "coding-review-agent-loop"},
+                "_rest_author_id": 424242, "body": _attach_round_metadata(_strip_round_metadata(record.body), metadata)})
+    projections = []
+    real_projection = pr_loop.historical_projection
+    def capture_projection(requirements, records):
+        result = real_projection(requirements, records)
+        projections.append(result)
+        return result
+    monkeypatch.setattr(pr_loop, "historical_projection", capture_projection)
+    votes = [{"item_id": "item-1", "disposition": "blocking", "note": "Pending human acceptance."},
+             {"item_id": "item-2", "disposition": "blocking", "note": "Pending other owner."}]
+    if fault == "foreign-owner":
+        runner.codex_outputs.append(_classified_review([
+            _association(rid, "evidence-only", answers=["item-2"])], state="blocking", dispositions=votes))
+    runner.codex_outputs.append(_classified_review([
+        _association(rid, "human-only", request=_EVIDENCE_TEXT)], state="blocking", dispositions=votes, evidence=[_EVIDENCE_TEXT]))
+    runner.gemini_outputs.append(_classified_review([
+        _association(rid, "human-only", request="Operator acceptance B")], reviewer="Google Gemini",
+        state="blocking", dispositions=votes, evidence=["Operator acceptance B"]))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _freeze_records(runner)
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    assert not runner.codex_outputs
+    if fault == "cross-round-conflict":
+        assert projections and any(r.requirement_id == rid and r.body == "A human must accept the policy."
+                                   for r in projections[0])
+    else:
+        assert any("Previous response not accepted: required judgement field" in cmd[-1]
+                   and "requirement_evidence" in cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex")

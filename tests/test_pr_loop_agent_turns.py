@@ -774,6 +774,9 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
         None if repaired_status is None
         else {"status": repaired_status, "rationale": "No architectural change."},
     )
+    from pr_loop_test_helpers import _with_code_classification
+    unacknowledged = _with_code_classification(unacknowledged, [requirement])
+    repaired = _with_code_classification(repaired, [requirement])
     runner = FakeRunner(codex_outputs=[unacknowledged] * 3)
     repair_calls = []
 
@@ -871,6 +874,9 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
     repaired = structured_pr_review(
         summary="Codex approves.", reviewer="OpenAI Codex", human_requirements_resolved=True
     )
+    from pr_loop_test_helpers import _with_code_classification
+    review = _with_code_classification(review, [requirement])
+    repaired = _with_code_classification(repaired, [requirement])
     runner = FakeRunner(codex_outputs=[review] * 3)
     config = make_config(
         tmp_path, reviewer="codex", max_rounds=1, review_parallel=parallel,

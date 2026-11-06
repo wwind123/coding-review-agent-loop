@@ -592,6 +592,17 @@ remains control input without repeating admission preflight. Later tracker
 closure or read failures retain the scheduling and surface diagnostics; any
 surrounding signed instruction prose remains a separate requirement.
 
+Reviewer round metadata has additive `requirement_evidence` associations with
+empty legacy defaults (#1922). Each entry preserves the original signed ID,
+role, requester-owned request or answered item IDs, and explicit mixed-source
+leftover instructions. Resume restores associations alongside the requester's
+own evidence requests, then projects only against current admitted signed sources
+and owned native items. Invalid associations and cross-round classification conflicts retain the full source without preventing a fresh review on resume. Missing legacy metadata never consumes an instruction.
+Acceptance still depends on current live content-bound citations and exact-head
+requester attestations; terminal publication, partial acceptance and push
+invalidation use the existing evidence release/freeze records.
+
+
 ## Decisions
 
 [Decision log](decisions/round-state-and-resume.md)

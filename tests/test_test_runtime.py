@@ -8000,3 +8000,14 @@ def test_report_projection_preserves_inner_argv(launcher):
 ])
 def test_report_projection_fails_closed(command):
     assert runtime.managed_test_wrapper_inner_command(command) is None
+
+
+@pytest.mark.parametrize("launcher", ["$AGENT_LOOP_EXECUTABLE", "${AGENT_LOOP_EXECUTABLE}", "${AGENT_LOOP_EXECUTABLE:-agent-loop}"])
+def test_exported_launcher_is_recognized_only_in_reports(launcher):
+    argv = [launcher, "run-tests", "--memory-dir", "/outside/cache", "--", "python3", "-m", "pytest", "tests/test_example.py"]
+    assert runtime.parse_managed_test_invocation(argv) is None
+    parsed = runtime.parse_managed_test_invocation(argv, allow_command_name_launcher=True)
+    assert parsed.inner_argv == ("python3", "-m", "pytest", "tests/test_example.py")
+    assert parsed.memory_dir == Path("/outside/cache")
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation([launcher, "run-tests", "--unknown", "--", "pytest"], allow_command_name_launcher=True)

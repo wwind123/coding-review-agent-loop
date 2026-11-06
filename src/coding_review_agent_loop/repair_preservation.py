@@ -1672,6 +1672,9 @@ def validate_repair_preservation(
     # source listed the same text both as a request and as a finding, the
     # repair resolves that overlap by keeping the typed request: the finding
     # copy may be dropped only when the request itself was preserved.
+    if source["kind"] == "pr_review":
+        require(source.get("requirement_evidence", []) == target.get("requirement_evidence", []),
+                "requirement_evidence semantic classification cannot change during repair")
     moved_to_evidence: set[str] = set()
     if source["kind"] == "pr_review" and isinstance(
         source.get("exact_head_evidence_requests"), list

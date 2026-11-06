@@ -1,3 +1,4 @@
+from pr_loop_test_helpers import _with_code_classification
 from agent_loop_helpers import *  # noqa: F403
 
 from types import SimpleNamespace
@@ -2603,6 +2604,8 @@ def test_pr_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
         reviewer="OpenAI Codex",
         human_requirements_resolved=True,
     )
+    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
+    repaired_with_marker = _with_code_classification(repaired_with_marker, (_PR_REQUIREMENT,))
     runner = FakeRunner(
         codex_outputs=[approved_without_marker],
         pr_payload=_pr_payload_with_human_requirement(),
@@ -2646,6 +2649,8 @@ def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_pat
         human_requirement_ids=["Requirement 1"],
         reviewer="Anthropic Claude",
     )
+    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
+    repaired_blocking = _with_code_classification(repaired_blocking, (_PR_REQUIREMENT,))
     runner = FakeRunner(
         claude_outputs=[coder_response],
         codex_outputs=[
@@ -2690,6 +2695,7 @@ def test_pr_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
     )
+    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
     runner = FakeRunner(
         codex_outputs=[approved_without_marker],
         pr_payload=_pr_payload_with_human_requirement(),
@@ -2982,6 +2988,8 @@ def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
         human_requirement_ids=["Requirement 1"],
         reviewer="Anthropic Claude",
     )
+    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
+    repaired_blocking = _with_code_classification(repaired_blocking, (_PR_REQUIREMENT,))
     runner = FakeRunner(
         claude_outputs=[coder_response],
         codex_outputs=[

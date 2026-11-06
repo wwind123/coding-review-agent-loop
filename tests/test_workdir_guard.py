@@ -1869,3 +1869,11 @@ def test_forwarded_output_does_not_exempt_inputs(tmp_path, operand, wrapper, npm
 def test_output_ambiguities_remain_strict(tmp_path, command):
     with pytest.raises(AgentLoopError):
         validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+
+
+@pytest.mark.parametrize("launcher", ['"$AGENT_LOOP_EXECUTABLE"', '"${AGENT_LOOP_EXECUTABLE}"'])
+def test_exported_launcher_reports_validate_inner_targets(tmp_path, launcher):
+    prefix = launcher + " run-tests --memory-dir /outside/cache -- python3 -m pytest "
+    validate_test_commands_within_workdir([prefix + "tests/test_example.py"], assigned_workdir=tmp_path)
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir([prefix + "/outside/foreign/test_example.py"], assigned_workdir=tmp_path)

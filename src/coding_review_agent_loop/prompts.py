@@ -471,6 +471,7 @@ def _memory_block(
                         memory_dir=memory.memory_dir,
                         prefix=verified_prefix,
                     )
+                    wrapper = wrapper.replace(shlex.quote(verified_prefix[0]), '\"$AGENT_LOOP_EXECUTABLE\"', 1)
                     invocation_lines.append(f"  Invocation guidance: {wrapper}")
             invocation_guidance = "\n".join(invocation_lines)
         else:
@@ -480,7 +481,7 @@ def _memory_block(
             if verified_prefix is not None:
                 invocation_guidance = (
                     "  Invocation guidance: "
-                    f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir, prefix=verified_prefix)}"
+                    f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir, prefix=verified_prefix)}".replace(shlex.quote(verified_prefix[0]), '\"$AGENT_LOOP_EXECUTABLE\"', 1)
                 )
         if verified_prefix is None:
             diagnostics = [item.diagnostic for item in wrapper_results if item.diagnostic]
@@ -596,6 +597,7 @@ MANAGED_RECEIPT_REVIEWER_GUIDANCE = (
     "inner command against the rule."
 )
 PRE_COLLECTION_CODER_GUIDANCE = (
+    'Invoke tests with `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests` to select the pinned release. If the pin could not be installed, this falls back to the unpinned inherited PATH command. '
     "If `agent-loop run-tests` reports a pre-collection launch failure (no test ran, so the run "
     "is not evidence), fix the interpreter or flags and rerun; do not argue the receipt. A "
     "genuine test failure is still cleared only by a passing rerun of the same command. Only a "
@@ -607,7 +609,7 @@ PRE_COLLECTION_CODER_GUIDANCE = (
 )
 FIXTURE_CODER_GUIDANCE = (
     "When a suite needs long-lived helper processes, put them in a committed executable "
-    "fixture script and run `agent-loop run-tests --fixture <script> -- <recognized test "
+    'fixture script and run `"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --fixture <script> -- <recognized test '
     "command>` (timeout at least 30s): the broker runs `<script> setup` and `<script> "
     "teardown` around the unchanged test command, and only a clean fixture lifecycle is "
     "citable; never wrap the test command in a script."
@@ -1452,7 +1454,23 @@ fulfills evidence. Preserve admitted scheduling shown below across heads; do not
 unchanged source as pre-merge work. Owners are free text, without assignment or account validation.
 """
 
-PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """`exact_head_evidence_requests` is optional and only for evidence that an agent
+PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """Signed-source classification: include `requirement_evidence`, an array
+of objects with exactly `requirement_id`, `role`, `request`, `answered_item_ids`
+and `leftover_instructions`. Classify every surfaced signed source whenever the
+review does not acknowledge it as resolved, including ordinary work with role
+`code`. Missing classification triggers one bounded reviewer continuation; a
+repeated omission stops the run before coder dispatch. Roles: `code` (ordinary code requirement), `human-only`
+(link `request` to a string in your exact_head_evidence_requests), `evidence-only`
+(answered prior item IDs, no remaining instructions), or `mixed` (answered prior
+item IDs plus explicit leftover code instruction text). Use empty strings/lists
+for inapplicable fields. You may classify answers only to your own native evidence
+items. Mixed sources retain their original signed ID. Do not invent leftover
+instructions or acknowledge human acceptance as coder work. A classification
+never grants clearance: dispose answered items resolved with live surfaced
+`evidence_requirement_ids` citations only when adequate for the exact head.
+This applies before and after freeze; early answers require no repost.
+
+`exact_head_evidence_requests` is optional and only for evidence that an agent
 session cannot produce but an approved contract requires at the exact reviewed
 head (for example an authenticated live-CLI run that only a human can perform).
 Never list missing human evidence in `blocking_items`, and never list a code

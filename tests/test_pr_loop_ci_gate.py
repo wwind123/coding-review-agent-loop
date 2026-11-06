@@ -42,6 +42,7 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     parse_pr_review,
 )
+from pr_loop_test_helpers import _with_code_classification
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -1567,6 +1568,10 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
         ],
         claude_outputs=[ack_markdown, ack_markdown],
     )
+    runner.codex_outputs = [
+        _with_code_classification(output, (requirement,))
+        for output in runner.codex_outputs
+    ]
     runner.pr_payload["headRefName"] = "feature/x"
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
@@ -1655,6 +1660,10 @@ def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
         ],
         claude_outputs=[ack_markdown, ack_markdown],
     )
+    runner.codex_outputs = [
+        _with_code_classification(output, (first,) if index < 2 else (first, second))
+        for index, output in enumerate(runner.codex_outputs)
+    ]
     runner.pr_payload["headRefName"] = "feature/x"
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",

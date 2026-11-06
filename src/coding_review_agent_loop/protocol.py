@@ -412,6 +412,7 @@ class ParsedReview:
     screenshot_requests: tuple[dict, ...] = ()
     screenshot_coverage_acceptances: tuple[dict, ...] = ()
     exact_head_evidence_requests: tuple[str, ...] = ()
+    requirement_evidence: tuple[dict, ...] = ()
     sub_item_degradations: tuple["ParseDegradation", ...] = ()
     post_merge_obligations: tuple[ObligationRequest, ...] = ()
 
@@ -3257,7 +3258,7 @@ def parse_structured_pr_review(
             "same_pr_followups",
             "future_followups",
             "architecture_impact",
-            "exact_head_evidence_requests", "screenshot_requests", "screenshot_coverage_acceptances",
+            "requirement_evidence", "exact_head_evidence_requests", "screenshot_requests", "screenshot_coverage_acceptances",
             "post_merge_obligations",
         },
     )
@@ -3320,7 +3321,9 @@ def parse_structured_pr_review(
     obligations = parse_review_fields(payload)
     from .review_images_coverage import parse_fields
     typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
-    return dataclasses.replace(parsed, exact_head_evidence_requests=evidence_requests,
+    from .requirement_evidence import parse_associations
+    associations = parse_associations(payload.get("requirement_evidence", []))
+    return dataclasses.replace(parsed, requirement_evidence=associations, exact_head_evidence_requests=evidence_requests,
                                screenshot_requests=typed, screenshot_coverage_acceptances=votes,
                                post_merge_obligations=obligations)
 

@@ -50,7 +50,7 @@ def test_launcher_is_content_addressed_isolated_and_idempotent(_private_launcher
     text = launcher.read_text(encoding="utf-8")
     assert text == ae.launcher_text()
     assert text.startswith("#!/bin/sh\nexec ")
-    assert f"{shlex.quote(sys.executable)} -I -c " in text
+    assert f"{shlex.quote(str(Path(sys.executable).parent.resolve() / Path(sys.executable).name))} -I -c " in text
     assert repr(str(PACKAGE_DIR.parent)) in text
     assert launcher.name == "agent-loop"
     assert launcher.parent.parent == _private_launcher_root / "coding-review-agent-loop" / "agent-loop-exe"

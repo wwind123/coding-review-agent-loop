@@ -563,6 +563,7 @@ from .pr_board_entry import _enforce_pr_board_floor
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
+from .requirement_evidence import historical_projection, classify_review, project, validate_associations
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -3343,7 +3344,7 @@ def run_pr_loop(
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
-                human_requirements=human_requirements,
+                human_requirements=historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments)),
                 source_round=round_number,
             )
             # A CI obligation is bound to the head that failed.  Only a
@@ -3777,6 +3778,7 @@ def run_pr_loop(
             # The accepted carrier beside each approved text, keyed by reviewer, so
             # an acknowledgement repair can pin its assessment and records (#925).
             accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
+            classified_review_carriers: dict[str, ParsedReview] = {}
             from .converted_capture import evidence_review_boundary, capture_stale_reviewers
             capture_boundary_index = evidence_review_boundary(
                 capture_records,
@@ -4143,7 +4145,7 @@ def run_pr_loop(
                         )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
-                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: validate_associations(_validate_review_response(
                     text,
                     reviewer=reviewer_name,
                     unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
@@ -4154,7 +4156,7 @@ def run_pr_loop(
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
-                ), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
+                ), human_requirements, prior_unresolved_items, reviewer_name), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
 
             def _pr_publication(reviewer_name: str):
                 return round_publication(
@@ -4931,6 +4933,7 @@ def run_pr_loop(
                             ),
                             phase=phase,
                             evidence_requests=parsed.exact_head_evidence_requests,
+                            requirement_evidence=parsed.requirement_evidence,
                             screenshot_requests=parsed.screenshot_requests, screenshot_coverage_acceptances=parsed.screenshot_coverage_acceptances, post_merge_requests=tuple(r.payload() for r in parsed.post_merge_obligations),
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
@@ -5559,6 +5562,7 @@ def run_pr_loop(
                         architecture_impact=resumed_impact,
                         architecture_impact_degradations=resumed_records,
                         exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
+                        requirement_evidence=resumed_record.metadata.requirement_evidence,
                         screenshot_requests=resumed_record.metadata.screenshot_requests, screenshot_coverage_acceptances=resumed_record.metadata.screenshot_coverage_acceptances,
                         post_merge_obligations=tuple(parse_post_merge_request(r) for r in resumed_record.metadata.post_merge_requests),
                         sub_item_degradations=resumed_record.metadata.sub_item_degradations,
@@ -5775,6 +5779,16 @@ def run_pr_loop(
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = []
 
+                classification_input = review_output
+                parsed_review, review_output = classify_review(parsed_review, review_output,
+                    requirements=human_requirements, items=prior_unresolved_items, reviewer_name=reviewer_name, previous=classified_review_carriers,
+                    invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config,
+                        prompt=prompt, marker_description="structured PR review classification",
+                        **_pr_review_validators(reviewer_name), usage_context=usage_context,
+                        role="reviewer", operation_description="Signed-source classification", reask_on_missing_judgement_field=True))
+                review_state = parsed_review.state
+                if review_output != classification_input: early_published_pr_reviewers.discard(reviewer)
+                classified_review_carriers[reviewer_name] = parsed_review
                 if carried_approval_record is None:
                     round_review_models[reviewer_name] = review_model_used
 
@@ -6161,9 +6175,6 @@ def run_pr_loop(
                         ]
                     )
                 )
-            # The carried ledger was authoritative for its items this round, so
-            # a resolved or re-promoted item leaves the pending set; only an
-            # item that left the ledger as `future` is held for publication.
             for item in prior_unresolved_items:
                 pending_future_items.pop(item.item_id, None)
             for item in future_from_prior_items:
@@ -6171,9 +6182,6 @@ def run_pr_loop(
             for item in unresolved_items:
                 pending_future_items.pop(item.item_id, None)
             pr_finding_history.observe_reconciled(unresolved_items, future_from_prior_items)
-            # Confirmed sub-item outcome of this round (#958): published after
-            # reconciliation and before any coder turn, approval, budget check
-            # or exit, so a terminal approval round is never silent.
             _publish_sub_item_progress(
                 runner,
                 config=config,
@@ -6183,9 +6191,6 @@ def run_pr_loop(
                 cleared=round_cleared_sub_items,
                 notes=round_sub_item_notes,
             )
-            # Dispositions first, then newly emitted evidence requests, so a
-            # same-response re-emission of a just-cleared request hits its
-            # head-scoped clearance entry instead of recreating it (#1068).
             evidence_clearances.extend(
                 clearance
                 for clearance in round_evidence_clearances
@@ -6245,11 +6250,7 @@ def run_pr_loop(
                     f"{pr_metadata.head_sha} by its requesting reviewer(s): "
                     + ", ".join(identity for identity, _head in round_evidence_clearances),
                 )
-            # Human-requirement acknowledgement is a structured reviewer/coder
-            # contract, not a reviewer-item ownership decision. Once every
-            # required reviewer has emitted the explicit acknowledgement on
-            # this round, clear the durable acknowledgement obligation here;
-            # ordinary `resolved` dispositions alone still cannot do so.
+            coder_requirements = project(human_requirements, classified_review_carriers, prior_unresolved_items)
             if human_requirements and any(
                 item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
                 for item in unresolved_items
@@ -6262,7 +6263,7 @@ def run_pr_loop(
                     for reviewer_name, review_output in approved_review_outputs
                     if human_requirements_resolved(review_output)
                 }
-                if required_reviewer_names <= acknowledged_reviewer_names:
+                if not coder_requirements or required_reviewer_names <= acknowledged_reviewer_names:
                     unresolved_items = _clear_human_requirements_ack_item(unresolved_items)
             future_followup_items: dict[str, UnresolvedReviewItem] = {}
             for item in [
@@ -6600,7 +6601,7 @@ def run_pr_loop(
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:
-                if human_requirements:
+                if coder_requirements:
                     missing_acknowledgements = [
                         reviewer_name
                         for reviewer_name, review_output in approved_review_outputs
@@ -6608,7 +6609,7 @@ def run_pr_loop(
                     ]
                     if missing_acknowledgements:
                         hr_ids = _surfaced_reviewer_requirement_ids(
-                            human_requirements,
+                            coder_requirements,
                             requirement_scope="PR requirements",
                         )
                         still_missing = []
@@ -9036,7 +9037,7 @@ def run_pr_loop(
                 coder_followup_items = select_coder_followup_items(other_items)
                 combined_review = summary_context + format_coder_followup_context(other_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
-                    human_requirements
+                    coder_requirements
                 )
                 resolved_base_branch = (
                     (latest_mergeability.base_branch if latest_mergeability else None)
@@ -9060,7 +9061,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=human_requirements,
+                    human_requirements=coder_requirements,
                     base_branch=resolved_base_branch,
                     head_sha=resolved_head_sha,
                     merge_state_detail=merge_state_detail,
@@ -9077,7 +9078,7 @@ def run_pr_loop(
                 coder_followup_items = select_coder_followup_items(same_pr_items)
                 combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
-                    human_requirements
+                    coder_requirements
                 )
                 followup_prompt = build_same_pr_followup_prompt(
                     pr_number,
@@ -9086,7 +9087,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=human_requirements,
+                    human_requirements=coder_requirements,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
@@ -9101,7 +9102,7 @@ def run_pr_loop(
                 coder_followup_items = select_coder_followup_items(unresolved_items)
                 combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
-                    human_requirements
+                    coder_requirements
                 )
                 followup_prompt = build_followup_prompt(
                     pr_number,
@@ -9110,7 +9111,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=human_requirements,
+                    human_requirements=coder_requirements,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
@@ -9291,13 +9292,13 @@ def run_pr_loop(
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
                     architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
+                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
                         resolved_item_ids=resolved_ids,
                         excluded_item_ids=excluded_ids,
-                        human_requirements=human_requirements,
+                        human_requirements=coder_requirements,
                         # New follow-ups require the v1 architecture contract.
                         required_architecture_impact_contract=1,
                         delivered_risk_test_matrix=(
@@ -9402,7 +9403,7 @@ def run_pr_loop(
                 unresolved_items = _reconcile_human_requirements_ack_item(
                     unresolved_items,
                     coder_output=coder_output,
-                    human_requirements=human_requirements,
+                    human_requirements=coder_requirements,
                     source_round=round_number,
                 )
                 updated_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number,
