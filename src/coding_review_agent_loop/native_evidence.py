@@ -252,9 +252,10 @@ def publication_dispositions(parsed, text, reviewer, items):
                  if d.item_id in conflicts else d for d in parsed.dispositions)
 
 
-def reopen_cleared_requests(items, boundary, records, head):
+def reopen_cleared_requests(items, boundary, records, head, *, admitted_records):
     """A release authorizes only its own head; restore its native requests on push."""
     prior = [r for r in records if r.index <= boundary.index]
+    admitted_prior = [r for r in admitted_records if r.index <= boundary.index]
     old_head = boundary.metadata.subject
     cleared = {identity for identity, h in boundary.metadata.evidence_clearances if h == old_head}
     if not cleared:
@@ -274,9 +275,10 @@ def reopen_cleared_requests(items, boundary, records, head):
         retired = {alias for item in candidates for alias in item.alias_item_ids}
         candidates = [item for item in candidates if item.item_id not in retired]
         _append_recorded_evidence_requests(candidates,
-            [r for r in group if r.metadata.role == "reviewer"], records=prior)
+            [r for r in group if r.metadata.role == "reviewer"], records=prior,
+            admitted_records=admitted_prior)
         candidates = consolidate_ledger(candidates, known_pr_heads(
-            [r for r in prior if r.index <= max(g.index for g in group)]))
+            [r for r in admitted_prior if r.index <= max(g.index for g in group)]))
     restored = [item for item in candidates if native(item) and set(identities(item)) & cleared]
     result = list(items)
     present = {identity for item in result for identity in identities(item)}

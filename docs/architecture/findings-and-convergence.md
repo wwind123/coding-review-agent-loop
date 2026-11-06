@@ -105,7 +105,12 @@ Conflicting alias votes cannot clear an obligation. Legacy records default to
 empty citation/alias fields. Replay uses admitted heads available at each ingestion
 boundary, never later records retroactively. Push recovery replays requester
 requests after each round's snapshots to retain consolidation text and aliases
-even when the same response clears the survivor before another snapshot.
+even when the same response clears the survivor before another snapshot. Recovery
+uses the authenticated subset for both request head recognition and ledger
+consolidation; retained foreign ordinary records cannot introduce known heads.
+Frozen-response ingestion retains pre-clearance targets to validate consolidation
+reemissions, suppressing them only when every native target belongs to the
+requester and has an authorized clearance at the current head.
 Converted rows and screenshot requests remain separate channels.
 
 Risk-matrix rows whose evidence cannot be tool-captured are converted into the

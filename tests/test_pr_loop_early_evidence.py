@@ -16,8 +16,8 @@ from pr_loop_test_helpers import (_evidence_review, _signed, _resolve, _EVIDENCE
 HEAD = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
 
-def deferred(tmp_path, *, mode="compact", policy="all-reviewers", two_owners=False):
-    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+def deferred(tmp_path, *, mode="compact", policy="all-reviewers", two_owners=False, requests=(_EVIDENCE_TEXT,)):
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=list(requests))],
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=["Operator acceptance B"])] if two_owners else [],
         pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
     config = make_config(tmp_path, pr_review_context_mode=mode, pr_review_policy=policy,
@@ -273,7 +273,8 @@ def test_alias_dispositions_in_real_loop(tmp_path, vote_kind):
 
 @pytest.mark.parametrize("mode", ["compact", "full"])
 @pytest.mark.parametrize("persisted", [False, True])
-def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, persisted):
+@pytest.mark.parametrize("frozen", [False, True])
+def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, persisted, frozen):
     from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
     from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
     runner, config = deferred(tmp_path, mode=mode)
@@ -291,6 +292,12 @@ def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, p
         head_sha=HEAD, items=items, reason="refresh-clean", surfaced_requirement_ids=(),
         allowed_rounds=config.max_rounds, watch_failure_extension_used=False,
         watch_head_extension_used=False)
+    if frozen:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    if frozen:
+        assert not runner.codex_outputs
+    initial_freezes = len(_freeze_records(runner))
     runner.pr_payload["comments"].append(_signed("Accepted for " + HEAD, 1))
     rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
     votes = [{"item_id": item_id, "disposition": "resolved", "note": "Signed acceptance is adequate.",
@@ -299,6 +306,10 @@ def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, p
         evidence=[] if persisted else [text]))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert not _release_records(runner)[-1].metadata.prior_items
+    assert len(_freeze_records(runner)) == initial_freezes
+    assert len([r for r in _release_records(runner)
+                if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not runner.codex_outputs
     runner.git_head = runner.pr_payload["headRefOid"] = "a" * 40
     runner.simulate_new_process()
     runner.codex_outputs.append(_evidence_review(hr=True, state="blocking", dispositions=[{
@@ -313,4 +324,46 @@ def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, p
     assert survivor.obligation_identity == originals[0].obligation_identity
     assert originals[1].obligation_identity in survivor.alias_obligation_identities
     assert freeze.subject == "a" * 40
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+@pytest.mark.parametrize("foreign", [False, True])
+def test_push_restart_preserves_distinct_requests_with_foreign_heads(tmp_path, mode, foreign):
+    from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
+    tokens = ("1234567" + "b" * 33, "abcdef0" + "c" * 33)
+    runner, config = deferred(tmp_path, mode=mode,
+        requests=tuple("Accept screenshot " + token[:7] for token in tokens))
+    records = _pr_records(runner)
+    items = []
+    _append_recorded_evidence_requests(items, [r for r in records if r.metadata.role == "reviewer"], records=records)
+    assert len(items) == 2
+    if foreign:
+        template = _pr_records(runner)[0].metadata
+        for token in tokens:
+            runner.pr_payload["comments"].insert(0, {
+                "author": {"login": "foreign"}, "_rest_author_id": 999,
+                "body": _attach_round_metadata("Foreign historical subject", dataclasses.replace(
+                    template, subject=token, prior_items=(), new_items=(), evidence_requests=()))})
+    support._publish_evidence_release(runner, config=config, pr_number=77, round_number=2,
+        head_sha=HEAD, items=items, reason="refresh-clean", surfaced_requirement_ids=(),
+        allowed_rounds=config.max_rounds, watch_failure_extension_used=False,
+        watch_head_extension_used=False)
+    runner.pr_payload["comments"].append(_signed("Accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[{
+        "item_id": i.item_id, "disposition": "resolved", "note": "Acceptance is adequate.",
+        "evidence_requirement_ids": [rid]} for i in items]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not _release_records(runner)[-1].metadata.prior_items
+    runner.git_head = runner.pr_payload["headRefOid"] = "d" * 40
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_evidence_review(hr=True, state="blocking", dispositions=[{
+        "item_id": i.item_id, "disposition": "blocking", "note": "Need new-head acceptance."
+    } for i in items]))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    reopened = _freeze_records(runner)[-1].metadata.prior_items
+    assert [(i.item_id, i.text, i.obligation_identity, i.alias_item_ids) for i in reopened] == [
+        (i.item_id, i.text, i.obligation_identity, ()) for i in items]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)

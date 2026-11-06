@@ -191,9 +191,37 @@ def test_reopen_legacy_snapshots_coalesces_without_future_heads(with_requests):
     boundary = record(2, H2, evidence_clearances=tuple(
         (i.obligation_identity, H2) for i in (*first, *second)))
     future = record(3, H1[:7] + "b" * 33)
-    restored = reopen_cleared_requests([], boundary, [a, b, boundary, future], future.metadata.subject)
+    restored = reopen_cleared_requests([], boundary, [a, b, boundary, future], future.metadata.subject, admitted_records=[a, b, boundary, future])
     assert len(restored) == 1
     assert restored[0].item_id == "item-1"
     assert restored[0].alias_item_ids == ("item-2",)
     assert restored[0].text == second[0].text
     assert restored[0].lifecycle == "evidence_deferred"
+
+
+@pytest.mark.parametrize("case", ["all", "partial", "wrong-head", "foreign", "converted", "missing", "conflict"])
+def test_post_clearance_consolidation_requires_all_authorized_native_targets(case):
+    items, _ = upsert(text="Screenshot A")
+    items, _ = upsert(items, "Screenshot B", number=2, owner="Gemini" if case == "foreign" else "Codex")
+    if case == "converted":
+        items[1] = replace(items[1], converted_row_id="row", converted_matrix_identity="m")
+    frozen = freeze_evidence_obligations(items, head_sha=H1)
+    votes = {i.item_id: [ReviewItemDisposition(i.item_id, i.reviewer, "resolved")] for i in items}
+    if case == "partial":
+        votes.pop("item-2")
+    if case == "conflict":
+        frozen = list(frozen)
+        frozen[1] = replace(frozen[1], alias_item_ids=("item-3",))
+        votes["item-3"] = [ReviewItemDisposition("item-3", "Codex", "blocking")]
+    clearances = []
+    kept, _ = _apply_unresolved_item_dispositions(frozen, votes, evidence_response_head=H1,
+        configured_reviewers=("Codex", "Gemini"), evidence_clearances=clearances)
+    text = "Consolidate item-1 and item-2 into this existing acceptance request."
+    updated, consumed = _upsert_evidence_obligation(kept, item_number=4, reviewer="Codex",
+        text=text, source_round=2, current_head_sha=H2 if case == "wrong-head" else H1,
+        clearances=clearances, pre_clearance_items=frozen[:1] if case == "missing" else frozen)
+    assert consumed == (case != "all")
+    if case == "all":
+        assert not updated
+    elif case in {"partial", "conflict"}:
+        assert any(i.item_id == "item-2" for i in updated)

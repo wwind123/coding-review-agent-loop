@@ -4501,7 +4501,8 @@ def _recover_unrecorded_pr_head_advance(
         boundary = latest_prior_record.metadata
         ledger = _evidence_boundary_ledger(latest_prior_record, records=records)
         from .native_evidence import reopen_cleared_requests
-        ledger = reopen_cleared_requests(ledger, latest_prior_record, records, head_sha)
+        ledger = reopen_cleared_requests(ledger, latest_prior_record, records, head_sha,
+            admitted_records=[r for r in records if _recovery_record_admitted(r, comments, trusted_actor)])
         broken_head = (
             boundary.evidence_freeze.frozen_head
             if boundary.phase == EVIDENCE_FREEZE_PHASE

@@ -4839,6 +4839,7 @@ def run_pr_loop(
                             source_round=review.metadata.round_number,
                             current_head_sha=review.metadata.subject,
                             clearances=evidence_clearances,
+                            pre_clearance_items=closed_reconciliation.prior_items,
                             known_heads=known_pr_heads(native_history(runner, config, pr_number, pr_comments), review.metadata.subject),
                         )
                         if consumed_item_number:
@@ -6227,6 +6228,7 @@ def run_pr_loop(
                         source_round=round_number,
                         current_head_sha=pr_metadata.head_sha,
                         clearances=evidence_clearances,
+                        pre_clearance_items=prior_unresolved_items,
                         known_heads=known_pr_heads(native_history(runner, config, pr_number, pr_comments), pr_metadata.head_sha),
                     )
                     if consumed_item_number:

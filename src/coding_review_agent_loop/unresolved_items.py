@@ -280,6 +280,7 @@ def _upsert_evidence_obligation(
     current_head_sha: str | None,
     clearances: Sequence[tuple[str, str]] = (),
     known_heads: Sequence[str] = (),
+    pre_clearance_items: Sequence[UnresolvedReviewItem] = (),
 ) -> tuple[list[UnresolvedReviewItem], bool]:
     """Upsert one reviewer's evidence request by identity.
 
@@ -295,6 +296,17 @@ def _upsert_evidence_obligation(
     identity = evidence_obligation_identity(text, reviewer)
     context_identity = contextual_identity(text, reviewer, heads)
     if current_head_sha and any((i, current_head_sha) in set(clearances) for i in (identity, context_identity)):
+        return list(unresolved_items), False
+    # Frozen-response settlement drops accepted targets before request ingestion.
+    # Suppress a consolidation only if every validated target was cleared here;
+    # a partial clearance must never waive the remaining target.
+    candidates = {i.item_id: i for i in pre_clearance_items}
+    candidates.update((i.item_id, i) for i in unresolved_items)
+    cleared_targets = consolidation_targets(text, list(candidates.values()), reviewer)
+    if current_head_sha and cleared_targets and all(
+        any((identity, current_head_sha) in clearances for identity in identities(item))
+        for item in cleared_targets
+    ):
         return list(unresolved_items), False
     matches = consolidation_targets(text, unresolved_items, reviewer)
     if not matches:
