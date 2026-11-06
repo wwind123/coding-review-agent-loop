@@ -2,7 +2,7 @@
 
 How the test suite exercises the orchestrator, when the architecture set must change, how architecture context is injected, and how semantic-claim validation degrades the narrowest offending element: architecture-impact parser modes and canonicalization, the reviewer status re-ask, `test_observations` citation degradation, and the `protocol.py` shape-check audit.
 
-Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
+Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
 
 ## Tests and Document Maintenance
 
@@ -179,7 +179,7 @@ candidate must also pass the unflagged preservation rules against the source,
 it inherits the source's architecture near-miss record, and it is accepted
 only with the after-repair drop record.
 
-Every function, method and nested def in `protocol.py` that can still reach
+Every function, method and nested def in `protocol.py`, `protocol_common.py` and `protocol_discuss.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
 `fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site
 carries an inline annotation. A propagating site names one clause from a
@@ -190,10 +190,18 @@ it can raise without re-raising is annotated as handled. Sites inside generic
 helpers are annotated as delegated to their callers. Imported raisers, such
 as the marker-neutralization check in `sanitize_historical_text`, are listed
 with the classes they raise. `tests/test_shape_check_audit.py` recomputes the
-transitive inventory from source, following bare names, same-module
+transitive inventory from all three owners as one linked parser graph, following bare names, same-module
 `Class.method`, `cls`, `self` and `super()` calls, constructors, and untyped
 receivers. It fails on an unclassified unit, a stale entry, a missing or
 mismatched clause, or a degrading parser that can raise or builds records.
+
+The owner list is explicit in `shape_check_audit.PARSER_OWNERS`. The inventory
+links internal imports to their definitions while retaining external imported-raiser
+verification, degradation coverage and the closed fatal-clause set.
+`tests/fixtures/protocol_support_move.json` records moved symbols, original
+body hashes, global references, decorators and consumer/lookup candidates for
+the following cleanup phase. `tests/test_protocol_support_move.py` checks
+verbatim bodies, temporary object identity and fresh-process import orders.
 
 ## Decisions
 

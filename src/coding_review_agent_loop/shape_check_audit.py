@@ -1,6 +1,6 @@
 """The protocol.py shape-check audit registry (#924 stage 3, #927).
 
-Every function, method and nested def in ``protocol.py`` that can still
+Every function, method and nested def in the ``PARSER_OWNERS`` modules that can still
 reach an ``AgentLoopError``-family raise after the stage-3 conversions is
 classified here as ``fatal``, ``mixed`` or ``delegated``, and every raise
 site and raise-reaching call site in it carries an inline
@@ -20,11 +20,11 @@ construction reaches ``sanitize_historical_text``, so a unit that builds
 records is never a degrading parser.
 
 ``tests/test_shape_check_audit.py`` recomputes the transitive inventory from
-source and fails on any disagreement.  protocol.py never imports this
+source and fails on any disagreement.  The parser owners never import this
 module; it has no runtime effect.
 
 Caveat: calls routed through attributes of other modules' objects are
-outside the inventory.  protocol.py imports only bare names from package
+outside the inventory.  The parser owners import only bare names from package
 modules, so today the caveat covers nothing.
 """
 
@@ -1955,3 +1955,6 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
 }
+
+# All definition owners participate in the linked AST inventory.
+PARSER_OWNERS = ("protocol_common", "protocol_discuss", "protocol")
