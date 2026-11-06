@@ -1,4 +1,6 @@
 
+from coding_review_agent_loop import managed_ci_authorization
+
 from coding_review_agent_loop import managed_ci_api as _managed_ci_api
 from coding_review_agent_loop import managed_ci_protection as _managed_ci_protection
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
@@ -522,7 +524,7 @@ def test_managed_branch_issue_pattern_is_defined_once_in_source():
         for path in src.rglob("*.py")
         for _ in range(path.read_text(encoding="utf-8").count("agent-loop/managed-([1-9]"))
     ]
-    assert hits == ["managed_ci.py"]
+    assert hits == ["managed_ci_authorization.py"]
 
 
 def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
@@ -11687,7 +11689,7 @@ def _continue_1069(runner, config, handoff, *, predecessor, new_head, rounds):
 
 def _ancestors_1069(monkeypatch, ancestors):
     monkeypatch.setattr(
-        managed_ci, "_github_proves_descendant",
+        managed_ci_authorization, "_github_proves_descendant",
         lambda _runner, *, config, predecessor_head, live_head: predecessor_head in ancestors,
     )
 
@@ -11872,7 +11874,7 @@ def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
     def unavailable(_runner, *, config, predecessor_head, live_head):
         raise AgentLoopError("Managed-CI API request failed: compare.")
 
-    monkeypatch.setattr(managed_ci, "_github_proves_descendant", unavailable)
+    monkeypatch.setattr(managed_ci_authorization, "_github_proves_descendant", unavailable)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,

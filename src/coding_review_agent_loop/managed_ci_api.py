@@ -2,6 +2,9 @@
 from __future__ import annotations
 from .managed_ci_tuple import MANAGED_LABEL
 import functools
+from collections.abc import Mapping
+from .github import note_host_footer_observed
+from .protocol_markers import strip_known_host_footer
 import json
 import re
 import threading
@@ -423,3 +426,21 @@ def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: 
     except json.JSONDecodeError as exc:
         raise AgentLoopError(f"Managed-CI API response was invalid JSON: {endpoint}.") from exc
     return payload if isinstance(payload, dict) else {}
+
+
+def _normalized_comment_body(
+    comment: Mapping[str, object], *, config: AgentLoopConfig | None
+) -> str:
+    """Return one raw ``_api_list`` comment body with the host footer removed once.
+
+    This is the managed-CI comment-ingestion boundary (#1043).  Strict record
+    parsers downstream never strip, so exactly one known host footer is
+    tolerated along any path and a doubled footer still reaches the parser.
+    """
+    raw = comment.get("body")
+    if not isinstance(raw, str):
+        return ""
+    body, footered = strip_known_host_footer(raw)
+    if footered:
+        note_host_footer_observed(config, "managed-CI record re-read")
+    return body

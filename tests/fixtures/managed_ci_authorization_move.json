@@ -1,0 +1,1480 @@
+{
+  "source_revision": "475fb2eff1f5764541ae5c2422080f71fe6e2b25",
+  "owners": {
+    "managed_ci_authorization": {
+      "_encode_issue_authorization_payload": {
+        "sha256": "5fa0e440106633114174d88c8f92d0bc5545c019e7c304703d376208ecfecdfa",
+        "original_lines": [
+          198,
+          200
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:5122",
+          "tests/test_managed_ci.py:5156",
+          "tests/test_managed_ci.py:5179",
+          "tests/test_managed_ci.py:8416",
+          "tests/test_managed_ci.py:9865"
+        ]
+      },
+      "format_issue_created_authorization_comment": {
+        "sha256": "a21946dad182c461a05e9bfcd47b15c9bcb11b4843873bc019cfc2d37f4d8011",
+        "original_lines": [
+          203,
+          222
+        ],
+        "same_module_references": [
+          "ISSUE_AUTHORIZATION_MARKER",
+          "ManagedCiIssueAuthorization",
+          "PR_COMMENT_SURFACE",
+          "TrustedBody",
+          "_encode_issue_authorization_payload",
+          "protocol_record_label"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_plan_binding.py:18",
+          "tests/test_managed_plan_binding.py:81",
+          "tests/test_managed_ci.py:58",
+          "tests/test_managed_ci.py:788",
+          "tests/test_managed_ci.py:1029",
+          "tests/test_managed_ci.py:1142",
+          "tests/test_managed_ci.py:1180",
+          "tests/test_managed_ci.py:1219",
+          "tests/test_managed_ci.py:1221",
+          "tests/test_managed_ci.py:1313",
+          "tests/test_managed_ci.py:1315",
+          "tests/test_managed_ci.py:1319",
+          "tests/test_managed_ci.py:1323",
+          "tests/test_managed_ci.py:2496",
+          "tests/test_managed_ci.py:2498",
+          "tests/test_managed_ci.py:2541",
+          "tests/test_managed_ci.py:2545",
+          "tests/test_managed_ci.py:2573",
+          "tests/test_managed_ci.py:2579",
+          "tests/test_managed_ci.py:2581",
+          "tests/test_managed_ci.py:2612",
+          "tests/test_managed_ci.py:2618",
+          "tests/test_managed_ci.py:2620",
+          "tests/test_managed_ci.py:2970",
+          "tests/test_managed_ci.py:3091",
+          "tests/test_managed_ci.py:3453",
+          "tests/test_managed_ci.py:3454",
+          "tests/test_managed_ci.py:3482",
+          "tests/test_managed_ci.py:3483",
+          "tests/test_managed_ci.py:3486",
+          "tests/test_managed_ci.py:3518",
+          "tests/test_managed_ci.py:3556",
+          "tests/test_managed_ci.py:3601",
+          "tests/test_managed_ci.py:3646",
+          "tests/test_managed_ci.py:3665",
+          "tests/test_managed_ci.py:3729",
+          "tests/test_managed_ci.py:3798",
+          "tests/test_managed_ci.py:3801",
+          "tests/test_managed_ci.py:3870",
+          "tests/test_managed_ci.py:3931",
+          "tests/test_managed_ci.py:4218",
+          "tests/test_managed_ci.py:4244",
+          "tests/test_managed_ci.py:4245",
+          "tests/test_managed_ci.py:4246",
+          "tests/test_managed_ci.py:4727",
+          "tests/test_managed_ci.py:4901",
+          "tests/test_managed_ci.py:5526",
+          "tests/test_managed_ci.py:8424",
+          "tests/test_managed_ci.py:8435",
+          "tests/test_managed_ci.py:8456",
+          "tests/test_managed_ci.py:8780",
+          "tests/test_managed_ci.py:10159",
+          "tests/test_managed_ci.py:10161",
+          "tests/test_managed_ci.py:10182",
+          "tests/test_managed_ci.py:10575",
+          "tests/test_managed_ci.py:10587",
+          "tests/test_managed_ci.py:10595",
+          "tests/test_managed_ci.py:10604",
+          "tests/test_managed_ci.py:10618",
+          "tests/test_managed_ci.py:11479",
+          "tests/test_managed_ci.py:11606",
+          "tests/test_managed_ci.py:11669",
+          "tests/test_managed_ci.py:11898",
+          "tests/test_managed_ci.py:12735",
+          "tests/test_managed_ci.py:14509",
+          "tests/test_pr_loop_managed_ci.py:58",
+          "tests/test_pr_loop_managed_ci.py:1127"
+        ]
+      },
+      "parse_issue_created_authorization_comment": {
+        "sha256": "0b2f914193117f7e1feef06598a7b889f7a97a68a60e0cea3563c94c81445610",
+        "original_lines": [
+          225,
+          369
+        ],
+        "same_module_references": [
+          "AgentLoopError",
+          "ISSUE_AUTHORIZATION_MARKER",
+          "MARKER_BY_TOKEN",
+          "ManagedCiIssueAuthorization",
+          "PR_COMMENT_SURFACE",
+          "TrustedBody",
+          "_OVERRIDE_PROTECTION_STATES",
+          "_SUPERSEDING_AUTHORIZATION_KINDS",
+          "_encode_issue_authorization_payload",
+          "_waiver_for_protection",
+          "format_issue_created_authorization_comment",
+          "scan_reserved_markers"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_reviewer_floor.py:719",
+          "tests/test_reviewer_floor.py:744",
+          "tests/test_managed_ci.py:59",
+          "tests/test_managed_ci.py:882",
+          "tests/test_managed_ci.py:954",
+          "tests/test_managed_ci.py:1030",
+          "tests/test_managed_ci.py:1912",
+          "tests/test_managed_ci.py:2689",
+          "tests/test_managed_ci.py:2770",
+          "tests/test_managed_ci.py:2830",
+          "tests/test_managed_ci.py:2905",
+          "tests/test_managed_ci.py:2995",
+          "tests/test_managed_ci.py:3392",
+          "tests/test_managed_ci.py:5126",
+          "tests/test_managed_ci.py:5160",
+          "tests/test_managed_ci.py:8433",
+          "tests/test_managed_ci.py:8454",
+          "tests/test_managed_ci.py:9886",
+          "tests/test_managed_ci.py:9891",
+          "tests/test_managed_ci.py:9903",
+          "tests/test_managed_ci.py:9945",
+          "tests/test_managed_ci.py:10606",
+          "tests/test_managed_ci.py:10608",
+          "tests/test_managed_ci.py:10611",
+          "tests/test_managed_ci.py:10631",
+          "tests/test_managed_ci.py:10635",
+          "tests/test_managed_ci.py:11508",
+          "tests/test_managed_ci.py:11600",
+          "tests/test_managed_ci.py:11605",
+          "tests/test_managed_ci.py:11636",
+          "tests/test_managed_ci.py:11713",
+          "tests/test_managed_ci.py:11731",
+          "tests/test_managed_ci.py:11781",
+          "tests/test_managed_ci.py:11809",
+          "tests/test_managed_ci.py:11886",
+          "tests/test_managed_ci.py:11897",
+          "tests/test_managed_ci.py:16773",
+          "tests/test_issue_implementation_recovery.py:25",
+          "tests/test_issue_implementation_recovery.py:314",
+          "tests/test_issue_implementation_recovery.py:418",
+          "tests/test_issue_implementation_recovery.py:579",
+          "tests/test_issue_implementation_recovery.py:691",
+          "tests/test_issue_implementation_recovery.py:938",
+          "tests/test_issue_implementation_recovery.py:1094"
+        ]
+      },
+      "parse_managed_ci_override_record": {
+        "sha256": "0713b0385822b54e89c0c4763aabb6b4b47b59f3f22cd2f3e0dc03d6d79dc828",
+        "original_lines": [
+          372,
+          448
+        ],
+        "same_module_references": [
+          "AgentLoopError",
+          "Literal",
+          "ManagedCiOverrideRecord",
+          "TrustedBody",
+          "UNPROTECTED_OVERRIDE_TRAILER",
+          "scan_reserved_markers"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_pr.py:18",
+          "src/coding_review_agent_loop/managed_pr.py:143",
+          "src/coding_review_agent_loop/managed_pr.py:226",
+          "tests/test_managed_ci.py:66",
+          "tests/test_managed_ci.py:4453",
+          "tests/test_managed_ci.py:4457",
+          "tests/test_managed_ci.py:8673",
+          "tests/test_managed_ci.py:8834",
+          "tests/test_issue_implementation_managed_pr.py:15",
+          "tests/test_issue_implementation_managed_pr.py:127",
+          "tests/test_issue_implementation_managed_pr.py:383"
+        ]
+      },
+      "_opening_override_nonce": {
+        "sha256": "8dc6d125857976824c14e8992f6223740711e9a4f50be611fdcaac9fd4123155",
+        "original_lines": [
+          451,
+          467
+        ],
+        "same_module_references": [
+          "PR_BODY_SURFACE",
+          "UNPROTECTED_OVERRIDE_TRAILER",
+          "parse_managed_ci_override_record"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_issue_created_tuple": {
+        "sha256": "9a28b759a2610c401811cc3f3a113305d22a43ec47a8c697e71970951a3e54f9",
+        "original_lines": [
+          877,
+          984
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "Literal",
+          "PR_BODY_SURFACE",
+          "PullRequestMetadata",
+          "Runner",
+          "_advertised_managed_actor",
+          "compare_opening_pr",
+          "managed_ci_api",
+          "parse_managed_ci_override_record",
+          "parse_strong_issue_reference_evidence",
+          "read_opening_pr",
+          "render_managed_ci_resume_command",
+          "replace"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:5370",
+          "tests/test_managed_ci.py:5397",
+          "tests/test_managed_ci.py:5437"
+        ]
+      },
+      "authenticate_issue_created_handoff": {
+        "sha256": "18eccaa39623a751c22c5901a1d77e78c0f55bd2f30ca390f4ee64bdd408e276",
+        "original_lines": [
+          987,
+          1007
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AuthenticatedIssueCreatedHandoff",
+          "ManagedCiCreationIntent",
+          "PullRequestMetadata",
+          "Runner",
+          "_issue_created_tuple"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/issue_implementation.py:80",
+          "src/coding_review_agent_loop/issue_implementation.py:681",
+          "src/coding_review_agent_loop/issue_loop.py:70",
+          "src/coding_review_agent_loop/issue_loop.py:1051",
+          "src/coding_review_agent_loop/orchestrator.py:257",
+          "tests/test_issue_implementation_coverage_reask.py:373",
+          "tests/test_issue_implementation_coverage_reask.py:526",
+          "tests/test_issue_implementation_coverage_reask.py:562",
+          "tests/test_issue_implementation_coverage_reask.py:734",
+          "tests/test_issue_implementation_coverage_reask.py:781",
+          "tests/test_issue_implementation_coverage_reask.py:1106",
+          "tests/test_managed_ci.py:56",
+          "tests/test_managed_ci.py:4529",
+          "tests/test_managed_ci.py:5387",
+          "tests/test_managed_ci.py:5418",
+          "tests/test_managed_ci.py:5463",
+          "tests/test_managed_ci.py:9353",
+          "tests/test_managed_ci.py:9381",
+          "tests/test_issue_implementation_managed_pr.py:147",
+          "tests/test_issue_implementation_managed_pr.py:401",
+          "tests/test_issue_implementation_managed_pr.py:437",
+          "tests/test_plan_first_loop_issue_scope.py:1209",
+          "tests/test_issue_implementation_recovery.py:305",
+          "tests/test_issue_implementation_recovery.py:395",
+          "tests/test_issue_implementation_recovery.py:512",
+          "tests/test_issue_implementation_recovery.py:570",
+          "tests/test_issue_implementation_recovery.py:1044",
+          "tests/test_issue_implementation_recovery.py:1403"
+        ]
+      },
+      "_authorization_actor": {
+        "sha256": "dc499ed5e2d1d964cfa0a6dde7817b53f2818d6d2a47e110a46275cd6fa8a3a3",
+        "original_lines": [
+          1010,
+          1033
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "Runner",
+          "_advertised_managed_actor",
+          "managed_ci_api"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:9314",
+          "tests/test_managed_ci.py:9350",
+          "tests/test_managed_ci.py:9379"
+        ]
+      },
+      "_authorization_comment_records": {
+        "sha256": "31c9555e585ea0fdcbd7e5d2045f73711c81ccd6431bd682b7404703f2014fa4",
+        "original_lines": [
+          1036,
+          1074
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "ISSUE_AUTHORIZATION_MARKER",
+          "ManagedCiIssueAuthorization",
+          "Runner",
+          "_api_list_detailed",
+          "_normalized_comment_body",
+          "_superseded_authorization_ids",
+          "_with_reason",
+          "parse_issue_created_authorization_comment"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_github_retry.py:307",
+          "tests/test_managed_ci.py:10566",
+          "tests/test_managed_ci.py:11736"
+        ]
+      },
+      "_superseded_authorization_ids": {
+        "sha256": "12319c418f8a3941e07827812403c8c0057314b2c93c5e977d3fa0d010cdca32",
+        "original_lines": [
+          1077,
+          1104
+        ],
+        "same_module_references": [
+          "Iterable",
+          "ManagedCiIssueAuthorization",
+          "_SUPERSEDING_AUTHORIZATION_KINDS"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:11574",
+          "tests/test_managed_ci.py:11579",
+          "tests/test_managed_ci.py:11900"
+        ]
+      },
+      "_superseded_authorization_comment_ids": {
+        "sha256": "eba403f6e1f1550da334f2fa8a3e5e921264e917db4a686376f52ca458b56fbc",
+        "original_lines": [
+          1107,
+          1137
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "ISSUE_AUTHORIZATION_MARKER",
+          "Iterable",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_normalized_comment_body",
+          "_superseded_authorization_ids",
+          "parse_issue_created_authorization_comment"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_github_proves_descendant": {
+        "sha256": "51e3b62237570ed4bd8ebb53e91f685108c18c22dfafc662ee8fbd0a1b2527bf",
+        "original_lines": [
+          1140,
+          1168
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "Runner",
+          "managed_ci_api",
+          "quote"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_module_split_imports.py:338",
+          "tests/test_managed_ci.py:11690",
+          "tests/test_managed_ci.py:11875"
+        ]
+      },
+      "find_actor_round_metadata_comment_ids": {
+        "sha256": "4050f5b25b94f66d71a50ae2424fbb24cd18a58d636608e1200418eb09beea45",
+        "original_lines": [
+          1171,
+          1282
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "Collection",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "Runner",
+          "_api_list_detailed",
+          "_continuity_round_records",
+          "_correlate_rejected_recovery",
+          "_with_reason",
+          "is_complete_code_review"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:262",
+          "src/coding_review_agent_loop/pr_loop.py:182",
+          "src/coding_review_agent_loop/pr_loop.py:9737",
+          "tests/test_pr_loop_authorization.py:319",
+          "tests/test_managed_ci.py:1403",
+          "tests/test_managed_ci.py:1420",
+          "tests/test_managed_ci.py:1667",
+          "tests/test_managed_ci.py:1722",
+          "tests/test_managed_ci.py:1789",
+          "tests/test_managed_ci.py:1851",
+          "tests/test_managed_ci.py:1867",
+          "tests/test_managed_ci.py:1882",
+          "tests/test_managed_ci.py:1898",
+          "tests/test_managed_ci.py:2005",
+          "tests/test_managed_ci.py:2053",
+          "tests/test_managed_ci.py:2471",
+          "tests/test_managed_ci.py:8942",
+          "tests/test_managed_ci.py:8973",
+          "tests/test_managed_ci.py:9025",
+          "tests/test_managed_ci.py:9055",
+          "tests/test_managed_ci.py:14634",
+          "tests/test_managed_ci.py:14696",
+          "tests/test_managed_ci.py:15260",
+          "tests/test_pr_loop_managed_ci.py:1673"
+        ]
+      },
+      "_continuity_round_records": {
+        "sha256": "af0ec8de1dac28c5e2e89938e0a6733a1c52e724782012535e778d86055b9c2d",
+        "original_lines": [
+          1285,
+          1358
+        ],
+        "same_module_references": [
+          "AgentLoopError",
+          "ROUND_RESUME_MARKER_RE",
+          "_CONTINUITY_RECOVERY_PHASES",
+          "_decode_recovery_round_record",
+          "_records_ci_repair_transitions",
+          "_records_merge_conflict_obligation",
+          "decode_mapping",
+          "hydrate_mapping"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:1640",
+          "tests/test_managed_ci.py:1660",
+          "tests/test_managed_ci.py:1719",
+          "tests/test_managed_ci.py:1999",
+          "tests/test_managed_ci.py:2176",
+          "tests/test_managed_ci.py:8934",
+          "tests/test_managed_ci.py:8964",
+          "tests/test_managed_ci.py:9015",
+          "tests/test_managed_ci.py:9047",
+          "tests/test_managed_ci.py:15271",
+          "tests/test_managed_ci.py:15490",
+          "tests/test_managed_ci.py:15532",
+          "tests/test_managed_ci.py:15743",
+          "tests/test_capture_authority.py:15",
+          "tests/test_capture_authority.py:80",
+          "tests/test_capture_authority.py:83"
+        ]
+      },
+      "_records_merge_conflict_obligation": {
+        "sha256": "fe6a6129a85e2d85b5deb5eaa732503f2fdc77a81657e01265f65d402ae6eb59",
+        "original_lines": [
+          1361,
+          1361
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_obligations.py:9",
+          "tests/test_managed_ci.py:1616",
+          "tests/test_managed_ci.py:1622"
+        ]
+      },
+      "_records_ci_repair_transitions": {
+        "sha256": "fe6a6129a85e2d85b5deb5eaa732503f2fdc77a81657e01265f65d402ae6eb59",
+        "original_lines": [
+          1361,
+          1361
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/managed_ci_obligations.py:43"
+        ]
+      },
+      "_continuity_round_metadata_is_valid": {
+        "sha256": "4d7cb7a44b0c3fc3a86c4faefdb5afea780842490c3540d47a49b744b004c0e4",
+        "original_lines": [
+          1364,
+          1388
+        ],
+        "same_module_references": [
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_continuity_link_shape"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:1672",
+          "tests/test_managed_ci.py:1728",
+          "tests/test_managed_ci.py:1796",
+          "tests/test_managed_ci.py:1856",
+          "tests/test_managed_ci.py:1873",
+          "tests/test_managed_ci.py:1887",
+          "tests/test_managed_ci.py:1903",
+          "tests/test_managed_ci.py:2010",
+          "tests/test_managed_ci.py:2060",
+          "tests/test_managed_ci.py:8936",
+          "tests/test_managed_ci.py:8966",
+          "tests/test_managed_ci.py:9019",
+          "tests/test_managed_ci.py:9049"
+        ]
+      },
+      "_continuity_link_shape": {
+        "sha256": "fc52414f71aa5d628b82496f585c8a535fd74618467475d78e0cf3c76496741f",
+        "original_lines": [
+          1391,
+          1431
+        ],
+        "same_module_references": [
+          "Literal",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_comments_by_id",
+          "_ordinary_continuity_round_metadata_is_valid",
+          "_recovery_continuity_is_valid"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_ordinary_continuity_round_metadata_is_valid": {
+        "sha256": "8af7043a767bc517c3c98ac6a12000b203d4c04ddba911c42bb93ec153e8e5e4",
+        "original_lines": [
+          1434,
+          1503
+        ],
+        "same_module_references": [
+          "AgentLoopError",
+          "ManagedCiIssueAuthorization",
+          "_continuity_round_records",
+          "_historical_bindings_match",
+          "is_complete_code_review"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_CONTINUITY_REJECTED_PHASE": {
+        "sha256": "52b587f4021bde91f8f8e3bad98b5ed4e690c2555abccd54643127b427f857ba",
+        "original_lines": [
+          1508,
+          1508
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_CONTINUITY_DISPATCH_PHASE": {
+        "sha256": "85d1210b477179bbbcbc635a8919dddc42ed47259f4a8211d9153ca62730a0c7",
+        "original_lines": [
+          1509,
+          1509
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_CONTINUITY_RECOVERY_PHASES": {
+        "sha256": "ae383cf02a801290fc1fbc1aec16d8ef07f13e1c2d1360fdebf86a2739a893a5",
+        "original_lines": [
+          1510,
+          1512
+        ],
+        "same_module_references": [
+          "_CONTINUITY_DISPATCH_PHASE",
+          "_CONTINUITY_REJECTED_PHASE"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "PlanPolicy": {
+        "sha256": "913642b4f2088b370875c044f49dd37f7e419eab6640b2e867afda93a4a59833",
+        "original_lines": [
+          1515,
+          1521
+        ],
+        "same_module_references": [
+          "Enum"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "ChainAuthContext": {
+        "sha256": "9e5077b556fab31733bbba8fb37d267c8871a6073b65fe8a54ea6874e91bbec5",
+        "original_lines": [
+          1524,
+          1542
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AuthenticatedIssueCreatedHandoff",
+          "dataclass"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "consumer_candidates": []
+      },
+      "chain_auth_context_for_handoff": {
+        "sha256": "a0737c3879a94e09a2252b33d03bb4a3d512d61cca3c281b4e3a6eb0e114dda4",
+        "original_lines": [
+          1545,
+          1567
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AuthenticatedIssueCreatedHandoff",
+          "ChainAuthContext",
+          "Collection"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:15301"
+        ]
+      },
+      "load_actor_authorization_records": {
+        "sha256": "4e6011ba1bd7d53c1ab5fc8e1c9862b6730aa4b83e6b46533613dd0bf1ccbeb5",
+        "original_lines": [
+          1570,
+          1587
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "ManagedCiIssueAuthorization",
+          "Runner",
+          "_authorization_comment_records"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "load_actor_label_event_ids": {
+        "sha256": "effd94c26bf8c324cf8f35c5e51027267d05cce6cb574ac53edd4678f8e70fb8",
+        "original_lines": [
+          1590,
+          1603
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "Runner",
+          "_actor_owned_label_event_ids"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "rejected_recovery_correlation_inputs": {
+        "sha256": "ab5c4fbfb0b1703b8d6881c02e427cd22661836dd7c700446d144dc4a69c72a3",
+        "original_lines": [
+          1606,
+          1648
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "Runner",
+          "chain_auth_context_for_handoff",
+          "load_actor_authorization_records",
+          "load_actor_label_event_ids"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop.py:185",
+          "src/coding_review_agent_loop/pr_loop.py:9752",
+          "tests/test_managed_ci.py:14638"
+        ]
+      },
+      "_comments_by_id": {
+        "sha256": "4acd08ab105d88fc6800b20588b320048ed4ef4e7c33b34f9abe5a272c84788a",
+        "original_lines": [
+          1651,
+          1658
+        ],
+        "same_module_references": [
+          "Iterable",
+          "Mapping"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_chain_record_admissible": {
+        "sha256": "7571f0ddb322174f7c80ba4471cfaed590e50c18d0d55bb5653f0636c7c007e6",
+        "original_lines": [
+          1661,
+          1737
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "PlanPolicy",
+          "_authorization_record_valid_for_handoff",
+          "waivable_protection_states"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_pending_authorization_fields_admissible": {
+        "sha256": "8a762dd1d2be4eceb59b709d907fee6af0fc23211ff49e4b3517d16620254668",
+        "original_lines": [
+          1740,
+          1774
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "_waiver_for_protection",
+          "waivable_protection_states"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:15310",
+          "tests/test_managed_ci.py:15330"
+        ]
+      },
+      "_recovery_context": {
+        "sha256": "32806efdc697e3b5a0fd8cb2d2fdfa4b7bc23d57b195425976e4345a421496f9",
+        "original_lines": [
+          1777,
+          1783
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "replace"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop.py:5041",
+          "src/coding_review_agent_loop/pr_loop.py:5050",
+          "src/coding_review_agent_loop/pr_loop.py:5062",
+          "src/coding_review_agent_loop/pr_loop.py:5152",
+          "src/coding_review_agent_loop/pr_loop.py:5154",
+          "src/coding_review_agent_loop/pr_loop.py:5213",
+          "src/coding_review_agent_loop/plan_first_loop.py:3523",
+          "src/coding_review_agent_loop/plan_first_loop.py:3534",
+          "src/coding_review_agent_loop/plan_first_loop.py:3579",
+          "src/coding_review_agent_loop/plan_first_loop.py:3599",
+          "tests/test_pr_loop_coder_followup.py:525"
+        ]
+      },
+      "_authenticate_authorization_chain": {
+        "sha256": "d33214ecf1e415d8680ccd2d017da521c4e1baeb9e85985a570812c6f6de31f3",
+        "original_lines": [
+          1786,
+          1866
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "PlanPolicy",
+          "_chain_record_admissible",
+          "_continuity_link_shape",
+          "_recovery_context"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_authenticated_recovery_root": {
+        "sha256": "9b9c501a1aa650233338387cd0cd21b53d69b29c2f818a13ccf110996a892c84",
+        "original_lines": [
+          1869,
+          1926
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "PlanPolicy",
+          "_authenticate_authorization_chain",
+          "_chain_record_admissible",
+          "_recovery_context"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_decode_recovery_round_record": {
+        "sha256": "67b3edbc93ce9bc2bc216cf41c9347a1dcdd7e7e4c12e079bd24ecec8e498749",
+        "original_lines": [
+          1929,
+          1939
+        ],
+        "same_module_references": [
+          "Mapping",
+          "_CONTINUITY_RECOVERY_PHASES"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_seat_binding_key": {
+        "sha256": "b3db373762cd3125697258fc9e2998649e1c84a1b8a7e9c22465ba7573bb6069",
+        "original_lines": [
+          1942,
+          1943
+        ],
+        "same_module_references": [
+          "Mapping"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_historical_bindings_match": {
+        "sha256": "da787fb28f7da279800c197e844fadce9621524adedd309bc7608d54dac0a0ea",
+        "original_lines": [
+          1946,
+          1974
+        ],
+        "same_module_references": [
+          "Mapping",
+          "Sequence",
+          "_seat_binding_key"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_rejected_recovery_round_ids": {
+        "sha256": "de542d58d7fec2980705abdd69ce9d976c712e91afcbbc303cd6793a42d50638",
+        "original_lines": [
+          1977,
+          2121
+        ],
+        "same_module_references": [
+          "Mapping",
+          "_CONTINUITY_DISPATCH_PHASE",
+          "_CONTINUITY_REJECTED_PHASE",
+          "_historical_bindings_match",
+          "_seat_binding_key",
+          "is_complete_code_review"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:15276",
+          "tests/test_managed_ci.py:15280",
+          "tests/test_managed_ci.py:15284",
+          "tests/test_managed_ci.py:15288"
+        ]
+      },
+      "_correlate_rejected_recovery": {
+        "sha256": "8d03fd268e61035f59df0b6a31bfdaad9b0a6ea4eeb4bc72fa85ba74d675c7d8",
+        "original_lines": [
+          2124,
+          2164
+        ],
+        "same_module_references": [
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_authenticated_recovery_root",
+          "_comments_by_id",
+          "_rejected_recovery_round_ids"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_recovery_continuity_is_valid": {
+        "sha256": "2692ca60dfbd410a1f7066decd95007ced07e7c6d76f0324dad51d9fa3ac5c84",
+        "original_lines": [
+          2167,
+          2225
+        ],
+        "same_module_references": [
+          "AgentLoopError",
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_continuity_round_records",
+          "_correlate_rejected_recovery",
+          "is_complete_code_review"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "publish_issue_created_authorization": {
+        "sha256": "b02e82d524fe6e67b3fa62799a80f9a5113d46e0fcfe58e3c1ddc93fe1cea2bc",
+        "original_lines": [
+          2228,
+          2339
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "ManagedCiIssueAuthorization",
+          "PullRequestMetadata",
+          "Runner",
+          "_active_managed_label_event",
+          "_authorization_comment_records",
+          "_issue_created_tuple",
+          "_last_list_failure",
+          "_surfaces_list_failures",
+          "_waiver_for_protection",
+          "_with_reason",
+          "format_issue_created_authorization_comment",
+          "post_verified_trusted_pr_protocol_comment",
+          "replace"
+        ],
+        "decorators": [
+          "_surfaces_list_failures"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/issue_implementation.py:82",
+          "src/coding_review_agent_loop/issue_implementation.py:218",
+          "src/coding_review_agent_loop/orchestrator.py:264",
+          "tests/test_github_retry.py:410",
+          "tests/test_issue_implementation_coverage_reask.py:374",
+          "tests/test_issue_implementation_coverage_reask.py:528",
+          "tests/test_issue_implementation_coverage_reask.py:564",
+          "tests/test_issue_implementation_coverage_reask.py:736",
+          "tests/test_issue_implementation_coverage_reask.py:782",
+          "tests/test_issue_implementation_coverage_reask.py:1107",
+          "tests/test_managed_ci.py:61",
+          "tests/test_managed_ci.py:906",
+          "tests/test_managed_ci.py:1039",
+          "tests/test_managed_ci.py:1042",
+          "tests/test_managed_ci.py:1059",
+          "tests/test_managed_ci.py:1072",
+          "tests/test_managed_ci.py:1085",
+          "tests/test_managed_ci.py:1099",
+          "tests/test_managed_ci.py:1254",
+          "tests/test_managed_ci.py:1358",
+          "tests/test_managed_ci.py:1429",
+          "tests/test_managed_ci.py:1496",
+          "tests/test_managed_ci.py:1807",
+          "tests/test_managed_ci.py:1936",
+          "tests/test_managed_ci.py:2025",
+          "tests/test_managed_ci.py:2102",
+          "tests/test_managed_ci.py:2217",
+          "tests/test_managed_ci.py:2341",
+          "tests/test_managed_ci.py:2721",
+          "tests/test_managed_ci.py:2890",
+          "tests/test_managed_ci.py:2944",
+          "tests/test_managed_ci.py:3064",
+          "tests/test_managed_ci.py:3118",
+          "tests/test_managed_ci.py:8446",
+          "tests/test_managed_ci.py:8475",
+          "tests/test_managed_ci.py:8516",
+          "tests/test_managed_ci.py:9897",
+          "tests/test_managed_ci.py:15441",
+          "tests/test_managed_ci.py:15657",
+          "tests/test_managed_ci.py:16706",
+          "tests/test_issue_implementation_managed_pr.py:150",
+          "tests/test_issue_implementation_managed_pr.py:404",
+          "tests/test_plan_first_loop_issue_scope.py:1210",
+          "tests/test_issue_implementation_recovery.py:1004"
+        ]
+      },
+      "_continuity_live_pr_tuple": {
+        "sha256": "2786c2d2ce6b3fc9190f11e3eaadc9945d64b96f09852b1859392a5cd0df8360",
+        "original_lines": [
+          2342,
+          2382
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "Runner",
+          "managed_ci_api"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_stranded_continuity_comment_ids": {
+        "sha256": "9e001916ed81e82351aab0a69cae78ef877f3075650ceca94ed8d85321177e79",
+        "original_lines": [
+          2385,
+          2464
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "Collection",
+          "ManagedCiIssueAuthorization",
+          "Runner",
+          "_github_proves_descendant",
+          "_managed_label_event_history"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "publish_issue_created_continuity_authorization": {
+        "sha256": "f7b7c534f78a3ad6b0574974e4aadc42b4a53d4339d585fecec54359eba01186",
+        "original_lines": [
+          2467,
+          2795
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "ChainAuthContext",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "Runner",
+          "_active_managed_label_event",
+          "_api_list_detailed",
+          "_authorization_comment_records",
+          "_continuity_link_shape",
+          "_continuity_live_pr_tuple",
+          "_is_retired_plan_history",
+          "_last_list_failure",
+          "_pending_authorization_fields_admissible",
+          "_stranded_continuity_comment_ids",
+          "_surfaces_list_failures",
+          "_waiver_for_protection",
+          "_with_reason",
+          "chain_auth_context_for_handoff",
+          "format_issue_created_authorization_comment",
+          "load_actor_label_event_ids",
+          "log",
+          "post_verified_trusted_pr_protocol_comment",
+          "replace"
+        ],
+        "decorators": [
+          "_surfaces_list_failures"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:263",
+          "src/coding_review_agent_loop/pr_loop.py:183",
+          "src/coding_review_agent_loop/pr_loop.py:9756",
+          "tests/test_pr_loop_authorization.py:327",
+          "tests/test_github_retry.py:440",
+          "tests/test_managed_ci.py:60",
+          "tests/test_managed_ci.py:924",
+          "tests/test_managed_ci.py:1107",
+          "tests/test_managed_ci.py:1153",
+          "tests/test_managed_ci.py:1191",
+          "tests/test_managed_ci.py:1232",
+          "tests/test_managed_ci.py:1262",
+          "tests/test_managed_ci.py:1280",
+          "tests/test_managed_ci.py:1335",
+          "tests/test_managed_ci.py:1363",
+          "tests/test_managed_ci.py:1436",
+          "tests/test_managed_ci.py:1505",
+          "tests/test_managed_ci.py:1812",
+          "tests/test_managed_ci.py:1945",
+          "tests/test_managed_ci.py:2035",
+          "tests/test_managed_ci.py:2150",
+          "tests/test_managed_ci.py:2157",
+          "tests/test_managed_ci.py:2284",
+          "tests/test_managed_ci.py:2291",
+          "tests/test_managed_ci.py:2422",
+          "tests/test_managed_ci.py:2429",
+          "tests/test_managed_ci.py:2988",
+          "tests/test_managed_ci.py:3015",
+          "tests/test_managed_ci.py:3030",
+          "tests/test_managed_ci.py:3126",
+          "tests/test_managed_ci.py:11682",
+          "tests/test_managed_ci.py:14704",
+          "tests/test_managed_ci.py:14708",
+          "tests/test_managed_ci.py:14916",
+          "tests/test_managed_ci.py:14969",
+          "tests/test_managed_ci.py:14993",
+          "tests/test_managed_ci.py:15016",
+          "tests/test_managed_ci.py:15036",
+          "tests/test_managed_ci.py:15065",
+          "tests/test_managed_ci.py:15077",
+          "tests/test_managed_ci.py:15183",
+          "tests/test_managed_ci.py:15249",
+          "tests/test_managed_ci.py:15354",
+          "tests/test_managed_ci.py:16740",
+          "tests/test_pr_loop_managed_ci.py:1680"
+        ]
+      },
+      "_timeline_source_repository": {
+        "sha256": "8c4834967cc2c9e3334668b9fbc60b57b7e97b98d4e83e7396cd4996794f55a7",
+        "original_lines": [
+          2798,
+          2819
+        ],
+        "same_module_references": [
+          "urlparse"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "authorize_fresh_issue_created_resume": {
+        "sha256": "c66e465d28501453f939af749b0b5284959ad2e1cb0ba88e08071dfcd42248e1",
+        "original_lines": [
+          2822,
+          3207
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "Collection",
+          "MANAGED_LABEL",
+          "ManagedCiIssueAuthorization",
+          "ManagedCiProbeContext",
+          "PullRequestMetadata",
+          "Runner",
+          "_OVERRIDE_PROTECTION_STATES",
+          "_api_list_detailed",
+          "_authorization_actor",
+          "_authorization_comment_records",
+          "_github_proves_descendant",
+          "_historical_managed_label_event",
+          "_last_list_failure",
+          "_managed_label_event_history",
+          "_opening_override_nonce",
+          "_surfaces_list_failures",
+          "_timeline_source_repository",
+          "_waiver_for_protection",
+          "_with_reason",
+          "assess_exact_head_protection",
+          "format_issue_created_authorization_comment",
+          "github_api_cwd",
+          "log",
+          "managed_ci_api",
+          "post_verified_trusted_pr_protocol_comment",
+          "waivable_protection_states",
+          "waiver_flags_for_protection"
+        ],
+        "decorators": [
+          "_surfaces_list_failures"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:255",
+          "src/coding_review_agent_loop/pr_loop.py:177",
+          "src/coding_review_agent_loop/pr_loop.py:988",
+          "tests/test_child_plan_provenance.py:1161",
+          "tests/test_child_plan_provenance.py:4495",
+          "tests/test_issue_pr_handoff.py:769",
+          "tests/test_issue_pr_handoff.py:865",
+          "tests/test_issue_pr_handoff.py:2140",
+          "tests/test_issue_pr_handoff.py:2562",
+          "tests/test_pr_loop_authorization.py:144",
+          "tests/test_pr_loop_authorization.py:210",
+          "tests/test_pr_loop_authorization.py:244",
+          "tests/test_pr_loop_authorization.py:268",
+          "tests/test_pr_loop_authorization.py:950",
+          "tests/test_pr_loop_authorization.py:976",
+          "tests/test_pr_loop_review_scheduling.py:2916",
+          "tests/test_reviewer_floor.py:770",
+          "tests/test_managed_ci.py:57",
+          "tests/test_managed_ci.py:2644",
+          "tests/test_managed_ci.py:2652",
+          "tests/test_managed_ci.py:2683",
+          "tests/test_managed_ci.py:2705",
+          "tests/test_managed_ci.py:2725",
+          "tests/test_managed_ci.py:2744",
+          "tests/test_managed_ci.py:2759",
+          "tests/test_managed_ci.py:2801",
+          "tests/test_managed_ci.py:2821",
+          "tests/test_managed_ci.py:2859",
+          "tests/test_managed_ci.py:2875",
+          "tests/test_managed_ci.py:2897",
+          "tests/test_managed_ci.py:2928",
+          "tests/test_managed_ci.py:2949",
+          "tests/test_managed_ci.py:3071",
+          "tests/test_managed_ci.py:3100",
+          "tests/test_managed_ci.py:3373",
+          "tests/test_managed_ci.py:3384",
+          "tests/test_managed_ci.py:3408",
+          "tests/test_managed_ci.py:3432",
+          "tests/test_managed_ci.py:9929",
+          "tests/test_managed_ci.py:9936",
+          "tests/test_managed_ci.py:9939",
+          "tests/test_managed_ci.py:11486",
+          "tests/test_managed_ci.py:15478",
+          "tests/test_managed_ci.py:15690",
+          "tests/test_handoff_growth_verdict.py:296",
+          "tests/test_pr_loop_reviewer_boards.py:659",
+          "tests/test_pr_loop_reviewer_boards.py:903",
+          "tests/test_pr_loop_managed_ci.py:1314",
+          "tests/test_pr_loop_managed_ci.py:1397"
+        ]
+      },
+      "revalidate_issue_created_handoff": {
+        "sha256": "eb4394c0618fa73196f9e8322e84557063e462c0be845cfaf5b4c48b8525eda0",
+        "original_lines": [
+          3210,
+          3321
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "PullRequestMetadata",
+          "Runner",
+          "_active_managed_label_event",
+          "_issue_created_tuple",
+          "_last_list_failure",
+          "_managed_label_event_history",
+          "_opening_override_nonce",
+          "_surfaces_list_failures",
+          "_with_reason",
+          "authorize_fresh_issue_created_resume",
+          "replace",
+          "revalidate_issue_created_handoff"
+        ],
+        "decorators": [
+          "_surfaces_list_failures"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:272",
+          "src/coding_review_agent_loop/pr_loop.py:191",
+          "src/coding_review_agent_loop/pr_loop.py:1007",
+          "src/coding_review_agent_loop/pr_loop.py:1156",
+          "src/coding_review_agent_loop/managed_ci_failure.py:141",
+          "tests/test_child_plan_provenance.py:1160",
+          "tests/test_child_plan_provenance.py:4556",
+          "tests/test_issue_pr_handoff.py:783",
+          "tests/test_issue_pr_handoff.py:883",
+          "tests/test_issue_pr_handoff.py:2141",
+          "tests/test_pr_loop_authorization.py:186",
+          "tests/test_pr_loop_authorization.py:311",
+          "tests/test_pr_loop_authorization.py:864",
+          "tests/test_pr_loop_authorization.py:915",
+          "tests/test_pr_loop_review_scheduling.py:2919",
+          "tests/test_managed_ci.py:70",
+          "tests/test_managed_ci.py:2135",
+          "tests/test_managed_ci.py:2269",
+          "tests/test_managed_ci.py:2407",
+          "tests/test_managed_ci.py:2837",
+          "tests/test_managed_ci.py:3189",
+          "tests/test_managed_ci.py:3223",
+          "tests/test_managed_ci.py:3291",
+          "tests/test_managed_ci.py:4579",
+          "tests/test_managed_ci.py:15391",
+          "tests/test_issue_implementation_managed_pr.py:153",
+          "tests/test_plan_first_loop_issue_scope.py:1211",
+          "tests/test_handoff_growth_verdict.py:324",
+          "tests/test_pr_loop_reviewer_boards.py:905",
+          "tests/test_pr_loop_managed_ci.py:1300",
+          "tests/test_pr_loop_managed_ci.py:1396",
+          "tests/test_pr_loop_managed_ci.py:1663"
+        ]
+      },
+      "_MANAGED_ISSUE_BRANCH_RE": {
+        "sha256": "4a3d5321f15fa11d928e379fd72d229768d61798f4e6882e0e8e1c42745d58b2",
+        "original_lines": [
+          3324,
+          3324
+        ],
+        "same_module_references": [],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "managed_branch_issue_number": {
+        "sha256": "ebd40bf8c3d8764e3c8e743681d4e0fa1648e25b288f82cf3c54bbff6485a17d",
+        "original_lines": [
+          3327,
+          3337
+        ],
+        "same_module_references": [
+          "_MANAGED_ISSUE_BRANCH_RE"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_board_state.py:370",
+          "src/coding_review_agent_loop/pr_board_state.py:375",
+          "tests/test_board_change.py:4977",
+          "tests/test_board_change.py:4985",
+          "tests/test_board_change.py:4986",
+          "tests/test_managed_ci.py:512",
+          "tests/test_managed_ci.py:514"
+        ]
+      },
+      "recover_issue_created_handoff": {
+        "sha256": "43dad338b7f921daa69a450bc96c30dcd87862c15d67d84fd2ecda7b1a7bacb9",
+        "original_lines": [
+          3340,
+          3446
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "MANAGED_LABEL",
+          "PR_BODY_SURFACE",
+          "PullRequestMetadata",
+          "Runner",
+          "UNPROTECTED_OVERRIDE_TRAILER",
+          "_active_managed_label_event",
+          "_issue_created_tuple",
+          "_last_list_failure",
+          "_recover_issue_created_protection",
+          "_surfaces_list_failures",
+          "_with_reason",
+          "managed_branch_issue_number",
+          "parse_managed_ci_override_record",
+          "read_opening_pr",
+          "render_managed_ci_resume_command",
+          "replace"
+        ],
+        "decorators": [
+          "_surfaces_list_failures"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:273",
+          "src/coding_review_agent_loop/pr_loop.py:192",
+          "src/coding_review_agent_loop/pr_loop.py:1028",
+          "tests/test_child_plan_provenance.py:1140",
+          "tests/test_child_plan_provenance.py:4548",
+          "tests/test_issue_pr_handoff.py:781",
+          "tests/test_issue_pr_handoff.py:882",
+          "tests/test_issue_pr_handoff.py:2139",
+          "tests/test_pr_loop_authorization.py:179",
+          "tests/test_pr_loop_authorization.py:860",
+          "tests/test_pr_loop_authorization.py:906",
+          "tests/test_managed_ci.py:69",
+          "tests/test_managed_ci.py:3140",
+          "tests/test_managed_ci.py:3334",
+          "tests/test_managed_ci.py:4574",
+          "tests/test_managed_ci.py:4617",
+          "tests/test_managed_ci.py:4663",
+          "tests/test_managed_ci.py:4740",
+          "tests/test_managed_ci.py:5538",
+          "tests/test_managed_ci.py:8795",
+          "tests/test_managed_ci.py:10216",
+          "tests/test_handoff_growth_verdict.py:321",
+          "tests/test_managed_ci_fresh_resume.py:35",
+          "tests/test_pr_loop_reviewer_boards.py:901",
+          "tests/test_pr_loop_managed_ci.py:1293",
+          "tests/test_pr_loop_managed_ci.py:1305",
+          "tests/test_pr_loop_managed_ci.py:1341",
+          "tests/test_pr_loop_managed_ci.py:1365",
+          "tests/test_pr_loop_managed_ci.py:1381",
+          "tests/test_pr_loop_managed_ci.py:1396",
+          "tests/test_pr_loop_managed_ci.py:1431",
+          "tests/test_pr_loop_managed_ci.py:1453"
+        ]
+      },
+      "_recover_issue_created_protection": {
+        "sha256": "cf644cf4739c3162054a6a1a742b69433c91a1901c6d7504077af858970478e2",
+        "original_lines": [
+          3449,
+          3640
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AgentLoopError",
+          "AuthenticatedIssueCreatedHandoff",
+          "ISSUE_AUTHORIZATION_MARKER",
+          "ManagedCiIssueAuthorization",
+          "ManagedCiProbeContext",
+          "Mapping",
+          "Runner",
+          "_OVERRIDE_PROTECTION_STATES",
+          "_actor_owned_label_event_ids",
+          "_api_list_detailed",
+          "_authorization_record_valid_for_handoff",
+          "_last_list_failure",
+          "_normalized_comment_body",
+          "_superseded_authorization_ids",
+          "_with_reason",
+          "assess_exact_head_protection",
+          "github_api_cwd",
+          "parse_issue_created_authorization_comment",
+          "reconcile_live_protection",
+          "render_managed_ci_resume_command",
+          "replace",
+          "waivable_protection_states",
+          "waiver_flags_for_protection"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_is_retired_plan_history": {
+        "sha256": "26db6e2462b9fffc410a59695b535dd65653c2ca46a129dd299a9278965940d7",
+        "original_lines": [
+          4867,
+          4877
+        ],
+        "same_module_references": [
+          "AuthenticatedIssueCreatedHandoff",
+          "ManagedCiIssueAuthorization"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_actor_owned_label_event_ids": {
+        "sha256": "8878a5c16a979b858e74a27a88b33f47ca9a513d22d1cfe53ecb8dc955843772",
+        "original_lines": [
+          4880,
+          4907
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "MANAGED_LABEL",
+          "Runner",
+          "_api_list"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_github_retry.py:352"
+        ]
+      },
+      "_authorization_matches": {
+        "sha256": "c022e81feee5967f7e86f2834aa0bcc6f6a5f4c6e699f7b1893d0339f46f29f0",
+        "original_lines": [
+          4910,
+          5021
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AuthenticatedIssueCreatedHandoff",
+          "ManagedCiIssueAuthorization",
+          "_waiver_for_protection",
+          "waivable_protection_states"
+        ],
+        "decorators": [],
+        "consumer_candidates": []
+      },
+      "_authorization_record_valid_for_handoff": {
+        "sha256": "75c24c1763b803e8c34270d787fd1ca1353fd636d82cf7ab797f37da6f9c569a",
+        "original_lines": [
+          5024,
+          5077
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "AuthenticatedIssueCreatedHandoff",
+          "ManagedCiIssueAuthorization",
+          "Mapping",
+          "_authorization_matches",
+          "_is_retired_plan_history",
+          "replace"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "tests/test_managed_ci.py:10118"
+        ]
+      }
+    },
+    "managed_ci_api": {
+      "_normalized_comment_body": {
+        "sha256": "c4ca57cb2faa6d66596e777b44bdf6701930ef621246901c510d04ef051dc19a",
+        "original_lines": [
+          6055,
+          6070
+        ],
+        "same_module_references": [
+          "AgentLoopConfig",
+          "Mapping",
+          "note_host_footer_observed",
+          "strip_known_host_footer"
+        ],
+        "decorators": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/protocol_markers.py:38"
+        ]
+      }
+    }
+  },
+  "compatibility": "All moved bindings remain explicit identity-preserving imports in managed_ci.py until phase eight.",
+  "patch_retargets": [
+    "tests/test_managed_ci.py: _github_proves_descendant patches now target managed_ci_authorization, where authorization and plan-binding paths look it up."
+  ]
+}
