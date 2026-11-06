@@ -1,0 +1,4548 @@
+{
+  "source_revision": "5e51424007c6a50a69feb7f4d3a19fe5260bc851",
+  "owners": {
+    "protocol_risk": {
+      "CITATION_DEGRADATION_MAX_DROPS": {
+        "sha256": "cc90f6b0e8e70e47d087a329aa205688580589dd4aff9e9038be4b4def3f0c23",
+        "original_lines": [
+          543,
+          543
+        ],
+        "global_references": [
+          "PARSE_DEGRADATION_RENDER_LIMIT"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:988",
+          "src/coding_review_agent_loop/repair_preservation.py:12",
+          "src/coding_review_agent_loop/repair_preservation.py:1014",
+          "src/coding_review_agent_loop/repair_preservation.py:1030",
+          "src/coding_review_agent_loop/shape_check_audit.py:417",
+          "tests/test_shape_check_audit.py:968"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATION_DROPPED_OUTCOME": {
+        "sha256": "24ce012907fa53bf688fe6390a10523073b28964c31dc2b9cad5e878936102b9",
+        "original_lines": [
+          544,
+          544
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:99",
+          "src/coding_review_agent_loop/pr_loop_support.py:386"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATIONS_DECODED_FROM_STRING_OUTCOME": {
+        "sha256": "b03e6000366388ca01bf6207b60b5bcea3290d7be5c0ad0140b2b625edc9d093",
+        "original_lines": [
+          547,
+          547
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:25",
+          "src/coding_review_agent_loop/comment_rendering.py:992",
+          "src/coding_review_agent_loop/comment_rendering.py:996"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_MAX_ROWS": {
+        "sha256": "975d13cecc1b1a75593daccdd7c8ee6689fc9d13b24bcbb0a8b885d0b673e749",
+        "original_lines": [
+          871,
+          871
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS": {
+        "sha256": "7ec038bc94f33e2a7ac09e5133989b36ae8a3d4fbf20b5bf7a99f7aa72e98c8d",
+        "original_lines": [
+          872,
+          872
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_risk_test_matrix.py:3513",
+          "tests/test_risk_test_matrix.py:3709"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES": {
+        "sha256": "9fbc8f40c28a350a6d926cf1dc90fd8fd412641c3674ce2bbc52cbbd8ba47aeb",
+        "original_lines": [
+          873,
+          873
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_MAX_CAVEATS": {
+        "sha256": "be122517e3d9112cd5161ae8e4982f7d3ab7cb9e414fd4355ac9c4ea6b34d588",
+        "original_lines": [
+          874,
+          874
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:2927",
+          "tests/test_protocol.py:2931",
+          "tests/test_protocol.py:2937",
+          "tests/test_protocol.py:2939"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES": {
+        "sha256": "1ae0ca6d52604f0170eca5842ff95315b15e4799fc2a0ef042c63c02e16c6f3e",
+        "original_lines": [
+          878,
+          878
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS": {
+        "sha256": "9f5f8c9f926a80dfddee6ca9837160652eebadb4a974cd5a7f550b16615450e0",
+        "original_lines": [
+          880,
+          880
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "DROPPED_VALUE_MAX_BYTES": {
+        "sha256": "da7e6e968613280dce7b5c08e4e2ccb00ace81b654e90f3a42ff8d2f03b08bca",
+        "original_lines": [
+          884,
+          884
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:346",
+          "tests/test_risk_test_matrix.py:2898",
+          "tests/test_risk_test_matrix.py:3130",
+          "tests/test_risk_test_matrix.py:3131",
+          "tests/test_risk_test_matrix.py:3137",
+          "tests/test_risk_test_matrix.py:3138",
+          "tests/test_risk_test_matrix.py:3203",
+          "tests/test_risk_test_matrix.py:3685",
+          "tests/test_protocol.py:6263",
+          "tests/test_protocol.py:6265",
+          "tests/test_protocol.py:6269"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIM_REQUIRED_KEYS": {
+        "sha256": "160c270f739e712e0a66e70d1b7ef8991ff82fbb8d57eee3be82fe7827bf3580",
+        "original_lines": [
+          889,
+          889
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIM_FACT_KEYS": {
+        "sha256": "341edd554ec0567aa3f7412f67590b8a8740ad57bc50b80503973d9bd249aa1e",
+        "original_lines": [
+          890,
+          896
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_risk_test_matrix.py:403",
+          "tests/test_risk_test_matrix.py:434"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS": {
+        "sha256": "a3656bc42660a3e961242b01da1040e6c1b801a208f536e0b87ab39751dac500",
+        "original_lines": [
+          897,
+          897
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIM_COVERAGE_KEYS": {
+        "sha256": "d5e8022cf321ed045e7f67a824cee35079bcb71929f4fc758305b9fdd9046a1d",
+        "original_lines": [
+          901,
+          901
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_TEST_LEVELS": {
+        "sha256": "a379605f0aaf8fc587306e153f715330e3b89905abeb2db59be62c45a5f60247",
+        "original_lines": [
+          902,
+          902
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_COVERAGE_GAP_KEYS": {
+        "sha256": "ae5a3fd959bebbe0a4ae46e93942e7a4ae6bcdb10c011094fd4ea1ea454adec3",
+        "original_lines": [
+          903,
+          903
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_COVERAGE_GAPS_FIELD": {
+        "sha256": "97c1f4e1b1edd3fad04543c230144ff83f27be480dea5b8e3a6d37698879f4e8",
+        "original_lines": [
+          904,
+          904
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SEMANTIC_RISK_CLAIM_KEYS": {
+        "sha256": "33ac171394119dce14a82647d5ade42e324b7cd896b1c883b74df26c69fd1ff6",
+        "original_lines": [
+          905,
+          909
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIM_FACT_KEYS",
+          "SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS",
+          "SEMANTIC_RISK_CLAIM_REQUIRED_KEYS"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:3413",
+          "tests/test_protocol.py:3420",
+          "tests/test_prompts.py:4156",
+          "tests/test_prompts.py:4190"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "semantic_risk_claim_example": {
+        "sha256": "3dd7b4189f3bcda10e6cb9b6d75a760f5170f82f7b88e7fbbcdb1677a343ab7a",
+        "original_lines": [
+          912,
+          931
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:53",
+          "src/coding_review_agent_loop/repair.py:524",
+          "src/coding_review_agent_loop/repair.py:548",
+          "src/coding_review_agent_loop/repair.py:1348",
+          "tests/test_risk_test_matrix.py:3446",
+          "tests/test_risk_test_matrix.py:3452",
+          "tests/test_risk_test_matrix.py:3455",
+          "tests/test_repair.py:5052",
+          "tests/test_repair.py:5060",
+          "tests/test_protocol.py:3415",
+          "tests/test_protocol.py:3416",
+          "tests/test_protocol.py:3419",
+          "tests/test_protocol.py:3421",
+          "tests/test_prompts.py:19",
+          "tests/test_prompts.py:2251",
+          "tests/test_prompts.py:4158",
+          "tests/test_prompts.py:4159",
+          "tests/test_prompts.py:4188",
+          "tests/test_prompts.py:4196",
+          "tests/test_prompts.py:4199",
+          "tests/test_prompts.py:4217",
+          "tests/test_prompts.py:4242"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "semantic_risk_claim_example_json": {
+        "sha256": "6e048e9bbab2936d3e67cd59817ad2c7d79a63e191443b839a036610a12bcb73",
+        "original_lines": [
+          934,
+          948
+        ],
+        "global_references": [
+          "json",
+          "semantic_risk_claim_example"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:53",
+          "src/coding_review_agent_loop/repair.py:1348",
+          "tests/test_repair.py:5052",
+          "tests/test_repair.py:5060",
+          "tests/test_protocol.py:3416",
+          "tests/test_protocol.py:3419",
+          "tests/test_prompts.py:19",
+          "tests/test_prompts.py:2251",
+          "tests/test_prompts.py:4159",
+          "tests/test_prompts.py:4188",
+          "tests/test_prompts.py:4217",
+          "tests/test_prompts.py:4242"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "semantic_risk_claim_schema_text": {
+        "sha256": "339dc8a19d3cf9abd22f19511789255c6a77e1c70fa284213f437096221c8af2",
+        "original_lines": [
+          951,
+          973
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIM_COVERAGE_KEYS",
+          "SEMANTIC_RISK_CLAIM_KEYS",
+          "_semantic_risk_claim_schema_text_base"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:369",
+          "src/coding_review_agent_loop/repair.py:54",
+          "src/coding_review_agent_loop/repair.py:1554",
+          "src/coding_review_agent_loop/repair.py:1703",
+          "src/coding_review_agent_loop/response_validation.py:74",
+          "src/coding_review_agent_loop/response_validation.py:330",
+          "src/coding_review_agent_loop/prompts.py:61",
+          "src/coding_review_agent_loop/prompts.py:1657",
+          "src/coding_review_agent_loop/prompts.py:1767",
+          "tests/test_risk_test_matrix.py:3447",
+          "tests/test_risk_test_matrix.py:3450",
+          "tests/test_risk_test_matrix.py:3453",
+          "tests/test_risk_test_matrix.py:3456",
+          "tests/test_risk_test_matrix.py:3514",
+          "tests/test_risk_test_matrix.py:3708",
+          "tests/test_protocol.py:57",
+          "tests/test_protocol.py:5541",
+          "tests/test_protocol.py:5543"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_semantic_risk_claim_schema_text_base": {
+        "sha256": "dbe3b216f7bbef85d0c794443a34c949ad2344d27dd06c8bdabe6d42cfd81bf3",
+        "original_lines": [
+          976,
+          1014
+        ],
+        "global_references": [
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS",
+          "SEMANTIC_RISK_CLAIM_FACT_KEYS",
+          "semantic_risk_claim_example_json"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SemanticRiskCoverageClaim": {
+        "sha256": "c7564b2edad0ebd59839321542d7eace52b2032a5c12df2a3c9fa4885dfadf8a",
+        "original_lines": [
+          1017,
+          1066
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:334",
+          "src/coding_review_agent_loop/risk_coverage_map.py:272",
+          "src/coding_review_agent_loop/response_validation.py:51",
+          "src/coding_review_agent_loop/response_validation.py:385",
+          "src/coding_review_agent_loop/shape_check_audit.py:238",
+          "src/coding_review_agent_loop/shape_check_audit.py:247",
+          "tests/test_evidence_conversion.py:29",
+          "tests/test_evidence_conversion.py:30",
+          "tests/test_evidence_conversion.py:106",
+          "tests/test_evidence_conversion.py:117",
+          "tests/test_evidence_conversion.py:123",
+          "tests/test_risk_test_matrix.py:20",
+          "tests/test_risk_test_matrix.py:21",
+          "tests/test_risk_test_matrix.py:123",
+          "tests/test_risk_test_matrix.py:160",
+          "tests/test_risk_test_matrix.py:161",
+          "tests/test_risk_test_matrix.py:197",
+          "tests/test_risk_test_matrix.py:199",
+          "tests/test_risk_test_matrix.py:361",
+          "tests/test_risk_test_matrix.py:407",
+          "tests/test_risk_test_matrix.py:461",
+          "tests/test_risk_test_matrix.py:514",
+          "tests/test_risk_test_matrix.py:515",
+          "tests/test_risk_test_matrix.py:594",
+          "tests/test_risk_test_matrix.py:595",
+          "tests/test_risk_test_matrix.py:690",
+          "tests/test_risk_test_matrix.py:691",
+          "tests/test_risk_test_matrix.py:740",
+          "tests/test_risk_test_matrix.py:773",
+          "tests/test_risk_test_matrix.py:798",
+          "tests/test_risk_test_matrix.py:799",
+          "tests/test_risk_test_matrix.py:948",
+          "tests/test_risk_test_matrix.py:987",
+          "tests/test_risk_test_matrix.py:1060",
+          "tests/test_risk_test_matrix.py:2366",
+          "tests/test_risk_test_matrix.py:3464",
+          "tests/test_risk_test_matrix.py:3733",
+          "tests/test_risk_test_matrix.py:3734",
+          "tests/test_evidence_reconciliation.py:99",
+          "tests/test_evidence_reconciliation.py:100",
+          "tests/test_evidence_reconciliation.py:160",
+          "tests/test_evidence_reconciliation.py:292",
+          "tests/test_evidence_reconciliation.py:293",
+          "tests/test_protocol.py:3028",
+          "tests/test_protocol.py:3069",
+          "tests/test_protocol.py:3077",
+          "tests/test_protocol.py:3101",
+          "tests/test_protocol.py:3102",
+          "tests/test_protocol.py:3132",
+          "tests/test_protocol.py:3138",
+          "tests/test_protocol.py:3182",
+          "tests/test_protocol.py:3183",
+          "tests/test_protocol.py:3204",
+          "tests/test_protocol.py:3210",
+          "tests/test_risk_coverage_map.py:12",
+          "tests/test_risk_coverage_map.py:68",
+          "tests/test_risk_coverage_map.py:80",
+          "tests/test_response_validation.py:1048",
+          "tests/test_response_validation.py:1049",
+          "tests/test_pr_loop_evidence_conversion.py:28",
+          "tests/test_pr_loop_evidence_conversion.py:29",
+          "tests/test_pr_loop_evidence_conversion.py:127",
+          "tests/test_pr_loop_evidence_conversion.py:138"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "SemanticRiskCoverageClaims": {
+        "sha256": "87c0d0d64e57b0f2a7cf0b67354a6184f1786aa2e9e992d58fa56a2f1427c94f",
+        "original_lines": [
+          1069,
+          1100
+        ],
+        "global_references": [
+          "ParseDegradation",
+          "SemanticRiskCoverageClaim",
+          "dataclass"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:334",
+          "src/coding_review_agent_loop/response_validation.py:51",
+          "src/coding_review_agent_loop/response_validation.py:385",
+          "src/coding_review_agent_loop/shape_check_audit.py:247",
+          "tests/test_evidence_conversion.py:30",
+          "tests/test_evidence_conversion.py:123",
+          "tests/test_risk_test_matrix.py:21",
+          "tests/test_risk_test_matrix.py:123",
+          "tests/test_risk_test_matrix.py:160",
+          "tests/test_risk_test_matrix.py:197",
+          "tests/test_risk_test_matrix.py:361",
+          "tests/test_risk_test_matrix.py:407",
+          "tests/test_risk_test_matrix.py:461",
+          "tests/test_risk_test_matrix.py:514",
+          "tests/test_risk_test_matrix.py:594",
+          "tests/test_risk_test_matrix.py:690",
+          "tests/test_risk_test_matrix.py:740",
+          "tests/test_risk_test_matrix.py:773",
+          "tests/test_risk_test_matrix.py:798",
+          "tests/test_risk_test_matrix.py:799",
+          "tests/test_risk_test_matrix.py:948",
+          "tests/test_risk_test_matrix.py:987",
+          "tests/test_risk_test_matrix.py:1060",
+          "tests/test_risk_test_matrix.py:2366",
+          "tests/test_risk_test_matrix.py:3464",
+          "tests/test_risk_test_matrix.py:3733",
+          "tests/test_evidence_reconciliation.py:100",
+          "tests/test_evidence_reconciliation.py:160",
+          "tests/test_evidence_reconciliation.py:292",
+          "tests/test_protocol.py:3028",
+          "tests/test_protocol.py:3077",
+          "tests/test_protocol.py:3102",
+          "tests/test_protocol.py:3138",
+          "tests/test_protocol.py:3183",
+          "tests/test_protocol.py:3210",
+          "tests/test_response_validation.py:1049",
+          "tests/test_pr_loop_evidence_conversion.py:29",
+          "tests/test_pr_loop_evidence_conversion.py:138"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:1154",
+          "src/coding_review_agent_loop/protocol.py:1189"
+        ]
+      },
+      "SemanticRiskCoverageGap": {
+        "sha256": "0cbed1fcbbe7b7806e9361fffc585c42cdc621deaf96cea0c14443b91a83a7e7",
+        "original_lines": [
+          1103,
+          1116
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/risk_coverage_map.py:273",
+          "src/coding_review_agent_loop/shape_check_audit.py:256",
+          "src/coding_review_agent_loop/shape_check_audit.py:265",
+          "tests/test_risk_coverage_map.py:13",
+          "tests/test_risk_coverage_map.py:172",
+          "tests/test_risk_coverage_map.py:200"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "SemanticRiskCoverageGaps": {
+        "sha256": "22c533354e1f1e90991b82ebb0d92552ddbc8fe27a6d0eb3bf389934cbea5439",
+        "original_lines": [
+          1119,
+          1131
+        ],
+        "global_references": [
+          "ParseDegradation",
+          "SemanticRiskCoverageGap",
+          "dataclass"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:265"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:1168",
+          "src/coding_review_agent_loop/protocol.py:1199"
+        ]
+      },
+      "RISK_TEST_MATRIX_CONTRACT_VERSION": {
+        "sha256": "69ff79c1d937714d091689cd3c21891a89cf0ca55ef48c21ec292195199cdf2f",
+        "original_lines": [
+          1604,
+          1604
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_ROWS": {
+        "sha256": "4e163a22841da03e2df58fdf174463758dbcbcbd3154ae8bec61a34747151c26",
+        "original_lines": [
+          1605,
+          1605
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_assembly.py:20",
+          "src/coding_review_agent_loop/plan_assembly.py:536",
+          "src/coding_review_agent_loop/plan_assembly.py:539",
+          "tests/test_child_plan_provenance.py:2261",
+          "tests/test_child_plan_provenance.py:2265",
+          "tests/test_plan_assembly.py:21",
+          "tests/test_plan_assembly.py:276",
+          "tests/test_plan_assembly.py:277",
+          "tests/test_plan_assembly.py:283",
+          "tests/test_plan_assembly.py:284",
+          "tests/test_plan_assembly.py:290"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_AUDIT_ROW_IDS": {
+        "sha256": "7588af6cd48b7a7291f379c21e1a3273b9a0607e6a54eae73174aef9507d08b3",
+        "original_lines": [
+          1609,
+          1609
+        ],
+        "global_references": [
+          "RISK_MATRIX_MAX_ROWS"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_EXCLUSIONS": {
+        "sha256": "9e5186b0e6928dad3d8ff2d5662cbdc1b53ed41194e13784b7de241c44ac167a",
+        "original_lines": [
+          1610,
+          1610
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_CHANGES": {
+        "sha256": "e9b243ec2c11ae9cb3c8d7767e850b175773f9783cd93b82529cabd4d00a1af8",
+        "original_lines": [
+          1611,
+          1611
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8691"
+        ]
+      },
+      "RISK_MATRIX_MAX_LIST_ITEMS": {
+        "sha256": "42d18c0a4b9e182565230a73f06c7bdb0ed1cceb010fca91f2e3a580159675a0",
+        "original_lines": [
+          1612,
+          1612
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:52",
+          "tests/test_protocol.py:5545"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_CAVEATS": {
+        "sha256": "0068d641236b5fd3b54c88f001e326ac97de50291acd8b6fdba73868e2ea7c3b",
+        "original_lines": [
+          1616,
+          1616
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_FIELD_BYTES": {
+        "sha256": "ca5bd3726dedcde1a73aa1f4b0f0e832f556999f711055b283e0d2773ba87438",
+        "original_lines": [
+          1617,
+          1617
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_MAX_PAYLOAD_BYTES": {
+        "sha256": "c872f1033381bf9f6ff0674a0d3fe3623e797b5e6d4889b8414410c7d0011bd0",
+        "original_lines": [
+          1618,
+          1618
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_APPLICABILITY": {
+        "sha256": "1cc4c1e66fdd8718b2dc721b71e6f1a833d8c5d6c12d94e2f5a5b6e26b08a0b4",
+        "original_lines": [
+          1619,
+          1619
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_CHANGE_OPERATIONS": {
+        "sha256": "2acd59277701702a7510b456baea85eebc42a008caab85bdf346a711c79dec94",
+        "original_lines": [
+          1620,
+          1620
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_REQUIRED_KEYS": {
+        "sha256": "de4973c1967e62ef0871083e1a7fae684cd32a936da691df383e2d5813a648e5",
+        "original_lines": [
+          1624,
+          1628
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:50",
+          "src/coding_review_agent_loop/repair.py:1431",
+          "src/coding_review_agent_loop/prompts.py:58",
+          "src/coding_review_agent_loop/prompts.py:2148",
+          "tests/test_repair.py:20",
+          "tests/test_repair.py:97",
+          "tests/test_protocol.py:54",
+          "tests/test_protocol.py:4022",
+          "tests/test_prompts.py:37",
+          "tests/test_prompts.py:127"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_OPTIONAL_KEYS": {
+        "sha256": "676544c3f7517202491a87d3d76e4a7b0da76d4f22ca522892afd603e5a21d9d",
+        "original_lines": [
+          1629,
+          1629
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:49",
+          "src/coding_review_agent_loop/repair.py:1432",
+          "src/coding_review_agent_loop/prompts.py:57",
+          "src/coding_review_agent_loop/prompts.py:2149",
+          "tests/test_prompts.py:36",
+          "tests/test_prompts.py:127"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_ROW_KEYS": {
+        "sha256": "b8ca24d7571cf908652c10fe5bda57657d82ae724c51ae398ea23dedd0963c84",
+        "original_lines": [
+          1630,
+          1643
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:51",
+          "src/coding_review_agent_loop/repair.py:1433",
+          "src/coding_review_agent_loop/prompts.py:59",
+          "src/coding_review_agent_loop/prompts.py:2150",
+          "tests/test_repair.py:21",
+          "tests/test_repair.py:97",
+          "tests/test_protocol.py:55",
+          "tests/test_protocol.py:4023",
+          "tests/test_prompts.py:38",
+          "tests/test_prompts.py:128"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_CHANGE_KEYS": {
+        "sha256": "3cd755fca7fa4b242612dc32efc511b62b744894389487a1d555dd876419a52d",
+        "original_lines": [
+          1644,
+          1644
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:48",
+          "src/coding_review_agent_loop/repair.py:1434",
+          "src/coding_review_agent_loop/prompts.py:56",
+          "src/coding_review_agent_loop/prompts.py:2151",
+          "tests/test_repair.py:19",
+          "tests/test_repair.py:98",
+          "tests/test_protocol.py:53",
+          "tests/test_protocol.py:4024",
+          "tests/test_prompts.py:35",
+          "tests/test_prompts.py:128"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS": {
+        "sha256": "70b28b45c664c4e57f9bfbf51a605c1eee886e6fce6fa35c6fe7ec89fbcc8077",
+        "original_lines": [
+          1645,
+          1645
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:47",
+          "src/coding_review_agent_loop/repair.py:1435",
+          "src/coding_review_agent_loop/prompts.py:55",
+          "src/coding_review_agent_loop/prompts.py:2152"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_OWNER_NAMES": {
+        "sha256": "74804348a84330d94d3e150dbb9ea57ce304a1bb7f89da683a1fa344edd2b4ec",
+        "original_lines": [
+          1646,
+          1646
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_MATRIX_EVIDENCE_STATUSES": {
+        "sha256": "d608bfc729d98774ba7c32d3d8bdfb1d1ff6adbaba56373da8bf1193547c40aa",
+        "original_lines": [
+          1647,
+          1652
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_RISK_ROW_ID_SYNTAX_RE": {
+        "sha256": "a2e99a975ca4d880f90787192c3b3d987372a56a7b4c119d17d9cb0ccfc4ac02",
+        "original_lines": [
+          1655,
+          1655
+        ],
+        "global_references": [
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RESERVED_FINDING_NAMESPACE_TOKENS": {
+        "sha256": "94419dee1b84c6e41b016923a8a3e9d06799a687a2ad92241d6c14bd58dd7c0f",
+        "original_lines": [
+          1662,
+          1662
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RESERVED_REQUIREMENT_PREFIX": {
+        "sha256": "caf1de0f82af7a4dc451df24ac66624a4b83320211eb924008a48634f24724b1",
+        "original_lines": [
+          1663,
+          1663
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_RESERVED_NAMESPACE_SEPARATORS": {
+        "sha256": "43e9cf504aaa281132b9bf7f69a7da7ebf24da3cecc61a220c0014ba3b279d4f",
+        "original_lines": [
+          1664,
+          1664
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_RESERVED_FINDING_AT_RE": {
+        "sha256": "8da8639daa6a5cbee16e978dc4320235f4988460f6838faac4bd7d53f431c594",
+        "original_lines": [
+          1665,
+          1668
+        ],
+        "global_references": [
+          "RESERVED_FINDING_NAMESPACE_TOKENS",
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_RESERVED_REQUIREMENT_AT_RE": {
+        "sha256": "4a5d877094f48850a538262e3e711e8a72e3b48bad3b7c89242a00667b676472",
+        "original_lines": [
+          1669,
+          1669
+        ],
+        "global_references": [
+          "RESERVED_REQUIREMENT_PREFIX",
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_IDENTIFIER_LIKE_SPAN_RE": {
+        "sha256": "481ca041cb6a8e007aaa0bf2f38e52dc39a516f70bc61321d5424aaebd1a51d9",
+        "original_lines": [
+          1671,
+          1671
+        ],
+        "global_references": [
+          "re"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6314"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_reserved_namespace_match_at": {
+        "sha256": "ebca2c9d588e1da0c1c6af77ca74994a4c62ff8b847330d01774e61ea4af41dc",
+        "original_lines": [
+          1674,
+          1682
+        ],
+        "global_references": [
+          "_RESERVED_FINDING_AT_RE",
+          "_RESERVED_NAMESPACE_SEPARATORS",
+          "_RESERVED_REQUIREMENT_AT_RE",
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_has_reserved_namespace": {
+        "sha256": "50c75afdf379829b312bb13c3d8f95cfea2947db17148d7265c7cd935e0705e4",
+        "original_lines": [
+          1685,
+          1690
+        ],
+        "global_references": [
+          "_reserved_namespace_match_at"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6315"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_is_valid_risk_row_id": {
+        "sha256": "4a41799541fa3929347f99240fc526931e6d2f422bb6e8be4aae082ad0439dbe",
+        "original_lines": [
+          1693,
+          1694
+        ],
+        "global_references": [
+          "_RISK_ROW_ID_SYNTAX_RE",
+          "_has_reserved_namespace"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6305"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_RISK_OWNER_STAGE_RE": {
+        "sha256": "f84faabc7c0fded318f4537345a1267062060b471c868a763f312fdbbcdd8204",
+        "original_lines": [
+          1701,
+          1701
+        ],
+        "global_references": [
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_risk_bounded_string": {
+        "sha256": "f3c767f63d5b1f29c9eaf160db37f32c509fbfc7b6207ed659e2254cfe55af43",
+        "original_lines": [
+          1704,
+          1708
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_MAX_FIELD_BYTES",
+          "_expect_non_empty_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1288",
+          "src/coding_review_agent_loop/shape_check_audit.py:1296"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8582",
+          "src/coding_review_agent_loop/protocol.py:8590",
+          "src/coding_review_agent_loop/protocol.py:8597",
+          "src/coding_review_agent_loop/protocol.py:8615",
+          "src/coding_review_agent_loop/protocol.py:8632",
+          "src/coding_review_agent_loop/protocol.py:8635",
+          "src/coding_review_agent_loop/protocol.py:8642"
+        ]
+      },
+      "_risk_bounded_string_list": {
+        "sha256": "a89869f122b4bf7b1cba3da77ba4dcb1aa44ab9abada42bb693290e1cd5a033d",
+        "original_lines": [
+          1711,
+          1726
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_MAX_FIELD_BYTES",
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "_expect_string_list"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1296"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RiskTestMatrixRow": {
+        "sha256": "fcbff26ab3f50c7edc6dab997adff570a13b66ccae44cb9dca60387c2ab39448",
+        "original_lines": [
+          1729,
+          1758
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/decomposition.py:45",
+          "src/coding_review_agent_loop/decomposition.py:567",
+          "src/coding_review_agent_loop/decomposition.py:595",
+          "src/coding_review_agent_loop/decomposition.py:692",
+          "src/coding_review_agent_loop/plan_assembly.py:32",
+          "src/coding_review_agent_loop/plan_assembly.py:580",
+          "src/coding_review_agent_loop/plan_assembly.py:598",
+          "src/coding_review_agent_loop/shape_check_audit.py:229"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8311",
+          "src/coding_review_agent_loop/protocol.py:8315",
+          "src/coding_review_agent_loop/protocol.py:8317"
+        ]
+      },
+      "RiskTestMatrix": {
+        "sha256": "cc6ff16896a5e067582fa427ece77a239fc413fd1020351cd036130d87c6f13f",
+        "original_lines": [
+          1761,
+          1780
+        ],
+        "global_references": [
+          "RiskTestMatrixRow",
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/decomposition.py:41",
+          "src/coding_review_agent_loop/decomposition.py:45",
+          "src/coding_review_agent_loop/decomposition.py:477",
+          "src/coding_review_agent_loop/decomposition.py:483",
+          "src/coding_review_agent_loop/decomposition.py:503",
+          "src/coding_review_agent_loop/decomposition.py:517",
+          "src/coding_review_agent_loop/decomposition.py:522",
+          "src/coding_review_agent_loop/decomposition.py:567",
+          "src/coding_review_agent_loop/decomposition.py:595",
+          "src/coding_review_agent_loop/decomposition.py:688",
+          "src/coding_review_agent_loop/decomposition.py:689",
+          "src/coding_review_agent_loop/decomposition.py:692",
+          "src/coding_review_agent_loop/decomposition.py:701",
+          "src/coding_review_agent_loop/decomposition.py:702",
+          "src/coding_review_agent_loop/decomposition.py:768",
+          "src/coding_review_agent_loop/decomposition.py:769",
+          "src/coding_review_agent_loop/decomposition.py:788",
+          "src/coding_review_agent_loop/decomposition.py:789",
+          "src/coding_review_agent_loop/decomposition.py:1886",
+          "src/coding_review_agent_loop/decomposition.py:1914",
+          "src/coding_review_agent_loop/comment_rendering.py:45",
+          "src/coding_review_agent_loop/comment_rendering.py:46",
+          "src/coding_review_agent_loop/comment_rendering.py:47",
+          "src/coding_review_agent_loop/comment_rendering.py:666",
+          "src/coding_review_agent_loop/comment_rendering.py:667",
+          "src/coding_review_agent_loop/comment_rendering.py:769",
+          "src/coding_review_agent_loop/comment_rendering.py:799",
+          "src/coding_review_agent_loop/comment_rendering.py:855",
+          "src/coding_review_agent_loop/plan_assembly.py:29",
+          "src/coding_review_agent_loop/plan_assembly.py:30",
+          "src/coding_review_agent_loop/plan_assembly.py:31",
+          "src/coding_review_agent_loop/plan_assembly.py:32",
+          "src/coding_review_agent_loop/plan_assembly.py:445",
+          "src/coding_review_agent_loop/plan_assembly.py:457",
+          "src/coding_review_agent_loop/plan_assembly.py:488",
+          "src/coding_review_agent_loop/plan_assembly.py:552",
+          "src/coding_review_agent_loop/plan_assembly.py:580",
+          "src/coding_review_agent_loop/plan_assembly.py:598",
+          "src/coding_review_agent_loop/plan_assembly.py:616",
+          "src/coding_review_agent_loop/plan_assembly.py:624",
+          "src/coding_review_agent_loop/plan_assembly.py:630",
+          "src/coding_review_agent_loop/plan_assembly.py:637",
+          "src/coding_review_agent_loop/plan_assembly.py:667",
+          "src/coding_review_agent_loop/round_state.py:73",
+          "src/coding_review_agent_loop/round_state.py:74",
+          "src/coding_review_agent_loop/round_state.py:4837",
+          "src/coding_review_agent_loop/shape_check_audit.py:184",
+          "src/coding_review_agent_loop/shape_check_audit.py:193",
+          "src/coding_review_agent_loop/shape_check_audit.py:202",
+          "src/coding_review_agent_loop/shape_check_audit.py:211",
+          "src/coding_review_agent_loop/shape_check_audit.py:220",
+          "src/coding_review_agent_loop/shape_check_audit.py:229",
+          "tests/test_risk_test_matrix.py:19",
+          "tests/test_risk_test_matrix.py:1142",
+          "tests/test_risk_test_matrix.py:1712",
+          "tests/test_comment_rendering.py:3240",
+          "tests/test_comment_rendering.py:3269"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7081",
+          "src/coding_review_agent_loop/protocol.py:7341"
+        ]
+      },
+      "RiskTestMatrixChange": {
+        "sha256": "0987c40b6dc751fd662ca29f9e981fdcd1a7a7e2a4c1b7422e8a8f93299f0246",
+        "original_lines": [
+          1783,
+          1794
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:46",
+          "src/coding_review_agent_loop/comment_rendering.py:667",
+          "src/coding_review_agent_loop/plan_assembly.py:30",
+          "src/coding_review_agent_loop/plan_assembly.py:552",
+          "src/coding_review_agent_loop/plan_assembly.py:624",
+          "src/coding_review_agent_loop/plan_assembly.py:630",
+          "src/coding_review_agent_loop/plan_assembly.py:637",
+          "src/coding_review_agent_loop/plan_assembly.py:667",
+          "src/coding_review_agent_loop/round_state.py:74",
+          "src/coding_review_agent_loop/round_state.py:4837",
+          "src/coding_review_agent_loop/shape_check_audit.py:193",
+          "tests/test_risk_test_matrix.py:19",
+          "tests/test_risk_test_matrix.py:1142",
+          "tests/test_risk_test_matrix.py:1712",
+          "tests/test_comment_rendering.py:3240",
+          "tests/test_comment_rendering.py:3269"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "_validate_risk_row_id": {
+        "sha256": "7e26d31e866714c3e4d5f061b5ed8e645b6a4606aa9d2c35f56372839e8eac3c",
+        "original_lines": [
+          1797,
+          1803
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "_is_valid_risk_row_id",
+          "_risk_bounded_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:365",
+          "src/coding_review_agent_loop/shape_check_audit.py:1330",
+          "tests/test_shape_check_audit.py:833",
+          "tests/test_protocol.py:6335",
+          "tests/test_protocol.py:6353",
+          "tests/test_protocol.py:6360"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8588",
+          "src/coding_review_agent_loop/protocol.py:8596",
+          "src/coding_review_agent_loop/protocol.py:8601",
+          "src/coding_review_agent_loop/protocol.py:8623"
+        ]
+      },
+      "_validate_risk_owner": {
+        "sha256": "043977f5af1586e85f16f7ba405b98fbd7098bbe91a0121b1f7eae224cd5b13d",
+        "original_lines": [
+          1806,
+          1812
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_OWNER_NAMES",
+          "_RISK_OWNER_STAGE_RE",
+          "_risk_bounded_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1321"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_risk_test_matrix": {
+        "sha256": "edda4a9d3124f3c5389a134c82b63fff2c8cdc575fc40cad1f36e89f32723371",
+        "original_lines": [
+          1815,
+          1888
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_APPLICABILITY",
+          "RISK_MATRIX_MAX_EXCLUSIONS",
+          "RISK_MATRIX_MAX_ROWS",
+          "RISK_TEST_MATRIX_OPTIONAL_KEYS",
+          "RISK_TEST_MATRIX_REQUIRED_KEYS",
+          "RISK_TEST_MATRIX_ROW_KEYS",
+          "RiskTestMatrix",
+          "RiskTestMatrixRow",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_risk_bounded_string",
+          "_risk_bounded_string_list",
+          "_validate_risk_owner",
+          "_validate_risk_row_id"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_assembly.py:45",
+          "src/coding_review_agent_loop/shape_check_audit.py:1183",
+          "src/coding_review_agent_loop/shape_check_audit.py:1193",
+          "src/coding_review_agent_loop/shape_check_audit.py:1203"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "parse_risk_test_matrix": {
+        "sha256": "3d71e1e5a827fb73c1cff907529b8905150b97339ee09cf7e86a48a5eee4654f",
+        "original_lines": [
+          1891,
+          1903
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_MAX_PAYLOAD_BYTES",
+          "RiskTestMatrix",
+          "_parse_risk_test_matrix",
+          "json"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/decomposition.py:48",
+          "src/coding_review_agent_loop/decomposition.py:483",
+          "src/coding_review_agent_loop/decomposition.py:522",
+          "src/coding_review_agent_loop/decomposition.py:571",
+          "src/coding_review_agent_loop/decomposition.py:701",
+          "src/coding_review_agent_loop/decomposition.py:702",
+          "src/coding_review_agent_loop/decomposition.py:1915",
+          "src/coding_review_agent_loop/comment_rendering.py:48",
+          "src/coding_review_agent_loop/comment_rendering.py:49",
+          "src/coding_review_agent_loop/comment_rendering.py:50",
+          "src/coding_review_agent_loop/comment_rendering.py:670",
+          "src/coding_review_agent_loop/comment_rendering.py:743",
+          "src/coding_review_agent_loop/comment_rendering.py:744",
+          "src/coding_review_agent_loop/comment_rendering.py:816",
+          "src/coding_review_agent_loop/pr_loop_support.py:112",
+          "src/coding_review_agent_loop/pr_loop_support.py:433",
+          "src/coding_review_agent_loop/pr_loop_support.py:652",
+          "src/coding_review_agent_loop/pr_loop_support.py:4611",
+          "src/coding_review_agent_loop/evidence_stall.py:26",
+          "src/coding_review_agent_loop/evidence_stall.py:135",
+          "src/coding_review_agent_loop/converted_capture_state.py:72",
+          "src/coding_review_agent_loop/converted_capture_state.py:104",
+          "src/coding_review_agent_loop/plan_assembly.py:45",
+          "src/coding_review_agent_loop/plan_assembly.py:47",
+          "src/coding_review_agent_loop/plan_assembly.py:553",
+          "src/coding_review_agent_loop/plan_assembly.py:622",
+          "src/coding_review_agent_loop/repair.py:45",
+          "src/coding_review_agent_loop/repair.py:46",
+          "src/coding_review_agent_loop/repair.py:1813",
+          "src/coding_review_agent_loop/repair.py:1814",
+          "src/coding_review_agent_loop/round_state.py:75",
+          "src/coding_review_agent_loop/round_state.py:76",
+          "src/coding_review_agent_loop/round_state.py:1989",
+          "src/coding_review_agent_loop/round_state.py:1990",
+          "src/coding_review_agent_loop/round_state.py:4757",
+          "src/coding_review_agent_loop/round_state.py:4758",
+          "src/coding_review_agent_loop/shape_check_audit.py:1183",
+          "src/coding_review_agent_loop/shape_check_audit.py:1193",
+          "src/coding_review_agent_loop/shape_check_audit.py:1203",
+          "src/coding_review_agent_loop/shape_check_audit.py:1554",
+          "src/coding_review_agent_loop/shape_check_audit.py:1566",
+          "src/coding_review_agent_loop/shape_check_audit.py:1575",
+          "src/coding_review_agent_loop/shape_check_audit.py:1589",
+          "tests/test_child_plan_provenance.py:26",
+          "tests/test_child_plan_provenance.py:202",
+          "tests/test_child_plan_provenance.py:881",
+          "tests/test_child_plan_provenance.py:2816",
+          "tests/test_evidence_conversion.py:35",
+          "tests/test_evidence_conversion.py:73",
+          "tests/test_risk_test_matrix.py:23",
+          "tests/test_risk_test_matrix.py:24",
+          "tests/test_risk_test_matrix.py:118",
+          "tests/test_risk_test_matrix.py:155",
+          "tests/test_risk_test_matrix.py:195",
+          "tests/test_risk_test_matrix.py:247",
+          "tests/test_risk_test_matrix.py:349",
+          "tests/test_risk_test_matrix.py:405",
+          "tests/test_risk_test_matrix.py:440",
+          "tests/test_risk_test_matrix.py:454",
+          "tests/test_risk_test_matrix.py:490",
+          "tests/test_risk_test_matrix.py:566",
+          "tests/test_risk_test_matrix.py:667",
+          "tests/test_risk_test_matrix.py:735",
+          "tests/test_risk_test_matrix.py:768",
+          "tests/test_risk_test_matrix.py:813",
+          "tests/test_risk_test_matrix.py:942",
+          "tests/test_risk_test_matrix.py:982",
+          "tests/test_risk_test_matrix.py:1029",
+          "tests/test_risk_test_matrix.py:1141",
+          "tests/test_risk_test_matrix.py:1154",
+          "tests/test_risk_test_matrix.py:1157",
+          "tests/test_risk_test_matrix.py:1159",
+          "tests/test_risk_test_matrix.py:1284",
+          "tests/test_risk_test_matrix.py:1304",
+          "tests/test_risk_test_matrix.py:1530",
+          "tests/test_risk_test_matrix.py:1586",
+          "tests/test_risk_test_matrix.py:1588",
+          "tests/test_risk_test_matrix.py:1607",
+          "tests/test_risk_test_matrix.py:1614",
+          "tests/test_risk_test_matrix.py:1673",
+          "tests/test_risk_test_matrix.py:1690",
+          "tests/test_risk_test_matrix.py:1710",
+          "tests/test_risk_test_matrix.py:1731",
+          "tests/test_risk_test_matrix.py:1749",
+          "tests/test_risk_test_matrix.py:1751",
+          "tests/test_risk_test_matrix.py:1778",
+          "tests/test_risk_test_matrix.py:1804",
+          "tests/test_risk_test_matrix.py:1811",
+          "tests/test_risk_test_matrix.py:1819",
+          "tests/test_risk_test_matrix.py:1829",
+          "tests/test_risk_test_matrix.py:1839",
+          "tests/test_risk_test_matrix.py:1849",
+          "tests/test_risk_test_matrix.py:1859",
+          "tests/test_risk_test_matrix.py:1870",
+          "tests/test_risk_test_matrix.py:1881",
+          "tests/test_risk_test_matrix.py:1891",
+          "tests/test_risk_test_matrix.py:1901",
+          "tests/test_risk_test_matrix.py:1911",
+          "tests/test_risk_test_matrix.py:1921",
+          "tests/test_risk_test_matrix.py:1931",
+          "tests/test_risk_test_matrix.py:1951",
+          "tests/test_risk_test_matrix.py:1957",
+          "tests/test_risk_test_matrix.py:2021",
+          "tests/test_risk_test_matrix.py:2024",
+          "tests/test_risk_test_matrix.py:2030",
+          "tests/test_risk_test_matrix.py:2035",
+          "tests/test_risk_test_matrix.py:2052",
+          "tests/test_risk_test_matrix.py:2056",
+          "tests/test_risk_test_matrix.py:2064",
+          "tests/test_risk_test_matrix.py:2079",
+          "tests/test_risk_test_matrix.py:2102",
+          "tests/test_risk_test_matrix.py:2104",
+          "tests/test_risk_test_matrix.py:2121",
+          "tests/test_risk_test_matrix.py:2140",
+          "tests/test_risk_test_matrix.py:2160",
+          "tests/test_risk_test_matrix.py:2182",
+          "tests/test_risk_test_matrix.py:2201",
+          "tests/test_risk_test_matrix.py:2203",
+          "tests/test_risk_test_matrix.py:2235",
+          "tests/test_risk_test_matrix.py:2256",
+          "tests/test_risk_test_matrix.py:2279",
+          "tests/test_risk_test_matrix.py:2301",
+          "tests/test_risk_test_matrix.py:2362",
+          "tests/test_risk_test_matrix.py:2408",
+          "tests/test_risk_test_matrix.py:2573",
+          "tests/test_risk_test_matrix.py:2759",
+          "tests/test_risk_test_matrix.py:2845",
+          "tests/test_risk_test_matrix.py:2850",
+          "tests/test_risk_test_matrix.py:2913",
+          "tests/test_risk_test_matrix.py:3144",
+          "tests/test_risk_test_matrix.py:3164",
+          "tests/test_risk_test_matrix.py:3166",
+          "tests/test_risk_test_matrix.py:3168",
+          "tests/test_risk_test_matrix.py:3258",
+          "tests/test_risk_test_matrix.py:3288",
+          "tests/test_risk_test_matrix.py:3289",
+          "tests/test_risk_test_matrix.py:3303",
+          "tests/test_risk_test_matrix.py:3304",
+          "tests/test_risk_test_matrix.py:3463",
+          "tests/test_risk_test_matrix.py:3728",
+          "tests/test_risk_test_matrix.py:3794",
+          "tests/test_risk_test_matrix.py:3816",
+          "tests/test_risk_test_matrix.py:3824",
+          "tests/test_risk_test_matrix.py:3836",
+          "tests/test_risk_test_matrix.py:3842",
+          "tests/test_risk_test_matrix.py:3854",
+          "tests/test_evidence_reconciliation.py:103",
+          "tests/test_evidence_reconciliation.py:138",
+          "tests/test_evidence_reconciliation.py:428",
+          "tests/test_evidence_reconciliation.py:449",
+          "tests/test_pr_loop_authorization.py:47",
+          "tests/test_pr_loop_authorization.py:668",
+          "tests/test_pr_loop_authorization.py:686",
+          "tests/test_pr_loop_followups.py:43",
+          "tests/test_pr_loop_followups.py:73",
+          "tests/test_comment_rendering.py:2660",
+          "tests/test_comment_rendering.py:2784",
+          "tests/test_comment_rendering.py:3240",
+          "tests/test_comment_rendering.py:3266",
+          "tests/test_protocol.py:35",
+          "tests/test_protocol.py:36",
+          "tests/test_protocol.py:3029",
+          "tests/test_protocol.py:3058",
+          "tests/test_protocol.py:3104",
+          "tests/test_protocol.py:3108",
+          "tests/test_protocol.py:3185",
+          "tests/test_protocol.py:3194",
+          "tests/test_protocol.py:4025",
+          "tests/test_protocol.py:4026",
+          "tests/test_protocol.py:4027",
+          "tests/test_pr_loop_coder_ci_guard.py:26",
+          "tests/test_pr_loop_coder_ci_guard.py:961",
+          "tests/test_prompts.py:39",
+          "tests/test_prompts.py:40",
+          "tests/test_prompts.py:122",
+          "tests/test_prompts.py:123",
+          "tests/test_prompts.py:124",
+          "tests/test_prompts.py:5619",
+          "tests/test_prompts.py:5652",
+          "tests/test_plan_first_loop_publication.py:52",
+          "tests/coverage_reask_helpers.py:20",
+          "tests/coverage_reask_helpers.py:72",
+          "tests/test_pr_loop_coder_followup.py:37",
+          "tests/test_pr_loop_coder_followup.py:1640",
+          "tests/test_pr_loop_coder_followup.py:1777",
+          "tests/test_semantic_evidence_repair_routing.py:720",
+          "tests/test_semantic_evidence_repair_routing.py:724",
+          "tests/test_response_validation.py:1052",
+          "tests/test_round_transport.py:34",
+          "tests/test_round_transport.py:148",
+          "tests/test_round_transport.py:609",
+          "tests/pr_loop_test_helpers.py:28",
+          "tests/pr_loop_test_helpers.py:309",
+          "tests/test_pr_loop_evidence_conversion.py:34",
+          "tests/test_pr_loop_evidence_conversion.py:76",
+          "tests/test_pr_loop_evidence_conversion.py:343",
+          "tests/test_pr_loop_evidence_stall.py:13",
+          "tests/test_pr_loop_evidence_stall.py:39",
+          "tests/test_pr_loop_evidence_stall.py:228",
+          "tests/test_issue_implementation_handoff.py:15",
+          "tests/test_issue_implementation_handoff.py:34"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_risk_test_matrix_changes": {
+        "sha256": "5374764e471e17d2a07078f3204a7c51a309802be838d77b6e67110614bb6a7d",
+        "original_lines": [
+          1906,
+          1934
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_CHANGE_OPERATIONS",
+          "RISK_MATRIX_MAX_AUDIT_ROW_IDS",
+          "RISK_MATRIX_MAX_CHANGES",
+          "RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS",
+          "RISK_TEST_MATRIX_CHANGE_KEYS",
+          "RiskTestMatrixChange",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_risk_bounded_string",
+          "_risk_bounded_string_list",
+          "_validate_risk_row_id"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1193"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "parse_risk_test_matrix_changes": {
+        "sha256": "8519a9040a4a7e6f545455b4d7e058f61084bc7041a47da2a4991ef0ed26405a",
+        "original_lines": [
+          1937,
+          1938
+        ],
+        "global_references": [
+          "RiskTestMatrixChange",
+          "_parse_risk_test_matrix_changes"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:49",
+          "src/coding_review_agent_loop/comment_rendering.py:744",
+          "src/coding_review_agent_loop/repair.py:46",
+          "src/coding_review_agent_loop/repair.py:1814",
+          "src/coding_review_agent_loop/round_state.py:76",
+          "src/coding_review_agent_loop/round_state.py:1990",
+          "src/coding_review_agent_loop/round_state.py:4758",
+          "src/coding_review_agent_loop/shape_check_audit.py:1193",
+          "src/coding_review_agent_loop/shape_check_audit.py:1566",
+          "tests/test_risk_test_matrix.py:3258",
+          "tests/test_risk_test_matrix.py:3289",
+          "tests/test_risk_test_matrix.py:3304",
+          "tests/test_protocol.py:36",
+          "tests/test_protocol.py:4027",
+          "tests/test_prompts.py:40",
+          "tests/test_prompts.py:124"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_ROW_STRING_LIST_KEYS": {
+        "sha256": "649b20893bcdc97f5519ad7f4104951b84df0f988dc3ef5c55564cf15cf42bf4",
+        "original_lines": [
+          1945,
+          1945
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_STRING_LIST_KEYS": {
+        "sha256": "5ecc9330c384ceb6bb7fb4fed8ae89212e3825acddb6195defd692b513716e1a",
+        "original_lines": [
+          1946,
+          1946
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RISK_TEST_MATRIX_CHANGE_STRING_LIST_KEYS": {
+        "sha256": "a8fe5b22a98877a637b7cb21547b46504707e3342e7e1404a24acf4cf3566058",
+        "original_lines": [
+          1947,
+          1947
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_wrap_lone_string": {
+        "sha256": "0927465316f50448443d79cfd07987fa366f1ce6fb3e314ba0afc653e0607685",
+        "original_lines": [
+          1950,
+          1954
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "normalize_risk_test_matrix_string_lists": {
+        "sha256": "e74ec7396ac40daf49a41ad154e601c12907f2812d9569efcee48df8252c8d16",
+        "original_lines": [
+          1957,
+          1979
+        ],
+        "global_references": [
+          "RISK_TEST_MATRIX_CHANGE_STRING_LIST_KEYS",
+          "RISK_TEST_MATRIX_ROW_STRING_LIST_KEYS",
+          "RISK_TEST_MATRIX_STRING_LIST_KEYS",
+          "_wrap_lone_string",
+          "copy"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:42",
+          "src/coding_review_agent_loop/repair.py:197",
+          "tests/test_risk_test_matrix.py:3257",
+          "tests/test_risk_test_matrix.py:3285",
+          "tests/test_risk_test_matrix.py:3290",
+          "tests/test_risk_test_matrix.py:3299",
+          "tests/test_risk_test_matrix.py:3312"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "risk_test_matrix_prompt_examples": {
+        "sha256": "480428ec32545e0e9d367a2bd51ea470a94f9e38c915ee46737bce9232cfe2c3",
+        "original_lines": [
+          1982,
+          2019
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:52",
+          "src/coding_review_agent_loop/repair.py:1430",
+          "src/coding_review_agent_loop/prompts.py:60",
+          "src/coding_review_agent_loop/prompts.py:2147",
+          "tests/test_protocol.py:56",
+          "tests/test_protocol.py:4017",
+          "tests/test_prompts.py:41",
+          "tests/test_prompts.py:121",
+          "tests/test_plan_first_loop_review.py:27",
+          "tests/test_plan_first_loop_review.py:561"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "risk_test_matrix_identity": {
+        "sha256": "d5c7f4b3d46e5a7755af6f6e2f7e5573207330e3eee900070faa1c67820e49b9",
+        "original_lines": [
+          2022,
+          2040
+        ],
+        "global_references": [
+          "Mapping",
+          "RISK_TEST_MATRIX_CONTRACT_VERSION",
+          "RiskTestMatrix",
+          "RiskTestMatrixChange",
+          "Sequence",
+          "_parse_risk_test_matrix_changes",
+          "hashlib",
+          "json",
+          "parse_risk_test_matrix"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_review_scheduling.py:365",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:374",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:400",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:410",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:450",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:473",
+          "src/coding_review_agent_loop/plan_review_scheduling.py:486",
+          "src/coding_review_agent_loop/issue_implementation.py:551",
+          "src/coding_review_agent_loop/issue_implementation.py:552",
+          "src/coding_review_agent_loop/orchestrator.py:370",
+          "src/coding_review_agent_loop/pr_loop.py:2964",
+          "src/coding_review_agent_loop/pr_loop.py:3784",
+          "src/coding_review_agent_loop/pr_loop.py:3789",
+          "src/coding_review_agent_loop/pr_loop.py:9308",
+          "src/coding_review_agent_loop/pr_loop.py:9309",
+          "src/coding_review_agent_loop/capture_dispatch.py:12",
+          "src/coding_review_agent_loop/capture_dispatch.py:19",
+          "src/coding_review_agent_loop/capture_dispatch.py:139",
+          "src/coding_review_agent_loop/prompt_context.py:584",
+          "src/coding_review_agent_loop/prompt_context.py:677",
+          "src/coding_review_agent_loop/prompt_context.py:859",
+          "src/coding_review_agent_loop/comment_rendering.py:51",
+          "src/coding_review_agent_loop/comment_rendering.py:671",
+          "src/coding_review_agent_loop/comment_rendering.py:745",
+          "src/coding_review_agent_loop/plan_first_loop.py:173",
+          "src/coding_review_agent_loop/plan_first_loop.py:2281",
+          "src/coding_review_agent_loop/plan_first_loop.py:2282",
+          "src/coding_review_agent_loop/plan_first_loop.py:2290",
+          "src/coding_review_agent_loop/plan_first_loop.py:5870",
+          "src/coding_review_agent_loop/plan_first_loop.py:5871",
+          "src/coding_review_agent_loop/plan_first_loop.py:5879",
+          "src/coding_review_agent_loop/pr_loop_support.py:428",
+          "src/coding_review_agent_loop/pr_loop_support.py:435",
+          "src/coding_review_agent_loop/pr_loop_support.py:3792",
+          "src/coding_review_agent_loop/pr_loop_support.py:4394",
+          "src/coding_review_agent_loop/pr_loop_support.py:4399",
+          "src/coding_review_agent_loop/pr_loop_support.py:4419",
+          "src/coding_review_agent_loop/pr_loop_support.py:4613",
+          "src/coding_review_agent_loop/pr_loop_support.py:4625",
+          "src/coding_review_agent_loop/pr_loop_support.py:4699",
+          "src/coding_review_agent_loop/pr_loop_support.py:4935",
+          "src/coding_review_agent_loop/pr_loop_support.py:5049",
+          "src/coding_review_agent_loop/pr_loop_support.py:5111",
+          "src/coding_review_agent_loop/capture_acceptance.py:127",
+          "src/coding_review_agent_loop/converted_capture_state.py:133",
+          "src/coding_review_agent_loop/converted_capture.py:17",
+          "src/coding_review_agent_loop/converted_capture.py:36",
+          "src/coding_review_agent_loop/round_state.py:77",
+          "src/coding_review_agent_loop/round_state.py:305",
+          "src/coding_review_agent_loop/round_state.py:711",
+          "src/coding_review_agent_loop/round_state.py:1962",
+          "src/coding_review_agent_loop/round_state.py:1979",
+          "src/coding_review_agent_loop/round_state.py:1994",
+          "src/coding_review_agent_loop/round_state.py:2007",
+          "src/coding_review_agent_loop/round_state.py:2016",
+          "src/coding_review_agent_loop/round_state.py:2457",
+          "src/coding_review_agent_loop/round_state.py:4737",
+          "src/coding_review_agent_loop/round_state.py:4748",
+          "src/coding_review_agent_loop/round_state.py:4762",
+          "src/coding_review_agent_loop/round_state.py:4775",
+          "src/coding_review_agent_loop/round_state.py:4786",
+          "src/coding_review_agent_loop/round_state.py:4803",
+          "src/coding_review_agent_loop/round_state.py:4818",
+          "src/coding_review_agent_loop/round_state.py:5134",
+          "src/coding_review_agent_loop/round_state.py:5139",
+          "src/coding_review_agent_loop/round_state.py:5155",
+          "src/coding_review_agent_loop/round_state.py:5171",
+          "src/coding_review_agent_loop/round_state.py:5175",
+          "src/coding_review_agent_loop/round_state.py:5181",
+          "src/coding_review_agent_loop/round_state.py:5750",
+          "src/coding_review_agent_loop/round_state.py:5752",
+          "src/coding_review_agent_loop/round_state.py:5758",
+          "src/coding_review_agent_loop/unresolved_items.py:1300",
+          "src/coding_review_agent_loop/unresolved_items.py:1316",
+          "src/coding_review_agent_loop/panel_evidence.py:358",
+          "src/coding_review_agent_loop/response_validation.py:162",
+          "src/coding_review_agent_loop/response_validation.py:178",
+          "src/coding_review_agent_loop/response_validation.py:510",
+          "src/coding_review_agent_loop/shape_check_audit.py:1694",
+          "tests/test_child_plan_provenance.py:3681",
+          "tests/test_child_plan_provenance.py:3690",
+          "tests/test_plan_first_loop_review_scheduling.py:32",
+          "tests/test_plan_first_loop_review_scheduling.py:122",
+          "tests/test_plan_first_loop_review_scheduling.py:125",
+          "tests/test_issue_pr_handoff.py:55",
+          "tests/test_issue_pr_handoff.py:167",
+          "tests/test_evidence_conversion.py:36",
+          "tests/test_evidence_conversion.py:131",
+          "tests/test_evidence_conversion.py:210",
+          "tests/test_evidence_conversion.py:323",
+          "tests/test_evidence_conversion.py:343",
+          "tests/test_evidence_conversion.py:711",
+          "tests/test_capture_fallback.py:93",
+          "tests/test_capture_fallback.py:96",
+          "tests/test_plan_ownership.py:11",
+          "tests/test_plan_ownership.py:50",
+          "tests/test_plan_ownership.py:51",
+          "tests/test_pr_loop_post_merge_obligations.py:293",
+          "tests/test_risk_test_matrix.py:25",
+          "tests/test_risk_test_matrix.py:142",
+          "tests/test_risk_test_matrix.py:182",
+          "tests/test_risk_test_matrix.py:221",
+          "tests/test_risk_test_matrix.py:248",
+          "tests/test_risk_test_matrix.py:255",
+          "tests/test_risk_test_matrix.py:299",
+          "tests/test_risk_test_matrix.py:376",
+          "tests/test_risk_test_matrix.py:397",
+          "tests/test_risk_test_matrix.py:480",
+          "tests/test_risk_test_matrix.py:491",
+          "tests/test_risk_test_matrix.py:499",
+          "tests/test_risk_test_matrix.py:567",
+          "tests/test_risk_test_matrix.py:575",
+          "tests/test_risk_test_matrix.py:668",
+          "tests/test_risk_test_matrix.py:676",
+          "tests/test_risk_test_matrix.py:759",
+          "tests/test_risk_test_matrix.py:790",
+          "tests/test_risk_test_matrix.py:823",
+          "tests/test_risk_test_matrix.py:970",
+          "tests/test_risk_test_matrix.py:1009",
+          "tests/test_risk_test_matrix.py:1030",
+          "tests/test_risk_test_matrix.py:1038",
+          "tests/test_risk_test_matrix.py:1149",
+          "tests/test_risk_test_matrix.py:1285",
+          "tests/test_risk_test_matrix.py:1587",
+          "tests/test_risk_test_matrix.py:1615",
+          "tests/test_risk_test_matrix.py:1625",
+          "tests/test_risk_test_matrix.py:1630",
+          "tests/test_risk_test_matrix.py:1636",
+          "tests/test_risk_test_matrix.py:1674",
+          "tests/test_risk_test_matrix.py:1681",
+          "tests/test_risk_test_matrix.py:1691",
+          "tests/test_risk_test_matrix.py:1701",
+          "tests/test_risk_test_matrix.py:1732",
+          "tests/test_risk_test_matrix.py:1740",
+          "tests/test_risk_test_matrix.py:1750",
+          "tests/test_risk_test_matrix.py:1779",
+          "tests/test_risk_test_matrix.py:1820",
+          "tests/test_risk_test_matrix.py:1840",
+          "tests/test_risk_test_matrix.py:1860",
+          "tests/test_risk_test_matrix.py:1882",
+          "tests/test_risk_test_matrix.py:1902",
+          "tests/test_risk_test_matrix.py:1922",
+          "tests/test_risk_test_matrix.py:1952",
+          "tests/test_risk_test_matrix.py:2022",
+          "tests/test_risk_test_matrix.py:2053",
+          "tests/test_risk_test_matrix.py:2065",
+          "tests/test_risk_test_matrix.py:2103",
+          "tests/test_risk_test_matrix.py:2122",
+          "tests/test_risk_test_matrix.py:2128",
+          "tests/test_risk_test_matrix.py:2141",
+          "tests/test_risk_test_matrix.py:2149",
+          "tests/test_risk_test_matrix.py:2161",
+          "tests/test_risk_test_matrix.py:2169",
+          "tests/test_risk_test_matrix.py:2183",
+          "tests/test_risk_test_matrix.py:2189",
+          "tests/test_risk_test_matrix.py:2202",
+          "tests/test_risk_test_matrix.py:2204",
+          "tests/test_risk_test_matrix.py:2211",
+          "tests/test_risk_test_matrix.py:2217",
+          "tests/test_risk_test_matrix.py:2236",
+          "tests/test_risk_test_matrix.py:2243",
+          "tests/test_risk_test_matrix.py:2257",
+          "tests/test_risk_test_matrix.py:2264",
+          "tests/test_risk_test_matrix.py:2280",
+          "tests/test_risk_test_matrix.py:2287",
+          "tests/test_risk_test_matrix.py:2348",
+          "tests/test_risk_test_matrix.py:2385",
+          "tests/test_risk_test_matrix.py:2432",
+          "tests/test_risk_test_matrix.py:2574",
+          "tests/test_risk_test_matrix.py:2581",
+          "tests/test_risk_test_matrix.py:2769",
+          "tests/test_risk_test_matrix.py:2948",
+          "tests/test_risk_test_matrix.py:3145",
+          "tests/test_risk_test_matrix.py:3482",
+          "tests/test_risk_test_matrix.py:3535",
+          "tests/test_risk_test_matrix.py:3758",
+          "tests/test_risk_test_matrix.py:3763",
+          "tests/test_risk_test_matrix.py:3780",
+          "tests/test_risk_test_matrix.py:3829",
+          "tests/test_human_requirement_dispositions.py:169",
+          "tests/test_panel_evidence.py:246",
+          "tests/test_evidence_reconciliation.py:104",
+          "tests/test_evidence_reconciliation.py:179",
+          "tests/test_evidence_reconciliation.py:280",
+          "tests/test_evidence_reconciliation.py:288",
+          "tests/test_evidence_reconciliation.py:432",
+          "tests/test_pr_loop_authorization.py:48",
+          "tests/test_pr_loop_authorization.py:694",
+          "tests/test_pr_loop_authorization.py:695",
+          "tests/test_pr_loop_authorization.py:704",
+          "tests/test_pr_loop_authorization.py:713",
+          "tests/test_pr_loop_authorization.py:728",
+          "tests/test_pr_loop_authorization.py:744",
+          "tests/test_pr_loop_followups.py:44",
+          "tests/test_pr_loop_followups.py:91",
+          "tests/test_pr_loop_followups.py:99",
+          "tests/test_pr_loop_followups.py:208",
+          "tests/test_pr_loop_followups.py:364",
+          "tests/test_pr_loop_followups.py:490",
+          "tests/test_protocol.py:3029",
+          "tests/test_protocol.py:3081",
+          "tests/test_protocol.py:3105",
+          "tests/test_protocol.py:3142",
+          "tests/test_protocol.py:3186",
+          "tests/test_protocol.py:3214",
+          "tests/test_board_amendment.py:1321",
+          "tests/test_pr_loop_coder_ci_guard.py:27",
+          "tests/test_pr_loop_coder_ci_guard.py:966",
+          "tests/test_pr_loop_coder_ci_guard.py:973",
+          "tests/test_pr_loop_coder_ci_guard.py:1006",
+          "tests/test_prompts.py:5620",
+          "tests/test_prompts.py:5653",
+          "tests/test_prompts.py:5661",
+          "tests/coverage_reask_helpers.py:21",
+          "tests/coverage_reask_helpers.py:73",
+          "tests/coverage_reask_helpers.py:81",
+          "tests/test_pr_loop_coder_followup.py:38",
+          "tests/test_pr_loop_coder_followup.py:1644",
+          "tests/test_pr_loop_coder_followup.py:1651",
+          "tests/test_pr_loop_coder_followup.py:1692",
+          "tests/test_pr_loop_coder_followup.py:1782",
+          "tests/test_pr_loop_coder_followup.py:1789",
+          "tests/test_pr_loop_coder_followup.py:1826",
+          "tests/test_pr_loop_coder_followup.py:2571",
+          "tests/test_plan_review_scheduling.py:66",
+          "tests/test_plan_review_scheduling.py:209",
+          "tests/test_semantic_evidence_repair_routing.py:721",
+          "tests/test_semantic_evidence_repair_routing.py:739",
+          "tests/test_response_validation.py:1053",
+          "tests/test_response_validation.py:1084",
+          "tests/test_round_transport.py:159",
+          "tests/test_round_transport.py:629",
+          "tests/test_round_transport.py:630",
+          "tests/test_round_transport.py:2126",
+          "tests/test_round_transport.py:2255",
+          "tests/pr_loop_test_helpers.py:29",
+          "tests/pr_loop_test_helpers.py:328",
+          "tests/pr_loop_test_helpers.py:335",
+          "tests/test_history_export.py:720",
+          "tests/test_pr_loop_resume.py:1254",
+          "tests/test_pr_loop_evidence_conversion.py:35",
+          "tests/test_pr_loop_evidence_conversion.py:79",
+          "tests/test_pr_loop_evidence_conversion.py:86",
+          "tests/test_pr_loop_evidence_conversion.py:146",
+          "tests/test_pr_loop_evidence_conversion.py:342",
+          "tests/test_pr_loop_evidence_conversion.py:521",
+          "tests/test_pr_loop_evidence_conversion.py:653",
+          "tests/test_pr_loop_evidence_conversion.py:658",
+          "tests/test_pr_loop_evidence_conversion.py:938",
+          "tests/test_pr_loop_evidence_conversion.py:1314",
+          "tests/test_pr_loop_evidence_conversion.py:1318",
+          "tests/test_pr_loop_evidence_conversion.py:1793",
+          "tests/test_pr_loop_evidence_conversion.py:2196",
+          "tests/test_pr_loop_evidence_conversion.py:2517",
+          "tests/test_pr_loop_evidence_conversion.py:2581",
+          "tests/test_pr_loop_evidence_stall.py:13",
+          "tests/test_pr_loop_evidence_stall.py:42",
+          "tests/test_pr_loop_evidence_stall.py:49",
+          "tests/test_pr_loop_evidence_stall.py:229",
+          "tests/test_pr_loop_evidence_stall.py:230",
+          "tests/test_pr_loop_evidence_stall.py:237",
+          "tests/test_pr_loop_evidence_stall.py:932",
+          "tests/test_capture_dispatch.py:91",
+          "tests/test_capture_dispatch.py:93",
+          "tests/workflow_transaction_helpers.py:263",
+          "tests/test_issue_implementation_handoff.py:16",
+          "tests/test_issue_implementation_handoff.py:58",
+          "tests/test_issue_implementation_handoff.py:65",
+          "tests/test_issue_implementation_handoff.py:603",
+          "tests/test_workflow_transaction.py:1036",
+          "tests/test_workflow_transaction.py:1074"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "sanitize_risk_test_matrix": {
+        "sha256": "718a37220816aa443fec5ddc91f79391c174ebf59821ca5712f8773d4ea714f7",
+        "original_lines": [
+          2043,
+          2047
+        ],
+        "global_references": [
+          "Mapping",
+          "RiskTestMatrix",
+          "parse_risk_test_matrix"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:78",
+          "src/coding_review_agent_loop/shape_check_audit.py:1722"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "validate_risk_test_matrix_revision": {
+        "sha256": "72e09ac81a4c36fb21ab53d1dc42a25bf1a4781c6b6c449fecf7b21bf4927802",
+        "original_lines": [
+          2050,
+          2249
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "Mapping",
+          "RiskTestMatrix",
+          "RiskTestMatrixChange",
+          "Sequence",
+          "_parse_risk_test_matrix_changes",
+          "parse_risk_test_matrix"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:366",
+          "src/coding_review_agent_loop/plan_first_loop.py:172",
+          "src/coding_review_agent_loop/plan_first_loop.py:4694",
+          "src/coding_review_agent_loop/plan_first_loop.py:5772",
+          "src/coding_review_agent_loop/plan_assembly.py:48",
+          "src/coding_review_agent_loop/plan_assembly.py:671",
+          "src/coding_review_agent_loop/shape_check_audit.py:1767",
+          "tests/test_risk_test_matrix.py:28",
+          "tests/test_risk_test_matrix.py:1165",
+          "tests/test_risk_test_matrix.py:1167",
+          "tests/test_risk_test_matrix.py:1169",
+          "tests/test_risk_test_matrix.py:1196",
+          "tests/test_risk_test_matrix.py:1209",
+          "tests/test_risk_test_matrix.py:1225",
+          "tests/test_risk_test_matrix.py:1240",
+          "tests/test_risk_test_matrix.py:1264",
+          "tests/test_risk_test_matrix.py:1274",
+          "tests/test_risk_test_matrix.py:1318",
+          "tests/test_risk_test_matrix.py:1325",
+          "tests/test_risk_test_matrix.py:1341",
+          "tests/test_risk_test_matrix.py:1366",
+          "tests/test_risk_test_matrix.py:1388",
+          "tests/test_risk_test_matrix.py:1407",
+          "tests/test_risk_test_matrix.py:1430",
+          "tests/test_risk_test_matrix.py:1440",
+          "tests/test_risk_test_matrix.py:1461",
+          "tests/test_risk_test_matrix.py:1489",
+          "tests/test_risk_test_matrix.py:1526"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "EVIDENCE_SOURCE_TOOL_CAPTURED": {
+        "sha256": "98f9b8a51bbe81f4c78a535f6b4ca8df118aeff2a90f91869faada0ec18f6728",
+        "original_lines": [
+          2252,
+          2252
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:109",
+          "src/coding_review_agent_loop/pr_loop_support.py:459",
+          "src/coding_review_agent_loop/converted_capture_state.py:72",
+          "src/coding_review_agent_loop/converted_capture_state.py:111"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "EVIDENCE_SOURCE_OPERATOR_SIGNED": {
+        "sha256": "4ed175eb2a32d475475614f7695a5211e653903c4d39dede55bc020050493d0c",
+        "original_lines": [
+          2253,
+          2253
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:108",
+          "src/coding_review_agent_loop/pr_loop_support.py:2148",
+          "tests/test_risk_test_matrix.py:3719",
+          "tests/test_risk_test_matrix.py:3789"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_SHA_HEX_RE": {
+        "sha256": "15c0224a96116f013c666c82cdd63c12441a12c05613bebef9de21b98a1e5064",
+        "original_lines": [
+          2254,
+          2254
+        ],
+        "global_references": [
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SignedEvidenceReference": {
+        "sha256": "14ff7943bd346e484ffe117cd9d6c4424d4abbcd3ede4e6180a59a47fbdc28c3",
+        "original_lines": [
+          2257,
+          2385
+        ],
+        "global_references": [
+          "Mapping",
+          "Sequence",
+          "_SHA_HEX_RE",
+          "dataclass",
+          "hashlib",
+          "json",
+          "re"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop.py:229",
+          "src/coding_review_agent_loop/pr_loop.py:2930",
+          "src/coding_review_agent_loop/pr_loop.py:2959",
+          "src/coding_review_agent_loop/pr_loop.py:2979",
+          "src/coding_review_agent_loop/pr_loop_support.py:110",
+          "src/coding_review_agent_loop/pr_loop_support.py:517",
+          "src/coding_review_agent_loop/pr_loop_support.py:637",
+          "src/coding_review_agent_loop/pr_loop_support.py:1998",
+          "src/coding_review_agent_loop/pr_loop_support.py:2067",
+          "src/coding_review_agent_loop/pr_loop_support.py:2129",
+          "src/coding_review_agent_loop/pr_loop_support.py:2130",
+          "src/coding_review_agent_loop/pr_loop_support.py:2132",
+          "src/coding_review_agent_loop/pr_loop_support.py:2139",
+          "src/coding_review_agent_loop/pr_loop_support.py:2175",
+          "src/coding_review_agent_loop/pr_loop_support.py:4379",
+          "src/coding_review_agent_loop/pr_loop_support.py:4575",
+          "src/coding_review_agent_loop/pr_loop_support.py:4582",
+          "src/coding_review_agent_loop/pr_loop_support.py:4638",
+          "src/coding_review_agent_loop/pr_loop_support.py:4784",
+          "src/coding_review_agent_loop/pr_loop_support.py:4917",
+          "src/coding_review_agent_loop/pr_loop_support.py:5096",
+          "src/coding_review_agent_loop/pr_loop_support.py:5178",
+          "src/coding_review_agent_loop/pr_loop_support.py:5200",
+          "src/coding_review_agent_loop/pr_loop_support.py:5221",
+          "src/coding_review_agent_loop/evidence_conversion.py:37",
+          "src/coding_review_agent_loop/evidence_conversion.py:494",
+          "src/coding_review_agent_loop/round_state.py:59",
+          "src/coding_review_agent_loop/round_state.py:429",
+          "src/coding_review_agent_loop/round_state.py:2657",
+          "src/coding_review_agent_loop/round_state.py:2660",
+          "tests/test_evidence_conversion.py:31",
+          "tests/test_evidence_conversion.py:601",
+          "tests/test_risk_test_matrix.py:3720",
+          "tests/test_risk_test_matrix.py:3764",
+          "tests/test_risk_test_matrix.py:3802",
+          "tests/test_risk_test_matrix.py:3871",
+          "tests/test_risk_test_matrix.py:3874",
+          "tests/test_round_state.py:1482",
+          "tests/test_round_state.py:1509",
+          "tests/test_pr_loop_evidence_conversion.py:30",
+          "tests/test_pr_loop_evidence_conversion.py:940"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "RiskTestMatrixEvidenceRow": {
+        "sha256": "a2eab7f716130153b0863bd8c71f60bb07b21dbb232f2c5ac4e0ceaeda04f160",
+        "original_lines": [
+          2388,
+          2426
+        ],
+        "global_references": [
+          "EVIDENCE_SOURCE_OPERATOR_SIGNED",
+          "EVIDENCE_SOURCE_TOOL_CAPTURED",
+          "TestObservationCitation",
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:211"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "RiskTestMatrixEvidence": {
+        "sha256": "659584a164ec86c821a7e0e7bcbb61de55c94c7a6ae5ef5eed87c6365e4a51e0",
+        "original_lines": [
+          2429,
+          2438
+        ],
+        "global_references": [
+          "RiskTestMatrixEvidenceRow",
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:47",
+          "src/coding_review_agent_loop/comment_rendering.py:769",
+          "src/coding_review_agent_loop/comment_rendering.py:799",
+          "src/coding_review_agent_loop/comment_rendering.py:855",
+          "src/coding_review_agent_loop/shape_check_audit.py:202",
+          "src/coding_review_agent_loop/shape_check_audit.py:211"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "PostAuthClaimDiagnostic": {
+        "sha256": "0fab2bed72daa6fe23fff1672e94737fa50855752bdc832676c95d86673fb7c4",
+        "original_lines": [
+          2441,
+          2454
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:333",
+          "src/coding_review_agent_loop/response_validation.py:50",
+          "src/coding_review_agent_loop/response_validation.py:312",
+          "src/coding_review_agent_loop/response_validation.py:655",
+          "src/coding_review_agent_loop/response_validation.py:706",
+          "src/coding_review_agent_loop/response_validation.py:728",
+          "src/coding_review_agent_loop/shape_check_audit.py:175",
+          "tests/test_comment_rendering.py:2946",
+          "tests/test_comment_rendering.py:2951",
+          "tests/test_comment_rendering.py:2952",
+          "tests/test_pr_loop_evidence_stall.py:367",
+          "tests/test_pr_loop_evidence_stall.py:433"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:1156",
+          "src/coding_review_agent_loop/protocol.py:1191"
+        ]
+      },
+      "DerivedRiskEvidenceResult": {
+        "sha256": "799b3985c190c7cd22cee4f73c94d8c6f8baf9f4c4314c69af97c70fa03afb60",
+        "original_lines": [
+          2457,
+          2472
+        ],
+        "global_references": [
+          "Mapping",
+          "PostAuthClaimDiagnostic",
+          "RiskTestMatrixEvidence",
+          "dataclass",
+          "field"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:332",
+          "src/coding_review_agent_loop/pr_loop_support.py:98",
+          "src/coding_review_agent_loop/pr_loop_support.py:417",
+          "src/coding_review_agent_loop/evidence_conversion.py:36",
+          "src/coding_review_agent_loop/evidence_conversion.py:57",
+          "src/coding_review_agent_loop/response_validation.py:49",
+          "src/coding_review_agent_loop/response_validation.py:459",
+          "src/coding_review_agent_loop/response_validation.py:496"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": []
+      },
+      "CAPTURE_LIMITED": {
+        "sha256": "1d18a61ba9ca7f9dbb98703d1cfda3a3873f7585077479c58f1c8fba31624ee4",
+        "original_lines": [
+          2476,
+          2476
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/local_test_evidence.py:882",
+          "src/coding_review_agent_loop/local_test_evidence.py:977",
+          "src/coding_review_agent_loop/local_test_evidence.py:987",
+          "src/coding_review_agent_loop/local_test_evidence.py:1059",
+          "src/coding_review_agent_loop/local_test_evidence.py:1088",
+          "src/coding_review_agent_loop/evidence_conversion.py:31",
+          "src/coding_review_agent_loop/evidence_conversion.py:35",
+          "src/coding_review_agent_loop/evidence_conversion.py:119",
+          "src/coding_review_agent_loop/evidence_conversion.py:126",
+          "src/coding_review_agent_loop/evidence_conversion.py:159",
+          "tests/test_evidence_conversion.py:27",
+          "tests/test_evidence_conversion.py:28",
+          "tests/test_evidence_conversion.py:161",
+          "tests/test_evidence_conversion.py:163",
+          "tests/test_evidence_conversion.py:175",
+          "tests/test_evidence_conversion.py:199",
+          "tests/test_evidence_conversion.py:204",
+          "tests/test_evidence_conversion.py:236",
+          "tests/test_evidence_conversion.py:239",
+          "tests/test_evidence_conversion.py:262",
+          "tests/test_evidence_conversion.py:275",
+          "tests/test_evidence_conversion.py:294",
+          "tests/test_evidence_conversion.py:295",
+          "tests/test_evidence_conversion.py:297",
+          "tests/test_evidence_conversion.py:351",
+          "tests/test_evidence_conversion.py:392",
+          "tests/test_evidence_conversion.py:690"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "NOT_CAPTURE_LIMITED": {
+        "sha256": "801276313107b7baea8bd16ace1f74f05af478506106ec49f9385b5f01d22e37",
+        "original_lines": [
+          2477,
+          2477
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/evidence_conversion.py:35",
+          "src/coding_review_agent_loop/evidence_conversion.py:119",
+          "tests/test_evidence_conversion.py:28",
+          "tests/test_evidence_conversion.py:163",
+          "tests/test_evidence_conversion.py:199",
+          "tests/test_evidence_conversion.py:262",
+          "tests/test_evidence_conversion.py:275",
+          "tests/test_evidence_conversion.py:295",
+          "tests/test_evidence_conversion.py:351",
+          "tests/test_evidence_conversion.py:392",
+          "tests/test_evidence_conversion.py:690"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CAPTURE_LIMITED_OBSERVATION_CLASSES": {
+        "sha256": "6c790bd4390bca65e238f895270587845c3264980bf456c635089ac6392feaf8",
+        "original_lines": [
+          2478,
+          2492
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CAPTURE_OBSERVATION_CLASSES": {
+        "sha256": "ce28770c8acfcd32e15c804bc516ea838031636143d45e85f3b5e078b47cc2b0",
+        "original_lines": [
+          2493,
+          2495
+        ],
+        "global_references": [
+          "CAPTURE_LIMITED_OBSERVATION_CLASSES"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/evidence_conversion.py:32",
+          "src/coding_review_agent_loop/evidence_conversion.py:121"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CAPTURE_DISQUALIFIERS": {
+        "sha256": "9ffefe214c1a288d674f515e84d7118558a51036131790c2eb1b2a9c4a987797",
+        "original_lines": [
+          2496,
+          2516
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/evidence_conversion.py:30",
+          "src/coding_review_agent_loop/evidence_conversion.py:123"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "disqualify_capture_classification": {
+        "sha256": "7f83332849745c0ca92310bece73e0b7d55df4a2a887bf3238ab8c32ed246dfd",
+        "original_lines": [
+          2519,
+          2531
+        ],
+        "global_references": [
+          "DerivedRiskEvidenceResult",
+          "NOT_CAPTURE_LIMITED",
+          "dataclasses"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/evidence_conversion.py:39",
+          "src/coding_review_agent_loop/response_validation.py:718",
+          "src/coding_review_agent_loop/response_validation.py:722",
+          "tests/test_evidence_conversion.py:34",
+          "tests/test_evidence_conversion.py:350"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "capture_observation_class": {
+        "sha256": "27644fad2a32961bba97436365e1a80f570d7d2da2f02827523a9c84817163d1",
+        "original_lines": [
+          2534,
+          2551
+        ],
+        "global_references": [
+          "_authoritative_receipt_passes",
+          "_observation_semantics",
+          "_observation_value"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:3148",
+          "tests/test_protocol.py:3164"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_journal_disqualifies": {
+        "sha256": "b950d36597bf37c78bcad136f72679fddfaff849e030a13ab75ead043fb2373d",
+        "original_lines": [
+          2554,
+          2566
+        ],
+        "global_references": [
+          "Sequence",
+          "_is_non_evidence_launch_failure",
+          "_observation_value"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_row_capture_classification": {
+        "sha256": "820ce1816910c244fcb4ab0c3f4481a0e21485b10c1ad8952f68c1156a767d95",
+        "original_lines": [
+          2569,
+          2589
+        ],
+        "global_references": [
+          "CAPTURE_LIMITED",
+          "CAPTURE_LIMITED_OBSERVATION_CLASSES",
+          "NOT_CAPTURE_LIMITED",
+          "Sequence"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_is_non_evidence_launch_failure": {
+        "sha256": "fe15e8af636148c9cc3ad06e3e99f4fa51d9039ba343e36bf2c959893d6c6efd",
+        "original_lines": [
+          2592,
+          2595
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_value": {
+        "sha256": "8eb029cc91ced78c1e0646ee7b54172ef8e264dbbaf8bde5448f52728709447d",
+        "original_lines": [
+          2598,
+          2601
+        ],
+        "global_references": [
+          "Mapping"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_attribution": {
+        "sha256": "6f09b50c6442fbb43cace43c6f7747eac8157e40f3e2bc5fa6d0be06c92080a3",
+        "original_lines": [
+          2604,
+          2615
+        ],
+        "global_references": [
+          "Mapping",
+          "_observation_value"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_command_text": {
+        "sha256": "d9cf619fe421904f37c8f8fb5c1b9b82ae6db7ff756a89db3a3aa8e5a95fab76",
+        "original_lines": [
+          2618,
+          2625
+        ],
+        "global_references": [
+          "_observation_value",
+          "shlex"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "UNAPPROVED_ROW_CLAIM_DIAGNOSTIC": {
+        "sha256": "51ac05c0decdad7e052e53e87f3115f1c7bae1ae3eed66ec6fa19914a161048d",
+        "original_lines": [
+          2628,
+          2628
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:336",
+          "src/coding_review_agent_loop/comment_rendering.py:27",
+          "src/coding_review_agent_loop/comment_rendering.py:874",
+          "src/coding_review_agent_loop/response_validation.py:53",
+          "src/coding_review_agent_loop/response_validation.py:421"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "DEGRADED_ROW_CLAIM_DIAGNOSTIC": {
+        "sha256": "601f4b885de86b792f42d6d25ad1aab98bb5a31ec6e3e84bc6b580d7733f0281",
+        "original_lines": [
+          2629,
+          2629
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:335",
+          "src/coding_review_agent_loop/comment_rendering.py:26",
+          "src/coding_review_agent_loop/comment_rendering.py:874",
+          "src/coding_review_agent_loop/response_validation.py:52",
+          "src/coding_review_agent_loop/response_validation.py:422"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_ROW_ID_UNAPPROVED_RULE": {
+        "sha256": "6d12b42a5143b027fbeed6956b4e2960639e23288d4d9d98c79811a41449fa25",
+        "original_lines": [
+          2634,
+          2634
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_ROW_ID_DUPLICATE_RULE": {
+        "sha256": "0b654e27d4c2405d6bf5698ed4d7d754f4bbff2486cbf3304dd1a58d65edcc09",
+        "original_lines": [
+          2635,
+          2635
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_ROW_ID_MALFORMED_RULE": {
+        "sha256": "87b778ddc582ab2d8b5835b0f5931f6d3853b9dd27d2bd44d369fe974bad48f2",
+        "original_lines": [
+          2636,
+          2636
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6489"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_ROW_ID_ABSENT_RULE": {
+        "sha256": "0dadc50c12033c196cfab32c05881e31a2104a82038a0a464a624f5c6e515c46",
+        "original_lines": [
+          2637,
+          2637
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_ROW_ID_MISTYPED_RULE": {
+        "sha256": "c731464474b517d59df598b3fd5fd8674ce90501b9d09a6412772553caaed521",
+        "original_lines": [
+          2638,
+          2638
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_DROPPED_OUTCOME": {
+        "sha256": "d83093c58a0e1b35703d63416c6a45052988d6102d21f3c35f63821ea8e2a7ec",
+        "original_lines": [
+          2639,
+          2639
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "COVERAGE_GAP_DROPPED_OUTCOME": {
+        "sha256": "b003f4ebac02d6aac74a67710b9d10c87add6438f00ff3c741ecc6ea84583c13",
+        "original_lines": [
+          2640,
+          2640
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_NOT_OBJECT_RULE": {
+        "sha256": "d32332fd11df3e60004c06431972194f4c9095aa32996103c81fd087d1e3af5a",
+        "original_lines": [
+          2643,
+          2643
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIMS_FIELD_NOT_ARRAY_RULE": {
+        "sha256": "864c8f3c2b1411c627806b02ec1f7362f252040e49a0ee665095d6fad3d7e2ee",
+        "original_lines": [
+          2644,
+          2644
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_EXECUTION_REFS_ABSENT_RULE": {
+        "sha256": "a70a4f33f72c50d029eb1b098c94b91c9effb90135da8f8c6ede9cd807124e1d",
+        "original_lines": [
+          2645,
+          2645
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_EXECUTION_REFS_EMPTY_RULE": {
+        "sha256": "e933add48393e198f2468e5d1003cce736554f9be6e7444cbfd0a19cb8109cf4",
+        "original_lines": [
+          2646,
+          2646
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_EXECUTION_REFS_MISTYPED_RULE": {
+        "sha256": "3b19fc4451d1bef2ec2cec573ee159d9271a43d867bf2d5e766fe8b2615a0a35",
+        "original_lines": [
+          2647,
+          2647
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_EXECUTION_REFS_NO_CATALOG_OVERSIZE_RULE": {
+        "sha256": "58e17d53dfc94debddb71b447897f7d3ffdc9401e6bfe3ea09aa26fca2ae6206",
+        "original_lines": [
+          2648,
+          2648
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_EXECUTION_REFS_REPEATED_RULE": {
+        "sha256": "f5826c745ec99c55e548787d4ddc4d70524cdf776c665535eb992a29841f6f2a",
+        "original_lines": [
+          2649,
+          2649
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_UNKNOWN_KEYS_RULE": {
+        "sha256": "3cd2daacd9b0b34fad554a5bcdcbb0992425f02f235b76dff373e5258aa240c0",
+        "original_lines": [
+          2650,
+          2650
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6519"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_FACT_MISTYPED_RULE": {
+        "sha256": "af8a4dc1e0596ef32b05bdb3c1a82347621655c891d02ac88c01fae43a248b73",
+        "original_lines": [
+          2651,
+          2651
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_FACT_OVERSIZE_RULE": {
+        "sha256": "980cb3d5fc7bfad09bcefc3ad60418e4b3fcf0cf85ebc229443a809878914720",
+        "original_lines": [
+          2652,
+          2652
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CLAIM_RESERVED_AUTHORITY_KEYS": {
+        "sha256": "cf60a7321d65f2015d4436bdd9da947b1e3ff64df5f5b647349f8fb15fb7a3cf",
+        "original_lines": [
+          2661,
+          2666
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1228",
+          "tests/test_shape_check_audit.py:972",
+          "tests/test_shape_check_audit.py:974"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_neutralize_identifier_like_span": {
+        "sha256": "0f91eca92cd1278494f599e4cee41ee9b9a3d0e7d5339421a72083253d4c7310",
+        "original_lines": [
+          2669,
+          2688
+        ],
+        "global_references": [
+          "_RESERVED_NAMESPACE_SEPARATORS",
+          "_reserved_namespace_match_at"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_neutralize_identifier_like": {
+        "sha256": "d57603fd9b0a43acaa36202f3450f37c016d8ba822dd50ee2aafabd3f22d1212",
+        "original_lines": [
+          2691,
+          2698
+        ],
+        "global_references": [
+          "_IDENTIFIER_LIKE_SPAN_RE",
+          "_neutralize_identifier_like_span"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6309"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_degraded_row_claim_message": {
+        "sha256": "476a002cf2d6c08581bcb6dafd463ea039fb6cdd594a9e10e2b414488af78266",
+        "original_lines": [
+          2701,
+          2708
+        ],
+        "global_references": [
+          "ParseDegradation",
+          "_dropped_ref_preview",
+          "_neutralize_identifier_like"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:431"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_unapproved_row_claim_message": {
+        "sha256": "ede349b8e63c7eba07b6b9f4fef6dd21ed7d039bde5603742d07217400204beb",
+        "original_lines": [
+          2711,
+          2739
+        ],
+        "global_references": [
+          "ParseDegradation",
+          "_dropped_ref_preview",
+          "_neutralize_identifier_like"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1312"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_claims_value": {
+        "sha256": "0802ddc8691b5170e6ae80b40cdd72c37513e46267e40b797097e0f8d137fb71",
+        "original_lines": [
+          2742,
+          2749
+        ],
+        "global_references": [
+          "SemanticRiskCoverageClaim",
+          "SemanticRiskCoverageClaims",
+          "Sequence"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "derive_risk_test_matrix_evidence": {
+        "sha256": "0b2df6317f82a5444c4b60cf496356194dc77e723cf655a8b738a35ff5962917",
+        "original_lines": [
+          2752,
+          3120
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "CLAIM_ROW_ID_UNAPPROVED_RULE",
+          "DEGRADED_ROW_CLAIM_DIAGNOSTIC",
+          "DerivedRiskEvidenceResult",
+          "Mapping",
+          "ParseDegradation",
+          "PostAuthClaimDiagnostic",
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "RiskTestMatrix",
+          "RiskTestMatrixEvidence",
+          "RiskTestMatrixEvidenceRow",
+          "SEMANTIC_RISK_CLAIMS_MAX_ROWS",
+          "SEMANTIC_RISK_CLAIM_FACT_KEYS",
+          "SemanticRiskCoverageClaim",
+          "SemanticRiskCoverageClaims",
+          "Sequence",
+          "TestObservationCitation",
+          "UNAPPROVED_ROW_CLAIM_DIAGNOSTIC",
+          "_authoritative_receipt_passes",
+          "_claims_value",
+          "_degraded_row_claim_message",
+          "_dropped_ref_preview",
+          "_is_non_evidence_launch_failure",
+          "_journal_disqualifies",
+          "_node_test_hint",
+          "_observation_attribution",
+          "_observation_command_text",
+          "_observation_semantics",
+          "_observation_value",
+          "_only_suite_start_unverified",
+          "_receipt_expected_status",
+          "_row_capture_classification",
+          "_semantic_execution_ref",
+          "_unapproved_row_claim_message",
+          "capture_observation_class",
+          "parse_risk_test_matrix",
+          "re",
+          "risk_test_matrix_identity",
+          "suite_start_unverified_diagnostic"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:368",
+          "src/coding_review_agent_loop/evidence_conversion.py:9",
+          "src/coding_review_agent_loop/response_validation.py:73",
+          "src/coding_review_agent_loop/response_validation.py:571",
+          "src/coding_review_agent_loop/shape_check_audit.py:1349",
+          "tests/test_evidence_conversion.py:33",
+          "tests/test_evidence_conversion.py:121",
+          "tests/test_risk_test_matrix.py:22",
+          "tests/test_risk_test_matrix.py:133",
+          "tests/test_risk_test_matrix.py:173",
+          "tests/test_risk_test_matrix.py:212",
+          "tests/test_risk_test_matrix.py:290",
+          "tests/test_risk_test_matrix.py:367",
+          "tests/test_risk_test_matrix.py:388",
+          "tests/test_risk_test_matrix.py:471",
+          "tests/test_risk_test_matrix.py:750",
+          "tests/test_risk_test_matrix.py:783",
+          "tests/test_risk_test_matrix.py:814",
+          "tests/test_risk_test_matrix.py:958",
+          "tests/test_risk_test_matrix.py:999",
+          "tests/test_risk_test_matrix.py:2339",
+          "tests/test_risk_test_matrix.py:2376",
+          "tests/test_risk_test_matrix.py:2423",
+          "tests/test_risk_test_matrix.py:2760",
+          "tests/test_risk_test_matrix.py:2938",
+          "tests/test_risk_test_matrix.py:3473",
+          "tests/test_risk_test_matrix.py:3525",
+          "tests/test_risk_test_matrix.py:3745",
+          "tests/test_evidence_reconciliation.py:102",
+          "tests/test_evidence_reconciliation.py:169",
+          "tests/test_protocol.py:3029",
+          "tests/test_protocol.py:3076",
+          "tests/test_protocol.py:3103",
+          "tests/test_protocol.py:3137",
+          "tests/test_protocol.py:3184",
+          "tests/test_protocol.py:3209",
+          "tests/test_semantic_evidence_repair_routing.py:719",
+          "tests/test_semantic_evidence_repair_routing.py:735",
+          "tests/test_response_validation.py:1155",
+          "tests/test_response_validation.py:1161",
+          "tests/test_pr_loop_evidence_conversion.py:33",
+          "tests/test_pr_loop_evidence_conversion.py:136"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "build_risk_test_matrix_evidence": {
+        "sha256": "29ccb4bc1062754ed539b47f8f3b01c9d871f9554b83e329e9b9a975c18d3202",
+        "original_lines": [
+          3125,
+          3125
+        ],
+        "global_references": [
+          "derive_risk_test_matrix_evidence"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_risk_evidence_citations": {
+        "sha256": "f7e41ffdf731fa3dc32da6bf16e82dc43fcc2ae0ec051f75367dcd113c3cd68c",
+        "original_lines": [
+          3128,
+          3129
+        ],
+        "global_references": [
+          "TestObservationCitation",
+          "_expect_test_observations"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1172",
+          "tests/test_shape_check_audit.py:809"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "parse_risk_test_matrix_evidence": {
+        "sha256": "dd6ba3eb50d5d1102e547c7861f78dd5adf6b368ce772d3725659b84581bcb2c",
+        "original_lines": [
+          3132,
+          3307
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "Mapping",
+          "RISK_MATRIX_EVIDENCE_STATUSES",
+          "RISK_MATRIX_MAX_CAVEATS",
+          "RISK_MATRIX_MAX_ROWS",
+          "RiskTestMatrix",
+          "RiskTestMatrixEvidence",
+          "RiskTestMatrixEvidenceRow",
+          "Sequence",
+          "SignedEvidenceReference",
+          "_authoritative_receipt_passes",
+          "_citation_matches_observation",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_observation_semantics",
+          "_parse_operator_signed_row",
+          "_parse_risk_evidence_citations",
+          "_receipt_expected_status",
+          "_risk_bounded_string",
+          "_risk_bounded_string_list",
+          "_validate_risk_row_id",
+          "dataclasses",
+          "parse_risk_test_matrix",
+          "re",
+          "risk_test_matrix_identity"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:50",
+          "src/coding_review_agent_loop/comment_rendering.py:816",
+          "src/coding_review_agent_loop/pr_loop_support.py:112",
+          "src/coding_review_agent_loop/pr_loop_support.py:433",
+          "src/coding_review_agent_loop/pr_loop_support.py:652",
+          "src/coding_review_agent_loop/pr_loop_support.py:4611",
+          "src/coding_review_agent_loop/evidence_stall.py:26",
+          "src/coding_review_agent_loop/evidence_stall.py:135",
+          "src/coding_review_agent_loop/converted_capture_state.py:72",
+          "src/coding_review_agent_loop/converted_capture_state.py:104",
+          "src/coding_review_agent_loop/shape_check_audit.py:1575",
+          "tests/test_risk_test_matrix.py:24",
+          "tests/test_risk_test_matrix.py:1304",
+          "tests/test_risk_test_matrix.py:1588",
+          "tests/test_risk_test_matrix.py:1607",
+          "tests/test_risk_test_matrix.py:1751",
+          "tests/test_risk_test_matrix.py:1804",
+          "tests/test_risk_test_matrix.py:1811",
+          "tests/test_risk_test_matrix.py:1829",
+          "tests/test_risk_test_matrix.py:1849",
+          "tests/test_risk_test_matrix.py:1870",
+          "tests/test_risk_test_matrix.py:1891",
+          "tests/test_risk_test_matrix.py:1911",
+          "tests/test_risk_test_matrix.py:1931",
+          "tests/test_risk_test_matrix.py:1957",
+          "tests/test_risk_test_matrix.py:2024",
+          "tests/test_risk_test_matrix.py:2030",
+          "tests/test_risk_test_matrix.py:2035",
+          "tests/test_risk_test_matrix.py:2056",
+          "tests/test_risk_test_matrix.py:2079",
+          "tests/test_risk_test_matrix.py:2104",
+          "tests/test_risk_test_matrix.py:3164",
+          "tests/test_risk_test_matrix.py:3166",
+          "tests/test_risk_test_matrix.py:3168",
+          "tests/test_risk_test_matrix.py:3794",
+          "tests/test_risk_test_matrix.py:3816",
+          "tests/test_risk_test_matrix.py:3824",
+          "tests/test_risk_test_matrix.py:3836",
+          "tests/test_risk_test_matrix.py:3842",
+          "tests/test_risk_test_matrix.py:3854",
+          "tests/test_evidence_reconciliation.py:428",
+          "tests/test_evidence_reconciliation.py:449",
+          "tests/test_comment_rendering.py:2660",
+          "tests/test_comment_rendering.py:2784",
+          "tests/test_plan_first_loop_publication.py:52"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7171",
+          "src/coding_review_agent_loop/protocol.py:7443"
+        ]
+      },
+      "_parse_operator_signed_row": {
+        "sha256": "3bc97cede9761504f9d0091c190cb1a5199215b95211ba0ac008126c03210746",
+        "original_lines": [
+          3310,
+          3359
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "EVIDENCE_SOURCE_OPERATOR_SIGNED",
+          "Mapping",
+          "RiskTestMatrixEvidenceRow",
+          "Sequence",
+          "SignedEvidenceReference",
+          "dataclasses"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1360"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "apply_signed_evidence_references": {
+        "sha256": "9467e7df2dd8db6593ea836305d3c8182780bd88eda5f321a75842d228d6017e",
+        "original_lines": [
+          3362,
+          3408
+        ],
+        "global_references": [
+          "EVIDENCE_SOURCE_OPERATOR_SIGNED",
+          "Mapping",
+          "RiskTestMatrix",
+          "RiskTestMatrixEvidence",
+          "RiskTestMatrixEvidenceRow",
+          "RiskTestMatrixRow",
+          "Sequence",
+          "SignedEvidenceReference",
+          "dataclasses",
+          "parse_risk_test_matrix"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:111",
+          "src/coding_review_agent_loop/pr_loop_support.py:655",
+          "src/coding_review_agent_loop/evidence_stall.py:25",
+          "src/coding_review_agent_loop/evidence_stall.py:143",
+          "src/coding_review_agent_loop/shape_check_audit.py:1370",
+          "tests/test_risk_test_matrix.py:3721",
+          "tests/test_risk_test_matrix.py:3783",
+          "tests/test_risk_test_matrix.py:3831",
+          "tests/test_risk_test_matrix.py:3860"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_citation_matches_observation": {
+        "sha256": "7407875771b3b0840b8107d5982e95ef2376b0c51cd8087a193059b46ecd917e",
+        "original_lines": [
+          3411,
+          3458
+        ],
+        "global_references": [
+          "Mapping",
+          "TestObservationCitation",
+          "_managed_test_wrapper_inner_command",
+          "shlex"
+        ],
+        "consumer_candidates": [
+          "tests/test_protocol.py:8206",
+          "tests/test_protocol.py:8211",
+          "tests/test_protocol.py:8218"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_semantics": {
+        "sha256": "34679c52479cd1bed25aeedc18b2a7ecd50ee5e2ac4d83b5bade5ea5ad5eb259",
+        "original_lines": [
+          3461,
+          3534
+        ],
+        "global_references": [
+          "Mapping"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_fixture_lifecycle_is_clean": {
+        "sha256": "be47f7ead8ab982f0bd911abf31571b6de659917895a06dfbefd3b25bbc9185b",
+        "original_lines": [
+          3537,
+          3549
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_authoritative_receipt_passes": {
+        "sha256": "c61beda416ce49369881c5e57590582f131995bbaa2d2b58dc2b4bf543d1bfeb",
+        "original_lines": [
+          3552,
+          3589
+        ],
+        "global_references": [
+          "_fixture_lifecycle_is_clean",
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [
+          "tests/test_local_test_evidence.py:5023",
+          "tests/test_local_test_evidence.py:5147",
+          "tests/test_local_test_evidence.py:5148",
+          "tests/test_local_test_evidence.py:5191",
+          "tests/test_local_test_evidence.py:5196",
+          "tests/test_local_test_evidence.py:5203",
+          "tests/test_local_test_evidence.py:5952",
+          "tests/test_local_test_evidence.py:7201",
+          "tests/test_local_test_evidence.py:7213",
+          "tests/test_local_test_evidence.py:7220",
+          "tests/test_local_test_evidence.py:7233",
+          "tests/test_test_runtime.py:5169",
+          "tests/test_test_runtime.py:5545",
+          "tests/test_test_runtime.py:5606",
+          "tests/test_test_runtime.py:5682",
+          "tests/test_test_runtime.py:5783",
+          "tests/test_test_runtime.py:6142",
+          "tests/test_test_runtime.py:6207",
+          "tests/test_test_runtime.py:6316",
+          "tests/test_test_runtime.py:6347",
+          "tests/test_test_runtime.py:6454",
+          "tests/test_test_runtime.py:6863",
+          "tests/test_test_runtime.py:7011",
+          "tests/test_test_runtime.py:7091"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_LAUNCH_FAILURE_PHRASES": {
+        "sha256": "187f397e7dd64767d1e9bf937fbb52e4a4371b7ed41705a4ebee7447ba1916d3",
+        "original_lines": [
+          3592,
+          3614
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_LAUNCH_PASSING_STATES": {
+        "sha256": "4724b5d09a3b912454f84ce77fbd0d59cfabbefa0d5de5fa335ae71aafec0016",
+        "original_lines": [
+          3615,
+          3619
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_launch_integrity_failure_reasons": {
+        "sha256": "4e1f049577c26c2ae3054e6e55e39c19116c1db88e925e79ce21c08550afea7e",
+        "original_lines": [
+          3622,
+          3636
+        ],
+        "global_references": [
+          "_LAUNCH_FAILURE_PHRASES",
+          "_LAUNCH_PASSING_STATES",
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_safe_label": {
+        "sha256": "f2ee3a4a3786d411fe6606724371b7fe907a4351523683c485a79d16bf40e69d",
+        "original_lines": [
+          3639,
+          3642
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_projection_field": {
+        "sha256": "d61c74c4bd348741e71195252faadeee4a16a900aa9286dffd6b20bca51ebb43",
+        "original_lines": [
+          3645,
+          3656
+        ],
+        "global_references": [
+          "Mapping"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_NODE_HINT_FILE_RE": {
+        "sha256": "662f58c431f8350c46ae5d57ec4f0be5560dc5dec64f266dee67baad247569bc",
+        "original_lines": [
+          3659,
+          3659
+        ],
+        "global_references": [
+          "re"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_NODE_HINT_EXTENSIONS": {
+        "sha256": "b446f19cdf84895b12920d50e3f67ae283dec3d8fe2d888b6e3c0f5b096659ed",
+        "original_lines": [
+          3660,
+          3660
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "EVIDENCE_REASK_MAX_CHARS": {
+        "sha256": "3de3e06b17f0af06a3a348f303841f1d53cab69b69774025e727d5f08759d78e",
+        "original_lines": [
+          3663,
+          3663
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/architecture_contract.py:30",
+          "src/coding_review_agent_loop/architecture_contract.py:788",
+          "tests/test_protocol.py:7175"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "render_evidence_rejection_detail": {
+        "sha256": "bdbd2acf52455247487227338fb6748026b43e62ba89682458088686dd59a6b2",
+        "original_lines": [
+          3666,
+          3677
+        ],
+        "global_references": [
+          "EVIDENCE_REASK_MAX_CHARS",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/architecture_contract.py:31",
+          "src/coding_review_agent_loop/architecture_contract.py:793",
+          "src/coding_review_agent_loop/shape_check_audit.py:119"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_node_test_hint": {
+        "sha256": "7f1cb37851501ff1a3fe7d8fdecc0cb3a221179ebb21b0edaf4081c62f13ee33",
+        "original_lines": [
+          3680,
+          3741
+        ],
+        "global_references": [
+          "_NODE_HINT_EXTENSIONS",
+          "_NODE_HINT_FILE_RE",
+          "_observation_projection_field",
+          "_safe_label",
+          "render_evidence_rejection_detail",
+          "shlex"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:110",
+          "tests/test_protocol.py:3178",
+          "tests/test_protocol.py:7138",
+          "tests/test_protocol.py:7140",
+          "tests/test_protocol.py:7141",
+          "tests/test_protocol.py:7142"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_command_label": {
+        "sha256": "76330b08fccd4800311e0f10159d9f5774bf1d02200572b2d1ae0e9faec62a35",
+        "original_lines": [
+          3744,
+          3775
+        ],
+        "global_references": [
+          "Mapping",
+          "_observation_projection_field",
+          "_safe_label",
+          "shlex"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_timestamp_label": {
+        "sha256": "915256cb66259cee3983e5c0d276154081702d52f3105e05e8b46ade74b932ef",
+        "original_lines": [
+          3778,
+          3781
+        ],
+        "global_references": [
+          "_observation_projection_field",
+          "_safe_label"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_observation_outcome_failure_reasons": {
+        "sha256": "98d10cd41405235c6411091acea67974563ebbbeb11c4336a41123d9b4dc8836",
+        "original_lines": [
+          3784,
+          3797
+        ],
+        "global_references": [
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_known_launch_integrity_passes": {
+        "sha256": "4e9bd34bc0ed613e31210f7d005bdefc9bd7344b39eb559bdc6ba0f8ecf5c806",
+        "original_lines": [
+          3800,
+          3827
+        ],
+        "global_references": [
+          "Mapping",
+          "_launch_integrity_failure_reasons",
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SUITE_START_UNVERIFIED_DIAGNOSTIC": {
+        "sha256": "1646a4df7febed3f47ad1ff81abafe9e7f23f6e6e6f3f7670d2d8fe3cc22abc1",
+        "original_lines": [
+          3830,
+          3834
+        ],
+        "global_references": [
+          "CITABLE_TEST_RUNNERS_SUMMARY"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SUITE_START_UNRECOGNIZED_DIAGNOSTIC": {
+        "sha256": "33bc850069ba1fdbcbfd7f7c0fe3a25e2be8c71885cc9eec64f688ec349d3319",
+        "original_lines": [
+          3837,
+          3841
+        ],
+        "global_references": [
+          "CITABLE_TEST_RUNNERS_SUMMARY"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC": {
+        "sha256": "2e71f09dac66bf639325b11b45a22335680fa9d9cb37620623a7816d2252d21a",
+        "original_lines": [
+          3842,
+          3847
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "suite_start_unverified_diagnostic": {
+        "sha256": "746d0aa06a274529760f4ab410baa185e9eaf624bd605ce113e9ee537f880cab",
+        "original_lines": [
+          3850,
+          3868
+        ],
+        "global_references": [
+          "SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC",
+          "SUITE_START_UNRECOGNIZED_DIAGNOSTIC",
+          "SUITE_START_UNVERIFIED_DIAGNOSTIC",
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_only_suite_start_unverified": {
+        "sha256": "7e5c35712eb5a5f5b3eaecfd98deee409f983cf33b1f1cad363ab90b9118d559",
+        "original_lines": [
+          3871,
+          3886
+        ],
+        "global_references": [
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_receipt_expected_status": {
+        "sha256": "00ab297964835fce7341747644a77b97c28962588b9a983d2df67f7f5a84d401",
+        "original_lines": [
+          3889,
+          3903
+        ],
+        "global_references": [
+          "_authoritative_receipt_passes",
+          "_observation_semantics"
+        ],
+        "consumer_candidates": [
+          "tests/test_evidence_reconciliation.py:101",
+          "tests/test_evidence_reconciliation.py:238",
+          "tests/test_local_test_evidence.py:5024",
+          "tests/test_local_test_evidence.py:5192",
+          "tests/test_test_runtime.py:5170",
+          "tests/test_test_runtime.py:5480",
+          "tests/test_test_runtime.py:5546"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_risk_test_matrix_contract_fields": {
+        "sha256": "0f3f9e97b04d036d7c5b9178274f0a869b32af3cf9d21c15c3feb191d05b2915",
+        "original_lines": [
+          3906,
+          3941
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_TEST_MATRIX_CONTRACT_VERSION",
+          "RiskTestMatrix",
+          "RiskTestMatrixChange",
+          "_expect_int",
+          "parse_risk_test_matrix",
+          "parse_risk_test_matrix_changes"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_assembly.py:45",
+          "src/coding_review_agent_loop/shape_check_audit.py:1203"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7635",
+          "src/coding_review_agent_loop/protocol.py:7743"
+        ]
+      },
+      "_expect_test_observations": {
+        "sha256": "66c8105420f9f3fb83b850d87be375dfd2fe77e5eab83f38f3fe11f3464d132e",
+        "original_lines": [
+          4320,
+          4346
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "TestObservationCitation",
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:773",
+          "tests/test_shape_check_audit.py:809"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATION_CITATION_KEYS": {
+        "sha256": "f92aaac0bc66b4910e1712099905b932759c10b7b2563d935004acadfc63345f",
+        "original_lines": [
+          4349,
+          4349
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATION_CITATION_CLAIMS": {
+        "sha256": "d2c2990914358cfd8b250eadf1955e3a493d744a3492c4840dadf074260deb73",
+        "original_lines": [
+          4350,
+          4350
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATION_NOT_OBJECT_RULE": {
+        "sha256": "764269baf9778b5a1439ee61bc348ac129b94eedb5d3c5325757e9415963c34a",
+        "original_lines": [
+          4351,
+          4351
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATION_KEYS_RULE": {
+        "sha256": "de393753ea37defa2212e2798637162dee6ae819b9f2e180602469f99f163700",
+        "original_lines": [
+          4352,
+          4352
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6525"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATION_BLANK_FIELD_RULE": {
+        "sha256": "fc1daf66ba57e1bda86bd5f54e867c873d6c2a8df48829bfce44f959ed873ff5",
+        "original_lines": [
+          4353,
+          4353
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "CITATION_CLAIM_RULE": {
+        "sha256": "55e392f6fe27e89d7499bb06680634382068c6c215669e6bff8f0556f79e5eca",
+        "original_lines": [
+          4354,
+          4354
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:6530"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATIONS_NOT_ARRAY_RULE": {
+        "sha256": "3cda1763098e4d09e340e6108dc4f2e8471db77567dad715656d045feb3f04de",
+        "original_lines": [
+          4355,
+          4355
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:101",
+          "src/coding_review_agent_loop/pr_loop_support.py:387",
+          "tests/test_protocol.py:8134",
+          "tests/test_protocol.py:8147",
+          "tests/test_round_transport.py:2981",
+          "tests/test_round_transport.py:2988"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE": {
+        "sha256": "7082a05ab763761c28b7c0bb46aa8ae42bc9218be19e76e58312b152ed4590b2",
+        "original_lines": [
+          4356,
+          4359
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:100",
+          "src/coding_review_agent_loop/pr_loop_support.py:394",
+          "src/coding_review_agent_loop/validated_agent.py:48",
+          "src/coding_review_agent_loop/validated_agent.py:1319",
+          "tests/test_protocol.py:8133",
+          "tests/test_protocol.py:8142",
+          "tests/test_round_transport.py:2980",
+          "tests/test_round_transport.py:2990",
+          "tests/test_pr_loop_agent_turns.py:1343"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATIONS_NOT_ARRAY_RULES": {
+        "sha256": "57edb14abafde330e032fd759972177b146ff29899ced12b463e88eda199ffa9",
+        "original_lines": [
+          4360,
+          4362
+        ],
+        "global_references": [
+          "TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE",
+          "TEST_OBSERVATIONS_NOT_ARRAY_RULE"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/pr_loop_support.py:101",
+          "src/coding_review_agent_loop/pr_loop_support.py:387"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE": {
+        "sha256": "90e70a4406a34759d2e384479236fd8812a6487cfbb40eb1af5561eda78aecd8",
+        "original_lines": [
+          4363,
+          4365
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "TEST_OBSERVATIONS_MODES": {
+        "sha256": "1b6bb09ca98f3a0ce85dbb2aa0afd044a78d7ee3a4cfcb8f28623dc6dd88582e",
+        "original_lines": [
+          4371,
+          4371
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_test_observation_item_defect": {
+        "sha256": "040afa310495839e0e49c1b5a24a7a57b632108ca21b79e788b0631fb8c075c8",
+        "original_lines": [
+          4374,
+          4395
+        ],
+        "global_references": [
+          "CITATION_BLANK_FIELD_RULE",
+          "CITATION_CLAIM_RULE",
+          "CITATION_KEYS_RULE",
+          "CITATION_NOT_OBJECT_RULE",
+          "TEST_OBSERVATION_CITATION_CLAIMS",
+          "TEST_OBSERVATION_CITATION_KEYS",
+          "TestObservationCitation"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair_preservation.py:14",
+          "src/coding_review_agent_loop/repair_preservation.py:1029",
+          "src/coding_review_agent_loop/repair_preservation.py:1098",
+          "src/coding_review_agent_loop/repair_preservation.py:1102",
+          "src/coding_review_agent_loop/shape_check_audit.py:68",
+          "tests/test_shape_check_audit.py:798",
+          "tests/test_shape_check_audit.py:915"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_citation_defect_observed": {
+        "sha256": "556fd4405df7866d14ba6efa04d41617cc9381a7b8bf2f14aca6ca42fda683de",
+        "original_lines": [
+          4398,
+          4406
+        ],
+        "global_references": [
+          "CITATION_CLAIM_RULE",
+          "CITATION_KEYS_RULE",
+          "_dropped_ref_preview",
+          "_json_type_label",
+          "_neutralize_identifier_like"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:351",
+          "tests/test_protocol.py:6524",
+          "tests/test_protocol.py:6528"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_decode_test_observations_string": {
+        "sha256": "c0456f5da27f01c710ddefb6c168bf4cfa45b0e95ca42612c9c4fe0daa3cd576",
+        "original_lines": [
+          4409,
+          4424
+        ],
+        "global_references": [
+          "_check_dropped_value_bound",
+          "json"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair_preservation.py:13",
+          "src/coding_review_agent_loop/repair_preservation.py:1024",
+          "src/coding_review_agent_loop/repair_preservation.py:1048",
+          "src/coding_review_agent_loop/repair_preservation.py:1091",
+          "src/coding_review_agent_loop/shape_check_audit.py:404"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_degradable_test_observations": {
+        "sha256": "c919efdc3c4f32e89c8dd6a096382b6e3313b229df8be1a51c5424165dc90ee0",
+        "original_lines": [
+          4427,
+          4513
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "CITATIONS_DECODED_FROM_STRING_OUTCOME",
+          "CITATION_DEGRADATION_MAX_DROPS",
+          "CITATION_DROPPED_OUTCOME",
+          "ParseDegradation",
+          "TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE",
+          "TEST_OBSERVATIONS_MODES",
+          "TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE",
+          "TEST_OBSERVATIONS_NOT_ARRAY_RULE",
+          "TestObservationCitation",
+          "TestObservationsShapeError",
+          "_check_dropped_value_bound",
+          "_citation_defect_observed",
+          "_decode_test_observations_string",
+          "_json_type_label",
+          "_test_observation_item_defect"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair_preservation.py:1033",
+          "src/coding_review_agent_loop/repair_preservation.py:1065",
+          "src/coding_review_agent_loop/repair_preservation.py:1066",
+          "src/coding_review_agent_loop/shape_check_audit.py:412",
+          "src/coding_review_agent_loop/shape_check_audit.py:1783",
+          "src/coding_review_agent_loop/shape_check_audit.py:1893",
+          "tests/test_shape_check_audit.py:892",
+          "tests/test_shape_check_audit.py:903",
+          "tests/test_shape_check_audit.py:904",
+          "tests/test_shape_check_audit.py:908",
+          "tests/test_shape_check_audit.py:915",
+          "tests/test_shape_check_audit.py:919",
+          "tests/test_repair_preservation.py:2967",
+          "tests/test_repair_preservation.py:2969"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7151",
+          "src/coding_review_agent_loop/protocol.py:7423"
+        ]
+      },
+      "_semantic_execution_ref": {
+        "sha256": "d173c9723bcffc594660185e5fe26e89d9099baccdbf37ce9946afed7430b33a",
+        "original_lines": [
+          4516,
+          4521
+        ],
+        "global_references": [
+          "Mapping"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1304"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_hard_capped_claim_string": {
+        "sha256": "29cf3c2fb4b463486f80613693679fe004b7b46492f7cdef53e7b5719fc702a4",
+        "original_lines": [
+          4524,
+          4529
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:920"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_json_type_label": {
+        "sha256": "ee9b3c960895bc31812236b390f255fcef79ed1d9d7dd98ef7409523cdc500da",
+        "original_lines": [
+          4532,
+          4546
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_optional_semantic_fact_string": {
+        "sha256": "2d69b0ae131a4f94815b3bcb542e138dafebe1421694fd703da139daa7bae532",
+        "original_lines": [
+          4549,
+          4567
+        ],
+        "global_references": [
+          "CLAIM_FACT_MISTYPED_RULE",
+          "CLAIM_FACT_OVERSIZE_RULE",
+          "RISK_MATRIX_MAX_FIELD_BYTES",
+          "_hard_capped_claim_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:967"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_optional_semantic_fact_list": {
+        "sha256": "2d3d0226b41b743a22c2998aaedec2b12c77447a4f7ad9593e57b00e5294463f",
+        "original_lines": [
+          4570,
+          4617
+        ],
+        "global_references": [
+          "CLAIM_FACT_MISTYPED_RULE",
+          "CLAIM_FACT_OVERSIZE_RULE",
+          "RISK_MATRIX_MAX_FIELD_BYTES",
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "_hard_capped_claim_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:959"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_semantic_execution_ref_list": {
+        "sha256": "97afb119472a522f704c4b595f069f512c4a5c1451aef9203e8875d651e57bdd",
+        "original_lines": [
+          4620,
+          4648
+        ],
+        "global_references": [
+          "CLAIM_EXECUTION_REFS_EMPTY_RULE",
+          "CLAIM_EXECUTION_REFS_MISTYPED_RULE",
+          "_hard_capped_claim_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1304"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_normalize_overlong_execution_refs": {
+        "sha256": "de37ad00ddc4928d096e23523ff9d1f2c818ea62fef2a208e9bc9b4be4b8a24c",
+        "original_lines": [
+          4651,
+          4670
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS",
+          "Sequence"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_truncate_utf8": {
+        "sha256": "c5d711daf8ff56d9f1ba5c5692d3f7afb0fe4243b01e2f6ce21727545e0d09e9",
+        "original_lines": [
+          4673,
+          4677
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_dropped_ref_preview": {
+        "sha256": "ccec3802e48fe4c9ec2f756218fe2566a35a2052ab363c75916cd45fadebb263",
+        "original_lines": [
+          4680,
+          4685
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:467"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_dropped_execution_refs_caveat": {
+        "sha256": "1b47790d8d1e1c625cd40aab1ece337fedfe54c9aaf122c43551958cc45f2b79",
+        "original_lines": [
+          4688,
+          4694
+        ],
+        "global_references": [
+          "Sequence",
+          "_named_refs_caveat"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:458"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_overflow_execution_refs_caveat": {
+        "sha256": "1fb9d7954c50840beab8d111269ae22220b154925fa2aac2076b1e47c55cf913",
+        "original_lines": [
+          4697,
+          4713
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS",
+          "Sequence",
+          "_named_refs_caveat"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:449"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_named_refs_caveat": {
+        "sha256": "d8d0655a736910a527b7dff793a04d65061c3503f0e1def2c7491867f638e59e",
+        "original_lines": [
+          4716,
+          4729
+        ],
+        "global_references": [
+          "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES",
+          "Sequence",
+          "_dropped_ref_preview",
+          "_truncate_utf8"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:440"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_truncated_fact_lists_caveat": {
+        "sha256": "3ccf0c9308fa1c75d2de5fb36835e1faef15dc6ed7ab321d1e1f2412aea22850",
+        "original_lines": [
+          4732,
+          4738
+        ],
+        "global_references": [
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES",
+          "Sequence",
+          "_truncate_utf8"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_dropped_value_bytes": {
+        "sha256": "ba20ea57d5209a966106f7017f4ab4e37e7fa7b0bacf2b220af8b0860d037997",
+        "original_lines": [
+          4741,
+          4745
+        ],
+        "global_references": [
+          "json"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_check_dropped_value_bound": {
+        "sha256": "2cf0643a9492a345bf5f424ac2ecbb18b47b040cbd6f640f666670c7ce4ce7c4",
+        "original_lines": [
+          4748,
+          4760
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "DROPPED_VALUE_MAX_BYTES",
+          "_dropped_value_bytes"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:342",
+          "tests/test_shape_check_audit.py:921"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_semantic_risk_coverage_claims": {
+        "sha256": "a73dd1d6d0dd682977865de287b1e1ca56737dcd5f58d38d1bb5e8856221750f",
+        "original_lines": [
+          4763,
+          5183
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "CLAIMS_FIELD_NOT_ARRAY_RULE",
+          "CLAIM_DROPPED_OUTCOME",
+          "CLAIM_EXECUTION_REFS_ABSENT_RULE",
+          "CLAIM_EXECUTION_REFS_EMPTY_RULE",
+          "CLAIM_EXECUTION_REFS_NO_CATALOG_OVERSIZE_RULE",
+          "CLAIM_EXECUTION_REFS_REPEATED_RULE",
+          "CLAIM_FACT_MISTYPED_RULE",
+          "CLAIM_NOT_OBJECT_RULE",
+          "CLAIM_RESERVED_AUTHORITY_KEYS",
+          "CLAIM_ROW_ID_DUPLICATE_RULE",
+          "CLAIM_ROW_ID_MISTYPED_RULE",
+          "CLAIM_ROW_ID_UNAPPROVED_RULE",
+          "CLAIM_UNKNOWN_KEYS_RULE",
+          "NonRepairableEvidenceRejection",
+          "ParseDegradation",
+          "RISK_MATRIX_MAX_LIST_ITEMS",
+          "SEMANTIC_RISK_CLAIMS_MAX_CAVEATS",
+          "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS",
+          "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES",
+          "SEMANTIC_RISK_CLAIMS_MAX_ROWS",
+          "SEMANTIC_RISK_CLAIM_COVERAGE_KEYS",
+          "SEMANTIC_RISK_CLAIM_FACT_KEYS",
+          "SEMANTIC_RISK_CLAIM_KEYS",
+          "SEMANTIC_RISK_TEST_LEVELS",
+          "SemanticRiskCoverageClaim",
+          "SemanticRiskCoverageClaims",
+          "Sequence",
+          "_check_dropped_value_bound",
+          "_claim_row_id_or_degradation",
+          "_dropped_execution_refs_caveat",
+          "_dropped_ref_preview",
+          "_fact_defect_observed",
+          "_json_type_label",
+          "_known_launch_integrity_passes",
+          "_launch_integrity_failure_reasons",
+          "_logger",
+          "_neutralize_identifier_like",
+          "_node_test_hint",
+          "_normalize_overlong_execution_refs",
+          "_observation_command_label",
+          "_observation_outcome_failure_reasons",
+          "_observation_semantics",
+          "_observation_timestamp_label",
+          "_only_suite_start_unverified",
+          "_optional_semantic_fact_list",
+          "_optional_semantic_fact_string",
+          "_overflow_execution_refs_caveat",
+          "_semantic_execution_ref",
+          "_semantic_execution_ref_list",
+          "_truncated_fact_lists_caveat"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1223",
+          "src/coding_review_agent_loop/shape_check_audit.py:1783",
+          "src/coding_review_agent_loop/shape_check_audit.py:1893",
+          "tests/test_shape_check_audit.py:891",
+          "tests/test_shape_check_audit.py:919",
+          "tests/test_shape_check_audit.py:941",
+          "tests/test_risk_test_matrix.py:2900",
+          "tests/test_risk_test_matrix.py:2929",
+          "tests/test_risk_test_matrix.py:3334",
+          "tests/test_risk_test_matrix.py:3336",
+          "tests/test_protocol.py:3389",
+          "tests/test_protocol.py:3391",
+          "tests/test_protocol.py:3401",
+          "tests/test_protocol.py:3414",
+          "tests/test_protocol.py:3422",
+          "tests/test_prompts.py:4157",
+          "tests/test_prompts.py:4200"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7158",
+          "src/coding_review_agent_loop/protocol.py:7430"
+        ]
+      },
+      "_gap_degradations": {
+        "sha256": "f91fc17a1a347e6b40a2d2e82e15d36d6b48dd188c05f154a57946cd629687b0",
+        "original_lines": [
+          5186,
+          5192
+        ],
+        "global_references": [
+          "COVERAGE_GAP_DROPPED_OUTCOME",
+          "ParseDegradation",
+          "Sequence"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:274"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_parse_semantic_risk_coverage_gaps": {
+        "sha256": "f602b3efefc28d8f46ec70ead8fd81cfa9d591d587ce4bc403a9c82dcb19d462",
+        "original_lines": [
+          5195,
+          5262
+        ],
+        "global_references": [
+          "Mapping",
+          "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES",
+          "SEMANTIC_RISK_CLAIMS_MAX_ROWS",
+          "SEMANTIC_RISK_COVERAGE_GAP_KEYS",
+          "SemanticRiskCoverageGap",
+          "SemanticRiskCoverageGaps",
+          "Sequence",
+          "_dropped_ref_preview",
+          "_gap_degradations",
+          "_json_type_label",
+          "_neutralize_identifier_like"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:283"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:7164",
+          "src/coding_review_agent_loop/protocol.py:7436"
+        ]
+      },
+      "_fact_defect_observed": {
+        "sha256": "5b6f1d4dfe30156e3b0d02a622979a6d7c383a05c62cedf77c8117737541c073",
+        "original_lines": [
+          5265,
+          5269
+        ],
+        "global_references": [
+          "CLAIM_FACT_OVERSIZE_RULE",
+          "_dropped_value_bytes",
+          "_json_type_label"
+        ],
+        "consumer_candidates": [],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "_claim_row_id_or_degradation": {
+        "sha256": "a928782d5ee58d3d97e003d7460f527f1072139c72f8b9365c6a7b9d62018a2b",
+        "original_lines": [
+          5272,
+          5302
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "CLAIM_ROW_ID_ABSENT_RULE",
+          "CLAIM_ROW_ID_MALFORMED_RULE",
+          "CLAIM_ROW_ID_MISTYPED_RULE",
+          "Mapping",
+          "SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES",
+          "_dropped_ref_preview",
+          "_neutralize_identifier_like",
+          "_validate_risk_row_id"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:360",
+          "tests/test_shape_check_audit.py:831",
+          "tests/test_shape_check_audit.py:832",
+          "tests/test_shape_check_audit.py:835"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "RiskTestMatrixMetadata": {
+        "sha256": "2319b5ea71cbe25a9bf26033e43d7ba8e798d363468eecd6995b03bdb6b2cc2c",
+        "original_lines": [
+          8276,
+          8295
+        ],
+        "global_references": [
+          "dataclass",
+          "sanitize_historical_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_assembly.py:31",
+          "src/coding_review_agent_loop/plan_assembly.py:445",
+          "src/coding_review_agent_loop/plan_assembly.py:488",
+          "src/coding_review_agent_loop/plan_assembly.py:616",
+          "src/coding_review_agent_loop/shape_check_audit.py:220"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8359"
+        ]
+      },
+      "_parse_complete_risk_test_matrix_row": {
+        "sha256": "66c856186c7d9233023c4f874bd674f7f1118fa407aa9ff796c4baa1edd62df2",
+        "original_lines": [
+          8443,
+          8463
+        ],
+        "global_references": [
+          "RISK_TEST_MATRIX_ROW_KEYS",
+          "RiskTestMatrixRow",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_risk_bounded_string",
+          "_risk_bounded_string_list",
+          "_validate_risk_owner",
+          "_validate_risk_row_id"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1013"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": []
+      },
+      "parse_risk_test_matrix_row": {
+        "sha256": "6e64ba62987045ac8b9493609f9b0e74aaca52223cfd20d5323ac2cb46bdbbe1",
+        "original_lines": [
+          8466,
+          8471
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RiskTestMatrixRow",
+          "_parse_complete_risk_test_matrix_row"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1589"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8580",
+          "src/coding_review_agent_loop/protocol.py:8589",
+          "src/coding_review_agent_loop/protocol.py:8606",
+          "src/coding_review_agent_loop/protocol.py:8631"
+        ]
+      },
+      "_parse_matrix_metadata": {
+        "sha256": "184a4c06aee513f3b016aa006049bb307a2b2e77c03dc2abf10bf78072af3911",
+        "original_lines": [
+          8510,
+          8535
+        ],
+        "global_references": [
+          "AgentLoopError",
+          "RISK_MATRIX_APPLICABILITY",
+          "RISK_MATRIX_MAX_EXCLUSIONS",
+          "RiskTestMatrixMetadata",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_risk_bounded_string",
+          "_risk_bounded_string_list"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1135"
+        ],
+        "decorators": [],
+        "retained_driver_lookup_sites": [
+          "src/coding_review_agent_loop/protocol.py:8640"
+        ]
+      }
+    }
+  },
+  "patch_candidates": [
+    {
+      "location": "src/coding_review_agent_loop/github.py:4068",
+      "text": "def patch_verified_trusted_protocol_comment("
+    },
+    {
+      "location": "src/coding_review_agent_loop/github.py:4079",
+      "text": "    return patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "src/coding_review_agent_loop/github.py:4090",
+      "text": "def patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "src/coding_review_agent_loop/managed_ci.py:57",
+      "text": "    patch_verified_trusted_protocol_comment_observed,"
+    },
+    {
+      "location": "src/coding_review_agent_loop/managed_ci.py:7437",
+      "text": "        protocol_version=2, base_ref=base_ref, dispatch_ref=dispatch_ref, trusted_actor_login=actor_login,"
+    },
+    {
+      "location": "src/coding_review_agent_loop/managed_ci.py:8732",
+      "text": "    written = patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:140",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', post)"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:150",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', ambiguous)"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:153",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', lambda *args, **kwargs: pytest.fail('duplicate write'))"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:163",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', failed)"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:307",
+      "text": "    monkeypatch.setattr(github, 'read_authenticated_protocol_comments',"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:312",
+      "text": "    monkeypatch.setattr(github, 'read_authenticated_protocol_comments',"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:323",
+      "text": "    monkeypatch.setattr(github, 'read_authenticated_protocol_comments',"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:368",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', post)"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:376",
+      "text": "    monkeypatch.setattr(github, 'post_verified_trusted_issue_protocol_comment', recover)"
+    },
+    {
+      "location": "tests/test_pr_loop_post_merge_obligations.py:388",
+      "text": "    monkeypatch.setattr(github, 'read_authenticated_protocol_comments',"
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:229",
+      "text": "        protocol_version=2, base_ref=\"refactor/1181\", dispatch_ref=\"main\","
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:263",
+      "text": "        _contract_dispatch_ref(ScriptRunner(), config, ManagedCiContract(protocol_version=2, base_ref=\"refactor/1181\"))"
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:266",
+      "text": "        ManagedCiContract(protocol_version=2, base_ref=\"refactor/1181\", dispatch_ref=\"main\"),"
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:272",
+      "text": "        protocol_version=2, base_ref=\"refactor/1181\", dispatch_ref=\"main\", nonce=\"n\","
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:396",
+      "text": "        protocol_version=2, base_ref=\"refactor/1181\", dispatch_ref=\"main\","
+    },
+    {
+      "location": "tests/test_managed_ci_integration_bases.py:597",
+      "text": "        protocol_version=2, base_ref=\"refactor/a\", dispatch_ref=\"main\","
+    },
+    {
+      "location": "tests/test_github_api_cwd.py:241",
+      "text": "            github.patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_github_api_cwd.py:246",
+      "text": "        result = github.patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_module_split_imports.py:94",
+      "text": "    'patch(\"coding_review_agent_loop.protocol.ParseDegradation\")',"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:95",
+      "text": "    'prefix = \"coding_review_agent_loop.protocol.\"\\npatch(prefix + \"ParseDegradation\")',"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:96",
+      "text": "    'prefix = \"coding_review_agent_loop.protocol\"\\npatch(f\"{prefix}.ParseDegradation\")',"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:98",
+      "text": "    'from coding_review_agent_loop import protocol as p\\nmonkeypatch.setattr(p, \"ParseDegradation\", fake)',"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:99",
+      "text": "    'from coding_review_agent_loop import protocol as p\\npatch.object(p, \"ParseDegradation\", fake)',"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:117",
+      "text": "              'patch(\"coding_review_agent_loop.protocol.parse_structured_discuss_answer\")\\n')"
+    },
+    {
+      "location": "tests/test_module_split_imports.py:134",
+      "text": "    monkeypatch.setattr(protocol_discuss, '_extract_structured_discuss_review_payload', stop_at_lookup)"
+    },
+    {
+      "location": "tests/test_managed_ci_reconciliation.py:131",
+      "text": "    contract = ci.ManagedCiContract(protocol_version=2, base_ref='main', dispatch_ref='main', repository='OWNER/REPO',"
+    },
+    {
+      "location": "tests/test_comment_rendering.py:2784",
+      "text": "    monkeypatch.setattr(rendering, \"parse_risk_test_matrix_evidence\", _explode)"
+    },
+    {
+      "location": "tests/test_protocol.py:5801",
+      "text": "    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value"
+    },
+    {
+      "location": "tests/test_protocol.py:6004",
+      "text": "    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value"
+    },
+    {
+      "location": "tests/test_protocol.py:6072",
+      "text": "    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value"
+    },
+    {
+      "location": "tests/test_git_boundary.py:1528",
+      "text": "def test_missing_ref_diagnostic_uses_requested_ref_only(repositories, monkeypatch, protocol, footer):"
+    },
+    {
+      "location": "tests/test_github.py:14",
+      "text": "    patch_verified_trusted_protocol_comment,"
+    },
+    {
+      "location": "tests/test_github.py:15",
+      "text": "    patch_verified_trusted_protocol_comment_observed,"
+    },
+    {
+      "location": "tests/test_github.py:271",
+      "text": "    written = patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_github.py:277",
+      "text": "    assert patch_verified_trusted_protocol_comment("
+    },
+    {
+      "location": "tests/test_github.py:299",
+      "text": "    written = patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_github.py:314",
+      "text": "        patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_github.py:848",
+      "text": "    return patch_verified_trusted_protocol_comment_observed("
+    },
+    {
+      "location": "tests/test_pr_loop_coder_ci_guard.py:178",
+      "text": "        protocol_version=2, base_ref=\"main\", dispatch_ref=\"main\","
+    },
+    {
+      "location": "tests/test_managed_ci.py:6441",
+      "text": "    monkeypatch.setattr(managed_ci, \"post_verified_trusted_pr_protocol_comment\", failed_post)"
+    },
+    {
+      "location": "tests/test_response_validation.py:1161",
+      "text": "    monkeypatch.setattr(_response_validation, \"derive_risk_test_matrix_evidence\", spy)"
+    },
+    {
+      "location": "tests/test_pr_loop_managed_ci.py:389",
+      "text": "            ManagedCiContract(protocol_version=2, dispatch_issued=True),"
+    },
+    {
+      "location": "tests/test_review_images_state.py:187",
+      "text": "    monkeypatch.setattr(github,'post_verified_trusted_pr_protocol_comment_observed',counted)"
+    },
+    {
+      "location": "tests/test_pr_loop_review_images.py:672",
+      "text": "    monkeypatch.setattr(pr_loop,'activate_managed_ci',lambda *a, **kw: ManagedCiContract(protocol_version=2))"
+    },
+    {
+      "location": "tests/test_pr_loop_review_images.py:1141",
+      "text": "    monkeypatch.setattr(pr_loop,'activate_managed_ci',lambda *a,**kw:ManagedCiContract(protocol_version=2))"
+    },
+    {
+      "location": "tests/fixtures/managed_ci/dispatch_validator.py:38",
+      "text": "        raise ValueError('managed dispatch inputs must be complete protocol-v2 values')"
+    }
+  ],
+  "compatibility_exports": [
+    "CAPTURE_DISQUALIFIERS",
+    "CAPTURE_LIMITED",
+    "CAPTURE_LIMITED_OBSERVATION_CLASSES",
+    "CAPTURE_OBSERVATION_CLASSES",
+    "CITATIONS_DECODED_FROM_STRING_OUTCOME",
+    "CITATION_BLANK_FIELD_RULE",
+    "CITATION_CLAIM_RULE",
+    "CITATION_DEGRADATION_MAX_DROPS",
+    "CITATION_DROPPED_OUTCOME",
+    "CITATION_KEYS_RULE",
+    "CITATION_NOT_OBJECT_RULE",
+    "CLAIMS_FIELD_NOT_ARRAY_RULE",
+    "CLAIM_DROPPED_OUTCOME",
+    "CLAIM_EXECUTION_REFS_ABSENT_RULE",
+    "CLAIM_EXECUTION_REFS_EMPTY_RULE",
+    "CLAIM_EXECUTION_REFS_MISTYPED_RULE",
+    "CLAIM_EXECUTION_REFS_NO_CATALOG_OVERSIZE_RULE",
+    "CLAIM_EXECUTION_REFS_REPEATED_RULE",
+    "CLAIM_FACT_MISTYPED_RULE",
+    "CLAIM_FACT_OVERSIZE_RULE",
+    "CLAIM_NOT_OBJECT_RULE",
+    "CLAIM_RESERVED_AUTHORITY_KEYS",
+    "CLAIM_ROW_ID_ABSENT_RULE",
+    "CLAIM_ROW_ID_DUPLICATE_RULE",
+    "CLAIM_ROW_ID_MALFORMED_RULE",
+    "CLAIM_ROW_ID_MISTYPED_RULE",
+    "CLAIM_ROW_ID_UNAPPROVED_RULE",
+    "CLAIM_UNKNOWN_KEYS_RULE",
+    "COVERAGE_GAP_DROPPED_OUTCOME",
+    "DEGRADED_ROW_CLAIM_DIAGNOSTIC",
+    "DROPPED_VALUE_MAX_BYTES",
+    "DerivedRiskEvidenceResult",
+    "EVIDENCE_REASK_MAX_CHARS",
+    "EVIDENCE_SOURCE_OPERATOR_SIGNED",
+    "EVIDENCE_SOURCE_TOOL_CAPTURED",
+    "NOT_CAPTURE_LIMITED",
+    "PostAuthClaimDiagnostic",
+    "RESERVED_FINDING_NAMESPACE_TOKENS",
+    "RESERVED_REQUIREMENT_PREFIX",
+    "RISK_MATRIX_APPLICABILITY",
+    "RISK_MATRIX_CHANGE_OPERATIONS",
+    "RISK_MATRIX_EVIDENCE_STATUSES",
+    "RISK_MATRIX_MAX_AUDIT_ROW_IDS",
+    "RISK_MATRIX_MAX_CAVEATS",
+    "RISK_MATRIX_MAX_CHANGES",
+    "RISK_MATRIX_MAX_EXCLUSIONS",
+    "RISK_MATRIX_MAX_FIELD_BYTES",
+    "RISK_MATRIX_MAX_LIST_ITEMS",
+    "RISK_MATRIX_MAX_PAYLOAD_BYTES",
+    "RISK_MATRIX_MAX_ROWS",
+    "RISK_MATRIX_OWNER_NAMES",
+    "RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS",
+    "RISK_TEST_MATRIX_CHANGE_KEYS",
+    "RISK_TEST_MATRIX_CHANGE_STRING_LIST_KEYS",
+    "RISK_TEST_MATRIX_CONTRACT_VERSION",
+    "RISK_TEST_MATRIX_OPTIONAL_KEYS",
+    "RISK_TEST_MATRIX_REQUIRED_KEYS",
+    "RISK_TEST_MATRIX_ROW_KEYS",
+    "RISK_TEST_MATRIX_ROW_STRING_LIST_KEYS",
+    "RISK_TEST_MATRIX_STRING_LIST_KEYS",
+    "RiskTestMatrix",
+    "RiskTestMatrixChange",
+    "RiskTestMatrixEvidence",
+    "RiskTestMatrixEvidenceRow",
+    "RiskTestMatrixMetadata",
+    "RiskTestMatrixRow",
+    "SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS",
+    "SEMANTIC_RISK_CLAIMS_MAX_CAVEATS",
+    "SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES",
+    "SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS",
+    "SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES",
+    "SEMANTIC_RISK_CLAIMS_MAX_ROWS",
+    "SEMANTIC_RISK_CLAIM_COVERAGE_KEYS",
+    "SEMANTIC_RISK_CLAIM_FACT_KEYS",
+    "SEMANTIC_RISK_CLAIM_KEYS",
+    "SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS",
+    "SEMANTIC_RISK_CLAIM_REQUIRED_KEYS",
+    "SEMANTIC_RISK_COVERAGE_GAPS_FIELD",
+    "SEMANTIC_RISK_COVERAGE_GAP_KEYS",
+    "SEMANTIC_RISK_TEST_LEVELS",
+    "SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC",
+    "SUITE_START_UNRECOGNIZED_DIAGNOSTIC",
+    "SUITE_START_UNVERIFIED_DIAGNOSTIC",
+    "SemanticRiskCoverageClaim",
+    "SemanticRiskCoverageClaims",
+    "SemanticRiskCoverageGap",
+    "SemanticRiskCoverageGaps",
+    "SignedEvidenceReference",
+    "TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE",
+    "TEST_OBSERVATIONS_MODES",
+    "TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE",
+    "TEST_OBSERVATIONS_NOT_ARRAY_RULE",
+    "TEST_OBSERVATIONS_NOT_ARRAY_RULES",
+    "TEST_OBSERVATION_CITATION_CLAIMS",
+    "TEST_OBSERVATION_CITATION_KEYS",
+    "UNAPPROVED_ROW_CLAIM_DIAGNOSTIC",
+    "_IDENTIFIER_LIKE_SPAN_RE",
+    "_LAUNCH_FAILURE_PHRASES",
+    "_LAUNCH_PASSING_STATES",
+    "_NODE_HINT_EXTENSIONS",
+    "_NODE_HINT_FILE_RE",
+    "_RESERVED_FINDING_AT_RE",
+    "_RESERVED_NAMESPACE_SEPARATORS",
+    "_RESERVED_REQUIREMENT_AT_RE",
+    "_RISK_OWNER_STAGE_RE",
+    "_RISK_ROW_ID_SYNTAX_RE",
+    "_SHA_HEX_RE",
+    "_authoritative_receipt_passes",
+    "_check_dropped_value_bound",
+    "_citation_defect_observed",
+    "_citation_matches_observation",
+    "_claim_row_id_or_degradation",
+    "_claims_value",
+    "_decode_test_observations_string",
+    "_degradable_test_observations",
+    "_degraded_row_claim_message",
+    "_dropped_execution_refs_caveat",
+    "_dropped_ref_preview",
+    "_dropped_value_bytes",
+    "_expect_test_observations",
+    "_fact_defect_observed",
+    "_fixture_lifecycle_is_clean",
+    "_gap_degradations",
+    "_hard_capped_claim_string",
+    "_has_reserved_namespace",
+    "_is_non_evidence_launch_failure",
+    "_is_valid_risk_row_id",
+    "_journal_disqualifies",
+    "_json_type_label",
+    "_known_launch_integrity_passes",
+    "_launch_integrity_failure_reasons",
+    "_named_refs_caveat",
+    "_neutralize_identifier_like",
+    "_neutralize_identifier_like_span",
+    "_node_test_hint",
+    "_normalize_overlong_execution_refs",
+    "_observation_attribution",
+    "_observation_command_label",
+    "_observation_command_text",
+    "_observation_outcome_failure_reasons",
+    "_observation_projection_field",
+    "_observation_semantics",
+    "_observation_timestamp_label",
+    "_observation_value",
+    "_only_suite_start_unverified",
+    "_optional_semantic_fact_list",
+    "_optional_semantic_fact_string",
+    "_overflow_execution_refs_caveat",
+    "_parse_complete_risk_test_matrix_row",
+    "_parse_matrix_metadata",
+    "_parse_operator_signed_row",
+    "_parse_risk_evidence_citations",
+    "_parse_risk_test_matrix",
+    "_parse_risk_test_matrix_changes",
+    "_parse_risk_test_matrix_contract_fields",
+    "_parse_semantic_risk_coverage_claims",
+    "_parse_semantic_risk_coverage_gaps",
+    "_receipt_expected_status",
+    "_reserved_namespace_match_at",
+    "_risk_bounded_string",
+    "_risk_bounded_string_list",
+    "_row_capture_classification",
+    "_safe_label",
+    "_semantic_execution_ref",
+    "_semantic_execution_ref_list",
+    "_semantic_risk_claim_schema_text_base",
+    "_test_observation_item_defect",
+    "_truncate_utf8",
+    "_truncated_fact_lists_caveat",
+    "_unapproved_row_claim_message",
+    "_validate_risk_owner",
+    "_validate_risk_row_id",
+    "_wrap_lone_string",
+    "apply_signed_evidence_references",
+    "build_risk_test_matrix_evidence",
+    "capture_observation_class",
+    "derive_risk_test_matrix_evidence",
+    "disqualify_capture_classification",
+    "normalize_risk_test_matrix_string_lists",
+    "parse_risk_test_matrix",
+    "parse_risk_test_matrix_changes",
+    "parse_risk_test_matrix_evidence",
+    "parse_risk_test_matrix_row",
+    "render_evidence_rejection_detail",
+    "risk_test_matrix_identity",
+    "risk_test_matrix_prompt_examples",
+    "sanitize_risk_test_matrix",
+    "semantic_risk_claim_example",
+    "semantic_risk_claim_example_json",
+    "semantic_risk_claim_schema_text",
+    "suite_start_unverified_diagnostic",
+    "validate_risk_test_matrix_revision"
+  ]
+}

@@ -70,6 +70,9 @@ def test_linked_audit_imports_resolve_to_the_declared_owner():
                     if isinstance(target, ast.Name):
                         assert target.id not in definitions, target.id
                         definitions[target.id] = owner
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                assert node.target.id not in definitions, node.target.id
+                definitions[node.target.id] = owner
             elif isinstance(node, ast.ImportFrom) and node.level == 1 and node.module in PARSER_OWNERS:
                 imports.append(node)
     for node in imports:
