@@ -257,13 +257,27 @@ def reopen_cleared_requests(items, boundary, records, head):
     prior = [r for r in records if r.index <= boundary.index]
     old_head = boundary.metadata.subject
     cleared = {identity for identity, h in boundary.metadata.evidence_clearances if h == old_head}
-    candidates = {}
+    if not cleared:
+        return list(items)
+    # Requests are ingested after snapshots. A same-response clearance may
+    # leave only the requester record carrying the consolidated lineage.
+    groups = {}
     for record in prior:
-        for item in (*record.metadata.prior_items, *record.metadata.new_items):
-            if native(item) and set(identities(item)) & cleared:
-                candidates[item.item_id] = item
-    retired = {alias for item in candidates.values() for alias in item.alias_item_ids}
-    restored = consolidate_ledger([item for item in candidates.values() if item.item_id not in retired], known_pr_heads(prior, head))
+        groups.setdefault((record.metadata.subject, record.metadata.round_number), []).append(record)
+    candidates = []
+    for group in groups.values():
+        snapshots = {item.item_id: item for record in group
+                     for item in (*record.metadata.prior_items, *record.metadata.new_items)
+                     if native(item) and set(identities(item)) & cleared}
+        candidates = [snapshots.pop(item.item_id, item) for item in candidates]
+        candidates.extend(snapshots.values())
+        retired = {alias for item in candidates for alias in item.alias_item_ids}
+        candidates = [item for item in candidates if item.item_id not in retired]
+        _append_recorded_evidence_requests(candidates,
+            [r for r in group if r.metadata.role == "reviewer"], records=prior)
+        candidates = consolidate_ledger(candidates, known_pr_heads(
+            [r for r in prior if r.index <= max(g.index for g in group)]))
+    restored = [item for item in candidates if native(item) and set(identities(item)) & cleared]
     result = list(items)
     present = {identity for item in result for identity in identities(item)}
     for item in restored:

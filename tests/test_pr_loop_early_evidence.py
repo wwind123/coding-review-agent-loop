@@ -269,3 +269,48 @@ def test_alias_dispositions_in_real_loop(tmp_path, vote_kind):
         assert [i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items] == ["item-1"]
         assert not _freeze_records(runner)[-1].metadata.evidence_clearances
     assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+@pytest.mark.parametrize("persisted", [False, True])
+def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, persisted):
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+    from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
+    runner, config = deferred(tmp_path, mode=mode)
+    records = _pr_records(runner)
+    items = []
+    _append_recorded_evidence_requests(items, [r for r in records if r.metadata.role == "reviewer"], records=records)
+    items, _ = _upsert_evidence_obligation(items, item_number=2, reviewer="Codex",
+        text="Second distinct operator acceptance", source_round=2, current_head_sha=HEAD)
+    originals = list(items)
+    text = "Consolidate item-1 and item-2 into this existing operator acceptance request."
+    if persisted:
+        items, _ = _upsert_evidence_obligation(items, item_number=3, reviewer="Codex",
+            text=text, source_round=2, current_head_sha=HEAD)
+    support._publish_evidence_release(runner, config=config, pr_number=77, round_number=2,
+        head_sha=HEAD, items=items, reason="refresh-clean", surfaced_requirement_ids=(),
+        allowed_rounds=config.max_rounds, watch_failure_extension_used=False,
+        watch_head_extension_used=False)
+    runner.pr_payload["comments"].append(_signed("Accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    votes = [{"item_id": item_id, "disposition": "resolved", "note": "Signed acceptance is adequate.",
+              "evidence_requirement_ids": [rid]} for item_id in ("item-1", "item-2")]
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=votes,
+        evidence=[] if persisted else [text]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not _release_records(runner)[-1].metadata.prior_items
+    runner.git_head = runner.pr_payload["headRefOid"] = "a" * 40
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_evidence_review(hr=True, state="blocking", dispositions=[{
+        "item_id": "item-2", "disposition": "blocking", "note": "Need acceptance at the new head."}]))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    freeze = _freeze_records(runner)[-1].metadata
+    assert len(freeze.prior_items) == 1
+    survivor = freeze.prior_items[0]
+    assert survivor.item_id == "item-1" and survivor.text == text
+    assert survivor.alias_item_ids == ("item-2",)
+    assert survivor.obligation_identity == originals[0].obligation_identity
+    assert originals[1].obligation_identity in survivor.alias_obligation_identities
+    assert freeze.subject == "a" * 40
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)

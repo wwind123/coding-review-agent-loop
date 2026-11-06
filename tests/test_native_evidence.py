@@ -179,3 +179,21 @@ def test_literal_placeholder_and_foreign_subjects_are_not_commit_references():
     _append_recorded_evidence_requests(replay, [trusted], records=[trusted, foreign], admitted_records=[trusted])
     _append_recorded_evidence_requests(replay, [foreign], records=[trusted, foreign], admitted_records=[trusted])
     assert len(replay) == 2
+
+
+@pytest.mark.parametrize("with_requests", [False, True])
+def test_reopen_legacy_snapshots_coalesces_without_future_heads(with_requests):
+    from coding_review_agent_loop.native_evidence import reopen_cleared_requests
+    first, _ = upsert(text="Accept " + H1[:7])
+    second, _ = upsert(text="Accept " + H2[:7], head=H2, number=2)
+    a = record(0, H1, prior_items=tuple(first))
+    b = record(1, H2, [second[0].text] if with_requests else (), prior_items=tuple(second))
+    boundary = record(2, H2, evidence_clearances=tuple(
+        (i.obligation_identity, H2) for i in (*first, *second)))
+    future = record(3, H1[:7] + "b" * 33)
+    restored = reopen_cleared_requests([], boundary, [a, b, boundary, future], future.metadata.subject)
+    assert len(restored) == 1
+    assert restored[0].item_id == "item-1"
+    assert restored[0].alias_item_ids == ("item-2",)
+    assert restored[0].text == second[0].text
+    assert restored[0].lifecycle == "evidence_deferred"
