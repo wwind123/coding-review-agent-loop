@@ -363,8 +363,10 @@ import dataclasses  # noqa: E402
 
 import coding_review_agent_loop.evidence_stall as evidence_stall_module  # noqa: E402
 import coding_review_agent_loop.pr_loop as pr_loop_module  # noqa: E402
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol import (
     PostAuthClaimDiagnostic,
+)
+from coding_review_agent_loop.protocol_common import (
     TestObservationCitation as _Citation,
 )
 from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping  # noqa: E402

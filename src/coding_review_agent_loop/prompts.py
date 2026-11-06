@@ -44,18 +44,13 @@ from .round_transport import (
     MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
     is_round_transport_sidecar,
 )
-from .protocol import (
+from .protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
+from .protocol import (
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
     MACHINE_AUTHORITY,
-    ParsedDiscussAgenda,
-    ParsedDiscussAnswer,
-    ParsedDiscussFinalSynthesis,
-    ParsedDiscussRoundSynthesis,
-    ParsedDiscussResponse,
-    ParsedDiscussReview,
     UnresolvedReviewItem,
-    discuss_round_synthesis_payload,
     is_failed_discuss_response,
     RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS,
     RISK_TEST_MATRIX_CHANGE_KEYS,
@@ -64,6 +59,17 @@ from .protocol import (
     RISK_TEST_MATRIX_ROW_KEYS,
     risk_test_matrix_prompt_examples,
     semantic_risk_claim_schema_text,
+)
+from .protocol_discuss_types import (
+    ParsedDiscussAgenda,
+    ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedDiscussRoundSynthesis,
+    ParsedDiscussResponse,
+    ParsedDiscussReview,
+)
+from .protocol_discuss import (
+    discuss_round_synthesis_payload,
 )
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
 from .risk_coverage_map import classify_required_level, coverage_map_applies, enforceable_rows

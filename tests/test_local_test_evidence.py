@@ -7765,7 +7765,9 @@ def test_real_codex_backend_delivers_broker_and_launcher_journal_1758(tmp_path, 
 @pytest.mark.parametrize("kind", ["current", "foreign", "restored", "standalone", "unknown"])
 def test_projection_uses_frozen_acquisition_not_latest_repair_turn_1758(tmp_path, kind):
     from dataclasses import replace
-    from coding_review_agent_loop.protocol import TestObservationCitation
+    from coding_review_agent_loop.protocol_common import (
+        TestObservationCitation,
+    )
     runner = Runner()
     row = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
                        receipt_id="original", registry=runner._environment_registry)

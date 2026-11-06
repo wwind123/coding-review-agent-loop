@@ -2320,7 +2320,9 @@ def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid(
 # --- #925: degradation records in round metadata ------------------------------
 
 def _deg_record(outcome="degraded-to-undetermined"):
-    from coding_review_agent_loop.protocol import ParseDegradation
+    from coding_review_agent_loop.protocol_common import (
+        ParseDegradation,
+    )
 
     return ParseDegradation.build(
         element_path="pr_review.architecture_impact.status",

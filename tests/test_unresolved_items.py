@@ -517,7 +517,9 @@ def test_excluded_1868_normalization_preserves_ledger_and_test_reports(kind, fie
     item = _excluded_1868(kind)
     notes = field.replace("items", "item_notes")
     parsed = _followup_1388(addressed_items=["item-1"])
-    from coding_review_agent_loop.protocol import TestObservationCitation
+    from coding_review_agent_loop.protocol_common import (
+        TestObservationCitation,
+    )
     parsed = dataclasses.replace(
         parsed, test_observations=(TestObservationCitation("pytest", "receipt", "current-result"),), **{field: (*getattr(parsed, field), "item-2"), notes: {"item-2": "Deferred."}},
         addressed_sub_items=("item-2.sub-1",), tests_run=("python -m pytest tests/test_example.py",),

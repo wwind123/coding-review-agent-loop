@@ -18,8 +18,7 @@ MANIFEST = json.loads((ROOT / "tests/fixtures/protocol_support_move.json").read_
 
 
 @pytest.mark.parametrize("owner", MANIFEST["owners"])
-def test_moved_bodies_and_temporary_exports(owner):
-    old = importlib.import_module("coding_review_agent_loop.protocol")
+def test_moved_bodies_and_owners(owner):
     new = importlib.import_module(f"coding_review_agent_loop.{owner}")
     source = (PACKAGE / f"{owner}.py").read_text()
     lines = source.splitlines(keepends=True)
@@ -33,7 +32,7 @@ def test_moved_bodies_and_temporary_exports(owner):
                 if isinstance(target, ast.Name):
                     definitions[target.id] = node
     for name, record in MANIFEST["owners"][owner].items():
-        assert getattr(old, name) is getattr(new, name), name
+        assert getattr(new, name) is not None, name
         node = definitions[name]
         first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
         body = "".join(lines[first - 1:node.end_lineno])
@@ -49,8 +48,8 @@ def test_fresh_import_order(first):
     modules = [first] + [name for name in ("protocol", "protocol_common", "protocol_discuss") if name != first]
     code = "\n".join(f"import coding_review_agent_loop.{name}" for name in modules)
     code += "\nfrom coding_review_agent_loop import protocol, protocol_common, protocol_discuss\n"
-    code += "assert protocol.ParseDegradation is protocol_common.ParseDegradation\n"
-    code += "assert protocol.parse_structured_discuss_answer is protocol_discuss.parse_structured_discuss_answer\n"
+    code += "assert protocol_common.ParseDegradation.__module__.endswith('protocol_common')\n"
+    code += "assert not hasattr(protocol, 'parse_structured_discuss_answer')\n"
     subprocess.run([sys.executable, "-c", code], check=True, timeout=30,
                    env={**os.environ, "PYTHONPATH": str(PACKAGE.parent)}, cwd=ROOT)
 

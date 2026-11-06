@@ -37,7 +37,6 @@ from .protocol import (
     _expect_execution_recommendation,
     _expect_human_requirement_dispositions,
     _expect_optional_issue_id_list,
-    _expect_string_list,
     _expect_typed_plan_stages,
     ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     _parse_architecture_impact,
@@ -49,6 +48,9 @@ from .protocol import (
     validate_risk_test_matrix_revision,
     validate_structured_plan_revision,
     validate_structured_plan_state,
+)
+from .protocol_common import (
+    _expect_string_list,
 )
 
 

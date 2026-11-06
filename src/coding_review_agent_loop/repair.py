@@ -40,10 +40,7 @@ from .protocol_markers import sanitize_historical_text, scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     normalize_risk_test_matrix_string_lists,
-    HUMAN_REQUIREMENTS_RESOLVED_RE,
-    PLAN_STATE_RE,
     STATE_RE,
-    parse_human_requirements_acknowledgement,
     parse_execution_recommendation_payload,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
@@ -55,6 +52,11 @@ from .protocol import (
     risk_test_matrix_prompt_examples,
     semantic_risk_claim_example_json,
     semantic_risk_claim_schema_text,
+)
+from .protocol_common import (
+    HUMAN_REQUIREMENTS_RESOLVED_RE,
+    PLAN_STATE_RE,
+    parse_human_requirements_acknowledgement,
 )
 from .errors import (
     AgentSettingsLockWaitTimeout,

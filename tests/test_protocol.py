@@ -19,31 +19,13 @@ from coding_review_agent_loop.plan_first_loop import _validate_plan_review_respo
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     DeferredStage,
-    DISCUSS_SYNTHESIS_MAX_ENTRIES,
-    DISCUSS_SYNTHESIS_MAX_TEXT_BYTES,
-    DISCUSS_ANALYZER_FRAMING_VALUES,
-    DISCUSS_OUTCOME_VALUES,
-    DISCUSS_RESEARCH_STATUS_VALUES,
-    DiscussAgendaDisagreement,
-    DiscussUnresolvedItem,
-    DiscussSourcedFact,
-    ParsedDiscussAgenda,
-    ParsedDiscussReview,
-    parse_canonical_discuss_round_synthesis,
-    parse_structured_discuss_final_synthesis,
-    parse_structured_discuss_round_synthesis,
-    serialize_discuss_final_synthesis,
-    serialize_discuss_round_synthesis,
-    _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
     _extract_structured_plan_revision_payload,
     validate_structured_task_result,
     _extract_structured_pr_review_payload,
-    normalize_response_file_structured_text,
     parse_agent_unavailable,
     parse_approved_followups,
-    parse_human_requirements_acknowledgement,
     parse_historical_structured_issue_implementation,
     parse_pr_review,
     parse_plan_item_dispositions,
@@ -52,10 +34,6 @@ from coding_review_agent_loop.protocol import (
     parse_plan_state,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
-    parse_structured_discuss_agenda,
-    parse_structured_discuss_answer,
-    parse_legacy_structured_discuss_answer,
-    parse_structured_discuss_review,
     parse_structured_plan_review,
     parse_structured_pr_review,
     parse_review,
@@ -67,9 +45,6 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
-    validate_structured_discuss_agenda,
-    validate_structured_discuss_answer,
-    validate_structured_discuss_review,
     validate_structured_human_requirements_acknowledgement,
     validate_structured_plan_state,
     validate_structured_plan_revision,
@@ -80,6 +55,37 @@ from coding_review_agent_loop.protocol import (
     RISK_TEST_MATRIX_ROW_KEYS,
     risk_test_matrix_prompt_examples,
     semantic_risk_claim_schema_text,
+)
+from coding_review_agent_loop.protocol_discuss_types import (
+    DISCUSS_SYNTHESIS_MAX_ENTRIES,
+    DISCUSS_SYNTHESIS_MAX_TEXT_BYTES,
+    DISCUSS_ANALYZER_FRAMING_VALUES,
+    DISCUSS_OUTCOME_VALUES,
+    DISCUSS_RESEARCH_STATUS_VALUES,
+    DiscussAgendaDisagreement,
+    DiscussUnresolvedItem,
+    DiscussSourcedFact,
+    ParsedDiscussAgenda,
+    ParsedDiscussReview,
+)
+from coding_review_agent_loop.protocol_discuss import (
+    parse_canonical_discuss_round_synthesis,
+    parse_structured_discuss_final_synthesis,
+    parse_structured_discuss_round_synthesis,
+    serialize_discuss_final_synthesis,
+    serialize_discuss_round_synthesis,
+    parse_structured_discuss_agenda,
+    parse_structured_discuss_answer,
+    parse_legacy_structured_discuss_answer,
+    parse_structured_discuss_review,
+    validate_structured_discuss_agenda,
+    validate_structured_discuss_answer,
+    validate_structured_discuss_review,
+)
+from coding_review_agent_loop.protocol_common import (
+    _expect_string_list,
+    normalize_response_file_structured_text,
+    parse_human_requirements_acknowledgement,
 )
 
 
@@ -5676,7 +5682,9 @@ def test_strict_entry_point_still_raises_on_near_miss():
 
 
 def test_degradation_record_is_bounded_and_marker_safe():
-    from coding_review_agent_loop.protocol import ParseDegradation
+    from coding_review_agent_loop.protocol_common import (
+        ParseDegradation,
+    )
 
     record = ParseDegradation.build(
         element_path="x.status",
@@ -8191,7 +8199,12 @@ def test_post_auth_suite_start_diagnostic_follows_the_persisted_reason_1661(reas
 @pytest.mark.parametrize("launcher", ["agent-loop", "/opt/bin/agent-loop", "python3 -m coding_review_agent_loop.cli"])
 def test_wrapped_citation_matches_only_exact_inner_journal_argv(launcher):
     import shlex
-    from coding_review_agent_loop.protocol import TestObservationCitation, _citation_matches_observation
+    from coding_review_agent_loop.protocol_common import (
+        TestObservationCitation,
+    )
+    from coding_review_agent_loop.protocol import (
+        _citation_matches_observation,
+    )
     inner = "python -m pytest 'tests/test_a.py::test_x[value with spaces]'"
     command = f"{launcher} run-tests --timeout-seconds 180 --memory-dir /private/memory -- {inner}"
     observation = {"receipt_id": "r", "command": shlex.split(inner)}

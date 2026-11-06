@@ -962,10 +962,10 @@ def test_registering_a_mixed_architecture_unit_fatal_fails(protocol_inventory, n
 
 
 def test_render_limit_is_shared_and_bounds_citation_drops():
-    from coding_review_agent_loop import comment_rendering, protocol
+    from coding_review_agent_loop import comment_rendering, protocol, protocol_common
 
-    assert comment_rendering.PARSE_DEGRADATION_RENDER_LIMIT is protocol.PARSE_DEGRADATION_RENDER_LIMIT
-    assert protocol.CITATION_DEGRADATION_MAX_DROPS <= protocol.PARSE_DEGRADATION_RENDER_LIMIT
+    assert comment_rendering.PARSE_DEGRADATION_RENDER_LIMIT is protocol_common.PARSE_DEGRADATION_RENDER_LIMIT
+    assert protocol.CITATION_DEGRADATION_MAX_DROPS <= protocol_common.PARSE_DEGRADATION_RENDER_LIMIT
 
 
 def test_reserved_authority_keys_are_exact():

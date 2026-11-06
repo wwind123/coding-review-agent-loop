@@ -12,7 +12,9 @@ from urllib.parse import urlsplit
 
 from .errors import AgentLoopError, ReportWorkdirRefusal
 from .scratch import scratch_root
-from .protocol import DiscussEvidenceClaim
+from .protocol_discuss_types import (
+    DiscussEvidenceClaim,
+)
 from .test_runtime import (
     ManagedWrapperTraversal,
     TestRuntimeConfigurationError,

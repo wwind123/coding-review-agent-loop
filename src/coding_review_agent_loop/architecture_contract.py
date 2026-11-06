@@ -40,6 +40,8 @@ from .protocol import (
     ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     ARCHITECTURE_IMPACT_UNDETERMINED,
     ArchitectureImpact,
+)
+from .protocol_common import (
     ParseDegradation,
 )
 from .repair_preservation import (
