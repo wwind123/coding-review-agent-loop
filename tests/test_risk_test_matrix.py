@@ -2902,9 +2902,6 @@ from coding_review_agent_loop.protocol_risk import (
     DROPPED_VALUE_MAX_BYTES,
     _parse_semantic_risk_coverage_claims,
 )
-from coding_review_agent_loop.protocol import (
-    NonRepairableEvidenceRejection as _ProtocolNonRepairable,
-)
 
 _CATALOG_927 = (
     _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1"),
@@ -3086,7 +3083,7 @@ def test_no_catalog_oversize_selector_drops_the_claim_and_hard_cap_rejects_927()
 def test_degraded_claim_citing_a_failing_selector_still_rejects_927():
     catalog = (*_CATALOG_927, _FAILING_927)
     claim = {**_claim_927("finding-3", refs=("invocation:observation-9",)), "notes": "degradable"}
-    with pytest.raises(_ProtocolNonRepairable, match="not an admissible passing observation"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="not an admissible passing observation"):
         _parse_927([_claim_927("row-a"), claim], catalog=catalog)
 
 
@@ -3611,7 +3608,7 @@ def test_overflow_refs_carry_no_authority_but_journal_failure_counts_1300():
     assert "execution_refs" in record.element_path
 
     # A failing handle within the kept 8 still raises.
-    with pytest.raises(_ProtocolNonRepairable):
+    with pytest.raises(NonRepairableEvidenceRejection):
         _parse_927([_claim_927("row-a", [failing.execution_ref, *refs[:9]])], catalog=(*catalog,))
 
 

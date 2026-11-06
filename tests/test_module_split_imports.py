@@ -16,10 +16,17 @@ _RISK_REWRITE = importlib.util.module_from_spec(_RISK_SPEC)
 _RISK_SPEC.loader.exec_module(_RISK_REWRITE)
 RISK_OWNERS = _RISK_REWRITE.symbol_owners()
 OWNERS = {**_REWRITE.symbol_owners(), **RISK_OWNERS}
+CLEANUP_PROTOCOL_OWNERS = {
+    'CITABLE_TEST_RUNNERS_SUMMARY': 'test_runtime',
+    'NonRepairableEvidenceRejection': 'errors',
+    'TestObservationsShapeError': 'errors',
+    '_managed_test_wrapper_inner_command': 'test_runtime',
+}
+OWNERS.update(CLEANUP_PROTOCOL_OWNERS)
 OLD = 'coding_review_agent_loop.protocol'
 
 
-def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS):
+def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS, functions=()):
     tree = ast.parse(source)
     # Quoted forward references are executable type dependencies too. Expand
     # annotation strings (including nested tuple/list references), but never
@@ -72,14 +79,20 @@ def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS):
             module = node.module or ''
             if node.level and module == old.rsplit('.', 1)[1]:
                 module = old
-            elif node.level and not module:
-                module = 'coding_review_agent_loop'
+            elif node.level:
+                module = 'coding_review_agent_loop' + ('.' + module if module else '')
             for alias in node.names:
                 bindings[alias.asname or alias.name] = module + '.' + alias.name
+                if driver and alias.name in functions and module == 'coding_review_agent_loop.' + owners[alias.name]:
+                    problems.append(f'{node.lineno}: driver-local function import {alias.name}')
                 if module == old and (alias.name in owners or alias.name == '*'):
                     problems.append(f'{node.lineno}: old import {alias.name}')
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if driver and resolve(node.value) in {
+                'coding_review_agent_loop.' + owners[name] + '.' + name for name in functions
+            }:
+                problems.append(f'{node.lineno}: driver-local function alias')
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                 if isinstance(target, ast.Name):
                     bindings[target.id] = resolve(node.value)
         if isinstance(node, (ast.Attribute, ast.Constant, ast.BinOp, ast.JoinedStr)):
@@ -97,8 +110,13 @@ def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS):
         for node in tree.body:
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    if alias.name in owners and (alias.asname or alias.name) not in loads:
+                    if node.module != '__future__' and (alias.asname or alias.name) not in loads:
                         problems.append(f'{node.lineno}: compatibility-only export {alias.name}')
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if (alias.asname or alias.name.split('.')[0]) not in loads:
+                        problems.append(f'{node.lineno}: unused import {alias.name}')
     return problems
 
 
@@ -233,11 +251,27 @@ _AUTH_REWRITE = importlib.util.module_from_spec(_AUTH_SPEC)
 _AUTH_SPEC.loader.exec_module(_AUTH_REWRITE)
 AUTHORIZATION_OWNERS = _AUTH_REWRITE.symbol_owners()
 MANAGED_OWNERS = {**_MANAGED_REWRITE.symbol_owners(), **AUTHORIZATION_OWNERS}
+CLEANUP_MANAGED_OWNERS = {
+    **dict.fromkeys(('CI_MACHINE_OBLIGATION_KINDS', 'MACHINE_AUTHORITY'), 'protocol'),
+    **dict.fromkeys(('KNOWN_HOST_COMMENT_FOOTER', 'MARKER_BY_TOKEN', 'scan_reserved_markers'), 'protocol_markers'),
+    **dict.fromkeys(('ROUND_RESUME_MARKER_RE', 'decode_mapping', 'hydrate_mapping'), 'round_transport'),
+    **dict.fromkeys(('PullRequestMergeability', 'parse_strong_issue_reference_evidence'), 'github'),
+    'is_complete_code_review': 'review_scope',
+    'run_gh_read': 'github_retry',
+}
+MANAGED_OWNERS.update(CLEANUP_MANAGED_OWNERS)
+# Inventory function-valued dependencies from their defining sources, leaving
+# type/constant imports and the frozen historical move manifests intact.
+MANAGED_FUNCTIONS = {
+    name for name, owner in MANAGED_OWNERS.items()
+    if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+           for node in ast.parse((ROOT / 'src/coding_review_agent_loop' / (owner + '.py')).read_text()).body)
+}
 MANAGED_OLD = 'coding_review_agent_loop.managed_ci'
 
 
 def managed_ownership_problems(source, *, driver=False):
-    return ownership_problems(source, driver=driver, old=MANAGED_OLD, owners=MANAGED_OWNERS)
+    return ownership_problems(source, driver=driver, old=MANAGED_OLD, owners=MANAGED_OWNERS, functions=MANAGED_FUNCTIONS)
 
 
 def test_consumers_use_managed_support_owners():
@@ -269,7 +303,8 @@ def test_guard_rejects_every_old_managed_support_symbol(name, template):
 @pytest.mark.parametrize('name,owner', sorted(MANAGED_OWNERS.items()))
 def test_guard_rejects_managed_support_compatibility_export(name, owner):
     assert managed_ownership_problems(f'from .{owner} import {name}', driver=True)
-    assert not managed_ownership_problems(f'from .{owner} import {name}\nx = {name}', driver=True)
+    problems = managed_ownership_problems(f'from .{owner} import {name}\nx = {name}', driver=True)
+    assert bool(problems) == (name in MANAGED_FUNCTIONS)
 
 
 def test_managed_rewrite_preserves_aliases_local_imports_and_real_patch_owners():
@@ -376,3 +411,86 @@ def test_final_managed_and_protocol_sizes_and_allowlist():
         assert len(path.read_text().splitlines()) <= size_guard['DEFAULT_LIMIT']
     for module in ('managed_ci', 'protocol'):
         assert f'src/coding_review_agent_loop/{module}.py' not in size_guard['ALLOWLIST']
+
+
+@pytest.mark.parametrize('template', [
+    'from .{owner} import {name} as helper\nhelper()',
+    'from coding_review_agent_loop.{owner} import {name}\n{name}()',
+    'from . import {owner} as support\nhelper = support.{name}\nhelper()',
+    'from . import {owner} as support\nhelper: object = support.{name}\nhelper()',
+])
+@pytest.mark.parametrize('name', sorted(MANAGED_FUNCTIONS))
+def test_driver_rejects_local_moved_function_bindings(name, template):
+    assert managed_ownership_problems(template.format(name=name, owner=MANAGED_OWNERS[name]), driver=True)
+
+
+@pytest.mark.parametrize('name', sorted(MANAGED_FUNCTIONS))
+def test_driver_allows_live_owner_lookups(name):
+    owner = MANAGED_OWNERS[name]
+    assert not managed_ownership_problems(
+        f'from . import {owner} as support\nsupport.{name}()', driver=True)
+
+
+@pytest.mark.parametrize('name', sorted(CLEANUP_PROTOCOL_OWNERS))
+@pytest.mark.parametrize('template', [
+    'from .protocol import {name} as moved',
+    'from . import protocol as p\nq = p\nq.{name}',
+    'patch("coding_review_agent_loop.protocol.{name}")',
+    'from . import protocol as p\nmonkeypatch.setattr(p, "{name}", fake)',
+    'from . import protocol as p\npatch.object(p, "{name}", fake)',
+])
+def test_guard_rejects_protocol_cleanup_paths(name, template):
+    assert ownership_problems(template.format(name=name))
+
+
+@pytest.mark.parametrize('helper', [
+    '_advertised_managed_actor', '_api_list', '_probe_json', 'assess_exact_head_protection',
+])
+def test_driver_owner_patch_intercepts_after_import(monkeypatch, tmp_path, helper):
+    from unittest.mock import Mock
+    from coding_review_agent_loop import managed_ci, managed_ci_api, managed_ci_protection
+    from coding_review_agent_loop.managed_ci_types import ManagedCiProbeContext
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.workdirs import active_workdir
+
+    config = make_config(tmp_path, managed_ci_trusted_actor='agent-loop')
+    context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
+    runner = Mock()
+    runner.run.side_effect = AssertionError('unexpected GitHub operation')
+    intercepted = Mock(side_effect=RuntimeError('owner lookup intercepted'))
+    owner = managed_ci_protection if helper == 'assess_exact_head_protection' else managed_ci_api
+    monkeypatch.setattr(owner, helper, intercepted)
+    if helper == '_advertised_managed_actor':
+        who = Mock(return_value={'login': 'agent-loop', 'id': 1})
+        monkeypatch.setattr(managed_ci_api, '_api_json', who)
+    with pytest.raises(RuntimeError, match='owner lookup intercepted'):
+        if helper == '_advertised_managed_actor':
+            managed_ci._adoption_identity(runner, config=config)
+        elif helper == '_api_list':
+            managed_ci._find_resume_audit(runner, config=config, pr_number=7,
+                actor_login='agent-loop', actor_id=1, base_ref='main')
+        elif helper == '_probe_json':
+            managed_ci.evaluate_managed_ci_readiness(runner, context=context,
+                base='main', trusted_actor='agent-loop')
+        else:
+            managed_ci._has_exact_head_protection(runner, config=config, base_ref='main')
+    if helper == '_advertised_managed_actor':
+        who.assert_called_once_with(runner, config, 'user', quiet=True)
+        intercepted.assert_called_once_with(runner, config)
+    elif helper == '_api_list':
+        intercepted.assert_called_once_with(runner, config,
+            f'repos/{config.repo}/issues/7/comments?per_page=100')
+    elif helper == '_probe_json':
+        intercepted.assert_called_once_with(runner, context, f'repos/{config.repo}')
+    else:
+        intercepted.assert_called_once_with(runner, context=context, base='main')
+    runner.run.assert_not_called()
+
+
+def test_protocol_quoted_risk_annotations_resolve():
+    import typing
+    from coding_review_agent_loop import protocol
+
+    for value in vars(protocol).values():
+        if isinstance(value, type) and value.__module__ == protocol.__name__:
+            typing.get_type_hints(value)

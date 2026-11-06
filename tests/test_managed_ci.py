@@ -1,3 +1,4 @@
+from coding_review_agent_loop import protocol, protocol_markers
 
 from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
 from coding_review_agent_loop import managed_ci_intent_validation as _managed_ci_intent_validation
@@ -1987,7 +1988,7 @@ def _hostile_ci_repair_round_comment(comment_id, *, field, value, author):
     payload = dict(decode_mapping(match.group("payload")))
     (item,) = payload["prior_items"]
     item = dict(item)
-    assert item["authority"] == managed_ci.MACHINE_AUTHORITY
+    assert item["authority"] == protocol.MACHINE_AUTHORITY
     item[field] = value
     payload["prior_items"] = [item]
     login, user_id = ("mallory", 9) if author == "foreign" else ("agent-loop", 1)
@@ -10563,7 +10564,7 @@ def test_recovered_record_with_foreign_plan_hash_fails_the_activation_gate(tmp_p
 
 # --- known host comment footer (#1043) ---------------------------------------
 
-HOST_FOOTER = managed_ci.KNOWN_HOST_COMMENT_FOOTER
+HOST_FOOTER = protocol_markers.KNOWN_HOST_COMMENT_FOOTER
 _NEAR_MISS_SUFFIXES = (
     HOST_FOOTER + HOST_FOOTER,
     HOST_FOOTER + "\n",
@@ -16803,3 +16804,25 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
     else:
         assert len(reviewer_commands) == 1
         assert "e9bff449de155dd0be5fd76276214538b0dfd315" in " ".join(reviewer_commands[0])
+
+
+@pytest.mark.parametrize('payload,reason', [
+    (None, 'repository metadata could not be read'),
+    ({}, 'base branch is unavailable'),
+])
+def test_readiness_owner_probe_failure_is_read_only(monkeypatch, tmp_path, payload, reason):
+    from unittest.mock import Mock
+
+    context = ManagedCiProbeContext('OWNER/REPO', 'gh', tmp_path)
+    runner = Mock()
+    runner.run.side_effect = AssertionError('unexpected GitHub operation')
+    probe = Mock(return_value=(payload, None))
+    monkeypatch.setattr(managed_ci_api, '_probe_json', probe)
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=context, base=None, trusted_actor='agent-loop')
+    assert readiness.state == 'indeterminate'
+    assert readiness.protection.state == 'indeterminate'
+    assert readiness.reasons == (reason,)
+    assert not readiness.workflow_v2
+    probe.assert_called_once_with(runner, context, 'repos/OWNER/REPO')
+    runner.run.assert_not_called()

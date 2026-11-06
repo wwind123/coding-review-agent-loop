@@ -50,10 +50,14 @@ failure inventories to migrate imports, aliases and patch lookups. Body hashes
 and fresh-interpreter import checks protect the final ownership graph. The body hashes,
 original references, consumer candidates and immediate patch retargets are
 recorded in `tests/fixtures/managed_ci_support_move.json` and drive
-`scripts/rewrite_managed_support_imports.py`. Driver API JSON and correlated-status lookups resolve
-through their owner modules so dependency patches intercept the live lookup. The symbol-specific
+`scripts/rewrite_managed_support_imports.py`. Driver moved-function dependencies resolve through their owner modules at each
+use, including callbacks, so owner patches made after driver import intercept the
+live lookup. Decorators use owner-qualified names at function definition time;
+patching an owner after import does not replace an already-applied decorator.
+Types and constants remain direct imports when used by driver gates. The symbol-specific
 guard in `tests/test_module_split_imports.py` rejects old driver imports, aliases,
-patch targets and compatibility-only exports. Fresh-interpreter import checks
+patch targets, compatibility-only exports and retained driver-local bindings of
+moved functions. Fresh-interpreter import checks
 cover driver-first and support/helper-first orders.
 This ownership split changes no runtime flow, persistence or authority (#1905, #1906).
 

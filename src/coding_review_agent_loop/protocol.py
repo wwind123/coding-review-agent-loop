@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import hashlib
-import logging
 import re
-import shlex
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 import dataclasses
@@ -18,8 +15,6 @@ from .errors import (
     AgentLoopError,
     IssueImplementationConflictError,
     MissingJudgementFieldError,
-    NonRepairableEvidenceRejection,
-    TestObservationsShapeError,
 )
 from .protocol_discuss_types import (
     ParsedDiscussAnswer,
@@ -30,10 +25,6 @@ from .protocol_discuss_types import (
 )
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
-from .test_runtime import (
-    CITABLE_TEST_RUNNERS_SUMMARY,
-    managed_test_wrapper_inner_command as _managed_test_wrapper_inner_command,
-)
 
 from .protocol_common import (
     ANY_HEADING_RE,
