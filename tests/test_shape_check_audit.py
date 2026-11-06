@@ -26,6 +26,7 @@ from coding_review_agent_loop import shape_check_audit
 from coding_review_agent_loop.shape_check_audit import (
     DEGRADING_PARSERS,
     FATAL_CLAUSES,
+    PARSER_OWNERS,
     IMPORTED_NON_RAISERS,
     IMPORTED_RAISERS,
     SHAPE_CHECK_AUDIT,
@@ -749,8 +750,22 @@ def audit_problems(
     return problems
 
 
-def _protocol_source() -> str:
-    return (PACKAGE_DIR / "protocol.py").read_text(encoding="utf-8")
+def _protocol_source(overrides: dict[str, str] | None = None) -> str:
+    # Link the parser owners into one logical graph. Internal bare-name imports
+    # become graph edges to the actual definitions, including class methods and
+    # degradation builders; external imports retain source verification below.
+    sources = []
+    for owner in PARSER_OWNERS:
+        source = (overrides or {}).get(owner)
+        if source is None:
+            source = (PACKAGE_DIR / f"{owner}.py").read_text(encoding="utf-8")
+        lines = source.splitlines(keepends=True)
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module in PARSER_OWNERS:
+                for line in range(node.lineno - 1, node.end_lineno):
+                    lines[line] = "\n"
+        sources.append("".join(lines))
+    return "\n".join(sources)
 
 
 @pytest.fixture(scope="module")
@@ -1376,3 +1391,12 @@ def parse(value):
     return ParseDegradation.build(text="x")  # shape-check: fatal:authentication-or-forgery
 ''', {"parse": _fatal("authentication-or-forgery")})
     assert "parse: registered fatal but has a degradation path" in problems
+
+
+@pytest.mark.parametrize("owner", ["protocol_common", "protocol_discuss"])
+def test_moved_owner_missing_annotation_is_detected(owner):
+    source = (PACKAGE_DIR / f"{owner}.py").read_text(encoding="utf-8")
+    source = source.replace("# shape-check: fatal:", "# removed: fatal:", 1)
+    inventory = collect_module("protocol", _protocol_source({owner: source}),
+                               imported_raisers=IMPORTED_RAISERS)
+    assert any("without a fatal clause" in problem for problem in _real_problems(inventory))

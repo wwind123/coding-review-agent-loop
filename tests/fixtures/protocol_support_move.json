@@ -1,0 +1,1672 @@
+{
+  "source_revision": "bdc90ddbd87252717ce1c7f49912f226217df05c",
+  "owners": {
+    "protocol_common": {
+      "ANY_HEADING_RE": {
+        "sha256": "65987aec8a936524fa56d0fc7d2b7bc815f4ca749168d9e15971764c277133e8",
+        "original_lines": [
+          137,
+          137
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:29",
+          "src/coding_review_agent_loop/comment_rendering.py:616"
+        ],
+        "decorators": []
+      },
+      "BULLET_RE": {
+        "sha256": "1b7ed2bcc8a108bae575d44d56cba5c6b9c5f2f6957239f0d7ad186c9783a12e",
+        "original_lines": [
+          140,
+          140
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "HTML_COMMENT_RE": {
+        "sha256": "197a07427c702367f407704dd5a01925970f660675a60cb51529f1160554d2e6",
+        "original_lines": [
+          138,
+          138
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:30",
+          "src/coding_review_agent_loop/comment_rendering.py:617",
+          "src/coding_review_agent_loop/comment_rendering.py:638",
+          "src/coding_review_agent_loop/comment_rendering.py:2196",
+          "src/coding_review_agent_loop/comment_rendering.py:2461",
+          "src/coding_review_agent_loop/round_state.py:60",
+          "src/coding_review_agent_loop/round_state.py:2092",
+          "src/coding_review_agent_loop/round_state.py:3249",
+          "src/coding_review_agent_loop/round_state.py:3272",
+          "src/coding_review_agent_loop/round_state.py:4929",
+          "src/coding_review_agent_loop/round_state.py:4967"
+        ],
+        "decorators": []
+      },
+      "HUMAN_REQUIREMENTS_ADDRESSED_MARKER": {
+        "sha256": "6d2ba8eb0cde7dd01165e50ad4a8a5740b0c2dfc51d956666c1393d856e778f1",
+        "original_lines": [
+          78,
+          78
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:325",
+          "src/coding_review_agent_loop/comment_rendering.py:31",
+          "src/coding_review_agent_loop/comment_rendering.py:2197",
+          "src/coding_review_agent_loop/child_plan_binding.py:56",
+          "src/coding_review_agent_loop/child_plan_binding.py:1663",
+          "src/coding_review_agent_loop/agent_failure.py:25",
+          "src/coding_review_agent_loop/agent_failure.py:751",
+          "src/coding_review_agent_loop/unresolved_items.py:34",
+          "src/coding_review_agent_loop/unresolved_items.py:1085",
+          "src/coding_review_agent_loop/prompts.py:48",
+          "src/coding_review_agent_loop/prompts.py:1301",
+          "tests/test_plan_first_loop_review_scheduling.py:27",
+          "tests/test_plan_first_loop_review_scheduling.py:343",
+          "tests/test_plan_first_loop_review_scheduling.py:1745",
+          "tests/test_issue_loop_direct.py:5",
+          "tests/test_issue_loop_direct.py:205",
+          "tests/test_pr_loop_human_requirements.py:27",
+          "tests/test_pr_loop_human_requirements.py:116",
+          "tests/test_pr_loop_human_requirements.py:374",
+          "tests/test_pr_loop_human_requirements.py:391",
+          "tests/test_board_change.py:3299",
+          "tests/test_board_change.py:3312",
+          "tests/test_repair.py:57",
+          "tests/test_repair.py:684",
+          "tests/test_repair.py:702",
+          "tests/test_protocol.py:302",
+          "tests/test_child_plan_binding.py:15",
+          "tests/test_child_plan_binding.py:215",
+          "tests/test_response_validation.py:655",
+          "tests/test_response_validation.py:681",
+          "tests/test_response_validation.py:687",
+          "tests/test_response_validation.py:693",
+          "tests/test_response_validation.py:699",
+          "tests/test_response_validation.py:705",
+          "tests/test_response_validation.py:727",
+          "tests/agent_loop_helpers.py:146",
+          "tests/agent_loop_helpers.py:573",
+          "tests/agent_loop_helpers.py:574",
+          "tests/test_plan_first_loop_review.py:20",
+          "tests/test_plan_first_loop_review.py:150",
+          "tests/test_plan_first_loop_review.py:210",
+          "tests/test_plan_first_loop_review.py:304",
+          "tests/test_plan_first_loop_review.py:1009",
+          "tests/test_plan_first_loop_review.py:1015",
+          "tests/test_plan_first_loop_review.py:1043",
+          "tests/test_plan_first_loop_review.py:1050",
+          "tests/test_plan_first_loop_review.py:1094",
+          "tests/test_plan_first_loop_review.py:1110",
+          "tests/test_plan_first_loop_review.py:1123",
+          "tests/test_plan_first_loop_review.py:1154",
+          "tests/test_plan_first_loop_review.py:1157",
+          "tests/test_plan_first_loop_review.py:1165",
+          "tests/test_plan_first_loop_review.py:1196",
+          "tests/test_plan_first_loop_review.py:1228",
+          "tests/test_plan_first_loop_review.py:1245",
+          "tests/issue_loop_test_helpers.py:35",
+          "tests/issue_loop_test_helpers.py:701",
+          "tests/issue_loop_test_helpers.py:901",
+          "tests/issue_loop_test_helpers.py:928"
+        ],
+        "decorators": []
+      },
+      "HUMAN_REQUIREMENTS_ADDRESSED_RE": {
+        "sha256": "a742c54c76365e8d63f53dfca94856799a153025019a6eeaa38680753c697e61",
+        "original_lines": [
+          106,
+          109
+        ],
+        "global_references": [
+          "HUMAN_REQUIREMENTS_ADDRESSED_MARKER"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:32",
+          "src/coding_review_agent_loop/comment_rendering.py:2196"
+        ],
+        "decorators": []
+      },
+      "HUMAN_REQUIREMENTS_HEADING_RE": {
+        "sha256": "412a8f119dfb493d6bbd4585cafec166f6f8b1ab9f0b42b69b53ecff871bd97d",
+        "original_lines": [
+          133,
+          133
+        ],
+        "global_references": [
+          "_followup_heading_re"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:34",
+          "src/coding_review_agent_loop/comment_rendering.py:2200"
+        ],
+        "decorators": []
+      },
+      "HUMAN_REQUIREMENTS_RESOLVED_RE": {
+        "sha256": "144745456cf679044784d5722404c8d29e90c821e8493c7085eb4e7b90093edf",
+        "original_lines": [
+          102,
+          105
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:43",
+          "src/coding_review_agent_loop/repair.py:263",
+          "src/coding_review_agent_loop/repair.py:283"
+        ],
+        "decorators": []
+      },
+      "HUMAN_REQUIREMENT_STABLE_ID_RE": {
+        "sha256": "02981d3b2b82b694a63206d0289042abbc8efd8d8109e900a51f7e34b981316c",
+        "original_lines": [
+          144,
+          144
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "PARSE_DEGRADATION_FIELD_CHARS": {
+        "sha256": "1a844166765b7daa38bb95e61a4a28a9883ec2cc470733a00db1183698c6ee43",
+        "original_lines": [
+          574,
+          574
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "PARSE_DEGRADATION_PREVIEW_CHARS": {
+        "sha256": "243be108d0404820379087ec2b94e0cd388179f2762e2f18f469504d0f430422",
+        "original_lines": [
+          575,
+          575
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "PLAN_STATE_RE": {
+        "sha256": "cd34437d0dcd200c2bc1e1d094bb4b0cc6c4f9cf6086b1f1a8524ffa66154dab",
+        "original_lines": [
+          84,
+          84
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:35",
+          "src/coding_review_agent_loop/comment_rendering.py:2063",
+          "src/coding_review_agent_loop/repair.py:44",
+          "src/coding_review_agent_loop/repair.py:231",
+          "src/coding_review_agent_loop/agents/gemini.py:23",
+          "src/coding_review_agent_loop/agents/gemini.py:162"
+        ],
+        "decorators": []
+      },
+      "PUBLIC_RESPONSE_MARKER": {
+        "sha256": "18677efe586d0c983d47a7a7eddc24d8f6fcf553add51cadbb1fb2b908959b2e",
+        "original_lines": [
+          76,
+          76
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:347",
+          "src/coding_review_agent_loop/agent_failure.py:26",
+          "src/coding_review_agent_loop/agent_failure.py:577",
+          "src/coding_review_agent_loop/agent_failure.py:578",
+          "src/coding_review_agent_loop/repair.py:77",
+          "src/coding_review_agent_loop/agents/gemini.py:23",
+          "src/coding_review_agent_loop/agents/gemini.py:122",
+          "src/coding_review_agent_loop/agents/gemini.py:143",
+          "src/coding_review_agent_loop/agents/gemini.py:151",
+          "src/coding_review_agent_loop/agents/gemini.py:153",
+          "src/coding_review_agent_loop/agents/antigravity.py:55",
+          "src/coding_review_agent_loop/agents/antigravity.py:975",
+          "src/coding_review_agent_loop/agents/antigravity.py:1036",
+          "src/coding_review_agent_loop/agents/antigravity.py:1323",
+          "src/coding_review_agent_loop/agents/antigravity.py:1325",
+          "src/coding_review_agent_loop/agents/replacement.py:8",
+          "src/coding_review_agent_loop/agents/replacement.py:71",
+          "tests/test_agent_failure_classification.py:10",
+          "tests/test_agent_failure_classification.py:232",
+          "tests/test_backends.py:26",
+          "tests/test_backends.py:302",
+          "tests/test_backends.py:565",
+          "tests/test_backends.py:587",
+          "tests/test_backends.py:588",
+          "tests/test_backends.py:590",
+          "tests/test_backends.py:602",
+          "tests/test_backends.py:870",
+          "tests/test_repair.py:1200",
+          "tests/test_repair.py:1525",
+          "tests/test_protocol.py:292",
+          "tests/test_protocol.py:4528",
+          "tests/test_protocol.py:4536",
+          "tests/test_protocol.py:4602",
+          "tests/test_protocol.py:4611",
+          "tests/test_prompts.py:3337",
+          "tests/test_validated_agent_recovery.py:11",
+          "tests/test_validated_agent_recovery.py:88",
+          "tests/test_validated_agent_recovery.py:161",
+          "tests/test_validated_agent_recovery.py:536",
+          "tests/test_validated_agent_recovery.py:567",
+          "tests/agent_loop_helpers.py:33",
+          "tests/test_antigravity.py:528",
+          "tests/test_antigravity.py:533",
+          "tests/test_antigravity.py:1863",
+          "tests/test_antigravity.py:1880",
+          "tests/test_antigravity.py:1890",
+          "tests/test_antigravity.py:1919",
+          "tests/test_antigravity.py:1927",
+          "tests/test_antigravity.py:2050",
+          "tests/test_antigravity.py:2059"
+        ],
+        "decorators": []
+      },
+      "ParseDegradation": {
+        "sha256": "fa4df23eb41c2f6eba8dfe405d196e7ac340cce3353def3fb4ff7919c32194f0",
+        "original_lines": [
+          613,
+          642
+        ],
+        "global_references": [
+          "PARSE_DEGRADATION_FIELD_CHARS",
+          "PARSE_DEGRADATION_PREVIEW_CHARS",
+          "_bounded_single_line"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:408",
+          "src/coding_review_agent_loop/decomposition.py:44",
+          "src/coding_review_agent_loop/decomposition.py:142",
+          "src/coding_review_agent_loop/decomposition.py:867",
+          "src/coding_review_agent_loop/repair_preservation.py:15",
+          "src/coding_review_agent_loop/repair_preservation.py:1756",
+          "src/coding_review_agent_loop/repair_preservation.py:1760",
+          "src/coding_review_agent_loop/validated_agent.py:50",
+          "src/coding_review_agent_loop/validated_agent.py:246",
+          "src/coding_review_agent_loop/validated_agent.py:349",
+          "src/coding_review_agent_loop/validated_agent.py:1220",
+          "src/coding_review_agent_loop/validated_agent.py:1293",
+          "src/coding_review_agent_loop/validated_agent.py:1370",
+          "src/coding_review_agent_loop/architecture_contract.py:43",
+          "src/coding_review_agent_loop/architecture_contract.py:358",
+          "src/coding_review_agent_loop/architecture_contract.py:416",
+          "src/coding_review_agent_loop/architecture_contract.py:433",
+          "src/coding_review_agent_loop/architecture_contract.py:434",
+          "src/coding_review_agent_loop/architecture_contract.py:436",
+          "src/coding_review_agent_loop/architecture_contract.py:875",
+          "src/coding_review_agent_loop/round_state.py:62",
+          "src/coding_review_agent_loop/round_state.py:277",
+          "src/coding_review_agent_loop/round_state.py:280",
+          "src/coding_review_agent_loop/round_state.py:285",
+          "src/coding_review_agent_loop/round_state.py:287",
+          "src/coding_review_agent_loop/round_state.py:2514",
+          "src/coding_review_agent_loop/round_state.py:2518",
+          "src/coding_review_agent_loop/unresolved_items.py:21",
+          "src/coding_review_agent_loop/unresolved_items.py:908",
+          "src/coding_review_agent_loop/unresolved_items.py:924",
+          "src/coding_review_agent_loop/shape_check_audit.py:18",
+          "src/coding_review_agent_loop/shape_check_audit.py:128",
+          "src/coding_review_agent_loop/shape_check_audit.py:139",
+          "tests/test_shape_check_audit.py:37",
+          "tests/test_shape_check_audit.py:724",
+          "tests/test_shape_check_audit.py:869",
+          "tests/test_shape_check_audit.py:882",
+          "tests/test_shape_check_audit.py:992",
+          "tests/test_shape_check_audit.py:1005",
+          "tests/test_shape_check_audit.py:1333",
+          "tests/test_shape_check_audit.py:1337",
+          "tests/test_shape_check_audit.py:1345",
+          "tests/test_shape_check_audit.py:1355",
+          "tests/test_shape_check_audit.py:1376",
+          "tests/test_architecture_contract.py:228",
+          "tests/test_architecture_contract.py:256",
+          "tests/test_comment_rendering.py:2406",
+          "tests/test_comment_rendering.py:2409",
+          "tests/test_protocol.py:5679",
+          "tests/test_protocol.py:5681",
+          "tests/test_round_transport.py:2323",
+          "tests/test_round_transport.py:2325"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ]
+      },
+      "ParsedHumanRequirementsAcknowledgement": {
+        "sha256": "52478c2720a8e3b452c37d303147030bfc9931ad976476e7eb821c0c7ffa5fb7",
+        "original_lines": [
+          4105,
+          4110
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ]
+      },
+      "SIGNATURE_RE": {
+        "sha256": "f4381203ed6ab2c5a4a08ad35996c101ff9b3b8fefaa1e46bc1fe9a5532be4cc",
+        "original_lines": [
+          139,
+          139
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:38",
+          "src/coding_review_agent_loop/comment_rendering.py:618",
+          "src/coding_review_agent_loop/comment_rendering.py:638",
+          "src/coding_review_agent_loop/comment_rendering.py:2452",
+          "src/coding_review_agent_loop/comment_rendering.py:2464",
+          "src/coding_review_agent_loop/round_state.py:61",
+          "src/coding_review_agent_loop/round_state.py:3249",
+          "src/coding_review_agent_loop/round_state.py:3272",
+          "src/coding_review_agent_loop/round_state.py:4932",
+          "src/coding_review_agent_loop/response_validation.py:1467",
+          "src/coding_review_agent_loop/response_validation.py:1502"
+        ],
+        "decorators": []
+      },
+      "TestObservationCitation": {
+        "sha256": "c64740740542d3180437bdbd0e037ef7f7c353a8ebe173714b76984323ad37a6",
+        "original_lines": [
+          985,
+          997
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_local_test_evidence.py:7768",
+          "tests/test_local_test_evidence.py:7777",
+          "tests/test_protocol.py:8194",
+          "tests/test_protocol.py:8198",
+          "tests/test_protocol.py:8200",
+          "tests/test_protocol.py:8201",
+          "tests/test_protocol.py:8202",
+          "tests/test_protocol.py:8203",
+          "tests/test_unresolved_items.py:520",
+          "tests/test_unresolved_items.py:522",
+          "tests/test_pr_loop_evidence_stall.py:368"
+        ],
+        "decorators": [
+          "dataclass(frozen=True)"
+        ]
+      },
+      "_bounded_single_line": {
+        "sha256": "161677fd651b8651ba47cea302c73565433ccea6d21c1a6d7d2cea70ad34e06e",
+        "original_lines": [
+          598,
+          610
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:314",
+          "src/coding_review_agent_loop/shape_check_audit.py:1001",
+          "tests/test_shape_check_audit.py:882"
+        ],
+        "decorators": []
+      },
+      "_consume_structured_footer_and_signature": {
+        "sha256": "12013b845c729eef27c8e57275b3c8ebbbe1402d3cdb33db89691591c5ffabdd",
+        "original_lines": [
+          6768,
+          6815
+        ],
+        "global_references": [
+          "HUMAN_REQUIREMENTS_RESOLVED_RE",
+          "parse_human_requirements_acknowledgement"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:381"
+        ],
+        "decorators": []
+      },
+      "_expect_bool": {
+        "sha256": "10e1349ef6781ffc3829606ec67fbdd596a7455afea1331465ec37ef03dda9ce",
+        "original_lines": [
+          4520,
+          4523
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:476"
+        ],
+        "decorators": []
+      },
+      "_expect_exact_keys": {
+        "sha256": "6576180e1a239b5cf567e6a9942db8783f9cb393291e65470eee36eb7c304205",
+        "original_lines": [
+          4498,
+          4511
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:502"
+        ],
+        "decorators": []
+      },
+      "_expect_int": {
+        "sha256": "a30fd3b6290d0bf17f26fe40756066911ecaedf355f84c83bdf4514ee8eb630e",
+        "original_lines": [
+          4514,
+          4517
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:565"
+        ],
+        "decorators": []
+      },
+      "_expect_non_empty_string": {
+        "sha256": "2851b7d9380b46b1c049b71a7ffb17922d1a299d9ac6da9491e301207d7a9511",
+        "original_lines": [
+          4526,
+          4532
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:600"
+        ],
+        "decorators": []
+      },
+      "_expect_object": {
+        "sha256": "b408b76ca95ec991ee70b9b7cd5e5d3185f8a29af69b43231f5cfd31126bb665",
+        "original_lines": [
+          4492,
+          4495
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:608"
+        ],
+        "decorators": []
+      },
+      "_expect_optional_string_list": {
+        "sha256": "d53d81d8b90a23728b691be794fdcdcfe520ced1b95d4c9dc3d801739e72763f",
+        "original_lines": [
+          5632,
+          5646
+        ],
+        "global_references": [
+          "_expect_string_list"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:625"
+        ],
+        "decorators": []
+      },
+      "_expect_string_list": {
+        "sha256": "5c05348fe2b86982f2d07544a6f99ad160d9d61567da2ce393914b6638586344",
+        "original_lines": [
+          4615,
+          4644
+        ],
+        "global_references": [
+          "_expect_non_empty_string",
+          "_flatten_labelled_object",
+          "_logger"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/plan_assembly.py:40",
+          "src/coding_review_agent_loop/shape_check_audit.py:757",
+          "tests/test_protocol.py:37",
+          "tests/test_protocol.py:4709",
+          "tests/test_protocol.py:4711",
+          "tests/agent_loop_helpers.py:170"
+        ],
+        "decorators": []
+      },
+      "_extract_json_object_prefix": {
+        "sha256": "a69c6364d5ca1f307649eff0003c2a458f8ddfdb2a9f45fb0e48335e6f09e7c4",
+        "original_lines": [
+          6754,
+          6765
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair_preservation.py:16",
+          "src/coding_review_agent_loop/repair_preservation.py:719",
+          "src/coding_review_agent_loop/shape_check_audit.py:811"
+        ],
+        "decorators": []
+      },
+      "_extract_structured_response_object": {
+        "sha256": "ce91dbaecfe4a8f179b0f74d8600ab499b5cfd4ce72c571db997eb9ed561a08a",
+        "original_lines": [
+          6721,
+          6734
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_flat_object_defect": {
+        "sha256": "32f178a6ad2dd8cf18db9a5684875a1f964529d8cce645207b1c8ba423eab7ed",
+        "original_lines": [
+          4535,
+          4570
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:7943"
+        ],
+        "decorators": []
+      },
+      "_flatten_labelled_object": {
+        "sha256": "96ddad76fad3470ff1f64df5b9e38d95376b789b1759f7d0ac49a7e5f297898e",
+        "original_lines": [
+          4603,
+          4612
+        ],
+        "global_references": [
+          "_flat_object_defect",
+          "_render_flat_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:765"
+        ],
+        "decorators": []
+      },
+      "_followup_heading_re": {
+        "sha256": "981c7933d5c2e10838a0825ca72f6d1c39259fc682a480af565df47a53b4d021",
+        "original_lines": [
+          115,
+          122
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_logger": {
+        "sha256": "3e8b215a0e7a2e65c87acf6bad9a28ef9bd09cad50f77abf81296ec2f696ef84",
+        "original_lines": [
+          74,
+          74
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair.py:66",
+          "src/coding_review_agent_loop/repair.py:2466",
+          "src/coding_review_agent_loop/repair.py:2469",
+          "src/coding_review_agent_loop/repair.py:2487"
+        ],
+        "decorators": [],
+        "original_sha256": "2bea9f78abec92f7ee5a2e80bc590a03795996cb59713bae8f7f7362d3791dd5",
+        "initializer_adjustment": "Pin the pre-move logger name so ownership does not change diagnostic filtering or singleton identity."
+      },
+      "_normalize_requirement_label": {
+        "sha256": "4aafaa6c7e4c43b7808f356279d1de2b9ff20e124bb17defc8987fa0a3e67962",
+        "original_lines": [
+          4260,
+          4271
+        ],
+        "global_references": [
+          "HUMAN_REQUIREMENT_STABLE_ID_RE"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/repair_preservation.py:20",
+          "src/coding_review_agent_loop/repair_preservation.py:767",
+          "src/coding_review_agent_loop/repair_preservation.py:1601",
+          "src/coding_review_agent_loop/shape_check_audit.py:950"
+        ],
+        "decorators": []
+      },
+      "_render_flat_object": {
+        "sha256": "842b7ea41dd608a9007b633a6a30d9b63ca252f14d4651595d93fc065c4a6cb5",
+        "original_lines": [
+          4592,
+          4600
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "tests/test_protocol.py:7943"
+        ],
+        "decorators": []
+      },
+      "_require_supported_schema_version": {
+        "sha256": "27abc1bfd83e137371ac4840640dc805ffd05e47877c1e1b40dd5eb00e1be0e6",
+        "original_lines": [
+          7043,
+          7048
+        ],
+        "global_references": [
+          "_expect_int"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1280"
+        ],
+        "decorators": []
+      },
+      "normalize_response_file_structured_text": {
+        "sha256": "489c19a326f6d874ee8ac705962656bc64b9de69871c347c4bbe9e483628f6a3",
+        "original_lines": [
+          6737,
+          6751
+        ],
+        "global_references": [
+          "PUBLIC_RESPONSE_MARKER"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:376",
+          "src/coding_review_agent_loop/agent_failure.py:28",
+          "src/coding_review_agent_loop/agent_failure.py:561",
+          "src/coding_review_agent_loop/agent_failure.py:713",
+          "src/coding_review_agent_loop/repair_preservation.py:21",
+          "src/coding_review_agent_loop/repair_preservation.py:703",
+          "tests/test_protocol.py:43",
+          "tests/test_protocol.py:4538",
+          "tests/test_protocol.py:4617",
+          "tests/agent_loop_helpers.py:175"
+        ],
+        "decorators": []
+      },
+      "parse_human_requirements_acknowledgement": {
+        "sha256": "4250ae99b4cb04b958d22bc4a3b4f2f92878a10405ff3db9cd4b29070767f094",
+        "original_lines": [
+          4299,
+          4336
+        ],
+        "global_references": [
+          "ANY_HEADING_RE",
+          "BULLET_RE",
+          "HTML_COMMENT_RE",
+          "HUMAN_REQUIREMENTS_ADDRESSED_RE",
+          "HUMAN_REQUIREMENTS_HEADING_RE",
+          "ParsedHumanRequirementsAcknowledgement",
+          "SIGNATURE_RE",
+          "_normalize_requirement_label"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/orchestrator.py:366",
+          "src/coding_review_agent_loop/comment_rendering.py:70",
+          "src/coding_review_agent_loop/comment_rendering.py:2217",
+          "src/coding_review_agent_loop/comment_rendering.py:2218",
+          "src/coding_review_agent_loop/child_plan_binding.py:60",
+          "src/coding_review_agent_loop/child_plan_binding.py:1615",
+          "src/coding_review_agent_loop/agent_failure.py:27",
+          "src/coding_review_agent_loop/agent_failure.py:743",
+          "src/coding_review_agent_loop/agent_failure.py:792",
+          "src/coding_review_agent_loop/repair.py:46",
+          "src/coding_review_agent_loop/repair.py:269",
+          "src/coding_review_agent_loop/unresolved_items.py:37",
+          "src/coding_review_agent_loop/unresolved_items.py:1081",
+          "src/coding_review_agent_loop/shape_check_audit.py:1473",
+          "tests/test_protocol.py:46",
+          "tests/test_response_validation.py:668",
+          "tests/agent_loop_helpers.py:177"
+        ],
+        "decorators": []
+      },
+      "parse_degradation_payload": {
+        "sha256": "8c5c7b86da5babdfe0b3eea6eed92cd5da93ca23e63d80f26be22e3d045d9599",
+        "original_lines": [
+          645,
+          662
+        ],
+        "global_references": [
+          "PARSE_DEGRADATION_FIELD_CHARS",
+          "PARSE_DEGRADATION_OUTCOMES",
+          "PARSE_DEGRADATION_PREVIEW_CHARS",
+          "ParseDegradation",
+          "_bounded_single_line"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:63",
+          "src/coding_review_agent_loop/round_state.py:2521",
+          "src/coding_review_agent_loop/shape_check_audit.py:1433"
+        ],
+        "decorators": []
+      },
+      "PARSE_DEGRADATION_OUTCOMES": {
+        "sha256": "1516e9d87de11b425e04f2bf4a37948c4c1c3c31bf2c8be1312355527d96142b",
+        "original_lines": [
+          576,
+          584
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "PARSE_DEGRADATION_RENDER_LIMIT": {
+        "sha256": "fb77d7cc831a1621817193dd8fa21d6d7f4597ff5caac66a8b3602e58520c55e",
+        "original_lines": [
+          587,
+          587
+        ],
+        "global_references": [],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/comment_rendering.py:27",
+          "src/coding_review_agent_loop/comment_rendering.py:974",
+          "src/coding_review_agent_loop/comment_rendering.py:1035",
+          "src/coding_review_agent_loop/comment_rendering.py:1042",
+          "tests/test_shape_check_audit.py:952",
+          "tests/test_shape_check_audit.py:953",
+          "tests/test_shape_check_audit.py:977"
+        ],
+        "decorators": []
+      }
+    },
+    "protocol_discuss": {
+      "DISCUSS_ANSWER_CONFIDENCE_VALUES": {
+        "sha256": "207ec16630f386b20628026f0238c0888d7fc751d6f008440dde05a6f7e51b22",
+        "original_lines": [
+          8960,
+          8960
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "DISCUSS_ANSWER_POSITION_VALUES": {
+        "sha256": "266354a91dfc8fda41e88699e42113a05dc469f885859139600299c1705017e2",
+        "original_lines": [
+          8959,
+          8959
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "DISCUSS_SEMANTIC_CLASSIFICATIONS": {
+        "sha256": "45914838e6243776b15815647085ae622f432b0799b0a1df93a9edf8f37ac20b",
+        "original_lines": [
+          9132,
+          9134
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_bounded_discuss_synthesis_list": {
+        "sha256": "a444a9dc44108a454e40e6824d05170af79e7436dba8cc5b9467a7f77be716df",
+        "original_lines": [
+          9239,
+          9255
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_expect_string_list"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:294"
+        ],
+        "decorators": []
+      },
+      "_bounded_discuss_synthesis_text": {
+        "sha256": "a00f6cffbe498715972b5b458342ece4f6c468785bb904f4d488c6d56841a23c",
+        "original_lines": [
+          9230,
+          9236
+        ],
+        "global_references": [
+          "_expect_non_empty_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:304"
+        ],
+        "decorators": []
+      },
+      "_bounded_synthesis_object_list": {
+        "sha256": "7f1b720bd2848e08d9c4a6a5d8e087ff71a4add9ef01698aec9116e7532e46b2",
+        "original_lines": [
+          9436,
+          9443
+        ],
+        "global_references": [
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:324"
+        ],
+        "decorators": []
+      },
+      "_disc_synthesis_change_payload": {
+        "sha256": "f5b145bd02548b0519a7a4f4c63c95f0f489d3617a33140f0120395b8665a6dc",
+        "original_lines": [
+          9528,
+          9534
+        ],
+        "global_references": [
+          "_disc_synthesis_reference_payload"
+        ],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_disc_synthesis_consensus_payload": {
+        "sha256": "617506e07136809de29529e454b563e3b4aab32fb38240016bcdc50be6c0902e",
+        "original_lines": [
+          9510,
+          9514
+        ],
+        "global_references": [
+          "_disc_synthesis_reference_payload"
+        ],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_disc_synthesis_disagreement_payload": {
+        "sha256": "6221467c9907f3e6791a839c96432c983433267655bde71c3c93aae48169a881",
+        "original_lines": [
+          9517,
+          9525
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_disc_synthesis_reference_payload": {
+        "sha256": "72fa47903768f16d8015ee33fa2e42490464aa550123a4c9e84d618b76628e47",
+        "original_lines": [
+          9504,
+          9507
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_extract_structured_discuss_agenda_payload": {
+        "sha256": "204efd6d9a4060dc6d49fa06c2c5bcbd1c6993c82fe844651539c4a72a0702b4",
+        "original_lines": [
+          6986,
+          7008
+        ],
+        "global_references": [
+          "PLAN_STATE_RE",
+          "_consume_structured_footer_and_signature",
+          "_extract_json_object_prefix",
+          "normalize_response_file_structured_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:829"
+        ],
+        "decorators": []
+      },
+      "_extract_structured_discuss_review_payload": {
+        "sha256": "b5f58d9f26c22876445014212038e646f48d769ff90847ae35334c3f3011996b",
+        "original_lines": [
+          6959,
+          6983
+        ],
+        "global_references": [
+          "PLAN_STATE_RE",
+          "_consume_structured_footer_and_signature",
+          "_extract_json_object_prefix",
+          "normalize_response_file_structured_text"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:838"
+        ],
+        "decorators": []
+      },
+      "_parse_canonical_discuss_synthesis": {
+        "sha256": "670d2b6f4cbe49f546716e1f8a27f68e8b10808943159cc33575d6033b1d83d4",
+        "original_lines": [
+          9579,
+          9588
+        ],
+        "global_references": [],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "_parse_discuss_agenda_disagreement": {
+        "sha256": "bfaed962194794bf89a356b8b2c1a3aa793fa95c94cbc5d751c15b787862b849",
+        "original_lines": [
+          9201,
+          9227
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1022"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_evidence": {
+        "sha256": "70d6305a34961e100a3abd2b785bd315c1dcc9318edc420440315b26dc8289a9",
+        "original_lines": [
+          8788,
+          8849
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1031"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_research": {
+        "sha256": "877999cf2bb918b8a22143c2e7349f5c764d0a195c07fe1cb371391eda49c6a6",
+        "original_lines": [
+          8725,
+          8785
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_object",
+          "_expect_string_list"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1040"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_change": {
+        "sha256": "87afb033a9e07a88ec54e853a714ae90af6c164713344effdcfebfe0fc2cdbab",
+        "original_lines": [
+          9357,
+          9377
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_parse_discuss_synthesis_references"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1049"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_consensus": {
+        "sha256": "5d7cc4d8032425f3f7a993ba922aacc0d406945e4ce0c1a97a86b9e99d6a8b9b",
+        "original_lines": [
+          9293,
+          9303
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_parse_discuss_synthesis_references"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1059"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_disagreement": {
+        "sha256": "3ab5ae0a380762bffca67e168d82d086668cc6c993accc32246aedf8c4016702",
+        "original_lines": [
+          9325,
+          9354
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_parse_discuss_synthesis_position"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1068"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_position": {
+        "sha256": "8e3f5f80b25960122524181678fe15fb0260088fa3e94cce8a061279be7a968d",
+        "original_lines": [
+          9306,
+          9322
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_list",
+          "_bounded_discuss_synthesis_text",
+          "_expect_exact_keys",
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1078"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_reference": {
+        "sha256": "8ad984af3e54f100bbcbe35f2acb2808b02b3d42abcf1592a13e908ecc95baed",
+        "original_lines": [
+          9258,
+          9269
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_expect_exact_keys",
+          "_expect_int",
+          "_expect_object"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1087",
+          "src/coding_review_agent_loop/shape_check_audit.py:1096"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_synthesis_references": {
+        "sha256": "117f2975b89a59dc6ff8e4e35b0a9ff558e86b49f69062fb051dd1cb31989706",
+        "original_lines": [
+          9272,
+          9290
+        ],
+        "global_references": [
+          "_parse_discuss_synthesis_reference"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1096"
+        ],
+        "decorators": []
+      },
+      "_parse_discuss_unresolved_items": {
+        "sha256": "388602bcee5c5dd33fb80dcdc3cb58d4d46ea92113cc997f39de671f97d71a25",
+        "original_lines": [
+          8987,
+          9005
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1106"
+        ],
+        "decorators": []
+      },
+      "_parse_final_synthesis_payload": {
+        "sha256": "ef229898701a6af63a3fcd9735360f543af7d5da3a3f6e8e121b5a234d2e9765",
+        "original_lines": [
+          9446,
+          9501
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_text",
+          "_bounded_synthesis_object_list",
+          "_expect_exact_keys",
+          "_parse_discuss_synthesis_consensus",
+          "_parse_discuss_synthesis_disagreement",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1125"
+        ],
+        "decorators": []
+      },
+      "_parse_round_synthesis_payload": {
+        "sha256": "32dea0f04e4076c62eaf761e84f63b043358f81a36eb34555bfa7dfea8f78106",
+        "original_lines": [
+          9380,
+          9433
+        ],
+        "global_references": [
+          "_bounded_discuss_synthesis_list",
+          "_bounded_synthesis_object_list",
+          "_expect_exact_keys",
+          "_parse_discuss_synthesis_change",
+          "_parse_discuss_synthesis_consensus",
+          "_parse_discuss_synthesis_disagreement",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1213"
+        ],
+        "decorators": []
+      },
+      "_parse_structured_discuss_answer": {
+        "sha256": "221d923ddcd1cb9a0001875401fa0034e9c89e9aac024de7b3db7e2da119653d",
+        "original_lines": [
+          9008,
+          9094
+        ],
+        "global_references": [
+          "DISCUSS_ANSWER_CONFIDENCE_VALUES",
+          "DISCUSS_ANSWER_POSITION_VALUES",
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_string_list",
+          "_extract_structured_discuss_review_payload",
+          "_parse_discuss_evidence",
+          "_parse_discuss_research",
+          "_parse_discuss_unresolved_items",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1241"
+        ],
+        "decorators": []
+      },
+      "discuss_final_synthesis_payload": {
+        "sha256": "27e251170857747f5ac19cc26ee4ea5cb3d7e9ed490c2db617de92b6d643bb42",
+        "original_lines": [
+          9550,
+          9558
+        ],
+        "global_references": [
+          "_disc_synthesis_consensus_payload",
+          "_disc_synthesis_disagreement_payload"
+        ],
+        "consumer_candidates": [],
+        "decorators": []
+      },
+      "discuss_round_synthesis_payload": {
+        "sha256": "829a9ee6a456e080ce2a10834f65a69858d84860291b32590a37958ca5be7e53",
+        "original_lines": [
+          9537,
+          9547
+        ],
+        "global_references": [
+          "_disc_synthesis_change_payload",
+          "_disc_synthesis_consensus_payload",
+          "_disc_synthesis_disagreement_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/prompts.py:58",
+          "src/coding_review_agent_loop/prompts.py:5220",
+          "src/coding_review_agent_loop/prompts.py:5399"
+        ],
+        "decorators": []
+      },
+      "parse_canonical_discuss_final_synthesis": {
+        "sha256": "84e546a869eebc46e7b6768443d2d8a9c7130266a326eb437bd438f17b69a6f0",
+        "original_lines": [
+          9634,
+          9638
+        ],
+        "global_references": [
+          "_parse_canonical_discuss_synthesis",
+          "_parse_final_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:84",
+          "src/coding_review_agent_loop/round_state.py:5846",
+          "src/coding_review_agent_loop/shape_check_audit.py:1417"
+        ],
+        "decorators": []
+      },
+      "parse_canonical_discuss_round_synthesis": {
+        "sha256": "1c1c80c67e0bd159636cd0eb6cf7b808cf4a264029b0a1d7a87d8664b271b889",
+        "original_lines": [
+          9627,
+          9631
+        ],
+        "global_references": [
+          "_parse_canonical_discuss_synthesis",
+          "_parse_round_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:85",
+          "src/coding_review_agent_loop/round_state.py:5836",
+          "src/coding_review_agent_loop/shape_check_audit.py:1425",
+          "tests/test_protocol.py:32",
+          "tests/test_protocol.py:5382"
+        ],
+        "decorators": []
+      },
+      "parse_legacy_structured_discuss_answer": {
+        "sha256": "68fec3eff4fda469f049b1811f22eee07c20aaf7466a9f4af4e5f80264a2426d",
+        "original_lines": [
+          8972,
+          8984
+        ],
+        "global_references": [
+          "_parse_structured_discuss_answer"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:88",
+          "src/coding_review_agent_loop/round_state.py:5864",
+          "src/coding_review_agent_loop/shape_check_audit.py:1482",
+          "tests/test_protocol.py:57",
+          "tests/test_protocol.py:288"
+        ],
+        "decorators": []
+      },
+      "parse_structured_discuss_agenda": {
+        "sha256": "e97edabb31be82e75d9ab8c49a4f8f9b4d3c8056ce4532c67a2c5fd89245c030",
+        "original_lines": [
+          9641,
+          9728
+        ],
+        "global_references": [
+          "_expect_bool",
+          "_expect_exact_keys",
+          "_expect_object",
+          "_expect_optional_string_list",
+          "_expect_string_list",
+          "_extract_structured_discuss_agenda_payload",
+          "_parse_discuss_agenda_disagreement",
+          "_parse_round_synthesis_payload",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:83",
+          "src/coding_review_agent_loop/round_state.py:5826",
+          "src/coding_review_agent_loop/shape_check_audit.py:1598",
+          "tests/test_repair.py:4380",
+          "tests/test_repair.py:4382",
+          "tests/test_protocol.py:55",
+          "tests/test_protocol.py:4940",
+          "tests/test_protocol.py:4941",
+          "tests/test_protocol.py:4954",
+          "tests/test_protocol.py:4956",
+          "tests/test_protocol.py:4960",
+          "tests/test_protocol.py:4961",
+          "tests/test_protocol.py:4966",
+          "tests/test_protocol.py:4968",
+          "tests/test_protocol.py:4971",
+          "tests/test_protocol.py:4973",
+          "tests/test_protocol.py:4976",
+          "tests/test_protocol.py:4985",
+          "tests/test_protocol.py:4988",
+          "tests/test_protocol.py:4993",
+          "tests/test_protocol.py:4996",
+          "tests/test_protocol.py:4999",
+          "tests/test_protocol.py:5002",
+          "tests/test_protocol.py:5011",
+          "tests/test_protocol.py:5270",
+          "tests/test_protocol.py:5271",
+          "tests/test_protocol.py:5277",
+          "tests/test_protocol.py:5282",
+          "tests/test_protocol.py:5290",
+          "tests/test_protocol.py:5296",
+          "tests/test_protocol.py:5303",
+          "tests/test_protocol.py:5308",
+          "tests/test_protocol.py:5310",
+          "tests/test_protocol.py:5316",
+          "tests/test_protocol.py:5319",
+          "tests/test_protocol.py:5322",
+          "tests/test_protocol.py:5327",
+          "tests/test_protocol.py:5330",
+          "tests/test_protocol.py:5333",
+          "tests/test_protocol.py:5376"
+        ],
+        "decorators": []
+      },
+      "parse_structured_discuss_answer": {
+        "sha256": "291112d8cb389f4eb8b0e1276a4cd67aac4c72efa55bbe8367ee4cdbd2fe5bfa",
+        "original_lines": [
+          8963,
+          8969
+        ],
+        "global_references": [
+          "_parse_structured_discuss_answer"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:87",
+          "src/coding_review_agent_loop/round_state.py:5857",
+          "src/coding_review_agent_loop/shape_check_audit.py:1241",
+          "src/coding_review_agent_loop/shape_check_audit.py:1610",
+          "tests/test_protocol.py:56",
+          "tests/test_protocol.py:188"
+        ],
+        "decorators": []
+      },
+      "parse_structured_discuss_final_synthesis": {
+        "sha256": "0d72a4f6adbdc9c474563b3a8054929acf9408d887f30cc5334c56ccde34bb19",
+        "original_lines": [
+          9609,
+          9617
+        ],
+        "global_references": [
+          "_extract_structured_discuss_review_payload",
+          "_parse_final_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:85",
+          "src/coding_review_agent_loop/discuss_loop.py:1115",
+          "src/coding_review_agent_loop/orchestrator.py:393",
+          "src/coding_review_agent_loop/shape_check_audit.py:1619",
+          "tests/test_protocol.py:33",
+          "tests/test_protocol.py:5418",
+          "tests/test_protocol.py:5422",
+          "tests/test_protocol.py:5433"
+        ],
+        "decorators": []
+      },
+      "parse_structured_discuss_review": {
+        "sha256": "8a0a998cbe44c65a0748ee9b633033b6e75e741154a908de342608f4e8c9f68d",
+        "original_lines": [
+          8852,
+          8945
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_optional_string_list",
+          "_extract_structured_discuss_review_payload",
+          "_parse_discuss_evidence",
+          "_parse_discuss_research",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/round_state.py:86",
+          "src/coding_review_agent_loop/round_state.py:5868",
+          "src/coding_review_agent_loop/shape_check_audit.py:1630",
+          "tests/test_evidence_reconciliation.py:9",
+          "tests/test_evidence_reconciliation.py:68",
+          "tests/test_evidence_reconciliation.py:72",
+          "tests/test_protocol.py:58",
+          "tests/test_protocol.py:4752",
+          "tests/test_protocol.py:4754",
+          "tests/test_protocol.py:4760",
+          "tests/test_protocol.py:4762",
+          "tests/test_protocol.py:4767",
+          "tests/test_protocol.py:4769",
+          "tests/test_protocol.py:4774",
+          "tests/test_protocol.py:4780",
+          "tests/test_protocol.py:4786",
+          "tests/test_protocol.py:4788",
+          "tests/test_protocol.py:4793",
+          "tests/test_protocol.py:4797",
+          "tests/test_protocol.py:4800",
+          "tests/test_protocol.py:4804",
+          "tests/test_protocol.py:4807",
+          "tests/test_protocol.py:4811",
+          "tests/test_protocol.py:4821",
+          "tests/test_protocol.py:4825",
+          "tests/test_protocol.py:4828",
+          "tests/test_protocol.py:4837",
+          "tests/test_protocol.py:5049",
+          "tests/test_protocol.py:5050",
+          "tests/test_protocol.py:5056",
+          "tests/test_protocol.py:5058",
+          "tests/test_protocol.py:5064",
+          "tests/test_protocol.py:5069",
+          "tests/test_protocol.py:5075",
+          "tests/test_protocol.py:5078",
+          "tests/test_protocol.py:5081",
+          "tests/test_protocol.py:5084",
+          "tests/test_protocol.py:5087",
+          "tests/test_protocol.py:5090",
+          "tests/test_protocol.py:5109",
+          "tests/test_protocol.py:5110",
+          "tests/test_protocol.py:5116",
+          "tests/test_protocol.py:5128",
+          "tests/test_protocol.py:5139",
+          "tests/test_protocol.py:5141",
+          "tests/test_protocol.py:5147",
+          "tests/test_protocol.py:5150",
+          "tests/test_protocol.py:5153",
+          "tests/test_protocol.py:5156",
+          "tests/test_protocol.py:5159",
+          "tests/test_protocol.py:5164",
+          "tests/test_protocol.py:5167",
+          "tests/test_protocol.py:5172",
+          "tests/test_protocol.py:5182",
+          "tests/test_protocol.py:5187",
+          "tests/test_protocol.py:5195",
+          "tests/test_protocol.py:5204",
+          "tests/test_protocol.py:5212"
+        ],
+        "decorators": []
+      },
+      "parse_structured_discuss_round_synthesis": {
+        "sha256": "f457baf4904e1d8b3dccd91e2f7b48e92ca85919dd47905f915bdff4a2a29fee",
+        "original_lines": [
+          9591,
+          9599
+        ],
+        "global_references": [
+          "_extract_structured_discuss_review_payload",
+          "_parse_round_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/shape_check_audit.py:1642",
+          "tests/test_protocol.py:34",
+          "tests/test_protocol.py:5390",
+          "tests/test_protocol.py:5395",
+          "tests/test_protocol.py:5400",
+          "tests/test_protocol.py:5405"
+        ],
+        "decorators": []
+      },
+      "serialize_discuss_final_synthesis": {
+        "sha256": "6cd650e7a2fc6aca1cea9eadd559ab6835deb5939184060eb43f7e498329b89e",
+        "original_lines": [
+          9570,
+          9576
+        ],
+        "global_references": [
+          "_parse_final_synthesis_payload",
+          "discuss_final_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:94",
+          "src/coding_review_agent_loop/discuss_loop.py:1514",
+          "src/coding_review_agent_loop/orchestrator.py:402",
+          "src/coding_review_agent_loop/shape_check_audit.py:1733",
+          "tests/test_discuss_loop.py:45",
+          "tests/test_discuss_loop.py:661",
+          "tests/test_protocol.py:35",
+          "tests/test_protocol.py:5435"
+        ],
+        "decorators": []
+      },
+      "serialize_discuss_round_synthesis": {
+        "sha256": "78c99621189064a5c800fa53cb0ba4a01677569aad66b72ccfc8ba514af63a73",
+        "original_lines": [
+          9561,
+          9567
+        ],
+        "global_references": [
+          "_parse_round_synthesis_payload",
+          "discuss_round_synthesis_payload"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:93",
+          "src/coding_review_agent_loop/discuss_loop.py:1516",
+          "src/coding_review_agent_loop/orchestrator.py:401",
+          "src/coding_review_agent_loop/shape_check_audit.py:1741",
+          "tests/test_discuss_loop.py:46",
+          "tests/test_discuss_loop.py:590",
+          "tests/test_protocol.py:36",
+          "tests/test_protocol.py:5381"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_agenda": {
+        "sha256": "ce2a984aa2b4d368705e525798c7e24fd26f6774492a2187eb887b2c64187816",
+        "original_lines": [
+          9731,
+          9735
+        ],
+        "global_references": [
+          "parse_structured_discuss_agenda"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:84",
+          "src/coding_review_agent_loop/discuss_loop.py:944",
+          "src/coding_review_agent_loop/discuss_loop.py:1118",
+          "src/coding_review_agent_loop/orchestrator.py:392",
+          "src/coding_review_agent_loop/shape_check_audit.py:1797",
+          "tests/test_protocol.py:70",
+          "tests/test_protocol.py:5016",
+          "tests/test_protocol.py:5018",
+          "tests/test_protocol.py:5021",
+          "tests/test_protocol.py:5022"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_answer": {
+        "sha256": "9d6963a57a04891df713b11dcb64063d0a5164db9b669d872553f56163b1c266",
+        "original_lines": [
+          9097,
+          9103
+        ],
+        "global_references": [
+          "parse_structured_discuss_answer"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:89",
+          "src/coding_review_agent_loop/discuss_loop.py:90",
+          "src/coding_review_agent_loop/discuss_loop.py:1240",
+          "src/coding_review_agent_loop/discuss_loop.py:1345",
+          "src/coding_review_agent_loop/orchestrator.py:397",
+          "src/coding_review_agent_loop/orchestrator.py:398",
+          "src/coding_review_agent_loop/shape_check_audit.py:1806",
+          "src/coding_review_agent_loop/shape_check_audit.py:1815",
+          "tests/test_repair.py:24",
+          "tests/test_repair.py:212",
+          "tests/test_repair.py:219",
+          "tests/test_protocol.py:71",
+          "tests/test_protocol.py:168",
+          "tests/test_protocol.py:180",
+          "tests/test_protocol.py:199",
+          "tests/test_protocol.py:207",
+          "tests/test_protocol.py:220",
+          "tests/test_protocol.py:225",
+          "tests/test_protocol.py:231",
+          "tests/test_protocol.py:236",
+          "tests/test_protocol.py:251",
+          "tests/test_protocol.py:263",
+          "tests/test_protocol.py:268",
+          "tests/test_protocol.py:276",
+          "tests/test_protocol.py:287"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_answer_confirmation": {
+        "sha256": "99a595127f64896b7212cff4650875fd19daa94dbc34e304158041520c5d47d1",
+        "original_lines": [
+          9177,
+          9198
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_extract_structured_discuss_review_payload",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:90",
+          "src/coding_review_agent_loop/discuss_loop.py:1345",
+          "src/coding_review_agent_loop/orchestrator.py:398",
+          "src/coding_review_agent_loop/shape_check_audit.py:1815"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_evidence_reconciliation": {
+        "sha256": "0ff28bdbe3afba7930ed7f3a87cdb1c101985991f22e1965a4f44f0bd1724646",
+        "original_lines": [
+          9106,
+          9129
+        ],
+        "global_references": [
+          "_expect_exact_keys",
+          "_extract_structured_discuss_review_payload",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:91",
+          "src/coding_review_agent_loop/discuss_loop.py:1195",
+          "src/coding_review_agent_loop/orchestrator.py:399",
+          "src/coding_review_agent_loop/shape_check_audit.py:1827"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_final_synthesis": {
+        "sha256": "23eb3542bb4c7840b66da0ce41a51b5332c25c6f6a176414de2b7a04585762cf",
+        "original_lines": [
+          9620,
+          9624
+        ],
+        "global_references": [
+          "parse_structured_discuss_final_synthesis"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:86",
+          "src/coding_review_agent_loop/discuss_loop.py:1114",
+          "src/coding_review_agent_loop/orchestrator.py:394",
+          "src/coding_review_agent_loop/shape_check_audit.py:1840"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_review": {
+        "sha256": "774bf893675f019a959b49949d80855e0f1398a3a2a94ce9522838b0a6db6cc9",
+        "original_lines": [
+          8948,
+          8956
+        ],
+        "global_references": [
+          "parse_structured_discuss_review"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:88",
+          "src/coding_review_agent_loop/discuss_loop.py:1244",
+          "src/coding_review_agent_loop/orchestrator.py:396",
+          "src/coding_review_agent_loop/shape_check_audit.py:1849",
+          "tests/test_protocol.py:72",
+          "tests/test_protocol.py:4814",
+          "tests/test_protocol.py:4818",
+          "tests/test_protocol.py:4840",
+          "tests/test_protocol.py:4843",
+          "tests/test_protocol.py:5215",
+          "tests/test_protocol.py:5217",
+          "tests/test_protocol.py:5222",
+          "tests/test_protocol.py:5225",
+          "tests/test_protocol.py:5228",
+          "tests/test_protocol.py:5230",
+          "tests/test_protocol.py:5236",
+          "tests/test_protocol.py:5239",
+          "tests/test_protocol.py:5243",
+          "tests/test_protocol.py:5244"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_round_synthesis": {
+        "sha256": "e7b3c23fea94a57d4b007cf602b24339375ebf079fa5e3430811d6750a1b50d2",
+        "original_lines": [
+          9602,
+          9606
+        ],
+        "global_references": [
+          "parse_structured_discuss_round_synthesis"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:87",
+          "src/coding_review_agent_loop/discuss_loop.py:1024",
+          "src/coding_review_agent_loop/orchestrator.py:395",
+          "src/coding_review_agent_loop/shape_check_audit.py:1858"
+        ],
+        "decorators": []
+      },
+      "validate_structured_discuss_semantic_comparison": {
+        "sha256": "c313d7e56f1a78d2b4bc6a6d5d90505879a524d134ea7ef9913abdd79e89bb20",
+        "original_lines": [
+          9137,
+          9174
+        ],
+        "global_references": [
+          "DISCUSS_SEMANTIC_CLASSIFICATIONS",
+          "_expect_exact_keys",
+          "_expect_non_empty_string",
+          "_expect_object",
+          "_expect_string_list",
+          "_extract_structured_discuss_review_payload",
+          "_require_supported_schema_version"
+        ],
+        "consumer_candidates": [
+          "src/coding_review_agent_loop/discuss_loop.py:92",
+          "src/coding_review_agent_loop/discuss_loop.py:1306",
+          "src/coding_review_agent_loop/orchestrator.py:400",
+          "src/coding_review_agent_loop/shape_check_audit.py:1867"
+        ],
+        "decorators": []
+      }
+    }
+  },
+  "patch_sites": [
+    {
+      "path": "tests/test_shape_check_audit.py",
+      "line": 952,
+      "text": "    assert comment_rendering.PARSE_DEGRADATION_RENDER_LIMIT is protocol.PARSE_DEGRADATION_RENDER_LIMIT"
+    },
+    {
+      "path": "tests/test_shape_check_audit.py",
+      "line": 953,
+      "text": "    assert protocol.CITATION_DEGRADATION_MAX_DROPS <= protocol.PARSE_DEGRADATION_RENDER_LIMIT"
+    }
+  ]
+}
