@@ -337,6 +337,22 @@ def render_plan_scheduling_diagnostic(label: str, message: str) -> str:
     return PLAN_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
 
 
+def _plan_acknowledgement_blocker(
+    reason: str, *, round_number: int, item_number: int
+) -> tuple[str, UnresolvedReviewItem]:
+    """Construct an ordinary plan finding without changing the round's ledgers."""
+    return (
+        "Orchestrator plan review:\n\n" + reason,
+        _next_unresolved_item(
+            item_number=item_number,
+            reviewer="Orchestrator",
+            source_round=round_number,
+            text=reason,
+            status="blocking",
+        ),
+    )
+
+
 def _plan_review_item_tags(
     item: object, prior_items: Sequence[UnresolvedReviewItem]
 ) -> dict[str, object]:
@@ -3582,28 +3598,18 @@ def _run_plan_first_loop_body(
                         f"Planning round {round_number}: current coder plan lacks complete "
                         "human requirement dispositions; re-injecting as blocking plan item",
                     )
-                    synthetic_review = (
-                        "Orchestrator plan review:\n\n"
+                    reason = (
                         "The current canonical coder plan lacks complete structured dispositions "
                         "for the signed human requirements. Coder must provide one valid "
                         "disposition with evidence for every surfaced requirement before a "
                         "reviewer approval marker can be accepted."
                     )
-                    blocking_reviews.append(("Orchestrator", synthetic_review))
-                    round_new_unresolved_items.append(
-                        _next_unresolved_item(
-                            item_number=next_unresolved_item_number,
-                            reviewer="Orchestrator",
-                            source_round=round_number,
-                            text=(
-                                "The current canonical coder plan lacks complete structured "
-                                "dispositions for the signed human requirements. Coder must provide "
-                                "one valid disposition with evidence for every surfaced requirement "
-                                "before a reviewer approval marker can be accepted."
-                            ),
-                            status="blocking",
-                        )
+                    synthetic_review, new_item = _plan_acknowledgement_blocker(
+                        reason, round_number=round_number,
+                        item_number=next_unresolved_item_number,
                     )
+                    blocking_reviews.append(("Orchestrator", synthetic_review))
+                    round_new_unresolved_items.append(new_item)
                     next_unresolved_item_number += 1
                     unresolved_items = [*unresolved_items, round_new_unresolved_items[-1]]
                     must_fix_items = [
@@ -3779,28 +3785,18 @@ def _run_plan_first_loop_body(
                         "approved without acknowledging signed human requirements; "
                         "re-injecting as blocking plan item",
                     )
-                    synthetic_review = (
-                        "Orchestrator plan review:\n\n"
+                    reason = (
                         f"Reviewer(s) {', '.join(still_missing)} approved without "
                         "acknowledging the signed human requirements. Coder must address the "
                         "human requirements and ensure the reviewer explicitly resolves them "
                         "before plan approval."
                     )
-                    blocking_reviews.append(("Orchestrator", synthetic_review))
-                    round_new_unresolved_items.append(
-                        _next_unresolved_item(
-                            item_number=next_unresolved_item_number,
-                            reviewer="Orchestrator",
-                            source_round=round_number,
-                            text=(
-                                f"Reviewer(s) {', '.join(still_missing)} approved without "
-                                "acknowledging the signed human requirements. Coder must address the "
-                                "human requirements and ensure the reviewer explicitly resolves them "
-                                "before plan approval."
-                            ),
-                            status="blocking",
-                        )
+                    synthetic_review, new_item = _plan_acknowledgement_blocker(
+                        reason, round_number=round_number,
+                        item_number=next_unresolved_item_number,
                     )
+                    blocking_reviews.append(("Orchestrator", synthetic_review))
+                    round_new_unresolved_items.append(new_item)
                     next_unresolved_item_number += 1
                     unresolved_items = [*unresolved_items, round_new_unresolved_items[-1]]
                     must_fix_items = [

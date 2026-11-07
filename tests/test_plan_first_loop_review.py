@@ -1527,6 +1527,173 @@ def test_issue_loop_plan_first_requires_reviewer_human_requirements_resolution(t
     assert "approved without acknowledging signed human requirements" in captured.err
 
 
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("missing_planner", [False, True])
+@pytest.mark.parametrize("missing_panel", [False, True])
+def test_acknowledgement_blockers_propagate_through_plan_revision(
+    tmp_path, monkeypatch, staged, missing_planner, missing_panel
+):
+    requirement, plan, unacknowledged, acknowledged, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    blocker_count = 2 if missing_planner else 1
+    item_ids = [f"item-{n}" for n in range(1, blocker_count + 1)]
+    dispositions = [{"item_id": item_id, "disposition": "resolved"} for item_id in item_ids]
+    base = AuthenticatedPlanState.from_plan(validate_structured_plan_state(plan), round_number=1)
+    revision = json.dumps({
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Make acknowledgement explicit before plan approval.",
+        "prior_plan_item_dispositions": dispositions,
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": [{"op": "replace", "field": "plan_steps", "value": [
+            "Preserve the public API and explicitly acknowledge its requirement."
+        ]}],
+    }) + (
+        "\n" + HUMAN_REQUIREMENTS_ADDRESSED_MARKER + "\n### Human requirements\n"
+        f"- {requirement.requirement_id}: preserve the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+
+    def resolved_review(text):
+        payload, footer = text.split("\n<!--", 1)
+        value = json.loads(payload)
+        value["prior_plan_item_dispositions"] = dispositions
+        return json.dumps(value) + "\n<!--" + footer
+
+    runner = _FakeRunner(
+        claude_outputs=[plan, revision],
+        codex_outputs=[unacknowledged, resolved_review(acknowledged)],
+        gemini_outputs=[unacknowledged if missing_panel else panel, resolved_review(panel)],
+    )
+    real_context = discuss_loop.get_issue_context
+
+    def context(runner_arg, **kwargs):
+        return replace(real_context(runner_arg, **kwargs), human_requirements=(requirement,))
+
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support,
+        pr_loop, plan_first_loop_module, issue_loop, plan_execution,
+    ), "get_issue_context", context)
+    # Fresh-plan validation remains strict. Only the defensive final-gate
+    # predicate is controlled, after the valid plan has already been accepted.
+    real_complete = plan_first_loop_module._current_plan_has_complete_human_requirement_dispositions
+    completeness_checks = []
+
+    def complete(*args, **kwargs):
+        completeness_checks.append(True)
+        return False if missing_planner and len(completeness_checks) == 1 else real_complete(*args, **kwargs)
+
+    monkeypatch.setattr(plan_first_loop_module, "_current_plan_has_complete_human_requirement_dispositions", complete)
+    revision_inputs = []
+    real_prompt = plan_first_loop_module.build_plan_revision_prompt
+
+    def revision_prompt(*args, **kwargs):
+        revision_inputs.append((args[3], tuple(kwargs["unresolved_items"])))
+        return real_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(plan_first_loop_module, "build_plan_revision_prompt", revision_prompt)
+    repair_inputs = []
+
+    def exhausted(text, **kwargs):
+        repair_inputs.append((text, tuple(kwargs["repair_kwargs"]["reviewer_requirement_ids"])))
+        return text, None, ()
+
+    monkeypatch.setattr(plan_first_loop_module, "_run_structured_repair", exhausted)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=2,
+        plan_execution_mode="plan-only",
+        plan_review_policy="primary-then-panel" if staged else "all-reviewers",
+        primary_plan_reviewer="codex" if staged else None,
+        plan_review_force_full=staged, review_parallel=missing_panel,
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(revision_inputs) == 1
+    feedback, items = revision_inputs[0]
+    assert [item.item_id for item in items] == item_ids
+    assert all(item.reviewer == "Orchestrator" and item.status == "blocking" for item in items)
+    assert all(item.source_round == 1 and not item.is_machine_obligation for item in items)
+    if missing_planner:
+        assert items[0].text == (
+            "The current canonical coder plan lacks complete structured dispositions "
+            "for the signed human requirements. Coder must provide one valid "
+            "disposition with evidence for every surfaced requirement before a "
+            "reviewer approval marker can be accepted."
+        )
+    names = "Codex, Gemini" if missing_panel else "Codex"
+    assert items[-1].text == (
+        f"Reviewer(s) {names} approved without "
+        "acknowledging the signed human requirements. Coder must address the "
+        "human requirements and ensure the reviewer explicitly resolves them "
+        "before plan approval."
+    )
+    assert all("Orchestrator plan review:\n\n" + item.text in feedback for item in items)
+    # Repair still runs independently after the planner-disposition blocker.
+    assert len(repair_inputs) == (2 if missing_panel else 1)
+    assert all(ids == (requirement.requirement_id,) for _text, ids in repair_inputs)
+    records = _plan_round_records(runner)
+    revised = next(r for r in records if r.role == "coder" and r.round_number == 2)
+    assert [item.item_id for item in revised.prior_items] == item_ids
+    assert [item.text for item in revised.prior_items] == [item.text for item in items]
+    # The reconciliation checkpoint remains before final acknowledgement repair.
+    checkpoints = [r for r in records if r.phase == "reconciliation" and r.round_number == 1]
+    assert len(checkpoints) == int(missing_panel)
+    assert all(not checkpoint.new_items for checkpoint in checkpoints)
+    assert not any(r.phase == "plan-phase-advance" for r in records if r.round_number == 2)
+    assert "Approved plan:" in runner.comments[-1]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("gate", ["no-requirements", "complete", "mandatory-finding"])
+def test_acknowledgement_gate_bypasses_unnecessary_blockers(tmp_path, monkeypatch, staged, gate):
+    requirement, plan, unacknowledged, acknowledged, panel = _repaired_acknowledgement_fixtures()
+    real_context = discuss_loop.get_issue_context
+
+    def context(runner_arg, **kwargs):
+        return replace(real_context(runner_arg, **kwargs), human_requirements=(
+            () if gate == "no-requirements" else (requirement,)
+        ))
+
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support,
+        pr_loop, plan_first_loop_module, issue_loop, plan_execution,
+    ), "get_issue_context", context)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("The conditional acknowledgement gate must not construct or repair a blocker")
+
+    monkeypatch.setattr(plan_first_loop_module, "_plan_acknowledgement_blocker", unexpected)
+    monkeypatch.setattr(plan_first_loop_module, "_run_structured_repair", unexpected)
+    review = acknowledged
+    if gate == "mandatory-finding":
+        payload = json.loads(unacknowledged.split("\n<!--", 1)[0])
+        payload.update(state="blocking", blocking_plan_issues=["Keep the rollout owner explicit."])
+        review = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    elif gate == "no-requirements":
+        plan = structured_v1_plan_state()
+        review = structured_plan_review(state="approved")
+        panel = review
+    runner = _FakeRunner(claude_outputs=[plan], codex_outputs=[review], gemini_outputs=[panel])
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        plan_execution_mode="plan-only",
+        plan_review_policy="primary-then-panel" if staged else "all-reviewers",
+        primary_plan_reviewer="codex" if staged else None, plan_review_force_full=staged,
+    )
+    if gate == "mandatory-finding":
+        with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        items = [item for r in _plan_round_records(runner) for item in r.new_items]
+        assert len(items) == 1
+        assert items[0].item_id == "item-1"
+        assert items[0].reviewer == "Codex"
+        assert items[0].text == "Keep the rollout owner explicit."
+    else:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+        assert not any(r.new_items for r in _plan_round_records(runner))
+    assert sum(cmd[0] == "claude" for cmd, _cwd in runner.commands) == 1
+
+
 def test_plan_first_grafana_requirement_blocks_admin_html_only_plan_then_accepts_integration(tmp_path):
     """A reviewer must reject a lookalike local UI until the named integration is planned."""
     runner = FakeRunner(

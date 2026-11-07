@@ -1727,8 +1727,9 @@ def _m1505_primary_records_for(runner, agent):
     ]
 
 
+@pytest.mark.parametrize("staged", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch, mixed):
+def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch, mixed, staged):
     """`repeat-reemission` (repaired path): the acknowledgement repair returns blocking."""
     requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
     dispositions = [{
@@ -1778,18 +1779,25 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
         with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
-            with pytest.raises(AgentLoopError):
+            with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
                 run_issue_loop(
-                    runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
+                    runner, issue_number=56, config=_staged_plan_config(
+                        tmp_path, max_rounds=2,
+                        plan_review_policy="primary-then-panel" if staged else "all-reviewers",
+                        primary_plan_reviewer="codex" if staged else None,
+                        reviewer=("codex", "gemini") if staged else ("codex",),
+                    ),
                     plan_first=True,
                 )
     messages = [str(call.args[-1]) for call in logged.call_args_list]
     assert any("repair returned blocking for Codex" in m for m in messages)
-    assert any(
-        "Codex repaired blocking outcome new mandatory finding provenance: "
-        f"pre_existing=0 revision_introduced=0 untagged={int(mixed)} repeats=1" in m
-        for m in messages
-    )
+    # This scheduler-only diagnostic is emitted when a staged baseline exists.
+    if staged:
+        assert any(
+            "Codex repaired blocking outcome new mandatory finding provenance: "
+            f"pre_existing=0 revision_introduced=0 untagged={int(mixed)} repeats=1" in m
+            for m in messages
+        )
     from coding_review_agent_loop.history_export import _plan_provenance_counts
     from coding_review_agent_loop.review_step_back import derive_plan_sweep_state
 
@@ -1803,6 +1811,10 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
         if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
         and record.metadata.round_number == 2
     ]
+    assert not any(
+        item.reviewer == "Orchestrator"
+        for record in records for item in record.metadata.new_items
+    )
     # The repaired blocking outcome supersedes the approval posted before it.
     assert [metadata.state for metadata in round_two] == ["approved", "blocking"]
     repaired_items = [item for item in round_two[-1].new_items if item.status == "blocking"]
@@ -1812,12 +1824,14 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
     if mixed:
         fresh_item = next(item for item in repaired_items if item.text == "Close gap 2b.")
         assert fresh_item.repeat_of is None
-    # The repeat-only repair ends the streak; the mixed one extends it.
-    state = derive_plan_sweep_state(records, primary="Codex")
-    assert [review.classification for review in state.reviews][-1] == (
-        "new-finding" if mixed else "repeat-only"
-    )
-    assert state.streak_before(3) == (2 if mixed else 0)
+    # Only staged planning has primary-phase checkpoints for the sweep.
+    if staged:
+        # The repeat-only repair ends the streak; the mixed one extends it.
+        state = derive_plan_sweep_state(records, primary="Codex")
+        assert [review.classification for review in state.reviews][-1] == (
+            "new-finding" if mixed else "repeat-only"
+        )
+        assert state.streak_before(3) == (2 if mixed else 0)
     # The export counts the genuinely new item and never the duplicate.
     counts = _plan_provenance_counts(records)
     assert counts.resolvable
