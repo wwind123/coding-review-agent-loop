@@ -1,5 +1,6 @@
 """Plan-first loop tests: execution strategy and execution decisions (#1543)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
@@ -98,7 +99,7 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     patch_attr_in(monkeypatch, (execution_policy, issue_loop, plan_execution), "_post_child_planning_handoff",
         lambda *_args, **kwargs: (handoff_calls.append(kwargs), events.append("handoff")),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_run_plan_first_loop",
         lambda *_args, **_kwargs: events.append("planner") or 19,
@@ -142,7 +143,7 @@ def test_direct_child_entry_dispatches_through_shared_child_dispatch(tmp_path, m
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
-    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop, issue_recovery,), "prepare_agent_memory", lambda *_args, **_kwargs: None)
     patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: calls.append(kwargs) or 23,
     )
@@ -162,7 +163,7 @@ def test_direct_child_entry_dispatches_through_shared_child_dispatch(tmp_path, m
         (EXECUTION_DISPOSITION_DIRECT, "agent-loop issue 56`"),
     ],
 )
-def test_parent_rerun_resume_hint_follows_recorded_disposition(
+def test_parent_rerun_dispatch_follows_recorded_disposition(
     tmp_path, monkeypatch, capsys, disposition, expected_hint
 ):
     fresh, child, parent = _fresh_child_route_fixture(disposition)
@@ -190,6 +191,9 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         "find_phase_implementation_handoffs_for_parent",
         lambda *_args, **_kwargs: (handoff,),
     )
+    dispatched = []
+    monkeypatch.setattr(plan_execution, "_dispatch_decomposition_child",
+                        lambda _runner, **kwargs: dispatched.append(kwargs) or 7)
     result = plan_execution._dispatch_current_decomposition_phase(
         _FakeRunner(), run_plan_first_loop=plan_first_loop_module._run_plan_first_loop, config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
@@ -203,8 +207,10 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         approved_plan_context=fresh.parent_plan_context, issue_context=parent,
         mode="implement-by-phase", coder_session_id=None,
     )
-    assert result == 0
-    assert expected_hint in capsys.readouterr().out
+    assert result == 7
+    assert dispatched[0]["route"].disposition == disposition
+    assert dispatched[0]["existing_handoff"] is handoff
+    assert "resume directly with" not in capsys.readouterr().out
 
 
 def test_auto_legacy_plan_round_reaches_review_before_legacy_refusal(tmp_path):

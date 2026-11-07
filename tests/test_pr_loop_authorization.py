@@ -1,5 +1,6 @@
 """PR-loop tests for pr_loop_support and issue_pr_handoff: PR authorization (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import prompt_support as _prompt_owner
 
@@ -890,9 +891,7 @@ def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, mo
         read_comments.append(len(comments))
         return real_recover(comments, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
-    ), "recover_approved_plan_context", recording_recover)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_recovery,), "recover_approved_plan_context", recording_recover)
     patch_attr_in(monkeypatch, (
         discuss_loop, pr_loop, issue_loop,
     ), "validate_open_issue", lambda *_a, **_k: None)

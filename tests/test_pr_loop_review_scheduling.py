@@ -1,5 +1,6 @@
 """PR-loop tests for review_rounds and review_scheduling: PR review scheduling (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import dataclasses
 import json
@@ -653,7 +654,7 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
             human_requirements=(requirement_1 if context_calls == 1 else requirement_2,),
         )
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", changing_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", changing_context)
     runner = FakeRunner(
         claude_outputs=[],
         codex_outputs=[
@@ -1592,7 +1593,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         context = original_context(runner, *args, **kwargs)
         return dataclasses.replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", context_with_requirement)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", context_with_requirement)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex", resolved=True)],
         # Gemini approves without acknowledging the signed requirement.
@@ -2791,7 +2792,7 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
     patch_attr_in(monkeypatch, (
         review_rounds, pr_loop,
     ), "_unavailable_reviewer_amendment_advisory", mark_advisory)
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", fetch)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", fetch)
     runner = _scheduler_stop_runner()
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
@@ -2872,7 +2873,7 @@ def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detect
 def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monkeypatch):
     """Row strict-managed-all-reviewers-restore-only on a real strict issue-created handoff."""
     plan_board = ("codex", "claude", "antigravity")
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_recovery,), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
     patch_attr_in(monkeypatch, (
         panel_evidence, pr_loop_support, pr_loop,

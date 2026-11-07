@@ -1,5 +1,6 @@
 """Plan-first loop tests: plan review rounds and plan-review follow-ups (#1543)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
@@ -1877,7 +1878,7 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
     patch_attr_in(monkeypatch, (review_rounds, pr_loop, plan_first_loop_module), "_round_ledger_may_be_incomplete", ledger_spy)
     logged = []
     real_log = agent_failure.log
-    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, plan_execution), "log",
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, issue_recovery, plan_execution,), "log",
         lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
     )
     runner = FakeRunner(

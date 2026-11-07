@@ -1,5 +1,6 @@
 """PR-loop tests for pr_loop: merge handling (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from pathlib import Path
@@ -85,7 +86,7 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
@@ -146,7 +147,7 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
             status="passed", checks=snapshot, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77,
             repo="OWNER/REPO",
@@ -219,7 +220,7 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
@@ -257,7 +258,7 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
@@ -387,7 +388,7 @@ def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_befo
             status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
@@ -439,7 +440,7 @@ def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_pa
                 status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             ),
         )
-        patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+        patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
             lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
                 number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
                 base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
@@ -532,7 +533,7 @@ def _ordinary_recovery_ready_setup(monkeypatch, runner_tmp):
             status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,

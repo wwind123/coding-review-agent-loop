@@ -744,3 +744,42 @@ def test_planning_route_child_with_open_dependency_pr_stops_before_handoff(
     )
     assert scenario.events == []
     assert comment_writes(runner) == []
+
+
+@pytest.mark.parametrize("fault", ["missing-override", "changed-disposition"])
+def test_parent_resume_route_conflict_stops_before_child_work(tmp_path, monkeypatch, fault):
+    from test_child_plan_provenance import fresh_staged_plan, fresh_child_contexts
+    from coding_review_agent_loop.decomposition import normalize_execution_recommendation
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+    from coding_review_agent_loop.round_metadata import _plan_subject
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+    plan = fresh_staged_plan(first_disposition=EXECUTION_DISPOSITION_DIRECT)
+    child, parent = fresh_child_contexts(
+        plan,
+        handoff_execution_disposition=(EXECUTION_DISPOSITION_PLANNING if fault == "changed-disposition"
+                                      else EXECUTION_DISPOSITION_DIRECT),
+        handoff_override_digest="a" * 64 if fault == "missing-override" else None,
+    )
+    recommendation = parse_execution_recommendation_payload(
+        json.JSONDecoder().raw_decode(plan)[0]["execution_recommendation"], context="test",
+    )
+    decomposition, _ = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan),
+    )
+    created = (CreatedPhaseIssue(phase=decomposition.phases[0], issue_url=child.url, issue_number=56),)
+    patch_attr_in(monkeypatch, (plan_execution, execution_policy), "get_issue_context",
+                  lambda _runner, **kwargs: child if kwargs["issue_number"] == 56 else parent)
+    monkeypatch.setattr(plan_execution, "_dispatch_decomposition_child",
+                        lambda *a, **k: pytest.fail("conflicting route dispatched"))
+    runner = FakeRunner()
+    with pytest.raises(AgentLoopError):
+        plan_execution._dispatch_current_decomposition_phase(
+            runner, run_plan_first_loop=lambda *a, **k: pytest.fail("planner invoked"),
+            config=make_config(tmp_path), memory=None, usage_context=None,
+            issue_number=55, current_plan=plan, plan_subject=_plan_subject(plan),
+            outcome=_staged_outcome(created, plan), recommendation=recommendation,
+            approved_plan_context=make_approved_plan_context(plan), issue_context=parent,
+            mode="implement-by-phase", coder_session_id=None,
+        )
+    assert runner.comments == [] and runner.issues == []
+    assert not any(cmd[0] in {"claude", "codex", "agy", "gemini"} for cmd, _ in runner.commands)

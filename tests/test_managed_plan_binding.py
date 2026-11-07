@@ -1,5 +1,6 @@
 """Managed-CI PR qualification reads the plan binding from the PR side (#966)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from dataclasses import replace
@@ -265,11 +266,11 @@ def _snapshot(
         architecture_identity_changed=False,
     )
     calls = []
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", lambda *a, **k: pr_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", lambda *a, **k: pr_context)
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", lambda *a, **k: issue)
     patch_attr_in(monkeypatch, (architecture_contract, pr_loop_support), "_revalidate_pr_architecture_identity", lambda *a, **k: (None, False)
     )
-    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", lambda *a, **k: plan
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_recovery,), "recover_approved_plan_context", lambda *a, **k: plan
     )
     monkeypatch.setattr(
         pr_loop_support, "verify_managed_pr_plan_binding", lambda *a, **k: calls.append(k)
@@ -346,7 +347,7 @@ def test_two_fresh_grants_at_the_live_head_fail_closed(tmp_path):
 
 
 def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_loop), "_resume_plan_round",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_recovery,), "_resume_plan_round",
         lambda comments, **_k: None if plan_text is None else (plan_text, object()),
     )
 
@@ -360,7 +361,7 @@ def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
     import coding_review_agent_loop.plan_verification as plan_verification
 
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (panel_evidence, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop, plan_execution), "approved_plan_hash",
+    patch_attr_in(monkeypatch, (panel_evidence, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_recovery, plan_execution,), "approved_plan_hash",
         lambda text: PLAN if text == "approved plan" else "0" * 16,
     )
 

@@ -1,5 +1,6 @@
 """PR-loop tests for checks and ci_health: the PR-loop CI gate (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
 
@@ -1576,7 +1577,7 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
         base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),
@@ -1677,7 +1678,7 @@ def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
             comments=(), human_requirements=requirements,
         )
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", review_context)
     selections = []
     real_select = pr_loop.select_coder_followup_items
 

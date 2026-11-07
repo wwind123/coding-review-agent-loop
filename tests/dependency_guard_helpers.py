@@ -7,6 +7,7 @@ progress resolution performs.
 """
 
 from __future__ import annotations
+import coding_review_agent_loop.issue_recovery as issue_recovery
 
 import coding_review_agent_loop.plan_execution as plan_execution
 from dataclasses import dataclass, field, replace
@@ -212,7 +213,7 @@ def install(monkeypatch, scenario: GuardScenario, *, handoff=None):
         return _call
 
     patch_attr_in(
-        monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory",
+        monkeypatch, (discuss_loop, pr_loop, issue_loop, issue_recovery,), "prepare_agent_memory",
         record("memory", None),
     )
     patch_attr_in(
@@ -227,7 +228,7 @@ def install(monkeypatch, scenario: GuardScenario, *, handoff=None):
         monkeypatch, (plan_first_loop, issue_loop), "_run_plan_first_loop", record("planner", 19)
     )
     patch_attr_in(
-        monkeypatch, (execution_policy, issue_loop, plan_execution),
+        monkeypatch, (execution_policy, issue_recovery, plan_execution,),
         "resolve_canonical_pr_for_issue", lambda *_a, **_k: None,
     )
     return FakeRunner()

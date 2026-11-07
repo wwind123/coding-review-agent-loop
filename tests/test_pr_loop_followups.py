@@ -1,3 +1,4 @@
+import coding_review_agent_loop.issue_recovery as issue_recovery
 
 import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
@@ -285,7 +286,7 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
                 race_pending = False
         return real_get_pr_review_context(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", get_pr_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", get_pr_context)
 
     def fake_correction(*_args, **kwargs):
         nonlocal race_pending
@@ -2166,7 +2167,7 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
             comments=comments, human_requirements=requirements,
         )
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", review_context)
     repairs = []
     real_repair = validated_agent_module._run_structured_repair
 

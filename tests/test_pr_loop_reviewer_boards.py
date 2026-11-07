@@ -1,5 +1,6 @@
 """PR-loop tests for board_amendment and reviewer_seats: PR reviewer boards (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.pr_plan_recovery as pr_plan_recovery
 
 import dataclasses
@@ -635,7 +636,7 @@ class _PlanCheckReached(Exception):
 def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     """Fresh managed-CI authorization through run_pr_loop, plan approved by three."""
     plan_board = ("codex", "gemini", "antigravity")
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_recovery,), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):
@@ -864,7 +865,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
     plan_board = ("codex", "gemini", "antigravity")
     plan_checks = []
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_recovery,), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):
@@ -885,9 +886,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
         source_locator="issue #56 canonical approved plan",
         expected_hash=panel_evidence.approved_plan_hash("approved plan"),
     )
-    patch_attr_in(monkeypatch, (
-        execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
-    ), "recover_approved_plan_context", lambda *a, **k: recovered_plan
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_recovery,), "recover_approved_plan_context", lambda *a, **k: recovered_plan
     )
     handoff = AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",

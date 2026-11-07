@@ -1,5 +1,6 @@
 """PR-loop behaviour of sub-item findings (#958), driven with scripted agents."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
 
@@ -294,7 +295,7 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch, mode):
         number=77, repo="OWNER/REPO", title="t", head_branch="feature/x",
         base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),

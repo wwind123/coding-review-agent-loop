@@ -1,5 +1,6 @@
 """Plan-first loop tests: plan step-back turns and episodes (#1543)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 from agent_loop_helpers import patch_object_in
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
@@ -1552,9 +1553,9 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "ensure_agent_workdirs", lambda *a, **k: None)
     patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture", lambda _r, config: config)
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
-    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", forbidden)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop, issue_recovery,), "prepare_agent_memory", forbidden)
     patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child", forbidden)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", forbidden)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", forbidden)
     monkeypatch.setattr(
         handoff_module, "authenticate_canonical_issue_pr",
         lambda *a, **k: SimpleNamespace(pr_number=7, state="MERGED"),
