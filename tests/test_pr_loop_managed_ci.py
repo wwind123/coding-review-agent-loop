@@ -1,5 +1,6 @@
 """PR-loop tests for managed_ci: exact-head qualification in the PR loop (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import managed_ci_types as _managed_ci_types
 
 import dataclasses
@@ -444,10 +445,7 @@ def test_managed_qualifying_checkpoint_without_fresh_attempt_path_forces_review(
         return result
 
     monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", stop_at_reviewer)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", stop_at_reviewer)
     monkeypatch.setattr(pr_loop_module, "_managed_checkpoint_needs_fresh_attempt", helper)
     monkeypatch.setattr(
         pr_loop, "dispatch_final_qualification", lambda *a, **k: dispatches.append(k)
@@ -611,10 +609,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         return original_run_validated_agent(*args, **kwargs)
 
     monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", stop_at_reviewer)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", stop_at_reviewer)
     dispatches = []
     monkeypatch.setattr(
         pr_loop,
@@ -1309,7 +1304,7 @@ def test_m1047_entry_normalization_runs_before_every_managed_resume_path(
         )
     elif path == "fresh":
         patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *a, **k: None)
-        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
             lambda *a, **k: SimpleNamespace(number=5, comments=[], human_requirements=()),
         )
         monkeypatch.setattr(

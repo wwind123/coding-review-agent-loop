@@ -1,5 +1,6 @@
 """Plan-first loop tests: architecture-impact contract in planning rounds (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import re
 from dataclasses import replace
 from types import SimpleNamespace
@@ -88,7 +89,7 @@ def _ack_staged_run(
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     repair_calls = []
 
     def fake_repair(raw, cmd, **kwargs):
@@ -195,7 +196,7 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     repair_calls = []
 
     def fake_repair(raw, cmd, **kwargs):
@@ -321,7 +322,7 @@ def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repai
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
         agent_max_retries=0, agent_retry_backoff_seconds=0, review_parallel=parallel,

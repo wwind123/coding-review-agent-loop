@@ -4,6 +4,7 @@ Integration tests drive the real ``run_pr_loop`` through ``FakeRunner``; the
 unit tests pin the link record, the resolver and the floor authorization.
 """
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import base64
 import dataclasses
 import json
@@ -3294,7 +3295,7 @@ def _patch_requirements(monkeypatch, requirements):
             return context
         return dataclasses.replace(context, human_requirements=tuple(requirements))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop), "get_issue_context", patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", patched)
 
 
 def _signed_requirement():
@@ -3847,7 +3848,7 @@ def test_staged_child_public_entry_merges_parent_requirements(tmp_path, monkeypa
 
     import coding_review_agent_loop.github as github
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop), "get_issue_context", with_parent)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", with_parent)
     monkeypatch.setattr(github, "get_issue_context", with_parent)
     runner, config = _approved_plain_plan(tmp_path, requirement=parent_requirement)
     parent_id = parent_requirement.requirement_id
@@ -5049,7 +5050,7 @@ def test_approved_all_reviewers_plan_resumed_with_a_baseline_budget_is_not_reope
 
     approving_configs, restored_configs = [], []
     real_approving = plan_first_loop._approving_plan_board_config
-    real_restore = plan_first_loop._restore_invocation_board
+    real_restore = plan_execution._restore_invocation_board
 
     def spy_approving(config, approving):
         result = real_approving(config, approving)
@@ -5062,7 +5063,7 @@ def test_approved_all_reviewers_plan_resumed_with_a_baseline_budget_is_not_reope
         return result
 
     monkeypatch.setattr(plan_first_loop, "_approving_plan_board_config", spy_approving)
-    monkeypatch.setattr(plan_first_loop, "_restore_invocation_board", spy_restore)
+    monkeypatch.setattr(plan_execution, "_restore_invocation_board", spy_restore)
     staged = _plan_cfg(
         tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
         primary_plan_reviewer="codex", plan_provenance_baseline_max_chars=50000,

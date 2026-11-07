@@ -1,3 +1,4 @@
+import coding_review_agent_loop.plan_execution as plan_execution
 import base64
 import dataclasses
 import json
@@ -71,7 +72,9 @@ from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
 from coding_review_agent_loop.execution_policy import _preflight_fresh_one_shot_recovery, _preflight_fresh_staged_topology
-from coding_review_agent_loop.plan_first_loop import _dispatch_current_decomposition_phase
+from coding_review_agent_loop.plan_execution import (
+    _dispatch_current_decomposition_phase,
+)
 from coding_review_agent_loop.split_materialization import (
     MaterializedSplitChild,
     SplitMaterializationMetadata,
@@ -2468,9 +2471,9 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
         events.append("coder")
         return real_implement(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment", _record_post
+    patch_attr_in(monkeypatch, (execution_policy, plan_execution), "post_phase_implementation_handoff_comment", _record_post
     )
-    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue", _record_implement)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_execution), "_implement_approved_issue", _record_implement)
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
@@ -2615,19 +2618,19 @@ def test_fresh_staged_parent_advances_to_the_next_phase_after_the_first_complete
         events.append(f"handoff-{kwargs['phase_index']}")
         return real_post(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (execution_policy, pr_loop, plan_first_loop), "collect_child_disposition_overrides", _record_overrides
+    patch_attr_in(monkeypatch, (execution_policy, pr_loop, plan_execution), "collect_child_disposition_overrides", _record_overrides
     )
-    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "resolve_child_execution_route", _record_route
+    patch_attr_in(monkeypatch, (execution_policy, plan_execution), "resolve_child_execution_route", _record_route
     )
-    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment", _record_post
+    patch_attr_in(monkeypatch, (execution_policy, plan_execution), "post_phase_implementation_handoff_comment", _record_post
     )
-    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue",
+    patch_attr_in(monkeypatch, (issue_implementation, plan_execution), "_implement_approved_issue",
         lambda *_args, **kwargs: events.append(f"coder-{kwargs['issue_context'].number}") or 0,
     )
 
     result = _dispatch_current_decomposition_phase(
         runner,
-        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        run_plan_first_loop=plan_first_loop._run_plan_first_loop, config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
         memory=None,
         usage_context=SimpleNamespace(),
         issue_number=55,
@@ -3354,7 +3357,7 @@ def test_staged_dry_run_dispatch_reads_no_child_state(tmp_path, capsys):
     )
 
     result = _dispatch_current_decomposition_phase(
-        runner, config=config, memory=None, usage_context=None, issue_number=56,
+        runner, run_plan_first_loop=plan_first_loop._run_plan_first_loop, config=config, memory=None, usage_context=None, issue_number=56,
         current_plan=plan, plan_subject=_plan_subject(plan), outcome=outcome,
         recommendation=None,
         approved_plan_context=None, issue_context=parent,
@@ -4730,7 +4733,7 @@ def test_parent_stdout_relaunch_lines_use_reviewed_routes_for_adopted_children()
         automations=tuple(phase.automation for phase in phases), plan_hash="a" * 16,
         mode="decompose-only", topology_source="approved-plan-v1",
     )
-    lines = plan_first_loop._staged_child_relaunch_lines(
+    lines = plan_execution._staged_child_relaunch_lines(
         PlanDecomposition(phases=phases), outcome
     )
     body = format_decomposition_parent_summary(**kwargs)

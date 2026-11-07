@@ -1,5 +1,6 @@
 """Plan-first loop tests: execution strategy and execution decisions (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
@@ -72,7 +73,7 @@ def test_fresh_child_issue_flags_cannot_switch_reviewed_route(
     tmp_path, monkeypatch, disposition, plan_first, message
 ):
     fresh, issue, parent = _fresh_child_route_fixture(disposition)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
@@ -90,14 +91,14 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     fresh.route = replace(fresh.route, override_digest=override_digest)
     events = []
     handoff_calls = []
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
-    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop_module, issue_loop), "_post_child_planning_handoff",
+    patch_attr_in(monkeypatch, (execution_policy, issue_loop, plan_execution), "_post_child_planning_handoff",
         lambda *_args, **kwargs: (handoff_calls.append(kwargs), events.append("handoff")),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_run_plan_first_loop",
         lambda *_args, **_kwargs: events.append("planner") or 19,
@@ -137,12 +138,12 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
 def test_direct_child_entry_dispatches_through_shared_child_dispatch(tmp_path, monkeypatch):
     fresh, issue, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
     calls = []
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: calls.append(kwargs) or 23,
     )
     assert run_issue_loop(_FakeRunner(), issue_number=56, config=make_config(tmp_path)) == 23
@@ -173,11 +174,11 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         recommendation_digest="digest", stage_id="stage-one", plan_subject="plan-subject",
         execution_disposition=disposition,
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     monkeypatch.setattr(
-        plan_first_loop_module, "find_existing_phase_implementation_handoff",
+        plan_execution, "find_existing_phase_implementation_handoff",
         lambda *_args, **_kwargs: handoff,
     )
     monkeypatch.setattr(
@@ -189,8 +190,8 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         "find_phase_implementation_handoffs_for_parent",
         lambda *_args, **_kwargs: (handoff,),
     )
-    result = plan_first_loop_module._dispatch_current_decomposition_phase(
-        _FakeRunner(), config=make_config(tmp_path), memory=None,
+    result = plan_execution._dispatch_current_decomposition_phase(
+        _FakeRunner(), run_plan_first_loop=plan_first_loop_module._run_plan_first_loop, config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
         current_plan="Approved parent plan", plan_subject="plan-subject",
         outcome=StagedTopologyOutcome(

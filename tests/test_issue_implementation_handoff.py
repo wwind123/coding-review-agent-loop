@@ -1,5 +1,6 @@
 """Issue-implementation tests: issue-to-PR handoff and coder receipts (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from types import SimpleNamespace
 
@@ -118,7 +119,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
             setattr(runner, "git_head", "6367c48dd193d56ea7b0baad25b19455e529f5ee-agent-1") or coder_response
         ),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue",
         lambda *_args, **_kwargs: None,
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation",
@@ -127,7 +128,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation",
         lambda *_args, **_kwargs: None,
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
         lambda *_args, **_kwargs: 0,
     )
     monkeypatch.setattr(
@@ -293,7 +294,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
     run_pr_calls = []
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", lambda *_a, **_k: coder_response
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     real_get_pr_review_context = pr_loop_support.get_observed_pr_review_context
     review_context_calls = 0
@@ -305,7 +306,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
             runner.pr_payload["headRefOid"] = "a607eb2974b572fbd8ce0410e987804f1e0775a6"
         return real_get_pr_review_context(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
         get_pr_review_context_with_optional_race,
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation",
@@ -315,7 +316,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
@@ -483,11 +484,11 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
 
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "post_trusted_pr_contract_record", recording_contract_record)
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "post_issue_pr_handoff_comment", recording_handoff)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
     monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
     monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
@@ -495,7 +496,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
@@ -658,11 +659,11 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         raise AssertionError("repair must not run for dropped execution_refs")
 
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "post_issue_pr_handoff_comment", recording_handoff)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
     monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
     monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
@@ -670,7 +671,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
@@ -784,7 +785,7 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     run_pr_calls = []
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_run_agent_result)
     patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", forbid_repair)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
@@ -792,7 +793,7 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(

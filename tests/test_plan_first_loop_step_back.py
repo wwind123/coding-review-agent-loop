@@ -1,5 +1,7 @@
 """Plan-first loop tests: plan step-back turns and episodes (#1543)."""
 
+from agent_loop_helpers import patch_object_in
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from copy import deepcopy
@@ -330,9 +332,7 @@ def _m1275_resume(tmp_path, history, *, claude=(), codex=(), **overrides):
         issue_comments=history, claude_outputs=list(claude), codex_outputs=list(codex)
     )
     config = _staged_plan_config(tmp_path, **values)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError) as excinfo:
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     messages = [str(call.args[-1]) for call in logged.call_args_list]
@@ -454,10 +454,7 @@ def test_a_spent_deferral_is_not_granted_again(tmp_path):
             for record in real_records(comments, flow=flow)
         )
 
-    with patch.object(
-        plan_first_loop_module, "_extract_round_metadata_records",
-        side_effect=mark_round_four,
-    ):
+    with patch_object_in((plan_first_loop_module, plan_execution), "_extract_round_metadata_records", side_effect=mark_round_four):
         rerun, error, _messages = _m1275_resume(
             tmp_path, history, plan_primary_stall_rounds=4, plan_step_back_rounds=2,
         )
@@ -519,9 +516,7 @@ def test_a_reached_stall_names_why_the_step_back_did_not_apply(
             for record in real_records(comments, flow=flow)
         )
 
-    with patch.object(
-        plan_first_loop_module, "_extract_round_metadata_records", side_effect=malformed
-    ):
+    with patch_object_in((plan_first_loop_module, plan_execution), "_extract_round_metadata_records", side_effect=malformed):
         rerun, error, _messages = _m1275_resume(
             tmp_path, history, plan_primary_stall_rounds=4, **overrides
         )
@@ -583,11 +578,7 @@ def test_step_back_state_is_suppressed_for_a_malformed_entry_without_crashing(tm
             for record in records
         )
 
-    with patch.object(
-        plan_first_loop_module, "_extract_round_metadata_records", side_effect=degrade
-    ), patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "_extract_round_metadata_records", side_effect=degrade), patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         runner, error = _m1251_run(
             tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=1
         )
@@ -776,9 +767,7 @@ def test_unqualified_legacy_blocks_do_not_count_toward_the_trigger(tmp_path):
             )
         )
 
-    with patch.object(
-        plan_first_loop_module, "_extract_round_metadata_records", side_effect=legacy
-    ):
+    with patch_object_in((plan_first_loop_module, plan_execution), "_extract_round_metadata_records", side_effect=legacy):
         runner, _error = _m1251_run(
             tmp_path, last_round=6, max_rounds=6, plan_step_back_escalation_rounds=5
         )
@@ -1090,9 +1079,7 @@ def test_degraded_history_with_an_existing_episode_suppresses_every_anchor(tmp_p
             for record in real_records(comments, flow=flow)
         )
 
-    with patch.object(
-        plan_first_loop_module, "_extract_round_metadata_records", side_effect=degrade
-    ):
+    with patch_object_in((plan_first_loop_module, plan_execution), "_extract_round_metadata_records", side_effect=degrade):
         rerun, error, messages = _m1275_resume(
             tmp_path, history, claude=claude[:1], codex=codex[:1],
             plan_step_back_escalation_rounds=2,
@@ -1221,9 +1208,7 @@ def test_no_episode_run_logs_no_anchor_and_prompts_carry_no_anchor_text(tmp_path
     codex, claude, _base = _m1103_blocking_chain(1, 4, base=base)
     runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
     config = _staged_plan_config(tmp_path, max_rounds=4)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
@@ -1320,9 +1305,7 @@ def test_narrowing_revision_inside_an_active_episode_carries_directive_and_ancho
             initial_plan.append(plan)
         return staged if plan == initial_plan[0] else real(plan, *args, **kwargs)
 
-    with patch.object(
-        plan_first_loop_module, "_current_execution_recommendation", recommendation
-    ):
+    with patch_object_in((plan_first_loop_module, plan_execution), "_current_execution_recommendation", recommendation):
         rerun, _error, messages = _m1275_resume(
             tmp_path, history, claude=claude[:1], codex=codex[:1],
             plan_step_back_escalation_rounds=9, plan_narrow_staged=True,
@@ -1437,9 +1420,7 @@ def test_growth_guard_revision_after_an_in_episode_approval_carries_no_anchor(tm
         tmp_path, max_rounds=12, plan_growth_max_chars=1000, plan_growth_max_revisions=3,
         plan_step_back_rounds=2, plan_step_back_escalation_rounds=9,
     )
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError):
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
 
@@ -1537,9 +1518,7 @@ def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anc
     assert derive_plan_step_back_state(before_approval, primary=primary).episode is not None
     assert derive_plan_step_back_state(list(records), primary=primary).episode is None
 
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         assert issue_loop.run_issue_loop(
             resumed, issue_number=56, config=config(), plan_first=True
         ) == 0
@@ -1566,7 +1545,7 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     def forbidden(*_a, **_k):
         raise AssertionError("no agent, memory, dispatch or review may start")
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 42 else parent,
     )
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *a, **k: None)
@@ -1574,8 +1553,8 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture", lambda _r, config: config)
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", forbidden)
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", forbidden)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", forbidden)
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child", forbidden)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", forbidden)
     monkeypatch.setattr(
         handoff_module, "authenticate_canonical_issue_pr",
         lambda *a, **k: SimpleNamespace(pr_number=7, state="MERGED"),

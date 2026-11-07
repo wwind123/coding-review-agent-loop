@@ -1059,10 +1059,7 @@ def _guarded_semantic_correction_loop(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
         response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(

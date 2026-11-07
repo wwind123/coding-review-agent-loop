@@ -1,5 +1,6 @@
 """Managed-CI PR qualification reads the plan binding from the PR side (#966)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -264,8 +265,8 @@ def _snapshot(
         architecture_identity_changed=False,
     )
     calls = []
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_observed_pr_review_context", lambda *a, **k: pr_context)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context", lambda *a, **k: issue)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", lambda *a, **k: pr_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", lambda *a, **k: issue)
     patch_attr_in(monkeypatch, (architecture_contract, pr_loop_support), "_revalidate_pr_architecture_identity", lambda *a, **k: (None, False)
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", lambda *a, **k: plan
@@ -359,7 +360,7 @@ def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
     import coding_review_agent_loop.plan_verification as plan_verification
 
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (panel_evidence, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "approved_plan_hash",
+    patch_attr_in(monkeypatch, (panel_evidence, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop, plan_execution), "approved_plan_hash",
         lambda text: PLAN if text == "approved plan" else "0" * 16,
     )
 

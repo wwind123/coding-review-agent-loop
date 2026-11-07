@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import os
 import signal
@@ -935,7 +936,7 @@ def test_nested_pr_loop_under_issue_and_task_keeps_outer_identity(tmp_path, monk
         nested.append((owner.command, owner.number, owner.target, len(workdir_claims._registry)))
         return real_pr_loop(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop", spy)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", spy)
     runner = FakeRunner(
         claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],

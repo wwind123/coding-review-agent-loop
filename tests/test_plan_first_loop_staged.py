@@ -1,5 +1,6 @@
 """Plan-first loop tests: staged parents and child stages (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
@@ -133,7 +134,7 @@ def _dispatch_staged(runner, tmp_path, outcome, handoffs, monkeypatch, **overrid
         number=55, repo="OWNER/REPO", title="Parent", body="Parent",
         url="https://github.com/OWNER/REPO/issues/55", comments=(),
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: parent,
     )
     kwargs = dict(
@@ -144,7 +145,7 @@ def _dispatch_staged(runner, tmp_path, outcome, handoffs, monkeypatch, **overrid
         issue_context=parent, mode="implement-by-phase", coder_session_id=None,
     )
     kwargs.update(overrides)
-    return plan_first_loop_module._dispatch_current_decomposition_phase(runner, **kwargs)
+    return plan_execution._dispatch_current_decomposition_phase(runner, run_plan_first_loop=plan_first_loop_module._run_plan_first_loop, **kwargs)
 
 
 def test_staged_terminal_report_names_required_parent_obligations(tmp_path, monkeypatch, capsys):
@@ -167,7 +168,7 @@ def test_staged_terminal_report_names_required_parent_obligations(tmp_path, monk
     runner = _merged_child_runner(
         {99: "closed", 100: "closed"}, pr_states={99: 912, 100: 913}
     )
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_a, **_k: pytest.fail("a delivered topology must not dispatch a child"),
     )
 
@@ -215,7 +216,7 @@ def test_staged_pending_human_stage_stops_then_advances_when_closed(tmp_path, mo
     created = _staged_created(("agent-pr", "human-action", "agent-pr"))
     outcome = _staged_outcome(created)
     handoffs = (_staged_handoff(1, 99),)
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_a, **_k: pytest.fail("a human-owned stage must not dispatch an agent"),
     )
     pending = _merged_child_runner({99: "closed", 100: "open"}, pr_states={99: 912})
@@ -228,7 +229,7 @@ def test_staged_pending_human_stage_stops_then_advances_when_closed(tmp_path, mo
     )
 
     dispatched = []
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_a, **kwargs: dispatched.append(kwargs) or 0,
     )
     advanced = _merged_child_runner(
@@ -474,7 +475,7 @@ def test_staged_plan_under_phase_modes_is_not_stopped(tmp_path, monkeypatch, mod
     )
     dispatched = []
     monkeypatch.setattr(
-        plan_first_loop_module,
+        plan_execution,
         "_dispatch_current_decomposition_phase",
         lambda *args, **kwargs: dispatched.append(kwargs["mode"]) or 7,
     )
@@ -720,7 +721,7 @@ def _m1268_carried_history(tmp_path, *, complete, monkeypatch=None):
     )
     if complete:
         monkeypatch.setattr(
-            plan_first_loop_module,
+            plan_execution,
             "_decompose_approved_plan",
             lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("approval boundary stub")),
         )
@@ -800,7 +801,7 @@ def test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approv
         issue_urls=_m1268_issue_urls(),
     )
     monkeypatch.setattr(
-        plan_first_loop_module,
+        plan_execution,
         "_decompose_approved_plan",
         lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("approval boundary stub")),
     )
@@ -1121,7 +1122,7 @@ def test_staged_resume_repairs_default_close_before_next_dispatch(tmp_path, monk
         assert runner.evidence_commands[-1] == ["gh", "api", "repos/OWNER/REPO/issues/99"]
         dispatched.append(kwargs)
         return 0
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", dispatch)
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child", dispatch)
     assert _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch) == 0
     assert [item["phase_index"] for item in dispatched] == [2]
     assert dispatched[0]["created"].issue_number == 100
@@ -1132,8 +1133,8 @@ def test_staged_resume_repairs_default_close_before_next_dispatch(tmp_path, monk
 def test_staged_dry_run_never_resolves_missed_close(tmp_path, monkeypatch):
     from default_branch_close_helpers import DefaultCloseRunner
     runner = DefaultCloseRunner(child=99, pr_number=912)
-    monkeypatch.setattr(plan_first_loop_module, "resolve_staged_phase_progress", lambda *_a, **_k: pytest.fail("dry run resolved child"))
-    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", lambda *_a, **_k: pytest.fail("dry run dispatched child"))
+    monkeypatch.setattr(plan_execution, "resolve_staged_phase_progress", lambda *_a, **_k: pytest.fail("dry run resolved child"))
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child", lambda *_a, **_k: pytest.fail("dry run dispatched child"))
     outcome = _staged_outcome(_staged_created(("agent-pr", "agent-pr")))
     assert _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch, config=make_config(tmp_path, dry_run=True)) == 0
     assert not runner.evidence_commands

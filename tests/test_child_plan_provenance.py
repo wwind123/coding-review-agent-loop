@@ -1,3 +1,5 @@
+import coding_review_agent_loop.plan_execution as plan_execution
+from agent_loop_helpers import patch_object_in
 import base64
 import dataclasses
 import json
@@ -373,7 +375,7 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
         comments=tuple([comment(plan_record(parent_plan))] +
                        ([] if fault == "parent_checkpoint" else [comment(checkpoint)])),
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
                         lambda runner, *, config, issue_number: child if issue_number == 56 else parent)
     runner = FakeRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
@@ -407,7 +409,7 @@ def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
 ):
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan, stable_stage_id=stable_stage_id)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -453,7 +455,7 @@ def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transitio
             comments=parent.comments[:-1]
             + (comment(replace_phase_handoff_payload(parent.comments[-1].body, **handoff_updates)),),
         )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -484,7 +486,7 @@ def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_
         summary_mode="decompose-only",
         handoff_mode="decompose-only",
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -514,7 +516,7 @@ def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
     # The child handoff deliberately carries the parent topology hash, but the
     # parent phase handoff is absent and the child has no approved plan.
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -557,7 +559,7 @@ def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
         )
     elif fault == "missing_child_plan":
         child = dataclasses.replace(child, comments=child.comments[1:])
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -608,7 +610,7 @@ def test_direct_and_legacy_handoff_pr_still_require_parent_phase_hash(
             flow="approved-plan-implementation", plan_hash="wrong-child-hash",
         )),),
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"})
@@ -625,7 +627,7 @@ def test_contradictory_unbound_handoff_fails_closed_in_workflow_paths(
     child, parent = fresh_child_contexts(
         plan, handoff_execution_disposition="requires-child-planning"
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -693,12 +695,12 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
             normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57
         ),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     assert execution_policy._preflight_fresh_staged_topology(
@@ -737,12 +739,12 @@ def test_legacy_ambiguous_child_workflow_plans_unless_legacy_handoff_exists(
     child, parent = fresh_child_contexts(plan)
     if not with_legacy_handoff:
         parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     dispatched = []
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
-    patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: dispatched.append(kwargs) or 0,
     )
     runner = FakeRunner()
@@ -839,7 +841,7 @@ def test_m780_12_generated_child_dispatch_enforces_owned_rows_and_keeps_later_ro
     child, parent = fresh_child_contexts(
         plan, inherited_matrix_row_ids=("row-stage-one",)
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -896,7 +898,7 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
         comments=(comment(plan_record(child_plan)), comment(child_handoff)),
     )
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -978,7 +980,7 @@ def test_rerun_preflight_reconciles_a_published_shortened_retained_excerpt(
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1032,7 +1034,7 @@ def test_rerun_preflight_still_rejects_a_foreign_retained_excerpt(tmp_path, monk
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1089,7 +1091,7 @@ def test_rerun_preflight_rejects_an_appended_retained_excerpt(tmp_path, monkeypa
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1137,7 +1139,7 @@ def managed_ci_resume(
         fetched.append(issue_number)
         return child if issue_number == child.number else parent
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", fake_get_issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context", fake_get_issue_context)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *_a, **_k: None)
     monkeypatch.setattr(
         pr_loop,
@@ -1256,7 +1258,7 @@ def test_staged_child_pr_audits_divergent_parent_plan_seat_board(
             )),
         ))
         child = dataclasses.replace(child, comments=(comment(child_record),) + child.comments)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
@@ -1716,7 +1718,7 @@ def _capture_child_planning_config(tmp_path, monkeypatch, capsys, **config_overr
     )
     captured = {}
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: IssueContext(
             number=issue_number, repo="OWNER/REPO", title="Child",
             body="Child", url="child-url", comments=(),
@@ -1729,9 +1731,9 @@ def _capture_child_planning_config(tmp_path, monkeypatch, capsys, **config_overr
 
     patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_run_plan_first_loop", fake_plan_first_loop)
 
-    assert _m1278_plan_loop._run_child_planning_cycle(
+    assert plan_execution._run_child_planning_cycle(
         FakeRunner(),
-        config=parent_config,
+        run_plan_first_loop=_m1278_plan_loop._run_plan_first_loop, config=parent_config,
         memory=None,
         usage_context=validated_agent._new_usage_context(parent_config),
         parent_issue=55,
@@ -2628,7 +2630,7 @@ def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_tu
         claude_outputs=[weak, _child_plan_state(_child_row())],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda r, *, config, issue_number: IssueContext(
             number=56, repo="OWNER/REPO", title="Child", body="Child", url="child-url",
             comments=(IssueComment(
@@ -2771,7 +2773,7 @@ def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
         handoff_execution_disposition="requires-child-planning",
     )
     child = dataclasses.replace(child, comments=())
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     # Direct child `--plan-first` entry.
@@ -2784,8 +2786,8 @@ def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
     )
     assert fresh_child is not None and fresh_child.route.is_planning
     config = make_config(tmp_path)
-    assert _m1278_plan_loop._dispatch_decomposition_child(
-        FakeRunner(), config=config, memory=None,
+    assert plan_execution._dispatch_decomposition_child(
+        FakeRunner(), run_plan_first_loop=_m1278_plan_loop._run_plan_first_loop, config=config, memory=None,
         usage_context=validated_agent._new_usage_context(config),
         parent_issue=55, approved_plan=fresh_child.approved_plan,
         plan_hash=fresh_child.plan_hash, plan_subject=fresh_child.plan_subject,
@@ -2832,7 +2834,7 @@ def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
         inherited_matrix_row_ids=("row-stage-one",), child_plan=child_plan,
     )
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -2970,7 +2972,7 @@ class _M936World:
         if signed:
             self.comments.append(comment(self.signed_record()))
         self.runner = None
-        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", self._issue_context)
+        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context", self._issue_context)
 
         def forbid_repair(*args, **kwargs):
             raise AssertionError("the repair model must never see an inherited-row rejection")
@@ -4243,7 +4245,7 @@ def test_m985_record_posted_during_default_policy_review_blocks_approval(tmp_pat
             return dataclasses.replace(context, comments=(*context.comments, record))
         return context
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context", issue_context)
     config = world.config()
     assert not config.auto_merge
     with pytest.raises(AgentLoopError) as excinfo:
@@ -4613,7 +4615,7 @@ def test_m1068_supersession_posted_during_review_stops_before_an_evidence_freeze
             return dataclasses.replace(context, comments=(*context.comments, record))
         return context
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context", issue_context)
     review = {
         "schema_version": 1, "kind": "pr_review", "state": "approved",
         "summary": "Code is complete.", "blocking_items": [], "same_pr_followups": [],
@@ -4706,7 +4708,7 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
     runner, plan, parent, normalized, retained, created = _long_title_rerun_1207(
         tmp_path, bodyless_search=bodyless_search
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
 
     result = execution_policy._preflight_fresh_staged_topology(
@@ -4726,7 +4728,7 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
 
 from unittest.mock import patch as _m1278_patch  # noqa: E402
 
-from coding_review_agent_loop import plan_first_loop as _m1278_plan_loop  # noqa: E402
+import coding_review_agent_loop.plan_first_loop as _m1278_plan_loop  # noqa: E402
 from coding_review_agent_loop.review_step_back import (  # noqa: E402
     derive_plan_step_back_state as _m1278_derive,
 )
@@ -4779,9 +4781,7 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     assert _m1278_derive(list(records), primary=primary).episode is None
 
     patch_text = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
-    with _m1278_patch.object(
-        _m1278_plan_loop, "log", wraps=_m1278_plan_loop.log
-    ) as logged:
+    with patch_object_in((_m1278_plan_loop, plan_execution), "log", wraps=_m1278_plan_loop.log) as logged:
         # Only the supersession revision matters here; the later board turns may
         # exhaust the scripted outputs.
         try:
@@ -4819,7 +4819,7 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     child, parent = fresh_child_contexts(
         parent_plan, handoff_execution_disposition="requires-child-planning", child_plan=child_plan,
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     blocking = structured_pr_review(
@@ -5316,7 +5316,7 @@ def test_m1390_edited_child_under_signed_supersession_keeps_its_plan_in_prefligh
     monkeypatch.setattr(plan_issue_scope_module, "plan_scope_decision", spy)
     monkeypatch.setattr(plan_first_loop_module, "plan_scope_decision", spy)
     patch_text = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
-    with patch.object(plan_first_loop_module, "log", wraps=plan_first_loop_module.log) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         assert world.run_issue(
             # The board floor is enabled, so the entry preflight decides too.
             config=world.config(plan_resume_keep_on_issue_edit=False, min_reviewers=1),

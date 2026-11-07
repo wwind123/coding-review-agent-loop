@@ -1,5 +1,6 @@
 """Execution-policy tests: execution-policy resolution and collection extraction (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from dataclasses import replace
 
@@ -394,14 +395,14 @@ def test_parent_implement_by_phase_path_keeps_resume_hint(tmp_path, monkeypatch,
     install(monkeypatch, scenario)
     fresh = scenario.fresh()
     monkeypatch.setattr(
-        plan_first_loop_module, "find_existing_phase_implementation_handoff",
+        plan_execution, "find_existing_phase_implementation_handoff",
         lambda *_a, **_k: handoff_for("s1"),
     )
     outcome = execution_policy.staged_outcome_from_summary(
         summary_for(phases), mode="implement-by-phase"
     )
-    result = plan_first_loop_module._dispatch_current_decomposition_phase(
-        _FakeRunnerForParent(), config=make_config(tmp_path), memory=None,
+    result = plan_execution._dispatch_current_decomposition_phase(
+        _FakeRunnerForParent(), run_plan_first_loop=plan_first_loop_module._run_plan_first_loop, config=make_config(tmp_path), memory=None,
         usage_context=_NS(), issue_number=55, current_plan="Approved parent plan",
         plan_subject="plan-subject", outcome=outcome,
         recommendation=fresh.recommendation, approved_plan_context=fresh.parent_plan_context,

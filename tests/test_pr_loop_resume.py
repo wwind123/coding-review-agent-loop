@@ -284,10 +284,7 @@ def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
             raise CoderInterrupted
         return original(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", interrupt_during_coder)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", interrupt_during_coder)
     with pytest.raises(CoderInterrupted):
         run_pr_loop(runner, pr_number=77, config=config)
 

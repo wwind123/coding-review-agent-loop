@@ -121,10 +121,12 @@ def test_child_planning_inherits_the_budget_only_when_staged(tmp_path):
 
 def test_approved_all_reviewers_board_switch_resets_and_restores_the_budget(tmp_path):
     """`flag-validation-inheritance`: the approved-plan board copy boundary (#1377)."""
-    from coding_review_agent_loop.plan_first_loop import (
+    from coding_review_agent_loop.plan_execution import (
         _PLAN_BOARD_CONFIG_FIELDS,
-        _approving_plan_board_config,
         _restore_invocation_board,
+    )
+    from coding_review_agent_loop.plan_first_loop import (
+        _approving_plan_board_config,
     )
 
     assert "plan_provenance_baseline_max_chars" in _PLAN_BOARD_CONFIG_FIELDS

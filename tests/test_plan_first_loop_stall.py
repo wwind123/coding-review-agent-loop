@@ -1,5 +1,6 @@
 """Plan-first loop tests: primary-phase stall stop and streak retirement (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import hashlib
 import json
 import re
@@ -209,7 +210,7 @@ def test_primary_stall_stop_is_suppressed_across_degraded_history(tmp_path):
     # The degraded round's ledger carries no prior item to disposition.
     codex, claude, _base = _m1103_blocking_chain(3, 4, base=base, resolve_first=False)
     rerun = _FakeRunner(issue_comments=history, codex_outputs=codex, claude_outputs=claude)
-    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log",
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, plan_execution), "log",
         wraps=agent_failure.log,
     ) as logged:
         with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
@@ -366,7 +367,7 @@ def test_growth_gated_primary_approval_resets_the_stall_streak(tmp_path):
         # An active step-back episode would defer the stall stop (#1275).
         plan_step_back_rounds=0,
     )
-    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log", wraps=agent_failure.log) as logged:
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, plan_execution), "log", wraps=agent_failure.log) as logged:
         with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
 

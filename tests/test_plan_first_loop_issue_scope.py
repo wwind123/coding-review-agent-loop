@@ -1,5 +1,6 @@
 """Plan-first loop tests: edited-issue planning scope (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -130,9 +131,7 @@ def _m1390_history(tmp_path, *, rounds=3, config=None):
 
 def _m1390_rerun(tmp_path, history, *, config=None, **runner_kwargs):
     runner = _m1390_runner(history, **runner_kwargs)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         try:
             result = run_issue_loop(
                 runner, issue_number=56,

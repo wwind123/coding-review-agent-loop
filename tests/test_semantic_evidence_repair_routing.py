@@ -7,6 +7,7 @@ terminal failure must name the validation rejection rather than a repair
 timeout. Envelope-shaped defects on the same kind still route to repair.
 """
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from unittest.mock import patch
 
@@ -119,7 +120,7 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     result = AgentResult(text=response_text, returncode=0)
     logged: list[str] = []
-    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text)))
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda config, text, *a, **k: logged.append(str(text)))
 
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
         with pytest.raises(AgentInvocationError) as excinfo:
@@ -471,7 +472,7 @@ def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config
     config = make_config(tmp_path, agent_max_retries=retries, **config_overrides)
     logged: list[str] = []
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=list(results)) as invoke:
-        with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text))
+        with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda config, text, *a, **k: logged.append(str(text))
         ):
             try:
                 response = _run_validated_agent(
@@ -748,7 +749,7 @@ def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tm
     catalog = _unverified_suite_catalog()
     text = _followup_with_claim()
     logged: list[str] = []
-    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text)))
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda config, text, *a, **k: logged.append(str(text)))
 
     def validate(candidate):
         return validate_structured_coder_followup(
