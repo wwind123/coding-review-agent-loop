@@ -361,6 +361,7 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
             "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
             surfaces=frozenset({PR_COMMENT_SURFACE}),
         ),
+        _b64_definition("AGENT_MANAGED_CI_SOURCE_CONTINUITY_V1", surfaces=frozenset({PR_COMMENT_SURFACE})),
         # Orchestrator-only PR reviewer-board change link (#1376).  Agent text
         # naming it is neutralized; only the orchestrator's record path writes it.
         _b64_definition("AGENT_PR_BOARD_CHANGE", surfaces=frozenset({PR_COMMENT_SURFACE})),

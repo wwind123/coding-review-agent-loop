@@ -6,6 +6,10 @@ import base64
 import json
 import secrets
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .managed_ci_source_authorization import SourceAuthority
 from dataclasses import dataclass, replace
 from urllib.parse import quote
 
@@ -40,6 +44,7 @@ class ManagedPrHandoff:
     source_sha: str
     managed_branch: str
     source_branch: str | None = None
+    source_authority: SourceAuthority | None = None
 
 
 def _api(
@@ -153,7 +158,7 @@ def _managed_pr_override_nonce(carrier: TrustedBody) -> str | None:
     return None if record is None else record.nonce
 
 
-def recover_managed_pr_origin(
+def _recover_managed_pr_origin(
     body: str,
     *,
     fetched_head_branch: str | None,
@@ -186,6 +191,21 @@ def recover_managed_pr_origin(
         fetched_head_branch,
         _managed_pr_override_nonce(carrier),
     )
+
+
+def recover_managed_pr_origin(body: str, *, fetched_head_branch: str | None,
+                              config: AgentLoopConfig | None = None, pr_number: int | None = None):
+    """Recover candidates with actionable diagnostics at the PR-loop boundary."""
+    try:
+        candidate = _recover_managed_pr_origin(body, fetched_head_branch=fetched_head_branch)
+        if candidate is None and config is not None and config.effective_managed_ci and (fetched_head_branch or "").startswith("agent-loop/managed-direct-"):
+            raise AgentLoopError("Source-managed body provenance is missing.")
+        return candidate
+    except AgentLoopError as exc:
+        if config is None or pr_number is None:
+            raise
+        from .managed_ci_source_authorization import source_recovery_advice
+        raise AgentLoopError(str(exc) + " " + source_recovery_advice(config, pr_number)) from exc
 
 
 def validate_managed_pr_body(
@@ -347,6 +367,7 @@ def create_managed_pr(
             "agent-loop defect from bypassing the voluntary final-ci/exact-head gate.",
         )
 
+    source_authority = None
     pr_number: int | None = None
     ref_created = False
     try:
@@ -431,6 +452,13 @@ def create_managed_pr(
                 "Another PR was opened for the source commit during managed PR creation; "
                 "the partial managed draft was closed."
             )
+        if intent.audit_nonce is not None:
+            from .managed_ci_source_authorization import publish_source_creation_root
+            source_authority = publish_source_creation_root(
+                runner, config=config, pr_number=pr_number,
+                source=(source_branch, source_sha, managed_branch, intent.audit_nonce),
+                protection=intent.protection_mode,
+            )
     except Exception as exc:
         if ref_created:
             cleanup_failures = _close_partial_handoff(
@@ -460,4 +488,4 @@ def create_managed_pr(
         config,
         f"Created managed draft PR #{pr_number} from {source_branch}@{source_sha[:12]} via {managed_branch}",
     )
-    return ManagedPrHandoff(pr_number, correlated_config, source_sha, managed_branch, source_branch)
+    return ManagedPrHandoff(pr_number, correlated_config, source_sha, managed_branch, source_branch, source_authority)

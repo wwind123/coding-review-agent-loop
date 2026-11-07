@@ -1762,3 +1762,91 @@ def test_observation_stop_keeps_existing_origin_cleanup(tmp_path, monkeypatch, o
         else:
             assert 'Manual rewind invalidates managed continuity' in message
     assert len(initial_messages) == 1
+
+
+def test_source_creation_survives_real_issue_handoff_stop_then_fresh_pr_resume(tmp_path, monkeypatch):
+    """The creation transaction, early issue gate and fresh activation all run."""
+    from test_managed_ci_source_resume import SourceRunner, create, config, SHA
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+    runner = SourceRunner()
+    handoff = create(runner, tmp_path)
+    root_id = handoff.source_authority.root_id
+    runner.rest_pr["body"] = "Related: https://github.com/OWNER/REPO/issues/56\n\n" + runner.rest_pr["body"]
+    runner.issue_comments = [{"id": 600, "author": {"login": "agent-loop"},
+        "body": format_issue_pr_handoff_comment(issue_number=56, pr_number=66,
+            pr_url="https://github.com/OWNER/REPO/pull/66", pr_head_sha=SHA,
+            flow="approved-plan-implementation", plan_hash="approved-plan")}]
+    with pytest.raises(AgentLoopError, match="handoff selects PR #66"):
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path))
+    assert root_id in runner.audit_comments
+    assert len(runner.audit_comments) == 1
+    assert not any("DELETE" in cmd for cmd, _ in runner.commands)
+    # Correct only the unrelated association; do not insert any audit fixture.
+    runner.rest_pr["body"] = runner.rest_pr["body"].split("\n\n", 1)[1]
+    def stop_after_activation(*args, **kwargs):
+        raise AgentLoopError("review-entry checkpoint")
+    monkeypatch.setattr(pr_loop, "validate_open_pr", stop_after_activation)
+    with pytest.raises(AgentLoopError, match="review-entry checkpoint"):
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path))
+    assert len(runner.audit_comments) == 2
+    assert f"resume_from={root_id}" in max(runner.audit_comments.values(), key=lambda c: c["id"])["body"]
+    assert not any("DELETE" in cmd for cmd, _ in runner.commands)
+    assert runner.rest_pr["labels"] == [{"name": "agent-loop-managed"}]
+    assert runner.dispatch_count == 0
+
+
+@pytest.mark.parametrize("draft,labeled,state", [(False, True, "ready/labeled"),
+    (None, True, "unknown/labeled"), (None, False, "unknown/unlabeled")])
+def test_source_early_pr_loop_lifecycle_refusal_is_actionable_and_read_only(tmp_path, draft, labeled, state):
+    from test_managed_ci_source_resume import SourceRunner, root, config
+    runner = SourceRunner()
+    root(runner, tmp_path)
+    runner.rest_pr.update(draft=draft, labels=[{"name": "agent-loop-managed"}] if labeled else [])
+    runner.commands.clear()
+    with pytest.raises(AgentLoopError) as error:
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path))
+    assert state in str(error.value)
+    assert ("successful fresh" in str(error.value) if draft is None else "restore draft/labeled" in str(error.value))
+    assert "agent-loop pr 7" not in str(error.value)
+    assert not any("POST" in cmd or "DELETE" in cmd or cmd[:3] == ["gh", "pr", "ready"] for cmd, _ in runner.commands)
+    assert runner.dispatch_count == 0
+
+
+def test_source_accepted_coder_round_publishes_real_continuity_before_stop(tmp_path, monkeypatch):
+    from test_managed_ci_source_resume import SourceRunner, root, config, activate, SHA
+    runner = SourceRunner(
+        codex_outputs=[structured_pr_review(state="blocking", summary="Fix required.",
+            blocking_items=["Correct the source resume check at src/guard.py:12."])],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    authority = root(runner, tmp_path)
+    original_checkpoint = pr_loop._pr_step_back_approach_alternative_stop
+    def checkpoint(*args, **kwargs):
+        if runner.rest_pr["head"]["sha"] != SHA:
+            raise AgentLoopError("post-coder-checkpoint")
+        return original_checkpoint(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, "_pr_step_back_approach_alternative_stop", checkpoint)
+    with pytest.raises(AgentLoopError, match="post-coder-checkpoint"):
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path, max_rounds=2))
+    successor = runner.rest_pr["head"]["sha"]
+    assert successor != SHA
+    from coding_review_agent_loop.managed_ci_source_authorization import authenticate_source_authority
+    recovered = authenticate_source_authority(runner, config=config(tmp_path), pr_number=7, expected_head=successor)
+    assert recovered.root_id == authority.root_id and recovered.terminal_id != authority.root_id
+    assert activate(runner, tmp_path).origin == "source-managed"
+    assert runner.dispatch_count == 0
+    assert not any("DELETE" in cmd for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("body", ["missing source record", "<!-- AGENT_MANAGED_PR_SOURCE_V1 broken -->"])
+def test_source_early_body_refusal_supplies_conditional_ordinary_recovery(tmp_path, body):
+    from test_managed_ci_source_resume import SourceRunner, root, config
+    runner = SourceRunner()
+    root(runner, tmp_path)
+    runner.rest_pr["body"] = body
+    runner.commands.clear()
+    with pytest.raises(AgentLoopError) as error:
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path))
+    assert "fresh PR state read" in str(error.value)
+    assert "--managed-ci --" not in str(error.value)
+    assert not any("POST" in cmd or "DELETE" in cmd for cmd, _ in runner.commands)

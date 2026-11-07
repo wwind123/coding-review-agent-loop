@@ -4414,17 +4414,17 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
 def test_source_managed_override_accepts_only_its_source_marker(tmp_path):
     from coding_review_agent_loop.managed_pr import _compose_body
 
-    nonce = "nonce-from-preflight"
+    from test_managed_ci_source_resume import SourceRunner, root, SHA
+    nonce = "opening-nonce"
     body = str(_compose_body(
         "## Summary\n\nPrepared change.",
-        source_branch="fix/prepared-change",
-        source_sha="a" * 40,
+        source_branch="fix/source",
+        source_sha=SHA,
         override_nonce=nonce,
     ))
-    source_runner = V2ManagedRunner(
-        workflow=SUPPRESSING_V2_WORKFLOW,
-        rest_pr={"body": body},
-    )
+    source_runner = SourceRunner(rest_pr={"body": body})
+    source_runner.rest_pr["body"] = body
+    root(source_runner, tmp_path)
     source_config = replace(
         make_config(
             tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
@@ -4438,7 +4438,8 @@ def test_source_managed_override_accepts_only_its_source_marker(tmp_path):
         source_runner, config=source_config, pr_number=7, metadata=metadata()
     )
     assert contract is not None
-    assert contract.audit_nonce == nonce
+    assert contract.audit_nonce != nonce
+    assert contract.origin == "source-managed"
 
     issue_runner = V2ManagedRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,

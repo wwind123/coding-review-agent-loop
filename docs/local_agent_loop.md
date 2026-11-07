@@ -7664,7 +7664,10 @@ agent-loop managed-pr \
 The command resolves the exact SHA of `--head`, rejects a source SHA that
 already has an open PR, and runs managed-CI readiness before creating anything.
 It then creates a unique `agent-loop/managed-direct-*` alias at that SHA, opens
-a draft, applies `agent-loop-managed`, and enters the ordinary PR review loop.
+a draft, applies `agent-loop-managed`, and publishes and reads back its creation
+override audit on a waived base before entering the PR review loop. Failure
+to publish or verify this authority closes the partial draft and removes its
+reserved alias; incomplete cleanup is reported explicitly.
 Use `--managed-ci` to leave a successfully qualified PR ready for the printed
 head-guarded manual merge, or replace it with `--auto-merge` to merge the
 qualified head automatically.
@@ -7676,10 +7679,42 @@ never changed or deleted.
 otherwise empty body with only the hidden source audit marker. On a repository
 whose preflight reports `override_eligible`, add
 `--allow-unprotected-managed-ci` to this invocation. Its nonce is embedded in
-the newly created body and correlated in memory exactly like issue-created v2.
+the newly created body and bound to the actor-authored creation audit. First
+activation reuses that root; it does not publish a competing creation root.
 The waiver is safe only under the same single-operator constraints documented
 above. `managed-pr` never adopts an already-open PR and does not weaken the
 strict-only `--managed-ci-adopt-existing-pr` path.
+
+A later process can resume a source-managed PR directly:
+
+```bash
+agent-loop pr N --repo OWNER/REPO --base main --managed-ci \
+  --managed-ci-trusted-actor LOGIN --allow-unprotected-managed-ci
+```
+
+Supply the currently applicable waiver on every invocation; unreadable
+protection requires its separate waiver. Resume authenticates the same-repository
+managed-direct alias, trusted PR author and active label owner, source record,
+opening nonce and verified creation audit. The original source branch's current
+tip is not authority. At a later coder head, every accepted transition must have
+an actor-owned continuity audit linked to authenticated blocking-review/coder
+round metadata, or an eligible conflict/CI obligation, in one gap-free chain.
+Every restart creates a fresh resume nonce and intent generation. Explicit
+managed re-entry from an unlabeled state authenticates provenance before
+changing draft or label state. Ready/labeled mixed states require operator
+restoration to draft/labeled; unknown states require a successful fresh read
+before choosing recovery. Refusal itself makes no lifecycle writes.
+
+Historical drafts without a verified creation audit, including drafts interrupted
+before publication in older releases, cannot acquire authority from their editable
+bodies. Advanced heads without continuity also refuse. Correct unrelated issue
+association or body blockers, verify the managed label is absent (respecting
+label ownership), and verify an available unlabeled workflow route. Restore that
+route if necessary and explicitly ready the draft if ordinary CI requires it.
+Then run ordinary review with `agent-loop pr N --repo OWNER/REPO`, omitting
+managed-CI, waiver, fresh-authorization, adoption and auto-merge options. A label
+DELETE acknowledgement alone does not establish that CI resumed. Issue-created
+fresh grants and strict-only adoption do not repair source-managed provenance.
 
 #### Optional adoption of an existing PR
 

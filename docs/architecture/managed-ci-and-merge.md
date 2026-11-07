@@ -608,6 +608,46 @@ attempts a merge. Open and closed-unmerged inputs and execution options are
 rejected. Dry-run writes nothing. Closed trackers retain their obligations and
 produce diagnostics, with publication attempted where possible.
 
+### Source-managed creation and restart authority
+
+`managed_ci_source_authorization.py` owns source-managed creation-root verification
+and round-backed head continuity. It depends on shared managed types, API and
+protection helpers, and substantive round authentication in the issue authorizer;
+it does not import the activation driver. `managed_pr.py` publishes and reads back
+the override audit inside its creation transaction before returning a handoff.
+Final checks bind repository, actor login/numeric identity, base, draft, managed-direct
+alias, exact source SHA, source record, nonce, current protection and owned active
+label event. Publication failure uses the partial-draft/ref cleanup path.
+
+PR-mode activation independently reads persisted facts. Editable body records
+nominate a source identity, while actor-owned creation comments establish authority.
+The compatible original-head audit format remains readable; new roots additionally
+bind the opening source branch and alias. Equivalent creation retries reuse their
+root; conflicting roots and audit-less historical drafts fail closed. Resume audits
+reference the original chain and mint a fresh nonce and intent generation rather
+than treating the latest comment or source branch tip as authority.
+
+Accepted source-managed coder rounds publish versioned continuity audit records
+after round metadata and before checkpoints or stops. Each binds its root, complete
+source/PR/actor/protection/label scope, predecessor comment/head, successor head and
+round comment identities. Restart requires a unique gap-free chain and reauthenticates
+ordered blocking-review/coder records or eligible conflict/CI obligations using the
+same correlation as issue-created continuity, without manufacturing an issue identity.
+Ancestry, commit authorship, missing rounds and rejected coder responses supply no
+authority. Re-entry authenticates before draft/label writes and final activation
+rereads the tuple, body, active label and provenance before its audit write.
+
+Source-managed refusal reports use measured lifecycle state and conditional recovery
+prerequisites, preserving foreign/replaced-label ownership. Unknown state requires a
+fresh successful read; ready/labeled needs operator correction to draft/labeled with
+verified authority and applicable waivers. Missing authority requires conditional
+ordinary recovery: resolve unrelated blockers, verify label absence and an unlabeled
+workflow route, restore the route or ready the draft if needed, then ordinary review
+without managed or auto-merge options. No unchanged failing managed command is
+advertised as a provenance repair. Issue-created authorization, strict adoption and
+exact-head qualification retain their existing contracts.
+
+
 ## Decisions
 
 [Decision log](decisions/managed-ci-and-merge.md)

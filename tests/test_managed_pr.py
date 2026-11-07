@@ -18,6 +18,7 @@ from coding_review_agent_loop.managed_pr import (
 from coding_review_agent_loop.runner import CommandResult, Runner
 
 from agent_loop_helpers import make_config
+from test_managed_ci_source_resume import SourceRunner
 
 
 class ManagedPrRunner(Runner):
@@ -39,13 +40,16 @@ class ManagedPrRunner(Runner):
         self.pull_reads = 0
         self.calls: list[tuple[list[str], str | None]] = []
         self.branch_reads = 0
+        self.provenance = SourceRunner(actor_login="wwind123")
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(item) for item in args]
         self.calls.append((cmd, input_text))
         if "--method" not in cmd:
-            assert cmd[-1] == "repos/OWNER/REPO/labels/agent-loop-managed"
-            return CommandResult(cmd, Path(cwd), "{}", "", 0 if self.label_exists else 1)
+            if cmd[-1] == "repos/OWNER/REPO/labels/agent-loop-managed":
+                return CommandResult(cmd, Path(cwd), "{}", "", 0 if self.label_exists else 1)
+            translated = [part.replace("/pulls/77", "/pulls/7").replace("/issues/77/", "/issues/7/") for part in cmd]
+            return self.provenance.run(translated, cwd=cwd, input_text=input_text, check=check, env=env)
         method = cmd[cmd.index("--method") + 1]
         endpoint = cmd[cmd.index("--method") + 2]
         payload: object = {}
@@ -62,10 +66,16 @@ class ManagedPrRunner(Runner):
                 else self.existing_pulls
             )
         elif method == "POST" and endpoint.endswith("/pulls"):
+            created = json.loads(input_text)
+            self.provenance.rest_pr.update(body=created["body"], draft=True)
+            self.provenance.rest_pr["head"].update(ref=created["head"], sha="a" * 40)
             payload = {"number": 77}
         elif method == "POST" and endpoint.endswith("/labels") and self.label_failure:
             returncode = 1
             stderr = "label failed"
+        elif "/comments" in endpoint:
+            translated = [part.replace("/issues/77/", "/issues/7/") for part in cmd]
+            return self.provenance.run(translated, cwd=cwd, input_text=input_text, check=check, env=env)
         elif self.cleanup_failure and method in {"PATCH", "DELETE"}:
             returncode = 1
             stderr = "cleanup failed"
@@ -85,7 +95,7 @@ def _intent(*args, branch, **kwargs):
     return ManagedCiCreationIntent(
         branch=branch,
         trusted_actor="wwind123",
-        protection_mode="plan_limited",
+        protection_mode="voluntary",
         audit_nonce="fresh-nonce",
     )
 

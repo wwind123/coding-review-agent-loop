@@ -75,6 +75,7 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from .managed_ci_status import FINAL_CONTEXT
+from .managed_ci_source_authorization import authenticate_source_authority, source_recovery_advice
 from . import (
     managed_ci_api,
     managed_ci_authorization,
@@ -555,10 +556,9 @@ def authenticate_source_managed_resume(
 ) -> AuthenticatedManagedResume:
     """Authenticate the durable lifecycle of a recovered managed-pr origin."""
     pr = managed_ci_api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
-    labels = {
-        item.get("name") for item in (pr.get("labels") or [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
+    labels = _strict_label_names(pr)
+    if labels is None:
+        raise AgentLoopError(source_recovery_advice(config, pr_number, state="unknown/unknown"))
     if pr.get("draft") is True and MANAGED_LABEL in labels:
         lifecycle: Literal[
             "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
@@ -575,11 +575,10 @@ def authenticate_source_managed_resume(
             state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
         else:
             state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
-        command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
         raise AgentLoopError(
             f"Managed source PR #{pr_number} observed mixed lifecycle state {state}; "
-            f"expected draft/labeled, draft/unlabeled with explicit managed CI, or authenticated "
-            f"ready/unlabeled. The PR was left unchanged. Resume with `{command}`."
+            "the PR was left unchanged. "
+            + source_recovery_advice(config, pr_number, state=state, lifecycle=True)
         )
     return AuthenticatedManagedResume(
         origin="source-managed",
@@ -771,6 +770,7 @@ class _FailedActivationContext:
     # unlabeled recovery route; it vetoes any automatic readiness write.
     recovery_incapable_fallback: bool = False
     resume_command: str | None = None
+    source_managed: bool = False
     report: str | None = None
 
     @property
@@ -861,6 +861,24 @@ def _report_failed_activation_state(
     write.
     """
     if context.report is not None:
+        return context.report
+    if context.source_managed:
+        measured = _read_failed_activation_state(runner, config, pr_number)
+        facts = []
+        for happened, description in (
+            (context.drafted_by_this_run, "ready-to-draft request acknowledged"),
+            (context.ready_undo_ambiguous, "ready-to-draft request not confirmed"),
+            (context.label_post_acknowledged, "label POST acknowledged"),
+            (context.label_post_ambiguous, "label POST not confirmed"),
+            (context.label_released, "label DELETE acknowledged"),
+            (context.label_release_attempted and not context.label_released, "label DELETE not confirmed"),
+        ):
+            if happened:
+                facts.append(description)
+        requests = (" Recorded requests: " + "; ".join(facts) + ".") if facts else ""
+        context.report = (f"Before activation: {context.entry.render()}." + requests + " "
+            + source_recovery_advice(config, pr_number, state=measured.render() if measured else "unknown",
+                lifecycle=not context.mutated and context.entry.draft is False and context.entry.labeled is True))
         return context.report
     try:
         text = _build_failed_activation_report(
@@ -1245,7 +1263,7 @@ def _failed_activation_guard(
     try:
         yield
     except Exception as exc:
-        if not context.mutated or getattr(exc, "_managed_state_reported", False):
+        if (not context.mutated and not context.source_managed) or getattr(exc, "_managed_state_reported", False):
             raise
         report = _report_failed_activation_state(
             runner, config=config, pr_number=pr_number, context=context
@@ -1411,6 +1429,12 @@ def _release_for_ordinary_recovery(
         if report_context is None:
             log(config, _measured_state_line(runner, config, pr_number))
         return None
+    if report_context is not None and report_context.source_managed and active_event is None:
+        raise AgentLoopError(reason + ". Label ownership requires a successful fresh timeline read; no label write was made.")
+    if report_context is not None and report_context.source_managed and active_event is not None:
+        who = managed_ci_api._api_json(runner, config, "user")
+        if active_event[1:] != (who.get("login"), who.get("id")):
+            raise AgentLoopError(reason + ". Foreign label left unchanged. " + source_recovery_advice(config, pr_number, state=report_context.entry.render()))
     prior_run_ids: set[int] = set()
     try:
         prior_run_ids = _workflow_run_ids(runner, config=config, head_sha=expected_head_sha)
@@ -1445,7 +1469,7 @@ def _release_for_ordinary_recovery(
         config,
         f"PR #{pr_number}: label DELETE acknowledged; ordinary unlabeled recovery selected ({reason})",
     )
-    if config.managed_ci:
+    if config.managed_ci or (report_context is not None and report_context.source_managed):
         fresh = None
         # With a known state, the fresh command must pass that state's own
         # waiver gate.  Before assessment, the fresh command re-runs its gate.
@@ -1478,6 +1502,8 @@ def _release_for_ordinary_recovery(
             "issue-created authorization grant was inferred for this failure."
             + (_missing_waiver_note(config, protection_state) if protection_state else "")
         )
+        if report_context is not None and report_context.source_managed:
+            remedy = source_recovery_advice(config, pr_number, state=report_context.entry.render())
         state = "" if report_context is not None else _measured_state_line(runner, config, pr_number) + " "
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
@@ -2134,6 +2160,8 @@ def _activate_v2_managed_ci(
     strict_labels = _strict_label_names(pr)
     entry = _PrStateSnapshot.from_payload(pr)
     if strict_labels is None or entry.draft is None:
+        if head_ref and head_ref.startswith("agent-loop/managed-direct-"):
+            raise AgentLoopError(source_recovery_advice(config, pr_number))
         raise AgentLoopError(
             f"PR #{pr_number} labels or draft state could not be read strictly; no label, draft, "
             "or readiness write was made."
@@ -2142,12 +2170,22 @@ def _activate_v2_managed_ci(
 
     # Every exit after this point that follows a PR mutation recorded on the
     # context carries one measured before/now report (#1067).
-    context = _FailedActivationContext(entry=entry, recovery_capable=ordinary_recovery_capable)
+    context = _FailedActivationContext(entry=entry, recovery_capable=ordinary_recovery_capable,
+        source_managed=bool(head_ref and head_ref.startswith("agent-loop/managed-direct-")))
     with _failed_activation_guard(runner, config=config, pr_number=pr_number, context=context):
         # Keep the low-level activation API safe for callers that enter through the
         # public PR mode without first calling the orchestration recovery helper.
         # The immutable tuple above is still authenticated before this lifecycle
         # is selected; the orchestrator supplies the richer resume record itself.
+        if managed_resume is None and config.managed_ci_pr_mode and context.source_managed:
+            from .managed_pr import recover_managed_pr_origin
+            candidate = recover_managed_pr_origin(pr.get("body") or "", fetched_head_branch=head_ref)
+            if candidate is None:
+                raise AgentLoopError("Source-managed body provenance is missing. " + source_recovery_advice(config, pr_number, state=entry.render()))
+            managed_resume = authenticate_source_managed_resume(
+                runner, config=config, pr_number=pr_number, source_branch=candidate[0],
+                source_sha=candidate[1], managed_branch=candidate[2], override_nonce=candidate[3],
+            )
         if managed_resume is None and config.managed_ci_pr_mode:
             if pr.get("draft") is False and MANAGED_LABEL not in labels:
                 lifecycle = "ready-unlabeled-reentry"
@@ -2170,6 +2208,7 @@ def _activate_v2_managed_ci(
             else resume_origin
             or ("source-managed" if config.pr_origin_flow == "managed-pr" else "issue-created")
         )
+        context.source_managed = origin == "source-managed" or context.source_managed
         lifecycle = managed_resume.lifecycle if managed_resume is not None else "draft-labeled"
         issue_hint = _issue_created_rendering_issue_number(
             managed_resume, origin=origin, head_ref=head_ref
@@ -2218,6 +2257,15 @@ def _activate_v2_managed_ci(
                 context=ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config)),
                 base=base_ref,
             )
+            if protection.state != "strict" and origin == "source-managed" and managed_resume is None:
+                from .managed_pr import recover_managed_pr_origin
+                candidate = recover_managed_pr_origin(pr.get("body") or "", fetched_head_branch=head_ref)
+                if candidate is None:
+                    raise AgentLoopError("Source-managed body provenance is missing. " + source_recovery_advice(config, pr_number, state=entry.render()))
+                managed_resume = authenticate_source_managed_resume(
+                    runner, config=config, pr_number=pr_number, source_branch=candidate[0],
+                    source_sha=candidate[1], managed_branch=candidate[2], override_nonce=candidate[3],
+                )
             if protection.state != "strict" and managed_resume is not None:
                 handoff = managed_resume.issue_created_handoff
                 if handoff is not None:
@@ -2262,8 +2310,26 @@ def _activate_v2_managed_ci(
                     if handoff is not None
                     else None
                 )
+                source_error = None
+                if origin == "source-managed":
+                    try:
+                        authority = authenticate_source_authority(
+                            runner, config=config, pr_number=pr_number, expected_head=live_sha,
+                            protection=protection.state,
+                            source=(managed_resume.source_branch, managed_resume.source_sha,
+                                    managed_resume.managed_branch, managed_resume.override_nonce),
+                        )
+                        protection = replace(protection, state=authority.protection)
+                        prior_audit = (authority.terminal_id, {"head": authority.head})
+                    except AgentLoopError as exc:
+                        source_error = str(exc)
+                        if MANAGED_LABEL in labels:
+                            current_event = managed_ci_api._active_managed_label_event(runner, config=config, pr_number=pr_number)
+                            if current_event != preflight_event:
+                                context.release_reason_kind = "event-changed"
+                                raise AgentLoopError(source_error + ". Label application changed; leaving it untouched.") from exc
                 if prior_audit is None:
-                    reason = "no fully bound actor-owned issue-created authorization reaches the live head"
+                    reason = source_error or "no fully bound actor-owned issue-created authorization reaches the live head"
                     if MANAGED_LABEL in labels:
                         existing_event = managed_ci_api._active_managed_label_event(
                             runner, config=config, pr_number=pr_number
@@ -2290,6 +2356,8 @@ def _activate_v2_managed_ci(
                             "Restore the source-managed authorization prerequisite; issue-created "
                             "fresh authorization cannot adopt this PR."
                         )
+                    if origin == "source-managed":
+                        remedy = source_recovery_advice(config, pr_number, state=entry.render())
                     raise AgentLoopError(
                         f"--managed-ci requested qualification, but activation failed ({reason}). "
                         f"PR #{pr_number} was left unchanged and this run did NOT qualify its head. "
@@ -2458,13 +2526,15 @@ def _activate_v2_managed_ci(
                 state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
             else:
                 state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
-            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+            command = (source_recovery_advice(config, pr_number, state=state, lifecycle=True)
+                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
             raise AgentLoopError(
                 f"Managed-CI {origin} draft re-entry for PR #{pr_number} observed {state}; "
                 f"the PR was left unchanged. Resume with `{command}` after restoring draft/unlabeled state."
             )
         elif lifecycle == "draft-unlabeled-reentry" and not config.managed_ci:
-            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+            command = ("supply explicit --managed-ci after confirming source authority and current waivers"
+                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
             raise AgentLoopError(
                 f"PR #{pr_number} is an authenticated managed {origin} draft/unlabeled re-entry. "
                 f"It was left unchanged; rerun with explicit `--managed-ci`: {command}"
@@ -2481,7 +2551,8 @@ def _activate_v2_managed_ci(
                 state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
             else:
                 state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
-            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+            command = (source_recovery_advice(config, pr_number, state=state, lifecycle=True)
+                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
             raise AgentLoopError(
                 f"Managed-CI {origin} resume for PR #{pr_number} observed {state}; "
                 f"expected draft/labeled, draft/unlabeled, or authenticated ready/unlabeled. "
@@ -2517,7 +2588,7 @@ def _activate_v2_managed_ci(
         # still identify this trusted actor. The old body nonce is provenance, not
         # authorization; this invocation mints a new nonce and intent generation.
         active_event: tuple[int, str, int] | None = None
-        if config.managed_ci_pr_mode or config.managed_ci:
+        if config.managed_ci_pr_mode or config.managed_ci or origin == "source-managed":
             active_event = managed_ci_api._active_managed_label_event(runner, config=config, pr_number=pr_number)
             if active_event is None:
                 recovery = _release_for_ordinary_recovery(
@@ -2643,6 +2714,9 @@ def _activate_v2_managed_ci(
             live_labels = _strict_label_names(live_pr)
             live_state = live_pr.get("state")
             live_repo = _str_field(live_pr, "head", "repo", "full_name")
+            if origin == "source-managed" and live_event != active_event:
+                context.release_reason_kind = "event-changed"
+                raise AgentLoopError("Source-managed label application changed before activation; label left untouched.")
             if (
                 not (live_state is None or (isinstance(live_state, str) and live_state in {"open", "OPEN"}))
                 or live_pr.get("draft") is not True
@@ -2669,6 +2743,13 @@ def _activate_v2_managed_ci(
                 )
                 return _ordinary_fallback_contract(runner, config=config, pr_number=pr_number, context=context, recovery=recovery)
             if protection.state != "strict":
+                if origin == "source-managed":
+                    authenticate_source_authority(
+                        runner, config=config, pr_number=pr_number, expected_head=live_sha,
+                        source=(managed_resume.source_branch, managed_resume.source_sha,
+                                managed_resume.managed_branch, managed_resume.override_nonce),
+                        protection=protection.state,
+                    )
                 override_nonce = secrets.token_urlsafe(24)
                 resume_label = protocol_record_label(
                     "managed_ci_resume_audit", pr_number=pr_number, head_sha=live_sha
