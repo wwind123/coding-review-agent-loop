@@ -7314,5 +7314,7 @@ def test_signed_source_classification_guidance_covers_ordinary_work(tmp_path, co
     assert "review does not acknowledge it as resolved" in prompt
     assert "including ordinary work with role\n`code`" in prompt
     assert "repeated omission stops the run before coder dispatch" in prompt
+    assert '`request` and\n`leftover_instructions` are strings (`""` when inapplicable)' in prompt
+    assert '`answered_item_ids`\nis a list (`[]` when inapplicable)' in prompt
     assert "optionally include `requirement_evidence`" not in prompt
     assert "when human-only\nevidence is involved" not in prompt

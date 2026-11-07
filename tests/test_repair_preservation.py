@@ -2999,3 +2999,73 @@ def test_excluded_future_1868_filtered_allowance_permits_claim_removal(required,
     source[note_field] = {**source.get(note_field, {}), "item-2": "Later work."}
     validate_repair_preservation(json.dumps(source), json.dumps(base),
                                  unresolved_item_ids=required, optional_item_ids=())
+
+
+# Empty text spellings are format equivalence only after semantic parsing (#1943).
+def _classification_repair_payload(entries):
+    return {"schema_version": 1, "kind": "pr_review", "state": "approved",
+            "summary": "Reviewed.", "blocking_items": [], "requirement_evidence": entries}
+
+
+def _repair_classifications(source, target):
+    # The source lacks the required review footer, an unrelated format defect.
+    raw = json.dumps(_classification_repair_payload(source))
+    repaired = json.dumps(_classification_repair_payload(target))
+    validate_repair_preservation(raw, repaired + "\n<!-- AGENT_STATE: approved -->\n-- Codex")
+
+
+@pytest.mark.parametrize("request_value", ["", [], None])
+@pytest.mark.parametrize("leftover", ["", [], None])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_repair_empty_text_equivalence(request_value, leftover, reverse):
+    from pr_loop_test_helpers import _association
+    canonical = [_association("source", "evidence-only", answers=["item-1"])]
+    variant = deepcopy(canonical)
+    variant[0].update(request=request_value, leftover_instructions=leftover)
+    source, target = (canonical, variant) if reverse else (variant, canonical)
+    before = deepcopy((source, target))
+    _repair_classifications(source, target)
+    assert (source, target) == before
+
+
+@pytest.mark.parametrize("change", ["role", "identity", "answers", "request", "leftover", "add", "remove", "order"])
+def test_repair_empty_text_cannot_change_classifications(change):
+    from pr_loop_test_helpers import _association
+    source = [_association("first", "evidence-only", answers=["item-1"]),
+              _association("second", "code")]
+    target = deepcopy(source)
+    if change == "role":
+        target[0].update(role="mixed", leftover_instructions="Fix retries.")
+    elif change == "identity":
+        target[0]["requirement_id"] = "other"
+    elif change == "answers":
+        target[0]["answered_item_ids"] = ["item-2"]
+    elif change == "request":
+        source[0] = _association("first", "human-only", request="Original request")
+        target[0] = {**source[0], "request": "Changed request"}
+    elif change == "leftover":
+        source[0].update(role="mixed", leftover_instructions="Original instructions")
+        target[0].update(role="mixed", leftover_instructions="Changed instructions")
+    elif change == "add":
+        target.append(_association("third", "code"))
+    elif change == "remove":
+        target.pop()
+    else:
+        target.reverse()
+    with pytest.raises(AgentLoopError, match="classification"):
+        _repair_classifications(source, target)
+
+
+@pytest.mark.parametrize("invalid_side", ["source", "target", "both"])
+def test_repair_empty_text_raw_fallback(invalid_side):
+    from pr_loop_test_helpers import _association
+    valid = [_association("source", "evidence-only", answers=["item-1"])]
+    invalid = deepcopy(valid)
+    invalid[0]["request"] = ["content"]
+    _repair_classifications(invalid, deepcopy(invalid))
+    source = invalid if invalid_side != "target" else valid
+    target = deepcopy(invalid) if invalid_side != "source" else valid
+    if invalid_side == "both":
+        target[0]["leftover_instructions"] = None
+    with pytest.raises(AgentLoopError, match="classification"):
+        _repair_classifications(source, target)

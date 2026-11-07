@@ -5,19 +5,33 @@ from .errors import AgentLoopError, MissingJudgementFieldError
 from .github import HumanReviewRequirement
 
 
+def normalize_empty_text(entry):
+    """Copy an association, canonicalizing only the two empty text spellings."""
+    result = dict(entry)
+    for field in ("request", "leftover_instructions"):
+        value = result[field]
+        if value is None or (type(value) is list and not value):
+            result[field] = ""
+    return result
+
+
 def parse_associations(value):
     if not isinstance(value, (list, tuple)):
         raise AgentLoopError("requirement_evidence must be an array")
     result = []
-    for entry in value:
+    for index, entry in enumerate(value):
         if not isinstance(entry, dict) or set(entry) != {
             "requirement_id", "role", "request", "answered_item_ids", "leftover_instructions"
         }:
-            raise AgentLoopError("requirement_evidence entries require source, role, request, answers and leftover instructions")
+            raise AgentLoopError("requirement_evidence entries require requirement_id, role, request, answered_item_ids and leftover_instructions")
         if not isinstance(entry["role"], str) or entry["role"] not in {"code", "human-only", "evidence-only", "mixed"}:
             raise AgentLoopError("Unknown requirement_evidence role")
-        if any(not isinstance(entry[k], str) for k in ("requirement_id", "request", "leftover_instructions")):
-            raise AgentLoopError("requirement_evidence source, request and instructions must be strings")
+        entry = normalize_empty_text(entry)
+        for field in ("requirement_id", "request", "leftover_instructions"):
+            if not isinstance(entry[field], str):
+                raise AgentLoopError(
+                    f"requirement_evidence[{index}].{field} must be a string "
+                    f"(got {type(entry[field]).__name__})")
         answers = entry["answered_item_ids"]
         if not isinstance(answers, list) or any(not isinstance(i, str) or not i for i in answers) or len(set(answers)) != len(answers):
             raise AgentLoopError("requirement_evidence answers must be distinct item IDs")
@@ -132,9 +146,9 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
         prompt = ("Continue the PR review with semantic signed-source classification. Return a complete "
             "structured pr_review and its normal footer. Preserve code findings. Classify every signed "
             "source in requirement_evidence using exactly requirement_id, role (code, human-only, "
-            "evidence-only, mixed), request (your exact emitted request for human-only, otherwise empty), "
-            "answered_item_ids (your own prior evidence items only, otherwise []), leftover_instructions "
-            "(explicit leftover code instructions for mixed, otherwise empty). Do not infer acceptance "
+            "evidence-only, mixed), request (a string: your exact emitted request for human-only, otherwise \"\"), "
+            "answered_item_ids (a list: your own prior evidence items only, otherwise []), leftover_instructions "
+            "(a string: explicit leftover code instructions for mixed, otherwise \"\"). Do not infer acceptance "
             "from a head mention. Only requester dispositions with evidence_requirement_ids attest adequacy. "
             "This is a real semantic reviewer turn; do not invent instructions.\nSigned sources: "
             + json.dumps(sources) + "\nPrior classifications to reconcile: " + repr(previous_entries) + "\nPrior items: " + repr(items) + "\nPrevious review:\n" + text)

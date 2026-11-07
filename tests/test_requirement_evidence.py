@@ -1,5 +1,6 @@
 """Signed requirement routing shape, ownership, replay and repair boundaries."""
 import dataclasses
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -120,6 +121,11 @@ def test_missing_classification_is_bounded_semantic_turn():
             reviewer_name="Codex", invoke=invoke)
     assert len(calls) == 1
     assert "real semantic reviewer turn" in calls[0]
+    assert 'request (a string:' in calls[0]
+    assert 'leftover_instructions (a string:' in calls[0]
+    assert 'otherwise ""' in calls[0]
+    assert 'answered_item_ids (a list:' in calls[0]
+    assert 'otherwise []' in calls[0]
 
 
 @pytest.mark.parametrize("field,value", [("role", "unknown"), ("role", []), ("answered_item_ids", ["item-1", "item-1"]),
@@ -170,3 +176,68 @@ def test_ordinary_code_requirement_classification_matches_prompt(acknowledged, c
     assert len(calls) == (0 if classified or acknowledged else 1)
     # Classification routes ordinary instructions to the coder without waiving them.
     assert project([SOURCE], {"Codex": parsed}, []) == (SOURCE,)
+
+
+@pytest.mark.parametrize("request_value", ["", [], None])
+@pytest.mark.parametrize("leftover", ["", [], None])
+def test_empty_text_live_review(request_value, leftover):
+    answers = ["item-8", "item-9", "item-11", "item-12", "item-13", "item-14"]
+    entry = _association(SOURCE.requirement_id, "evidence-only", answers=answers)
+    canonical = deepcopy(entry)
+    entry.update(request=request_value, leftover_instructions=leftover)
+    original = deepcopy(entry)
+    assert parse_associations([entry]) == (canonical,)
+    parsed = parse_structured_pr_review(_classified_review([entry]), reviewer="Codex",
+                                        architecture_status_mode="legacy")
+    assert parsed.state == "approved"
+    assert parsed.requirement_evidence == (canonical,)
+    assert entry == original
+
+
+@pytest.mark.parametrize("field", ["request", "leftover_instructions", "requirement_id"])
+@pytest.mark.parametrize("value", [["text"], 7, True, {}, ()])
+def test_text_type_errors_name_index_and_field(field, value):
+    first = _association("first", "code")
+    entry = _association("second", "code")
+    entry[field] = value
+    with pytest.raises(AgentLoopError) as error:
+        parse_associations([first, entry])
+    assert str(error.value) == (
+        f"requirement_evidence[1].{field} must be a string (got {type(value).__name__})")
+
+
+@pytest.mark.parametrize("value", [[], None])
+def test_identity_is_not_normalized(value):
+    entry = _association(value, "code")
+    with pytest.raises(AgentLoopError, match=r"requirement_evidence\[0\].requirement_id must be a string"):
+        parse_associations([entry])
+
+
+@pytest.mark.parametrize("value", [[], None])
+@pytest.mark.parametrize("role,field,message", [
+    ("human-only", "request", "Human-only requirements"),
+    ("mixed", "leftover_instructions", "Only mixed sources")])
+def test_normalized_empty_text_retains_required_content(role, field, message, value):
+    entry = _association("source", role, answers=["item-1"] if role == "mixed" else [])
+    entry[field] = value
+    with pytest.raises(AgentLoopError, match=message):
+        parse_associations([entry])
+
+
+@pytest.mark.parametrize("request_value", ["", [], None])
+@pytest.mark.parametrize("leftover", ["", [], None])
+def test_empty_text_metadata_replay(request_value, leftover):
+    items, entry, _, _ = setup_role("evidence-only")
+    canonical = deepcopy(entry)
+    entry.update(request=request_value, leftover_instructions=leftover)
+    original = deepcopy(entry)
+    meta = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=1,
+        subject="a" * 40, prior_items=tuple(items), requirement_evidence=(entry,))
+    decoded = _decode_round_metadata(_encode_round_metadata(meta))
+    assert decoded.requirement_evidence == (canonical,)
+    again = _decode_round_metadata(_encode_round_metadata(decoded))
+    assert again.requirement_evidence == decoded.requirement_evidence
+    assert historical_projection([SOURCE], [SimpleNamespace(metadata=again)]) == ()
+    foreign = dataclasses.replace(again, prior_items=(dataclasses.replace(items[0], reviewer="Gemini"),))
+    assert historical_projection([SOURCE], [SimpleNamespace(metadata=foreign)]) == (SOURCE,)
+    assert entry == original

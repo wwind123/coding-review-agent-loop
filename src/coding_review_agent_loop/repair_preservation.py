@@ -1673,7 +1673,20 @@ def validate_repair_preservation(
     # repair resolves that overlap by keeping the typed request: the finding
     # copy may be dropped only when the request itself was preserved.
     if source["kind"] == "pr_review":
-        require(source.get("requirement_evidence", []) == target.get("requirement_evidence", []),
+        from .requirement_evidence import normalize_empty_text, parse_associations
+        original = source.get("requirement_evidence", [])
+        repaired = target.get("requirement_evidence", [])
+        equivalent = original == repaired
+        try:
+            parse_associations(original)
+            parse_associations(repaired)
+        except AgentLoopError:
+            pass  # Malformed classifications retain the original raw comparison.
+        else:
+            equivalent = type(original) is type(repaired) and (
+                [normalize_empty_text(entry) for entry in original]
+                == [normalize_empty_text(entry) for entry in repaired])
+        require(equivalent,
                 "requirement_evidence semantic classification cannot change during repair")
     moved_to_evidence: set[str] = set()
     if source["kind"] == "pr_review" and isinstance(
