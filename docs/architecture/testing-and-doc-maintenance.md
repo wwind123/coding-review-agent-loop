@@ -2,7 +2,7 @@
 
 How the test suite exercises the orchestrator, when the architecture set must change, how architecture context is injected, and how semantic-claim validation degrades the narrowest offending element: architecture-impact parser modes and canonicalization, the reviewer status re-ask, `test_observations` citation degradation, and the `protocol.py` shape-check audit.
 
-Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/protocol_risk.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
+Source paths: `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/prompt_support.py`, `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/protocol_risk.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
 
 ## Tests and Document Maintenance
 
@@ -16,6 +16,15 @@ boundaries, or execution topology, update the architecture set and the affected 
 guide in the same PR. An internal refactor or ordinary bug fix need not change
 the document if those contracts stay the same. Keep diagrams textual and paths
 relative; avoid copying volatile CLI defaults or protocol schemas here.
+
+`prompt_support.py` owns shared prompt context dataclasses and reusable architecture,
+memory, runtime/test, workdir, human-requirement and reviewer guidance. Role-specific
+builders in `prompts.py` call this owner directly, so post-import patches intercept
+shared helper calls without compatibility exports. The symbol manifest and unchanged
+body digests live in `tests/fixtures/prompt_support_move.json`;
+`tests/test_module_split_imports.py` audits old imports, aliases, annotations,
+patch targets, unused builder imports, fresh import orders and shared patch coverage.
+The owner/path inventory is in `docs/prompt_support_ownership.md`.
 
 Architecture-context injection is bounded and advisory on the supported prompt
 paths, and fresh turns with an acquired architecture snapshot use the versioned

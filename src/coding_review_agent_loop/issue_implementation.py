@@ -89,6 +89,8 @@ from .managed_ci_recovery_commands import (
 from .prompts import (
     build_issue_implementation_prompt,
     build_plan_decomposition_prompt,
+)
+from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol import (

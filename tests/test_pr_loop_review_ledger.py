@@ -19,7 +19,7 @@ from coding_review_agent_loop.round_state import (
     _decode_round_metadata,
     _strip_round_metadata,
 )
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.prompt_support import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
 )
 from coding_review_agent_loop.review_scheduling import TransitionClassification

@@ -1475,7 +1475,10 @@ FIXTURE_HEADING_TEXT = "Multi-process fixtures (`run-tests --fixture`)"
 
 
 def test_fixture_hook_contract_is_documented_and_linked():
-    from coding_review_agent_loop.prompts import FIXTURE_CODER_GUIDANCE, _coder_test_reporting_guidance
+    from coding_review_agent_loop.prompt_support import (
+        FIXTURE_CODER_GUIDANCE,
+        _coder_test_reporting_guidance,
+    )
 
     doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"#### {FIXTURE_HEADING_TEXT}\n" in doc

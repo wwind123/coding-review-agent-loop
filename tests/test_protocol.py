@@ -308,8 +308,10 @@ from coding_review_agent_loop.discuss_loop import _detect_discuss_consensus
 from coding_review_agent_loop.agent_failure import _decode_public_response_json_prefix, _failure_category, _is_transient_public_response
 from coding_review_agent_loop.panel_evidence import _plan_subject
 from coding_review_agent_loop.plan_first_loop import render_canonical_plan_revision
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
+from coding_review_agent_loop.protocol import (
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
 )
 

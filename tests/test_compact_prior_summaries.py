@@ -8,6 +8,8 @@ from coding_review_agent_loop.prompts import (
     _canonical_plan_ledger_rules,
     _canonical_pr_review_ledger_rules,
     _compact_prior_ledger_block,
+)
+from coding_review_agent_loop.prompt_support import (
     CompactPriorContext,
 )
 from coding_review_agent_loop.round_transport import encode_mapping

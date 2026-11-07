@@ -18,6 +18,8 @@ from coding_review_agent_loop.comment_rendering import normalize_freeform_signat
 from coding_review_agent_loop.prompts import (
     build_review_prompt,
     format_human_requirements,
+)
+from coding_review_agent_loop.prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
 from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement

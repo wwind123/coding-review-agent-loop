@@ -32,7 +32,9 @@ from coding_review_agent_loop.managed_ci_types import (
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
 from coding_review_agent_loop.round_state import _decode_round_metadata
-from coding_review_agent_loop.prompts import HUMAN_REQUIREMENTS_ADDRESSED_MARKER
+from coding_review_agent_loop.protocol_common import (
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
 import coding_review_agent_loop.architecture_contract as architecture_contract
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.discuss_loop as discuss_loop

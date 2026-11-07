@@ -188,7 +188,9 @@ def test_coder_prompt_states_node_test_and_npm_run_rules(tmp_path):
 
 
 def test_recommendation_cohorts_follow_the_resolved_package_script(tmp_path):
-    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+    from coding_review_agent_loop.prompt_support import (
+        _expected_worker_cohorts,
+    )
 
     config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
     _package(config.claude_dir, {"test:py": "pytest tests/", "test:j": "jest"})

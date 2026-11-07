@@ -23,7 +23,9 @@ from coding_review_agent_loop.github import (
     get_pr_review_context,
     human_requirement_id,
 )
-from coding_review_agent_loop.prompts import render_coder_human_requirements_prompt_context
+from coding_review_agent_loop.prompt_support import (
+    render_coder_human_requirements_prompt_context,
+)
 from coding_review_agent_loop.protocol import (
     HumanRequirementDisposition,
     validate_human_requirement_dispositions,

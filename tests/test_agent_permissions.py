@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from coding_review_agent_loop import prompt_support as _prompt_owner
+
 import dataclasses
 import json
 import os
@@ -23,7 +25,9 @@ from coding_review_agent_loop.agents.codex import BACKEND as CODEX_BACKEND
 from coding_review_agent_loop.agents.registry import run_agent_result
 from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.prompts import _coder_workdir_guidance
+from coding_review_agent_loop.prompt_support import (
+    _coder_workdir_guidance,
+)
 from coding_review_agent_loop.protocol import parse_agent_unavailable
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -1494,7 +1498,7 @@ def test_sandboxed_coder_grant_and_guidance_share_the_test_python_invocation(tmp
     rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
     assert [rule for rule in rules if "run-tests" in rule] == [f"Bash({invocation})"]
     assert f"`{invocation}`" in _coder_workdir_guidance(config)
-    worker_guidance = prompts.parallel_test_worker_guidance(config)
+    worker_guidance = _prompt_owner.parallel_test_worker_guidance(config)
     assert f"your granted test invocation `{invocation}` uses it" in worker_guidance
     # Read-only roles, repair included, get no test grant.
     for role in ("reviewer", "repair", None):
@@ -1513,7 +1517,7 @@ def test_test_command_keeps_precedence_over_test_python_in_the_sandbox(tmp_path,
     assert invocation.endswith("-- make test")
     rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
     assert [rule for rule in rules if "run-tests" in rule] == [f"Bash({invocation})"]
-    worker_guidance = prompts.parallel_test_worker_guidance(config)
+    worker_guidance = _prompt_owner.parallel_test_worker_guidance(config)
     assert str(python) not in worker_guidance
     assert "does not use it" in worker_guidance
 

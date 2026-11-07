@@ -35,7 +35,7 @@ from .github import (
     validate_open_pr,
 )
 from .logging import log
-from .prompts import (
+from .prompt_support import (
     _coder_managed_ci_dispatch_guidance,
     render_coder_human_requirements_prompt_context,
 )

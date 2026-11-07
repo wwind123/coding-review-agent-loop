@@ -23,7 +23,7 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
     _strip_round_metadata,
 )
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
 from coding_review_agent_loop.protocol import (

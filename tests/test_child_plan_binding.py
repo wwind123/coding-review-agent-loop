@@ -12,7 +12,9 @@ from coding_review_agent_loop.errors import (
     DeterministicPlanValidationExhaustion,
 )
 from coding_review_agent_loop.github import IssueComment, IssueContext
-from coding_review_agent_loop.prompts import HUMAN_REQUIREMENTS_ADDRESSED_MARKER
+from coding_review_agent_loop.protocol_common import (
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.panel_evidence as panel_evidence
 from issue_loop_test_helpers import (

@@ -76,6 +76,8 @@ from .prompts import (
     build_issue_prompt,
     build_task_clarification_prompt,
     build_task_prompt,
+)
+from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
