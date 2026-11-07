@@ -1,11 +1,12 @@
-"""Close a child issue after its PR merged into a non-default base (#1285).
+"""Close merged children for integration recovery and scoped staged-parent repair.
 
 GitHub closes a closing-referenced issue only when the PR merges into the
 repository default branch.  A managed PR merged into a trusted integration
 branch therefore leaves its child issue open, which staged-phase tracking
 would report as an inconsistent phase.  This module closes the child after a
 confirmed merge, and retries that closure without replaying the merge when a
-later run finds the PR already MERGED.
+later run finds the PR already MERGED. A separate staged-parent helper repairs
+missed default-branch auto-closure without changing generic callers.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Literal
 
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
-from .github import IssueContext, parse_strong_issue_reference_evidence
+from .github import IssueContext, get_pr_merge_commit_sha, parse_strong_issue_reference_evidence
 from .logging import log
 from .runner import Runner
 from .workdirs import github_api_cwd
@@ -304,6 +305,84 @@ def close_child_after_integration_merge(
         return "unresolved"
     log(config, f"Issue #{issue_context.number}: closed after PR #{pr_number} merged into {base_ref}")
     return "closed"
+
+
+def close_staged_child_after_default_merge(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    pr_number: int,
+) -> CloseOutcome:
+    """Repair a missed auto-close after staged-parent canonical authentication.
+
+    The shared default-branch outcome alone never authorizes closure. Recheck
+    merge/base evidence, the live closing contract and commit before writing,
+    and require observed closure before the parent may advance.
+    """
+    if config.dry_run:
+        return "skipped"
+    verification = verify_integration_merge(
+        runner, config=config, issue_context=issue_context, pr_number=pr_number
+    )
+    if verification.outcome != "default-branch":
+        return "unresolved"
+    pr = _api(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    if pr is None:
+        return "unresolved"
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    body = pr.get("body")
+    # The shared parser accepts blockquotes for other callers. This scoped
+    # repair requires an instruction outside quoted examples, including lazy
+    # continuation lines of a quoted paragraph.
+    closing_lines: list[str] = []
+    quoted = False
+    for line in body.splitlines() if isinstance(body, str) else ():
+        if not line.strip():
+            quoted = False
+        if line.lstrip().startswith(">"):
+            quoted = True
+        if not quoted:
+            closing_lines.append(line)
+    if (
+        pr.get("merged") is not True
+        or not isinstance(pr.get("merged_at"), str)
+        or not pr["merged_at"].strip()
+        or base.get("ref") != verification.base_ref
+        or str(repo.get("full_name", "")).casefold() != config.repo.casefold()
+        or not isinstance(body, str)
+        or not parse_strong_issue_reference_evidence(
+            "\n".join(closing_lines), repo=config.repo, issue_number=issue_context.number
+        )
+    ):
+        return "unresolved"
+    try:
+        merge_sha = get_pr_merge_commit_sha(runner, config, pr_number)
+    except AgentLoopError:
+        return "unresolved"
+    endpoint = f"repos/{config.repo}/issues/{issue_context.number}"
+    issue = _api(runner, config, endpoint)
+    state = str(issue.get("state", "")).lower() if issue else ""
+    if state == "closed":
+        return "already-closed"
+    if state != "open":
+        return "unresolved"
+    comment = (
+        f"Closing as completed: PR #{pr_number} merged into the default branch "
+        f"(`{verification.base_ref}`) at merge commit `{merge_sha}`, but GitHub "
+        "did not close this child. Staged-parent recovery confirmed the merge."
+        "\n\n-- agent-loop"
+    )
+    result = runner.run(
+        [config.gh_cmd, "issue", "close", str(issue_context.number),
+         "--repo", config.repo, "--reason", "completed", "--comment", comment],
+        cwd=github_api_cwd(), check=False,
+    )
+    if result.returncode != 0:
+        return "unresolved"
+    issue = _api(runner, config, endpoint)
+    return "closed" if issue and str(issue.get("state", "")).lower() == "closed" else "unresolved"
 
 
 def require_child_closed_or_report(

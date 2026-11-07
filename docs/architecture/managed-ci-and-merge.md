@@ -325,6 +325,10 @@ run ID, attempt, and Actions URL. Authorization failures before target
 establishment produce no status; downstream checkout/test failures cannot
 produce success.
 
+The same module also provides the scoped staged-parent default-branch
+missed-close recovery described in [planning](planning.md); generic callers
+retain their default-branch no-op behavior.
+
 Every managed-CI GitHub API read and status POST goes through one bounded
 retry helper, the `MANAGED_CI_HTTP_RETRY` block (#1476). It is inlined
 byte-identically in the validate, verify and publish steps, outside the pinned
