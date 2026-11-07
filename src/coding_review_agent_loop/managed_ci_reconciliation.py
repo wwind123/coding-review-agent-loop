@@ -14,9 +14,12 @@ from .review_scope import is_complete_code_review
 
 from dataclasses import replace
 import json
+import math
+import time
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from .workdirs import active_workdir
 from .errors import AgentLoopError
 from .managed_ci_result import FailedManagedRun, VerifiedManagedResult
 from .managed_ci_intent_validation import IntentBinding, classify_intent_page, match_intent_envelope
@@ -267,6 +270,33 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
     message = (f'PR #{pr_number}: recorded managed run {ref.run_id} is pending, unreadable, '
                'or lacks authoritative failure evidence; repair remains unresolved. Resume after '
                'the current attempt and complete check board are inspectable.')
+    timeout = config.ci_timeout_seconds
+    interval = config.ci_poll_interval_seconds
+    deadline = time.monotonic() + timeout
+    polls = max(1, math.ceil(timeout / max(interval, 1)))
+    for observation in range(polls + 1):
+        if observation and time.monotonic() >= deadline:
+            break
+        if observation and ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha:
+            raise AgentLoopError(message)
+        waiting = _observe_handoff_failure(
+            runner, config=config, pr_number=pr_number, metadata=metadata,
+            contract=contract, checkpoint=checkpoint, message=message, original_only=bool(observation))
+        if not waiting:
+            if observation and ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha:
+                raise AgentLoopError(message)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or observation == polls:
+            break
+        runner.run(['sleep', str(min(interval, remaining))], cwd=active_workdir(config))
+    raise AgentLoopError(message)
+
+
+def _observe_handoff_failure(runner, *, config, pr_number, metadata, contract, checkpoint, message, original_only):
+    """Return True only for the original baseline's narrow publication window."""
+    from . import managed_ci as ci
+    ref = checkpoint.failed_managed_run
     from .managed_ci_failure import require_live_failure
     if require_live_failure(runner, config=config, pr_number=pr_number, metadata=metadata,
                             contract=contract, checkpoint=checkpoint):
@@ -282,7 +312,11 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
                        run_attempt=ref.failed_attempt, workflow_revision=ref.workflow_revision,
                        terminal_attempts=tuple((x['run_id'], x['run_attempt']) for x in record['terminal_attempts']))
         snapshot = ci._refresh_v2_attached_run(runner, config=config, contract=view, strict_provenance=True)
-        if (snapshot is not None and snapshot.live_run_attempt == ref.failed_attempt
+        if original_only and (snapshot is None or type(snapshot.live_run_attempt) is not int
+                              or snapshot.live_run_attempt != ref.failed_attempt):
+            raise AgentLoopError(message)
+        if (snapshot is not None and type(snapshot.live_run_attempt) is int
+            and snapshot.live_run_attempt > 0 and snapshot.live_run_attempt == ref.failed_attempt
             and snapshot.run_attempt == ref.failed_attempt and snapshot.status == 'in_progress'
             and snapshot.conclusion is None):
             final = _managed_ci_status._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
@@ -290,6 +324,10 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
                 and final.url and urlparse(final.url)._replace(query='', fragment='').geturl().rstrip('/')
                 == f'https://github.com/{ref.repository}/actions/runs/{ref.run_id}'):
                 return  # publication can precede completion of the baseline run
+            if final is None or final.status not in _managed_ci_types._TERMINAL_CI_STATUSES:
+                if ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha:
+                    raise AgentLoopError(message)
+                return True
         if (snapshot is not None and type(snapshot.run_attempt) is int
             and snapshot.run_attempt >= ref.failed_attempt and snapshot.status == 'completed'
             and snapshot.conclusion in {'failure', 'timed_out', 'cancelled'}):

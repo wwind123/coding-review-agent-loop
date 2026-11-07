@@ -580,6 +580,7 @@ def test_failed_reference_source_round_must_match_obligation(tmp_path):
 
 def _baseline_race(tmp_path):
     fixture = recovery(tmp_path)
+    fixture = (dataclasses.replace(fixture[0], ci_timeout_seconds=2, ci_poll_interval_seconds=1), *fixture[1:])
     runner = fixture[1]
     runner.workflow_runs[0].update(run_attempt=1, status='in_progress', conclusion=None)
     runner.pr_status_payload = {'state': 'failure', 'statuses': [_status(1, 'failure')]}
@@ -765,3 +766,129 @@ def test_baseline_failure_classification_and_normalized_url(tmp_path, state):
     assert any(f'/commits/{V2_HEAD}/statuses?' in part
                for cmd, _ in runner.commands for part in cmd)
     _no_dispatch_or_agents(runner)
+
+
+def _handoff_clock(monkeypatch, runner, transition=None, api_seconds=0):
+    from coding_review_agent_loop import managed_ci_reconciliation as reconciliation
+    clock = [0.0]
+    sleeps = []
+    monkeypatch.setattr(reconciliation.time, 'monotonic', lambda: clock[0])
+    real = runner.run
+    def run(args, **kwargs):
+        if args[0] == 'sleep':
+            seconds = float(args[1])
+            sleeps.append(seconds)
+            clock[0] += seconds
+            if transition:
+                transition()
+        else:
+            clock[0] += api_seconds
+        return real(args, **kwargs)
+    monkeypatch.setattr(runner, 'run', run)
+    return clock, sleeps
+
+
+@pytest.mark.parametrize('result', ['failure', 'timed_out', 'cancelled', 'published-failure',
+                                    'published-error', 'published-timed_out', 'published-cancelled'])
+def test_handoff_wait_delayed_failure(tmp_path, monkeypatch, result):
+    fixture = _baseline_race(tmp_path)
+    runner, contract = fixture[1], fixture[3]
+    before = dataclasses.asdict(contract)
+    runner.pr_status_payload['statuses'] = []
+    def transition():
+        if result.startswith('published-'):
+            status = _status(1, result.removeprefix('published-'))
+            status['target_url'] += '/?logs=1#summary'
+            runner.pr_status_payload['statuses'] = [status]
+        else:
+            runner.workflow_runs[0].update(status='completed', conclusion=result)
+    _, sleeps = _handoff_clock(monkeypatch, runner, transition)
+    _handoff(fixture)
+    assert sleeps == [1]
+    assert dataclasses.asdict(contract) == before
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('timeout,interval,api_seconds', [(2, 1, 0), (1, 5, 0), (2, 1, 1)])
+def test_handoff_wait_deadline_and_poll_budget(tmp_path, monkeypatch, timeout, interval, api_seconds):
+    fixture = _baseline_race(tmp_path)
+    fixture = (dataclasses.replace(fixture[0], ci_timeout_seconds=timeout,
+                                   ci_poll_interval_seconds=interval), *fixture[1:])
+    runner = fixture[1]
+    runner.pr_status_payload['statuses'] = []
+    clock, sleeps = _handoff_clock(monkeypatch, runner, api_seconds=api_seconds)
+    with pytest.raises(ci.AgentLoopError, match='repair remains unresolved'):
+        _handoff(fixture)
+    assert clock[0] >= timeout
+    assert sum(sleeps) <= timeout
+    assert all(s <= min(timeout, interval) for s in sleeps)
+    assert runner.run_reads <= 6
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('mutation', ['record', 'actor', 'advertised', 'ref', 'revision', 'unreadable',
+                                    'head', 'omitted', 'string', 'bool', 'newer', 'newer-completed', 'success', 'published-success'])
+def test_handoff_wait_rechecks_identity_and_nonfailure(tmp_path, monkeypatch, mutation):
+    fixture = _baseline_race(tmp_path)
+    runner = fixture[1]
+    runner.pr_status_payload['statuses'] = []
+    def transition():
+        run = runner.workflow_runs[0]
+        if mutation == 'record': runner.intent_comments.clear()
+        elif mutation == 'actor': run['actor']['id'] = 5
+        elif mutation == 'advertised': runner.advertised_actor = 'other'
+        elif mutation == 'ref': run['head_branch'] = 'other'
+        elif mutation == 'revision': run['head_sha'] = 'f'*40
+        elif mutation == 'unreadable': runner.run_error = True
+        elif mutation == 'head': runner.pr_payload['headRefOid'] = 'f'*40
+        elif mutation == 'omitted': run.pop('run_attempt')
+        elif mutation == 'string': run['run_attempt'] = '1'
+        elif mutation == 'bool': run['run_attempt'] = True
+        elif mutation == 'newer': run['run_attempt'] = 2
+        elif mutation == 'newer-completed':
+            run.update(run_attempt=2, status='completed', conclusion='failure')
+            runner.pr_status_payload['statuses'] = [_status(2, 'failure')]
+        elif mutation == 'success': run.update(status='completed', conclusion='success')
+        else: runner.pr_status_payload['statuses'] = [_status(1, 'success')]
+    _, sleeps = _handoff_clock(monkeypatch, runner, transition)
+    with pytest.raises(ci.AgentLoopError):
+        _handoff(fixture)
+    assert sleeps == [1]
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('resume', [True, False])
+def test_handoff_wait_real_loop_timeout_resume_budget(tmp_path, monkeypatch, auto_merge, resume):
+    fixture = _baseline_race(tmp_path)
+    config, runner, _, _, cp, item, ref = fixture
+    config = dataclasses.replace(config, auto_merge=auto_merge)
+    runner.pr_status_payload['statuses'] = []
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    monkeypatch.setattr(support, 'merge_pr', lambda *a, **k: pytest.fail('unqualified merge'))
+    _, sleeps = _handoff_clock(monkeypatch, runner)
+    def latest():
+        records = _extract_round_metadata_records(
+            [type('C', (), {'body': c['body']})() for c in runner.pr_payload['comments']], flow='pr')
+        return [r.metadata for r in records if r.metadata.qualification_checkpoint][-1]
+    if resume:
+        with pytest.raises(ci.AgentLoopError, match='repair remains unresolved'):
+            pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        assert calls == []
+        assert latest().phase != 'coder-dispatch'
+        assert latest().round_number == 2
+        assert latest().qualification_checkpoint.failed_managed_run == ref
+    def finish():
+        runner.workflow_runs[0].update(status='completed', conclusion='failure')
+    _handoff_clock(monkeypatch, runner, finish)
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 1
+    checkpoint = latest().qualification_checkpoint
+    assert checkpoint.failed_managed_run == ref
+    assert checkpoint.allowed_rounds == cp.allowed_rounds
+    assert checkpoint.watch_failure_extension_used == cp.watch_failure_extension_used
+    assert runner.dispatch_count == 0
+    assert not any(cmd[:4] == ['gh', 'pr', 'edit', '7'] and '--remove-label' in cmd
+                   for cmd, _ in runner.commands)

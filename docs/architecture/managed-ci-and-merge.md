@@ -181,6 +181,19 @@ conflict-resolution coder turn; it does not revoke failure authority. Completed
 historical failures retain their repair authority across newer same-target
 intents; supersession rejection applies to the separate live failure path.
 
+When the authenticated original baseline is still `in_progress` without a
+conclusion or correlated terminal status, repair handoff waits locally using
+`--ci-poll-interval-seconds` and `--ci-timeout-seconds`. A finite poll budget and
+monotonic deadline include API time and cap each sleep to the remaining time.
+Every observation rechecks the original audit record, advertised actor, strict
+workflow provenance, explicit same-attempt identity and target head. Completion
+or terminal publication ends waiting and applies the existing failure checks;
+success cannot authorize repair. Authenticated live failed-job evidence still
+permits immediate repair. Queued/waiting originals and pending newer attempts
+retain their existing refusal behavior. Timeout keeps the checkpoint, managed
+label and spent budget without dispatching a coder or CI; resume the original
+issue or PR command when evidence is available.
+
 The baseline failure can also authorize repair during the publication race: the
 strictly authenticated live run must be `in_progress` with no conclusion and
 explicitly report a positive integer attempt equal to the recorded failed
