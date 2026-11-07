@@ -215,3 +215,8 @@ def test_line_count_matches_newline_terminated_wc(tmp_path):
     path = tmp_path / "f.py"
     path.write_text("a\nb\n\nc\n", encoding="utf-8")
     assert count_lines(path) == 4
+
+
+@pytest.mark.parametrize('name', ['prompts.py', 'prompt_support.py'])
+def test_prompt_split_restores_thousand_line_headroom(name):
+    assert count_lines(PACKAGE_DIR / name) <= 5000

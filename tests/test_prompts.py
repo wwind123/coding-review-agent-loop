@@ -1,3 +1,7 @@
+
+from coding_review_agent_loop import prompt_support as _prompt_owner
+
+from coding_review_agent_loop import prompt_support as _prompt_owner
 import sys
 import json
 import re
@@ -563,7 +567,7 @@ def test_runtime_prompt_keeps_configured_command_when_wrapper_is_unverified(
         toolchain=None,
     )
     monkeypatch.setattr(
-        prompts_module,
+        _prompt_owner,
         "preflight_wrapper_candidates",
         lambda **_kwargs: (
             runtime.LauncherProbeResult(
@@ -607,7 +611,7 @@ def test_runtime_prompt_scopes_health_and_allows_verified_wrapper_guidance(
     wrapper = runtime.LauncherProbeResult(
         ("/opt/agent-loop", "run-tests"), "verified", "agent-loop preflight: verified"
     )
-    monkeypatch.setattr(prompts_module, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,))
+    monkeypatch.setattr(_prompt_owner, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,))
     prompt = build_issue_prompt(764, config, memory=memory)
     assert "Invocation guidance:" in prompt
     assert "Launcher-health advisory evidence" in prompt
@@ -2888,7 +2892,7 @@ def test_explicit_managed_cap_fails_closed_when_protected_context_has_no_room(tm
         tmp_path, architecture_context=architecture, managed_context_max_chars=32
     )
     with pytest.raises(AgentLoopError, match="Managed prompt context cap"):
-        prompts_module._architecture_context_block(config, protected_context=("x" * 32,))
+        _prompt_owner._architecture_context_block(config, protected_context=("x" * 32,))
 
 
 def test_architecture_opt_out_preserves_legacy_prompt_rendering(tmp_path):
@@ -4169,7 +4173,7 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
         semantic_risk_claim_example_json,
     )
 
-    context = prompts_module.CoderHumanRequirementsPromptContext(
+    context = _prompt_owner.CoderHumanRequirementsPromptContext(
         block="", surfaced_requirement_ids=(), requires_direct_discussion_ack=False
     )
     surfaces = {
@@ -4228,7 +4232,7 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
         semantic_risk_claim_example_json,
     )
 
-    context = prompts_module.CoderHumanRequirementsPromptContext(
+    context = _prompt_owner.CoderHumanRequirementsPromptContext(
         block="", surfaced_requirement_ids=(), requires_direct_discussion_ack=False
     )
     surfaces = {
@@ -4261,7 +4265,9 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
 import json as _json
 from pathlib import Path
 
-from coding_review_agent_loop.prompts import QUOTED_COMMAND_REVIEW_RULE
+from coding_review_agent_loop.prompt_support import (
+    QUOTED_COMMAND_REVIEW_RULE,
+)
 
 
 def test_every_reviewer_prompt_builder_carries_the_no_execution_policy(tmp_path):
@@ -4508,7 +4514,7 @@ def test_emitted_invocation_guidance_lines_pass_the_checkout_validator(
         ("/opt/agent-loop", "run-tests"), "verified", "agent-loop preflight: verified"
     )
     monkeypatch.setattr(
-        prompts_module, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,)
+        _prompt_owner, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,)
     )
 
     prompt = build_issue_prompt(892, config, memory=memory)
@@ -4903,13 +4909,13 @@ def test_every_reviewer_prompt_form_carries_the_flow_correct_exhaustiveness_rule
     other = "plan" if flow == "pr" else "pr"
     assert _exhaustiveness_clauses(other)[2] not in flat
     # The full and compact forms share one helper, so they cannot drift.
-    assert prompts_module._reviewer_exhaustiveness_guidance(flow) in prompt
+    assert _prompt_owner._reviewer_exhaustiveness_guidance(flow) in prompt
 
 
 def test_exhaustiveness_rule_is_static_per_flow_and_keeps_existing_review_rules(tmp_path):
-    assert prompts_module._reviewer_exhaustiveness_guidance("pr") == prompts_module._reviewer_exhaustiveness_guidance("pr")
+    assert _prompt_owner._reviewer_exhaustiveness_guidance("pr") == _prompt_owner._reviewer_exhaustiveness_guidance("pr")
     with pytest.raises(KeyError):
-        prompts_module._reviewer_exhaustiveness_guidance("discuss")
+        _prompt_owner._reviewer_exhaustiveness_guidance("discuss")
     config = make_config(tmp_path)
     for compact in (False, True):
         flat = " ".join(_exhaustive_reviewer_prompt(config, "pr", compact).split())
@@ -5044,7 +5050,9 @@ def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mod
 
 def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
     """Issue #1073: a plain pytest in an xdist repo may run parallel or, without xdist, serially."""
-    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+    from coding_review_agent_loop.prompt_support import (
+        _expected_worker_cohorts,
+    )
 
     config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
     command = ["python3", "-m", "pytest", "tests/"]
@@ -5092,7 +5100,9 @@ def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(
         coder_test_command_timeout_seconds=1800,
         agent_memory_dir=memory_dir,
     )
-    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+    from coding_review_agent_loop.prompt_support import (
+        _expected_worker_cohorts,
+    )
 
     if declared:
         (repo / "pyproject.toml").write_text(
@@ -5196,15 +5206,15 @@ def test_prompts_label_unverified_signed_requirements_in_every_authority_stateme
     assert "Their author identity was not verified by the tool" in listing
     assert "They still must be dispositioned" in listing
 
-    context = prompts_module.render_coder_human_requirements_prompt_context((requirement,))
+    context = _prompt_owner.render_coder_human_requirements_prompt_context((requirement,))
     assert context.unverified_authors is True
-    coder = prompts_module._coder_human_requirements_guidance(context)
+    coder = _prompt_owner._coder_human_requirements_guidance(context)
     assert "is authoritative for" not in coder
     assert "binding for disposition" in coder and "authors are unverified" in coder
     assert f"`{requirement.requirement_id}`" in coder
     assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in coder
 
-    review = prompts_module._human_requirements_review_guidance((requirement,))
+    review = _prompt_owner._human_requirements_review_guidance((requirement,))
     assert "override AI reviewer preferences" not in review
     assert "were not author-verified" in review
     assert "approval gate below still applies" in review
@@ -5218,12 +5228,12 @@ def test_prompts_keep_authoritative_wording_when_every_author_is_verified():
     assert "- Author verification: verified against the configured trusted human reviewer set" in listing
     assert "not verified by the tool" not in listing
 
-    context = prompts_module.render_coder_human_requirements_prompt_context((requirement,))
+    context = _prompt_owner.render_coder_human_requirements_prompt_context((requirement,))
     assert context.unverified_authors is False
-    coder = prompts_module._coder_human_requirements_guidance(context)
+    coder = _prompt_owner._coder_human_requirements_guidance(context)
     assert "is authoritative for next-revision requirements" in coder
 
-    review = prompts_module._human_requirements_review_guidance((requirement,))
+    review = _prompt_owner._human_requirements_review_guidance((requirement,))
     assert "Signed human reviewer requirements override AI reviewer preferences" in review
     assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in review
 
@@ -5234,7 +5244,7 @@ def test_mixed_verification_is_treated_as_unverified():
     requirements = (_trust_requirement("verified"), replace(_trust_requirement("unverified"), body="Other."))
     listing = format_human_requirements(requirements)
     assert "Their author identity was not verified by the tool" in listing
-    assert "override AI reviewer preferences" not in prompts_module._human_requirements_review_guidance(requirements)
+    assert "override AI reviewer preferences" not in _prompt_owner._human_requirements_review_guidance(requirements)
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -5781,7 +5791,9 @@ def test_rendered_recommendation_matches_recorded_package_script_rows_1294(tmp_p
         test_worker_enforcement="clamp", coder_test_command_timeout_seconds=1800,
         agent_memory_dir=memory_dir,
     )
-    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+    from coding_review_agent_loop.prompt_support import (
+        _expected_worker_cohorts,
+    )
 
     cohorts = _expected_worker_cohorts(config, command)
     # An enforced pytest body may run parallel or serial; both cohorts are
@@ -5923,21 +5935,21 @@ def test_pr_review_prompt_treats_managed_receipts_as_direct_runs_1568(tmp_path, 
     config = make_config(tmp_path, coder="claude", reviewer="codex")
     review = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
     flat = " ".join(review.split())
-    assert review.count(prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE) == 1
+    assert review.count(_prompt_owner.MANAGED_RECEIPT_REVIEWER_GUIDANCE) == 1
     assert _MANAGED_RECEIPT_1568 in flat
     assert "not to the loop's own capture runner" in flat
     # All receipt rules sit together.
     assert (
-        f"{prompts_module.PRE_COLLECTION_REVIEWER_GUIDANCE}\n"
-        f"{prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE}"
+        f"{_prompt_owner.PRE_COLLECTION_REVIEWER_GUIDANCE}\n"
+        f"{_prompt_owner.MANAGED_RECEIPT_REVIEWER_GUIDANCE}"
     ) in review
-    guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    guidance = _prompt_owner._reviewer_unproducible_evidence_guidance("pr")
     assert review.count(guidance) == 1
     assert _UNPRODUCIBLE_1568 in flat
     assert "Do not put such a request in `blocking_items` or `same_pr_followups`" in flat
     assert "a missing or failing receipt, keep the existing rules" in flat
     # Directly after the blocking-scope criteria.
-    assert prompts_module._reviewer_blocking_scope_guidance("pr") + guidance in review
+    assert _prompt_owner._reviewer_blocking_scope_guidance("pr") + guidance in review
 
 
 
@@ -5954,25 +5966,25 @@ def test_pr_unproducible_rule_defers_human_only_evidence_to_exact_head_requests_
     assert carve_out in flat
     assert "never move it to `summary` or `future_followups` under this rule" in flat
     assert prompts_module.PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE in review
-    pr_guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    pr_guidance = _prompt_owner._reviewer_unproducible_evidence_guidance("pr")
     # The carve-out sits inside the rule, before its non-blocking fallback ends.
     assert "exact_head_evidence_requests" in pr_guidance
-    assert "exact_head_evidence_requests" not in prompts_module._reviewer_unproducible_evidence_guidance("plan")
+    assert "exact_head_evidence_requests" not in _prompt_owner._reviewer_unproducible_evidence_guidance("plan")
 
 @pytest.mark.parametrize("compact", [False, True])
 def test_plan_review_prompt_states_plan_flow_receipt_and_unproducible_rules_1568(tmp_path, compact):
     config = make_config(tmp_path)
     prompt = build_plan_review_prompt(1568, 1, "Plan.", config, reviewer="codex", compact_context=compact)
     flat = " ".join(prompt.split())
-    guidance = prompts_module._reviewer_unproducible_evidence_guidance("plan")
-    assert prompts_module._reviewer_blocking_scope_guidance("plan") + guidance in prompt
+    guidance = _prompt_owner._reviewer_unproducible_evidence_guidance("plan")
+    assert _prompt_owner._reviewer_blocking_scope_guidance("plan") + guidance in prompt
     assert prompt.count(guidance) == 1
     assert _UNPRODUCIBLE_1568 in flat
     assert "Do not put such a request in `blocking_plan_issues` or `same_plan_followups`" in flat
     assert "requires plain or no-wrapper test runs is satisfied by managed `agent-loop run-tests` receipts" in flat
     assert "do not require it to state otherwise" in flat
     assert "blocking_items" not in guidance
-    assert "no-wrapper" not in prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    assert "no-wrapper" not in _prompt_owner._reviewer_unproducible_evidence_guidance("pr")
 
 
 def test_planner_prompts_phrase_captured_evidence_through_run_tests_1568(tmp_path):
@@ -6056,8 +6068,8 @@ def test_pr_review_with_local_receipts_carries_receipt_guidance_1568(tmp_path, c
     else:
         stable, tail = prompt, ""
     for text in (
-        prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE,
-        prompts_module._reviewer_unproducible_evidence_guidance("pr"),
+        _prompt_owner.MANAGED_RECEIPT_REVIEWER_GUIDANCE,
+        _prompt_owner._reviewer_unproducible_evidence_guidance("pr"),
     ):
         assert text in stable
         assert text not in tail
@@ -6065,8 +6077,8 @@ def test_pr_review_with_local_receipts_carries_receipt_guidance_1568(tmp_path, c
 
 def test_compact_stable_prefixes_keep_unproducible_guidance_head_independent_1568(tmp_path):
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    pr_guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
-    plan_guidance = prompts_module._reviewer_unproducible_evidence_guidance("plan")
+    pr_guidance = _prompt_owner._reviewer_unproducible_evidence_guidance("pr")
+    plan_guidance = _prompt_owner._reviewer_unproducible_evidence_guidance("plan")
     pr_prefixes, plan_prefixes = [], []
     for head in ("4a0cde71aee7158542d013fc0c9f5acfc735c612", "bbb222"):
         prompt = build_review_prompt(
@@ -6075,7 +6087,7 @@ def test_compact_stable_prefixes_keep_unproducible_guidance_head_independent_156
         )
         prefix, tail = prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
         assert pr_guidance in prefix and pr_guidance not in tail
-        assert prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE in prefix
+        assert _prompt_owner.MANAGED_RECEIPT_REVIEWER_GUIDANCE in prefix
         pr_prefixes.append(prefix)
         plan_prompt = build_plan_review_prompt(
             1568, 2, f"Plan {head}.", config, reviewer="codex", compact_context=True,
@@ -6139,7 +6151,7 @@ def test_claude_backend_guidance_names_the_call_limit_and_the_timeout_rule(tmp_p
     monkeypatch.delenv("BASH_DEFAULT_TIMEOUT_MS", raising=False)
     config = make_config(tmp_path, coder="claude", coder_test_command_timeout_seconds=600)
     budget = runtime.run_tests_foreground_budget_seconds(600)
-    text = prompts_module._coder_local_test_scope_guidance(config, structured=True)
+    text = _prompt_owner._coder_local_test_scope_guidance(config, structured=True)
     assert (
         f" For Claude, every Bash call in this turn defaults to a {budget}s limit, which covers the "
         "run-tests watchdog, the shared-capacity wait and parent overhead. Run agent-loop run-tests in "
@@ -6153,7 +6165,7 @@ def test_claude_backend_guidance_names_the_call_limit_and_the_timeout_rule(tmp_p
 
 def test_antigravity_and_generic_backend_guidance_are_unchanged(tmp_path):
     antigravity = make_config(tmp_path, coder="antigravity", reviewer="codex")
-    text = prompts_module._coder_local_test_scope_guidance(antigravity)
+    text = _prompt_owner._coder_local_test_scope_guidance(antigravity)
     assert (
         f" For Antigravity, the configured print timeout is "
         f"{antigravity.antigravity_print_timeout_seconds}s; it should exceed the selected "
@@ -6161,9 +6173,9 @@ def test_antigravity_and_generic_backend_guidance_are_unchanged(tmp_path):
     ) in text
     assert "For Claude" not in text
     codex = make_config(tmp_path, coder="codex", reviewer="claude")
-    text = prompts_module._coder_local_test_scope_guidance(codex)
+    text = _prompt_owner._coder_local_test_scope_guidance(codex)
     assert _GENERIC_BACKEND_SENTENCE in text and "For Claude" not in text
-    assert _GENERIC_BACKEND_SENTENCE in prompts_module._coder_local_test_scope_guidance(None)
+    assert _GENERIC_BACKEND_SENTENCE in _prompt_owner._coder_local_test_scope_guidance(None)
 
 
 def _fake_test_python(tmp_path):
@@ -6194,7 +6206,7 @@ def test_configured_interpreter_guidance_states_only_what_the_check_established(
         lifecycle_probe, "xdist_import_check", lambda invocation, env, cwd: calls.append((invocation, cwd)) or state,
     )
     config = make_config(tmp_path, test_python=str(python))
-    text = prompts_module.parallel_test_worker_guidance(config)
+    text = _prompt_owner.parallel_test_worker_guidance(config)
     assert expected in text and absent not in text
     assert f"`{python}`" in text
     assert calls == [((str(python),), config.claude_dir)]
@@ -6210,7 +6222,7 @@ def test_configured_interpreter_guidance_states_only_what_the_check_established(
 
 def test_unconfigured_interpreter_renders_the_long_suite_sentence(tmp_path):
     config = make_config(tmp_path)
-    text = prompts_module.parallel_test_worker_guidance(config)
+    text = _prompt_owner.parallel_test_worker_guidance(config)
     assert "For long or full suites: `agent-loop run-tests` prints a foreground-budget notice" in text
     assert "PEP 668" in text
     assert "Configured test interpreter" not in text
@@ -6225,11 +6237,11 @@ def test_interpreter_check_errors_degrade_to_todays_text(tmp_path, monkeypatch):
 
     monkeypatch.setattr(lifecycle_probe, "xdist_import_check", boom)
     config = make_config(tmp_path, test_python=str(_fake_test_python(tmp_path)))
-    text = prompts_module.parallel_test_worker_guidance(config)
+    text = _prompt_owner.parallel_test_worker_guidance(config)
     from coding_review_agent_loop.test_workers import detect_parallel_support, repository_root
 
     today = render_worker_guidance(
-        prompts_module.preliminary_worker_budget(config),
+        _prompt_owner.preliminary_worker_budget(config),
         parallel_supported=detect_parallel_support(repository_root(config.claude_dir)),
     )
     assert text == today
@@ -6386,7 +6398,7 @@ def test_pr_review_prompt_states_blocking_criteria_and_future_on_blocking(
     flat = " ".join(build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact).split())
     for clause in _CRITERIA_CLAUSES_1389:
         assert clause in flat
-    assert prompts_module._reviewer_blocking_scope_guidance("pr") in build_review_prompt(
+    assert _prompt_owner._reviewer_blocking_scope_guidance("pr") in build_review_prompt(
         77, 2, config, reviewer="codex", compact_context=compact
     )
     assert "do not use structured Future follow-ups; keep all required" not in flat
@@ -6410,7 +6422,7 @@ def test_plan_review_prompt_states_criteria_same_design_and_eligibility_order(tm
     flat = " ".join(prompt.split())
     for clause in _CRITERIA_CLAUSES_1389:
         assert clause in flat
-    assert prompts_module._reviewer_blocking_scope_guidance("plan") in prompt
+    assert _prompt_owner._reviewer_blocking_scope_guidance("plan") in prompt
     assert "missing edge cases within the issue's scope" in flat or compact
     assert "they are allowed in both approved and blocking plan reviews" in flat
     assert "do not use structured Future follow-ups" not in flat
@@ -6534,11 +6546,11 @@ def test_managed_ci_dispatch_guidance_only_when_turn_is_guarded(tmp_path):
         assert "orchestrator dispatches the correlated exact-head qualification" in prompt
         assert "so a human operator can decide" in prompt
         # Removing exactly the guidance yields the unguarded prompt.
-        guidance = prompts_module._coder_managed_ci_dispatch_guidance(True)
+        guidance = _prompt_owner._coder_managed_ci_dispatch_guidance(True)
         assert prompt.replace(guidance, "", 1) == baseline[name], name
     for name, prompt in _coder_prompt_set(managed_unguarded).items():
         assert "This pull request uses managed CI." not in prompt, name
-    assert prompts_module._coder_managed_ci_dispatch_guidance(False) == ""
+    assert _prompt_owner._coder_managed_ci_dispatch_guidance(False) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -6608,12 +6620,12 @@ def test_root_only_under_limit_prompt_has_no_set_specific_text(tmp_path, builder
     for text in _SET_STRINGS:
         assert text not in prompt
     # The legacy root-only guidance is pinned; the set clause is not added.
-    assert prompts_module._architecture_impact_guidance(required=True, config=config) == _LEGACY_IMPACT_GUIDANCE
-    assert prompts_module._architecture_impact_guidance(required=True) == _LEGACY_IMPACT_GUIDANCE
+    assert _prompt_owner._architecture_impact_guidance(required=True, config=config) == _LEGACY_IMPACT_GUIDANCE
+    assert _prompt_owner._architecture_impact_guidance(required=True) == _LEGACY_IMPACT_GUIDANCE
     optional = _LEGACY_IMPACT_GUIDANCE.replace(
         "(required)", "(expected when architecture context is available)"
     )
-    assert prompts_module._architecture_impact_guidance(config=config) == optional
+    assert _prompt_owner._architecture_impact_guidance(config=config) == optional
     expected = optional if builder in {"plan-review", "pr-review"} else _LEGACY_IMPACT_GUIDANCE
     assert expected in prompt
 
@@ -6641,7 +6653,7 @@ def test_set_guidance_names_the_configured_detail_dirs(tmp_path, builder):
         architecture_detail_dirs=("docs/design",),
     )
     prompt = _SET_BUILDERS[builder](config)
-    guidance = prompts_module._architecture_impact_guidance(required=True, config=config)
+    guidance = _prompt_owner._architecture_impact_guidance(required=True, config=config)
     assert "a linked .md detail doc under docs/design/)" in guidance
     assert "docs/architecture" not in guidance
     assert "excluded history (decision logs, ADRs) is never a member" in guidance
@@ -6650,14 +6662,14 @@ def test_set_guidance_names_the_configured_detail_dirs(tmp_path, builder):
     assert "- docs/design/a.md — Design A: A owns intake." in prompt
     default = make_config(tmp_path, architecture_context=_set_snapshot(members=(member,)))
     assert "a linked .md detail doc under docs/architecture/)" in (
-        prompts_module._architecture_impact_guidance(required=True, config=default)
+        _prompt_owner._architecture_impact_guidance(required=True, config=default)
     )
     many = make_config(
         tmp_path, architecture_context=_set_snapshot(members=(member,)),
         architecture_detail_dirs=tuple(f"d{index}" for index in range(6)),
     )
     assert "under d0/, d1/, d2/, d3/ or [2 more])" in (
-        prompts_module._architecture_impact_guidance(required=True, config=many)
+        _prompt_owner._architecture_impact_guidance(required=True, config=many)
     )
 
 
@@ -6688,7 +6700,7 @@ def test_oversized_diagnostic_names_the_configured_detail_dir(tmp_path):
     )
     assert "short root overview plus docs/design/* detail docs" in snapshot.diagnostic
     config = make_config(tmp_path, architecture_context=snapshot, architecture_detail_dirs=("docs/design",))
-    block = prompts_module._architecture_context_block(config)
+    block = _prompt_owner._architecture_context_block(config)
     assert "docs/design/* detail docs" in block and "docs/architecture" not in block
     default = acquire_architecture_snapshot(
         Runner(), checkout=tmp_path, repository="owner/repo", revision=revision, max_bytes=64,
@@ -6716,13 +6728,13 @@ def _pair_of(base, candidate, change="unchanged"):
 def test_oversized_root_is_injected_in_snapshot_and_pair_prompts(tmp_path, context):
     for value in (context, _pair_of(context, context)):
         config = make_config(tmp_path, architecture_context=value)
-        block = prompts_module._architecture_context_block(config)
+        block = _prompt_owner._architecture_context_block(config)
         assert block
         assert "- Size: 200000 bytes" in block
         assert "should be split" in block
         assert "Architecture context omitted for managed prompt budget" not in block
     if context.links_status == "unscanned":
-        assert "membership unknown" in prompts_module._architecture_context_block(
+        assert "membership unknown" in _prompt_owner._architecture_context_block(
             make_config(tmp_path, architecture_context=context)
         )
 
@@ -6737,7 +6749,7 @@ def test_oversized_root_is_injected_in_snapshot_and_pair_prompts(tmp_path, conte
 )
 def test_missing_and_binary_roots_keep_the_legacy_empty_block(tmp_path, context):
     config = make_config(tmp_path, architecture_context=context)
-    assert prompts_module._architecture_context_block(config) == ""
+    assert _prompt_owner._architecture_context_block(config) == ""
     assert build_task_prompt("Implement.", config) == build_task_prompt("Implement.", make_config(tmp_path))
 
 
@@ -6751,11 +6763,11 @@ def test_oversized_fallback_changes_only_the_architecture_block_and_guidance(tmp
     legacy_config = make_config(tmp_path)
     with_block = build_followup_prompt(77, 2, "Fix.", oversized_config, human_requirements=(requirement,))
     legacy = build_followup_prompt(77, 2, "Fix.", legacy_config, human_requirements=(requirement,))
-    block = prompts_module._architecture_context_block(
+    block = _prompt_owner._architecture_context_block(
         oversized_config,
         protected_context=(),
     )
-    set_clause = prompts_module._architecture_impact_guidance(
+    set_clause = _prompt_owner._architecture_impact_guidance(
         required=True, config=oversized_config
     )[len(_LEGACY_IMPACT_GUIDANCE):]
     assert set_clause and block
@@ -6811,7 +6823,7 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
         monkeypatch.setattr(containment_module, "probe_host_memory_bytes", lambda: 2 * 1024 ** 3)
         monkeypatch.setattr(test_workers_module, "probe_cpu_count", lambda: (2, "test"))
     monkeypatch.setattr(
-        prompts_module, "preliminary_worker_budget",
+        _prompt_owner, "preliminary_worker_budget",
         lambda _config: WorkerBudget(8, "derived", "clamp", "cpu", {}, True),
     )
     golden = _golden_json.loads(_ROOT_ONLY_PROMPT_GOLDEN.read_text(encoding="utf-8"))
@@ -7004,7 +7016,7 @@ def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails
         toolchain=None,
     )
     monkeypatch.setattr(
-        prompts_module,
+        _prompt_owner,
         "preflight_wrapper_candidates",
         lambda **_kwargs: (runtime.LauncherProbeResult(("/opt/agent-loop", "run-tests"), "failed", "import failed"),),
     )
@@ -7015,8 +7027,10 @@ def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails
 
 # --- Issue #1560: complete, valid schema examples and reviewer independence ---
 
-from coding_review_agent_loop.prompts import (  # noqa: E402
+from coding_review_agent_loop.prompt_support import (
     REVIEW_INDEPENDENCE_RULE,
+)
+from coding_review_agent_loop.prompts import (
     build_plan_decomposition_prompt,
 )
 
@@ -7154,7 +7168,9 @@ def test_plan_review_prompt_flags_a_missing_or_weak_smallest_alternative(
 @pytest.mark.parametrize("builder", ["issue", "pr-followup"])
 def test_coder_prompts_carry_the_shared_citable_runner_sentence_1659(tmp_path, builder):
     """`prompt-citable-runner-sentence`: both citing coder prompts name the runners."""
-    from coding_review_agent_loop.prompts import CITABLE_RECEIPT_GUIDANCE
+    from coding_review_agent_loop.prompt_support import (
+        CITABLE_RECEIPT_GUIDANCE,
+    )
     from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
 
     prompt = _SET_BUILDERS[builder](make_config(tmp_path))
@@ -7206,7 +7222,9 @@ def test_pr_local_environment_note_only_with_the_flag_and_after_a_rebuild(tmp_pa
 
     from coding_review_agent_loop import checkout_verification as cv
     from coding_review_agent_loop import worktree_pr_env
-    from coding_review_agent_loop.prompts import _coder_workdir_guidance
+    from coding_review_agent_loop.prompt_support import (
+        _coder_workdir_guidance,
+    )
 
     base = _replace(make_config(tmp_path), worktree_links=("node_modules",))
     workdir = base.claude_dir.resolve()
@@ -7245,7 +7263,7 @@ def test_salvage_wrapper_is_outcome_neutral(tmp_path, source, outcome):
 
 def test_coder_test_invocations_explicitly_use_exported_executable(tmp_path, monkeypatch):
     wrapper = runtime.LauncherProbeResult(("/opt/release-A/agent-loop", "run-tests"), "verified", "verified")
-    monkeypatch.setattr(prompts_module, "preflight_wrapper_candidates", lambda **kwargs: (wrapper,))
+    monkeypatch.setattr(_prompt_owner, "preflight_wrapper_candidates", lambda **kwargs: (wrapper,))
     config = make_config(tmp_path)
     memory = AgentMemoryContext(memory_dir=tmp_path / "memory", current_commit=None,
         last_analyzed_commit=None, changed_files=(), repo_summary=None, architecture_map=None,
@@ -7280,7 +7298,7 @@ def test_unconditional_test_guidance_survives_pin_install_failure(tmp_path, monk
         text = test_workers.render_interpreter_guidance(test_workers.InterpreterGuidance(
             path="/usr/bin/python3", state=0, recommend=True))
     else:
-        text = getattr(prompts_module, guidance)
+        text = getattr(_prompt_owner, guidance)
     command = next(c for c in re.findall(r"`([^`]+)`", text) if c.startswith('"${AGENT_LOOP_EXECUTABLE:-agent-loop}"'))
     result = subprocess.run(["/bin/sh", "-c", command.split(" run-tests")[0] + " run-tests"],
         env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)

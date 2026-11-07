@@ -1,5 +1,7 @@
 """PR-loop tests for pr_loop_support and issue_pr_handoff: PR authorization (#1542)."""
 
+from coding_review_agent_loop import prompt_support as _prompt_owner
+
 import base64
 import json
 import re
@@ -362,7 +364,7 @@ def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
         toolchain=None,
     )
     monkeypatch.setattr(
-        prompts_module,
+        _prompt_owner,
         "preflight_wrapper_candidates",
         lambda **_kwargs: (runtime.LauncherProbeResult(("/opt/agent-loop", "run-tests"), "failed", "import failed"),),
     )

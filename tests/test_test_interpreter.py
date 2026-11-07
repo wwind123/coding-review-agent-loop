@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from coding_review_agent_loop import prompt_support as _prompt_owner
+
 import os
 import stat
 import sys
@@ -244,7 +246,7 @@ def test_lexical_symlink_identity_is_kept_everywhere(tmp_path, monkeypatch):
         runtime.reset_coder_test_invocations()
     seen = []
     monkeypatch.setattr(lp, "_run_check", lambda invocation, *_a, **_k: seen.append(tuple(invocation)) or 0)
-    prompts.configured_interpreter_guidance(config)
+    _prompt_owner.configured_interpreter_guidance(config)
     assert seen == [(str(first),)]
 
 
@@ -255,11 +257,11 @@ def test_each_render_reruns_the_check_without_a_cache(tmp_path):
     fake = _script(tmp_path / "venv" / "bin" / "python", f"#!/bin/sh\nexit $(cat {state})\n")
     mtime = fake.stat().st_mtime_ns
     config = make_config(tmp_path, test_python=str(fake))
-    first = prompts.parallel_test_worker_guidance(config)
+    first = _prompt_owner.parallel_test_worker_guidance(config)
     assert "could not import pytest-xdist" in first
     # Packages change; the executable itself does not.
     state.write_text("0", encoding="utf-8")
     assert fake.stat().st_mtime_ns == mtime
-    second = prompts.parallel_test_worker_guidance(config)
+    second = _prompt_owner.parallel_test_worker_guidance(config)
     assert "found pytest and pytest-xdist importable" in second
     assert "could not import" not in second

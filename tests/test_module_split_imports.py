@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -494,3 +495,71 @@ def test_protocol_quoted_risk_annotations_resolve():
     for value in vars(protocol).values():
         if isinstance(value, type) and value.__module__ == protocol.__name__:
             typing.get_type_hints(value)
+
+
+# Phase-one prompt ownership manifest; deliberately outside the frozen facade registry.
+
+PROMPT_MOVE = json.loads((ROOT / 'tests/fixtures/prompt_support_move.json').read_text())
+PROMPT_OWNERS = {name: 'prompt_support' for name in PROMPT_MOVE['symbols']}
+
+
+def test_prompt_consumers_use_real_owners_and_driver_has_no_unused_imports():
+    problems = []
+    for folder in ('src', 'tests'):
+        for path in (ROOT / folder).rglob('*.py'):
+            problems.extend(f'{path.relative_to(ROOT)}: {problem}' for problem in
+                            ownership_problems(path.read_text(), driver=path.name == 'prompts.py',
+                                               old='coding_review_agent_loop.prompts', owners=PROMPT_OWNERS))
+    assert problems == []
+
+
+@pytest.mark.parametrize('first', ['prompts', 'prompt_support', 'orchestrator', 'prompt_context'])
+def test_prompt_support_fresh_import_orders(first):
+    import os
+    import subprocess
+    import sys
+
+    modules = [first] + [m for m in ('prompts', 'prompt_support', 'orchestrator', 'prompt_context') if m != first]
+    subprocess.run([sys.executable, '-c', '\n'.join('import coding_review_agent_loop.' + m for m in modules)],
+                   check=True, timeout=30, cwd=ROOT, env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+
+
+def test_prompt_support_move_preserves_function_class_and_constant_bodies():
+    import hashlib
+
+    tree = ast.parse((ROOT / 'src/coding_review_agent_loop/prompt_support.py').read_text())
+    actual = {}
+    for node in tree.body:
+        name = node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else (
+            node.targets[0].id if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) else None)
+        if name in PROMPT_OWNERS:
+            actual[name] = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+    assert actual == PROMPT_MOVE['body_sha256']
+
+
+def missing_patch_owners(covered, reachable, name):
+    """Check path-specific reachability, independently of listed-owner validation."""
+    return {module.__name__ for module in reachable if hasattr(module, name)} - {
+        module.__name__ for module in covered}
+
+
+def test_prompt_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(monkeypatch, tmp_path):
+    # Both callers are imported before patching. This is a real shared lookup,
+    # not an assumption that every package binding is reached by every path.
+    from coding_review_agent_loop import prompts, prompt_support
+    from agent_loop_helpers import make_config, patch_attr_in
+
+    reachable = (prompts, prompt_support)
+    assert missing_patch_owners((prompts,), reachable, 'sanitize_historical_text') == {prompt_support.__name__}
+    assert not missing_patch_owners(reachable, reachable, 'sanitize_historical_text')
+    calls = []
+    def fake(text):
+        calls.append(text)
+        return 'intercepted'
+    patch_attr_in(monkeypatch, reachable, 'sanitize_historical_text', fake)
+    config = make_config(tmp_path)
+    assert 'intercepted' in prompt_support._architecture_detail_dirs_text(config)
+    # Retained local summary formatting also reads the shared sanitizer binding.
+    assert prompts._bounded_context_text('retained probe') == 'intercepted'
+    assert 'retained probe' in calls
+    assert len(calls) >= 2

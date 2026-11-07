@@ -291,10 +291,14 @@ from .managed_ci_protection import (
 )
 from .managed_pr import recover_managed_pr_origin, validate_managed_pr_body
 from .migrations import validate_pr_migration_topology
-from .prompts import (
+from .prompt_support import (
     CompactPlanTailContext,
     CompactPriorContext,
     CompactPrReviewTailContext,
+    format_agent_list,
+    render_coder_human_requirements_prompt_context,
+)
+from .prompts import (
     build_discuss_agenda_prompt,
     build_discuss_round_synthesis_prompt,
     build_discuss_final_synthesis_prompt,
@@ -321,8 +325,6 @@ from .prompts import (
     build_same_pr_followup_prompt,
     build_task_clarification_prompt,
     build_task_prompt,
-    format_agent_list,
-    render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
     AgentUnavailable,

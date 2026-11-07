@@ -137,14 +137,21 @@ from coding_review_agent_loop.round_state import (
 )
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.response_validation import _validate_plan_revision_response
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.prompt_support import (
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
     CompactPlanTailContext,
     CompactPrReviewTailContext,
     CompactPriorContext,
+    render_coder_human_requirements_prompt_context,
+)
+from coding_review_agent_loop.protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
+from coding_review_agent_loop.protocol import (
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
+)
+from coding_review_agent_loop.prompts import (
     _build_followup_guidance,
     _build_unresolved_items_guidance,
     _phased_plan_guard,
@@ -161,7 +168,6 @@ from coding_review_agent_loop.prompts import (
     build_review_prompt,
     format_human_requirements,
     format_issue_context,
-    render_coder_human_requirements_prompt_context,
 )
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,

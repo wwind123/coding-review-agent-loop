@@ -10,8 +10,10 @@ import pytest
 from agent_loop_helpers import make_config
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.github import PullRequestMetadata
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.prompt_context import (
     approved_plan_reconciliation_guidance,
+)
+from coding_review_agent_loop.prompts import (
     build_followup_prompt,
     build_review_prompt,
     format_approved_plan_context,

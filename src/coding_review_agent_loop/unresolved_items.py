@@ -16,7 +16,9 @@ from .errors import (
     UnknownPriorItemDispositionError,
 )
 from .github import PullRequestMergeability
-from .prompts import render_coder_human_requirements_prompt_context
+from .prompt_support import (
+    render_coder_human_requirements_prompt_context,
+)
 from .protocol_common import (
     ParseDegradation,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,

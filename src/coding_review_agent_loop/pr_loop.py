@@ -211,15 +211,12 @@ from .finding_history import (
     FindingHistoryLedger,
     log_declared_generalization,
 )
+from .prompt_support import CompactPriorContext, CompactPrReviewTailContext, format_agent_list, render_coder_human_requirements_prompt_context
 from .prompts import (
-    CompactPriorContext,
-    CompactPrReviewTailContext,
     build_followup_prompt,
     build_merge_conflict_prompt,
     build_review_prompt,
     build_same_pr_followup_prompt,
-    format_agent_list,
-    render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
     ParsedPlanReview,

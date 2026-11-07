@@ -2,7 +2,9 @@
 
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
-from coding_review_agent_loop.prompts import HUMAN_REQUIREMENTS_ADDRESSED_MARKER
+from coding_review_agent_loop.protocol_common import (
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
 from issue_loop_test_helpers import FakeRunner
 from agent_loop_helpers import command_index, make_config, prior_item_dispositions
 

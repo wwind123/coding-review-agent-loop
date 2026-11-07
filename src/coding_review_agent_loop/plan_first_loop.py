@@ -140,9 +140,8 @@ from .finding_history import (
     FindingHistoryLedger,
     log_declared_generalization,
 )
+from .prompt_support import CompactPlanTailContext, CompactPriorContext, format_agent_list, render_coder_human_requirements_prompt_context
 from .prompts import (
-    CompactPlanTailContext,
-    CompactPriorContext,
     INHERITED_COVERAGE_DELTA_MAX_BYTES,
     INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES,
     build_issue_plan_prompt,
@@ -150,8 +149,6 @@ from .prompts import (
     inherited_obligations_enforceable_size,
     build_plan_review_prompt,
     build_plan_revision_prompt,
-    format_agent_list,
-    render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
     ParsedPlanReview,

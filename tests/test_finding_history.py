@@ -481,7 +481,9 @@ def test_planner_prompts_default_unchanged_and_carry_guidance_in_each_branch(tmp
     compact = build_plan_revision_prompt(
         *args, compact_context=True, generalization_guidance=True, finding_history=view
     )
-    from coding_review_agent_loop.prompts import COMPACT_PLANNING_VOLATILE_TAIL_MARKER
+    from coding_review_agent_loop.prompt_support import (
+        COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
+    )
 
     prefix, tail = compact.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER)
     assert "Proactive generalization" in prefix and "item-1" not in prefix

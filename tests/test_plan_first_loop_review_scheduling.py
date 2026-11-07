@@ -22,8 +22,10 @@ from coding_review_agent_loop.github import (
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
 from coding_review_agent_loop.round_state import _decode_round_metadata
-from coding_review_agent_loop.prompts import (
+from coding_review_agent_loop.prompt_support import (
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
+)
+from coding_review_agent_loop.protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
 from coding_review_agent_loop.protocol import (
