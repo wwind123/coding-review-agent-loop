@@ -385,7 +385,7 @@ def test_stage_one_is_never_blocked(tmp_path, monkeypatch):
     assert scenario.reads == []
 
 
-def test_parent_implement_by_phase_path_keeps_resume_hint(tmp_path, monkeypatch, capsys):
+def test_parent_implement_by_phase_path_resumes_child(tmp_path, monkeypatch, capsys):
     """Row parent-path-unchanged: the parent never raises the dependency error."""
     phases = _two_stage()
     scenario = GuardScenario(
@@ -408,9 +408,8 @@ def test_parent_implement_by_phase_path_keeps_resume_hint(tmp_path, monkeypatch,
         recommendation=fresh.recommendation, approved_plan_context=fresh.parent_plan_context,
         issue_context=issue_context(55), mode="implement-by-phase", coder_session_id=None,
     )
-    assert result == 0
-    assert "agent-loop issue 61" in capsys.readouterr().out
-    assert "dispatch" not in scenario.events
+    assert result == 23
+    assert "dispatch" in scenario.events
     assert ("verify", 61) not in scenario.reads
 
 

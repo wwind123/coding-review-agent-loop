@@ -1,4 +1,6 @@
 """Fresh risk-matrix integrity replay and string-list normalization (#1229)."""
+
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import hashlib
 import json
@@ -94,7 +96,7 @@ def _run(runner, config, texts_kind="plan_state"):
     logs: list[str] = []
     exhaustions = []
     with patch_object_in((validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", wraps=validated_agent_module._run_structured_repair) as spy, \
-            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda _c, m: logs.append(m)), \
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, issue_recovery, plan_execution,), "log", lambda _c, m: logs.append(m)), \
             patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
             patch.object(validated_agent_module.time, "sleep", lambda *_a: None):
         try:

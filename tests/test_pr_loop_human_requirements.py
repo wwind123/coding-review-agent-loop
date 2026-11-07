@@ -1,5 +1,6 @@
 """PR-loop tests for unresolved_items and pr_loop: PR human requirements (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
@@ -463,7 +464,7 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
         ]
     )
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: next(contexts),
     )
 
@@ -670,7 +671,7 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
             else (requirement_1,),
         )
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         next_context,
     )
     config = make_config(

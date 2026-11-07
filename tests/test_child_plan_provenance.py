@@ -1,3 +1,4 @@
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 from agent_loop_helpers import patch_object_in
 import base64
@@ -695,7 +696,7 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
             normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57
         ),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -743,7 +744,7 @@ def test_legacy_ambiguous_child_workflow_plans_unless_legacy_handoff_exists(
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     dispatched = []
-    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop, issue_recovery,), "prepare_agent_memory", lambda *_args, **_kwargs: None)
     patch_attr_in(monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: dispatched.append(kwargs) or 0,
     )
@@ -980,7 +981,7 @@ def test_rerun_preflight_reconciles_a_published_shortened_retained_excerpt(
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1034,7 +1035,7 @@ def test_rerun_preflight_still_rejects_a_foreign_retained_excerpt(tmp_path, monk
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1091,7 +1092,7 @@ def test_rerun_preflight_rejects_an_appended_retained_excerpt(tmp_path, monkeypa
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
@@ -1671,7 +1672,7 @@ def test_managed_ci_resume_divergent_child_records_never_consult_parent(
         seen.append(comments)
         return unrecorded_divergent(comments, **kwargs)
 
-    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", divergent)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_recovery,), "recover_approved_plan_context", divergent)
     # Only plan recovery is observed; the refusal remedy's route lookup reads
     # the parent's provenance (#1662) but never offers it as a plan source.
     monkeypatch.setattr(execution_policy, "recover_approved_plan_context", unrecorded_divergent)
@@ -4708,7 +4709,7 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
     runner, plan, parent, normalized, retained, created = _long_title_rerun_1207(
         tmp_path, bodyless_search=bodyless_search
     )
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
 
     result = execution_policy._preflight_fresh_staged_topology(
@@ -5406,3 +5407,124 @@ def test_m1390_edited_supersession_child_activates_a_pending_amendment_at_the_re
     ]
     assert amended and min(r.round_number for r in amended) == retained_round
     assert not world.agent_calls("agy")
+
+
+@pytest.mark.parametrize("entry", ["parent", "child"])
+@pytest.mark.parametrize("result", [0, 7])
+@pytest.mark.parametrize("case", ["canonical", "inadmissible", "supersession", "no-pr", "parent-close", "retired"])
+def test_parent_and_child_planning_recovery_share_checks(
+    tmp_path, monkeypatch, entry, result, case
+):
+    """Real dispatch/recovery retains handoff authority across both entry paths."""
+    world = (_m988_rebound_world(tmp_path, monkeypatch) if case == "retired" else
+             _M936World(tmp_path, monkeypatch, weak=case == "inadmissible",
+                        signed=case == "supersession"))
+    selected_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO",
+    ).plan_hash
+    # A complete newer round reconstructs independently, but cannot replace
+    # the plan selected by the implementation handoff.
+    from coding_review_agent_loop.round_state import _resume_plan_round
+    newer_raw = _m936_child_state(_m936_inherited_row(), summary="Newer unrelated round.")
+    newer_record = _m936_unbound_round(world, newer_raw, number=9)
+    newer = _extract_round_metadata_records([newer_record], flow="plan")[0].metadata.canonical_plan
+    if case != "no-pr":
+        world.comments.append(newer_record)
+        assert _resume_plan_round(world.comments, configured_reviewers=("codex",))[0] == newer
+        assert approved_plan_hash(newer) != world.old_hash
+    if case == "no-pr":
+        world.comments = [c for c in world.comments if not AGENT_ISSUE_PR_HANDOFF_RE.search(c.body)]
+    calls, plans = [], []
+    def pr_boundary(_runner, **kwargs):
+        calls.append(kwargs)
+        return result
+    def planning_boundary(_runner, **kwargs):
+        plans.append(kwargs)
+        return result
+    monkeypatch.setattr(issue_recovery, "run_pr_loop", pr_boundary)
+    monkeypatch.setattr(issue_loop, "_run_plan_first_loop", planning_boundary)
+    world.runner = _ChildPlanningRunner(pr_payload={
+        "number": 77, "body": "Fixes #56" + ("\nCloses #55" if case == "parent-close" else ""),
+        "state": "OPEN", "url": "https://github.com/OWNER/REPO/pull/77",
+    })
+    config = world.config()
+    def invoke():
+        if entry == "child":
+            return issue_loop.run_issue_loop(world.runner, issue_number=56, config=config, plan_first=True)
+        child = world._issue_context(world.runner, config=config, issue_number=56)
+        fresh = execution_policy._resolve_fresh_child_provenance(
+            issue_context=child, parent_issue_context=world.parent,
+        )
+        from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+        from coding_review_agent_loop.validated_agent import _new_usage_context
+        return plan_execution._dispatch_current_decomposition_phase(
+            world.runner, run_plan_first_loop=planning_boundary, config=config, memory=None,
+            usage_context=_new_usage_context(config), issue_number=55,
+            current_plan=fresh.approved_plan, plan_subject=fresh.plan_subject,
+            outcome=StagedTopologyOutcome(
+                created=(fresh.created,), stage_ids=(fresh.stage_id,), automations=("agent-pr",),
+                plan_hash=fresh.plan_hash, mode="implement-by-phase", topology_source="approved-plan-v1",
+            ), recommendation=fresh.recommendation,
+            approved_plan_context=fresh.parent_plan_context, issue_context=world.parent,
+            mode="implement-by-phase", coder_session_id="parent-session",
+        )
+    if case in {"inadmissible", "parent-close"}:
+        with pytest.raises(AgentLoopError):
+            invoke()
+        assert calls == [] and plans == []
+    else:
+        assert invoke() == result
+        if case in {"canonical", "retired"}:
+            assert plans == [] and len(calls) == 1
+            call = calls[0]
+            assert call["pr_number"] == 77
+            assert call["issue_context"].number == 56
+            assert call["parent_issue_context"].number == 55
+            assert call["approved_plan_context"].plan_hash == selected_hash
+            assert call["managed_ci_issue_number"] == 56
+        else:
+            assert calls == [] and len(plans) == 1
+            call = plans[0]
+            assert call["issue_number"] == 56
+            assert call["requested_policy"] == "auto"
+            assert call["inherited_matrix_binding"] is not None
+            assert bool(call.get("plan_supersession")) == (case == "supersession")
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in body for body in world.posted())
+    assert world.runner.issues == []
+
+
+def test_parent_direct_resume_keeps_managed_child_authority(tmp_path, monkeypatch):
+    """Parent dispatch reaches the existing managed authorization/head revalidation."""
+    from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+    from coding_review_agent_loop.validated_agent import _new_usage_context
+    plan = fresh_staged_plan(first_disposition="direct-implementation")
+    child, parent = fresh_child_contexts(plan, handoff_execution_disposition="direct-implementation")
+    _run, runner, captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent,
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",), plan_execution_mode="implement-by-phase",
+    )
+    fresh = execution_policy._resolve_fresh_child_provenance(
+        issue_context=child, parent_issue_context=parent,
+    )
+    with pytest.raises(_ManagedResumeCaptured):
+        plan_execution._dispatch_current_decomposition_phase(
+            runner, run_plan_first_loop=_m1278_plan_loop._run_plan_first_loop,
+            config=config, memory=None, usage_context=_new_usage_context(config), issue_number=55,
+            current_plan=fresh.approved_plan, plan_subject=fresh.plan_subject,
+            outcome=StagedTopologyOutcome(
+                created=(fresh.created,), stage_ids=(fresh.stage_id,), automations=("agent-pr",),
+                plan_hash=fresh.plan_hash, mode="implement-by-phase", topology_source="approved-plan-v1",
+            ), recommendation=fresh.recommendation, approved_plan_context=fresh.parent_plan_context,
+            issue_context=parent, mode="implement-by-phase", coder_session_id="parent-session",
+        )
+    assert captured["handoff"].issue_number == 56
+    assert captured["handoff"].pr_number == 77
+    assert captured["handoff"].head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert_no_agent_process(runner)
+    assert runner.issues == []
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in body for body in runner.comments)

@@ -21,6 +21,7 @@ import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.execution_policy as execution_policy
 import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from agent_loop_helpers import patch_attr_in
@@ -1436,7 +1437,7 @@ def test_legacy_resume_observes_before_publication(tmp_path, monkeypatch, outcom
 
     runner.run = run
     delegated = []
-    monkeypatch.setattr(issue_loop, "run_pr_loop", lambda *a, **k: delegated.append(k) or 0)
+    patch_attr_in(monkeypatch, (issue_loop, issue_recovery), "run_pr_loop", lambda *a, **k: delegated.append(k) or 0)
     if outcome == "converged":
         assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
         assert delegated

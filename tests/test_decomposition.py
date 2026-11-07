@@ -1,4 +1,7 @@
 import coding_review_agent_loop.plan_execution as plan_execution
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
 import base64
 import dataclasses
 import json
@@ -1714,7 +1717,12 @@ def test_issue_loop_plan_first_implement_by_phase_rerun_without_handoff_implemen
     assert len(claude_calls) == 1
     assert "GitHub issue #99" in claude_calls[0][-1]
 
-def test_issue_loop_plan_first_implement_by_phase_rerun_with_handoff_stops(tmp_path, capsys):
+def test_issue_loop_plan_first_implement_by_phase_rerun_with_handoff_resumes(tmp_path, capsys, monkeypatch):
+    resumed = []
+    def resume(_runner, **kwargs):
+        resumed.append(kwargs)
+        return 0
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue", resume)
     plan = structured_plan_state(summary="Add schema helpers.")
     child = CreatedPhaseIssue(
         phase=RecordedPhase(title="Schema helpers", automation="agent-pr"),
@@ -1774,8 +1782,7 @@ def test_issue_loop_plan_first_implement_by_phase_rerun_with_handoff_stops(tmp_p
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     output = capsys.readouterr().out
-    assert "already handed off to child issue #99" in output
-    assert "agent-loop issue 99" in output
+    assert [call["issue_number"] for call in resumed] == [99]
     assert runner.issues == []
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
@@ -3040,8 +3047,11 @@ def test_unreadable_parent_history_withholds_the_record(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("pr_state", [None, "OPEN"])
-def test_staged_parent_hints_only_for_an_open_child(tmp_path, capsys, pr_state):
+def test_staged_parent_resumes_only_an_open_child(tmp_path, capsys, pr_state, monkeypatch):
     """Matrix row `open-child-runnable-hint`."""
+    resumed = []
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue",
+                        lambda _runner, **kwargs: resumed.append(kwargs) or 0)
     plan, created, summary = staged_legacy_plan_records(stage_count=1)
     parent_comments = approved_plan_comments(plan) + [
         {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
@@ -3062,8 +3072,7 @@ def test_staged_parent_hints_only_for_an_open_child(tmp_path, capsys, pr_state):
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     output = capsys.readouterr().out
-    assert "already handed off to child issue #99" in output
-    assert "`agent-loop issue 99`" in output
+    assert [call["issue_number"] for call in resumed] == [99]
     assert "--implementation-coder" not in output
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
@@ -3431,8 +3440,13 @@ def test_staged_parent_names_the_phase_when_a_child_state_is_malformed(tmp_path,
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
-def test_legacy_rerun_with_recorded_stage_ids_keeps_todays_hint(tmp_path, capsys):
+def test_legacy_rerun_with_recorded_stage_ids_resumes(tmp_path, capsys, monkeypatch):
     """Matrix row `legacy-topology-rerun`: recorded stage identity and hint."""
+    resumed = []
+    def resume(_runner, **kwargs):
+        resumed.append(kwargs)
+        return 0
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue", resume)
     plan, created, summary = staged_v1_recorded_plan_records()
     parent_comments = approved_plan_comments(plan) + [
         {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
@@ -3452,7 +3466,7 @@ def test_legacy_rerun_with_recorded_stage_ids_keeps_todays_hint(tmp_path, capsys
     assert "recorded-stage-1: in progress (#99)" in output
     assert "recorded-stage-2: pending" in output
     # A legacy handoff resumes as direct implementation, never child planning.
-    assert "resume directly with `agent-loop issue 99`" in output
+    assert [call["issue_number"] for call in resumed] == [99]
     assert "--plan-first" not in output
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
@@ -3589,12 +3603,17 @@ def test_staged_progress_wraps_a_raw_parsing_failure_with_phase_context(monkeypa
     assert isinstance(failure.value.__cause__, ValueError)
 
 
-def test_later_closed_human_stage_is_reported_while_an_earlier_phase_is_open(tmp_path, capsys):
+def test_later_closed_human_stage_is_reported_while_an_earlier_phase_is_open(tmp_path, capsys, monkeypatch):
     """A human stage closed ahead of its turn renders as attested, not pending.
 
     The earlier agent phase is still the selected, resumable one: the operator
     keeps its hint, and the closed human stage confers no authority to skip it.
     """
+    resumed = []
+    def resume(_runner, **kwargs):
+        resumed.append(kwargs)
+        return 0
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue", resume)
     plan, created, summary = staged_legacy_plan_records(
         stage_count=3, automations=("agent-pr", "human-action", "agent-pr")
     )
@@ -3618,7 +3637,7 @@ def test_later_closed_human_stage_is_reported_while_an_earlier_phase_is_open(tmp
     assert "2: complete (#100, human attestation)" in output
     assert "2: pending" not in output
     # The still-open earlier phase remains the resume target.
-    assert "resume directly with `agent-loop issue 99`" in output
+    assert [call["issue_number"] for call in resumed] == [99]
     # No PR evidence is read for the human stage, and phase 3 stays unread.
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
     assert not any(
@@ -4740,3 +4759,172 @@ def test_parent_stdout_relaunch_lines_use_reviewed_routes_for_adopted_children()
     assert [f"- {line}" for line in lines] == (
         body.split("Relaunch commands:\n", 1)[1].split("\n\n", 1)[0].splitlines()
     )
+
+
+@pytest.mark.parametrize("topology", ["fresh", "legacy", "legacy-stage-ids"])
+@pytest.mark.parametrize("result", [0, 7])
+@pytest.mark.parametrize("policy", ["auto", "implement-by-phase"])
+def test_parent_resume_recovers_canonical_child_pr(
+    tmp_path, monkeypatch, topology, result, policy
+):
+    """Parent entry drives real dispatch and canonical recovery, without a coder."""
+    from test_child_plan_provenance import fresh_staged_plan, fresh_child_contexts, comment
+    from coding_review_agent_loop.github import get_issue_context
+
+    if topology == "fresh":
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+        plan = fresh_staged_plan(first_disposition=EXECUTION_DISPOSITION_DIRECT)
+        payload, end = json.JSONDecoder().raw_decode(plan)
+        for key in ("risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes"):
+            payload.pop(key, None)
+        plan = json.dumps(payload) + plan[end:]
+        raw_response = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+        parsed = validate_structured_plan_state(raw_response)
+        child, parent = fresh_child_contexts(
+            plan, handoff_execution_disposition=EXECUTION_DISPOSITION_DIRECT,
+        )
+        approvals = (
+            comment(_attach_round_metadata(plan, PostedRoundMetadata(
+                flow="plan", role="coder", agent="Claude", round_number=1,
+                subject=_plan_subject(plan), canonical_plan=plan,
+                raw_structured_coder_response=raw_response, execution_strategy_contract_version=1,
+                execution_strategy_identity=parsed.execution_recommendation.identity(),
+            ))),
+            comment(approved_plan_comments(plan)[1]["body"]),
+        )
+        parent = dataclasses.replace(parent, comments=(*approvals, *parent.comments[1:]))
+        parent_number, child_number = 55, 56
+        decomposition, _ = normalize_execution_recommendation(
+            parsed.execution_recommendation, approved_plan=plan, plan_subject=_plan_subject(plan),
+        )
+        phase_two = decomposition.phases[1]
+        second_body = format_phase_issue_body(
+            repo="OWNER/REPO", parent_issue=55, approved_plan=plan, phase=phase_two,
+            created_so_far=(CreatedPhaseIssue(phase=decomposition.phases[0], issue_number=56, issue_url=child.url),),
+            phase_identity_value=phase_identity(
+                parent_issue=55, plan_hash=approved_plan_hash(plan), topology_source="approved-plan-v1",
+                phase_index=2, phase=phase_two, stage_id=phase_two.stage_id,
+                execution_strategy_contract_version=1,
+            ), topology_source="approved-plan-v1", phase_index=2, phase_plan_hash=approved_plan_hash(plan),
+            strategy="staged", recommendation_digest=decomposition.recommendation_digest,
+            execution_strategy_contract_version=1,
+        )
+        runner = FakeRunner(
+            pr_payload={"body": "Fixes #56"},
+            issue_payloads_by_number={
+                56: {"title": "Phase 1: First contract (from #55)", "body": child.body, "url": child.url},
+                57: {"title": "Phase 2: Second contract (from #55)", "body": second_body,
+                     "url": "https://github.com/OWNER/REPO/issues/57"},
+            },
+        )
+        real_get = get_issue_context
+        def contexts(runner, *, config, issue_number):
+            if issue_number == 55:
+                return parent
+            if issue_number == 56:
+                return child
+            return real_get(runner, config=config, issue_number=issue_number)
+        patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop,
+                                   plan_execution, plan_first_loop, pr_loop,
+                                   pr_loop_support, phase_progress_module),
+                      "get_issue_context", contexts)
+    else:
+        records = (staged_legacy_plan_records(stage_count=2) if topology == "legacy"
+                   else staged_v1_recorded_plan_records())
+        plan, created, summary = records
+        child_handoff = child_pr_handoff_comment(99, 912)
+        child_handoff["body"] = format_issue_pr_handoff_comment(
+            issue_number=99, pr_number=912, pr_url="https://github.com/OWNER/REPO/pull/912",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            flow="approved-plan-implementation", plan_hash=approved_plan_hash(plan),
+        )
+        runner = FakeRunner(
+            issue_comments=approved_plan_comments(plan) + [
+                {"author": {"login": "bot"}, "body": summary},
+                phase_handoff_comment(plan, created, 1),
+            ],
+            issue_comments_by_number={99: [child_handoff], 100: []},
+            pr_payloads_by_number={912: {**pr_payload_for_state(912, "OPEN"), "body": "Fixes #99"}},
+        )
+        parent_number, child_number = 56, 99
+        # Legacy auto is intentionally unsupported; retain its explicit policy.
+        if policy == "auto":
+            policy = "implement-by-phase"
+    recovered = []
+    def pr_loop_boundary(_runner, **kwargs):
+        recovered.append(kwargs)
+        return result
+    monkeypatch.setattr(issue_implementation, "run_pr_loop", pr_loop_boundary)
+    config = make_config(tmp_path, plan_execution_mode=policy)
+    assert run_issue_loop(runner, issue_number=parent_number, config=config, plan_first=True) == result
+    assert len(recovered) == 1
+    call = recovered[0]
+    assert call["issue_context"].number == child_number
+    assert call["parent_issue_context"].number == parent_number
+    assert call["managed_ci_issue_number"] == child_number
+    assert call["approved_plan_context"].plan_hash == approved_plan_hash(plan)
+    assert runner.issues == []
+    assert not any(cmd[0] in {"claude", "codex", "agy", "gemini"} for cmd, _ in runner.commands)
+    assert not any(PHASE_IMPLEMENTATION_MARKER_RE.search(body) for body in runner.comments)
+
+
+@pytest.mark.parametrize("existing", [True, False])
+@pytest.mark.parametrize("topology", ["fresh", "legacy", "legacy-stage-ids"])
+def test_parent_resume_before_pr_does_not_reuse_parent_session(
+    tmp_path, monkeypatch, existing, topology
+):
+    """Drive the real child implementation until its first coder invocation."""
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+    from coding_review_agent_loop.validated_agent import _new_usage_context
+    if topology == "fresh":
+        from test_child_plan_provenance import fresh_staged_plan, fresh_child_contexts
+        plan = fresh_staged_plan(first_disposition=EXECUTION_DISPOSITION_DIRECT)
+        child, parent = fresh_child_contexts(plan, handoff_execution_disposition=EXECUTION_DISPOSITION_DIRECT)
+        child = dataclasses.replace(child, comments=())
+        if not existing:
+            parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+        fresh = execution_policy._resolve_fresh_child_provenance(
+            issue_context=child, parent_issue_context=parent,
+        )
+        created = (fresh.created,)
+        parent_number = 55
+        recommendation = fresh.recommendation
+        runner = FakeRunner()
+        patch_attr_in(monkeypatch, (plan_execution, execution_policy, child_plan_binding), "get_issue_context",
+                      lambda _runner, **kwargs: child if kwargs["issue_number"] == 56 else parent)
+    else:
+        plan, created, summary = (staged_legacy_plan_records(stage_count=2) if topology == "legacy"
+                                  else staged_v1_recorded_plan_records())
+        comments = approved_plan_comments(plan) + [{"author": {"login": "bot"}, "body": summary}]
+        if existing:
+            comments.append(phase_handoff_comment(plan, created, 1))
+        runner = FakeRunner(issue_comments=comments, issue_comments_by_number={99: [], 100: []})
+        parent_number = 56
+        recommendation = None
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+    assert issue_implementation._approved_implementation_config(config)[1] is True
+    sessions = []
+    class CoderReached(Exception):
+        pass
+    def coder_boundary(*args, **kwargs):
+        sessions.append(kwargs["session_id"])
+        raise CoderReached
+    monkeypatch.setattr(issue_implementation, "_run_validated_agent", coder_boundary)
+    if topology != "fresh":
+        parent = execution_policy.get_issue_context(runner, config=config, issue_number=56)
+    with pytest.raises(CoderReached):
+        plan_execution._dispatch_current_decomposition_phase(
+            runner, run_plan_first_loop=plan_first_loop._run_plan_first_loop,
+            config=config, memory=None, usage_context=_new_usage_context(config),
+            issue_number=parent_number, current_plan=plan, plan_subject=_plan_subject(plan),
+            outcome=StagedTopologyOutcome(
+                created=created, stage_ids=tuple(getattr(p.phase, "stage_id", None) or str(i) for i, p in enumerate(created, 1)),
+                automations=("agent-pr",) * len(created), plan_hash=approved_plan_hash(plan),
+                mode="implement-by-phase", topology_source="approved-plan-v1" if topology == "fresh" else "legacy",
+            ), recommendation=recommendation,
+            approved_plan_context=make_approved_plan_context(plan), issue_context=parent,
+            mode="implement-by-phase", coder_session_id="parent-session",
+        )
+    assert sessions == [None if existing else "parent-session"]
+    assert runner.issues == []
+    assert sum(bool(PHASE_IMPLEMENTATION_MARKER_RE.search(body)) for body in runner.comments) == (0 if existing else 1)

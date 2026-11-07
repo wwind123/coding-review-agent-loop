@@ -54,3 +54,12 @@ coverage intercepts both actual calls without live GitHub/provider activity.
 - `round_metadata.py`: 3261 lines.
 - `plan_first_loop.py`: 4785 lines.
 - `plan_execution.py`: 1310 lines.
+
+## Shared issue recovery (#1939)
+
+`issue_recovery.py` owns plan selection, inherited-row/supersession validation,
+retirement and canonical-PR recovery. `issue_loop` and resumed planning-child
+dispatch call it without another entry-point claim or telemetry scope. Planning
+continues via the caller's explicit callback. Test patches follow moved recovery
+lookups; dependencies still used by issue/task creation retain both owners.
+Only the deliberately changed dispatch and child-planning body hashes are updated.

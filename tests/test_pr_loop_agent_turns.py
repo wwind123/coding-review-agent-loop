@@ -1,5 +1,6 @@
 """PR-loop tests for validated_agent, agent_failure and repair: PR-loop agent turns (#1542)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import dataclasses
 import datetime
@@ -750,7 +751,7 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
         head_branch="feature/review-context", base_branch="main",
         head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: PullRequestReviewContext(
             metadata=metadata, comments=(), human_requirements=(requirement,)
         ),
@@ -850,7 +851,7 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         body="Keep the current audit trail.",
     )
     real_context = pr_loop_support.get_observed_pr_review_context
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
         lambda *args, **kwargs: dataclasses.replace(
             real_context(*args, **kwargs), human_requirements=(requirement,)
         ),
@@ -1034,7 +1035,7 @@ def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
     def boom(*_a, **_k):
         raise AgentLoopError("pr stop")
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", boom)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", boom)
     with pytest.raises(AgentLoopError, match="pr stop"):
         pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     records = list(load_records(telemetry_log_path()))

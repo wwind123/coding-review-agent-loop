@@ -1,5 +1,6 @@
 """Issue-loop tests: run-window telemetry (#1543)."""
 
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
 import pytest
 
@@ -62,7 +63,7 @@ def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_att
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     seen = {}
@@ -85,7 +86,7 @@ def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_att
         seen["after_nested"] = dict(inner_runner.telemetry_attribution)
         return 0
 
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", nested_pr_phase)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop", nested_pr_phase)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
 
     records = list(load_records(telemetry_log_path()))
@@ -139,7 +140,7 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     seen = {}
@@ -176,8 +177,8 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
             broker.stop()
         raise AgentLoopError("stop after broker attempt")
 
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", observed_pr_loop)
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", first_pr_read)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop", observed_pr_loop)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", first_pr_read)
     with pytest.raises(AgentLoopError, match="stop after broker attempt"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
 
@@ -279,7 +280,7 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path, max_rounds=3)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
@@ -292,7 +293,7 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
         finally:
             seen["after_nested"] = dict(runner.telemetry_attribution)
 
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", observed)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop", observed)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
 
     assert real_launches and real_launches[0][0] == 0 and "outcome=passed" in real_launches[0][1]

@@ -3306,9 +3306,9 @@ earlier phase titles. Parent decomposition metadata
 metadata payload is `v1_`-prefixed zlib-compressed URL-safe base64, like the
 topology checkpoint; summaries published in the earlier plain-base64 form
 remain readable. While an
-`implement-by-phase` child is still open, rerun that child issue directly
-instead of expecting the parent to restart it; once it is closed with a merged
-PR, rerun the parent to advance to the next phase.
+`implement-by-phase` child is still open, rerun the parent to resume that child,
+or run the child issue directly with its recorded route. Once it is closed with
+a merged PR, rerun the parent to advance to the next phase.
 
 Implement a free-form task:
 
@@ -5227,6 +5227,17 @@ the decision rests on.
 
 ### Phased decomposition versus split materialization
 
+Rerunning a staged parent resumes its first incomplete safely routed agent child,
+including an existing child PR. For example, rerun `agent-loop issue 1927
+--plan-first --plan-execution-mode auto` after an interrupted stage. The parent
+reuses the child's handoff and returns the child's exact exit status, including
+managed-CI timing stops. Exit zero retains the child's usual meaning; it does
+not promise that the child merged or every parent obligation is delivered.
+Planning children use the same plan and PR recovery checks as direct child
+`--plan-first` entry. Only the current phase runs: rerun the parent again after
+delivery to advance to the next phase. Human stages and non-executing modes
+keep their existing stops, and unsafe recovery still fails closed.
+
 #### Staged plans under plan-only and implement-one-shot
 
 `plan-only` and `implement-one-shot` apply the phased-delivery guard: a plan that
@@ -5320,8 +5331,9 @@ What each mechanism produces and where the run stops:
   report once every phase is complete, recording it on the parent as an
   `AGENT_PLAN_STAGED_COMPLETION` comment. If the selected phase is `human-action`
   or `manual-close` and its child is still open, the run stops without
-  implementing anything. Resume an in-progress child with
-  `agent-loop issue <child>`; rerun the parent to move on to the next phase.
+  implementing anything. Rerun the parent to resume its in-progress agent child
+  and return that child's result; after delivery a later rerun advances to the
+  next phase. Direct child entry with its recorded route remains supported.
 - **`--materialize-split-issues`**: files one linked child issue for discuss
   `split` proposals or plan-only/one-shot deferred work. Use
   `external_dependencies` for existing `#N`, issue URL, or

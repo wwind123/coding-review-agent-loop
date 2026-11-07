@@ -491,8 +491,9 @@ A `human-action` or `manual-close` phase is
 complete on closure of its child issue alone - that closure is the operator
 attestation, and no PR evidence is read for it. The first incomplete phase is
 dispatched through the existing child-dispatch seam with its real phase index;
-an in-progress phase instead yields a runnable resume command for its still-open
-child; and a fully complete topology yields a terminal report that distinguishes
+an in-progress agent phase uses the same dispatcher to resume its still-open
+child and returns its exact integer result; and a fully complete topology yields
+a terminal report that distinguishes
 agent-delivered stages from human-attested ones and names any operator-owned
 retained-parent and final-integration work. Final-integration work is never
 implemented automatically and the delivered parent is never closed
@@ -555,6 +556,17 @@ guards. To correct an invalid approved plan, post a new signed human requirement
 requesting a corrected plan, then rerun. The reopened plan enters the unapproved
 round-start correction path. An ordinary issue edit or rerun alone does not retire
 approvals. Compatible legacy plans without recommendations keep their existing route.
+
+
+Parent-driven planning-child resume and direct plan-first issue entry share
+`issue_recovery.py`: handoff-selected plan reconstruction, inherited-row and
+signed supersession validation, retirement/history, canonical-PR resolution,
+execution-policy preflights and closing-contract checks precede child work.
+Startup, telemetry and workdir claims remain entry-owned. Existing handoffs are
+reused; resumed implementation never inherits a parent planning session. Recovery
+returns either a handled integer (including zero) or validated continuation state.
+New and resumed children stop at one current phase; later-rerun advancement still
+requires authenticated delivery of earlier phases.
 
 
 ## Decisions

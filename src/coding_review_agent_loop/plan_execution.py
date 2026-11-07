@@ -80,7 +80,6 @@ from .execution_policy import (
     ChildExecutionRoute,
     resolve_child_execution_route,
     _fresh_phase_marker_payload,
-    _child_resume_hint,
     child_relaunch_line,
     _post_child_planning_handoff,
     _print_staged_phase_progress,
@@ -111,6 +110,8 @@ def _run_child_planning_cycle(
     parent_issue: int,
     child_issue_number: int,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    resume: bool = False,
+    parent_issue_context: IssueContext | None = None,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
     # The child inherits the operator's run-wide plan-review policy and primary
@@ -152,6 +153,39 @@ def _run_child_planning_cycle(
         f"Issue #{parent_issue}: child #{child_issue_number} requires its own reviewed plan; "
         "starting the child plan-first cycle with policy auto before any implementation coder",
     )
+    if resume:
+        from .issue_recovery import recover_issue_execution
+        from .execution_policy import _resolve_fresh_child_provenance
+        from .plan_verification import enforce_issue_board_floor, build_plan_approval_inputs
+        from .reviewer_floor import board_floor_enabled
+        from .panel_evidence import plan_issue_text_digest
+
+        fresh_child = _resolve_fresh_child_provenance(
+            issue_context=child_issue_context, parent_issue_context=parent_issue_context,
+        )
+        if fresh_child is None or not fresh_child.route.is_planning:
+            raise AgentLoopError("Child planning resume requires authenticated planning provenance.")
+        if board_floor_enabled(child_config):
+            enforce_issue_board_floor(
+                child_config, child_issue_context.comments,
+                issue_number=child_issue_number, runner=runner,
+                human_requirements=child_issue_context.human_requirements, planning=True,
+                inputs=build_plan_approval_inputs(
+                    runner, issue_context=child_issue_context, config=child_config,
+                    parent_issue_context=parent_issue_context,
+                ),
+                issue_digest=plan_issue_text_digest(child_issue_context),
+            )
+        recovery = recover_issue_execution(
+            runner, config=child_config, issue_number=child_issue_number,
+            issue_context=child_issue_context, parent_issue_context=parent_issue_context,
+            staged_parent_issue=parent_issue, fresh_child=fresh_child,
+            plan_first=True, requested_policy="auto", implement_after_approval=False,
+            usage_context=usage_context, run_plan_first_loop=run_plan_first_loop,
+        )
+        if isinstance(recovery, int):
+            return recovery
+        child_config, child_issue_context = recovery.config, recovery.issue_context
     return run_plan_first_loop(
         runner,
         issue_number=child_issue_number,
@@ -191,6 +225,8 @@ def _dispatch_decomposition_child(
     entry.  The handoff is persisted before any coder or planning work; when
     a matching handoff already exists it is reused, never re-posted.
     """
+    if existing_handoff is not None:
+        coder_session_id = None
     if created.issue_number is None:
         raise AgentLoopError(
             "Cannot implement decomposed phase because its child issue number "
@@ -238,6 +274,8 @@ def _dispatch_decomposition_child(
             usage_context=usage_context,
             parent_issue=parent_issue,
             child_issue_number=created.issue_number,
+            resume=existing_handoff is not None,
+            parent_issue_context=parent_issue_context,
             inherited_matrix_binding=_inherited_matrix_binding(
                 parent_issue=parent_issue,
                 stage_id=stage_id,
@@ -436,15 +474,6 @@ def _dispatch_current_decomposition_phase(
         child_issue_number=child_issue_number,
     )
     if not fresh:
-        if handoff is not None:
-            # Only an in-progress phase reaches here: a completed child is
-            # never advertised as a resume target (#918).
-            print(
-                f"Issue #{issue_number} approved plan already handed off to child issue "
-                f"#{handoff.child_issue_number}; resume directly with "
-                f"`agent-loop issue {handoff.child_issue_number}`."
-            )
-            return 0
         route = ChildExecutionRoute(EXECUTION_DISPOSITION_DIRECT, None, "legacy-topology")
         overrides: tuple[ChildDispositionOverride, ...] = ()
     else:
@@ -467,15 +496,6 @@ def _dispatch_current_decomposition_phase(
             recorded_handoff=handoff,
             overrides=overrides,
         )
-        if handoff is not None:
-            # Reconciliation ran inside the seam; the hint follows the
-            # recorded route so it never guides into the conflicting form.
-            print(
-                f"Issue #{issue_number} approved plan already handed off to child issue "
-                f"#{handoff.child_issue_number} with disposition `{route.disposition}`; "
-                f"resume directly with `{_child_resume_hint(handoff.child_issue_number, route.disposition)}`."
-            )
-            return 0
     if not fresh:
         child_issue_context = get_issue_context(
             runner, config=config, issue_number=child_issue_number
