@@ -64,6 +64,16 @@ def _state(pr):
     return draft + ("/labeled" if labeled else "/unlabeled")
 
 
+def source_body_refusal_advice(runner, config, pr_number):
+    """Measure lifecycle for early body/identity refusals without any writes."""
+    try:
+        pr = api._api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+        state = _state(pr)
+    except AgentLoopError:
+        state = "unknown/unknown"
+    return source_recovery_advice(config, pr_number, state=state)
+
+
 def _comments(runner, config, pr_number):
     values, reason = api._api_list_detailed(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
     if values is None:

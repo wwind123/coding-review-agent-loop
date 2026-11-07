@@ -194,7 +194,7 @@ def _recover_managed_pr_origin(
 
 
 def recover_managed_pr_origin(body: str, *, fetched_head_branch: str | None,
-                              config: AgentLoopConfig | None = None, pr_number: int | None = None):
+                              config: AgentLoopConfig | None = None, pr_number: int | None = None, runner=None):
     """Recover candidates with actionable diagnostics at the PR-loop boundary."""
     try:
         candidate = _recover_managed_pr_origin(body, fetched_head_branch=fetched_head_branch)
@@ -204,11 +204,24 @@ def recover_managed_pr_origin(body: str, *, fetched_head_branch: str | None,
     except AgentLoopError as exc:
         if config is None or pr_number is None:
             raise
-        from .managed_ci_source_authorization import source_recovery_advice
-        raise AgentLoopError(str(exc) + " " + source_recovery_advice(config, pr_number)) from exc
+        from .managed_ci_source_authorization import source_body_refusal_advice, source_recovery_advice
+        advice = (source_body_refusal_advice(runner, config, pr_number) if runner is not None
+                  else source_recovery_advice(config, pr_number))
+        raise AgentLoopError(str(exc) + " " + advice) from exc
 
 
-def validate_managed_pr_body(
+def validate_managed_pr_body(body, *, config=None, pr_number=None, runner=None, **identity):
+    """Keep all early body/identity refusals on the same measured recovery path."""
+    try:
+        _validate_managed_pr_body(body, **identity)
+    except AgentLoopError as exc:
+        if config is None or pr_number is None or runner is None:
+            raise
+        from .managed_ci_source_authorization import source_body_refusal_advice
+        raise AgentLoopError(str(exc) + " " + source_body_refusal_advice(runner, config, pr_number)) from exc
+
+
+def _validate_managed_pr_body(
     body: str,
     *,
     source_branch: str,

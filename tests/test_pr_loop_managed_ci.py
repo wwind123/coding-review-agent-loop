@@ -1837,18 +1837,48 @@ def test_source_accepted_coder_round_publishes_real_continuity_before_stop(tmp_p
     assert not any("DELETE" in cmd for cmd, _ in runner.commands)
 
 
-@pytest.mark.parametrize("body", ["missing source record", "<!-- AGENT_MANAGED_PR_SOURCE_V1 broken -->"])
-def test_source_early_body_refusal_supplies_conditional_ordinary_recovery(tmp_path, body):
+@pytest.mark.parametrize("damage,cause", [
+    ("missing", "provenance is missing"), ("malformed", "Invalid"),
+    ("base", "base branch does not match"),
+])
+@pytest.mark.parametrize("draft,labeled,state", [
+    (True, True, "draft/labeled"), (True, False, "draft/unlabeled"),
+    (False, False, "ready/unlabeled"), (None, True, "unknown/labeled"),
+    (None, False, "unknown/unlabeled"),
+])
+def test_source_early_body_refusal_supplies_conditional_ordinary_recovery(tmp_path, damage, cause, draft, labeled, state):
+    import copy
     from test_managed_ci_source_resume import SourceRunner, root, config
     runner = SourceRunner()
     root(runner, tmp_path)
-    runner.rest_pr["body"] = body
+    if damage == "base":
+        runner.rest_pr["base"]["ref"] = "other-base"
+    else:
+        runner.rest_pr["body"] = ("missing source record" if damage == "missing"
+                                 else "<!-- AGENT_MANAGED_PR_SOURCE_V1 broken -->")
+    runner.rest_pr.update(draft=draft, labels=[{"name": "agent-loop-managed"}] if labeled else [])
+    before = copy.deepcopy(runner.rest_pr)
     runner.commands.clear()
     with pytest.raises(AgentLoopError) as error:
         run_pr_loop(runner, pr_number=7, config=config(tmp_path))
-    assert "fresh PR state read" in str(error.value)
-    assert "--managed-ci --" not in str(error.value)
-    assert not any("POST" in cmd or "DELETE" in cmd for cmd, _ in runner.commands)
+    output = str(error.value)
+    assert cause in output and f"Measured lifecycle: {state}" in output
+    if draft is None:
+        assert "successful fresh PR state read" in output
+        assert "agent-loop pr 7" not in output
+    else:
+        for prerequisite in ("Resolve unrelated issue association or body blockers", "trusted owner",
+                             "verify `agent-loop-managed` is absent", "unlabeled pull_request workflow route",
+                             "restore that route", "Explicitly ready the draft", "without managed-CI, waiver",
+                             "fresh-authorization, adoption or auto-merge", "agent-loop pr 7 --repo OWNER/REPO"):
+            assert prerequisite in output
+        assert "successful fresh PR state read" not in output
+    assert "--managed-ci" not in output
+    assert runner.rest_pr == before
+    assert not any("POST" in cmd or "PATCH" in cmd or "DELETE" in cmd
+                   or cmd[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"])
+                   for cmd, _ in runner.commands)
+    assert runner.dispatch_count == 0
 
 
 @pytest.mark.parametrize("waived", [False, True])

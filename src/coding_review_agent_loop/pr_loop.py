@@ -1021,7 +1021,7 @@ def run_pr_loop(
         if managed_pr_origin is None:
             recovered_origin = recover_managed_pr_origin(
                 initial_pr_context.metadata.body or "",
-                fetched_head_branch=initial_pr_context.metadata.head_branch, config=config, pr_number=pr_number,
+                fetched_head_branch=initial_pr_context.metadata.head_branch, config=config, pr_number=pr_number, runner=runner,
             )
             if recovered_origin is not None:
                 managed_pr_origin = recovered_origin
@@ -1180,6 +1180,7 @@ def run_pr_loop(
                 fetched_base_branch=initial_pr_context.metadata.base_branch,
                 expected_base_branch=config.base,
                 require_creation_head_sha=not managed_pr_recovered,
+                config=config, pr_number=pr_number, runner=runner,
             )
             if managed_pr_recovered and authenticated_managed_resume is None and config.effective_managed_ci:
                 authenticated_managed_resume = authenticate_source_managed_resume(

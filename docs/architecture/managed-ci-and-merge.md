@@ -640,7 +640,9 @@ authority. Re-entry authenticates before draft/label writes and final activation
 rereads the tuple, body, active label and provenance before its audit write.
 
 Source-managed refusal reports use measured lifecycle state and conditional recovery
-prerequisites, preserving foreign/replaced-label ownership. Unknown state requires a
+prerequisites, preserving foreign/replaced-label ownership. Early body parsing and
+branch/base validation refusals share a fresh read of lifecycle state before choosing
+ordinary recovery guidance; they perform no lifecycle or label writes. Unknown state requires a
 fresh successful read. PR-loop entry first releases a retained label from an open
 ready PR for every origin, preserving qualified manual re-entry on strict and waived
 bases. Direct low-level ready/labeled refusal needs operator correction to draft/labeled with
