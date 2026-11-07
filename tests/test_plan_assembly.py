@@ -24,13 +24,15 @@ from coding_review_agent_loop.protocol import (
 from coding_review_agent_loop.protocol_risk import (
     RISK_MATRIX_MAX_ROWS,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     _attach_round_metadata,
     PostedRoundMetadata,
     _decode_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
     _plan_subject,
+)
+from coding_review_agent_loop.round_state import (
     _resume_plan_round,
 )
 from coding_review_agent_loop.round_transport import decode_mapping

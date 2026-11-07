@@ -23,7 +23,10 @@ from coding_review_agent_loop.publication_resume import (
 )
 from coding_review_agent_loop.review_rounds import _launch_reviewer_turns, _ReviewerTurnResult
 from coding_review_agent_loop.review_spool import ReviewRoundSpool
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 
 from agent_loop_helpers import make_config
 from test_github import ACTOR, OTHER_ACTOR, FakeGitHub, _iso

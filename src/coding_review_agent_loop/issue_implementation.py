@@ -108,11 +108,13 @@ from .usage import RunUsageContext
 from .workdirs import active_workdir
 from .workdir_guard import validate_assigned_head_advanced
 from .comment_rendering import render_public_agent_comment
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     PostedRoundMetadata,
     _attach_round_metadata,
     _plan_subject,
+)
+from .round_state import (
     make_approved_plan_context,
 )
 from .plan_growth import PlanGrowthApprovalVerdict

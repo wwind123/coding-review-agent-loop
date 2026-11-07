@@ -67,18 +67,20 @@ from .comment_rendering import (
     _extract_plan_human_requirements_block,
     render_public_agent_comment,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     PostedRoundMetadata,
     _attach_round_metadata,
-    _extract_round_metadata_records,
-    recover_approved_plan_context,
     PlanValidationDiagnosticPayload,
     PlanValidationDiagnosticTransport,
     encode_plan_validation_diagnostic_body,
     has_plan_validation_diagnostic_marker,
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
+)
+from .round_state import (
+    _extract_round_metadata_records,
+    recover_approved_plan_context,
 )
 from .round_transport import (
     prepare_round_comment,

@@ -22,7 +22,11 @@ from coding_review_agent_loop.decomposition import (
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import HumanReviewRequirement, IssueComment, IssueContext
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+    _plan_subject,
+)
 from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
 )
@@ -1831,7 +1835,9 @@ from coding_review_agent_loop.decomposition import (  # noqa: E402
     InheritedRowDifference,
     inherited_matrix_reviewed_deltas,
 )
-from coding_review_agent_loop.round_state import sanitize_plan_validation_diagnostic  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    sanitize_plan_validation_diagnostic,
+)  # noqa: E402
 
 CASE_SENSITIVE_EFFECT = "Do not unset $HOME_Dir or write /Var/Agent/State."
 WHITESPACE_SENSITIVE_EFFECT = "Do not run `git  push   --force origin main`."
@@ -3656,7 +3662,9 @@ def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path
     runner_kwargs = dict(codex_outputs=[PR_APPROVAL])
     assert world.run_pr(**runner_kwargs) == 0
     assert len(world.agent_calls("codex")) == 1
-    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.code_approval import (
+        _latest_pr_approved_reviews_for_head,
+    )
 
     new_context = execution_policy.recover_approved_plan_context(
         world.all_comments(),
@@ -4722,7 +4730,7 @@ from coding_review_agent_loop import plan_first_loop as _m1278_plan_loop  # noqa
 from coding_review_agent_loop.review_step_back import (  # noqa: E402
     derive_plan_step_back_state as _m1278_derive,
 )
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
     _decode_round_metadata as _m1278_decode,
     _encode_round_metadata as _m1278_encode,
 )
@@ -5194,7 +5202,9 @@ def test_m1377_signed_supersession_revises_and_approves_before_the_pr_is_rebound
     replacement: the planner revises, every reviewer of the effective board approves
     the replacement, and only then is open PR #77 rebound, once, to the new hash."""
     from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_HEADING
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     world = _M1377World(tmp_path, monkeypatch)
     outputs = {

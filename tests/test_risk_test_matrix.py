@@ -30,14 +30,16 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
 )
 from coding_review_agent_loop.decomposition import validate_risk_matrix_ownership
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _decode_round_metadata,
     _encode_round_metadata,
     _attach_round_metadata,
+    scope_approved_plan_matrix,
+)
+from coding_review_agent_loop.round_state import (
     make_approved_plan_context,
     recover_approved_plan_context,
-    scope_approved_plan_matrix,
 )
 from coding_review_agent_loop.round_transport import (
     prepare_round_comment,

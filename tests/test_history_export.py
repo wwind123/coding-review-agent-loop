@@ -44,11 +44,13 @@ from coding_review_agent_loop.protocol import AgentUnavailable
 from coding_review_agent_loop.protocol_markers import named_reserved_marker_tokens
 from coding_review_agent_loop.review_step_back import render_step_back_human_decision
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     PostedRoundRecord,
-    _approved_plan_hash,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
+    _approved_plan_hash,
 )
 from coding_review_agent_loop.runner import CommandResult
 

@@ -125,15 +125,17 @@ from coding_review_agent_loop.unresolved_items import (
     _validate_review_response,
     _validate_plan_review_response,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
     _encode_round_metadata,
     _plan_subject,
+    _strip_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _resume_pr_round,
     _resume_plan_round,
-    _strip_round_metadata,
 )
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.response_validation import _validate_plan_revision_response

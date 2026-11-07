@@ -17,6 +17,19 @@ PACKAGE = ROOT / 'src/coding_review_agent_loop'
 MANIFEST = json.loads((ROOT / 'tests/fixtures/managed_ci_authorization_move.json').read_text())
 
 
+def historical_authorization_body(owner, name, body):
+    """Undo only the approved codec import move for the frozen byte check."""
+    if (owner, name) == ('managed_ci_authorization', '_decode_recovery_round_record'):
+        body = body.replace(
+            '    from .round_metadata import (\n'
+            '        decode_round_metadata_mapping,\n'
+            '        recovery_record_problems,\n'
+            '    )\n',
+            '    from .round_state import decode_round_metadata_mapping, recovery_record_problems\n',
+        )
+    return body
+
+
 def test_authorization_bodies_and_dependencies():
     for owner, records in MANIFEST['owners'].items():
         module = importlib.import_module('coding_review_agent_loop.' + owner)
@@ -37,6 +50,7 @@ def test_authorization_bodies_and_dependencies():
             node = definitions[name]
             first = min([node.lineno] + [d.lineno for d in getattr(node, 'decorator_list', [])])
             body = ''.join(lines[first - 1:node.end_lineno])
+            body = historical_authorization_body(owner, name, body)
             assert hashlib.sha256(body.encode()).hexdigest() == record['sha256'], name
         assert len(source.splitlines()) <= 6000
         for node in ast.walk(ast.parse(source)):
@@ -45,6 +59,26 @@ def test_authorization_bodies_and_dependencies():
                 assert not any(a.name == 'managed_ci' for a in node.names)
             elif isinstance(node, ast.Import):
                 assert not any(a.name == 'coding_review_agent_loop.managed_ci' for a in node.names)
+
+
+@pytest.mark.parametrize('case', ['current', 'historical', 'logic', 'wrong-owner', 'other-symbol'])
+def test_authorization_parity_allows_only_exact_codec_import_move(case):
+    source = (PACKAGE / 'managed_ci_authorization.py').read_text()
+    node = next(node for node in ast.parse(source).body
+                if isinstance(node, ast.FunctionDef) and node.name == '_decode_recovery_round_record')
+    body = ''.join(source.splitlines(keepends=True)[node.lineno - 1:node.end_lineno])
+    owner, name = 'managed_ci_authorization', node.name
+    if case == 'historical':
+        body = historical_authorization_body(owner, name, body)
+    elif case == 'logic':
+        body = body.replace('return metadata', 'return None')
+    elif case == 'wrong-owner':
+        body = body.replace('from .round_metadata import', 'from .protocol import')
+    elif case == 'other-symbol':
+        name = 'other_decoder'
+    digest = hashlib.sha256(historical_authorization_body(owner, name, body).encode()).hexdigest()
+    expected = MANIFEST['owners'][owner][node.name]['sha256']
+    assert (digest == expected) == (case in ('current', 'historical'))
 
 
 @pytest.mark.parametrize('first', [

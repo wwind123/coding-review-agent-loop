@@ -64,12 +64,14 @@ from .pr_contract import (
 )
 from .plan_review_scheduling import PlanCandidateKey
 from .protocol_markers import TrustedBody
-from .round_state import (
+from .round_metadata import (
     PostedRoundRecord,
+    _plan_subject,
+)
+from .round_state import (
     _approved_plan_hash,
     _extract_round_metadata_records,
     _legacy_freeform_plan_candidates,
-    _plan_subject,
 )
 from .round_transport import ROUND_RESUME_MARKER_RE
 

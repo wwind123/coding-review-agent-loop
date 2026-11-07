@@ -15,7 +15,9 @@ from .unresolved_items import (
 )
 
 if TYPE_CHECKING:
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
 
 _LEGACY_MACHINE_REVIEWERS = {
     "GitHub managed exact-head CI": "managed-exact-head-ci",
@@ -406,7 +408,10 @@ def recover_pr_acknowledgement_aliases(records: Sequence[PostedRoundRecord]) -> 
     """
     # Authentication-specific carriers are admitted later by their owning
     # reader. They cannot establish stage-1 legacy producer authority here.
-    from .round_state import RECOVERY_RECORD_PHASES, EVIDENCE_CONVERSION_PHASE
+    from .round_metadata import (
+        RECOVERY_RECORD_PHASES,
+        EVIDENCE_CONVERSION_PHASE,
+    )
 
     origins = {}
     copies = {}

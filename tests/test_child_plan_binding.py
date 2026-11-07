@@ -41,7 +41,9 @@ from coding_review_agent_loop.protocol import (  # noqa: E402
     validate_structured_plan_revision as _m948_validate_revision,
     validate_structured_plan_state as _m948_validate_state,
 )
-from coding_review_agent_loop.round_state import PostedRoundMetadata as _M948Metadata  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata as _M948Metadata,
+)  # noqa: E402
 
 
 def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):

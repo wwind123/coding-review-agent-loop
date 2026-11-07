@@ -6,7 +6,10 @@ import pytest
 from dataclasses import replace
 
 from coding_review_agent_loop.pr_loop_support import _visibility_snapshot
-from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+)
 from coding_review_agent_loop.round_visibility import (
     same_round_public_publications,
     visible_peer_names,

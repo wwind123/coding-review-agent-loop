@@ -415,7 +415,10 @@ def load_history(runner, config, pr_number):
 
 def persist_lifecycle(runner, config, metadata, binding, *, round_number=1, coverage=None):
     from .github import resolve_authenticated_github_actor, post_verified_trusted_pr_protocol_comment_observed
-    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     actor = resolve_authenticated_github_actor(runner, config=config)
     from .reviewer_seats import reviewer_seat_binding
     scope = {'version': 1, 'kind': 'visible-defects', 'head': metadata.head_sha, 'seat': binding['seat']}
@@ -423,7 +426,9 @@ def persist_lifecycle(runner, config, metadata, binding, *, round_number=1, cove
         round_number=round_number, subject=metadata.head_sha, review_scope=scope, visual_lifecycle=binding,
         seat_binding=reviewer_seat_binding(config), screenshot_coverage=coverage)
     from .review_images_state import validate
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
     validate(PostedRoundRecord(0, m, ''), repo=config.repo, pr=metadata.number)
     body = _attach_round_metadata('Visual lifecycle: ' + binding['kind'], m)
     return post_verified_trusted_pr_protocol_comment_observed(runner, config=config,
@@ -436,7 +441,10 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
     if outcome.response is None or outcome.fresh:
         return outcome, items, next_number
     from .github import post_verified_trusted_pr_round_comment, resolve_authenticated_github_actor
-    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from .unresolved_items import _next_unresolved_item, _apply_unresolved_item_dispositions
     from .agent_failure import _metadata_identity_fields
     parsed = outcome.parsed

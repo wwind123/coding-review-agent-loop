@@ -18,7 +18,9 @@ from .round_transport import MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS, is_round_tran
 from .salvage import AGENT_SALVAGE_MARKER_RE
 
 if TYPE_CHECKING:
-    from .round_state import ApprovedPlanContext
+    from .round_metadata import (
+        ApprovedPlanContext,
+    )
 
 
 def _truncate_issue_text(text: str, *, max_chars: int, label: str) -> str:

@@ -33,7 +33,7 @@ import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
 )
@@ -1079,7 +1079,9 @@ def test_m1390_approval_recovery_and_strict_qualification_read_the_current_scope
     )
     from coding_review_agent_loop.pr_loop import _canonical_plan_without_handoff
     from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     runner, config = _m1390_scoped_approval_history(tmp_path)
     records = []

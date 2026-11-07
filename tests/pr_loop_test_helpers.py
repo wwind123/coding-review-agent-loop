@@ -30,7 +30,10 @@ from coding_review_agent_loop.protocol_risk import (
     parse_risk_test_matrix,
     risk_test_matrix_identity,
 )
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
 from coding_review_agent_loop.runner import CommandResult
 

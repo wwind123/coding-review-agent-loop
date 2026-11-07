@@ -101,11 +101,13 @@ from .comment_rendering import (
     normalize_freeform_signature,
     render_public_agent_comment,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     PostedRoundMetadata,
     _attach_round_metadata,
     _plan_subject,
+)
+from .round_state import (
     _resume_plan_round,
     make_approved_plan_context,
     recover_approved_plan_context,

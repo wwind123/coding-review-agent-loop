@@ -580,7 +580,9 @@ def test_restart_recovers_provenanced_pr_created_before_replacement_handoff(tmp_
 
 def discuss_split(proposal):
     from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-    from coding_review_agent_loop.round_state import PostedRoundMetadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+    )
     return comment(_attach_round_metadata("Split consensus.", PostedRoundMetadata(
         flow="discuss", role="summary", agent="Orchestrator", round_number=1,
         subject="discuss-subject", is_final=True, split_proposals=(proposal,),

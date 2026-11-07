@@ -37,13 +37,15 @@ from coding_review_agent_loop.review_step_back import (
     render_step_back_human_decision,
     step_back_alternative_summary,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     PostedRoundRecord,
-    UnresolvedReviewItem,
     _decode_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+)
+from coding_review_agent_loop.protocol import (
+    UnresolvedReviewItem,
 )
 from coding_review_agent_loop.round_transport import decode_mapping
 
@@ -2423,7 +2425,9 @@ from coding_review_agent_loop.review_step_back import (  # noqa: E402
     render_provenance_baseline_block,
     reviewer_previous_plan_baseline,
 )
-from coding_review_agent_loop.round_state import _plan_subject  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    _plan_subject,
+)  # noqa: E402
 from dataclasses import replace as dataclasses_replace  # noqa: E402
 
 PRE = "pre_existing"

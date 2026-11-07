@@ -20,15 +20,17 @@ from coding_review_agent_loop.plan_issue_scope import (
     scope_plan_comments,
     scope_prompt_comments,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     PostedRoundMetadata,
     _attach_round_metadata,
-    _extract_round_metadata_records,
     _plan_subject,
-    _resume_plan_round,
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
+)
+from coding_review_agent_loop.round_state import (
+    _extract_round_metadata_records,
+    _resume_plan_round,
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
 

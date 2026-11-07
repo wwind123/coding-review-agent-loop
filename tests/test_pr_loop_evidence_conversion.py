@@ -36,9 +36,11 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     ReviewItemDisposition,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _extract_round_metadata_records,
 )
 from coding_review_agent_loop.unresolved_items import (
@@ -1813,7 +1815,12 @@ def _conversion_metadata(*, source, round_number, head=START_HEAD, review_round=
 def test_conversion_repeat_round_recognizes_unfinished_auto_and_operator_conversions():
     """`operator-conversion-restart-full-board` (unit)."""
     from coding_review_agent_loop.pr_loop_support import conversion_repeat_round
-    from coding_review_agent_loop.round_state import PostedRoundRecord, admit_evidence_authority_records
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
+    from coding_review_agent_loop.round_state import (
+        admit_evidence_authority_records,
+    )
 
     def recs(*metadatas):
         return [PostedRoundRecord(index=i, metadata=m, body="") for i, m in enumerate(metadatas)]
@@ -2111,7 +2118,9 @@ def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, po
     for evidence in ("row-a", "tests/test_row-a.py::test_it", "risk_test_matrix_evidence", "evidence_citations"):
         assert evidence in prompt
     # Reconstructing the same history does not invalidate the fresh approval.
-    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.code_approval import (
+        _latest_pr_approved_reviews_for_head,
+    )
     approvals = _latest_pr_approved_reviews_for_head(
         authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context,
@@ -2424,7 +2433,9 @@ def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path,
     )
     # Code approvals are independent of capture freshness; the semantic gate
     # below still refuses a capture without published acceptance.
-    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.code_approval import (
+        _latest_pr_approved_reviews_for_head,
+    )
     before = _latest_pr_approved_reviews_for_head(
         authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context,

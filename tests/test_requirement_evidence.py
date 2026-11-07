@@ -9,7 +9,11 @@ from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.protocol import UnresolvedReviewItem, parse_structured_pr_review
 from coding_review_agent_loop.requirement_evidence import parse_associations, project, historical_projection, classify_review
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _encode_round_metadata, _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _encode_round_metadata,
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
 from pr_loop_test_helpers import _association, _classified_review, _evidence_review
 

@@ -1,5 +1,7 @@
 """PR-loop tests for round_state and round_transport: PR round resume (#1542)."""
 
+from coding_review_agent_loop import round_metadata
+
 import base64
 import dataclasses
 import json
@@ -18,12 +20,16 @@ from coding_review_agent_loop.github import (
     IssueComment,
     PullRequestCheck,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.qualification_checkpoint import (
     QualificationCheckpoint,
+)
+from coding_review_agent_loop.round_state import (
+    _resume_pr_round,
+)
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
-    _resume_pr_round,
     _strip_round_metadata,
 )
 from coding_review_agent_loop.protocol import (
@@ -1080,7 +1086,10 @@ def _oversized_pr_round_body(role: str):
     import os
 
     from coding_review_agent_loop.protocol_markers import TrustedBody
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     text = _attach_round_metadata(
         "Visible PR round response",
@@ -1168,7 +1177,7 @@ def _coder_records_959(runner):
         body = item.get("body") if isinstance(item, dict) else None
         if not isinstance(body, str) or "AGENT_LOOP_META: " not in body:
             continue
-        metadata = round_state._decode_round_metadata(
+        metadata = round_metadata._decode_round_metadata(
             body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         )
         if metadata.role == "coder":

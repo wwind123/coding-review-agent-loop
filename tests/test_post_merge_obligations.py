@@ -12,7 +12,11 @@ from coding_review_agent_loop.post_merge_obligations import (
     validate_registry, validate_tracker,
 )
 from coding_review_agent_loop.protocol import parse_structured_pr_review
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _encode_round_metadata, _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _encode_round_metadata,
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
 from agent_loop_helpers import structured_pr_review
 

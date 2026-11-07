@@ -345,7 +345,11 @@ def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
 @pytest.mark.parametrize('invalid', [False, True])
 def test_plan_first_legacy_resume_observation_precedes_handoff(tmp_path, monkeypatch, invalid):
     from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
+    )
     from coding_review_agent_loop.decomposition import approved_plan_hash
     from issue_loop_test_helpers import _provenance_pages
     from types import SimpleNamespace
@@ -408,7 +412,11 @@ def test_plan_first_legacy_resume_observation_precedes_handoff(tmp_path, monkeyp
 
 def test_plan_first_legacy_resume_convergence_binds_complete_handoff(tmp_path, monkeypatch):
     from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
+    )
     from coding_review_agent_loop.decomposition import approved_plan_hash
     from issue_loop_test_helpers import _provenance_pages
     from types import SimpleNamespace

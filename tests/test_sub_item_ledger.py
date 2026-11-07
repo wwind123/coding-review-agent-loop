@@ -12,12 +12,14 @@ from coding_review_agent_loop.protocol import (
     ReviewSubItem,
     UnresolvedReviewItem,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     _deserialize_disposition,
     _deserialize_unresolved_item,
-    _prior_item_ledger_signature,
     _serialize_disposition,
     _serialize_unresolved_item,
+)
+from coding_review_agent_loop.round_state import (
+    _prior_item_ledger_signature,
 )
 from coding_review_agent_loop.unresolved_items import (
     ClearedItemProgress,

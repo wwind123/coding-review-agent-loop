@@ -187,7 +187,7 @@ from .followups import (
     FollowupSourceContext,
 )
 from .config import phased_delivery_guard_active
-from .round_state import (
+from .round_metadata import (
     reset_plan_board_stamp,
     set_plan_board_stamp,
     prior_plan_execution_mode,
@@ -196,14 +196,16 @@ from .round_state import (
     PostedRoundRecord,
     ResumedReviewRound,
     _attach_round_metadata,
-    _extract_round_metadata_records,
     _plan_subject,
-    _prior_item_ledger_signature,
-    _resume_plan_round,
-    make_approved_plan_context,
     scope_approved_plan_matrix,
     PlanValidationDiagnosticTransport,
     sanitize_plan_validation_diagnostic,
+)
+from .round_state import (
+    _extract_round_metadata_records,
+    _prior_item_ledger_signature,
+    _resume_plan_round,
+    make_approved_plan_context,
 )
 from .plan_assembly import (
     AssembledPlanSidecar,

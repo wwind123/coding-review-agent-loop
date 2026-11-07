@@ -10,7 +10,7 @@ from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     _attach_round_metadata,
     _decode_round_metadata,
     _strip_round_metadata,

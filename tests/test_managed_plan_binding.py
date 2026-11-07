@@ -20,7 +20,7 @@ from coding_review_agent_loop.managed_ci_authorization import (
 from coding_review_agent_loop.managed_ci import (
     verify_managed_pr_plan_binding,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     ApprovedPlanContext,
     PostedRoundMetadata,
     _attach_round_metadata,
@@ -476,7 +476,9 @@ def test_strict_qualification_checks_the_plan_against_the_supplied_board_not_the
 from coding_review_agent_loop.managed_ci_types import (
     UNPROTECTED_OVERRIDE_TRAILER,
 )  # noqa: E402
-from coding_review_agent_loop.round_state import RecoveryRoundBudget  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    RecoveryRoundBudget,
+)  # noqa: E402
 
 
 class RecoveryRunner:

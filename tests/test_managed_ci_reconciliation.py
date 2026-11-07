@@ -19,8 +19,15 @@ from coding_review_agent_loop.managed_ci_reconciliation import (
     observe_repair_result, reconcile_repair_checkpoint, capture_failed_run,
 )
 from coding_review_agent_loop.managed_ci_result import FailedManagedRun, VerifiedManagedResult
+from coding_review_agent_loop.qualification_checkpoint import (
+    QualificationCheckpoint,
+)
 from coding_review_agent_loop.round_state import (
-    QualificationCheckpoint, PostedRoundMetadata, _attach_round_metadata, _extract_round_metadata_records,
+    _extract_round_metadata_records,
+)
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
 )
 from coding_review_agent_loop.github import PullRequestMetadata
 from coding_review_agent_loop.protocol import UnresolvedReviewItem

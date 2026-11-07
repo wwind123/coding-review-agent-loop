@@ -4621,7 +4621,7 @@ def _plan_history_comments_with_resolved_items():
     from types import SimpleNamespace
 
     from coding_review_agent_loop.protocol import ReviewItemDisposition
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
     )

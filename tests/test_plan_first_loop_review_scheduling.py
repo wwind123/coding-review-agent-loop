@@ -21,7 +21,9 @@ from coding_review_agent_loop.github import (
 )
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.prompt_support import (
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
 )
@@ -65,7 +67,9 @@ from agent_loop_helpers import (
     structured_v1_plan_state,
 )
 from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noqa: E402
-from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundRecord,
+)  # noqa: E402
 import coding_review_agent_loop.validated_agent as validated_agent_module
 
 

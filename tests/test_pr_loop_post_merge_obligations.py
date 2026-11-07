@@ -12,7 +12,10 @@ from coding_review_agent_loop import post_merge_runtime as runtime
 from coding_review_agent_loop.post_merge_obligations import parse_request, source_for_item, scheduled_rows
 from coding_review_agent_loop.protocol import parse_structured_pr_review
 from coding_review_agent_loop.pr_loop_support import _partition_unresolved_items, _render_evidence_freeze_notice, _evidence_freeze_diagnostic
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 from test_post_merge_obligations import REQUEST, admission, evidence, signed, transition
 
 
@@ -276,7 +279,12 @@ def test_real_pr_loop_declaration_stays_required_without_freeze_or_coder(tmp_pat
 
 def test_converted_row_overlay_preserves_truth_and_residual_barrier(tmp_path, monkeypatch):
     from coding_review_agent_loop import pr_loop_support as support
-    from coding_review_agent_loop.round_state import PostedRoundRecord, admit_evidence_authority_records
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
+    from coding_review_agent_loop.round_state import (
+        admit_evidence_authority_records,
+    )
     from test_evidence_stall import _evidence
     run, _ = setup_run(tmp_path, monkeypatch)
     row = replace(evidence(), converted_row_id='row-a', converted_matrix_identity='a'*64)

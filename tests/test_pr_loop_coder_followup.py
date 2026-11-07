@@ -22,12 +22,16 @@ from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
     ManagedCiOutcome,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.qualification_checkpoint import (
     QualificationCheckpoint,
+)
+from coding_review_agent_loop.round_state import (
+    _resume_pr_round,
+)
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
-    _resume_pr_round,
 )
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.review_scheduling import TransitionClassification
@@ -163,7 +167,7 @@ def test_m1034_followup_head_log_wording():
 
 
 def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_stable():
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         _encode_round_metadata,
         followup_head_unchanged_sha,
     )
@@ -193,9 +197,11 @@ def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_s
 
 
 def test_m1034_malformed_followup_dispatch_head_is_rejected():
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         _decode_round_metadata_mapping,
         _encode_round_metadata,
+    )
+    from coding_review_agent_loop.round_transport import (
         decode_mapping,
     )
 
@@ -799,7 +805,9 @@ def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_
 
 _A_1292, _B_1292, _C_1292 = "a" * 40, "b" * 40, "c" * 40
 from coding_review_agent_loop.protocol import UnresolvedReviewItem  # noqa: E402
-from coding_review_agent_loop.round_state import RecoveryRoundBudget as _Budget1292  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    RecoveryRoundBudget as _Budget1292,
+)  # noqa: E402
 
 
 def _item_1292(number=1, text="Add a regression test."):
@@ -2805,7 +2813,10 @@ def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monke
 @pytest.mark.parametrize("repair_future", [False, True])
 def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatch, dispatch, repair_future):
     from pr_loop_test_helpers import _evidence_review, _EVIDENCE_TEXT, _pr_records
-    from coding_review_agent_loop.round_state import _serialize_unresolved_item, _deserialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _serialize_unresolved_item,
+        _deserialize_unresolved_item,
+    )
 
     first = _evidence_review(state="blocking", blocking=["Fix src/a.py:10."], evidence=[_EVIDENCE_TEXT])
     final = _evidence_review(state="blocking", evidence=[_EVIDENCE_TEXT], dispositions=[

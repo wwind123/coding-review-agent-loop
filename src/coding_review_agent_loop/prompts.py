@@ -87,7 +87,9 @@ from .prompt_context import (
 )
 
 if TYPE_CHECKING:
-    from .round_state import ApprovedPlanContext
+    from .round_metadata import (
+        ApprovedPlanContext,
+    )
 
 PR_REVIEW_SUB_ITEM_GUIDANCE = """A `blocking_items` or `same_pr_followups` object may also carry an optional
 ordered `sub_items` array of 2 to 12 distinct statements:

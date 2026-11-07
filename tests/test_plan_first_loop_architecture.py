@@ -10,7 +10,9 @@ import pytest
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.github import IssueContext
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 import coding_review_agent_loop.architecture_contract as architecture_contract
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.discuss_loop as discuss_loop

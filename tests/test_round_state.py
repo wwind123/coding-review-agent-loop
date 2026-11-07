@@ -15,16 +15,18 @@ from coding_review_agent_loop.github import (
 )
 from coding_review_agent_loop.protocol_markers import KNOWN_HOST_COMMENT_FOOTER
 from coding_review_agent_loop.review_scheduling import make_contract
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     PostedRoundMetadata,
     _decode_round_metadata,
     _encode_round_metadata,
     _attach_round_metadata,
-    _latest_pr_approved_reviews_for_head,
     PostedRoundRecord,
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
+)
+from coding_review_agent_loop.code_approval import (
+    _latest_pr_approved_reviews_for_head,
 )
 from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
 
@@ -399,11 +401,13 @@ def test_bodies_differing_only_by_the_exact_footer_are_not_a_conflict():
 
 # --- Human-only exact-head evidence records (#1068) --------------------------
 
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
     EvidenceFreezeRecord,
     EvidenceReleaseRecord,
     _attach_round_metadata,
     _deserialize_unresolved_item,
+)
+from coding_review_agent_loop.round_state import (
     _drop_unterminated_evidence_response_records,
     _extract_round_metadata_records,
     _resume_pr_round,
@@ -577,7 +581,9 @@ def test_pr_round_reconciled_only_by_a_reconciliation_summary(phases, expected):
 
 
 def test_plan_execution_mode_fields_round_trip_and_are_omitted_when_absent():
-    from coding_review_agent_loop.round_state import prior_plan_execution_mode
+    from coding_review_agent_loop.round_metadata import (
+        prior_plan_execution_mode,
+    )
 
     base = dict(flow="plan", role="coder", agent="Claude", round_number=1, subject="s")
     legacy = PostedRoundMetadata(**base)
@@ -592,7 +598,9 @@ def test_plan_execution_mode_fields_round_trip_and_are_omitted_when_absent():
     payload["plan_execution_mode"] = "not-a-mode"
     assert _decode_round_metadata(encode_mapping(payload)).plan_execution_mode is None
 
-    from coding_review_agent_loop.round_state import PostedRoundRecord
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
 
     records = [
         PostedRoundRecord(index=0, metadata=recorded, body=""),
@@ -614,16 +622,20 @@ def test_planning_only_scheduler_mode_is_invalid_on_a_pr_flow_checkpoint():
 # --- Coder-recovery and head-review-recovery records (#1292) -----------------
 
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem  # noqa: E402
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
     CODER_DISPATCH_PHASE,
     CODER_FOLLOWUP_REJECTED_PHASE,
     HEAD_REVIEW_RECOVERY_PHASE,
     MAX_REJECTED_DISPATCH_ATTEMPTS,
-    QualificationCheckpoint,
     RecoveryRoundBudget,
     _recovery_record_problems,
-    pr_resume_needs_author_admission,
     sanitize_recovery_reason,
+)
+from coding_review_agent_loop.qualification_checkpoint import (
+    QualificationCheckpoint,
+)
+from coding_review_agent_loop.round_state import (
+    pr_resume_needs_author_admission,
 )
 
 _ACTOR = ("agent-actor", 4242)
@@ -1173,7 +1185,9 @@ def test_prior_head_reconstruction_stops_at_the_head_review_handoff_boundary():
 
 def test_durable_sanitizer_strips_coverage_gaps_like_claims():
     import json
-    from coding_review_agent_loop.round_state import _sanitize_durable_coder_response
+    from coding_review_agent_loop.round_metadata import (
+        _sanitize_durable_coder_response,
+    )
 
     payload = {
         "kind": "issue_implementation",
@@ -1245,7 +1259,10 @@ def test_evidence_row_ids_tag_round_trips_and_legacy_items_are_byte_stable():
 @pytest.mark.parametrize("bad", ["row-a", [], [1], ["a", "a"], [""]])
 def test_malformed_stored_tag_degrades_to_an_ordinary_finding(bad):
     from coding_review_agent_loop.protocol import UnresolvedReviewItem
-    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _deserialize_unresolved_item,
+        _serialize_unresolved_item,
+    )
 
     item = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=1, text="t", status="blocking")
     payload = _serialize_unresolved_item(item)
@@ -1323,10 +1340,12 @@ _PLAN_ROOT = {
 )
 def test_board_identity_fields_are_flow_scoped_and_paired(flow, fields):
     """Row plan-metadata-cross-flow: the wrong flow's fields, or half a pair, are malformed."""
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
         _decode_round_metadata_mapping,
+    )
+    from coding_review_agent_loop.round_state import (
         _extract_round_metadata_records,
     )
 
@@ -1352,12 +1371,14 @@ def test_board_identity_fields_are_flow_scoped_and_paired(flow, fields):
 def test_plan_board_stamp_applies_only_to_plan_flow_records():
     """Row plan-metadata-cross-flow: the plan stamp never touches PR-flow records."""
     from coding_review_agent_loop.board_change import PLAN_SURFACE, PrBoardStamp
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
-        _extract_round_metadata_records,
         reset_plan_board_stamp,
         set_plan_board_stamp,
+    )
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
     )
 
     token = set_plan_board_stamp(PrBoardStamp(
@@ -1382,8 +1403,10 @@ def test_plan_board_stamp_applies_only_to_plan_flow_records():
 # --- Deferred publication replay (#1389) ------------------------------------
 
 from coding_review_agent_loop.protocol import ReviewItemDisposition  # noqa: E402
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
+)
+from coding_review_agent_loop.round_state import (
     canonical_deferred_history_items,
     canonical_history_item_outcomes,
 )
@@ -1566,7 +1589,10 @@ def test_invalid_conversion_fields_decode_as_unconverted_without_raising():
 
 
 def test_malformed_converted_item_fields_fail_safe():
-    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _deserialize_unresolved_item,
+        _serialize_unresolved_item,
+    )
 
     obligation, finding, partial, _audit, _reference = _conversion_fixtures()
     bad_binding = _serialize_unresolved_item(obligation)
@@ -1650,7 +1676,9 @@ def test_resume_adopts_an_admitted_conversion_record_and_drops_a_foreign_one():
 
 
 def _plan_reviewer_metadata(**overrides):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+    )
 
     values = dict(
         flow="plan", role="reviewer", agent="Codex", round_number=2,
@@ -1695,7 +1723,10 @@ def test_provenance_repeat_and_sweep_marker_round_trip_and_legacy_stays_byte_sta
 )
 def test_malformed_stored_provenance_or_repeat_decodes_as_absent(key, bad, caplog):
     from coding_review_agent_loop.protocol import UnresolvedReviewItem
-    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _deserialize_unresolved_item,
+        _serialize_unresolved_item,
+    )
 
     item = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=1, text="t", status="blocking")
     payload = _serialize_unresolved_item(item)
@@ -1788,7 +1819,7 @@ def _m1112_first_primary_payload(runner):
 
 def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
     """`malformed-fields` and `all-reviewers-unaffected` at the codec."""
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         _decode_round_metadata_mapping,
         _encode_round_metadata,
     )
@@ -1834,7 +1865,7 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
 
 def test_step_back_deferral_marker_is_strictly_validated(tmp_path):
     """`deferral-marker-roundtrip` at the codec (#1275)."""
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         _decode_round_metadata_mapping,
         _encode_round_metadata,
     )
@@ -1868,7 +1899,9 @@ def test_step_back_deferral_marker_is_strictly_validated(tmp_path):
 
 def test_planning_checkpoint_mode_round_trips_and_tolerates_unknown_values(tmp_path):
     """`metadata-roundtrip` on a valid planning checkpoint."""
-    from coding_review_agent_loop.round_state import _encode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _encode_round_metadata,
+    )
     from coding_review_agent_loop.round_transport import encode_mapping
 
     runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
@@ -2354,8 +2387,13 @@ def test_visual_tail_preserves_current_prior_boundary_and_operator_sources(opera
 
 
 def test_visual_origin_roundtrips_and_changes_only_visual_ledger_signature():
+    from coding_review_agent_loop.round_metadata import (
+        _serialize_unresolved_item,
+        _deserialize_unresolved_item,
+    )
     from coding_review_agent_loop.round_state import (
-        _serialize_unresolved_item, _deserialize_unresolved_item, _prior_item_ledger_signature)
+        _prior_item_ledger_signature,
+    )
     from coding_review_agent_loop.unresolved_items import _next_unresolved_item
     ordinary = _next_unresolved_item(item_number=1, reviewer='Codex', source_round=1,
                                      text='Title clips', status='blocking')
@@ -2411,3 +2449,32 @@ def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(operator, sco
         else:
             with pytest.raises(AgentLoopError, match='handoff could not be recovered safely'):
                 _resume([*history,tail], _NEW)
+
+
+def test_extracted_metadata_board_contexts_share_identity_and_reset():
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from coding_review_agent_loop import round_metadata, round_state, pr_loop, plan_first_loop
+
+    assert pr_loop.set_pr_board_stamp is round_metadata.set_pr_board_stamp
+    assert plan_first_loop.set_plan_board_stamp is round_metadata.set_plan_board_stamp
+    for flow, setter, resetter in (
+        ('pr', pr_loop.set_pr_board_stamp, pr_loop.reset_pr_board_stamp),
+        ('plan', plan_first_loop.set_plan_board_stamp, plan_first_loop.reset_plan_board_stamp),
+    ):
+        record = round_metadata.PostedRoundMetadata(flow, 'coder', 'Codex', 1, 'head')
+        def replay():
+            body = round_metadata._attach_round_metadata('Coder.', record)
+            return round_state._extract_round_metadata_records([SimpleNamespace(body=body)], flow=flow)[0].metadata
+        token = setter(SimpleNamespace(apply=lambda value: replace(value, model_used='outer')))
+        try:
+            assert replay().model_used == 'outer'
+            nested = setter(SimpleNamespace(apply=lambda value: replace(value, model_used='inner')))
+            try:
+                assert replay().model_used == 'inner'
+            finally:
+                resetter(nested)
+            assert replay().model_used == 'outer'
+        finally:
+            resetter(token)
+        assert replay() == record

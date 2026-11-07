@@ -27,7 +27,10 @@ from coding_review_agent_loop.plan_growth import (
     plan_growth_approval_verdict,
 )
 from coding_review_agent_loop.protocol import validate_structured_plan_state
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
 import coding_review_agent_loop.panel_evidence as panel_evidence
 import coding_review_agent_loop.pr_loop as pr_loop

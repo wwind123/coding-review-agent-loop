@@ -84,9 +84,8 @@ from .round_state import (
     canonical_deferred_history_items,
     drop_inert_post_reconciliation_checkpoints,
     startup_force_full_latch,
-    reset_pr_board_stamp,
-    set_pr_board_stamp,
 )
+from .round_metadata import reset_pr_board_stamp, set_pr_board_stamp
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
@@ -276,28 +275,31 @@ from .followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     EVIDENCE_CONVERSION_PHASE,
     EVIDENCE_FREEZE_PHASE,
     EVIDENCE_RELEASE_PHASE,
     EVIDENCE_RESPONSE_PHASE,
-    QualificationCheckpoint,
     PostedRoundMetadata,
     _is_followup_dispatch_head,
     PostedRoundRecord,
     ResumedReviewRound,
     _attach_round_metadata,
-    _extract_round_metadata_records,
-    _latest_pr_approved_reviews_for_head,
-    _prior_item_ledger_signature, _scheduler_item_ledger_signature,
-    _resume_plan_round,
-    make_approved_plan_context,
     scope_approved_plan_matrix,
-    recover_approved_plan_context,
-    _resume_pr_round,
     RecoveryRoundBudget,
 )
+from .qualification_checkpoint import QualificationCheckpoint
+from .round_state import (
+    _extract_round_metadata_records,
+    _prior_item_ledger_signature,
+    _scheduler_item_ledger_signature,
+    _resume_plan_round,
+    make_approved_plan_context,
+    recover_approved_plan_context,
+    _resume_pr_round,
+)
+from .code_approval import _latest_pr_approved_reviews_for_head
 from .protocol_markers import TrustedBody
 from .review_scheduling import (
     PrePanelSafetyError,

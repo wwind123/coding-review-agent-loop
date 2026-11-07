@@ -15,7 +15,7 @@ from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.managed_ci_types import (
     ManagedCiCreationIntent,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     PlanValidationDiagnosticTransport,
     encode_plan_validation_diagnostic_body,

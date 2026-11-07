@@ -146,38 +146,42 @@ from .followups import (
     _publish_approved_followups,
     FollowupSourceContext,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     EVIDENCE_FREEZE_PHASE,
     EVIDENCE_CONVERSION_PHASE,
-    admit_evidence_authority_records,
-    record_carries_evidence_authority,
     EVIDENCE_RELEASE_PHASE,
     EvidenceFreezeRecord,
     EvidenceReleaseRecord,
-    QualificationCheckpoint,
     PostedRoundMetadata,
     followup_head_unchanged_sha,
     rebuild_resumed_coder_carrier,
     PostedRoundRecord,
     _attach_round_metadata,
-    _extract_round_metadata_records,
     _is_followup_dispatch_head,
-    _prior_item_ledger_signature,
-    _scheduler_item_ledger_signature,
-    _resume_plan_round,
     scope_approved_plan_matrix,
-    recover_approved_plan_context,
-    _resume_pr_round,
     CODER_DISPATCH_PHASE,
     CODER_FOLLOWUP_REJECTED_PHASE,
     HEAD_REVIEW_RECOVERY_PHASE,
     RecoveryRoundBudget,
     ResumedReviewRound,
     _recovery_record_problems,
+    sanitize_recovery_reason,
+)
+from .round_state import (
+    admit_evidence_authority_records,
+    record_carries_evidence_authority,
+    _extract_round_metadata_records,
+    _prior_item_ledger_signature,
+    _scheduler_item_ledger_signature,
+    _resume_plan_round,
+    recover_approved_plan_context,
+    _resume_pr_round,
     pr_resume_needs_author_admission,
     unauthenticated_recovery_record_indexes,
-    sanitize_recovery_reason,
+)
+from .qualification_checkpoint import (
+    QualificationCheckpoint,
 )
 from .protocol_markers import (
     TrustedBody,
@@ -5612,7 +5616,9 @@ def _record_failed_acknowledgement(
 ):
     """Upsert and durably publish exhausted PR acknowledgement repair."""
     from .unresolved_items import _upsert_human_requirements_ack_item
-    from .round_state import _attach_round_metadata
+    from .round_metadata import (
+        _attach_round_metadata,
+    )
 
     items = _upsert_human_requirements_ack_item(
         items, source_round=source_round,

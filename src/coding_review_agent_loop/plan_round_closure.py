@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
 
 
 # Planning summary records that are posted *before* reviewer reconciliation.
@@ -160,7 +162,11 @@ def plan_amendment_activation_round(records, lineage, execution_round: int) -> i
 
 def attach_plan_rollover_metadata(body, metadata, *, staged: bool):
     """A staged advance is not an amendment use or a scheduler decision."""
-    from .round_state import _attach_round_metadata, set_plan_board_stamp, reset_plan_board_stamp
+    from .round_metadata import (
+        _attach_round_metadata,
+        set_plan_board_stamp,
+        reset_plan_board_stamp,
+    )
 
     if not staged:
         return _attach_round_metadata(body, metadata)

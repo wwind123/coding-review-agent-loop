@@ -37,9 +37,11 @@ from coding_review_agent_loop.pr_loop_support import _scheduler_contract_from_me
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.reviewer_floor import BoardSeat
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _extract_round_metadata_records,
 )
 import coding_review_agent_loop.child_plan_binding as child_plan_binding_module
@@ -1580,7 +1582,9 @@ def _evidence_history(release_head):
     """Gemini's deploy-log request was cleared at ``release_head`` by a durable
     release; in round 2 Gemini (outgoing) re-emits it and Codex (retained)
     emits a new request, at head 6367c48dd193d56ea7b0baad25b19455e529f5ee."""
-    from coding_review_agent_loop.round_state import EvidenceReleaseRecord
+    from coding_review_agent_loop.round_metadata import (
+        EvidenceReleaseRecord,
+    )
     from coding_review_agent_loop.unresolved_items import evidence_obligation_identity
 
     release = _attach_round_metadata(
@@ -2903,7 +2907,9 @@ def _rewrite_last_plan_record(runner, **changes):
     """Rewrite the newest plan round record carrying a board-change digest."""
     import re
 
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     for comment in reversed(runner.issue_comments):
         match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
@@ -2920,7 +2926,9 @@ def _rewrite_last_plan_record(runner, **changes):
 
 def _strip_plan_stamps(runner):
     """Rewrite every plan record as pre-upgrade (unstamped) history."""
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     import re
 
@@ -3084,7 +3092,10 @@ def test_approval_classification_is_independent_of_the_invocation_board(tmp_path
 def test_unanimous_approvals_with_an_open_carried_obligation_are_not_approved():
     """Row plan-approval-gate-open-obligation (unit): a reassigned item blocks completion."""
     from coding_review_agent_loop.plan_verification import plan_open_obligations
-    from coding_review_agent_loop.round_state import PostedRoundRecord, ResumedReviewRound
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+        ResumedReviewRound,
+    )
 
     gemini_item = UnresolvedReviewItem(
         item_id="item-1", reviewer="Gemini", source_round=1, text="Name the owner.",
@@ -3414,7 +3425,9 @@ def test_recovery_refuses_an_unreconstructible_ledger(tmp_path):
         classify_plan_approval,
         require_recoverable_plan_approval,
     )
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     runner, config = _approved_plain_plan(tmp_path)
     lost = UnresolvedReviewItem(
@@ -3620,7 +3633,9 @@ def _rewrite_plan_records(runner, predicate, *, body_suffix="", **changes):
     """Rewrite every plan round record whose metadata matches ``predicate``."""
     import re
 
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
 
     rewritten = 0
     for comment in runner.issue_comments:
@@ -4275,7 +4290,9 @@ def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement, *, ack
     name ``requirement``, plus an issue-side handoff bound to the plan hash.  Without
     the acknowledgement the fallback cannot prove the binding."""
     from coding_review_agent_loop.decomposition import format_one_shot_impl_handoff_comment
-    from coding_review_agent_loop.round_state import _plan_subject
+    from coding_review_agent_loop.round_metadata import (
+        _plan_subject,
+    )
 
     _patch_requirements(monkeypatch, [requirement])
     runner, config = _approved_plain_plan(tmp_path, requirement=requirement)
@@ -4638,7 +4655,9 @@ def _legacy_plan_with_one_shot_handoff(tmp_path, monkeypatch, requirement):
         format_one_shot_impl_handoff_comment,
     )
     from coding_review_agent_loop.execution_policy import _current_execution_recommendation
-    from coding_review_agent_loop.round_state import _plan_subject
+    from coding_review_agent_loop.round_metadata import (
+        _plan_subject,
+    )
 
     _patch_requirements(monkeypatch, [requirement])
     runner, _config = _approved_plain_plan(tmp_path, requirement=requirement)
@@ -5117,12 +5136,16 @@ def _resolve_neutral_plan(bodies, board):
 def test_neutral_link_advance_preserves_lineage_authority(legacy, retained):
     bodies, advance, board = _neutral_lineage_fixture()
     if legacy:
-        from coding_review_agent_loop.round_state import _decode_round_metadata
+        from coding_review_agent_loop.round_metadata import (
+            _decode_round_metadata,
+        )
         import re
         meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[-1]).group(1))
         bodies[-1] = _attach_round_metadata("Legacy settlement", dataclasses.replace(meta, phase="authoritative"))
     if retained:
-        from coding_review_agent_loop.round_state import _decode_round_metadata
+        from coding_review_agent_loop.round_metadata import (
+            _decode_round_metadata,
+        )
         import re
         meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[-1]).group(1))
         bodies.append(_attach_round_metadata("Retained reviewer", dataclasses.replace(
@@ -5177,7 +5200,9 @@ def test_neutral_advance_cannot_shelter_invalid_retained_work(defect):
 @pytest.mark.parametrize("older_unbound", [False, True])
 @pytest.mark.parametrize("successive", [False, True])
 def test_neutral_advances_do_not_compare_seat_bindings_across_boards(older_unbound, successive):
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
     import re
     bodies, advance, board = _neutral_lineage_fixture()
     root_meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[0]).group(1))

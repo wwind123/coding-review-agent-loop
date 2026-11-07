@@ -24,13 +24,17 @@ from coding_review_agent_loop.prompt_support import (
 )
 from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
 from coding_review_agent_loop import round_state
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     PostedRoundRecord,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     make_approved_plan_context,
     recover_approved_plan_context,
     _approved_plan_hash,
+)
+from coding_review_agent_loop.code_approval import (
     _latest_pr_approved_reviews_for_head,
 )
 

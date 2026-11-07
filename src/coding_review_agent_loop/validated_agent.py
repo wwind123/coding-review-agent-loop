@@ -93,7 +93,9 @@ from .worker_telemetry import append_record, run_record, telemetry_log_path
 from .workdirs import active_workdir
 from .comment_rendering import render_agent_unavailable_comment
 from . import quota_wait
-from .round_state import ApprovedPlanContext
+from .round_metadata import (
+    ApprovedPlanContext,
+)
 from .agent_failure import (
     STRUCTURED_PUBLIC_RESPONSE_KINDS,
     LONG_RESET_THRESHOLD_SECONDS,

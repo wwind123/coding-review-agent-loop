@@ -11,7 +11,9 @@ import pytest
 
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.protocol import EXECUTION_DISPOSITION_DIRECT
 import coding_review_agent_loop.architecture_contract as architecture_contract
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
@@ -47,8 +49,12 @@ from agent_loop_helpers import (
 )
 import test_child_plan_provenance as _m936_cpp  # noqa: E402
 from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noqa: E402
-from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
-from coding_review_agent_loop.round_state import _encode_round_metadata  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundRecord,
+)  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    _encode_round_metadata,
+)  # noqa: E402
 from coding_review_agent_loop.review_step_back import derive_plan_step_back_state  # noqa: E402
 
 

@@ -2,7 +2,9 @@
 
 from .decomposition import RiskMatrixOwnershipError, validate_risk_matrix_ownership
 from .comment_rendering import RISK_TEST_MATRIX_MARKER_RE, decode_risk_test_matrix_marker
-from .round_state import sanitize_plan_validation_diagnostic
+from .round_metadata import (
+    sanitize_plan_validation_diagnostic,
+)
 
 
 def plan_ownership_diagnostic(plan, recommendation) -> str | None:

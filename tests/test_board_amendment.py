@@ -1,5 +1,7 @@
 """Signed reviewer-board amendment records (#943): parser, chain, lineage, ledger."""
 
+from coding_review_agent_loop import round_metadata
+
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +27,10 @@ from coding_review_agent_loop.plan_review_scheduling import (
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.review_scheduling import make_contract
-from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+)
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.issue_loop as issue_loop
 import coding_review_agent_loop.panel_evidence as panel_evidence
@@ -785,7 +790,7 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
     def interrupt_after_coder(*args, **kwargs):
         result = original_post(*args, **kwargs)
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(kwargs["body"])
-        if match and round_state._decode_round_metadata(match["payload"]).role == "coder":
+        if match and round_metadata._decode_round_metadata(match["payload"]).role == "coder":
             raise KeyboardInterrupt
         return result
 

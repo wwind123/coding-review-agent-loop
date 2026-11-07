@@ -7,8 +7,15 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.native_evidence import (consolidate_ledger, known_pr_heads,
     request_key, provisional_clearances)
 from coding_review_agent_loop.protocol import ReviewItemDisposition, parse_pr_review
-from coding_review_agent_loop.round_state import (PostedRoundMetadata, PostedRoundRecord,
-    _append_recorded_evidence_requests, _encode_round_metadata, _decode_round_metadata)
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+    _encode_round_metadata,
+    _decode_round_metadata,
+)
+from coding_review_agent_loop.native_evidence import (
+    _append_recorded_evidence_requests,
+)
 from coding_review_agent_loop.unresolved_items import (_upsert_evidence_obligation,
     _apply_unresolved_item_dispositions, freeze_evidence_obligations)
 from pr_loop_test_helpers import _evidence_review, _resolve

@@ -5,7 +5,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
 
 from .protocol import MACHINE_OBLIGATION_KINDS, MACHINE_LIFECYCLE_STATES, EVIDENCE_OBLIGATION_KIND
 from .managed_ci_result import FailedManagedRun, VerifiedManagedResult

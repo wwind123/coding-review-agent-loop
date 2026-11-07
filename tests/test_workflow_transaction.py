@@ -59,7 +59,12 @@ from coding_review_agent_loop.pr_contract import (
     encode_pr_contract_v2,
     pr_contract_record_hash,
 )
-from coding_review_agent_loop.round_state import _approved_plan_hash, _plan_subject
+from coding_review_agent_loop.round_state import (
+    _approved_plan_hash,
+)
+from coding_review_agent_loop.round_metadata import (
+    _plan_subject,
+)
 from coding_review_agent_loop.workflow_transaction import (
     ABORT_STALE_HEAD,
     ABORT_SUPERSEDED_INTENT,
@@ -1885,7 +1890,10 @@ def test_issue_origin_intent_cannot_omit_the_issue_side_handoff():
 
 
 def _pr_round_comment(comment_id, *, role, plan_hash, plan_subject):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     body = _attach_round_metadata(
         f"Round {comment_id}.\n-- Claude",

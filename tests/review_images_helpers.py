@@ -75,7 +75,10 @@ def stub_capture_prerequisites(monkeypatch):
 
 def append_visual_record(runner, *, head=None, round_number=1, state='approved', scheduler=None):
     """Append a bound visual publication without giving it ordinary authority."""
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     head = head or runner.pr_payload['headRefOid']
     metadata = PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex',
         round_number=round_number, subject=head, state=state, phase='visual',

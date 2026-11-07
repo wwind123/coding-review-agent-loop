@@ -666,7 +666,7 @@ def _approved_plan_with_planner_comment(*, steps, comment_payload):
     from coding_review_agent_loop.github import _parse_issue_comments
     from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
     from coding_review_agent_loop.protocol import validate_structured_plan_state
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
     )

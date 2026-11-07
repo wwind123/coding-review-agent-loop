@@ -12,9 +12,11 @@ from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.partial_round_recovery import compute_partial_round_recovery
 from coding_review_agent_loop.pr_loop_support import comment_identity_key
 from coding_review_agent_loop.review_scheduling import make_contract
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _resume_pr_round,
 )
 from coding_review_agent_loop.round_transport import prepare_round_comment

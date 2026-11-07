@@ -409,7 +409,9 @@ def test_m1390_fresh_scope_validation_diagnostic_survives_a_restart(tmp_path):
         if "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment["body"]
     ]
     assert len(diagnostics) == 1
-    from coding_review_agent_loop.round_state import decode_plan_validation_diagnostic_body
+    from coding_review_agent_loop.round_metadata import (
+        decode_plan_validation_diagnostic_body,
+    )
 
     payload = decode_plan_validation_diagnostic_body(diagnostics[0])
     assert payload.target_coder_round == 4

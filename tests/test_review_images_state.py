@@ -10,8 +10,11 @@ from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.review_images_config import CaptureConfig, delivery_limits
 from coding_review_agent_loop.review_images_manifest import publish
 from coding_review_agent_loop.review_scope import authority_records, is_complete_code_review
-from coding_review_agent_loop.round_state import (
-    PostedRoundMetadata, PostedRoundRecord, _encode_round_metadata, _decode_round_metadata,
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+    _encode_round_metadata,
+    _decode_round_metadata,
 )
 from review_images_helpers import manifest, png
 
@@ -164,7 +167,12 @@ def test_verified_pr_round_transport_returns_final_anchor_and_requires_sidecars(
     from agent_loop_helpers import FakeRunner, make_config
     from test_round_transport import _random_text
     from coding_review_agent_loop import github
-    from coding_review_agent_loop.round_state import _attach_round_metadata, _extract_round_metadata_records
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+    )
     from coding_review_agent_loop.errors import AgentLoopError
     config=make_config(tmp_path)
     runner=FakeRunner()

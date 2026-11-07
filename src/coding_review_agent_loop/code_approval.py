@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
     from .execution_policy import ApprovedPlanContext
 from .agents.base import AgentName
 from .agents.registry import agent_display_name

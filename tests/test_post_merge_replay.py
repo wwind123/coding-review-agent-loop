@@ -7,7 +7,10 @@ from coding_review_agent_loop import post_merge_runtime as runtime
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, PullRequestReviewContext
 from coding_review_agent_loop.post_merge_obligations import active_registry, validate_registry
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 from test_post_merge_obligations import evidence, signed, transition
 from test_pr_loop_post_merge_obligations import metadata, merged, publication_setup, setup_run
 

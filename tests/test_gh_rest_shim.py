@@ -23,7 +23,7 @@ from coding_review_agent_loop.github import (
     read_pull_request_commit_metadata,
     strip_bot_login_suffix,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
 )

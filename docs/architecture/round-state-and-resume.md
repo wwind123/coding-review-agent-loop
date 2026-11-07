@@ -2,13 +2,19 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
-Scheduler metadata decoding and its key sets live in `round_state_scheduler.py`,
-with explicit re-exports from `round_state.py`. Round entry points, encoding,
-authentication and reconstruction remain in `round_state.py`; the extraction
-preserves serialized bytes, legacy defaults and conservative invalid-record
-handling, with no change to persistence or approval authority.
+`round_metadata.py` owns round value types, semantic validation, field codecs,
+diagnostic transport and recovery, board stamp contexts, attach/strip helpers,
+and the plan subject hash. It never imports `round_state.py`. The context
+variables have one owner, so nested set/reset tokens retain their identity.
+`round_state.py` owns transcript selection, evidence admission, replay and
+approved-plan recovery; it calls metadata helpers through their actual owner.
+Scheduler field decoding remains in `round_state_scheduler.py`, checkpoint
+types in `qualification_checkpoint.py`, and legacy promotion helpers in
+`legacy_machine_items.py`; consumers import these support owners directly.
+The split preserves serialized bytes, legacy defaults and conservative
+invalid-record handling without changing persistence or approval authority.
 
 Pure issue-reference parsing and its evidence types live in
 `github_issue_references.py`, with explicit compatibility re-exports from
@@ -21,7 +27,7 @@ changing the trust or persistence contracts.
 ## Legacy PR acknowledgement recovery
 
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,
-re-exported by `round_state.py`. Before PR promotion, it indexes the earliest
+used by `round_state.py`. Before PR promotion, it indexes the earliest
 durable appearance of each numbered acknowledgement candidate across both
 `prior_items` and `new_items` in history order. Recovery transport carriers
 (dispatch, rejected follow-up, and head-review recovery) are lineage-neutral
@@ -209,7 +215,7 @@ sessions). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
 
 Managed repair checkpoints can retain an optional typed failed-run reference
 and a verified later-attempt result (#1709). The checkpoint type lives in
-`qualification_checkpoint.py`, re-exported by `round_state.py`; shared immutable
+`qualification_checkpoint.py`, imported directly by consumers; shared immutable
 result types live in `managed_ci_result.py`. Partial references, nonpositive IDs
 or attempts, and contradictory head/base/obligation bindings invalidate a
 checkpoint. Existing checkpoint shapes remain readable, and consumed watcher
@@ -326,7 +332,7 @@ existing qualification recovery when one exists, preserving reviewer-board
 link fallback and named-seat rebinding. Pending board amendments still re-enter
 their effective round. Dedicated recovery and closed-round boundaries retain
 precedence. Qualification lookup helpers live in `qualification_checkpoint.py`
-and remain re-exported from `round_state.py`.
+and consumers import them directly.
 
 Issue implementation delegates PR review to the same PR loop used by a fresh
 PR invocation. Both use the repository, PR surface, PR number, recorded round

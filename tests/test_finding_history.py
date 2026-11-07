@@ -24,10 +24,14 @@ from coding_review_agent_loop.prompts import (
     build_same_pr_followup_prompt,
 )
 from coding_review_agent_loop.review_step_back import PlanStepBackContext
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     PostedRoundRecord,
+)
+from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
+)
+from coding_review_agent_loop.round_state import (
     _canonically_resolved_history_item_ids,
     canonical_history_item_outcomes,
 )

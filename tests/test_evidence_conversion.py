@@ -37,7 +37,7 @@ from coding_review_agent_loop.protocol_risk import (
 from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _decode_round_metadata,
     _encode_round_metadata,
@@ -730,7 +730,10 @@ def test_ill_typed_classification_values_decode_as_none_without_raising(mutate):
     ],
 )
 def test_ill_typed_audits_decode_as_unconverted_without_raising(mutate):
-    from coding_review_agent_loop.round_state import _decode_round_metadata as decode, _encode_round_metadata as encode
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata as decode,
+        _encode_round_metadata as encode,
+    )
 
     payload = mutate(_audit().to_payload())
     assert EvidenceConversionAudit.from_payload(payload) is None

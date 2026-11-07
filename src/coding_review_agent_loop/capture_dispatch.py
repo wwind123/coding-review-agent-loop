@@ -52,7 +52,9 @@ def scoped_validator(validate, *, scopes, reviewer, items):
 
 def qualification_capture_pending(records, *, config, comments, head, plan, requirements):
     from .capture_acceptance import capture_pending
-    from .round_state import _latest_pr_approved_reviews_for_head
+    from .code_approval import (
+        _latest_pr_approved_reviews_for_head,
+    )
     from .reviewer_seats import reviewer_seat_binding, SeatAgent, seat_backend
     from .config import resolve_invocation
     acquisition = {}
@@ -87,8 +89,13 @@ def select_capture_reviewers(decision, scopes, required_reviewers):
 
 def resume_capture_round(records, *, comments, trusted_actor, head):
     """Replay admitted scoped responses through settlement, without code authority."""
-    from .round_state import (ResumedReviewRound, _recovery_record_admitted,
-                              _max_unresolved_item_number_from_records)
+    from .round_metadata import (
+        ResumedReviewRound,
+    )
+    from .round_state import (
+        _recovery_record_admitted,
+        _max_unresolved_item_number_from_records,
+    )
     from .review_scope import scope_present, valid_evidence_scope
     records = authority_records(records)
     current = [record for record in records if record.metadata.subject == head]

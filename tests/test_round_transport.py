@@ -9,21 +9,25 @@ import pytest
 import coding_review_agent_loop.round_transport as transport
 import coding_review_agent_loop.comment_rendering as comment_rendering
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     PostedRoundMetadata,
-    QualificationCheckpoint,
     _attach_round_metadata,
     _decode_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
-    _extract_round_metadata_records,
-    _prior_item_ledger_signature,
     _plan_subject,
     decode_plan_validation_diagnostic_body,
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
+)
+from coding_review_agent_loop.qualification_checkpoint import (
+    QualificationCheckpoint,
+)
+from coding_review_agent_loop.round_state import (
+    _extract_round_metadata_records,
+    _prior_item_ledger_signature,
 )
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.protocol import (
@@ -2115,7 +2119,7 @@ def test_planning_scheduler_record_decodes_valid_and_never_cross_decodes():
         make_plan_contract,
     )
     from coding_review_agent_loop.review_scheduling import make_contract
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _decode_round_metadata,
         _encode_round_metadata,
@@ -2191,7 +2195,7 @@ def test_planning_scheduler_record_decodes_valid_and_never_cross_decodes():
 def test_planning_scheduler_record_without_a_candidate_key_decodes_invalid():
     """A partial planning record falls back instead of pinning the run."""
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         _decode_round_metadata_mapping,
     )
 
@@ -2220,7 +2224,7 @@ def test_planning_scheduler_record_without_a_candidate_key_decodes_invalid():
 
 def test_absent_planning_scheduler_metadata_stays_absent():
     """Full-board planning comments remain byte-compatible legacy records."""
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _decode_round_metadata,
         _encode_round_metadata,
@@ -2248,7 +2252,9 @@ def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid(
         PlanCandidateKey,
         make_plan_contract,
     )
-    from coding_review_agent_loop.round_state import _decode_round_metadata_mapping
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata_mapping,
+    )
 
     complete = PlanCandidateKey(
         subject="a" * 64,
@@ -2335,7 +2341,7 @@ def _deg_record(outcome="degraded-to-undetermined"):
 
 
 def test_degradation_records_round_trip_through_round_metadata():
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _decode_round_metadata,
         _encode_round_metadata,
@@ -2351,7 +2357,7 @@ def test_degradation_records_round_trip_through_round_metadata():
 
 
 def test_historical_and_malformed_degradation_metadata_rehydrate_safely():
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _decode_round_metadata_mapping,
         _encode_round_metadata,
@@ -2551,7 +2557,9 @@ def test_m953_larger_payload_spills_both_growth_fields_losslessly() -> None:
 
 
 def test_m953_evidence_spill_forces_prior_items_reference(monkeypatch) -> None:
-    from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _deserialize_unresolved_item,
+    )
 
     payload = {
         "flow": "pr",
@@ -2904,7 +2912,12 @@ def test_round_summary_renders_every_citation_record_once_beside_architecture_re
 
 @pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
 def test_resumed_round_restores_citation_records_equal_to_a_reparse_927(kind):
-    from coding_review_agent_loop.round_state import _resume_pr_round, rebuild_resumed_coder_carrier
+    from coding_review_agent_loop.round_state import (
+        _resume_pr_round,
+    )
+    from coding_review_agent_loop.round_metadata import (
+        rebuild_resumed_coder_carrier,
+    )
 
     text = _citation_response_927(kind)
     records = _parse_927(kind, text).test_observation_degradations
@@ -2982,7 +2995,12 @@ def test_resume_reparse_of_a_posted_prose_payload_keeps_todays_records_1626(kind
         TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
         TEST_OBSERVATIONS_NOT_ARRAY_RULE,
     )
-    from coding_review_agent_loop.round_state import _resume_pr_round, rebuild_resumed_coder_carrier
+    from coding_review_agent_loop.round_state import (
+        _resume_pr_round,
+    )
+    from coding_review_agent_loop.round_metadata import (
+        rebuild_resumed_coder_carrier,
+    )
 
     text = _citation_response_1626(kind, "The node command ran with no environment override.")
     records = _parse_1626(kind, text).test_observation_degradations
