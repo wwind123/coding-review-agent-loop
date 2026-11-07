@@ -1,4 +1,5 @@
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
 import hashlib
 """PR-loop tests for followups and pr_loop_support: PR follow-up filing (#1542)."""
@@ -251,10 +252,7 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
         response_validation,
         "stable_tracked_tree_snapshot",
@@ -287,9 +285,7 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
                 race_pending = False
         return real_get_pr_review_context(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", get_pr_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", get_pr_context)
 
     def fake_correction(*_args, **kwargs):
         nonlocal race_pending
@@ -412,10 +408,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
     def forbidden_repair(*_a, **_k):
         raise AssertionError("repair must not run for dropped execution_refs")
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(validated_agent, "attempt_repair", forbidden_repair)
     monkeypatch.setattr(validated_agent, "execute_repair", forbidden_repair)
     monkeypatch.setattr(
@@ -1762,10 +1755,7 @@ def _advance_head_after_coder_1389(monkeypatch, runner, *, interrupt=None):
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
     return Interrupted
 
 
@@ -2176,9 +2166,7 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
             comments=comments, human_requirements=requirements,
         )
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", review_context)
     repairs = []
     real_repair = validated_agent_module._run_structured_repair
 

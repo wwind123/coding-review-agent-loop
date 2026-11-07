@@ -1,4 +1,5 @@
 """Ownership correction drives real plan-first orchestration paths."""
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from types import SimpleNamespace
 
@@ -315,7 +316,7 @@ def test_resumed_ownership_correction_precedes_phase_advance(tmp_path, monkeypat
         original_context = github.get_issue_context
         def with_requirement(*args, **kwargs):
             return replace(original_context(*args, **kwargs), human_requirements=(requirement,))
-        patch_attr_in(monkeypatch, (loop, issue_loop, discuss, execution, child, pr, support),
+        patch_attr_in(monkeypatch, (loop, issue_loop, discuss, execution, child, pr, support, plan_execution),
                       "get_issue_context", with_requirement)
     dispositions = ([{"requirement_id": requirement.requirement_id, "disposition": "addressed",
                       "evidence": "Correct the ownership."}] if reopened else [])

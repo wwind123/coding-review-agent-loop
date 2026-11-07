@@ -1,5 +1,6 @@
 """Integration tests for plan-first split/deferred-stage materialization and
 the selected-stage implementation handoff (#476)."""
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 
 import pytest
@@ -230,8 +231,8 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         events.append("implement")
         return 0
 
-    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_decompose_approved_plan", fake_decompose)
-    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue", fake_implement)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_execution), "_decompose_approved_plan", fake_decompose)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_execution), "_implement_approved_issue", fake_implement)
 
     compatible = (
         execution_mode == "plan-only" and strategy == "one-shot"

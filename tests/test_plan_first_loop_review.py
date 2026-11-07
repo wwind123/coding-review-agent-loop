@@ -1,5 +1,6 @@
 """Plan-first loop tests: plan review rounds and plan-review follow-ups (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
@@ -204,7 +205,7 @@ def test_issue_loop_plan_first_fails_closed_when_requirements_change_after_appro
         human_requirements=(requirement_1, requirement_2),
     )
     contexts = iter((initial, refreshed))
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda *args, **kwargs: next(contexts),
     )
     plan_output = structured_plan_state(summary="Plan the compatibility fix.").replace(
@@ -286,7 +287,7 @@ def test_issue_loop_plan_first_fails_closed_when_a_requirement_is_withdrawn(
     contexts = iter(
         (_context(requirement_1, requirement_2), _context(requirement_1))
     )
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context",
         lambda *args, **kwargs: next(contexts),
     )
     dispositions = [
@@ -1709,7 +1710,7 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
     patch_attr_in(monkeypatch, (review_rounds, pr_loop, plan_first_loop_module), "_round_ledger_may_be_incomplete", ledger_spy)
     logged = []
     real_log = agent_failure.log
-    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log",
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, plan_execution), "log",
         lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
     )
     runner = FakeRunner(
@@ -1773,7 +1774,7 @@ def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
         snapshots.append(context)
         return context
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", get_issue_context_spy
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", get_issue_context_spy
     )
     runner = FakeRunner(
         claude_outputs=[
@@ -2593,7 +2594,7 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=tuple(requirements))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
 
     def operator_comment(body):
         runner.issue_comments.append({

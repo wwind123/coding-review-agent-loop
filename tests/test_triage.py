@@ -6,6 +6,7 @@ is called.
 
 from __future__ import annotations
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import datetime
 import json
 import threading
@@ -102,8 +103,8 @@ class _StopAtFirstTurn(Exception):
 
 def _patch_issue_startup(monkeypatch, issue_context):
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "validate_open_issue", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module), "get_issue_context", lambda *a, **k: issue_context)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop_module), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module, plan_execution), "get_issue_context", lambda *a, **k: issue_context)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop_module, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop_module), "sync_coder_base_before_implementation", lambda *a, **k: None
     )
@@ -744,12 +745,12 @@ def test_recorded_staged_child_route_wins_without_a_triage_call(
     tmp_path, monkeypatch, capsys, disposition, plan_first, seam
 ):
     fresh, issue, parent = _fresh_child(disposition, handoff=_recorded_handoff(disposition))
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop_module), "_resolve_fresh_child_provenance", lambda **_: fresh)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop_module), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop_module, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
     runner = FakeRunner(codex_outputs=[_triage_output("discuss-first")])
     seen: list[dict] = []
     monkeypatch.setattr(issue_loop_module, seam, _record_dispatch(seen, runner, raise_stop=False))

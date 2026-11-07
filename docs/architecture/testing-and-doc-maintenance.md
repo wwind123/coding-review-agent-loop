@@ -24,7 +24,8 @@ shared helper calls without compatibility exports. The symbol manifest and uncha
 body digests live in `tests/fixtures/prompt_support_move.json`;
 `tests/test_module_split_imports.py` audits old imports, aliases, annotations,
 patch targets, unused builder imports, fresh import orders and shared patch coverage.
-The owner/path inventory is in `docs/prompt_support_ownership.md`.
+The prompt owner/path inventory is in `docs/prompt_support_ownership.md`; the
+combined inventory and execution-boundary audit are in `docs/plan_execution_ownership.md`.
 
 Architecture-context injection is bounded and advisory on the supported prompt
 paths, and fresh turns with an acquired architecture snapshot use the versioned

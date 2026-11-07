@@ -1,5 +1,6 @@
 """PR-loop tests for panel_evidence: the human-only exact-head evidence freeze (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import dataclasses
 import re
 
@@ -375,9 +376,7 @@ def _inject_signed_input_before(monkeypatch, runner, *, body, when):
             runner.pr_payload["comments"].append(_signed(body, 40 + len(runner.pr_payload["comments"])))
         return real_context(runner_, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", context_with_injection)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", context_with_injection)
     return injected
 
 
@@ -885,9 +884,7 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
             runner.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
         return real_context(runner_, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", head_moves_before_gate)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", head_moves_before_gate)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert moved

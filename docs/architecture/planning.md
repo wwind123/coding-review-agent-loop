@@ -2,7 +2,7 @@
 
 The main lifecycle diagram and the plan-first path up to the implementation PR: the canonical approved plan and its handoff binding, the generation-1 risk-based mode and transition matrix and its inheritance by child plans, implementation evidence claims and their selector, row-ID and launcher rules, deterministic planning-validation recovery, and the generation-1 execution strategy with staged child phases.
 
-Source paths: `src/coding_review_agent_loop/plan_ownership.py`, `tests/test_plan_ownership.py`, `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
+Source paths: `src/coding_review_agent_loop/plan_ownership.py`, `tests/test_plan_ownership.py`, `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/plan_execution.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
 
 ## Main Lifecycle
 
@@ -32,6 +32,15 @@ response, exhausted budget, or failed prerequisite. The arrows describe the
 normal path, not permission to retry indefinitely or ignore failed checks.
 
 ## Planning and Implementation
+
+`plan_first_loop.py` owns candidate review and the wrapper that scopes and
+resets the plan board stamp. It calls `plan_execution.py` with an explicit
+approval snapshot and live boundary values when the candidate is approved.
+The execution owner performs the existing live requirement and ledger checks,
+mode resolution, board restoration, handoff publication and child dispatch.
+Recursive child planning uses a caller-supplied entry point, so the execution
+owner never imports the planning driver. Retained planning requirement and
+board-field lookups use the execution owner directly.
 
 Plan-first mode records a canonical approved plan and its identity. The
 issue-to-PR handoff binds that plan to the implementation PR independently of

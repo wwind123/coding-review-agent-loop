@@ -1,4 +1,5 @@
 """A reviewer that omits a carried-item disposition is re-asked once (#1167)."""
+import coding_review_agent_loop.plan_execution as plan_execution
 import threading
 from unittest.mock import patch
 
@@ -101,7 +102,7 @@ def test_omission_is_reasked_once_on_same_model_and_accepted(tmp_path, backend):
     repair_calls: list[str] = []
     logs: list[str] = []
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)), \
-            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "log", lambda _cfg, msg: logs.append(msg)), \
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda _cfg, msg: logs.append(msg)), \
             patch.object(validated_agent.time, "sleep", side_effect=AssertionError("slept")):
         response = validated_agent._run_validated_agent(
             runner,
@@ -375,7 +376,7 @@ def test_parallel_worker_reasks_with_real_validator_without_repair_or_fallback(t
     repair_calls: list[str] = []
     logs: list[str] = []
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)), \
-            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "log", lambda _cfg, msg: logs.append(msg)):
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, plan_execution), "log", lambda _cfg, msg: logs.append(msg)):
         assert run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, target)) == 0
 
     commands = _target_commands(runner, target)

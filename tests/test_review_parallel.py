@@ -1,5 +1,6 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
 import dataclasses
 import json
@@ -904,9 +905,7 @@ def test_plan_parallel_revision_validation_exhaustion_survives_resume(
         agent_max_retries=0,
     )
 
-    with patch_object_in((
-        validated_agent, pr_loop, plan_first_loop,
-    ), "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError) as error:
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -958,16 +957,12 @@ def test_repeated_exhausted_plan_failures_select_highest_attempt_across_invocati
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch_object_in((
-        validated_agent, pr_loop, plan_first_loop,
-    ), "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     runner.claude_outputs = [invalid_candidate]
-    with patch_object_in((
-        validated_agent, pr_loop, plan_first_loop,
-    ), "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -1317,10 +1312,7 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
             )
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent",
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         run_validated_agent_with_session_observation,
     )
     runner = FakeRunner(
@@ -1791,10 +1783,7 @@ def test_plan_parallel_interruption_between_publications_replays_withheld_review
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     real_post = architecture_contract.post_issue_comment
 
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_second_review_post(real_post, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -1863,10 +1852,7 @@ def _plan_partial_round_runner():
 
 
 def _interrupt_plan_round_between_publications(runner, config, markers):
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_second_review_post(architecture_contract.post_issue_comment, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -2396,10 +2382,7 @@ def test_pr_loop_parallel_quota_error_takes_precedence_over_other_fatal_error(tm
             raise QuotaResetExceededError("Codex quota exhausted; resets in 2h.")
         raise _OtherFatalError("Gemini failed deterministically.")
 
-    with patch_object_in((
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", side_effect=fake_run_validated_agent):
+    with patch_object_in((validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", side_effect=fake_run_validated_agent):
         with pytest.raises(QuotaResetExceededError):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2864,10 +2847,7 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
     # Round 1 settles the primary; round 2 is the reviewer-only panel round.
     # The panel publishes its blocking review and the run is then interrupted
     # at the reconciliation boundary.
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment", side_effect=interrupt_before_reconciliation
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment", side_effect=interrupt_before_reconciliation
     ):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -4139,10 +4119,7 @@ def test_plan_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_p
 def test_plan_interrupted_primary_resumed_into_a_same_round_panel_still_launches_the_panel(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_phase(
             architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
@@ -4158,10 +4135,7 @@ def test_plan_interrupted_primary_resumed_into_a_same_round_panel_still_launches
 
 
 def _interrupt_panel_plan_round(runner, config):
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_second_review_post(architecture_contract.post_issue_comment, _PLAN_PANEL_MARKERS),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4369,10 +4343,7 @@ def test_pr_same_round_gate_survives_verified_deletion_and_rerun(tmp_path):
 def test_plan_same_round_gate_is_kept_and_listing_is_verified(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_phase(
             architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
@@ -4420,10 +4391,7 @@ def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp
             raise AgentLoopError("transient read failure")
         return real_context(*args, **kwargs)
 
-    with patch_object_in((
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", side_effect=flaky_context):
+    with patch_object_in((discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", side_effect=flaky_context):
         with pytest.raises(review_rounds.PartialReviewRoundError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -4521,10 +4489,7 @@ def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     runner.round_markers = markers
     runner.slow_reviewer = ("gemini", "agy")
     config = _panel_plan_config(tmp_path, plan_review_force_full=True)
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_second_publication_of(
             architecture_contract.post_issue_comment, markers, first_marker=markers[0]
         ),
@@ -4563,10 +4528,7 @@ def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
             raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
         return real_extract(comments, flow=flow)
 
-    with patch_object_in((
-        architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy,
-        child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export,
-    ), "_extract_round_metadata_records", side_effect=extract):
+    with patch_object_in((architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export, plan_execution), "_extract_round_metadata_records", side_effect=extract):
         with pytest.raises(AgentLoopError) as excinfo:
             run_pr_loop(runner, pr_number=77, config=config, **{})
 
@@ -4629,10 +4591,7 @@ def test_pr_publication_hidden_by_a_ledger_mismatch_still_counts_as_a_peer(tmp_p
 def _same_round_plan_panel_state(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment",
         side_effect=_interrupt_on_phase(
             architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
@@ -4996,10 +4955,7 @@ def _interrupt_plan_second_review_after_freezing(runner, config, markers):
                     return real_post(*args, **kwargs)
         return real_post(*args, **kwargs)
 
-    with patch_object_in((
-        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
-        child_plan_binding, plan_first_loop,
-    ), "post_issue_comment", side_effect=fail_second_review_body):
+    with patch_object_in((architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop), "post_issue_comment", side_effect=fail_second_review_body):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -5598,10 +5554,7 @@ def test_pr_frozen_bodies_survive_scheduler_and_peer_drift(tmp_path, monkeypatch
         return real_attach(body, metadata)
 
     launches_before = len(runner.reviewer_launches)
-    with patch_object_in((
-        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
-        plan_first_loop, issue_loop,
-    ), "_attach_round_metadata", side_effect=drifting):
+    with patch_object_in((discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "_attach_round_metadata", side_effect=drifting):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert composed, "the drifting composition was never exercised"
@@ -5972,10 +5925,7 @@ def test_pr_peer_already_public_before_the_rerun_changes_scheduler_inputs(tmp_pa
         seen.append(metadata)
         return real_attach(body, metadata)
 
-    with patch_object_in((
-        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
-        plan_first_loop, issue_loop,
-    ), "_attach_round_metadata", side_effect=observing):
+    with patch_object_in((discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "_attach_round_metadata", side_effect=observing):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     comments = runner.pr_payload["comments"]
@@ -6029,10 +5979,7 @@ def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp
         seen.append(metadata)
         return real_attach(body, metadata)
 
-    with patch_object_in((
-        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
-        plan_first_loop, issue_loop,
-    ), "_attach_round_metadata", side_effect=observing):
+    with patch_object_in((discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "_attach_round_metadata", side_effect=observing):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     comments = runner.pr_payload["comments"]

@@ -188,8 +188,10 @@ from .issue_implementation import (
     _advisory_issue_pr_provenance,
     _publish_issue_authorization_with_recovery,
 )
-from .plan_first_loop import (
+from .plan_execution import (
     _dispatch_decomposition_child,
+)
+from .plan_first_loop import (
     _run_plan_first_loop,
 )
 from .triage import arm_issue_triage
@@ -338,6 +340,7 @@ def run_issue_loop(
                 memory = prepare_agent_memory(runner, config)
                 return _dispatch_decomposition_child(
                     runner,
+                    run_plan_first_loop=_run_plan_first_loop,
                     config=config,
                     memory=memory,
                     usage_context=usage_context,

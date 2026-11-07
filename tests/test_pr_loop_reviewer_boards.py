@@ -635,9 +635,7 @@ class _PlanCheckReached(Exception):
 def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     """Fresh managed-CI authorization through run_pr_loop, plan approved by three."""
     plan_board = ("codex", "gemini", "antigravity")
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop,
-    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):
@@ -866,9 +864,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
     plan_board = ("codex", "gemini", "antigravity")
     plan_checks = []
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop,
-    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):

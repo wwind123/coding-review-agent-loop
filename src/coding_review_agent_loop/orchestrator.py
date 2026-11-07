@@ -1249,10 +1249,12 @@ from .issue_implementation import (
     _implement_approved_issue,
     _decompose_approved_plan,
 )
-from .plan_first_loop import (
+from .plan_execution import (
     _run_child_planning_cycle,
     _dispatch_decomposition_child,
     _dispatch_current_decomposition_phase,
+)
+from .plan_first_loop import (
     _run_plan_first_loop,
 )
 from .issue_loop import (

@@ -1,0 +1,25 @@
+{
+  "old_owner": "plan_first_loop",
+  "new_owner": "plan_execution",
+  "symbols": [
+    "_run_child_planning_cycle",
+    "_dispatch_decomposition_child",
+    "_dispatch_current_decomposition_phase",
+    "_typed_deferred_work_titles",
+    "_PLAN_BOARD_CONFIG_FIELDS",
+    "_with_planning_requirements",
+    "_restore_invocation_board",
+    "_staged_child_relaunch_lines"
+  ],
+  "body_sha256": {
+    "_run_child_planning_cycle": "4c51579e4809a306863ea5ee7ddf40656781add9d0f1b226e0f17f9d49599dc6",
+    "_dispatch_decomposition_child": "0c6d05885b2bceecfa971193b605741b76f456ae368848433bd988fbde6a8b22",
+    "_dispatch_current_decomposition_phase": "08c5acf586f8309b8096ec2997640aca02f3c09c620607dd14943d32ae6e9c03",
+    "_typed_deferred_work_titles": "749620dac3dfb7bc8edff3cb942c1df6a36e63c1ded602d838bc42c82f0d8382",
+    "_PLAN_BOARD_CONFIG_FIELDS": "2b09d644c0b707c51713d04d874f909e247a0560d1cd7319e8178eaa62a1ff8e",
+    "_with_planning_requirements": "ebf2815a67444363d46d229f77b043ed54b872bd47ab951b139a220fea75c79c",
+    "_restore_invocation_board": "0ad5a04cc79bb0edf6df2de58b64ce4235a00dcb1878c851b3c6e8cf4a1a5b09",
+    "_staged_child_relaunch_lines": "8e91264b956013748255f0858396907c41d8a33f11b94ac666333d7b2873392b"
+  },
+  "approved_branch_sha256": "4fe57e24310527bc14885543351267e54498a5adde1373b1f705bc9f805c35e5"
+}

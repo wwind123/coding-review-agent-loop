@@ -1,5 +1,6 @@
 """PR-loop tests for checks and ci_health: the PR-loop CI gate (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import round_metadata
 
 import dataclasses
@@ -84,10 +85,7 @@ def _advance_head_after_coder(monkeypatch, runner, head_sha="15cab520f7c90f2ab17
             runner.pr_payload["headRefOid"] = head_sha
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
 
 def test_orchestrator_finalization_guard_rejects_uncleared_machine_obligation():
@@ -766,10 +764,7 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
             raise CoderReached
         return original(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", capture)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", capture)
     with pytest.raises(CoderReached):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
     assert snapshots == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "6367c48dd193d56ea7b0baad25b19455e529f5ee"]
@@ -1581,9 +1576,7 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
         base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),
@@ -1684,9 +1677,7 @@ def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
             comments=(), human_requirements=requirements,
         )
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", review_context)
     selections = []
     real_select = pr_loop.select_coder_followup_items
 
@@ -2447,10 +2438,7 @@ def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypa
             raise CoderReached
         return original(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", capture)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", capture)
     monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
     with pytest.raises(CoderReached):

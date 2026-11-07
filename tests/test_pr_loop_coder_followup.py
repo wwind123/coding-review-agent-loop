@@ -1733,10 +1733,7 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
         response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
@@ -1872,10 +1869,7 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
         corrections.append(1)
         return SimpleNamespace(text=corrected_text)
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     patch_attr_in(monkeypatch, (
         validated_agent, response_validation,
     ), "run_agent_result", fake_correction)
@@ -2626,8 +2620,7 @@ def test_saturated_canonical_receipt_only_handoff_1758(tmp_path, monkeypatch, mo
         runner._local_test_observations.append(current)
         return response
 
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, issue_loop, issue_implementation,
-                                plan_first_loop, discuss_loop, triage), "_run_validated_agent", acquire)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, issue_loop, issue_implementation, plan_first_loop, discuss_loop, triage), "_run_validated_agent", acquire)
     monkeypatch.setattr(response_validation, "stable_tracked_tree_snapshot", lambda _: SimpleNamespace(
         head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True))
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop),

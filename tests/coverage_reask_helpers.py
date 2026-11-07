@@ -7,6 +7,7 @@ committed-tree probe, re-ask, refresh, and rendering run end to end.
 
 from __future__ import annotations
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import os
 import subprocess
@@ -190,11 +191,11 @@ class CoverageHarness:
 
         if not self.real_agent:
             patch_attr_in(m, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", scripted)
-        patch_attr_in(m, (execution_policy, issue_implementation, plan_first_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+        patch_attr_in(m, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
         patch_attr_in(m, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
         patch_attr_in(m, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
         patch_attr_in(m, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None)
-        patch_attr_in(m, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop",
+        patch_attr_in(m, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop",
             lambda *_a, **kwargs: self.run_pr_calls.append(kwargs) or 0,
         )
         m.setattr(

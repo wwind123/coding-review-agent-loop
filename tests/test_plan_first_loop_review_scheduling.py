@@ -1,5 +1,7 @@
 """Plan-first loop tests: staged plan-review scheduling and finding provenance (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
+import coding_review_agent_loop.plan_verification as split_owner_plan_verification
 import json
 import re
 from dataclasses import replace
@@ -387,7 +389,7 @@ def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
         )
         return replace(context, human_requirements=requirements)
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
 
     with pytest.raises(
         AgentLoopError,
@@ -427,7 +429,7 @@ def test_staged_planning_persists_a_repaired_primary_acknowledgement(tmp_path, m
         )
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
 
     with patch(
         "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
@@ -489,7 +491,7 @@ def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
         )
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     config = _staged_plan_config(tmp_path)
     real_post = architecture_contract.post_issue_comment
 
@@ -578,7 +580,7 @@ def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     config = make_config(
         tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
         plan_review_policy="primary-then-panel", primary_plan_reviewer=flash,
@@ -1340,9 +1342,7 @@ def _m1505_run(tmp_path, *, claude, codex, expect=AgentLoopError, **overrides):
     values.update(overrides)
     runner = _FakeRunner(claude_outputs=list(claude), codex_outputs=list(codex))
     config = _staged_plan_config(tmp_path, **values)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(expect):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return runner, [str(call.args[-1]) for call in logged.call_args_list]
@@ -1589,9 +1589,7 @@ def test_sweep_effort_is_ignored_with_a_log_line_for_a_backend_without_effort(tm
         tmp_path, max_rounds=1, primary_plan_reviewer="gemini",
         plan_sweep_reasoning_effort="high",
     )
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     messages = [str(call.args[-1]) for call in logged.call_args_list]
@@ -1683,9 +1681,7 @@ def test_sweep_effort_workflow_for_claude_and_seat_primaries(tmp_path, primary_k
     }
     runner = _FakeRunner(**outputs)
     config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     messages = [str(call.args[-1]) for call in logged.call_args_list]
@@ -1779,11 +1775,9 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
-        with patch.object(
-            plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-        ) as logged:
+        with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
             with pytest.raises(AgentLoopError):
                 run_issue_loop(
                     runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
@@ -1924,9 +1918,7 @@ def test_resumed_round_renders_and_records_the_same_baseline_form(tmp_path):
     assert len(_m1516_primary_records(first)) == 1
     rerun = _FakeRunner(issue_comments=list(first.issue_comments), codex_outputs=codex[1:])
     config = _staged_plan_config(tmp_path / "resumed", max_rounds=2)
-    with patch.object(
-        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
-    ) as logged:
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", wraps=plan_first_loop_module.log) as logged:
         with pytest.raises(AgentLoopError):
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     rerun_messages = [str(call.args[-1]) for call in logged.call_args_list]
@@ -2620,7 +2612,7 @@ def test_approved_reconciled_resume_reaches_execution_without_scheduling(tmp_pat
     calls = len(runner.commands)
     for _ in range(2):
         with patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")), \
-             patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0) as implement:
+             patch.object(plan_execution, "_implement_approved_issue", return_value=0) as implement:
             assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
             assert implement.call_count == (mode == "auto")
     assert len(_plan_round_records(runner)) == before
@@ -2739,8 +2731,8 @@ def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
     # discarded to recover approval of round 2, even at the old round limit.
     before = len(_plan_round_records(runner))
     calls = len(runner.commands)
-    with patch.object(plan_first_loop_module, "_implement_approved_issue", side_effect=AssertionError("implemented")), \
-         patch.object(plan_first_loop_module, "_decompose_approved_plan", side_effect=AssertionError("decomposed")):
+    with patch.object(plan_execution, "_implement_approved_issue", side_effect=AssertionError("implemented")), \
+         patch.object(plan_execution, "_decompose_approved_plan", side_effect=AssertionError("decomposed")):
         with pytest.raises(AgentLoopError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert not any(r.phase == "plan-phase-advance" for r in _plan_round_records(runner)[before:])
@@ -2764,10 +2756,10 @@ def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_pa
     with pytest.raises(AgentLoopError, match="phase advance was still pending"):
         run_issue_loop(runner, issue_number=56, config=original, plan_first=True)
     reduced = _staged_plan_config(tmp_path, max_rounds=3, plan_execution_mode="auto" if strategy == "staged" else "plan-only")
-    with patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+    with patch.object(plan_execution, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
             created=(), stage_ids=(), automations=(), plan_hash="test-plan",
             mode="implement-by-phase", topology_source="approved-plan-v1")), \
-         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0):
+         patch.object(plan_execution, "_dispatch_current_decomposition_phase", return_value=0):
         assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
     checkpoint = next(r for r in reversed(_plan_round_records(runner)) if r.phase == "scheduler-prelaunch")
     runner.issue_comments.append({"body": _attach_round_metadata("Settled", PostedRoundMetadata(
@@ -2790,13 +2782,13 @@ def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_pa
     links = [c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]
     assert len(links) == 1
     logs = []
-    with patch.object(plan_first_loop_module, "log", side_effect=lambda _config, message: logs.append(message)), \
-         patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0) as implement, \
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", side_effect=lambda _config, message: logs.append(message)), \
+         patch.object(plan_execution, "_implement_approved_issue", return_value=0) as implement, \
          patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")), \
-         patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+         patch.object(plan_execution, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
              created=(), stage_ids=(), automations=(), plan_hash="test-plan",
              mode="implement-by-phase", topology_source="approved-plan-v1")) as decompose, \
-         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0) as dispatch:
+         patch.object(plan_execution, "_dispatch_current_decomposition_phase", return_value=0) as dispatch:
         try:
             result = run_issue_loop(runner, issue_number=56, config=replace(
                 original, max_rounds=checkpoint.round_number, plan_execution_mode=mode), plan_first=True)
@@ -2861,7 +2853,7 @@ def test_approved_neutral_resume_preserves_lifecycle_and_publication_parity(tmp_
         selected = replace(config, plan_execution_mode=mode, approved_followups=policy)
         before = len(_plan_round_records(runner))
         for _ in range(2):
-            with patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0):
+            with patch.object(plan_execution, "_implement_approved_issue", return_value=0):
                 assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
         assert len(_plan_round_records(runner)) == before
         assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
@@ -2922,7 +2914,7 @@ def test_approved_resume_does_not_activate_pending_post_approval_link(tmp_path):
                                  "createdAt": "2026-05-23T00:00:00Z"})
     before = len(runner.issue_comments)
     logs = []
-    with patch.object(plan_first_loop_module, "log", side_effect=lambda _config, message: logs.append(message)):
+    with patch_object_in((plan_first_loop_module, plan_execution), "log", side_effect=lambda _config, message: logs.append(message)):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert len(runner.issue_comments) == before
     assert any("does not reopen planning; it is not activated" in message for message in logs)
@@ -2958,7 +2950,7 @@ def test_approved_publication_resume_preserves_followups(tmp_path, policy, mode,
                        plan_review_policy=review_policy, primary_plan_reviewer=None if review_policy == "all-reviewers" else "codex", review_parallel=True)
     before = len(_plan_round_records(runner))
     for _ in range(2):
-        with patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0):
+        with patch.object(plan_execution, "_implement_approved_issue", return_value=0):
             assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
     assert len(_plan_round_records(runner)) == before
     assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
@@ -2980,7 +2972,7 @@ def test_approved_shortcut_nonbinding_disagreement_refuses_without_writes(tmp_pa
         text="Preserve the obligation.")
     real_classify = plan_first_loop_module.classify_plan_approval
     real_context = plan_first_loop_module.get_issue_context
-    real_ledger = plan_first_loop_module.plan_ledger_unreconstructible_items
+    real_ledger = split_owner_plan_verification.plan_ledger_unreconstructible_items
     real_apply = plan_first_loop_module._apply_unresolved_item_dispositions
     classified = False
 
@@ -3019,8 +3011,8 @@ def test_approved_shortcut_nonbinding_disagreement_refuses_without_writes(tmp_pa
         classified = False
         with ExitStack() as stack:
             stack.enter_context(patch.object(plan_first_loop_module, "classify_plan_approval", side_effect=classify))
-            stack.enter_context(patch.object(plan_first_loop_module, "get_issue_context", side_effect=context))
-            stack.enter_context(patch.object(plan_first_loop_module, "plan_ledger_unreconstructible_items", side_effect=ledger))
+            stack.enter_context(patch_object_in((plan_first_loop_module, plan_execution), "get_issue_context", side_effect=context))
+            stack.enter_context(patch.object(plan_execution, "plan_ledger_unreconstructible_items", side_effect=ledger))
             stack.enter_context(patch.object(plan_first_loop_module, "_apply_unresolved_item_dispositions", side_effect=apply))
             with pytest.raises(AgentLoopError) as exc:
                 run_issue_loop(runner, issue_number=56, config=replace(

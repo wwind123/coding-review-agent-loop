@@ -1,5 +1,6 @@
 """Issue-loop tests: issue resume and approved-plan routing (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 from types import SimpleNamespace
 
@@ -427,7 +428,7 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         assert config.repo == "OWNER/REPO"
         return child if issue_number == 56 else parent
 
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", issue_context_for)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", issue_context_for)
     runner = _FakeRunner(
         pr_payload={
             "number": 77,

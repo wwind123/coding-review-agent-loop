@@ -1,5 +1,6 @@
 """PR-loop tests for review_rounds and review_scheduling: PR review scheduling (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import dataclasses
 import json
 import re
@@ -652,9 +653,7 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
             human_requirements=(requirement_1 if context_calls == 1 else requirement_2,),
         )
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", changing_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", changing_context)
     runner = FakeRunner(
         claude_outputs=[],
         codex_outputs=[
@@ -744,10 +743,7 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
         issue_fetches += 1
         return initial_issue if issue_fetches == 1 else changed_issue
 
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", changing_issue)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", changing_issue)
     migration_calls = []
     monkeypatch.setattr(
         pr_loop,
@@ -861,10 +857,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         issue_fetches += 1
         return initial_issue if issue_fetches == 1 else replacement_issue
 
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", changing_issue)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", changing_issue)
     migration_calls = []
 
     def validate_migration(*args, **kwargs):
@@ -1471,10 +1464,7 @@ def test_staged_external_head_change_invalidates_primary_approval_before_panel(t
                 runner.pr_payload["headRefOid"] = "d6736bfa7d2f4e674190376e7805c8055597c618"
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
     config = _staged_config(tmp_path)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -1537,10 +1527,7 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
                 runner.pr_payload["headRefOid"] = "e0784dc3fc93886c0e9558c3f2c5c3a871894af2"
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
     config = _staged_config(tmp_path, max_rounds=8)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -1605,9 +1592,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         context = original_context(runner, *args, **kwargs)
         return dataclasses.replace(context, human_requirements=(requirement,))
 
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", context_with_requirement)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", context_with_requirement)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex", resolved=True)],
         # Gemini approves without acknowledging the signed requirement.
@@ -2528,14 +2513,9 @@ def test_840_round_boundary_undecodable_history_stops_with_diagnostic(tmp_path, 
         state["broken"] = True
         return original_mergeability(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (
-        architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy,
-        child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export,
-    ), "_extract_round_metadata_records", extract)
+    patch_attr_in(monkeypatch, (architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export, plan_execution), "_extract_round_metadata_records", extract)
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "get_pr_mergeability", mergeability)
-    patch_attr_in(monkeypatch, (
-        review_rounds, pr_loop, plan_first_loop,
-    ), "_round_ledger_may_be_incomplete", lambda **kwargs: False)
+    patch_attr_in(monkeypatch, (review_rounds, pr_loop, plan_first_loop), "_round_ledger_may_be_incomplete", lambda **kwargs: False)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
         gemini_outputs=[_staged_review(reviewer="Google Gemini")],
@@ -2811,9 +2791,7 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
     patch_attr_in(monkeypatch, (
         review_rounds, pr_loop,
     ), "_unavailable_reviewer_amendment_advisory", mark_advisory)
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context", fetch)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context", fetch)
     runner = _scheduler_stop_runner()
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
@@ -2894,9 +2872,7 @@ def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detect
 def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monkeypatch):
     """Row strict-managed-all-reviewers-restore-only on a real strict issue-created handoff."""
     plan_board = ("codex", "claude", "antigravity")
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
-    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_loop), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
     patch_attr_in(monkeypatch, (
         panel_evidence, pr_loop_support, pr_loop,

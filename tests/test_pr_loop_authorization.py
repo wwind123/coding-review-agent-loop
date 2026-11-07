@@ -1,5 +1,6 @@
 """PR-loop tests for pr_loop_support and issue_pr_handoff: PR authorization (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import prompt_support as _prompt_owner
 
 import base64
@@ -853,10 +854,7 @@ def test_pr_ordinary_resume_without_parent_context_still_fails_closed(tmp_path, 
     patch_attr_in(monkeypatch, (
         discuss_loop, pr_loop, issue_loop,
     ), "validate_open_issue", lambda *_a, **_k: None)
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", lambda *_a, **_k: child
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", lambda *_a, **_k: child
     )
     monkeypatch.setattr(
         pr_loop, "recover_issue_created_handoff",
@@ -898,10 +896,7 @@ def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, mo
     patch_attr_in(monkeypatch, (
         discuss_loop, pr_loop, issue_loop,
     ), "validate_open_issue", lambda *_a, **_k: None)
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     monkeypatch.setattr(
@@ -937,10 +932,7 @@ def test_pr_fresh_authorization_recovers_parent_held_plan(tmp_path, monkeypatch)
     patch_attr_in(monkeypatch, (
         discuss_loop, pr_loop, issue_loop,
     ), "validate_open_issue", lambda *_a, **_k: None)
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     captured: dict[str, object] = {}
@@ -970,10 +962,7 @@ def test_pr_fresh_authorization_without_parent_context_still_fails_closed(tmp_pa
     patch_attr_in(monkeypatch, (
         discuss_loop, pr_loop, issue_loop,
     ), "validate_open_issue", lambda *_a, **_k: None)
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", lambda *_a, **_k: child)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", lambda *_a, **_k: child)
     monkeypatch.setattr(
         pr_loop, "authorize_fresh_issue_created_resume",
         lambda *_a, **_k: (_ for _ in ()).throw(_FreshScopeCaptured()),

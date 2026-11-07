@@ -1,5 +1,6 @@
 """Issue-implementation tests: managed PR creation and requirement blocking (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import pytest
 
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
@@ -202,8 +203,8 @@ def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_
     gate_calls = []
 
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *args, **kwargs: None)
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", lambda *args, **kwargs: issue_context)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", lambda *args, **kwargs: issue_context)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
 
@@ -216,9 +217,9 @@ def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_
 
     for name, owners in (
         ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
-        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
-        ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_execution, issue_loop)),
+        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_execution, issue_loop)),
+        ("run_pr_loop", (pr_loop, issue_implementation, plan_execution, issue_loop)),
     ):
         patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
 
@@ -238,7 +239,7 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
     issue_context = _issue_context_with_blocked_requirement()
     gate_calls = []
 
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *args, **kwargs: None)
 
@@ -251,9 +252,9 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
 
     for name, owners in (
         ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
-        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
-        ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_execution, issue_loop)),
+        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_execution, issue_loop)),
+        ("run_pr_loop", (pr_loop, issue_implementation, plan_execution, issue_loop)),
     ):
         patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
 
@@ -285,7 +286,7 @@ def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
         pr_payload={"body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=forged"},
     )
     config = make_config(tmp_path)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
 
@@ -327,11 +328,11 @@ def test_approved_plan_non_managed_allows_pr_body_naming_reserved_token(
         },
     )
     config = make_config(tmp_path)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop, plan_execution), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     reviewed = []
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0
     )
 
     assert issue_implementation._implement_approved_issue(
@@ -404,7 +405,7 @@ def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(
         "publish_issue_created_authorization",
         lambda *_args, **_kwargs: handoff,
     )
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", review_entry)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", review_entry)
 
     assert (
         run_issue_loop(

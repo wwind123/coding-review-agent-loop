@@ -1,5 +1,6 @@
 """Plan-first loop tests: plan comment publication and sidecars (#1543)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
@@ -315,7 +316,7 @@ def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
         return derived, extra
 
     patch_attr_in(monkeypatch, (response_validation, pr_loop, issue_implementation, issue_loop), "_derive_authenticated_risk_evidence_for_coder", derive)
-    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", lambda *_a, **_k: 0)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, plan_execution), "run_pr_loop", lambda *_a, **_k: 0)
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
@@ -354,7 +355,7 @@ def test_plan_first_legacy_resume_observation_precedes_handoff(tmp_path, monkeyp
     from issue_loop_test_helpers import _provenance_pages
     from types import SimpleNamespace
     monkeypatch.setattr(issue_loop, 'resolve_canonical_pr_for_issue', lambda *a, **k: None)
-    monkeypatch.setattr(plan_first_loop_module, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
+    monkeypatch.setattr(plan_execution, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     runner = FakeRunner(
         issue_comments=[
@@ -421,7 +422,7 @@ def test_plan_first_legacy_resume_convergence_binds_complete_handoff(tmp_path, m
     from issue_loop_test_helpers import _provenance_pages
     from types import SimpleNamespace
     monkeypatch.setattr(issue_loop, 'resolve_canonical_pr_for_issue', lambda *a, **k: None)
-    monkeypatch.setattr(plan_first_loop_module, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
+    monkeypatch.setattr(plan_execution, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     runner = FakeRunner(
         issue_comments=[
@@ -477,7 +478,7 @@ def test_plan_first_legacy_resume_convergence_binds_complete_handoff(tmp_path, m
         return original(args, **kwargs)
     runner.run = run
     delegated = []
-    monkeypatch.setattr(plan_first_loop_module, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
+    monkeypatch.setattr(plan_execution, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
     handoffs = [body for body in runner.comments if 'Flow: approved-plan-implementation' in body]
     assert len(handoffs) == 1

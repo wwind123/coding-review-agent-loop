@@ -8,6 +8,7 @@ progress resolution performs.
 
 from __future__ import annotations
 
+import coding_review_agent_loop.plan_execution as plan_execution
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
@@ -163,8 +164,7 @@ def install(monkeypatch, scenario: GuardScenario, *, handoff=None):
 
     patch_attr_in(
         monkeypatch,
-        (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-         plan_first_loop, issue_loop),
+        (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution),
         "get_issue_context",
         get_context,
     )
@@ -216,18 +216,18 @@ def install(monkeypatch, scenario: GuardScenario, *, handoff=None):
         record("memory", None),
     )
     patch_attr_in(
-        monkeypatch, (plan_first_loop, issue_loop), "_dispatch_decomposition_child",
+        monkeypatch, (issue_loop, plan_execution), "_dispatch_decomposition_child",
         record("dispatch", 23),
     )
     patch_attr_in(
-        monkeypatch, (execution_policy, plan_first_loop, issue_loop),
+        monkeypatch, (execution_policy, issue_loop, plan_execution),
         "_post_child_planning_handoff", record("planning-handoff", None),
     )
     patch_attr_in(
         monkeypatch, (plan_first_loop, issue_loop), "_run_plan_first_loop", record("planner", 19)
     )
     patch_attr_in(
-        monkeypatch, (execution_policy, plan_first_loop, issue_loop),
+        monkeypatch, (execution_policy, issue_loop, plan_execution),
         "resolve_canonical_pr_for_issue", lambda *_a, **_k: None,
     )
     return FakeRunner()

@@ -1,3 +1,4 @@
+import coding_review_agent_loop.plan_execution as plan_execution
 from coding_review_agent_loop import protocol, protocol_markers
 
 from coding_review_agent_loop import managed_ci_authorization as _managed_ci_authorization
@@ -5770,9 +5771,7 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     merged: list[tuple[int, str | None]] = []
@@ -5828,9 +5827,7 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     events: list[str] = []
@@ -6043,9 +6040,7 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
             head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
-    patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_observed_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, plan_execution), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
@@ -15628,10 +15623,7 @@ def _m1376_plan_bound(monkeypatch):
         canonical_text="plan", plan_hash=_PLAN_1376, plan_subject="subject",
         availability="available",
     )
-    patch_attr_in(monkeypatch, (
-        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
-        plan_first_loop, issue_loop,
-    ), "get_issue_context", lambda *a, **k: issue)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", lambda *a, **k: issue)
     patch_attr_in(monkeypatch, (
         execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
     ), "recover_approved_plan_context", lambda *a, **k: plan)
@@ -16656,10 +16648,7 @@ def test_fresh_process_resume_with_drifted_review_identity_forces_review_with_re
         events.append("review")
         raise _ReviewReached
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", review_then_stop)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", review_then_stop)
 
     with pytest.raises(_ReviewReached):
         pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)

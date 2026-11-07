@@ -1,5 +1,6 @@
 """PR-loop tests for unresolved_items and review_rounds: the PR review ledger (#1542)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import dataclasses
 import json
 import re
@@ -1436,17 +1437,10 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
         ledger_flags.append(result)
         return result
 
-    patch_attr_in(monkeypatch, (
-        review_rounds, pr_loop, plan_first_loop,
-    ), "_round_ledger_may_be_incomplete", ledger_spy)
+    patch_attr_in(monkeypatch, (review_rounds, pr_loop, plan_first_loop), "_round_ledger_may_be_incomplete", ledger_spy)
     logged = []
     real_log = agent_failure.log
-    patch_attr_in(monkeypatch, (
-        agent_failure, integration_close, architecture_contract, validated_agent,
-        response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy,
-        child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "log",
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, plan_execution), "log",
         lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
     )
     runner = FakeRunner(

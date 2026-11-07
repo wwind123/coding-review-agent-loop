@@ -1,5 +1,6 @@
 """Plan-growth signals, the one-shot growth gate and its levers (#886)."""
 
+import coding_review_agent_loop.plan_execution as plan_execution
 import hashlib
 import json
 from types import SimpleNamespace
@@ -895,7 +896,7 @@ def test_staged_conversion_revision_is_ledger_checked_with_the_gate_on_or_off(
     # staged-plan stop (#1268) does not apply and approval reaches decomposition.
     config = _config(tmp_path, plan_growth_gate=gate, plan_execution_mode="decompose-only")
     monkeypatch.setattr(
-        plan_first_loop_module,
+        plan_execution,
         "_decompose_approved_plan",
         lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("decomposition reached")),
     )

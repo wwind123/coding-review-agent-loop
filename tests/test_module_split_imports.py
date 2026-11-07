@@ -54,7 +54,16 @@ def ownership_problems(source, *, driver=False, old=OLD, owners=OWNERS, function
                             expanded_node.lineno = child.lineno
                     nodes.extend(expanded_nodes)
                     pending.extend(expanded_nodes)
+    # Module aliases may be imported after function definitions; those functions
+    # still resolve the binding when invoked after module initialization.
     bindings = {}
+    for imported in nodes:
+        if isinstance(imported, ast.Import):
+            for alias in imported.names:
+                bindings[alias.asname or alias.name.split('.')[0]] = alias.name if alias.asname else alias.name.split('.')[0]
+        elif isinstance(imported, ast.ImportFrom) and imported.module == 'coding_review_agent_loop':
+            for alias in imported.names:
+                bindings[alias.asname or alias.name] = imported.module + '.' + alias.name
     problems = []
 
     def resolve(node):
@@ -677,3 +686,201 @@ def test_round_manifest_rejects_old_aliases_annotations_and_patch_paths(name):
         f'from . import round_state as state\nmonkeypatch.setattr(state, "{name}", fake)',
     ):
         assert ownership_problems(source, old=OLD_ROUND, owners=ROUND_OWNERS)
+
+
+PLAN_MOVE = json.loads((ROOT / 'tests/fixtures/plan_execution_move.json').read_text())
+PLAN_OWNERS = {name: 'plan_execution' for name in PLAN_MOVE['symbols']}
+
+
+def test_plan_consumers_use_real_owners_and_no_unused_driver_imports():
+    problems = []
+    for folder in ('src', 'tests'):
+        for path in (ROOT / folder).rglob('*.py'):
+            problems.extend(f'{path.relative_to(ROOT)}: {problem}' for problem in
+                            ownership_problems(path.read_text(), driver=path.name in ('plan_first_loop.py', 'plan_execution.py'),
+                                               old='coding_review_agent_loop.plan_first_loop', owners=PLAN_OWNERS, functions=PLAN_OWNERS))
+    assert problems == []
+    driver = ast.parse((ROOT / 'src/coding_review_agent_loop/plan_first_loop.py').read_text())
+    definitions = {n.name for n in driver.body if isinstance(n, ast.FunctionDef)}
+    definitions.update(target.id for n in driver.body if isinstance(n, ast.Assign)
+                       for target in n.targets if isinstance(target, ast.Name))
+    assert not definitions.intersection(PLAN_OWNERS)
+
+
+@pytest.mark.parametrize('first', ['plan_execution', 'plan_first_loop', 'issue_loop', 'orchestrator'])
+def test_plan_execution_fresh_import_orders(first):
+    import os
+    import subprocess
+    import sys
+
+    modules = [first] + [m for m in ('plan_execution', 'plan_first_loop', 'issue_loop', 'orchestrator') if m != first]
+    subprocess.run([sys.executable, '-c', '\n'.join('import coding_review_agent_loop.' + m for m in modules)],
+                   check=True, timeout=30, cwd=ROOT, env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+    tree = ast.parse((ROOT / 'src/coding_review_agent_loop/plan_execution.py').read_text())
+    assert not any(isinstance(n, ast.ImportFrom) and 'plan_first_loop' in (n.module or '')
+                   or isinstance(n, ast.Import) and any('plan_first_loop' in a.name for a in n.names)
+                   for n in ast.walk(tree))
+
+
+def test_combined_split_sizes_and_original_policy():
+    from test_source_file_size import DEFAULT_LIMIT, ALLOWLIST
+
+    for module in ('prompts', 'prompt_support', 'round_state', 'round_metadata', 'plan_first_loop', 'plan_execution'):
+        assert len((ROOT / f'src/coding_review_agent_loop/{module}.py').read_text().splitlines()) <= 5000
+    assert DEFAULT_LIMIT == 6000
+    assert ALLOWLIST['src/coding_review_agent_loop/pr_loop.py'] == 9945
+
+
+def test_plan_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(monkeypatch, tmp_path):
+    from coding_review_agent_loop import plan_first_loop, plan_execution
+    from agent_loop_helpers import make_config
+
+    reachable = (plan_first_loop, plan_execution)
+    assert missing_patch_owners((plan_first_loop,), reachable, 'get_issue_context') == {plan_execution.__name__}
+    calls = []
+
+    def intercept(*args, **kwargs):
+        calls.append(kwargs['issue_number'])
+        raise RuntimeError('local context intercepted')
+
+    for module in reachable:
+        monkeypatch.setattr(module, 'get_issue_context', intercept)
+    config = make_config(tmp_path)
+    from types import SimpleNamespace
+    monkeypatch.setattr(plan_first_loop, '_infer_staged_parent_issue', lambda context: 77)
+    with pytest.raises(RuntimeError, match='local context intercepted'):
+        plan_first_loop._run_plan_first_loop(None, issue_number=1, config=config,
+                                             memory=None, issue_context=SimpleNamespace(), usage_context=None)
+    with pytest.raises(RuntimeError, match='local context intercepted'):
+        plan_execution._run_child_planning_cycle(None, config=config, memory=None,
+                                                usage_context=None, parent_issue=1, child_issue_number=88,
+                                                run_plan_first_loop=lambda *a, **k: pytest.fail('no dispatch'))
+    assert calls == [77, 88]
+
+
+def test_plan_execution_move_preserves_bodies_except_explicit_callback():
+    import hashlib
+
+    class CallbackPlumbing(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            node.keywords = [k for k in node.keywords if k.arg != 'run_plan_first_loop']
+            if isinstance(node.func, ast.Name) and node.func.id == 'run_plan_first_loop':
+                node.func.id = '_run_plan_first_loop'
+            return node
+
+    actual = {}
+    tree = ast.parse((ROOT / 'src/coding_review_agent_loop/plan_execution.py').read_text())
+    for node in tree.body:
+        name = node.name if isinstance(node, ast.FunctionDef) else (
+            node.targets[0].id if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) else None)
+        if name in PLAN_OWNERS:
+            value = ast.Module(body=node.body, type_ignores=[]) if isinstance(node, ast.FunctionDef) else node
+            value = CallbackPlumbing().visit(value)
+            actual[name] = hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
+    assert actual == PLAN_MOVE['body_sha256']
+    execution = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == '_execute_approved_plan')
+    branch = CallbackPlumbing().visit(ast.Module(body=execution.body[1:], type_ignores=[]))
+    assert hashlib.sha256(ast.dump(branch, include_attributes=False).encode()).hexdigest() == PLAN_MOVE['approved_branch_sha256']
+
+
+@pytest.mark.parametrize('name', PLAN_OWNERS)
+def test_plan_manifest_rejects_late_aliases_annotations_and_patch_paths(name):
+    old = 'coding_review_agent_loop.plan_first_loop'
+    for source in (
+        f'def call():\n    loop.{name}()\nimport {old} as loop',
+        f'import {old} as loop\ndef call(value: "loop.{name}"): pass',
+        f'patch("{old}.{name}")',
+        f'from . import plan_first_loop as loop\nmonkeypatch.setattr(loop, "{name}", fake)',
+    ):
+        assert ownership_problems(source, old=old, owners=PLAN_OWNERS)
+
+
+def patch_owner_inventory(source, path):
+    """Enumerate direct, shared-table and loop-carried patch owners statically."""
+    tree = ast.parse(source)
+    aliases, values = {}, {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname or a.name: a.name.rsplit('.', 1)[-1]
+                            for a in node.names if a.name.startswith('coding_review_agent_loop.')})
+        elif isinstance(node, ast.ImportFrom) and node.module == 'coding_review_agent_loop':
+            aliases.update({a.asname or a.name: a.name for a in node.names})
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    values[target.id] = node.value
+
+    def owners(node, seen=()):
+        if isinstance(node, ast.Name):
+            if node.id in aliases:
+                return [aliases[node.id]]
+            if node.id in values and node.id not in seen:
+                return owners(values[node.id], (*seen, node.id))
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            return [name for child in node.elts for name in owners(child, seen)]
+        elif isinstance(node, ast.IfExp):
+            return list(dict.fromkeys((*owners(node.body, seen), *owners(node.orelse, seen))))
+        return []
+
+    rows = []
+    def record(node, dependency, covered):
+        if not isinstance(dependency, str) or not set(covered).intersection(('plan_first_loop', 'plan_execution')):
+            return
+        enclosing = [f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                     and f.lineno <= node.lineno <= f.end_lineno]
+        scope = min(enclosing, key=lambda f: f.end_lineno - f.lineno).name if enclosing else '<module>'
+        row = {'path': str(path) + '::' + scope, 'dependency': dependency,
+               'covered': list(dict.fromkeys(covered))}
+        if row not in rows:
+            rows.append(row)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in ('patch_attr_in', 'patch_object_in'):
+                index = 1 if node.func.id == 'patch_attr_in' else 0
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in ('setattr', 'object'):
+                index = 0
+            else:
+                continue
+            if len(node.args) > index + 1 and isinstance(node.args[index + 1], ast.Constant):
+                record(node, node.args[index + 1].value, owners(node.args[index]))
+        elif isinstance(node, ast.For):
+            iterable = values.get(node.iter.id, node.iter) if isinstance(node.iter, ast.Name) else node.iter
+            if isinstance(iterable, (ast.Tuple, ast.List)):
+                for row in iterable.elts:
+                    if isinstance(row, ast.Tuple) and len(row.elts) == 2 and isinstance(row.elts[0], ast.Constant):
+                        record(node, row.elts[0].value, owners(row.elts[1]))
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant):
+                    record(node, key.value, owners(value))
+    return sorted(rows, key=lambda r: (r['path'], r['dependency'], r['covered']))
+
+
+def test_plan_patch_owner_inventory_matches_audited_paths():
+    expected = json.loads((ROOT / 'tests/fixtures/plan_execution_patch_inventory.json').read_text())
+    actual = [row for path in sorted((ROOT / 'tests').rglob('*.py'))
+              for row in patch_owner_inventory(path.read_text(), path.relative_to(ROOT))]
+    assert actual == expected
+
+
+def test_patch_inventory_resolves_aliases_shared_tables_and_loop_carried_owners():
+    prefix = """
+from coding_review_agent_loop import plan_first_loop as retained, plan_execution as extracted
+SHARED = (retained, extracted)
+"""
+    forms = (
+        "POSTERS = {'get_issue_context': SHARED}",
+        "for name, targets in (('get_issue_context', SHARED),):\n    patch_attr_in(monkeypatch, targets, name, fake)",
+        "patch_object_in(SHARED, 'get_issue_context', fake)",
+    )
+    for form in forms:
+        source = prefix + form
+        complete = patch_owner_inventory(source, 'fixture.py')
+        omitted = patch_owner_inventory(source.replace('SHARED = (retained, extracted)', 'SHARED = (retained,)'), 'fixture.py')
+        assert complete and all(row['covered'] == ['plan_first_loop', 'plan_execution'] for row in complete)
+        assert omitted != complete
+        assert all(set(expected['covered']) - set(actual['covered']) == {'plan_execution'}
+                   for expected, actual in zip(complete, omitted))

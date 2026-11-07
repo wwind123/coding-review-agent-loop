@@ -697,10 +697,7 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -781,10 +778,7 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -877,10 +871,7 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -993,10 +984,7 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -1085,10 +1073,7 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -1152,10 +1137,7 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -1245,10 +1227,7 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -1370,10 +1349,7 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
             runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -1477,10 +1453,7 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
             runner.pr_payload["headRefOid"] = next(heads)
         return response
 
-    patch_attr_in(monkeypatch, (
-        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
-        issue_loop,
-    ), "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
