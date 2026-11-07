@@ -515,7 +515,11 @@ def test_issue_resume_reconciles_a_merged_integration_pr_without_replaying_the_m
     )
 
 
-def test_run_issue_loop_reconciles_before_canonical_pr_resolution():
+@pytest.mark.parametrize(
+    "route_boundary",
+    ["_resolve_fresh_child_provenance", "_dispatch_decomposition_child", "recover_issue_execution"],
+)
+def test_run_issue_loop_reconciles_before_canonical_pr_resolution(route_boundary):
     import inspect
 
     import coding_review_agent_loop.issue_loop as issue_loop
@@ -524,9 +528,16 @@ def test_run_issue_loop_reconciles_before_canonical_pr_resolution():
     reconcile = source.index("reconcile_merged_integration_child(")
     # Before every route, including the staged direct-child dispatch, so the
     # approved-implementation resume path (which rejects MERGED) is never reached first.
-    assert reconcile < source.index("_resolve_fresh_child_provenance(")
-    assert reconcile < source.index("_dispatch_decomposition_child(")
-    assert reconcile < source.index("resolve_canonical_pr_for_issue(")
+    assert reconcile < source.index(f"{route_boundary}(")
+
+    # Canonical resolution now belongs to shared recovery. Keep the ordering
+    # guard at the caller's boundary and verify the real callee owns the lookup,
+    # rather than requiring an extracted implementation to remain inline.
+    from coding_review_agent_loop.issue_recovery import recover_issue_execution
+
+    assert issue_loop.recover_issue_execution is recover_issue_execution
+    recovery_source = inspect.getsource(recover_issue_execution)
+    assert "resolve_canonical_pr_for_issue(" in recovery_source
 
 
 def test_parent_completion_is_not_recorded_when_post_merge_evidence_is_unreadable(tmp_path, monkeypatch):
