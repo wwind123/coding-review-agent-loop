@@ -200,6 +200,7 @@ from .managed_ci_authorization import (
     recover_issue_created_handoff,
 )
 from .managed_ci_recovery_commands import render_managed_ci_resume_command
+from .managed_ci_source_authorization import publish_source_continuity, source_recovery_advice
 from .managed_pr import (
     recover_managed_pr_origin,
     validate_managed_pr_body,
@@ -824,9 +825,8 @@ def run_pr_loop(
                 approved_plan_context=approved_plan_context,
             )
             operator_conversion_preflighted = True
-        # A successful manual qualification retains the managed label on the
-        # ready PR.  Release it before any managed-CI authentication so every
-        # downstream path sees the ready/unlabeled state it already handles.
+        # Manual qualification retains the managed label on the ready PR.
+        # Release it before lifecycle authentication for every origin.
         if release_retained_managed_label(
             runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
         ):
@@ -1021,7 +1021,7 @@ def run_pr_loop(
         if managed_pr_origin is None:
             recovered_origin = recover_managed_pr_origin(
                 initial_pr_context.metadata.body or "",
-                fetched_head_branch=initial_pr_context.metadata.head_branch,
+                fetched_head_branch=initial_pr_context.metadata.head_branch, config=config, pr_number=pr_number, runner=runner,
             )
             if recovered_origin is not None:
                 managed_pr_origin = recovered_origin
@@ -1180,16 +1180,15 @@ def run_pr_loop(
                 fetched_base_branch=initial_pr_context.metadata.base_branch,
                 expected_base_branch=config.base,
                 require_creation_head_sha=not managed_pr_recovered,
+                config=config, pr_number=pr_number, runner=runner,
             )
             if managed_pr_recovered and authenticated_managed_resume is None and config.effective_managed_ci:
                 authenticated_managed_resume = authenticate_source_managed_resume(
                     runner,
                     config=config,
                     pr_number=pr_number,
-                    source_branch=source_branch,
-                    source_sha=source_sha,
-                    managed_branch=managed_branch,
-                    override_nonce=override_nonce,
+                    source_branch=source_branch, source_sha=source_sha,
+                    managed_branch=managed_branch, override_nonce=override_nonce,
                 )
         recorded_pr_contract = find_latest_pr_contract(
             initial_pr_context.comments,
@@ -2114,13 +2113,12 @@ def run_pr_loop(
                         f"an unlabeled CI route is unavailable. {activation.state_report}"
                     )
                     return 0
-                command = render_managed_ci_resume_command(
-                    config, pr_number=pr_number, managed_ci=True,
-                )
-                print(
-                    f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
-                    f"an unlabeled CI route is unavailable. Resume with `{command}`."
-                )
+                if managed_pr_origin is not None:
+                    print(source_recovery_advice(config, pr_number))
+                else:
+                    command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+                    print(f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
+                          f"an unlabeled CI route is unavailable. Resume with `{command}`.")
                 return 0
         else:
             managed_ci = activation
@@ -9732,6 +9730,11 @@ def run_pr_loop(
                     latest_coder_metadata,
                 ),
             )
+            if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
+                predecessor, successor = pr_metadata.head_sha, updated_pr_context.metadata.head_sha
+                if predecessor and successor and predecessor != successor:
+                    publish_source_continuity(runner, config=config, pr_number=pr_number,
+                        predecessor_head=predecessor, new_head=successor, round_number=round_number)
             if managed_ci_handoff is not None and managed_ci is not None and managed_ci.issue_created_pr:
                 predecessor_head = pr_metadata.head_sha
                 new_head = updated_pr_context.metadata.head_sha
@@ -9756,12 +9759,8 @@ def run_pr_loop(
                         ),
                     )
                     managed_ci_handoff = publish_issue_created_continuity_authorization(
-                        runner,
-                        config=config,
-                        handoff=managed_ci_handoff,
-                        predecessor_head=predecessor_head,
-                        new_head=new_head,
-                        round_comment_ids=round_comment_ids,
+                        runner, config=config, handoff=managed_ci_handoff, predecessor_head=predecessor_head,
+                        new_head=new_head, round_comment_ids=round_comment_ids,
                     )
                     authenticated_managed_resume = AuthenticatedManagedResume(
                         origin="issue-created",

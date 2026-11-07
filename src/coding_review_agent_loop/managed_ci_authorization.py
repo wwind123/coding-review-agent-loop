@@ -302,7 +302,7 @@ def parse_managed_ci_override_record(
     body_keys = {"nonce"}
     audit_keys = {
         "nonce", "repo", "base", "head", "protection", "active_label_event_id",
-        "resume_from", "provenance_head", "generation",
+        "resume_from", "provenance_head", "generation", "source",
     }
     if schema == "body":
         if set(values) != body_keys:

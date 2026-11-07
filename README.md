@@ -2132,8 +2132,12 @@ agent-loop managed-ci preflight \
 ```
 
 For code already pushed without an open PR, the pre-creation form begins with
-`agent-loop managed-pr --head BRANCH`. Managed issue and PR recovery relies on
-a canonical issue handoff, explicit `--managed-ci` intent, documented
+`agent-loop managed-pr --head BRANCH`. On a waived base, creation verifies a
+durable creation audit before entering review. Resume with `agent-loop pr N
+--managed-ci --managed-ci-trusted-actor LOGIN --allow-unprotected-managed-ci`;
+current waivers and authenticated source/coder continuity are required. Historical
+audit-less drafts need the ordinary recovery described in the CLI guide.
+Managed issue recovery relies on a canonical issue handoff, explicit `--managed-ci` intent, documented
 draft/labeled and ready/unlabeled lifecycle states, immutable actor evidence,
 and preserved base provenance. Historical records are audit evidence only and
 never grant fresh authority.
