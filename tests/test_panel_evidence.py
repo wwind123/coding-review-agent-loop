@@ -10,7 +10,9 @@ from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 import coding_review_agent_loop.panel_evidence as panel_evidence
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from issue_loop_test_helpers import (
@@ -23,7 +25,9 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_v1_plan_state,
 )
-from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundRecord,
+)  # noqa: E402
 
 
 def _completed_staged_plan_comments(tmp_path):
@@ -237,7 +241,9 @@ def test_managed_ci_plan_approval_all_reviewers_still_requires_one_round(tmp_pat
 
 def test_operator_opening_requires_a_complete_candidate_key(tmp_path):
     """A partial-key record can never establish a qualified panel opening."""
-    from coding_review_agent_loop.round_state import PostedRoundRecord
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
 
     partial = PlanCandidateKey(
         subject="a" * 64,

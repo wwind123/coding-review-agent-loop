@@ -35,7 +35,9 @@ from typing import TypeVar
 
 from .errors import AgentLoopError
 from .protocol import UnresolvedReviewItem, parse_signed_human_requirement_body
-from .round_state import PostedRoundRecord
+from .round_metadata import (
+    PostedRoundRecord,
+)
 
 REVIEWER_BOARD_AMENDMENT_KIND = "reviewer-board-amendment"
 REVIEWER_BOARD_AMENDMENT_SCHEMA_VERSION = 1

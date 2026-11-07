@@ -22,7 +22,10 @@ from coding_review_agent_loop.discuss_loop import (
     _detect_discuss_answer_consensus,
 )
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata
-from coding_review_agent_loop.round_state import _decode_round_metadata, _encode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+    _encode_round_metadata,
+)
 from coding_review_agent_loop.response_validation import render_public_agent_comment
 from coding_review_agent_loop.comment_rendering import render_discuss_round_summary_comment
 from coding_review_agent_loop.errors import AgentLoopError
@@ -4174,7 +4177,10 @@ def test_evidence_reconciler_propagates_checkout_refusals(monkeypatch, tmp_path)
 def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
     import coding_review_agent_loop.round_transport as transport
     from coding_review_agent_loop.discuss_loop import _discuss_subject, _is_bot_authored_discuss_comment
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from coding_review_agent_loop.github import IssueContext
 
     body = _attach_round_metadata(

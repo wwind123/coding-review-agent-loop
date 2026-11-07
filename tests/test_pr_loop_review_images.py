@@ -699,7 +699,10 @@ def test_managed_root_path_captures_before_approval_without_final_ci(visual_setu
 @pytest.mark.parametrize('attack', ['resolve', 'inject', 'unavailable', 'missing-identity'])
 def test_visual_restart_requires_authenticated_author(visual_setup, monkeypatch, enabled, attack):
     from coding_review_agent_loop import pr_loop, github
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from coding_review_agent_loop.protocol import ReviewItemDisposition
     from coding_review_agent_loop.unresolved_items import _next_unresolved_item
     config, calls, original = visual_setup
@@ -834,7 +837,10 @@ def test_durable_dispatch_order_and_crash_resume(visual_setup, monkeypatch, poli
 
 
 def _append_lifecycle(runner, *, value=None, head=None, foreign=False):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     head = runner.pr_payload['headRefOid'] if head is None else head
     m = PostedRoundMetadata(flow='pr', role='reviewer', agent='OpenAI Codex', round_number=1,
                             subject=head, visual_lifecycle=value, visual_lifecycle_present=True)
@@ -990,7 +996,9 @@ def test_shared_transport_failure_stops_before_visual_admission(visual_setup, mo
     with pytest.raises(AgentLoopError): run_pr_loop(runner,pr_number=77,config=config)
     assert not any(c[0] in {'capture','images','ci','diff'} for c in calls)
     assert len(runner.pr_payload['comments'])==1
-    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.code_approval import (
+        _latest_pr_approved_reviews_for_head,
+    )
     with pytest.raises(AgentLoopError): _latest_pr_approved_reviews_for_head([SimpleNamespace(body=body)],head_sha=value['subject'],configured_reviewers=('codex',))
 
 
@@ -1124,7 +1132,9 @@ def test_recovery_checkpoint_validates_lifecycle_without_opening_execution(visua
     from coding_review_agent_loop.managed_ci_types import (
         ManagedCiContract,
     )
-    from coding_review_agent_loop.round_state import _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
     visual_config,calls,_=visual_setup
     config,runner=_managed_qualifying_resume(tmp_path,reviewer_codex_model='gpt-6.1-sol')
     config=replace(config,review_images_paths=visual_config.review_images_paths,
@@ -1180,7 +1190,9 @@ def test_lifecycle_corruption_cannot_erase_verified_findings(visual_setup, monke
     monkeypatch.setattr(pr_loop,'_run_validated_agent',stop)
     runner=FakeRunner(codex_outputs=[structured_pr_review()]*5)
     def corrupt_comment():
-        from coding_review_agent_loop.round_state import _attach_round_metadata
+        from coding_review_agent_loop.round_metadata import (
+            _attach_round_metadata,
+        )
         _append_lifecycle(runner, head='unknown' if corruption == 'unknown-subject' else None, foreign=True)
         comment = runner.pr_payload['comments'][-1]
         record = _extract_round_metadata_records([SimpleNamespace(body=comment['body'])], flow='pr')[0]

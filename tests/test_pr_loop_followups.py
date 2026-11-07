@@ -1,3 +1,5 @@
+
+from coding_review_agent_loop import round_metadata
 import hashlib
 """PR-loop tests for followups and pr_loop_support: PR follow-up filing (#1542)."""
 
@@ -30,7 +32,7 @@ from coding_review_agent_loop.local_test_evidence import (
 from coding_review_agent_loop.unresolved_items import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
@@ -143,12 +145,12 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
         if isinstance(item, dict)
         and isinstance(item.get("body"), str)
         and "AGENT_LOOP_META: " in item["body"]
-        and round_state._decode_round_metadata(
+        and round_metadata._decode_round_metadata(
             item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         ).role == "coder"
     ]
     assert coder_metadata_comments
-    coder_metadata = round_state._decode_round_metadata(
+    coder_metadata = round_metadata._decode_round_metadata(
         coder_metadata_comments[-1].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
     )
     assert coder_metadata.risk_test_matrix_evidence is not None

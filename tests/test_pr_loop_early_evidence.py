@@ -6,7 +6,9 @@ import pytest
 from coding_review_agent_loop.cli import run_pr_loop
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.github import _parse_pr_human_requirements
-from coding_review_agent_loop.round_state import _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _attach_round_metadata,
+)
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as support
 from agent_loop_helpers import FakeRunner, make_config
@@ -27,7 +29,9 @@ def deferred(tmp_path, *, mode="compact", policy="all-reviewers", two_owners=Fal
     if mode == "compact":
         # Start from a legitimate deferred-evidence checkpoint in round 2 so
         # the compact-context branch (which begins at round 2) is exercised.
-        from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
+        from coding_review_agent_loop.native_evidence import (
+            _append_recorded_evidence_requests,
+        )
         records = _pr_records(runner)
         items = []
         _append_recorded_evidence_requests(items, [r for r in records if r.metadata.role == "reviewer"], records=records)
@@ -288,7 +292,9 @@ def test_alias_dispositions_in_real_loop(tmp_path, vote_kind):
 @pytest.mark.parametrize("frozen", [False, True])
 def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, persisted, frozen):
     from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
-    from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
+    from coding_review_agent_loop.native_evidence import (
+        _append_recorded_evidence_requests,
+    )
     runner, config = deferred(tmp_path, mode=mode)
     records = _pr_records(runner)
     items = []
@@ -342,7 +348,9 @@ def test_consolidated_clearance_push_restart_preserves_lineage(tmp_path, mode, p
 @pytest.mark.parametrize("mode", ["compact", "full"])
 @pytest.mark.parametrize("foreign", [False, True])
 def test_push_restart_preserves_distinct_requests_with_foreign_heads(tmp_path, mode, foreign):
-    from coding_review_agent_loop.round_state import _append_recorded_evidence_requests
+    from coding_review_agent_loop.native_evidence import (
+        _append_recorded_evidence_requests,
+    )
     tokens = ("1234567" + "b" * 33, "abcdef0" + "c" * 33)
     runner, config = deferred(tmp_path, mode=mode,
         requests=tuple("Accept screenshot " + token[:7] for token in tokens))
@@ -443,7 +451,9 @@ def test_classified_mixed_answer_keeps_original_id_and_only_leftover_code(tmp_pa
 @pytest.mark.parametrize("fault", ["foreign-owner", "cross-round-conflict"])
 def test_invalid_classification_can_reach_fresh_review(tmp_path, monkeypatch, fault):
     from pr_loop_test_helpers import _association, _classified_review
-    from coding_review_agent_loop.round_state import _strip_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _strip_round_metadata,
+    )
     runner, config = deferred(tmp_path, mode="full", two_owners=True)
     runner.pr_payload["comments"].append(_signed("A human must accept the policy.", 1))
     rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id

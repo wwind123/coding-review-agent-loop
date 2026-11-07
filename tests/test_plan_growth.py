@@ -49,9 +49,11 @@ from coding_review_agent_loop.protocol import (
     parse_plan_revision_patch,
     validate_structured_plan_state,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _extract_round_metadata_records,
 )
 import coding_review_agent_loop.child_plan_binding as child_plan_binding

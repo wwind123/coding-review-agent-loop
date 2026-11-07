@@ -19,7 +19,12 @@ from coding_review_agent_loop.prompts import (
     format_approved_plan_context,
 )
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
-from coding_review_agent_loop.round_state import ApprovedPlanContext, make_approved_plan_context
+from coding_review_agent_loop.round_metadata import (
+    ApprovedPlanContext,
+)
+from coding_review_agent_loop.round_state import (
+    make_approved_plan_context,
+)
 from coding_review_agent_loop.unresolved_items import (
     _apply_dispute_evidence,
     _is_disputed_item,

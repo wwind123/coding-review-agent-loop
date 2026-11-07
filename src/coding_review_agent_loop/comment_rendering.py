@@ -108,7 +108,9 @@ from .local_test_evidence import (
 if TYPE_CHECKING:
     from .agents.base import AgentName
     from .config import AgentLoopConfig
-    from .round_state import PostedRoundMetadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+    )
 
 ITEM_SUMMARY_LIMIT = 100
 PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"

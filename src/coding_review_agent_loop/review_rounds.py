@@ -36,8 +36,10 @@ from .ci_health import (
     is_canonical_pending_only_text,
     is_wholly_infrastructure_blocked,
 )
-from .round_state import (
+from .round_metadata import (
     ResumedReviewRound,
+)
+from .round_state import (
     _canonically_resolved_history_item_ids,
     _live_round_resolved_item_ids,
     _extract_round_metadata_records,

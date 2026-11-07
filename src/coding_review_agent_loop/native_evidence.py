@@ -10,7 +10,9 @@ from .protocol import EVIDENCE_OBLIGATION_KIND
 
 if TYPE_CHECKING:
     from .protocol import UnresolvedReviewItem
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
 
 HEX_TOKEN = re.compile(r"(?<![a-zA-Z0-9_])[0-9a-fA-F]{7,40}(?![a-zA-Z0-9_])")
 

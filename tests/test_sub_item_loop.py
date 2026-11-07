@@ -1,5 +1,7 @@
 """PR-loop behaviour of sub-item findings (#958), driven with scripted agents."""
 
+from coding_review_agent_loop import round_metadata
+
 import json
 
 import pytest
@@ -70,7 +72,7 @@ def _progress_comments(runner):
 
 def _metadata_records(runner):
     return [
-        round_state._decode_round_metadata(
+        round_metadata._decode_round_metadata(
             discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
         )
         for comment in runner.pr_payload["comments"]

@@ -1390,7 +1390,10 @@ def _authenticated_recovery_root(
 
 def _decode_recovery_round_record(payload: Mapping[str, object]) -> object | None:
     """Decode a recovery summary record; None when it fails per-phase validation."""
-    from .round_state import decode_round_metadata_mapping, recovery_record_problems
+    from .round_metadata import (
+        decode_round_metadata_mapping,
+        recovery_record_problems,
+    )
 
     try:
         metadata = decode_round_metadata_mapping(payload)

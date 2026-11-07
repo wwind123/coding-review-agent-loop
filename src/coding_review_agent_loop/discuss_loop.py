@@ -105,10 +105,14 @@ from .comment_rendering import (
     render_public_agent_comment,
     _render_discuss_agenda_lines,
 )
-from .round_state import (
+from .round_metadata import (
     PostedRoundMetadata,
-    ROUND_RESUME_MARKER_RE,
     _attach_round_metadata,
+)
+from .round_transport import (
+    ROUND_RESUME_MARKER_RE,
+)
+from .round_state import (
     _decode_discuss_vote,
     _extract_round_metadata_records,
     _resume_discuss_round,

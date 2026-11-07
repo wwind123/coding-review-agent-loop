@@ -18,7 +18,7 @@ from coding_review_agent_loop.unresolved_items import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     _reconcile_human_requirements_ack_item,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _strip_round_metadata,
@@ -1156,7 +1156,12 @@ def test_mixed_code_work_keeps_human_requirement_out_of_coder_prompt(tmp_path):
 
 @pytest.mark.parametrize("role", ["human-only", "evidence-only"])
 def test_legacy_ack_gate_clears_after_real_evidence_classification(tmp_path, role):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _append_recorded_evidence_requests
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+    )
+    from coding_review_agent_loop.native_evidence import (
+        _append_recorded_evidence_requests,
+    )
     from coding_review_agent_loop import pr_loop_support as support
     from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT, _freeze_records, _pr_records
     from test_pr_loop_early_evidence import deferred, HEAD

@@ -37,12 +37,14 @@ from .protocol import (
     review_freeform_summary_text,
 )
 from .protocol import parse_review
-from .round_state import (
+from .round_metadata import (
     PostedRoundMetadata,
     PostedRoundRecord,
     ResumedReviewRound,
-    _extract_round_metadata_records,
     _plan_subject,
+)
+from .round_state import (
+    _extract_round_metadata_records,
 )
 from .plan_assembly import (
     AssembledPlanSidecar,

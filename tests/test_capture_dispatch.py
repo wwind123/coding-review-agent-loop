@@ -3,7 +3,9 @@ import dataclasses
 import pytest
 import coding_review_agent_loop.pr_loop as loop
 from coding_review_agent_loop.capture_acceptance import capture_pending
-from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+from coding_review_agent_loop.code_approval import (
+    _latest_pr_approved_reviews_for_head,
+)
 from coding_review_agent_loop.pr_loop_support import admitted_capture_history
 from test_pr_loop_evidence_conversion import (
     _prepare_verified_recovery, _review, _records, _prompts, _reviews_after,
@@ -119,7 +121,9 @@ def test_unavailable_scoped_reviewer_keeps_acceptance_pending(tmp_path, monkeypa
 @pytest.mark.parametrize("replacement", [False, True])
 def test_live_qualification_rechecks_identical_and_replacement_evidence(tmp_path, monkeypatch, replacement):
     import json
-    from coding_review_agent_loop.round_state import _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
     from test_pr_loop_evidence_conversion import _comment
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
     runner.codex_outputs.append(_review())
@@ -141,7 +145,9 @@ def test_live_qualification_rechecks_identical_and_replacement_evidence(tmp_path
 
 @pytest.mark.parametrize("scope", [None, {}, "unknown", {"kind": "unsupported"}])
 def test_live_qualification_rejects_malformed_scoped_publication(tmp_path, monkeypatch, scope):
-    from coding_review_agent_loop.round_state import _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
     runner.codex_outputs.append(_review())
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
@@ -289,7 +295,9 @@ def test_capture_dispatch_uses_admitted_amendment_lineage(tmp_path, monkeypatch,
         # A replacement capture after fresh restored-seat code approval must
         # dispatch to the original per-row requesters, through the real loop.
         import json
-        from coding_review_agent_loop.round_state import _attach_round_metadata
+        from coding_review_agent_loop.round_metadata import (
+            _attach_round_metadata,
+        )
         from test_pr_loop_evidence_conversion import _comment
         evidence = json.loads(json.dumps(capture.metadata.risk_test_matrix_evidence))
         evidence["rows"][0]["outcome_assertions"] = ["Replacement capture after restoration"]
@@ -315,7 +323,9 @@ def test_capture_dispatch_uses_admitted_amendment_lineage(tmp_path, monkeypatch,
         # approval from the removed requester. It cannot replace the required
         # conservative complete review by the actual effective board.
         from coding_review_agent_loop.capture_acceptance import reviewer_contract
-        from coding_review_agent_loop.round_state import _attach_round_metadata
+        from coding_review_agent_loop.round_metadata import (
+            _attach_round_metadata,
+        )
         from coding_review_agent_loop.errors import AgentLoopError
         from test_pr_loop_evidence_conversion import _comment
         metadata = dataclasses.replace(reviews[-1].metadata, agent="Gemini")

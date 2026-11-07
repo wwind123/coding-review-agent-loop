@@ -20,12 +20,14 @@ from coding_review_agent_loop.github import (
 from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
-    _resume_pr_round,
     _strip_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
+    _resume_pr_round,
 )
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.protocol import (

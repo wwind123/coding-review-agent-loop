@@ -27,7 +27,7 @@ from coding_review_agent_loop.protocol_markers import (
     strip_known_host_footer,
 )
 
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     encode_plan_validation_diagnostic_body,
 )
@@ -1165,7 +1165,10 @@ def _oversized_round_body(flow: str, role: str) -> TrustedBody:
     import base64
     import os
 
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     large = base64.urlsafe_b64encode(os.urandom(70_000)).decode("ascii")
     field = "canonical_plan" if flow == "plan" and role == "coder" else "canonical_reviewer_response"

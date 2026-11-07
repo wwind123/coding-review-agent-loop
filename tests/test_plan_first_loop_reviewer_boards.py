@@ -52,7 +52,9 @@ def _m943_strip_ownership(runner, item_id="item-1"):
     ``owner_states``, ``owner_evidence``, and ``owner_dispositions`` emptied,
     so the finding falls back to its author exactly as a legacy ledger does.
     """
-    from coding_review_agent_loop.round_state import _encode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _encode_round_metadata,
+    )
 
     def legacy(items):
         return tuple(

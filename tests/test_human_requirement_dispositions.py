@@ -138,7 +138,10 @@ def test_ack_gate_requires_dedicated_coder_disposition_evidence():
 
 
 def _carried_plan_record(*, agent, state, key, requirement_ids, index):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        PostedRoundRecord,
+    )
 
     return PostedRoundRecord(
         index=index,

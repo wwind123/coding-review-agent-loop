@@ -563,3 +563,117 @@ def test_prompt_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(m
     assert prompts._bounded_context_text('retained probe') == 'intercepted'
     assert 'retained probe' in calls
     assert len(calls) >= 2
+
+
+# Phase-two inventory is separate from the frozen historical facade registry.
+ROUND_MOVE = json.loads((ROOT / 'tests/fixtures/round_metadata_move.json').read_text())
+ROUND_OWNERS = {**ROUND_MOVE['support_owners'],
+                **{name: 'round_metadata' for name in ROUND_MOVE['symbols']}}
+OLD_ROUND = 'coding_review_agent_loop.round_state'
+
+
+def test_round_consumers_use_real_owners_and_have_no_unused_driver_imports():
+    problems = []
+    for folder in ('src', 'tests'):
+        for path in (ROOT / folder).rglob('*.py'):
+            problems.extend(f'{path.relative_to(ROOT)}: {problem}' for problem in
+                            ownership_problems(path.read_text(), driver=path.name in (
+                                'round_state.py', 'round_metadata.py'), old=OLD_ROUND, owners=ROUND_OWNERS))
+    assert problems == []
+
+
+def test_round_metadata_move_preserves_bodies():
+    import hashlib
+
+    actual = {}
+    tree = ast.parse((ROOT / 'src/coding_review_agent_loop/round_metadata.py').read_text())
+    for node in tree.body:
+        name = node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else (
+            node.targets[0].id if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            else node.target.id if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) else None)
+        if name in ROUND_MOVE['symbols']:
+            actual[name] = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+    assert actual == ROUND_MOVE['body_sha256']
+
+
+@pytest.mark.parametrize('first', ['round_state', 'round_metadata', 'orchestrator',
+                                   'qualification_checkpoint', 'plan_round_closure'])
+def test_round_metadata_fresh_import_orders(first):
+    import os
+    import subprocess
+    import sys
+
+    modules = [first] + [m for m in ('round_state', 'round_metadata', 'orchestrator',
+                                     'qualification_checkpoint', 'plan_round_closure') if m != first]
+    subprocess.run([sys.executable, '-c', '\n'.join('import coding_review_agent_loop.' + m for m in modules)],
+                   check=True, timeout=30, cwd=ROOT, env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+
+
+def test_round_metadata_sizes_and_policy():
+    import runpy
+
+    for module in ('round_state', 'round_metadata'):
+        assert len((ROOT / 'src/coding_review_agent_loop' / (module + '.py')).read_text().splitlines()) <= 5000
+    policy = runpy.run_path(str(ROOT / 'tests/test_source_file_size.py'))
+    assert policy['DEFAULT_LIMIT'] == 6000
+    assert policy['ALLOWLIST']['src/coding_review_agent_loop/pr_loop.py'] == 9945
+
+
+def test_round_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(monkeypatch):
+    from coding_review_agent_loop import round_state, round_metadata
+    from agent_loop_helpers import patch_attr_in
+
+    # Both real paths bind decode_mapping: replay ingests an attached body,
+    # while the leaf codec accepts its encoded payload directly.
+    reachable = (round_state, round_metadata)
+    assert missing_patch_owners((round_state,), reachable, 'decode_mapping') == {round_metadata.__name__}
+    assert not missing_patch_owners(reachable, reachable, 'decode_mapping')
+    metadata = round_metadata.PostedRoundMetadata('pr', 'coder', 'Codex', 1, 'head')
+    body = round_metadata._attach_round_metadata('Coder.', metadata)
+    encoded = round_metadata._encode_round_metadata(metadata)
+    calls = []
+    original = round_metadata.decode_mapping
+    def decode(value):
+        calls.append(value)
+        return original(value)
+    patch_attr_in(monkeypatch, reachable, 'decode_mapping', decode)
+    from types import SimpleNamespace
+    assert round_state._extract_round_metadata_records([SimpleNamespace(body=body)], flow='pr')[0].metadata == metadata
+    assert round_metadata._decode_round_metadata(encoded) == metadata
+    assert calls == [encoded, encoded]
+
+
+def test_round_metadata_dependency_closure_and_no_reverse_import():
+    import builtins
+    import symtable
+
+    for module in ('round_state', 'round_metadata'):
+        source = (ROOT / 'src/coding_review_agent_loop' / (module + '.py')).read_text()
+        table = symtable.symtable(source, module, 'exec')
+        bound = {symbol.get_name() for symbol in table.get_symbols()
+                 if symbol.is_assigned() or symbol.is_imported()}
+        def global_references(scope):
+            names = {symbol.get_name() for symbol in scope.get_symbols()
+                     if symbol.is_global() and symbol.is_referenced()}
+            for child in scope.get_children():
+                names.update(global_references(child))
+            return names
+        assert global_references(table) - bound - set(dir(builtins)) - {'__name__'} == set()
+        if module == 'round_metadata':
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.ImportFrom):
+                    assert node.module not in ('round_state', OLD_ROUND)
+                    assert all(alias.name != 'round_state' for alias in node.names)
+                elif isinstance(node, ast.Import):
+                    assert all(alias.name != OLD_ROUND for alias in node.names)
+
+
+@pytest.mark.parametrize('name', ROUND_MOVE['symbols'])
+def test_round_manifest_rejects_old_aliases_annotations_and_patch_paths(name):
+    for source in (
+        f'from .round_state import {name}',
+        f'from . import round_state as state\nx: "state.{name}"',
+        f'patch("{OLD_ROUND}.{name}")',
+        f'from . import round_state as state\nmonkeypatch.setattr(state, "{name}", fake)',
+    ):
+        assert ownership_problems(source, old=OLD_ROUND, owners=ROUND_OWNERS)

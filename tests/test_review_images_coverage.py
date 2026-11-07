@@ -20,9 +20,15 @@ from coding_review_agent_loop.review_images_manifest import publish
 from coding_review_agent_loop.review_images_config import delivery_limits
 from coding_review_agent_loop.review_images_state import digest, History
 from coding_review_agent_loop.review_scope import authority_records, is_complete_code_review
-from coding_review_agent_loop.round_state import (PostedRoundMetadata, PostedRoundRecord,
-    _encode_round_metadata, _decode_round_metadata, EVIDENCE_RELEASE_REASONS,
-    EvidenceFreezeRecord, EvidenceReleaseRecord)
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+    _encode_round_metadata,
+    _decode_round_metadata,
+    EVIDENCE_RELEASE_REASONS,
+    EvidenceFreezeRecord,
+    EvidenceReleaseRecord,
+)
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from test_pr_loop_review_images import visual_setup, records
 from test_review_images_state import binding, record, history, success, HEAD, OTHER
@@ -711,7 +717,12 @@ def test_large_coverage_attachment_spills_without_losing_visual_findings(attachm
     import base64
     import random
     from coding_review_agent_loop import round_transport as transport
-    from coding_review_agent_loop.round_state import _attach_round_metadata, _extract_round_metadata_records
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+    )
     from coding_review_agent_loop.unresolved_items import _next_unresolved_item
     images = []
     content = {'base.png': png()}

@@ -1,5 +1,7 @@
 """PR-loop tests for checks and ci_health: the PR-loop CI gate (#1542)."""
 
+from coding_review_agent_loop import round_metadata
+
 import dataclasses
 import json
 from pathlib import Path
@@ -28,8 +30,10 @@ from coding_review_agent_loop.managed_ci_types import (
 from coding_review_agent_loop.unresolved_items import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.qualification_checkpoint import (
     QualificationCheckpoint,
+)
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
 )
@@ -951,7 +955,7 @@ def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
     ]
     assert metadata_bodies
     for body in metadata_bodies:
-        decoded = round_state._decode_round_metadata(
+        decoded = round_metadata._decode_round_metadata(
             body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         )
         rendered = repr(decoded)

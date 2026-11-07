@@ -4,9 +4,11 @@ import dataclasses
 from types import SimpleNamespace
 
 import pytest
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.code_approval import (
     _latest_pr_approved_reviews_for_head,
 )
 from coding_review_agent_loop.architecture_contract import _latest_pr_architecture_observation

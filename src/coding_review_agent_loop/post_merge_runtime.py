@@ -69,7 +69,10 @@ def restore(runner, config, pr, comments, *, admitted_before=None):
 
 def persist(runner, config, pr, head, registry, diagnostics=(), *, items=(), round_number=1):
     from .github import post_verified_trusted_pr_round_comment, resolve_authenticated_github_actor
-    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     if config.dry_run:
         return
     actor = resolve_authenticated_github_actor(runner, config=config)
@@ -253,7 +256,10 @@ def tracker_record(admission, merged):
 
 
 def record_body(record):
-    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     r = record['request']
     from .protocol_markers import sanitize_untrusted_prose
     return _attach_round_metadata(sanitize_untrusted_prose(

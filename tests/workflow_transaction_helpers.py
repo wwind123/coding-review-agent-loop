@@ -15,11 +15,13 @@ from coding_review_agent_loop.pr_contract import (
     format_pr_contract_v2_comment,
     make_pr_contract,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
-    _approved_plan_hash,
     _attach_round_metadata,
     _plan_subject,
+)
+from coding_review_agent_loop.round_state import (
+    _approved_plan_hash,
 )
 from coding_review_agent_loop.workflow_transaction import (
     ENTRY_AUTHORIZATION,

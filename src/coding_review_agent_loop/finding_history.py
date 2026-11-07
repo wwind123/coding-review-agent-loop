@@ -27,7 +27,9 @@ from .protocol_markers import sanitize_untrusted_prose
 from .review_step_back import effective_new_items, project_finding_locations
 
 if TYPE_CHECKING:
-    from .round_state import PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundRecord,
+    )
 
 FINDING_HISTORY_MAX_ROUNDS = 6
 FINDING_HISTORY_MAX_CHARS = 6000

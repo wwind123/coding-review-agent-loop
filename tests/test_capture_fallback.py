@@ -7,7 +7,9 @@ import coding_review_agent_loop.pr_loop as loop
 from coding_review_agent_loop.capture_acceptance import (
     capture_assignments, capture_pending, full_capture_binding,
 )
-from coding_review_agent_loop.round_state import _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _attach_round_metadata,
+)
 from test_pr_loop_evidence_conversion import (
     _carried_panel_runner, _plan_context, _records, _reviews_after, _push_external_head,
     _coder, _repeat_review, _review, _install_derivation, _comment, _prompts,

@@ -1,4 +1,6 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
+
+from coding_review_agent_loop import round_metadata
 import dataclasses
 import json
 import stat
@@ -16,7 +18,7 @@ from coding_review_agent_loop.errors import (
     AgentSettingsLockWaitTimeout,
     QuotaResetExceededError,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PlanValidationDiagnosticPayload,
     encode_plan_validation_diagnostic_body,
 )
@@ -1481,7 +1483,7 @@ def test_pr_parallel_resolves_disputed_scope_claim_and_tracks_translation_defect
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     reviewer_metadata = [
-        round_state._decode_round_metadata(match["payload"])
+        round_metadata._decode_round_metadata(match["payload"])
         for comment in runner.pr_payload["comments"]
         if (match := discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"]))
     ]
@@ -1644,7 +1646,7 @@ def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(t
             run_pr_loop(runner, pr_number=77, config=config)
 
     codex_publications = lambda: sum(
-        (metadata := round_state._decode_round_metadata(
+        (metadata := round_metadata._decode_round_metadata(
             discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
         )).agent == "Codex"
         and metadata.phase == "publication"
@@ -2407,7 +2409,7 @@ def test_pr_loop_parallel_quota_error_takes_precedence_over_other_fatal_error(tm
 # ---------------------------------------------------------------------------
 
 def test_plan_first_parallel_zero_pending_resume_constructs_no_executor(tmp_path):
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
         _plan_subject,
@@ -2876,7 +2878,7 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
             match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
             if match is None:
                 continue
-            metadata = round_state._decode_round_metadata(match["payload"])
+            metadata = round_metadata._decode_round_metadata(match["payload"])
             if metadata.flow == "plan":
                 records.append(metadata)
         return records
@@ -3173,9 +3175,11 @@ import string as _string
 from coding_review_agent_loop.github import IssueComment as _IssueComment
 from coding_review_agent_loop.partial_round_recovery import compute_partial_round_recovery
 from coding_review_agent_loop.protocol_markers import TrustedBody as _TrustedBody
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata as _Metadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _resume_pr_round as _resume_pr,
 )
 from coding_review_agent_loop.round_transport import prepare_round_comment as _prepare
@@ -3724,7 +3728,7 @@ def test_scheduler_enabled_round_recovers_with_retained_prelaunch_and_coder(tmp_
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match is None:
             continue
-        metadata = round_state._decode_round_metadata(match["payload"])
+        metadata = round_metadata._decode_round_metadata(match["payload"])
         if index in doomed:
             assert metadata.role != "coder" and metadata.phase != "scheduler-prelaunch"
     _delete_listed_comments(runner, ids, surface="pr")
@@ -3914,7 +3918,7 @@ def _interrupt_on_phase(real_post, phase, *, flow="pr", round_number=None):
     def post(*args, **kwargs):
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(str(kwargs["body"]))
         if match is not None and not state["fired"]:
-            metadata = round_state._decode_round_metadata(match["payload"])
+            metadata = round_metadata._decode_round_metadata(match["payload"])
             if (
                 metadata.flow == flow and metadata.role == "summary" and metadata.phase == phase
                 and (round_number is None or metadata.round_number == round_number)
@@ -4011,7 +4015,7 @@ def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round
     phases = []
     for comment in listed.values():
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
-        metadata = round_state._decode_round_metadata(match["payload"])
+        metadata = round_metadata._decode_round_metadata(match["payload"])
         phases.append((metadata.round_number, metadata.role, metadata.agent, metadata.scheduler_phase))
         # Never the primary's gating review, never a round-1 record.
         assert metadata.round_number == 2 and metadata.agent != "Codex"
@@ -4248,7 +4252,9 @@ def test_recovery_lists_the_primary_when_it_is_part_of_the_launching_batch():
 )
 def test_visible_peer_names_excludes_only_the_gating_primary_review(kwargs, expected):
     from coding_review_agent_loop.round_visibility import visible_peer_names
-    from coding_review_agent_loop.round_state import PostedRoundRecord
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
 
     def record(index, agent, state="approved"):
         return PostedRoundRecord(
@@ -4275,7 +4281,9 @@ def test_visible_peer_names_excludes_only_the_gating_primary_review(kwargs, expe
 
 
 def test_visibility_snapshot_keeps_refreshed_publications_when_the_checkpoint_is_missing():
-    from coding_review_agent_loop.round_state import PostedRoundRecord
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
 
     def record(index, agent):
         return PostedRoundRecord(
@@ -4333,7 +4341,7 @@ def test_pr_same_round_gate_survives_verified_deletion_and_rerun(tmp_path):
     listed = []
     for index, comment in enumerate(runner.pr_payload["comments"]):
         if index + 10_001 in ids:
-            metadata = round_state._decode_round_metadata(
+            metadata = round_metadata._decode_round_metadata(
                 discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
             )
             listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
@@ -4426,7 +4434,12 @@ def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp
 
 def test_selector_ignores_ledger_signatures_and_per_reviewer_dedupe():
     """Peer discovery reads the complete history, not resume's filtered view (#1156)."""
-    from coding_review_agent_loop.round_state import PostedRoundRecord, UnresolvedReviewItem
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundRecord,
+    )
+    from coding_review_agent_loop.protocol import (
+        UnresolvedReviewItem,
+    )
     from coding_review_agent_loop.round_visibility import same_round_public_publications
 
     def record(index, agent, prior_items=()):
@@ -4641,7 +4654,7 @@ def test_plan_publication_stripped_as_pre_opening_still_counts_as_a_peer(tmp_pat
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match is None:
             return None
-        metadata = round_state._decode_round_metadata(match["payload"])
+        metadata = round_metadata._decode_round_metadata(match["payload"])
         return (metadata.role, metadata.agent, metadata.phase, metadata.scheduler_phase)
 
     gemini = next(i for i, c in enumerate(comments) if role_of(c) == ("reviewer", "Gemini", "publication", None))
@@ -4736,7 +4749,7 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
     listed = []
     for index, comment in enumerate(runner.pr_payload["comments"]):
         if index + 10_001 in _listed_comment_ids(message):
-            metadata = round_state._decode_round_metadata(
+            metadata = round_metadata._decode_round_metadata(
                 discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
             )
             listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
@@ -4770,7 +4783,7 @@ def _plan_meta(comment):
     match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
     if match is None:
         return None
-    metadata = round_state._decode_round_metadata(match["payload"])
+    metadata = round_metadata._decode_round_metadata(match["payload"])
     return metadata if metadata.flow == "plan" else None
 
 
@@ -5376,7 +5389,7 @@ def _plan_checkpoint_indexes(runner):
         if not match:
             continue
         try:
-            metadata = round_state._decode_round_metadata(match["payload"])
+            metadata = round_metadata._decode_round_metadata(match["payload"])
         except AgentLoopError:
             continue
         if metadata.role == "summary" and metadata.phase == "scheduler-prelaunch":
@@ -5821,7 +5834,7 @@ def test_pr_peer_publication_between_attempts_changes_live_scheduler_state(tmp_p
     for comment in comments:
         match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match:
-            states.append(round_state._decode_round_metadata(match["payload"]))
+            states.append(round_metadata._decode_round_metadata(match["payload"]))
     assert any(
         md.phase == "reconciliation" and set(md.scheduler_approved_reviewers) == {"Codex", "Gemini"}
         for md in states

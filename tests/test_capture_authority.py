@@ -4,10 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    PostedRoundRecord,
+    _encode_round_metadata,
+    _decode_round_metadata,
+    _attach_round_metadata,
+)
 from coding_review_agent_loop.round_state import (
-    PostedRoundMetadata, PostedRoundRecord, _encode_round_metadata,
-    _decode_round_metadata, _aggregate_record_dispositions,
-    _pr_round_is_reconciled, _latest_pr_approved_reviews_for_head, _attach_round_metadata,
+    _aggregate_record_dispositions,
+    _pr_round_is_reconciled,
+)
+from coding_review_agent_loop.code_approval import (
+    _latest_pr_approved_reviews_for_head,
 )
 from coding_review_agent_loop.review_scope import is_complete_code_review, valid_evidence_scope
 from coding_review_agent_loop.panel_evidence import _derive_pr_panel_evidence, _pr_record_is_panel_qualified

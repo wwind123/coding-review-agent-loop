@@ -120,11 +120,15 @@ from .followups import (
     PLAN_APPROVED_FOLLOWUP_MARKER_RE,
     approved_plan_hashes_for_issue,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
-    ROUND_RESUME_MARKER_RE,
-    _extract_round_metadata_records,
     _plan_subject,
+)
+from .round_transport import (
+    ROUND_RESUME_MARKER_RE,
+)
+from .round_state import (
+    _extract_round_metadata_records,
     make_approved_plan_context,
     recover_approved_plan_context,
 )

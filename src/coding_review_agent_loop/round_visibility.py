@@ -18,7 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from .round_state import PostedRoundRecord, _is_acknowledgement_failure_boundary
+from .round_metadata import (
+    PostedRoundRecord,
+)
+from .round_state import (
+    _is_acknowledgement_failure_boundary,
+)
 
 # Scheduler phases whose launch is gated on the primary's approved review.
 GATED_LAUNCH_PHASES = frozenset({"secondary-audit", "final-secondary-sweep"})

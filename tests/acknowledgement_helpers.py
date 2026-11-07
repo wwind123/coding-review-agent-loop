@@ -1,7 +1,10 @@
 """Durable historical PR acknowledgement fixtures (no live GitHub effects)."""
 from dataclasses import replace
 from coding_review_agent_loop.protocol import UnresolvedReviewItem, UNKNOWN_MACHINE_AUTHORITY
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 from coding_review_agent_loop.unresolved_items import _upsert_human_requirements_ack_item
 
 ACK_TEXT = (
@@ -98,7 +101,9 @@ def ack_resume_history(*, promoted=False, coder_ack=False, conflict=False, unrel
         surfaced_reviewer_requirement_ids=(requirement_id,),
         body=structured_pr_review(state="blocking" if conflict else "approved", human_requirements_resolved=True),
     )
-    from coding_review_agent_loop.round_state import RecoveryRoundBudget
+    from coding_review_agent_loop.round_metadata import (
+        RecoveryRoundBudget,
+    )
     dispatch = durable_record(
         (alias, *other), role="summary", agent="Orchestrator", phase="coder-dispatch",
         dispatch_round=1, dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", dispatch_attempt=1, recovery_dispatch=False,
@@ -123,7 +128,13 @@ def ack_matrix_metadata():
 
 def ack_origin_history(history, carrier):
     """Add the transport/evidence variants preceding the first coder carrier."""
-    from coding_review_agent_loop.round_state import _decode_round_metadata, _strip_round_metadata, ROUND_RESUME_MARKER_RE
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+        _strip_round_metadata,
+    )
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+    )
     def decode(body):
         return _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(body).group("payload"))
     dispatch, *ordinary = history

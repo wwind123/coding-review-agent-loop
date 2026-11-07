@@ -350,6 +350,8 @@ def _archived_indexes(comments: Sequence[object], scope_start_round: int) -> fro
     from .protocol_markers import strip_known_host_footer
     from .round_state import (
         _extract_round_metadata_records,
+    )
+    from .round_metadata import (
         decode_plan_validation_diagnostic_body,
     )
     from .round_transport import PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE

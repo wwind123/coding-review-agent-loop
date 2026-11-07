@@ -39,7 +39,10 @@ from .plan_growth import (
 from .protocol import PROVENANCE_PRE_EXISTING, PROVENANCE_REVISION_INTRODUCED
 
 if TYPE_CHECKING:
-    from .round_state import PostedRoundMetadata, PostedRoundRecord
+    from .round_metadata import (
+        PostedRoundMetadata,
+        PostedRoundRecord,
+    )
 
 CLASS_NEW_FINDING = "new-finding"
 CLASS_REPEAT_ONLY = "repeat-only"
@@ -693,7 +696,9 @@ def reviewer_previous_plan_baseline(
     record of that subject whose canonical plan hashes to it.  No earlier
     review is a first review; an unmatched subject or hash is unavailable.
     """
-    from .round_state import _plan_subject
+    from .round_metadata import (
+        _plan_subject,
+    )
 
     previous = None
     for record in sorted(records, key=lambda item: item.index):

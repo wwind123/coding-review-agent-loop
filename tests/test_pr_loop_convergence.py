@@ -836,9 +836,11 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
 
     from coding_review_agent_loop.errors import AgentLoopError
     from coding_review_agent_loop.github import get_pr_review_context
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         PostedRoundRecord,
+    )
+    from coding_review_agent_loop.round_state import (
         _extract_round_metadata_records,
         canonical_history_item_outcomes,
     )

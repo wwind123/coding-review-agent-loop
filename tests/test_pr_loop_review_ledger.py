@@ -13,7 +13,7 @@ from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.managed_ci_types import (
     ManagedCiContract,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
@@ -1236,9 +1236,11 @@ def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
 
 from coding_review_agent_loop.protocol import ReviewItemDisposition as _Disp862
 from coding_review_agent_loop.protocol import UnresolvedReviewItem as _Item862
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata as _Meta862,
     PostedRoundRecord as _Record862,
+)
+from coding_review_agent_loop.round_state import (
     _canonically_resolved_history_item_ids,
 )
 

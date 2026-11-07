@@ -31,7 +31,9 @@ from coding_review_agent_loop.managed_ci_types import (
 )
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.protocol_common import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )

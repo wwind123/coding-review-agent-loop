@@ -278,7 +278,9 @@ def test_m936_approved_inadmissible_plan_is_revised_instead_of_dead_ending(tmp_p
     # No synthetic reviewer item and no signed record or digest is involved.
     revised = [body for body in posted if "Inherited rows restored." in body]
     assert revised
-    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+    )
     from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE
 
     metadata = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(revised[0]).group("payload"))

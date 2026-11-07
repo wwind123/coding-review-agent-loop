@@ -94,7 +94,11 @@ from .workdir_guard import (
 )
 from .comment_rendering import normalize_freeform_signature, render_public_agent_comment
 from .followups import _approved_followup_from_unresolved_item, _dedupe_approved_followups
-from .round_state import ApprovedPlanContext, PostedRoundRecord, RequirementsContext
+from .round_metadata import (
+    ApprovedPlanContext,
+    PostedRoundRecord,
+    RequirementsContext,
+)
 from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
     _VALIDATION_TEST_TURN_CONTEXT,
@@ -1079,7 +1083,9 @@ def _resumed_pr_reviewer_matches_requirements(
     resumable, while a non-empty current set requires both the resolution marker
     and digest-backed identities from the persisted metadata.
     """
-    from .round_state import _contradictory_evidence_approval
+    from .review_approval import (
+        _contradictory_evidence_approval,
+    )
     if _contradictory_evidence_approval(record.metadata):
         return False
     plan_matches = approved_plan_context is None or (

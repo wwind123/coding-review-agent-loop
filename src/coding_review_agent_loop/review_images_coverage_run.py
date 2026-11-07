@@ -205,7 +205,10 @@ def apply_receipts(items, receipts, current_board, head, *, human_clearances=())
 
 def publish(runner, config, pr, head, round_number, kind, payload, *, agent='Orchestrator', scope=None):
     from .github import resolve_authenticated_github_actor, post_verified_trusted_pr_protocol_comment_observed
-    from .round_state import PostedRoundMetadata, _attach_round_metadata
+    from .round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     actor = resolve_authenticated_github_actor(runner, config=config)
     metadata = PostedRoundMetadata(flow='pr', role='coverage-' + kind, agent=agent,
         round_number=round_number, subject=head, phase='screenshot-coverage-' + kind,
@@ -375,7 +378,9 @@ def terminal_fields(runner, *, config, pr, head, items, reason, refs=()):
 
 def release(runner, *, config, pr, head, items, round_number, baseline, clearances=(), references=()):
     from .pr_loop_support import _publish_evidence_release
-    from .round_state import EVIDENCE_RELEASE_PHASE
+    from .round_metadata import (
+        EVIDENCE_RELEASE_PHASE,
+    )
     history = history_for(runner, config, pr)
     attachment = report(history, repo=config.repo, pr=pr, head=head)
     verified = verified_receipts(history, attachment, items, config=config, pr=pr, head=head)

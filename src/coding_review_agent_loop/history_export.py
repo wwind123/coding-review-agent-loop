@@ -71,7 +71,13 @@ from .review_step_back import (
 from .decomposition import find_decompositions_for_parent, find_phase_implementation_handoffs_for_parent
 from .followups import approved_plan_hashes_for_issue
 from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
-from .round_state import PostedRoundRecord, _approved_plan_hash, _extract_round_metadata_records
+from .round_metadata import (
+    PostedRoundRecord,
+)
+from .round_state import (
+    _approved_plan_hash,
+    _extract_round_metadata_records,
+)
 from .round_transport import ROUND_RESUME_MARKER_RE
 from .transient import NON_RETRYABLE_AGENT_OUTPUT_RE, is_transient_agent_output
 

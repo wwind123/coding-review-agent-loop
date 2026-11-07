@@ -122,7 +122,11 @@ def _run_pr(config, runner, *, plan=None):
 
 
 def _three_reviewer_plan_runner(plan):
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
+    )
 
     comments = approved_plan_comments(plan)
     for index, agent in enumerate(("Claude", "Gemini"), start=2):
@@ -431,7 +435,10 @@ def test_staged_malformed_history_with_a_signed_amendment_writes_nothing(
 
     import coding_review_agent_loop.round_transport as transport
     from coding_review_agent_loop.cli import run_pr_loop
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from pr_loop_test_helpers import (
         _m943_amendment_from_error, _m943_append, _m943_partial_pr_round, _staged_config,
     )
@@ -573,7 +580,10 @@ def test_standalone_pr_entry_floor_resolves_the_bound_plan(
 def _no_handoff_plan_pr(tmp_path, *, plan_state, scope):
     """Issue #56 holds an approved plan but no handoff record; the PR run has no issue context."""
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from test_issue_pr_handoff import _named_config, _named_plan_comments, _three_provider_plan
 
     seats, approved = _three_provider_plan(tmp_path)

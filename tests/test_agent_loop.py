@@ -54,7 +54,11 @@ from coding_review_agent_loop.agent_failure import (
     _parse_rate_limit_reset_seconds,
 )
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-from coding_review_agent_loop.round_state import _decode_round_metadata, _encode_round_metadata, _strip_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+    _encode_round_metadata,
+    _strip_round_metadata,
+)
 from coding_review_agent_loop.pr_loop_support import _resume_plan_round
 from coding_review_agent_loop.plan_first_loop import render_canonical_plan_revision
 from coding_review_agent_loop.response_validation import render_public_agent_comment

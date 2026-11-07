@@ -513,7 +513,10 @@ def _excluded_1868(kind):
 @pytest.mark.parametrize("kind", ["evidence", "future", "converted", "tombstone"])
 @pytest.mark.parametrize("field", ["addressed_items", "remaining_items"])
 def test_excluded_1868_normalization_preserves_ledger_and_test_reports(kind, field):
-    from coding_review_agent_loop.round_state import _serialize_unresolved_item, _deserialize_unresolved_item
+    from coding_review_agent_loop.round_metadata import (
+        _serialize_unresolved_item,
+        _deserialize_unresolved_item,
+    )
     item = _excluded_1868(kind)
     notes = field.replace("items", "item_notes")
     parsed = _followup_1388(addressed_items=["item-1"])

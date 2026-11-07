@@ -825,7 +825,9 @@ def plan_round_candidate_key(plan_round: object, *, plan_text: str, surfaced_ids
     """The exact-plan candidate key of the resumed round under ``surfaced_ids``, or ``None``."""
     from .panel_evidence import _plan_candidate_key_for
     from .plan_assembly import decode_assembled_plan_sidecar
-    from .round_state import _plan_subject
+    from .round_metadata import (
+        _plan_subject,
+    )
 
     coder_metadata = getattr(plan_round, "coder_metadata", None)
     sidecar = None

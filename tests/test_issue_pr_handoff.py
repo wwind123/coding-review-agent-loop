@@ -35,7 +35,10 @@ from agent_loop_helpers import patch_attr_in
 def _staged_plan_checkpoint(binding, names, primary, round_number=1):
     """A primary-then-panel planning checkpoint with complete scheduler metadata."""
     from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey, make_plan_contract
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     return _attach_round_metadata("Plan scheduling checkpoint.", PostedRoundMetadata(
         flow="plan", role="summary", agent="Orchestrator", round_number=round_number,
@@ -66,7 +69,10 @@ def test_named_plan_handoff_board_rule_records_changes_instead_of_refusing(tmp_p
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, resolve_plan_handoff_board, reviewer_seat_binding,
     )
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
     opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
@@ -128,7 +134,10 @@ def test_named_plan_handoff_applies_signed_outage_and_restoration(tmp_path):
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, reconcile_plan_handoff_board, reviewer_seat_binding,
     )
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     seats = tuple(
         SeatAgent(ReviewerSeat(name, backend, (model,)), tmp_path / name)
@@ -217,8 +226,12 @@ def test_named_staged_handoff_uses_parent_board_when_child_has_unrelated_plan(tm
     from coding_review_agent_loop.cli import run_pr_loop
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
     from coding_review_agent_loop.round_state import (
-        PostedRoundMetadata, _attach_round_metadata, make_approved_plan_context,
+        make_approved_plan_context,
     )
 
     seats = tuple(
@@ -305,7 +318,10 @@ def _named_plan_comments(approved, plan_config, *, removed=(), restored=False, i
     )
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     binding = reviewer_seat_binding(plan_config)
     board = tuple(agent_display_name(seat) for seat in plan_config.reviewer)
@@ -622,8 +638,10 @@ def _plain_plan_comments(plan, approvals, *, versioned=True, change_digest=None)
     ``change_digest`` forges a board-change digest onto every reviewer record
     of the otherwise rootless history.
     """
-    from coding_review_agent_loop.round_state import (
-        PostedRoundMetadata, _attach_round_metadata, _plan_subject,
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
     )
 
     subject = _plan_subject(plan)
@@ -801,7 +819,10 @@ def test_plan_verification_context_keeps_a_primary_then_panel_plan_policy(tmp_pa
     from types import SimpleNamespace
     from coding_review_agent_loop.plan_verification import plan_verification_inputs
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
-    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
 
     seats = (
         _seat(tmp_path, "primary", "codex", "gpt-6.1-sol", "medium"),
@@ -2263,8 +2284,10 @@ def _bound_plan_history(tmp_path, *, mutate):
     from types import SimpleNamespace
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
-    from coding_review_agent_loop.round_state import (
-        PostedRoundMetadata, _attach_round_metadata, _plan_subject,
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
     )
 
     seats = (
@@ -2388,9 +2411,13 @@ def test_malformed_staged_plan_history_is_never_downgraded_to_all_reviewers(tmp_
     from coding_review_agent_loop.plan_verification import plan_verification_inputs
     from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
-    from coding_review_agent_loop.round_state import (
-        PostedRoundMetadata, _attach_round_metadata, _extract_round_metadata_records,
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
         _plan_subject,
+    )
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
     )
 
     seats = (
@@ -2492,8 +2519,11 @@ def _with_checkpoint_rebinds(comments, *models):
     import copy
     from dataclasses import replace
     from types import SimpleNamespace
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+    )
     from coding_review_agent_loop.round_state import (
-        _attach_round_metadata, _extract_round_metadata_records,
+        _extract_round_metadata_records,
     )
 
     records = _extract_round_metadata_records(
@@ -2716,8 +2746,9 @@ def _forge_lost_plan_obligation(comments):
     import re
 
     from coding_review_agent_loop.protocol import UnresolvedReviewItem
-    from coding_review_agent_loop.round_state import (
-        _attach_round_metadata, _decode_round_metadata,
+    from coding_review_agent_loop.round_metadata import (
+        _attach_round_metadata,
+        _decode_round_metadata,
     )
 
     lost = UnresolvedReviewItem(

@@ -10,7 +10,10 @@ from coding_review_agent_loop.agent_failure import (
     ValidatedAgentResponse,
 )
 from coding_review_agent_loop.discuss_loop import ROUND_RESUME_MARKER_RE
-from coding_review_agent_loop.round_state import _decode_round_metadata, _strip_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+    _strip_round_metadata,
+)
 from coding_review_agent_loop.protocol import (
     parse_plan_review,
 )

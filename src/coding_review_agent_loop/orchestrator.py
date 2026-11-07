@@ -567,43 +567,28 @@ from .followups import (
     _publish_approved_followups,
     FollowupSourceContext,
 )
-from .round_state import (
+from .round_metadata import (
     ApprovedPlanContext,
     EVIDENCE_FREEZE_PHASE,
     EVIDENCE_RELEASE_PHASE,
     EVIDENCE_RESPONSE_PHASE,
     EvidenceFreezeRecord,
     EvidenceReleaseRecord,
-    QualificationCheckpoint,
     PostedRoundMetadata,
     _is_followup_dispatch_head,
     followup_head_unchanged_sha,
     rebuild_resumed_coder_carrier,
     PostedRoundRecord,
-    ROUND_RESUME_MARKER_RE,
     ResumedRoundSelection,
     ResumedReviewRound,
     _attach_round_metadata,
-    _decode_discuss_vote,
     _decode_round_metadata,
     _deserialize_disposition,
     _deserialize_unresolved_item,
     _encode_round_metadata,
-    _canonically_resolved_history_item_ids,
-    _live_round_resolved_item_ids,
-    _extract_round_metadata_records,
-    _latest_pr_approved_reviews_for_head,
-    _max_unresolved_item_number_from_records,
     _plan_subject,
-    _prior_item_ledger_signature,
-    _resume_discuss_round,
-    _resume_plan_round,
-    make_approved_plan_context,
     scope_approved_plan_matrix,
-    recover_approved_plan_context,
     RequirementsContext,
-    _resume_pr_round,
-    _select_current_round_records,
     _serialize_disposition,
     _serialize_unresolved_item,
     _strip_round_metadata,
@@ -613,6 +598,29 @@ from .round_state import (
     has_plan_validation_diagnostic_marker,
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
+)
+from .qualification_checkpoint import (
+    QualificationCheckpoint,
+)
+from .round_transport import (
+    ROUND_RESUME_MARKER_RE,
+)
+from .round_state import (
+    _decode_discuss_vote,
+    _canonically_resolved_history_item_ids,
+    _live_round_resolved_item_ids,
+    _extract_round_metadata_records,
+    _max_unresolved_item_number_from_records,
+    _prior_item_ledger_signature,
+    _resume_discuss_round,
+    _resume_plan_round,
+    make_approved_plan_context,
+    recover_approved_plan_context,
+    _resume_pr_round,
+    _select_current_round_records,
+)
+from .code_approval import (
+    _latest_pr_approved_reviews_for_head,
 )
 from .round_transport import (
     decode_mapping,

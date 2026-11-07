@@ -2363,7 +2363,7 @@ def test_degraded_review_carriers_reach_round_metadata_and_summary():
         parse_structured_plan_review,
         parse_structured_pr_review,
     )
-    from coding_review_agent_loop.round_state import (
+    from coding_review_agent_loop.round_metadata import (
         PostedRoundMetadata,
         _attach_round_metadata,
         _decode_round_metadata,
@@ -2662,7 +2662,9 @@ from coding_review_agent_loop.protocol_risk import (
 from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup as _validate_followup_959,
 )
-from coding_review_agent_loop.round_state import PostedRoundMetadata as _Meta959
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata as _Meta959,
+)
 
 _IDENTITY_959 = "a" * 64
 _EVIDENCE_HEADING_959 = "### Risk-based mode and transition test matrix evidence"

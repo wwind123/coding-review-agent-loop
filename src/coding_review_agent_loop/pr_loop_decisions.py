@@ -7,7 +7,9 @@ from .ci_health import WatchFailureClass
 from .github import observation_is_stale
 from .protocol import ReviewItemDisposition, UnresolvedReviewItem, human_requirements_resolved
 from .response_validation import _reviewer_requirement_coverage_matches
-from .round_state import PostedRoundRecord
+from .round_metadata import (
+    PostedRoundRecord,
+)
 from .unresolved_items import _apply_unresolved_item_dispositions
 
 

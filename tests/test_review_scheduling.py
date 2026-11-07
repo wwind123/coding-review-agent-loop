@@ -237,11 +237,13 @@ from coding_review_agent_loop.review_scheduling import (
     select_reviewers,
 )
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     _prior_item_ledger_signature,
 )
 from coding_review_agent_loop.pr_loop_support import (

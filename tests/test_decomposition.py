@@ -3859,7 +3859,7 @@ from coding_review_agent_loop.decomposition import (  # noqa: E402
     parse_child_plan_supersession_records,
 )
 from coding_review_agent_loop.decomposition import approved_plan_hash as _m936_plan_hash  # noqa: E402
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata as _M936Metadata,
     _attach_round_metadata as _m936_attach,
     _decode_round_metadata as _m936_decode,

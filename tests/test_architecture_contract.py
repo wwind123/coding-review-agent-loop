@@ -10,7 +10,9 @@ import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from coding_review_agent_loop.cli import AgentLoopError
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
-from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    _decode_round_metadata,
+)
 from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_issue_implementation,

@@ -113,7 +113,10 @@ from coding_review_agent_loop.pr_loop_support import (
     _stop_on_terminal_without_status,
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_metadata import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+)
 from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import resolve_base_branch
@@ -14487,7 +14490,7 @@ def test_prepare_v2_merge_post_write_verification_still_refuses_a_later_head_cha
 
 # --- Rejected-coder recovery continuity across a fresh grant (#1367) ---------
 
-from coding_review_agent_loop.round_state import (  # noqa: E402
+from coding_review_agent_loop.round_metadata import (
     RecoveryRoundBudget as _Budget1367,
 )
 
@@ -15614,7 +15617,9 @@ def _m1376_plan_bound(monkeypatch):
     """Bind every run to an approved plan on issue 643, so fresh qualification
     walks the PR-side authorization chain itself (#966 binding path)."""
     from coding_review_agent_loop.github import IssueContext
-    from coding_review_agent_loop.round_state import ApprovedPlanContext
+    from coding_review_agent_loop.round_metadata import (
+        ApprovedPlanContext,
+    )
 
     issue = IssueContext(
         number=643, repo="OWNER/REPO", title="t", body="b", url=None, comments=(),
@@ -16471,7 +16476,9 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     """
     import dataclasses
     from coding_review_agent_loop.github import PullRequestMergeability
-    from coding_review_agent_loop.round_state import QualificationCheckpoint
+    from coding_review_agent_loop.qualification_checkpoint import (
+        QualificationCheckpoint,
+    )
 
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,

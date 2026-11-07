@@ -16,9 +16,11 @@ import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.review_rounds as review_rounds
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _attach_round_metadata,
+)
+from coding_review_agent_loop.round_state import (
     startup_force_full_latch,
 )
 from coding_review_agent_loop.unresolved_items import _upsert_converted_evidence_obligation

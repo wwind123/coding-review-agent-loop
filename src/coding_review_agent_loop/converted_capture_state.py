@@ -1,7 +1,9 @@
 """Pure converted-capture eligibility reconstructed from ordered round records."""
 from .review_scope import visual_candidate, is_visual_review, is_visual_item, authority_records
 
-from .round_state import EVIDENCE_FREEZE_PHASE
+from .round_metadata import (
+    EVIDENCE_FREEZE_PHASE,
+)
 
 
 def capture_candidates(records, *, items, head, matrix_identity, diagnostic=None):
