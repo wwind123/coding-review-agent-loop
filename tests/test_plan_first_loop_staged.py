@@ -1107,3 +1107,31 @@ def test_planner_resume_before_clearance_resolves_a_retained_future_finding(tmp_
     assert len(revisions) == 3
     assert "Codex finding item-2 (resolved) docs/b.md:20" in history(revisions[2])
     assert "(deferred)" not in history(revisions[2])
+
+
+def test_staged_resume_repairs_default_close_before_next_dispatch(tmp_path, monkeypatch):
+    from default_branch_close_helpers import DefaultCloseRunner, MERGE_SHA
+    runner = DefaultCloseRunner(child=99, pr_number=912)
+    outcome = _staged_outcome(_staged_created(("agent-pr", "agent-pr")))
+    dispatched = []
+    def dispatch(*_a, **kwargs):
+        assert runner.state == "closed"
+        assert runner.evidence_commands[-1] == ["gh", "api", "repos/OWNER/REPO/issues/99"]
+        dispatched.append(kwargs)
+        return 0
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", dispatch)
+    assert _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch) == 0
+    assert [item["phase_index"] for item in dispatched] == [2]
+    assert dispatched[0]["created"].issue_number == 100
+    assert len(runner.closes) == 1
+    assert "PR #912" in runner.closes[0][-1] and MERGE_SHA in runner.closes[0][-1]
+
+
+def test_staged_dry_run_never_resolves_missed_close(tmp_path, monkeypatch):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=99, pr_number=912)
+    monkeypatch.setattr(plan_first_loop_module, "resolve_staged_phase_progress", lambda *_a, **_k: pytest.fail("dry run resolved child"))
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", lambda *_a, **_k: pytest.fail("dry run dispatched child"))
+    outcome = _staged_outcome(_staged_created(("agent-pr", "agent-pr")))
+    assert _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch, config=make_config(tmp_path, dry_run=True)) == 0
+    assert not runner.evidence_commands

@@ -464,9 +464,21 @@ closed ahead of its turn is reported as attested and still confers no authority
 to skip the earlier phase. An `agent-pr` phase is
 complete only when its child issue is CLOSED and its canonical issue-to-PR
 handoff names a MERGED pull request, authenticated by the same identity, URL
-and closing-contract checks that resume applies; an open child with a merged or
-closed canonical PR, and a closed child with absent, unreadable or unmerged PR
-evidence, both fail closed. A `human-action` or `manual-close` phase is
+and closing-contract checks that resume applies. For an open child whose
+canonical PR is MERGED, the existing integration-close path runs first, followed
+by the exact child/PR just-merged default-branch tolerance. Outside that window,
+`integration_close.close_staged_child_after_default_merge` rechecks the live
+same-repository default-branch merge and recorded-base agreement, requires an
+affirmative child-closing reference in the live body and a readable merge SHA,
+then closes the child as completed with a comment naming the PR and full SHA.
+Only a live CLOSED read-back permits advancement. Already-closed races need no
+duplicate write; failed evidence or closure stops with parent/phase context and
+can be retried without replaying the child or merge. Shared default-branch
+helper semantics remain a no-op; this recovery is staged-parent-only. Read-only
+prerequisite resolution never closes issues and still reports an open
+default-branch child incomplete. An open child with a closed unmerged PR, or a
+closed child with absent, unreadable or unmerged PR evidence, fails closed.
+A `human-action` or `manual-close` phase is
 complete on closure of its child issue alone - that closure is the operator
 attestation, and no PR evidence is read for it. The first incomplete phase is
 dispatched through the existing child-dispatch seam with its real phase index;

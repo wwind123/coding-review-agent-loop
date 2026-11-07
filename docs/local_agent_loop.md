@@ -2992,9 +2992,19 @@ The modes are:
   states that agent-loop leaves the parent open for the operator to verify and
   close. Completion evidence
   is authenticated: a closed child whose PR evidence is missing, unreadable or
-  unmerged, an open child whose canonical PR is merged or closed, and a handoff
+  unmerged, an open child whose canonical PR is closed without merging, and a handoff
   recorded for a later phase while an earlier one is incomplete all stop the run
-  with a diagnostic rather than skipping or re-dispatching a phase. A
+  with a diagnostic rather than skipping or re-dispatching a phase.
+  Staged-parent resume also repairs a child GitHub left open after its
+  authenticated canonical PR merged into the live default branch. It verifies
+  the same-repository merge, recorded-base agreement, affirmative child-closing
+  reference in the live PR body and merge commit, then closes the child as
+  completed with a comment naming the PR and full merge SHA. Only confirmed
+  closure allows advancement; unreadable evidence or failed closure stops the
+  parent, and rerunning retries from live state without replaying the merge.
+  The exact child/PR just-merged asynchronous-close tolerance remains; read-only
+  prerequisite checks never perform this repair, and dry runs resolve no child
+  state. A
   `human-action` or `manual-close` phase completes when its child issue is
   closed: that closure is the operator's attestation that the required work and
   remark are done. Older decomposition summaries without a handoff marker are

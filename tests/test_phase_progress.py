@@ -23,6 +23,8 @@ from dependency_guard_helpers import (
     summary_for,
 )
 
+from default_branch_close_helpers import QUOTE_BOUNDARY_CASES
+
 PHASES = (plan_phase("s1"), plan_phase("s2", depends_on=("s1",)), plan_phase("s3"))
 
 
@@ -119,3 +121,78 @@ def test_default_arguments_keep_the_closure_capable_parent_path(tmp_path, monkey
     assert progress[0].status == STATUS_COMPLETE and progress[0].child_state == "CLOSED"
     assert ("verify", 61) not in scenario.reads
     assert [phase.stage_id for phase in progress] == ["s1", "s2", "s3"]
+
+
+@pytest.mark.parametrize("just_merged", [None, (61, 99), (99, 71)])
+def test_default_merge_outside_exact_pair_requires_confirmed_closure(tmp_path, monkeypatch, just_merged):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=61, pr_number=71)
+    monkeypatch.setattr(phase_progress, "find_phase_implementation_handoffs_for_parent", lambda *_a, **_k: (handoff_for("s1"),))
+    # Exercise real canonical authentication and the real merge/closure helper.
+    result = resolve_staged_phase_progress(
+        runner, config=make_config(tmp_path), parent_issue=55, parent_comments=(),
+        outcome=_outcome(), just_merged=just_merged,
+    )
+    assert result[0].status == STATUS_COMPLETE and result[0].child_state == "CLOSED"
+    assert len(runner.closes) == 1
+    assert result[1].status == STATUS_NOT_DISPATCHED
+
+
+def test_matching_just_merged_does_not_enter_fallback(tmp_path, monkeypatch):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=61, pr_number=71)
+    monkeypatch.setattr(phase_progress, "find_phase_implementation_handoffs_for_parent", lambda *_a, **_k: (handoff_for("s1"),))
+    monkeypatch.setattr(phase_progress, "close_staged_child_after_default_merge", lambda *_a, **_k: pytest.fail("exact pair bypasses fallback"))
+    result = resolve_staged_phase_progress(
+        runner, config=make_config(tmp_path), parent_issue=55, parent_comments=(),
+        outcome=_outcome(), just_merged=(61, 71),
+    )
+    assert result[0].status == STATUS_COMPLETE and result[0].child_state == "OPEN"
+    assert not runner.closes
+
+
+@pytest.mark.parametrize("failure", ["authentication", "closing-reference", "close", "unresolved-integration"])
+def test_default_recovery_failure_retains_context_and_incomplete_phase(tmp_path, monkeypatch, failure):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=61, pr_number=71)
+    monkeypatch.setattr(phase_progress, "find_phase_implementation_handoffs_for_parent", lambda *_a, **_k: (handoff_for("s1"),))
+    if failure == "authentication":
+        runner.pr_payloads_by_number[71]["url"] = "https://github.com/OTHER/REPO/pull/71"
+        monkeypatch.setattr(phase_progress, "close_staged_child_after_default_merge", lambda *_a, **_k: pytest.fail("unauthenticated fallback"))
+    if failure == "closing-reference":
+        runner.live_pr["body"] = "Refs #61"
+    if failure == "close":
+        runner.close_rc = 1
+    if failure == "unresolved-integration":
+        runner.live_pr["base"]["ref"] = "integration/old"
+    with pytest.raises(AgentLoopError, match=r"Issue #55.*phase 1.*s1.*(?:#61|child issue)"):
+        resolve_staged_phase_progress(
+            runner, config=make_config(tmp_path), parent_issue=55, parent_comments=(),
+            outcome=_outcome(),
+            just_merged=(61, 71) if failure == "unresolved-integration" else None,
+        )
+    assert len(runner.closes) == (1 if failure == "close" else 0)
+
+
+@pytest.mark.parametrize("body, closes", QUOTE_BOUNDARY_CASES)
+def test_authenticated_default_recovery_markdown_boundaries(tmp_path, monkeypatch, body, closes):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=61, pr_number=71)
+    runner.live_pr["body"] = body.format(child=61)
+    monkeypatch.setattr(phase_progress, "find_phase_implementation_handoffs_for_parent",
+                        lambda *_a, **_k: (handoff_for("s1"),))
+    def resolve():
+        return resolve_staged_phase_progress(
+            runner, config=make_config(tmp_path), parent_issue=55, parent_comments=(),
+            outcome=_outcome(),
+        )
+    if closes:
+        result = resolve()
+        assert result[0].status == STATUS_COMPLETE
+        assert result[0].child_state == "CLOSED"
+        assert result[1].status == STATUS_NOT_DISPATCHED
+    else:
+        with pytest.raises(AgentLoopError, match="is OPEN but its canonical implementation PR"):
+            resolve()
+    assert len(runner.closes) == int(closes)
+    assert runner.state == ("closed" if closes else "open")
