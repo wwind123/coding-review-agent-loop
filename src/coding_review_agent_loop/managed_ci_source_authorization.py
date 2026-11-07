@@ -129,6 +129,19 @@ def _live(runner, config, pr_number, *, source=None, expected_head=None, creatio
     return pr, recovered, actor, actor_id, event
 
 
+def _authority_snapshot(live):
+    """Compare trust inputs, excluding GitHub's asynchronous computed metadata."""
+    pr, source, actor, actor_id, event = live
+    return (
+        pr.get("state"), pr.get("draft"),
+        pr["user"].get("login"), pr["user"].get("id"),
+        pr["head"]["repo"].get("full_name"), pr["head"].get("ref"), pr["head"].get("sha"),
+        pr["base"].get("ref"), pr.get("body"),
+        tuple(sorted(label["name"] for label in pr["labels"])),
+        source, actor, actor_id, event,
+    )
+
+
 def _root_body(fields, pr_number):
     required = ("nonce", "repo", "base", "head", "protection")
     line = UNPROTECTED_OVERRIDE_TRAILER + " " + " ".join(f"{key}={fields[key]}" for key in required)
@@ -337,7 +350,7 @@ def authenticate_source_authority(runner, *, config, pr_number, expected_head=No
     final_protection = reconcile_live_protection(current.protection, final_protection, config=config)
     if final_protection.state != current.protection or current.protection not in waivable_protection_states(config):
         raise AgentLoopError("Source-managed protection or current explicit waiver changed during authentication.")
-    if _live(runner, config, pr_number, source=source, expected_head=expected_head) != (pr, source, actor, actor_id, event):
+    if _authority_snapshot(_live(runner, config, pr_number, source=source, expected_head=expected_head)) != _authority_snapshot((pr, source, actor, actor_id, event)):
         raise AgentLoopError("Source-managed live tuple or label event changed during authentication.")
     return current
 
@@ -353,7 +366,7 @@ def publish_source_creation_root(runner, *, config, pr_number, source, protectio
     if relevant:
         return authenticate_source_authority(runner, config=config, pr_number=pr_number,
             expected_head=source[1], source=source, protection=protection)
-    if _live(runner, config, pr_number, source=source, expected_head=source[1], creation=True) != before:
+    if _authority_snapshot(_live(runner, config, pr_number, source=source, expected_head=source[1], creation=True)) != _authority_snapshot(before):
         raise AgentLoopError("Source-managed creation tuple or label event changed before audit publication.")
     final_protection = assess_exact_head_protection(runner,
         context=ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config)), base=config.base)
@@ -381,7 +394,7 @@ def publish_source_continuity(runner, *, config, pr_number, predecessor_head, ne
     comments = _comments(runner, config, pr_number)
     if not _round_valid(comments, record):
         raise AgentLoopError("Source-managed coder transition requires authenticated round evidence.")
-    if authenticate_source_authority(runner, config=config, pr_number=pr_number) != authority or _live(runner, config, pr_number, expected_head=new_head) != before:
+    if authenticate_source_authority(runner, config=config, pr_number=pr_number) != authority or _authority_snapshot(_live(runner, config, pr_number, expected_head=new_head)) != _authority_snapshot(before):
         raise AgentLoopError("Source-managed coder tuple or provenance changed before publication.")
     post_verified_trusted_pr_protocol_comment(runner, config=config, pr_number=pr_number,
         body=format_source_continuity(record), expected_author_login=authority.actor, expected_author_id=authority.actor_id)

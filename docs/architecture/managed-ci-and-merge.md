@@ -617,7 +617,9 @@ it does not import the activation driver. `managed_pr.py` publishes and reads ba
 the override audit inside its creation transaction before returning a handoff.
 Final checks bind repository, actor login/numeric identity, base, draft, managed-direct
 alias, exact source SHA, source record, nonce, current protection and owned active
-label event. Publication failure uses the partial-draft/ref cleanup path.
+label event. Race comparisons project only these authenticated fields and strict label
+names; asynchronous GitHub mergeability metadata, timestamps and counters are excluded.
+Publication failure uses the partial-draft/ref cleanup path.
 
 PR-mode activation independently reads persisted facts. Editable body records
 nominate a source identity, while actor-owned creation comments establish authority.
@@ -639,7 +641,9 @@ rereads the tuple, body, active label and provenance before its audit write.
 
 Source-managed refusal reports use measured lifecycle state and conditional recovery
 prerequisites, preserving foreign/replaced-label ownership. Unknown state requires a
-fresh successful read; ready/labeled needs operator correction to draft/labeled with
+fresh successful read. PR-loop entry first releases a retained label from an open
+ready PR for every origin, preserving qualified manual re-entry on strict and waived
+bases. Direct low-level ready/labeled refusal needs operator correction to draft/labeled with
 verified authority and applicable waivers. Missing authority requires conditional
 ordinary recovery: resolve unrelated blockers, verify label absence and an unlabeled
 workflow route, restore the route or ready the draft if needed, then ordinary review

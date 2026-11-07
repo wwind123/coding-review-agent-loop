@@ -205,6 +205,7 @@ def test_auditless_legacy_draft_refuses_with_conditional_ordinary_recovery(tmp_p
     with pytest.raises(AgentLoopError) as error:
         activate(runner, tmp_path)
     message = str(error.value)
+    assert message.count("Measured lifecycle:") == 1
     assert "No verified source-managed creation audit" in message
     assert "verify" in message and "unlabeled" in message and "ordinary review" in message
     assert "Resume with" not in message
@@ -298,6 +299,9 @@ def test_lifecycle_refusal_complete_output_has_actionable_correction_and_no_writ
     message = str(error.value)
     assert state in message or "unknown" in message
     assert ("fresh" in message if draft is None else "restore draft/labeled" in message)
+    assert message.count("Measured lifecycle:") == 1
+    assert "Resume with `Measured" not in message
+    assert "after restoring draft/unlabeled" not in message
     assert "agent-loop pr 7" not in message
     assert not any("POST" in cmd or "DELETE" in cmd or cmd[:3] == ["gh", "pr", "ready"] for cmd, _ in runner.commands)
     assert_no_qualification(runner)
@@ -490,4 +494,68 @@ def test_implicit_source_authority_failure_stops_before_ordinary_auto_merge(tmp_
     runner = SourceRunner()
     with pytest.raises(AgentLoopError, match="ordinary review"):
         activate(runner, tmp_path, managed_ci=False, auto_merge=True)
+    assert_no_qualification(runner)
+
+
+@pytest.mark.parametrize("operation", ["creation", "authentication", "continuity"])
+def test_async_github_metadata_does_not_change_authority(tmp_path, operation):
+    runner = SourceRunner()
+    if operation != "creation":
+        root(runner, tmp_path)
+    original = runner._run_locked
+    reads = 0
+    def changing(args, **kwargs):
+        nonlocal reads
+        if "repos/OWNER/REPO/pulls/7" in args and "--method" not in args:
+            reads += 1
+            runner.rest_pr.update(mergeable=None if reads % 2 else True,
+                mergeable_state=str(reads), rebaseable=bool(reads % 2),
+                updated_at=str(reads), comments=reads, commits=reads)
+        return original(args, **kwargs)
+    runner._run_locked = changing
+    if operation == "creation":
+        assert create(runner, tmp_path).source_authority
+    elif operation == "authentication":
+        assert activate(runner, tmp_path).origin == "source-managed"
+    else:
+        successor = "a" * 40
+        runner.intent_comments.extend([
+            _round_comment(100, role="reviewer", subject=SHA, round_number=1, state="blocking"),
+            _round_comment(101, role="coder", subject=successor, round_number=2),
+        ])
+        runner.rest_pr["head"]["sha"] = successor
+        assert source_auth.publish_source_continuity(runner, config=config(tmp_path),
+            pr_number=7, predecessor_head=SHA, new_head=successor, round_number=1).head == successor
+    assert reads >= 2
+    assert runner.rest_pr["state"] == "open"
+    assert not any("DELETE" in cmd for cmd, _ in runner.commands)
+    assert_no_qualification(runner)
+
+
+@pytest.mark.parametrize("lifecycle,draft,labeled,explicit", [
+    ("draft-unlabeled-reentry", False, True, True),
+    ("draft-labeled", False, True, True),
+    ("draft-unlabeled-reentry", True, False, False),
+])
+def test_source_late_lifecycle_refusals_render_advice_once(tmp_path, lifecycle, draft, labeled, explicit):
+    from coding_review_agent_loop.managed_ci_types import AuthenticatedManagedResume
+    runner = SourceRunner()
+    root(runner, tmp_path)
+    runner.rest_pr.update(draft=draft, labels=[{"name": "agent-loop-managed"}] if labeled else [])
+    resume = AuthenticatedManagedResume(origin="source-managed", lifecycle=lifecycle,
+        source_branch="fix/source", source_sha=SHA, managed_branch=BRANCH, override_nonce="opening-nonce")
+    runner.commands.clear()
+    with pytest.raises(AgentLoopError) as error:
+        managed_ci.activate_managed_ci(runner, config=config(tmp_path, managed_ci=explicit, auto_merge=True),
+            pr_number=7, metadata=replace(metadata(), head_branch=BRANCH, body=runner.rest_pr["body"]),
+            managed_resume=resume)
+    message = str(error.value)
+    assert message.count("Measured lifecycle:") == 1
+    assert "Resume with `" not in message
+    assert "after restoring draft/unlabeled" not in message
+    if explicit:
+        assert "restore draft/labeled" in message
+    else:
+        assert "requires explicit --managed-ci" in message
+    assert not any("POST" in cmd or "DELETE" in cmd or cmd[:3] == ["gh", "pr", "ready"] for cmd, _ in runner.commands)
     assert_no_qualification(runner)

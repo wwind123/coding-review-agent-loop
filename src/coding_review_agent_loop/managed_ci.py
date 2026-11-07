@@ -1265,6 +1265,8 @@ def _failed_activation_guard(
     except Exception as exc:
         if (not context.mutated and not context.source_managed) or getattr(exc, "_managed_state_reported", False):
             raise
+        if context.source_managed and not context.mutated and "Measured lifecycle:" in str(exc):
+            raise
         report = _report_failed_activation_state(
             runner, config=config, pr_number=pr_number, context=context
         )
@@ -1434,7 +1436,7 @@ def _release_for_ordinary_recovery(
     if report_context is not None and report_context.source_managed and active_event is not None:
         who = managed_ci_api._api_json(runner, config, "user")
         if active_event[1:] != (who.get("login"), who.get("id")):
-            raise AgentLoopError(reason + ". Foreign label left unchanged. " + source_recovery_advice(config, pr_number, state=report_context.entry.render()))
+            raise AgentLoopError(reason + ". Foreign label left unchanged.")
     prior_run_ids: set[int] = set()
     try:
         prior_run_ids = _workflow_run_ids(runner, config=config, head_sha=expected_head_sha)
@@ -1503,7 +1505,7 @@ def _release_for_ordinary_recovery(
             + (_missing_waiver_note(config, protection_state) if protection_state else "")
         )
         if report_context is not None and report_context.source_managed:
-            remedy = source_recovery_advice(config, pr_number, state=report_context.entry.render())
+            remedy = ""
         state = "" if report_context is not None else _measured_state_line(runner, config, pr_number) + " "
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
@@ -2357,7 +2359,7 @@ def _activate_v2_managed_ci(
                             "fresh authorization cannot adopt this PR."
                         )
                     if origin == "source-managed":
-                        remedy = source_recovery_advice(config, pr_number, state=entry.render())
+                        remedy = ""
                     raise AgentLoopError(
                         f"--managed-ci requested qualification, but activation failed ({reason}). "
                         f"PR #{pr_number} was left unchanged and this run did NOT qualify its head. "
@@ -2526,15 +2528,23 @@ def _activate_v2_managed_ci(
                 state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
             else:
                 state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
-            command = (source_recovery_advice(config, pr_number, state=state, lifecycle=True)
-                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
+            if context.source_managed:
+                raise AgentLoopError(
+                    f"Source-managed lifecycle changed during {lifecycle}; "
+                    "the PR was left unchanged and its head was not qualified."
+                )
+            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
             raise AgentLoopError(
                 f"Managed-CI {origin} draft re-entry for PR #{pr_number} observed {state}; "
                 f"the PR was left unchanged. Resume with `{command}` after restoring draft/unlabeled state."
             )
         elif lifecycle == "draft-unlabeled-reentry" and not config.managed_ci:
-            command = ("supply explicit --managed-ci after confirming source authority and current waivers"
-                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
+            if context.source_managed:
+                raise AgentLoopError(
+                    "Source-managed draft/unlabeled re-entry requires explicit --managed-ci "
+                    "and current applicable waivers; the PR was left unchanged."
+                )
+            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
             raise AgentLoopError(
                 f"PR #{pr_number} is an authenticated managed {origin} draft/unlabeled re-entry. "
                 f"It was left unchanged; rerun with explicit `--managed-ci`: {command}"
@@ -2551,8 +2561,12 @@ def _activate_v2_managed_ci(
                 state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
             else:
                 state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
-            command = (source_recovery_advice(config, pr_number, state=state, lifecycle=True)
-                       if context.source_managed else managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True))
+            if context.source_managed:
+                raise AgentLoopError(
+                    f"Source-managed lifecycle changed during {lifecycle}; "
+                    "the PR was left unchanged and its head was not qualified."
+                )
+            command = managed_ci_recovery_commands.render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
             raise AgentLoopError(
                 f"Managed-CI {origin} resume for PR #{pr_number} observed {state}; "
                 f"expected draft/labeled, draft/unlabeled, or authenticated ready/unlabeled. "

@@ -826,10 +826,8 @@ def run_pr_loop(
             )
             operator_conversion_preflighted = True
         # Manual qualification retains the managed label on the ready PR.
-        # Ordinary and issue-created entry release it before authentication;
-        # source-managed requests retain the measured state for read-only checks.
-        source_entry = (initial_pr_context.metadata.head_branch or "").startswith("agent-loop/managed-direct-")
-        if not (source_entry and config.effective_managed_ci) and release_retained_managed_label(
+        # Release it before lifecycle authentication for every origin.
+        if release_retained_managed_label(
             runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
         ):
             initial_pr_context = get_observed_pr_review_context(

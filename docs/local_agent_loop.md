@@ -7701,8 +7701,10 @@ an actor-owned continuity audit linked to authenticated blocking-review/coder
 round metadata, or an eligible conflict/CI obligation, in one gap-free chain.
 Every restart creates a fresh resume nonce and intent generation. Explicit
 managed re-entry from an unlabeled state authenticates provenance before
-changing draft or label state. Ready/labeled mixed states require operator
-restoration to draft/labeled; unknown states require a successful fresh read
+changing draft or label state. At PR-loop entry, an open ready PR first releases
+a retained managed label, preserving manual qualification re-entry on both strict
+and waived bases. Direct low-level ready/labeled mixed-state refusals require
+operator restoration to draft/labeled; unknown states require a successful fresh read
 before choosing recovery. Refusal itself makes no lifecycle writes.
 
 Historical drafts without a verified creation audit, including drafts interrupted

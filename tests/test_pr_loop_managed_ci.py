@@ -1795,8 +1795,7 @@ def test_source_creation_survives_real_issue_handoff_stop_then_fresh_pr_resume(t
     assert runner.dispatch_count == 0
 
 
-@pytest.mark.parametrize("draft,labeled,state", [(False, True, "ready/labeled"),
-    (None, True, "unknown/labeled"), (None, False, "unknown/unlabeled")])
+@pytest.mark.parametrize("draft,labeled,state", [(None, True, "unknown/labeled"), (None, False, "unknown/unlabeled")])
 def test_source_early_pr_loop_lifecycle_refusal_is_actionable_and_read_only(tmp_path, draft, labeled, state):
     from test_managed_ci_source_resume import SourceRunner, root, config
     runner = SourceRunner()
@@ -1850,3 +1849,23 @@ def test_source_early_body_refusal_supplies_conditional_ordinary_recovery(tmp_pa
     assert "fresh PR state read" in str(error.value)
     assert "--managed-ci --" not in str(error.value)
     assert not any("POST" in cmd or "DELETE" in cmd for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("waived", [False, True])
+def test_source_ready_retained_label_reenters_real_activation(tmp_path, monkeypatch, waived):
+    from test_managed_ci_source_resume import SourceRunner, root, config
+    from test_managed_ci import FINAL_CONTEXT
+    runner = SourceRunner()
+    root(runner, tmp_path)
+    if not waived:
+        runner.pr_branch_protection_payload = {"contexts": [FINAL_CONTEXT]}
+    runner.rest_pr["draft"] = False
+    def checkpoint(*args, **kwargs):
+        raise AgentLoopError("review-entry checkpoint")
+    monkeypatch.setattr(pr_loop, "validate_open_pr", checkpoint)
+    with pytest.raises(AgentLoopError, match="review-entry checkpoint"):
+        run_pr_loop(runner, pr_number=7, config=config(tmp_path, allow_unprotected_managed_ci=waived))
+    assert runner.rest_pr["draft"] is True
+    assert runner.rest_pr["labels"] == [{"name": "agent-loop-managed"}]
+    assert sum("DELETE" in cmd for cmd, _ in runner.commands) == 1
+    assert runner.dispatch_count == 0
