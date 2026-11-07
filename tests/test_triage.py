@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.issue_loop as issue_loop_module
+import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 import coding_review_agent_loop.triage as triage_module
 from agent_loop_helpers import FakeRunner, make_config
@@ -104,8 +105,8 @@ class _StopAtFirstTurn(Exception):
 def _patch_issue_startup(monkeypatch, issue_context):
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "validate_open_issue", lambda *a, **k: None)
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module, plan_execution), "get_issue_context", lambda *a, **k: issue_context)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop_module, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module, issue_recovery), "prepare_agent_memory", lambda *a, **k: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop_module), "sync_coder_base_before_implementation", lambda *a, **k: None
     )
 
@@ -749,8 +750,8 @@ def test_recorded_staged_child_route_wins_without_a_triage_call(
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop_module), "_resolve_fresh_child_provenance", lambda **_: fresh)
-    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
-    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_loop_module, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module, issue_recovery), "prepare_agent_memory", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
     runner = FakeRunner(codex_outputs=[_triage_output("discuss-first")])
     seen: list[dict] = []
     monkeypatch.setattr(issue_loop_module, seam, _record_dispatch(seen, runner, raise_stop=False))
@@ -874,13 +875,13 @@ def _resolved_pr(plan_hash):
 
 def test_plan_first_plan_hash_mismatch_refuses_before_triage(tmp_path, monkeypatch):
     runner, config, usage, seen = _guarded_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(issue_loop_module, "resolve_canonical_pr_for_issue", lambda *a, **k: _resolved_pr("b" * 16))
+    monkeypatch.setattr(issue_recovery, "resolve_canonical_pr_for_issue", lambda *a, **k: _resolved_pr("b" * 16))
     monkeypatch.setattr(
-        issue_loop_module, "find_latest_issue_pr_handoff",
+        issue_recovery, "find_latest_issue_pr_handoff",
         lambda *a, **k: SimpleNamespace(flow="approved-plan-implementation", plan_hash="a" * 16),
     )
     monkeypatch.setattr(
-        issue_loop_module, "recover_approved_plan_context",
+        issue_recovery, "recover_approved_plan_context",
         lambda *a, **k: SimpleNamespace(is_available=False, canonical_text=None),
     )
     with pytest.raises(AgentLoopError, match="reconstructable approved plan has hash"):
@@ -888,12 +889,22 @@ def test_plan_first_plan_hash_mismatch_refuses_before_triage(tmp_path, monkeypat
     _assert_no_triage(runner, usage)
 
 
-def test_existing_pr_resumption_skips_triage_and_logs_the_recorded_route(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("plan_first", [False, True], ids=["direct", "plan-first"])
+@pytest.mark.parametrize("result", [0, 7])
+def test_existing_pr_resumption_skips_triage_and_logs_the_recorded_route(
+    tmp_path, monkeypatch, capsys, plan_first, result
+):
     runner, config, usage, _seen = _guarded_run(tmp_path, monkeypatch, quiet=False)
     resumed: list[dict] = []
-    monkeypatch.setattr(issue_loop_module, "resolve_canonical_pr_for_issue", lambda *a, **k: _resolved_pr(None))
-    monkeypatch.setattr(issue_loop_module, "run_pr_loop", _record_dispatch(resumed, runner, raise_stop=False))
-    assert run_issue_loop(runner, issue_number=56, config=config, usage_context=usage) == 0
+    monkeypatch.setattr(issue_recovery, "resolve_canonical_pr_for_issue", lambda *a, **k: _resolved_pr(None))
+    def resume_pr(*args, **kwargs):
+        _record_dispatch(resumed, runner, raise_stop=False)(*args, **kwargs)
+        return result
+
+    monkeypatch.setattr(issue_recovery, "run_pr_loop", resume_pr)
+    assert run_issue_loop(
+        runner, issue_number=56, config=config, plan_first=plan_first, usage_context=usage,
+    ) == result
     assert len(resumed) == 1
     assert usage._dispatch_hook_state == "unarmed"
     _assert_no_triage(runner, usage)
