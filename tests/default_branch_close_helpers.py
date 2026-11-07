@@ -1,6 +1,8 @@
 """Scripted live GitHub evidence for staged-parent missed-close recovery."""
 
 import json
+
+import pytest
 from pathlib import Path
 
 from agent_loop_helpers import FakeRunner, child_pr_handoff_comment, pr_payload_for_state
@@ -57,3 +59,28 @@ class DefaultCloseRunner(FakeRunner):
             if endpoint.startswith(f"repos/OWNER/REPO/issues/{self.pr_number}/comments?"):
                 return answer([])
         return super().run(args, cwd=cwd, **kwargs)
+
+
+# One matrix drives both helper and authenticated phase-resolution coverage.
+QUOTE_BOUNDARY_CASES = [
+    pytest.param("> Example\n" + fence + "\n" + gap + "Fixes #{child}\n" + fence,
+                 False, id=f"quote-then-fence-{label}-{bool(gap)}")
+    for fence, label in [("```", "backtick"), ("~~~", "tilde"), ("````", "long")]
+    for gap in ["", "\n"]
+] + [
+    pytest.param("> Background\n" + boundary + "\nFixes #{child}", True, id=label)
+    for boundary, label in [
+        ("## Closure", "heading"), ("---", "thematic-break"),
+        ("- Implementation", "list"), ("```\nexample\n```", "closed-fence"),
+        ("", "blank-line"),
+    ]
+] + [
+    pytest.param(body, False, id=label)
+    for body, label in [
+        ("> Background\nFixes #{child}", "lazy-continuation"),
+        ("> Background\n> Fixes #{child}", "explicit-quote"),
+        ("> > Background\nFixes #{child}", "nested-lazy"),
+        ("```\n> Example\n\nFixes #{child}\n```", "quote-inside-fence"),
+        ("> ```\n> Fixes #{child}\n> ```", "quoted-fence"),
+    ]
+]

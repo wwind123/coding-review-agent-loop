@@ -23,6 +23,8 @@ from dependency_guard_helpers import (
     summary_for,
 )
 
+from default_branch_close_helpers import QUOTE_BOUNDARY_CASES
+
 PHASES = (plan_phase("s1"), plan_phase("s2", depends_on=("s1",)), plan_phase("s3"))
 
 
@@ -170,3 +172,27 @@ def test_default_recovery_failure_retains_context_and_incomplete_phase(tmp_path,
             just_merged=(61, 71) if failure == "unresolved-integration" else None,
         )
     assert len(runner.closes) == (1 if failure == "close" else 0)
+
+
+@pytest.mark.parametrize("body, closes", QUOTE_BOUNDARY_CASES)
+def test_authenticated_default_recovery_markdown_boundaries(tmp_path, monkeypatch, body, closes):
+    from default_branch_close_helpers import DefaultCloseRunner
+    runner = DefaultCloseRunner(child=61, pr_number=71)
+    runner.live_pr["body"] = body.format(child=61)
+    monkeypatch.setattr(phase_progress, "find_phase_implementation_handoffs_for_parent",
+                        lambda *_a, **_k: (handoff_for("s1"),))
+    def resolve():
+        return resolve_staged_phase_progress(
+            runner, config=make_config(tmp_path), parent_issue=55, parent_comments=(),
+            outcome=_outcome(),
+        )
+    if closes:
+        result = resolve()
+        assert result[0].status == STATUS_COMPLETE
+        assert result[0].child_state == "CLOSED"
+        assert result[1].status == STATUS_NOT_DISPATCHED
+    else:
+        with pytest.raises(AgentLoopError, match="is OPEN but its canonical implementation PR"):
+            resolve()
+    assert len(runner.closes) == int(closes)
+    assert runner.state == ("closed" if closes else "open")

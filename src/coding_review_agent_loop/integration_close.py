@@ -15,6 +15,8 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
+from markdown_it import MarkdownIt
+
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .github import IssueContext, get_pr_merge_commit_sha, parse_strong_issue_reference_evidence
@@ -333,18 +335,15 @@ def close_staged_child_after_default_merge(
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
     body = pr.get("body")
-    # The shared parser accepts blockquotes for other callers. This scoped
-    # repair requires an instruction outside quoted examples, including lazy
-    # continuation lines of a quoted paragraph.
-    closing_lines: list[str] = []
-    quoted = False
-    for line in body.splitlines() if isinstance(body, str) else ():
-        if not line.strip():
-            quoted = False
-        if line.lstrip().startswith(">"):
-            quoted = True
-        if not quoted:
-            closing_lines.append(line)
+    # Remove complete parsed quote blocks, including lazy continuations, while
+    # preserving surrounding fence delimiters and Markdown block boundaries.
+    # The shared reference parser intentionally accepts quotes for other callers.
+    closing_lines = body.splitlines() if isinstance(body, str) else []
+    if isinstance(body, str):
+        for token in MarkdownIt("commonmark").parse(body):
+            if token.type == "blockquote_open" and token.map is not None:
+                start, end = token.map
+                closing_lines[start:end] = [""] * (end - start)
     if (
         pr.get("merged") is not True
         or not isinstance(pr.get("merged_at"), str)

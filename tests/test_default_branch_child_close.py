@@ -5,7 +5,7 @@ import pytest
 import coding_review_agent_loop.integration_close as closure
 from coding_review_agent_loop.github import IssueContext
 from agent_loop_helpers import make_config
-from default_branch_close_helpers import DefaultCloseRunner, MERGE_SHA
+from default_branch_close_helpers import DefaultCloseRunner, MERGE_SHA, QUOTE_BOUNDARY_CASES
 
 
 def recover(tmp_path, runner, **overrides):
@@ -113,3 +113,12 @@ def test_already_closed_race_and_dry_run_do_not_write(tmp_path):
     runner.evidence_commands.clear()
     assert recover(tmp_path, runner, dry_run=True) == "skipped"
     assert not runner.evidence_commands
+
+
+@pytest.mark.parametrize("body, closes", QUOTE_BOUNDARY_CASES)
+def test_markdown_quote_boundaries(tmp_path, body, closes):
+    runner = DefaultCloseRunner()
+    runner.live_pr["body"] = body.format(child=42)
+    assert recover(tmp_path, runner) == ("closed" if closes else "unresolved")
+    assert len(runner.closes) == int(closes)
+    assert runner.state == ("closed" if closes else "open")
