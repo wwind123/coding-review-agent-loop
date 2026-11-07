@@ -9182,9 +9182,9 @@ def run_pr_loop(
                 ),
             )
             # Persist the exact machine state and any consumed watcher budget
-            # before invoking the coder. If the agent process is interrupted
-            # during repair, resume must not forget the failed head or mint the
-            # same extension again.
+            # before invoking the coder. Keep recorded managed repair on this
+            # round until dispatch: a handoff timeout must not spend a round.
+            # Resume must retain the failed head and the spent extension.
             qualification_checkpoint = _machine_obligation_checkpoint(
                 unresolved_items,
                 previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
@@ -9224,7 +9224,7 @@ def run_pr_loop(
                 runner,
                 config=config,
                 pr_number=pr_number,
-                round_number=round_number + 1,
+                round_number=round_number + (0 if qualification_checkpoint and qualification_checkpoint.failed_managed_run else 1),
                 head_sha=pr_metadata.head_sha,
                 unresolved_items=unresolved_items,
                 checkpoint=qualification_checkpoint,

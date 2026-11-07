@@ -46,3 +46,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Managed-CI support consumers now import their definition owners directly; only internally used driver imports remain. Manifest-driven rewriting, symbol/patch guards and fresh-process imports protect the support cleanup without changing runtime or authority (#1906).
 
 - Issue-created authorization, continuity and recovery now live in an acyclic authorization owner with temporary identity-preserving driver imports. Comment ingestion is shared through the API owner; body hashes and import-order checks protect the move window (#1907).
+
+- Original-baseline repair handoff waits within the existing CI timeout and poll settings, revalidating identity and trust on every observation. Pre-dispatch managed repair checkpoints retain their current round so timeout and resume preserve the coder budget (#1938).
