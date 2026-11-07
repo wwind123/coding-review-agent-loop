@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from .workdirs import active_workdir
 from .errors import AgentLoopError
+from .logging import log
 from .managed_ci_result import FailedManagedRun, VerifiedManagedResult
 from .managed_ci_intent_validation import IntentBinding, classify_intent_page, match_intent_envelope
 
@@ -272,8 +273,10 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
                'the current attempt and complete check board are inspectable.')
     timeout = config.ci_timeout_seconds
     interval = config.ci_poll_interval_seconds
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
     polls = max(1, math.ceil(timeout / max(interval, 1)))
+    run_label = f'PR #{pr_number}: managed run {ref.run_id} attempt {ref.failed_attempt}'
     for observation in range(polls + 1):
         if observation and time.monotonic() >= deadline:
             break
@@ -285,11 +288,19 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
         if not waiting:
             if observation and ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha:
                 raise AgentLoopError(message)
+            if observation:
+                log(config, f'{run_label}: failure evidence available after waiting '
+                            f'{time.monotonic() - started:.0f}s; continuing repair handoff')
             return
+        if not observation:
+            log(config, f'{run_label} is still in progress without final failure evidence; '
+                        f'waiting up to {timeout}s (polling every {interval}s) before repair handoff')
         remaining = deadline - time.monotonic()
         if remaining <= 0 or observation == polls:
             break
         runner.run(['sleep', str(min(interval, remaining))], cwd=active_workdir(config))
+    log(config, f'{run_label}: still no final failure evidence after waiting '
+                f'{time.monotonic() - started:.0f}s; stopping with the checkpoint retained')
     raise AgentLoopError(message)
 
 

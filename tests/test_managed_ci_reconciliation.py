@@ -892,3 +892,45 @@ def test_handoff_wait_real_loop_timeout_resume_budget(tmp_path, monkeypatch, aut
     assert runner.dispatch_count == 0
     assert not any(cmd[:4] == ['gh', 'pr', 'edit', '7'] and '--remove-label' in cmd
                    for cmd, _ in runner.commands)
+
+
+def _loud(fixture):
+    return (dataclasses.replace(fixture[0], quiet=False), *fixture[1:])
+
+
+def test_handoff_wait_logs_start_and_evidence(tmp_path, monkeypatch, capsys):
+    fixture = _loud(_baseline_race(tmp_path))
+    runner = fixture[1]
+    runner.pr_status_payload['statuses'] = []
+    def transition():
+        runner.workflow_runs[0].update(status='completed', conclusion='failure')
+    _handoff_clock(monkeypatch, runner, transition)
+    _handoff(fixture)
+    err = capsys.readouterr().err
+    assert 'PR #7: managed run 100 attempt 1 is still in progress without final failure evidence; ' \
+        'waiting up to 2s (polling every 1s) before repair handoff' in err
+    assert 'PR #7: managed run 100 attempt 1: failure evidence available after waiting 1s' in err
+    assert 'stopping with the checkpoint retained' not in err
+
+
+def test_handoff_wait_logs_timeout(tmp_path, monkeypatch, capsys):
+    fixture = _loud(_baseline_race(tmp_path))
+    runner = fixture[1]
+    runner.pr_status_payload['statuses'] = []
+    _handoff_clock(monkeypatch, runner)
+    with pytest.raises(ci.AgentLoopError, match='repair remains unresolved'):
+        _handoff(fixture)
+    err = capsys.readouterr().err
+    assert err.count('waiting up to 2s') == 1
+    assert 'PR #7: managed run 100 attempt 1: still no final failure evidence after waiting 2s; ' \
+        'stopping with the checkpoint retained' in err
+    assert 'failure evidence available' not in err
+
+
+def test_handoff_without_wait_logs_nothing(tmp_path, monkeypatch, capsys):
+    fixture = _loud(_baseline_race(tmp_path))
+    _, sleeps = _handoff_clock(monkeypatch, fixture[1])
+    _handoff(fixture)
+    assert sleeps == []
+    err = capsys.readouterr().err
+    assert 'waiting up to' not in err and 'after waiting' not in err

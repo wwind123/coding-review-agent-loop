@@ -8188,7 +8188,9 @@ success cannot authorize repair. Authenticated live failed-job evidence still
 permits immediate repair. Queued/waiting originals and pending newer attempts
 retain their existing refusal behavior. Timeout keeps the checkpoint, managed
 label and spent budget without dispatching a coder or CI; resume the original
-issue or PR command when evidence is available.
+issue or PR command when evidence is available. The run log records the wait:
+one line when it starts (run, attempt, timeout and poll interval), then one line
+when failure evidence arrives or the wait times out, with the elapsed seconds.
 
 The baseline failure can authorize repair during the publication race: the
 strictly authenticated live run must be `in_progress` with no conclusion and
