@@ -240,8 +240,12 @@ the review does not acknowledge it as resolved, including ordinary work with rol
 repeated omission stops the run before coder dispatch. Entries contain requirement_id, role (code, human-only,
 evidence-only, mixed), request, answered_item_ids and leftover_instructions.
 The parser checks shape; routing checks surfaced source identity, native target
-existence and requester ownership. Repair preserves the entire field exactly,
-including its absence; a real bounded reviewer continuation owns missing
+existence and requester ownership. Only `request` and `leftover_instructions`
+normalize empty lists or null to empty strings before strict validation; invalid
+text types report the indexed field and observed type (#1943). Repair compares
+copies under that same narrow empty-text equivalence only when both collections
+parse, retaining raw equality otherwise. Collection shape, order and all other
+content stay protected. A real bounded reviewer continuation owns missing
 classification. Mixed-source prompt and disposition validation use the original
 signed ID with explicit leftover scope. Classification is separate from native
 evidence authorization and does not waive live citation validation. Report-side

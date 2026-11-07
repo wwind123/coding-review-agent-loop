@@ -136,8 +136,9 @@ review does not acknowledge it as resolved, including ordinary work with role
 repeated omission stops the run before coder dispatch. Roles: `code` (ordinary code requirement), `human-only`
 (link `request` to a string in your exact_head_evidence_requests), `evidence-only`
 (answered prior item IDs, no remaining instructions), or `mixed` (answered prior
-item IDs plus explicit leftover code instruction text). Use empty strings/lists
-for inapplicable fields. You may classify answers only to your own native evidence
+item IDs plus explicit leftover code instruction text). `request` and
+`leftover_instructions` are strings (`""` when inapplicable); `answered_item_ids`
+is a list (`[]` when inapplicable). You may classify answers only to your own native evidence
 items. Mixed sources retain their original signed ID. Do not invent leftover
 instructions or acknowledge human acceptance as coder work. A classification
 never grants clearance: dispose answered items resolved with live surfaced
