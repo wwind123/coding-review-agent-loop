@@ -21,8 +21,8 @@ from coding_review_agent_loop.runner import CommandResult
 pytestmark = pytest.mark.usefixtures('private_response_tempdir')
 
 
-def live_fixture(tmp_path, monkeypatch, *, auto_merge=True):
-    fixture = recovery(tmp_path, auto_merge=auto_merge)
+def live_fixture(tmp_path, monkeypatch, *, auto_merge=True, allowed_rounds=3):
+    fixture = recovery(tmp_path, auto_merge=auto_merge, allowed_rounds=allowed_rounds)
     config, runner, metadata, contract, cp, item, ref = fixture
     runner.workflow_runs[0].update(run_attempt=1, status='in_progress', conclusion=None)
     runner.intent_comments[1] = v2_intent_comment(state='attached', run_id=100, run_attempt=1)
@@ -411,3 +411,270 @@ def test_real_restart_conflicted_failure_reaches_conflict_coder(tmp_path, monkey
     else:
         assert runner.intent_comments[1] == before
     assert observe(fixture) is None  # conflict repair never clears CI qualification
+
+
+def superseded_fixture(tmp_path, monkeypatch, *, auto_merge=True, completed=False):
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    runner = fixture[1]
+    runner.intent_comments.append(v2_intent_comment(
+        comment_id=19, nonce='z'*32, generation='replacement-generation',
+        state='completed' if completed else 'attached', run_id=101, run_attempt=1))
+    run = copy.deepcopy(runner.workflow_runs[0])
+    run.update(id=101, name=run['name'].replace(V2_NONCE, 'z'*32))
+    if isinstance(run.get('display_title'), str):
+        run['display_title'] = run['display_title'].replace(V2_NONCE, 'z'*32)
+    if completed:
+        run.update(status='completed', conclusion='failure')
+    runner.workflow_runs.append(run)
+    for job in runner.attempt_jobs:
+        job['run_id'] = 101
+    return fixture
+
+
+def replacement_checkpoints(runner):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [type('C', (), {'body': c['body']})() for c in runner.pr_payload['comments']], flow='pr')
+    return [r.metadata.qualification_checkpoint for r in records if r.metadata.qualification_checkpoint]
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('completed', [True, False])
+def test_superseded_restart_persists_replacement_before_handoff(tmp_path, monkeypatch, auto_merge, completed):
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge, completed=completed)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    old = copy.deepcopy(runner.intent_comments[1])
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    latest = replacement_checkpoints(runner)[-1]
+    expected = dataclasses.replace(ref, audit_comment_id=19, nonce='z'*32, run_id=101,
+                                   generation='replacement-generation')
+    assert latest.failed_managed_run == expected
+    assert latest.obligation_identity == cp.obligation_identity
+    assert latest.allowed_rounds == cp.allowed_rounds and latest.watch_failure_extension_used
+    assert latest.verified_managed_result is None and latest.lifecycle == 'repair_required'
+    assert len(calls) == 1 and calls[0][0] == 'claude'
+    assert runner.intent_comments[1] == old and runner.dispatch_count == 0
+    # Interrupted after publication: reconstruct the replacement, without CI discovery.
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert replacement_checkpoints(runner)[-1].failed_managed_run == expected
+    assert len(calls) == 2 and runner.dispatch_count == 0
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('interruption', ['before-write', 'after-write'])
+def test_superseded_replacement_publication_interrupt(tmp_path, monkeypatch, auto_merge, interruption):
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, *_ = fixture
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    real = pr_loop._persist_qualification_checkpoint
+    interrupted = False
+    def persist(*args, **kwargs):
+        nonlocal interrupted
+        cp = kwargs['checkpoint']
+        if cp and cp.failed_managed_run and cp.failed_managed_run.run_id == 101 and not interrupted:
+            interrupted = True
+            if interruption == 'after-write':
+                real(*args, **kwargs)
+            raise ci.AgentLoopError('publication interrupted')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, '_persist_qualification_checkpoint', persist)
+    with pytest.raises(ci.AgentLoopError, match='publication interrupted'):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert calls == [] and runner.dispatch_count == 0
+    assert replacement_checkpoints(runner)[-1].failed_managed_run.run_id == (101 if interruption == 'after-write' else 100)
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 1 and replacement_checkpoints(runner)[-1].failed_managed_run.run_id == 101
+    assert runner.dispatch_count == 0
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('mutation', [
+    'login', 'id', 'repository', 'pr', 'head', 'base', 'nonce', 'generation',
+    'workflow', 'run', 'attempt', 'excluded', 'malformed', 'duplicate', 'authorization',
+    'original-id', 'original-excluded', 'original-malformed', 'queued', 'pending',
+    'unreadable', 'success', 'plumbing', 'uncorrelated', 'race-attempt', 'race-head',
+    'race-base', 'race-authority', 'race-intent',
+])
+def test_superseded_replacement_refuses_invalid_evidence(tmp_path, monkeypatch, auto_merge, mutation):
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    comment = runner.intent_comments[-1]
+    raw = json.loads(comment['body'].split(' ', 2)[2].rsplit(' -->', 1)[0])
+    if mutation in {'repository', 'pr', 'head', 'base', 'nonce', 'generation', 'workflow', 'run', 'attempt'}:
+        field, value = {
+            'repository': ('repository', 'OTHER/REPO'), 'pr': ('pr', 8),
+            'head': ('expected_head_sha', 'f'*40), 'base': ('base_ref', 'other'),
+            'nonce': ('nonce', 'x'*32), 'generation': ('generation', None),
+            'workflow': ('workflow_revision', 'f'*40), 'run': ('run_id', 102),
+            'attempt': ('run_attempt', 2),
+        }[mutation]
+        raw[field] = value
+    elif mutation == 'excluded': raw['terminal_attempts'] = [{'run_id': 101, 'run_attempt': 1}]
+    elif mutation == 'malformed': del raw['created_at']
+    comment['body'] = '<!-- AGENT_MANAGED_CI_INTENT_V2 ' + json.dumps(raw) + ' -->'
+    if mutation in {'login', 'id'}: comment['user'][mutation] = 'attacker' if mutation == 'login' else 5
+    elif mutation == 'duplicate': runner.intent_comments.append(copy.deepcopy(comment))
+    elif mutation == 'authorization': runner.advertised_actor = 'other'
+    elif mutation == 'original-id': runner.intent_comments[1]['user']['id'] = 5
+    elif mutation == 'original-excluded':
+        runner.intent_comments[1] = v2_intent_comment(state='attached', run_id=100, run_attempt=1, terminal_attempts=[(100, 1)])
+    elif mutation == 'original-malformed': runner.intent_comments[1]['body'] = 'untrusted prose'
+    elif mutation in {'queued', 'pending'}: runner.workflow_runs[-1]['status'] = mutation
+    elif mutation == 'unreadable': runner.workflow_runs.pop()
+    elif mutation == 'success':
+        runner.workflow_runs[-1].update(status='completed', conclusion='success')
+    elif mutation == 'plumbing': runner.attempt_jobs[0]['name'] = 'Publish final exact-head status'
+    elif mutation == 'uncorrelated': runner.attempt_jobs[0]['run_id'] = 100
+    elif mutation == 'race-attempt': runner.after_jobs = lambda: runner.workflow_runs[-1].update(run_attempt=2)
+    elif mutation == 'race-head': runner.after_jobs = lambda: runner.rest_pr['head'].update(sha='f'*40)
+    elif mutation == 'race-base': runner.after_jobs = lambda: runner.rest_pr['base'].update(ref='other')
+    elif mutation == 'race-authority': runner.after_jobs = lambda: runner.rest_pr.update(labels=[])
+    elif mutation == 'race-intent':
+        runner.after_jobs = lambda: runner.intent_comments.append(v2_intent_comment(
+            comment_id=20, nonce='x'*32, generation='newer', run_id=102, run_attempt=1))
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    before = copy.deepcopy(runner.intent_comments[1])
+    with pytest.raises(ci.AgentLoopError):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert calls == [] and runner.dispatch_count == 0
+    latest = replacement_checkpoints(runner)[-1]
+    assert latest.failed_managed_run == ref and latest.watch_failure_extension_used
+    assert latest.verified_managed_result is None and runner.intent_comments[1] == before
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+def test_no_push_coder_discovers_existing_superseding_failure(tmp_path, monkeypatch, auto_merge):
+    from agent_loop_helpers import structured_coder_followup
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge, allowed_rounds=4)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs = [structured_coder_followup(remaining_items=[item.item_id])]
+    runner.codex_outputs = [structured_pr_review(
+        state='approved', prior_item_dispositions=[{'item_id': item.item_id, 'disposition': 'resolved'}])]
+    _capture_activation(monkeypatch)
+    real_advance = runner._maybe_advance_pr_head_for_coder_followup
+    def advance(cmd):
+        real_advance(cmd)
+        if cmd[0] != 'claude':
+            return
+        # An external publisher supplied R2 before the loop resumes.
+        # This covers discovery, not the loop's normal qualification dispatch.
+        runner.intent_comments.append(v2_intent_comment(
+            comment_id=runner._next_comment_id(), nonce='z'*32, generation='replacement-generation',
+            run_id=101, run_attempt=1))
+        run = copy.deepcopy(runner.workflow_runs[0])
+        run.update(id=101, name=run['name'].replace(V2_NONCE, 'z'*32))
+        runner.workflow_runs.append(run)
+        for job in runner.attempt_jobs:
+            job['run_id'] = 101
+    monkeypatch.setattr(runner, '_maybe_advance_pr_head_for_coder_followup', advance)
+    real = runner._run_with_log_locked
+    calls = []
+    def stop(args, **kwargs):
+        if args[0] == 'claude':
+            calls.append(list(args))
+            if len(calls) == 2:
+                raise RepairReached('second repair')
+        return real(args, **kwargs)
+    monkeypatch.setattr(runner, '_run_with_log_locked', stop)
+    old = copy.deepcopy(runner.intent_comments[1])
+    with pytest.raises(RepairReached, match='second repair'):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    latest = replacement_checkpoints(runner)[-1]
+    assert len(calls) == 2 and runner.pr_payload['headRefOid'] == ref.head_sha
+    assert latest.failed_managed_run.run_id == 101 and latest.failed_managed_run.source_round == item.source_round
+    assert latest.obligation_identity == cp.obligation_identity and latest.watch_failure_extension_used
+    assert latest.allowed_rounds == cp.allowed_rounds and runner.dispatch_count == 0
+    assert runner.intent_comments[1] == old and latest.verified_managed_result is None
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('disposition', ['addressed', 'remaining'])
+def test_no_push_coder_keeps_failed_head_out_of_qualification(tmp_path, monkeypatch, auto_merge, disposition):
+    """Same-head review approval cannot turn a repair obligation into qualification."""
+    from agent_loop_helpers import structured_coder_followup
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge, allowed_rounds=4)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs = [structured_coder_followup(**{
+        f'{disposition}_items': [item.item_id],
+    })]
+    runner.codex_outputs = [structured_pr_review(
+        state='approved', prior_item_dispositions=[{'item_id': item.item_id, 'disposition': 'resolved'}])]
+    # Real activation and qualification are left enabled. Only agent execution
+    # is stopped, immediately before the second repair turn would consume budget.
+    old = copy.deepcopy(runner.intent_comments[1])
+    real = runner._run_with_log_locked
+    calls = []
+    def stop(args, **kwargs):
+        if args[0] == 'claude':
+            calls.append(list(args))
+            if len(calls) == 2:
+                latest = replacement_checkpoints(runner)[-1]
+                assert latest.failed_managed_run == ref
+                assert latest.lifecycle == 'repair_required'
+                assert latest.candidate_head_sha is None
+                assert latest.obligation_identity == cp.obligation_identity
+                assert latest.allowed_rounds == cp.allowed_rounds
+                assert latest.watch_failure_extension_used == cp.watch_failure_extension_used
+                assert latest.watch_head_extension_used == cp.watch_head_extension_used
+                assert latest.verified_managed_result is None
+                assert runner.dispatch_count == 0
+                raise RepairReached('same-head repair still required')
+        return real(args, **kwargs)
+    monkeypatch.setattr(runner, '_run_with_log_locked', stop)
+    with pytest.raises(RepairReached, match='same-head repair still required'):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 2 and runner.pr_payload['headRefOid'] == ref.head_sha
+    assert len(runner.workflow_runs) == 1 and runner.intent_comments[1] == old
+    assert not any('rerun' in cmd or 'cancel' in cmd or cmd[:3] == ['gh', 'pr', 'merge']
+                   for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('race', ['attempt', 'head', 'base', 'authority', 'intent'])
+def test_replacement_handoff_revalidates_after_publication(tmp_path, monkeypatch, auto_merge, race):
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, *_ = fixture
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    real = pr_loop._persist_qualification_checkpoint
+    def persist(*args, **kwargs):
+        real(*args, **kwargs)
+        cp = kwargs['checkpoint']
+        if not cp or not cp.failed_managed_run or cp.failed_managed_run.run_id != 101:
+            return
+        if race == 'attempt': runner.workflow_runs[-1]['run_attempt'] = 2
+        elif race == 'head': runner.rest_pr['head']['sha'] = 'f'*40
+        elif race == 'base': runner.rest_pr['base']['ref'] = 'other'
+        elif race == 'authority': runner.rest_pr['labels'] = []
+        else: runner.intent_comments.append(v2_intent_comment(
+            comment_id=runner._next_comment_id(), nonce='x'*32, generation='newest', run_id=102, run_attempt=1))
+    monkeypatch.setattr(pr_loop, '_persist_qualification_checkpoint', persist)
+    with pytest.raises(ci.AgentLoopError):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert calls == [] and runner.dispatch_count == 0
+    latest = replacement_checkpoints(runner)[-1]
+    assert latest.failed_managed_run.run_id == 101 and latest.watch_failure_extension_used
+    assert latest.verified_managed_result is None
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+def test_completed_history_is_not_replaced_by_newer_failure(tmp_path, monkeypatch, auto_merge):
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    runner.intent_comments[1] = v2_intent_comment(state='completed', run_id=100, run_attempt=1)
+    runner.workflow_runs[0].update(status='completed', conclusion='failure')
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 1 and replacement_checkpoints(runner)[-1].failed_managed_run == ref
+    assert runner.dispatch_count == 0

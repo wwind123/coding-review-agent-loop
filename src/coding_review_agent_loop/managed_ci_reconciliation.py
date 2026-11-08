@@ -61,6 +61,88 @@ def _record(page, contract, ref):
     return record
 
 
+def refresh_repair_reference(runner, *, config, pr_number, metadata, contract, checkpoint):
+    """Read-only replacement of a proven superseded attachment.
+
+    Activation supplies trust predicates, never a preferred run. Callers must
+    publish the returned checkpoint before dispatching the coder.
+    """
+    from . import managed_ci as ci
+    from . import managed_ci_failure as failure
+    if (checkpoint is None or not checkpoint.valid or contract is None
+        or contract.protocol_version != 2 or contract.activation_path != 'managed'
+        or checkpoint.lifecycle != 'repair_required'
+        or checkpoint.obligation_kind != 'managed-exact-head-ci'
+        or checkpoint.failed_managed_run is None):
+        return checkpoint
+    ref = checkpoint.failed_managed_run
+    if (ref.repository, ref.pr_number, ref.head_sha, ref.base_ref, ref.obligation_identity) != (
+        config.repo, pr_number, metadata.head_sha, metadata.base_branch or config.base,
+        checkpoint.obligation_identity):
+        return checkpoint
+    try:
+        page = ci._read_intent_comment_page(runner, config, pr_number)
+        original = failure.authenticated_attachment(page, contract, ref)
+        if (original is None or original.intent_state != 'attached'
+            or ci._v2_attachment_is_excluded(original)):
+            return checkpoint
+        candidates = []
+        for comment in page:
+            if (type(comment.get('id')) is not int or comment['id'] <= ref.audit_comment_id
+                or comment.get('user', {}).get('login') != contract.trusted_actor_login
+                or comment.get('user', {}).get('id') != contract.trusted_actor_id):
+                continue
+            match = match_intent_envelope(comment.get('body'), visible_capable=contract.visible_intent_capable,
+                                          host_footer_capable=contract.host_footer_capable)
+            if match is None:
+                continue
+            raw = json.loads(match.group('payload'))
+            if (raw.get('repository'), raw.get('pr'), raw.get('expected_head_sha'), raw.get('base_ref')) != (
+                ref.repository, ref.pr_number, ref.head_sha, ref.base_ref):
+                continue
+            if raw.get('nonce') == ref.nonce:
+                return checkpoint
+            if raw.get('state') not in {'attached', 'completed'}:
+                continue
+            candidate = replace(ref, audit_comment_id=comment['id'], nonce=raw['nonce'],
+                                run_id=raw['run_id'], failed_attempt=raw['run_attempt'],
+                                generation=raw['generation'], workflow_revision=raw['workflow_revision'])
+            view = failure.original_view(page, contract, candidate)
+            if view is not None and not ci._v2_attachment_is_excluded(view):
+                candidates.append((candidate, view))
+        if len(candidates) != 1:
+            return checkpoint
+        candidate, view = candidates[0]
+        early = failure.observe_active_failure(runner, config=config, pr_number=pr_number,
+                                              metadata=metadata, contract=view)
+        if early is None:
+            def terminal():
+                snapshot = ci._refresh_v2_attached_run(runner, config=config, contract=view, strict_provenance=True)
+                return (snapshot is not None and snapshot.live_run_attempt == candidate.failed_attempt
+                        and snapshot.status == 'completed' and snapshot.conclusion in {'failure', 'timed_out'})
+            if not terminal():
+                return checkpoint
+            jobs = failure.read_attempt_jobs(runner, config, candidate.run_id, candidate.failed_attempt)
+            from .ci_health import check_name_matches
+            if jobs is None or not any(c in {'failure', 'timed_out'}
+                                      and not check_name_matches(n, ci.plumbing_check_names(config))
+                                      for n, c, _ in jobs):
+                return checkpoint
+            final = _managed_ci_status._v2_correlated_status(
+                runner, config=config, expected_head=ref.head_sha, contract=view)
+            if final is not None and final.status == 'success':
+                return checkpoint
+            if not terminal():
+                return checkpoint
+        if (not failure.live_authority(runner, config=config, pr_number=pr_number, metadata=metadata, contract=view)
+            or ci.get_pr_head_sha(runner, config, pr_number) != ref.head_sha
+            or failure.original_view(ci._read_intent_comment_page(runner, config, pr_number), contract, candidate) != view):
+            return checkpoint
+        return replace(checkpoint, failed_managed_run=candidate, verified_managed_result=None)
+    except (AgentLoopError, KeyError, TypeError, ValueError, AttributeError):
+        return checkpoint
+
+
 def resolve_legacy_reference(page, contract, checkpoint):
     """Require a unique completed intent inside the authenticated failure round."""
     from .round_state import _extract_round_metadata_records
@@ -224,6 +306,8 @@ def reconcile_repair_checkpoint(runner, *, config, pr_number, metadata, contract
                 checkpoint = replace(checkpoint, failed_managed_run=reference)
         except (AgentLoopError, KeyError, TypeError, ValueError):
             pass
+    checkpoint = refresh_repair_reference(
+        runner, config=config, pr_number=pr_number, metadata=metadata, contract=contract, checkpoint=checkpoint)
     result = observe_repair_result(runner, config=config, pr_number=pr_number,
                                    metadata=metadata, contract=contract, checkpoint=checkpoint)
     if result is not None and not any(

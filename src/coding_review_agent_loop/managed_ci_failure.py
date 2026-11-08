@@ -47,7 +47,7 @@ def _is_v2_intent_run(
             return False
     return True
 
-def original_view(page, contract, ref):
+def authenticated_attachment(page, contract, ref):
     """Authenticate an original attachment without adopting it for dispatch."""
     verdict = classify_intent_page(
         page, requested_nonce=ref.nonce, trusted_login=contract.trusted_actor_login,
@@ -62,6 +62,23 @@ def original_view(page, contract, ref):
         or record['run_id'] != ref.run_id or record['run_attempt'] != ref.failed_attempt
         or record['state'] not in {'attached', 'completed'}):
         return None
+    return replace(
+        contract, repository=ref.repository, pr_number=ref.pr_number,
+        expected_head_sha=ref.head_sha, base_ref=ref.base_ref, nonce=ref.nonce,
+        attached_run_id=ref.run_id, run_attempt=ref.failed_attempt, workflow_revision=ref.workflow_revision,
+        intent_comment_id=ref.audit_comment_id, intent_generation=ref.generation,
+        created_at=record['created_at'], intent_state=record['state'],
+        terminal_run_id=record['terminal_run_id'], terminal_run_attempt=record['terminal_run_attempt'],
+        terminal_outcome=record['terminal_outcome'],
+        terminal_attempts=tuple((x['run_id'], x['run_attempt']) for x in record['terminal_attempts']),
+    )
+
+
+def original_view(page, contract, ref):
+    """Authenticate an attachment and reject superseded live authority."""
+    view = authenticated_attachment(page, contract, ref)
+    if view is None:
+        return None
     for comment in page:
         if (comment.get('id', 0) <= ref.audit_comment_id
             or comment.get('user', {}).get('login') != contract.trusted_actor_login
@@ -74,16 +91,7 @@ def original_view(page, contract, ref):
             if (other.get('repository'), other.get('pr'), other.get('expected_head_sha'), other.get('base_ref')) == (
                 ref.repository, ref.pr_number, ref.head_sha, ref.base_ref):
                 return None
-    return replace(
-        contract, repository=ref.repository, pr_number=ref.pr_number,
-        expected_head_sha=ref.head_sha, base_ref=ref.base_ref, nonce=ref.nonce,
-        attached_run_id=ref.run_id, run_attempt=ref.failed_attempt, workflow_revision=ref.workflow_revision,
-        intent_comment_id=ref.audit_comment_id, intent_generation=ref.generation,
-        created_at=record['created_at'], intent_state=record['state'],
-        terminal_run_id=record['terminal_run_id'], terminal_run_attempt=record['terminal_run_attempt'],
-        terminal_outcome=record['terminal_outcome'],
-        terminal_attempts=tuple((x['run_id'], x['run_attempt']) for x in record['terminal_attempts']),
-    )
+    return view
 
 
 def read_attempt_jobs(runner, config, run_id, attempt):

@@ -606,7 +606,10 @@ def _upsert_machine_obligation(
             updated = replace(
                 existing,
                 reviewer=(existing.reviewer if existing.reviewer else "Orchestrator"),
-                source_round=source_round,
+                # Same-head managed failures refresh one durable repair,
+                # including its original failed-run source-round binding.
+                source_round=(existing.source_round if kind == MANAGED_CI_OBLIGATION_KIND
+                              and existing.failed_head_sha == failed_head_sha else source_round),
                 text=text,
                 status="blocking",
                 source_status="blocking",
