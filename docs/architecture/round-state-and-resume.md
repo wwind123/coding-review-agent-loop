@@ -41,7 +41,9 @@ invocation actor. Operators using a separate account must configure
 Ineligible historical amendments are ignored with a bounded diagnostic naming
 the surface, comment and rejection reason; comments are never rewritten.
 Signature, payload, chronology, floor and misplaced-record checks still apply
-to admitted amendments.
+to admitted amendments. Source-managed continuity publication and restart pass
+the invocation configuration into historical board reconstruction, so both use
+the same configured human identities as ordinary PR admission.
 
 The amendment projection grants no authority to loop-published records sharing
 the same comment. Round anchors and sidecars use a separate invocation-only

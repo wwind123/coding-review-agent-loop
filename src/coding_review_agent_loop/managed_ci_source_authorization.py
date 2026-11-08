@@ -302,9 +302,9 @@ def _roots(comments, *, config, pr_number, source, actor, actor_id, protection, 
     return min(roots, key=lambda x: x[0])
 
 
-def _round_valid(comments, record):
+def _round_valid(comments, record, *, config):
     """Reuse ordered round and historical-board correlation without an issue."""
-    return _ordinary_continuity_round_metadata_is_valid(comments, authorization=record)
+    return _ordinary_continuity_round_metadata_is_valid(comments, authorization=record, config=config)
 
 
 def authenticate_source_authority(runner, *, config, pr_number, expected_head=None, source=None, protection=None):
@@ -346,7 +346,7 @@ def authenticate_source_authority(runner, *, config, pr_number, expected_head=No
         if (record.authority != expected or record.authority.label_event_id not in valid_events
             or record.predecessor_id != current.terminal_id or record.predecessor_head != current.head
             or type(cid) is not int or cid <= max(record.round_comment_ids)
-            or record.successor_head in visited or not _round_valid(comments, record)):
+            or record.successor_head in visited or not _round_valid(comments, record, config=config)):
             raise AgentLoopError("Source-managed continuity is not an authenticated gap-free round-backed chain.")
         visited.add(record.successor_head)
         consumed.add(cid)
@@ -409,7 +409,7 @@ def publish_source_continuity(runner, *, config, pr_number, predecessor_head, ne
     record = SourceContinuity(1, "source-managed", authority, authority.terminal_id, predecessor_head, new_head, rounds)
     before = _live(runner, config, pr_number, expected_head=new_head)
     comments = _comments(runner, config, pr_number)
-    if not _round_valid(comments, record):
+    if not _round_valid(comments, record, config=config):
         raise AgentLoopError("Source-managed coder transition requires authenticated round evidence.")
     if authenticate_source_authority(runner, config=config, pr_number=pr_number) != authority or _authority_snapshot(_live(runner, config, pr_number, expected_head=new_head)) != _authority_snapshot(before):
         raise AgentLoopError("Source-managed coder tuple or provenance changed before publication.")

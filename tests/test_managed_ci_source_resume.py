@@ -300,6 +300,86 @@ def test_source_coder_continuity_two_round_backed_advances_and_restarts(tmp_path
     assert not any("DELETE" in cmd for cmd, _ in runner.commands)
 
 
+@pytest.mark.parametrize("entry", ["publication", "restart"])
+@pytest.mark.parametrize("human_identity", ["configured", "unconfigured", "wrong-login", "wrong-id"])
+def test_source_continuity_preserves_human_board_amendments(tmp_path, entry, human_identity):
+    from coding_review_agent_loop.board_amendment import (
+        format_reviewer_board_amendment_comment, parse_reviewer_board_amendment_records,
+    )
+    from coding_review_agent_loop.board_change import (
+        board_change_link_payload, board_change_link_digest, render_board_change_link,
+    )
+    from coding_review_agent_loop.github import TrustedHumanActor
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from test_board_change import _identity
+
+    runner = SourceRunner()
+    first = root(runner, tmp_path)
+    trusted = config(tmp_path, human_reviewer_trusted_actors=(TrustedHumanActor("Operator", 81),))
+    root_board = _identity(("a", "codex"), ("b", "claude"), ("c", "antigravity"))
+    rebound = _identity(("a", "codex"), ("b", "codex"), ("c", "antigravity"))
+    amended = rebound.with_seats(rebound.seats[:2])
+    link = board_change_link_payload(pr_number=7, root=root_board, predecessor=root_board.digest,
+        old_board=root_board, new_board=rebound, old_seat_binding=root_board.seat_binding(),
+        binding_init={}, anchor_round=1, advance=True)
+    signed = format_reviewer_board_amendment_comment(flow="pr", issue=None, pr_number=7,
+        original_required_reviewers=rebound.names, policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("c",), effective_from_round=3, reason="backend-unavailable",
+        rationale="Backend unavailable.")
+    (amendment,), _ = parse_reviewer_board_amendment_records(signed, comment_locator="human")
+    successor = "a" * 40
+
+    def round_comment(comment_id, role, number, board, *, change=None, amendment_digest=None):
+        return {"id": comment_id, "user": {"login": "agent-loop", "id": 1},
+            "body": _attach_round_metadata(f"{role} round", PostedRoundMetadata(
+                flow="pr", role=role, agent="a", round_number=number,
+                subject=successor if role == "coder" else SHA,
+                state="blocking" if role == "reviewer" else None,
+                pr_board_root=root_board.payload(), pr_board_identity=board.payload(),
+                seat_binding=board.seat_binding(), reviewer_board_change_digest=change,
+                reviewer_board_amendment_digest=amendment_digest))}
+
+    runner.intent_comments.extend([
+        round_comment(90, "reviewer", 1, root_board),
+        {"id": 91, "user": {"login": "agent-loop", "id": 1}, "body": str(render_board_change_link(link))},
+        round_comment(92, "reviewer", 2, rebound, change=board_change_link_digest(link)),
+        {"id": 93, "user": {"login": "operator", "id": 81}, "body": signed},
+        round_comment(100, "reviewer", 3, amended, amendment_digest=amendment.digest),
+        round_comment(101, "coder", 4, amended, amendment_digest=amendment.digest),
+    ])
+    runner.rest_pr["head"]["sha"] = successor
+    if entry == "restart":
+        published = source_auth.publish_source_continuity(runner, config=trusted, pr_number=7,
+            predecessor_head=SHA, new_head=successor, round_number=3)
+        assert published.root_id == first.root_id and published.head == successor
+    options = {
+        "configured": (TrustedHumanActor("OPERATOR", 81),), "unconfigured": (),
+        "wrong-login": (TrustedHumanActor("someone-else", 81),),
+        "wrong-id": (TrustedHumanActor("Operator", 82),),
+    }
+    invocation = replace(trusted, human_reviewer_trusted_actors=options[human_identity])
+    before = copy.deepcopy(runner.audit_comments)
+
+    def enter():
+        if entry == "publication":
+            return source_auth.publish_source_continuity(runner, config=invocation, pr_number=7,
+                predecessor_head=SHA, new_head=successor, round_number=3)
+        return source_auth.authenticate_source_authority(runner, config=invocation, pr_number=7,
+            expected_head=successor)
+
+    if human_identity == "configured":
+        advanced = enter()
+        assert advanced.root_id == first.root_id and advanced.head == successor
+        for _ in range(2):
+            assert source_auth.authenticate_source_authority(runner, config=invocation, pr_number=7,
+                expected_head=successor) == advanced
+    else:
+        with pytest.raises(AgentLoopError, match="round evidence|round-backed chain"):
+            enter()
+        assert runner.audit_comments == before
+    assert_no_qualification(runner)
+
+
 @pytest.mark.parametrize("damage", ["unsolicited", "missing-round", "tampered-round", "fork", "gap"])
 def test_unproven_continuity_refuses_without_dispatch_or_synthetic_evidence(tmp_path, damage):
     runner = SourceRunner()
