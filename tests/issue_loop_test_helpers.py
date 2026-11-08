@@ -505,6 +505,7 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             "reviews": [],
         }
         pr_payload.update(kwargs.pop("pr_payload", {}))
+        kwargs.setdefault("authenticated_actor", ("agent-loop", 1))
         super().__init__(pr_payload=pr_payload, **kwargs)
         self.rest_pr = {
             "state": "open",
@@ -520,6 +521,12 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             "user": {"login": "agent-loop", "id": 1},
         }
         self.authorization_comments = list(authorization_comments or [])
+        for comment in self.authorization_comments:
+            self.pr_payload["comments"].append({
+                "author": comment["user"], "databaseId": comment["id"],
+                "createdAt": comment.get("created_at", "2026-05-23T00:00:41Z"),
+                "body": comment["body"],
+            })
         self.issue_events = [{
             "id": 101,
             "event": "labeled",
@@ -565,23 +572,28 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             return CommandResult(
                 recorded, cwd_path, json.dumps(self.issue_events), "", 0
             )
-        if endpoint.startswith("repos/OWNER/REPO/issues/77/comments?"):
-            recorded, cwd_path = self._record_command(args, cwd)
-            return CommandResult(
-                recorded, cwd_path, json.dumps(self.authorization_comments), "", 0
-            )
+        # The base runner projects the complete PR thread into paginated REST
+        # comments, including ordinary publications and authorization records.
+        if endpoint.startswith("repos/OWNER/REPO/issues/77/comments?") and "&page=" not in endpoint:
+            # Managed-CI readers use gh's automatic pagination; admission owns
+            # its page loop. Serve both from the same complete projection.
+            command.remove(endpoint)
+            command.insert(2, "repos/OWNER/REPO/issues/77/comments?per_page=1000000&page=1")
+            return super()._run_locked(command, cwd=cwd, check=check, input_text=input_text)
         if endpoint == "repos/OWNER/REPO/issues/77/comments" and "POST" in command:
             recorded, cwd_path = self._record_command(args, cwd)
             body = self._form_value(command, "body") or ""
+            self._ensure_fixture_comment_ids(self.pr_payload["comments"], 77)
             comment_id = max(
-                (comment["id"] for comment in self.authorization_comments),
+                (comment.get("id", comment.get("databaseId"))
+                 for comment in self.pr_payload["comments"]),
                 default=40,
             ) + 1
             comment = {
                 "id": comment_id,
                 "body": body,
                 "user": {"login": "agent-loop", "id": 1},
-                "created_at": f"2026-05-23T00:00:{comment_id:02d}Z",
+                "created_at": "2026-05-23T00:00:41Z",
             }
             self.authorization_comments.append(comment)
             self.pr_payload.setdefault("comments", []).append({

@@ -13,6 +13,44 @@ from coding_review_agent_loop.pr_loop_support import admitted_capture_history
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 from test_board_author_admission import raw, HUMAN
 from test_pr_round_ingestion import anchor
+from issue_loop_test_helpers import _IssueRecoveryWorkflowRunner
+
+
+@pytest.mark.parametrize('transport', ['pr-cli', 'rest'])
+@pytest.mark.parametrize('existing_count', [0, 101])
+def test_recovery_fixture_preserves_complete_comment_history(tmp_path, transport, existing_count):
+    existing = [dict(id=41 + i, user=dict(login='agent-loop', id=1),
+                     created_at='2026-05-23T00:00:41Z', body='existing discussion')
+                for i in range(existing_count)]
+    runner = _IssueRecoveryWorkflowRunner(labeled=True, authorization_comments=existing)
+    config = make_config(tmp_path)
+    body = format_pr_contract_comment(contract())
+    body_file = tmp_path / 'comment.md'
+    body_file.write_text(body, encoding='utf-8')
+    if transport == 'pr-cli':
+        command = ['gh', 'pr', 'comment', '77', '--body-file', str(body_file)]
+    else:
+        command = ['gh', 'api', '--method', 'POST',
+                   'repos/OWNER/REPO/issues/77/comments', '-f', f'body={body}']
+    runner.run(command, cwd=tmp_path, check=True)
+    # Publish through the other transport too: both must share identities and
+    # appear in the complete REST listing used during repeated acquisition.
+    runner.run(['gh', 'api', '--method', 'POST',
+                'repos/OWNER/REPO/issues/77/comments', '-f', 'body=ordinary discussion'],
+               cwd=tmp_path, check=True)
+    from coding_review_agent_loop.managed_ci_api import _api_list_detailed
+    managed_comments, reason = _api_list_detailed(runner, config,
+        'repos/OWNER/REPO/issues/77/comments?per_page=100')
+    assert reason == ''
+    assert len(managed_comments) == existing_count + 2
+    for _ in range(2):
+        context = github.get_pr_review_context(runner, config=config, pr_number=77)
+        assert len(context.comments) == existing_count + 2
+        assert len({c.comment_id for c in context.comments}) == existing_count + 2
+        assert {c.comment_id for c in context.comments} == {c['id'] for c in managed_comments}
+        assert all((c.author, c.author_id) == ('agent-loop', 1) for c in context.comments)
+        assert find_latest_pr_contract(context.comments, repository=config.repo,
+                                       pr_number=77) == contract()
 
 
 def contract(**kwargs):
