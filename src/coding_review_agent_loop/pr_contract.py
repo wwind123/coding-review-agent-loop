@@ -192,9 +192,10 @@ def render_pr_contract_marker(contract: PrExpectedClosingContract) -> str:
 def find_latest_pr_contract(
     comments: Sequence[object], *, repository: str, pr_number: int
 ) -> PrExpectedClosingContract | None:
+    from .pr_round_ingestion import record_body
     found: PrExpectedClosingContract | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PR_EXPECTED_CLOSING_MARKER_RE.finditer(body):

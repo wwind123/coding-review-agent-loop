@@ -60,7 +60,15 @@ empty-configuration behavior as amendments. A trusted human supersession does
 not authenticate subsequent coder rounds or rebind audits. Ineligible child
 controls are ignored and logged before parsing, including historical records;
 trusted payload, chronology, hash, digest and surface guards remain unchanged.
-Contract, salvage and capture reader migration belongs to the later recovery stage. Signed human requirements retain their
+Legacy PR contracts and remote salvage now read the invocation-only body projection
+before decoding or selection. PR startup, owning-issue lookup and handoff recovery
+use authenticated PR observations; issue and approved-plan implementation bind
+salvage observations before comparing remote recovery with local fallback.
+Capture history applies the same admission to every role, including complete
+reviewer records: a model reviewer label cannot authenticate a GitHub author.
+Configured human identities cannot publish any of these families. Foreign
+historical candidates are ignored and logged without rewriting discussion;
+trusted contract supersession, transaction handling and local salvage remain unchanged. Signed human requirements retain their
 separate author policy and unconfigured behavior.
 
 ## Legacy PR acknowledgement recovery

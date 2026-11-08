@@ -480,9 +480,13 @@ def run_issue_loop(
             config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
         )
         assigned_head_before = _read_assigned_workdir_head(runner, config)
+        from .pr_round_ingestion import admit_issue_board_comments
+        salvage_comments, _actor = admit_issue_board_comments(
+            runner, config, issue_number=issue_number, comments=issue_context.comments,
+        )
         salvage_summary = latest_salvage_context(
             config.log_dir,
-            issue_context.comments,
+            salvage_comments,
             repo=config.repo,
             issue_number=issue_number,
             scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,

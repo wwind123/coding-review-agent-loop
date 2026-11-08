@@ -346,3 +346,44 @@ def test_capture_dispatch_uses_admitted_amendment_lineage(tmp_path, monkeypatch,
         else:
             assert fresh.converted_capture_review_pending
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+@pytest.mark.parametrize("human_configured", [False, True])
+def test_foreign_publications_cannot_change_capture_pending_on_restart(
+    tmp_path, monkeypatch, reviewed, human_configured,
+):
+    from coding_review_agent_loop.errors import AgentInvocationError
+    from coding_review_agent_loop.round_metadata import _attach_round_metadata
+    from test_board_author_admission import HUMAN
+    from test_pr_loop_evidence_conversion import _comment
+    runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
+    config = dataclasses.replace(config,
+        human_reviewer_trusted_actors=(HUMAN,) if human_configured else ())
+    if reviewed:
+        runner.codex_outputs.append(_review())
+        assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    else:
+        with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    records = _records(runner)
+    capture = next(r for r in reversed(records) if r.metadata.role == "coder")
+    # A complete reviewer would clear pending; a later changed capture would
+    # reopen it. Neither claim is authoritative from the configured human.
+    reviewer = dataclasses.replace(capture.metadata, role="reviewer", agent="Codex",
+        risk_test_matrix_evidence=None, review_scope=None, review_scope_present=False)
+    import copy
+    changed = copy.deepcopy(capture.metadata.risk_test_matrix_evidence)
+    changed["rows"][0]["outcome_assertions"] = ["Foreign replacement claim"]
+    newer_capture = dataclasses.replace(capture.metadata, risk_test_matrix_evidence=changed)
+    for metadata in (reviewer, newer_capture):
+        runner.pr_payload["comments"].append({
+            **_comment(_attach_round_metadata("Foreign publication", metadata)),
+            "author": {"login": "operator"}, "_rest_author_id": 81,
+            "createdAt": "2099-01-01T00:00:00Z",
+        })
+    for _ in range(2):
+        runner.simulate_new_process()
+        fresh, _, _, _ = loop._fresh_pr_qualification_snapshot(runner, config=config,
+            pr_number=77, issue_context=None, parent_issue_context=None, approved_plan_context=context)
+        assert fresh.converted_capture_review_pending == (not reviewed)

@@ -789,9 +789,10 @@ def find_latest_remote_salvage(
     scope: str,
     approved_plan_hash: str | None = None,
 ) -> RemoteSalvageRecord | None:
+    from .pr_round_ingestion import record_body
     best: RemoteSalvageRecord | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in AGENT_SALVAGE_MARKER_RE.finditer(body):

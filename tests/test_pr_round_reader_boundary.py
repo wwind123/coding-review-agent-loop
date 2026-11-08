@@ -18,7 +18,8 @@ CODECS = {'_extract_round_metadata_records', '_decode_round_metadata_records', '
           'parse_reviewer_board_amendment_records', 'collect_child_disposition_overrides',
           'collect_child_plan_supersessions', 'find_child_plan_rebind_records',
           'authorized_replan_lineage', 'parse_child_disposition_override_records',
-          'parse_child_plan_supersession_records'}
+          'parse_child_plan_supersession_records', 'find_latest_pr_contract',
+          'find_latest_remote_salvage', 'latest_salvage_context'}
 
 
 def calls(source, exports=None):
@@ -87,6 +88,9 @@ def test_round_reader_call_sites_have_reviewed_input_provenance():
 
 
 @pytest.mark.parametrize('source', [
+    'from .pr_contract import find_latest_pr_contract as read\ndef new_reader(comments):\n return read(comments)',
+    'def new_reader(comments):\n return find_latest_remote_salvage(comments)',
+    'from . import salvage as recovery\ndef new_reader(comments):\n read = recovery.latest_salvage_context\n return read(comments)',
     'from .decomposition import collect_child_plan_supersessions as read\ndef new_reader(comments):\n return read(comments)',
     'def new_reader(comments):\n return find_child_plan_rebind_records(comments)',
     'def new_reader(comments):\n return collect_reviewer_board_amendments(comments, flow="pr", pr_number=77)',

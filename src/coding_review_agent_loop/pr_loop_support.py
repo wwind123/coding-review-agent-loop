@@ -4471,19 +4471,17 @@ def _authenticated_pr_comments_status(
 def admitted_capture_history(runner, config, *, pr_number, comments):
     """Admit the entire capture chain, including freezes without references.
 
-    Conversion admission strips authority fields on foreign records but keeps
-    ordinary content. A capture additionally needs authenticated coder and
-    freeze publications, so do not reconstruct it from that ordinary content.
+    Shared ingestion masks foreign anchors and sidecars before decoding.
+    Every role requires authenticated invocation publication; a reviewer role
+    in model output cannot authenticate the GitHub author.
     """
-    from .round_state import _extract_round_metadata_records, _recovery_record_admitted
+    from .round_state import _extract_round_metadata_records
 
-    hydrated, actor, complete = _authenticated_pr_comments_status(
+    hydrated, _actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments,
     )
     records = _extract_round_metadata_records(hydrated, flow="pr")
-    return tuple(record for record in records
-                 if (record.metadata.role == "reviewer" and is_complete_code_review(record.metadata))
-                 or _recovery_record_admitted(record, hydrated, actor)), complete
+    return records, complete
 
 
 def admitted_pr_records(

@@ -41,3 +41,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-07: Live PR observations bind round candidates to complete REST identities before decoding, excluding foreign anchors and chunks together while retaining raw prose and index joins. A per-call-site AST inventory guards the live-reader boundary; owned corruption and downstream evidence, board, approval and publication gates remain strict (#1860).
 
 - Plan and decomposition readers use the shared author-bound family projections, preserving separate parent/child surfaces, raw discussion and stable indices; historical foreign controls are ignored and logged before payload parsing (#1965).
+
+- Legacy PR contracts and remote salvage select invocation-only body projections before decoding; capture reconstruction has no reviewer-role exemption. Complete authenticated acquisition preserves raw discussion, trusted transaction semantics and local salvage fallback (#1966).
