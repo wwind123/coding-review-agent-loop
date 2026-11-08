@@ -2097,6 +2097,7 @@ class _ChildPlanningRunner(FakeRunner):
     """FakeRunner that also serves the authenticated diagnostic-record seam."""
 
     def __init__(self, **kwargs):
+        kwargs.setdefault("authenticated_actor", ("agent", 7))
         super().__init__(**kwargs)
         self.diagnostic_posts = []
 
@@ -2988,16 +2989,42 @@ class _M936World:
         fields.update(overrides)
         return format_child_plan_supersession_comment(**fields)
 
-    def _issue_context(self, _runner, *, config, issue_number):
+    def _issue_context(self, runner, *, config, issue_number):
         if issue_number != 56:
             return self.parent
-        posted = [comment(str(item["body"])) for item in (self.runner.issue_comments if self.runner else [])]
-        return dataclasses.replace(self.child, comments=(*self.comments, *posted))
+        from coding_review_agent_loop.github import _parse_issue_comments
+
+        runner = runner or self.runner or _ChildPlanningRunner()
+        # The snapshot and exhaustive REST listing must describe the same
+        # history, including retained rounds and newly published comments.
+        retained = [
+            {"body": c.body, "createdAt": c.created_at,
+             "author": {"login": "agent" if c.author == "bot" else c.author,
+                        "id": 7 if c.author == "bot" else c.author_id},
+             "_rest_author_id": 7 if c.author == "bot" else c.author_id}
+            for c in self.comments
+        ]
+        observation = retained + list(runner.issue_comments)
+        # This world models all rounds at one timestamp, in append order.
+        # Keep that convention when folding server publications into history.
+        for index, item in enumerate(observation, 1):
+            item["createdAt"] = "2026-09-13T00:00:00Z"
+            item["id"] = 10_000 + index
+            if "_rest_author_id" in item:
+                item["author"] = {**item["author"], "id": item["_rest_author_id"]}
+        runner.issue_comments_by_number[issue_number] = observation
+        return dataclasses.replace(self.child, comments=_parse_issue_comments(observation))
 
     def settle(self):
         """Fold the finished run's comments into durable history."""
         if self.runner is not None:
-            self.comments.extend(comment(str(item["body"])) for item in self.runner.issue_comments)
+            from coding_review_agent_loop.github import _parse_issue_comments
+
+            self.comments.extend(_parse_issue_comments([
+                {**item, "createdAt": "2026-09-13T00:00:00Z",
+                 "author": {**item["author"], "id": item.get("_rest_author_id", 7)}}
+                for item in self.runner.issue_comments
+            ]))
             self.runner = None
 
     def config(self, **kwargs):
@@ -3045,6 +3072,53 @@ class _M936World:
 
     def all_comments(self):
         return [*self.comments, *(comment(body) for body in self.posted())]
+
+
+@pytest.mark.parametrize("source", ["retained", "posted", "settled"])
+@pytest.mark.parametrize("identity", ["actor", "foreign", "missing"])
+def test_child_world_snapshot_and_rest_keep_the_same_identities(
+    tmp_path, monkeypatch, source, identity,
+):
+    from coding_review_agent_loop.board_amendment import (
+        collect_reviewer_board_amendments, format_reviewer_board_amendment_comment,
+    )
+    from coding_review_agent_loop.plan_board_state import admitted_issue_comments
+    from coding_review_agent_loop.github import _parse_issue_comments
+
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    body = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("Antigravity",), effective_from_round=2,
+        rationale="Backend unavailable.",
+    )
+    login, user_id = {"actor": ("agent", 7), "foreign": ("outsider", 99),
+                      "missing": ("agent", None)}[identity]
+    raw = {"body": body, "author": {"login": login, "id": user_id},
+           "_rest_author_id": user_id, "createdAt": "2026-09-18T00:00:00Z"}
+    world.runner = _ChildPlanningRunner()
+    if source == "retained":
+        world.comments.extend(_parse_issue_comments([raw]))
+    else:
+        world.runner.issue_comments.append(raw)
+        if source == "settled":
+            world.settle()
+            world.runner = _ChildPlanningRunner()
+    for _ in range(2):
+        config = world.config()
+        snapshot = world._issue_context(world.runner, config=config, issue_number=56)
+        if identity == "missing":
+            with pytest.raises(AgentLoopError, match="author.*id|author.*ID"):
+                admitted_issue_comments(world.runner, config=config, issue_number=56,
+                                        comments=snapshot.comments)
+        else:
+            admitted, actor = admitted_issue_comments(
+                world.runner, config=config, issue_number=56, comments=snapshot.comments,
+            )
+            assert actor == ("agent", 7)
+            amendments = collect_reviewer_board_amendments(admitted, flow="plan", issue_number=56)
+            assert bool(amendments) == (identity == "actor")
 
 
 def test_m936_admissible_handoff_resumes_its_pr_unchanged(tmp_path, monkeypatch):
