@@ -51,7 +51,7 @@ def test_patch_object_in_rejects_a_module_that_does_not_bind_the_name():
 
 @pytest.mark.parametrize("flow", ["plan", "pr"])
 @pytest.mark.parametrize("actor", [None, ("loop", 42)])
-@pytest.mark.parametrize("identity", ["legacy", "rest-id", "author-id", "foreign"])
+@pytest.mark.parametrize("identity", ["legacy", "rest-id", "author-id", "foreign", "missing-rest-id", "missing-author-id"])
 def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, actor, identity):
     """Legacy publications get the actor; explicit foreign identities stay foreign."""
     from agent_loop_helpers import FakeRunner, make_config
@@ -72,6 +72,12 @@ def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, 
         comment["_rest_author_id"] = 81
     elif identity == "author-id":
         comment["author"]["id"] = 81
+    elif identity in {"missing-rest-id", "missing-author-id"}:
+        comment["author"]["login"] = expected_actor[0]
+        if identity == "missing-rest-id":
+            comment["_rest_author_id"] = None
+        else:
+            comment["author"]["id"] = None
     elif identity == "foreign":
         comment["author"]["login"] = "outsider"
     expected = expected_actor if identity == "legacy" else (
@@ -80,6 +86,16 @@ def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, 
     runner = FakeRunner(authenticated_actor=actor, issue_comments=[comment],
                         pr_payload={"comments": [comment]})
     config = make_config(tmp_path)
+    if identity in {"missing-rest-id", "missing-author-id"}:
+        from coding_review_agent_loop.errors import AgentLoopError
+        # Both surfaces must fail closed instead of assigning the actor ID.
+        with pytest.raises(AgentLoopError):
+            if flow == "plan":
+                github.get_issue_context(runner, config=config, issue_number=56)
+            else:
+                github.get_pr_review_context(runner, config=config, pr_number=77)
+        assert not runner.comments
+        return
     observations = []
     for _ in range(2):
         if flow == "plan":
