@@ -35,3 +35,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Retirement assessment owns its strict listing reader and receives approved split ownership as a caller-supplied policy function, preserving the acyclic module layering enforced by the extraction registry (#1792).
 
 - Planning startup, refreshed probes and partial-round recovery admit complete issue observations before decoding; child overrides and supersessions use the configured human control policy, while digest-bound coder lineage and rebind audits remain invocation-only (#1965).
+
+- Historical child retirement admits each complete child observation before handoff lineage validation and endpoint enumeration; human trust cannot authorize loop-published handoffs (#1965).

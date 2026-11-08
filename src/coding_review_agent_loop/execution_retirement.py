@@ -87,6 +87,12 @@ def _authenticate_child_pr_history(runner, *, config, context):
     terminal. Keep each lineage's full prefix so same-PR contract replacements
     still authenticate against their original closing contract.
     """
+    from .pr_round_ingestion import admit_issue_board_comments
+    comments, _ = admit_issue_board_comments(
+        runner, config, issue_number=context.number,
+        comments=context.comments, force_probe=True,
+    )
+    context = replace(context, comments=comments)
     from .issue_pr_handoff import (
         AGENT_ISSUE_PR_HANDOFF_RE, decode_issue_pr_handoff_record,
         authenticate_canonical_issue_pr, resolve_issue_pr_handoff_lineage,
