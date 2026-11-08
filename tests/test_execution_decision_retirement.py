@@ -288,6 +288,47 @@ def test_historical_child_unreadable_handoff_blocks(tmp_path, fault):
     no_dispatch(runner)
 
 
+@pytest.mark.parametrize("fault", ["malformed", "conflicting"])
+@pytest.mark.parametrize("author", ["invocation", "configured-human", "foreign"])
+def test_historical_child_handoffs_admitted_before_retirement_on_restart(
+    tmp_path, capsys, fault, author,
+):
+    from coding_review_agent_loop.github import TrustedHumanActor
+
+    implementation = dict(pr(83), body="", headRefName="other-branch",
+        url="https://github.com/OWNER/REPO/pull/83",
+        headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])
+    def handoff(head):
+        return format_issue_pr_handoff_comment(issue_number=90, pr_number=83,
+            pr_url=implementation["url"], pr_head_sha=head,
+            flow="issue-implementation", plan_hash=None)
+    trusted = comment(handoff(implementation["headRefOid"]))
+    body = ("<!-- AGENT_ISSUE_PR_HANDOFF: invalid -->" if fault == "malformed"
+            else handoff("a" * 40))
+    injected = comment(body, 2)
+    if author != "invocation":
+        injected.update(author={"login": "operator" if author == "configured-human" else "outsider"},
+                        _rest_author_id=81 if author == "configured-human" else 99)
+    runner = RetirementRunner(children=[child()],
+        issue_comments_by_number={90: [trusted, injected]},
+        pr_payloads_by_number={83: implementation})
+    options = dict(human_reviewer_trusted_actors=(TrustedHumanActor("operator", 81),), quiet=False)
+    for _ in range(2):
+        if author == "invocation":
+            with pytest.raises(AgentLoopError, match="payload|Divergent"):
+                run(runner, tmp_path, **options)
+            no_dispatch(runner)
+            assert runner.claude_outputs  # No planner consumed the unverified history.
+        else:
+            assert run(runner, tmp_path, **options) == 0
+            assert _m1087_implementation_dispatched(runner)
+            assert _m1087_posted_decisions(runner)[0].retires_plan_hashes == (_M1087_STALE_HASH,)
+            diagnostic = capsys.readouterr().err
+            assert "issue #90 comment" in diagnostic
+            assert "ignored loop record: author is not the invocation actor" in diagnostic
+        assert runner.issue_comments_by_number[90][1]["body"] == body
+
+
 @pytest.mark.parametrize("old_strategy", ["one-shot", "staged"])
 @pytest.mark.parametrize("new_strategy", ["one-shot", "staged"])
 @pytest.mark.parametrize("policy", ["auto", "explicit"])

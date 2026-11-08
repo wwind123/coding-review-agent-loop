@@ -39,3 +39,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-06: Cross-round classification conflicts cannot prevent fresh reviewer turns on resume; invalid replay entries retain conservative source enforcement. (#1922, #1924).
 
 - 2026-11-07: Live PR observations bind round candidates to complete REST identities before decoding, excluding foreign anchors and chunks together while retaining raw prose and index joins. A per-call-site AST inventory guards the live-reader boundary; owned corruption and downstream evidence, board, approval and publication gates remain strict (#1860).
+
+- Plan and decomposition readers use the shared author-bound family projections, preserving separate parent/child surfaces, raw discussion and stable indices; historical foreign controls are ignored and logged before payload parsing (#1965).

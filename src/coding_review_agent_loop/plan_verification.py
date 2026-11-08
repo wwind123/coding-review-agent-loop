@@ -35,6 +35,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Callable, Sequence
 
+from .pr_round_ingestion import record_body
 from .errors import AgentLoopError
 from .reviewer_floor import BoardSeat, SignedBoardAuthorization, distinct_providers
 
@@ -657,7 +658,7 @@ def board_change_audit_already_posted(comments: Sequence[object], digest: str) -
     def body(comment: object) -> object:
         if isinstance(comment, dict):
             return comment.get("body")
-        return getattr(comment, "body", None)
+        return record_body(comment)
 
     return any(
         isinstance(text := body(comment), str)
@@ -756,7 +757,7 @@ def plan_hash_has_issue_handoff(
         if handoff is not None and handoff.plan_hash == plan_hash:
             return True
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for pattern, decode in (

@@ -16,6 +16,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from typing import Literal
+from .pr_round_ingestion import record_body
 from .config import AgentLoopConfig
 from .decomposition import (
     approved_plan_hash,
@@ -1454,7 +1455,7 @@ def _resumed_inherited_replan_force_full(comments: Sequence[object]) -> bool:
     if latest.prior_plan_subject is None:
         return False
     bodies = [
-        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+        body for comment in comments if isinstance((body := record_body(comment)), str)
     ]
     for record in coder_records[:-1]:
         plan = record.metadata.canonical_plan

@@ -3,7 +3,7 @@
     "module": "approved_plan_resume",
     "function": "approved_plan_resume_view",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "approved_plan_resume.approved_plan_resume_view reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "architecture_contract",
@@ -57,25 +57,85 @@
     "module": "child_plan_binding",
     "function": "_plan_contract_shape",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "child_plan_binding._plan_contract_shape reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "child_plan_binding",
     "function": "_rebind_growth_advisory",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "child_plan_binding._rebind_growth_advisory reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_reject_pending_child_plan_supersession",
+    "call": "codec(child_comments, child_issue=binding.child_issue, parent_issue=binding.parent_issue, stage_id=binding.stage_id)",
+    "provenance": "PR entry, qualification snapshots and child-plan validation obtain the child issue via get_issue_context before passing child_comments; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_require_authorized_replan_state",
+    "call": "codec(comments, child_issue=issue_number, parent_issue=plan_supersession.parent_issue, stage_id=plan_supersession.stage_id)",
+    "provenance": "plan_first_loop passes admitted startup/scoped history and every refreshed issue observation; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "child_plan_binding",
     "function": "_require_authorized_replan_state",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "child_plan_binding._require_authorized_replan_state reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_require_authorized_replan_state",
+    "call": "codec(comments, superseded_hash=plan_supersession.superseded_hash, digest=plan_supersession.digest, supersessions=supersessions)",
+    "provenance": "plan_first_loop passes admitted startup/scoped history and every refreshed issue observation; this call selects invocation-only rebind bodies and digest-bound coder metadata before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "child_plan_binding",
     "function": "_resumed_inherited_replan_force_full",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "child_plan_binding._resumed_inherited_replan_force_full reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_route_child_plan_handoff",
+    "call": "codec(issue_context.comments, child_issue=issue_number, parent_issue=fresh_child.parent_issue, stage_id=fresh_child.stage_id, ignored_sink=ignored)",
+    "provenance": "plan_execution passes the separately acquired planning child issue context into handoff routing; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verified_retired_child_plan_hashes",
+    "call": "codec(child_comments)",
+    "provenance": "issue_recovery and _retired_child_execution_plan_hashes pass the separately acquired child issue history before execution-decision reconciliation; this call selects invocation-only rebind bodies and digest-bound coder metadata before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verified_retired_child_plan_hashes",
+    "call": "codec(child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id)",
+    "provenance": "issue_recovery and _retired_child_execution_plan_hashes pass the separately acquired child issue history before execution-decision reconciliation; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verified_retired_child_plan_hashes",
+    "call": "codec(child_comments, superseded_hash=record.superseded_plan_hash, digest=record.plan_supersession_digest, supersessions=supersessions, through_round=record.approved_round)",
+    "provenance": "issue_recovery and _retired_child_execution_plan_hashes pass the separately acquired child issue history before execution-decision reconciliation; this call selects invocation-only rebind bodies and digest-bound coder metadata before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verify_child_plan_rebind",
+    "call": "codec(child_comments)",
+    "provenance": "the issue/PR child-binding callers pass the child get_issue_context observation before replacement selection; this call selects invocation-only rebind bodies and digest-bound coder metadata before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verify_child_plan_rebind",
+    "call": "codec(child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id)",
+    "provenance": "the issue/PR child-binding callers pass the child get_issue_context observation before replacement selection; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "verify_child_plan_rebind",
+    "call": "codec(child_comments, superseded_hash=record.superseded_plan_hash, digest=record.plan_supersession_digest, supersessions=supersessions, through_round=record.approved_round)",
+    "provenance": "the issue/PR child-binding callers pass the child get_issue_context observation before replacement selection; this call selects invocation-only rebind bodies and digest-bound coder metadata before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "code_approval",
@@ -93,13 +153,31 @@
     "module": "decomposition",
     "function": "authorized_replan_lineage",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "decomposition.authorized_replan_lineage reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
+  },
+  {
+    "module": "decomposition",
+    "function": "collect_child_disposition_overrides",
+    "call": "codec(body, comment_locator=locator)",
+    "provenance": "The child collector selects record_body(human_control=True) before calling this pure payload parser; live parent and child observations are separately acquired with get_issue_context. Raw codec unit fixtures remain offline."
+  },
+  {
+    "module": "decomposition",
+    "function": "collect_child_plan_supersessions",
+    "call": "codec(body, comment_locator=locator, comment_index=index)",
+    "provenance": "The child collector selects record_body(human_control=True) before calling this pure payload parser; live parent and child observations are separately acquired with get_issue_context. Raw codec unit fixtures remain offline."
   },
   {
     "module": "discuss_loop",
     "function": "_recover_final_discuss_split_proposals",
     "call": "codec(issue_context.comments, flow='discuss')",
     "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "execution_policy",
+    "function": "_preflight_fresh_staged_topology",
+    "call": "codec(parent_comments=issue_context.comments, child_comments=child_comments, parent_issue=issue_number, plan_hash=plan_hash, topology_stage_ids=tuple((item.stage_id or '' for item in decomposition.phases)), routed_stage_id=phase.stage_id or '', child_stage_id=phase.stage_id, child_issue_number=adopted.issue_number)",
+    "provenance": "parent dispatch supplies its admitted parent snapshot and separately fetches each existing child issue; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "execution_policy",
@@ -111,7 +189,13 @@
     "module": "execution_policy",
     "function": "_refuse_plain_mode_over_planning",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "This plain-mode guard force-probes the complete issue observation through admit_pr_comments on ISSUE_THREAD_SURFACE before extracting plan records; original indices and configured-human amendment eligibility survive without granting human round authority."
+  },
+  {
+    "module": "execution_policy",
+    "function": "_resolve_fresh_child_provenance",
+    "call": "codec(parent_comments=parent_issue_context.comments, child_comments=issue_context.comments, parent_issue=parent_issue, plan_hash=plan_hash, topology_stage_ids=tuple((item.stage_id or '' for item in decomposition.phases)), routed_stage_id=stage_id, child_stage_id=stage_id, child_issue_number=issue_context.number)",
+    "provenance": "issue_loop and PR child validation separately acquire the parent and child contexts before route resolution; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "history_export",
@@ -153,61 +237,61 @@
     "module": "panel_evidence",
     "function": "_plan_growth_verdict_for_hash",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "panel_evidence._plan_growth_verdict_for_hash reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "panel_evidence",
     "function": "_planner_candidate_rounds",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "panel_evidence._planner_candidate_rounds reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "panel_evidence",
     "function": "_require_complete_canonical_plan_approval",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "panel_evidence._require_complete_canonical_plan_approval reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "panel_evidence",
     "function": "_resumed_plan_transition_inputs",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "panel_evidence._resumed_plan_transition_inputs reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "partial_round_recovery",
     "function": "_compute",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+    "provenance": "_compute consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "partial_round_recovery",
     "function": "_compute::check",
     "call": "codec(remaining, flow=flow)",
-    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+    "provenance": "_compute::check consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "partial_round_recovery",
     "function": "_frame",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+    "provenance": "_frame consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "partial_round_recovery",
     "function": "_plan",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+    "provenance": "_plan consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "partial_round_recovery",
     "function": "compute_partial_round_recovery",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+    "provenance": "compute_partial_round_recovery consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "plan_board_state",
     "function": "resolve_plan_board_state",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_board_state.resolve_plan_board_state reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_board_state",
@@ -219,7 +303,7 @@
     "module": "plan_board_state",
     "function": "resolve_plan_lineage",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_board_state.resolve_plan_lineage reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_board_state",
@@ -229,15 +313,27 @@
   },
   {
     "module": "plan_execution",
+    "function": "_dispatch_current_decomposition_phase",
+    "call": "codec(parent_comments=issue_context.comments, child_comments=child_comments, parent_issue=issue_number, plan_hash=plan_hash, topology_stage_ids=topology_stage_ids, routed_stage_id=stage_id, child_stage_id=stage_id, child_issue_number=child_issue_number)",
+    "provenance": "dispatch fetches the parent and selected child with get_issue_context before applying stage-scoped overrides; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "plan_execution",
+    "function": "_dispatch_current_decomposition_phase",
+    "call": "codec(parent_comments=parent_issue_context.comments, child_comments=child_issue_context.comments, parent_issue=issue_number, plan_hash=plan_hash, topology_stage_ids=topology_stage_ids, routed_stage_id=stage_id, child_stage_id=stage_id, child_issue_number=child_issue_number)",
+    "provenance": "dispatch fetches the parent and selected child with get_issue_context before applying stage-scoped overrides; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
+  },
+  {
+    "module": "plan_execution",
     "function": "_execute_approved_plan",
     "call": "codec(scope_plan_comments(refreshed_issue_context.comments, plan_scope_start_round), flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_execution._execute_approved_plan reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body",
     "call": "codec(issue_context.comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
@@ -249,61 +345,67 @@
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body",
     "call": "codec(plan_fresh_comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body",
     "call": "codec(scope_plan_comments(round_outcome_issue_context.comments, plan_scope_start_round), flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body::plan_history_records",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body::plan_history_records reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body::planning_contract_drift_records",
     "call": "codec(issue_context.comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body::planning_contract_drift_records reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_first_loop",
     "function": "_run_plan_first_loop_body::planning_contract_drift_records",
     "call": "codec(issue_context.comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_first_loop._run_plan_first_loop_body::planning_contract_drift_records reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_issue_scope",
     "function": "_archived_indexes",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_issue_scope._archived_indexes reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_issue_scope",
     "function": "plan_scope_decision",
     "call": "codec(admitted_comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_issue_scope.plan_scope_decision reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
+  },
+  {
+    "module": "plan_verification",
+    "function": "_build_plan_approval_inputs::supersession_check",
+    "call": "codec(getattr(issue_context, 'comments', ()), child_issue=child_number, parent_issue=fresh_child.parent_issue, stage_id=fresh_child.stage_id, ignored_sink=[])",
+    "provenance": "build_plan_approval_inputs captures the admitted child issue context used by issue preflight and planning approval classification; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "plan_verification",
     "function": "classify_plan_approval",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_verification.classify_plan_approval reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_verification",
     "function": "classify_plan_approval",
     "call": "codec(plan_comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_verification.classify_plan_approval reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_verification",
     "function": "derive_plan_verification_context",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_verification.derive_plan_verification_context reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "plan_verification",
@@ -315,7 +417,7 @@
     "module": "plan_verification",
     "function": "plan_verification_inputs",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+    "provenance": "plan_verification.plan_verification_inputs reads plan history from get_issue_context's complete authenticated issue observation; plan_first_loop also admits its supplied startup context before drift probes. The round-state facade masks invocation-only anchors and sidecars before decoding, retaining indices. Raw codec fixtures are offline only."
   },
   {
     "module": "post_merge_runtime",
@@ -388,6 +490,12 @@
     "function": "run_pr_loop",
     "call": "codec(issue_context.comments, issue_number=issue_context.number)",
     "provenance": "initial_pr_context comes from get_pr_review_context and its shared admission binding; owning issue_context comes from get_issue_context, which admits amendment candidates before misplaced-record diagnostics."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(parent_comments=parent_issue_context.comments, child_comments=issue_context.comments, parent_issue=parent_issue_context.number, plan_hash=phase_plan_hash, topology_stage_ids=tuple((item.stage_id or '' for item in normalized.phases)), routed_stage_id=stable_stage_id, child_stage_id=stable_stage_id, child_issue_number=issue_context.number)",
+    "provenance": "PR startup separately calls get_issue_context for the owning child and staged parent before validating the bound route; this call selects human-control bodies for overrides and supersessions before payload parsing. Raw reducer fixtures are offline only."
   },
   {
     "module": "pr_loop",
@@ -519,13 +627,13 @@
     "module": "review_rounds",
     "function": "_round_ledger_may_be_incomplete",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow ledger helpers: live PR review receives admitted observations, while plan flows retain strict raw parsing."
+    "provenance": "_round_ledger_may_be_incomplete consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "review_rounds",
     "function": "_round_resolved_history_item_ids",
     "call": "codec(comments, flow=flow)",
-    "provenance": "Pure dynamic-flow ledger helpers: live PR review receives admitted observations, while plan flows retain strict raw parsing."
+    "provenance": "_round_resolved_history_item_ids consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline."
   },
   {
     "module": "round_state",
@@ -543,7 +651,7 @@
     "module": "round_state",
     "function": "_resume_plan_round",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+    "provenance": "_resume_plan_round is a pure reducer whose live planning callers in plan_first_loop, plan_verification and child_plan_binding receive get_issue_context observations; startup also admits a supplied snapshot before any drift probe. The codec facade routes bound issue anchors and sidecars through invocation-only extraction. Offline tests may use raw codec fixtures."
   },
   {
     "module": "round_state",
@@ -555,7 +663,7 @@
     "module": "round_state",
     "function": "find_approved_plan_comment",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+    "provenance": "find_approved_plan_comment is a pure reducer whose live planning callers in plan_first_loop, plan_verification and child_plan_binding receive get_issue_context observations; startup also admits a supplied snapshot before any drift probe. The codec facade routes bound issue anchors and sidecars through invocation-only extraction. Offline tests may use raw codec fixtures."
   },
   {
     "module": "round_state",
@@ -567,7 +675,7 @@
     "module": "round_state",
     "function": "recover_approved_plan_context",
     "call": "codec(comments, flow='plan')",
-    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+    "provenance": "recover_approved_plan_context is a pure reducer whose live planning callers in plan_first_loop, plan_verification and child_plan_binding receive get_issue_context observations; startup also admits a supplied snapshot before any drift probe. The codec facade routes bound issue anchors and sidecars through invocation-only extraction. Offline tests may use raw codec fixtures."
   },
   {
     "module": "round_state",

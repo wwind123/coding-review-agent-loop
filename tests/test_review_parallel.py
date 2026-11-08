@@ -613,6 +613,7 @@ class _PlanDiagnosticParallelRunner(FakeRunner):
         self.actor_login = actor_login
         self.actor_id = actor_id
         super().__init__(
+            authenticated_actor=(actor_login, actor_id),
             claude_outputs=claude_outputs,
             codex_outputs=codex_outputs,
             gemini_outputs=gemini_outputs,
@@ -634,9 +635,9 @@ class _PlanDiagnosticParallelRunner(FakeRunner):
     def _rest_comment(self, raw_comment, index):
         author = raw_comment.get("author") or raw_comment.get("user") or {}
         login = author.get("login") if isinstance(author, dict) else None
-        author_id = author.get("id") if isinstance(author, dict) else None
+        author_id = raw_comment.get("_rest_author_id", author.get("id")) if isinstance(author, dict) else None
         return {
-            "id": raw_comment.get("id") or 1000 + index,
+            "id": raw_comment.get("id") or raw_comment.get("databaseId") or 1000 + index,
             "created_at": raw_comment.get("createdAt") or raw_comment.get("created_at"),
             "body": raw_comment.get("body"),
             "user": {
@@ -1134,7 +1135,7 @@ def test_revision_success_supersedes_diagnostic_before_a_later_same_invocation_p
     runner.issue_comments.insert(
         0,
         {
-            "author": {"login": "history", "id": 99},
+            "author": {"login": runner.actor_login, "id": runner.actor_id},
             "createdAt": "2026-09-17T05:00:00Z",
             "body": str(initial_comment),
             "id": 699,
@@ -5157,9 +5158,8 @@ def test_pr_carrier_is_checked_before_a_fresh_peer_is_launched(tmp_path):
     assert runner.reviewer_launches == launches_before
 
 
-def test_plan_rerun_under_a_different_actor_stops_before_any_post_or_launch(tmp_path):
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
-
+@pytest.mark.parametrize("actor", [("someone-else", 99), ("agent-bot", 99), ("someone-else", 7)])
+def test_plan_rerun_under_a_different_actor_ignores_foreign_history(tmp_path, monkeypatch, actor):
     runner, markers = _plan_partial_round_runner()
     runner.authenticated_actor = ("agent-bot", 7)
     runner.serve_rest_issue_comments = True
@@ -5167,15 +5167,27 @@ def test_plan_rerun_under_a_different_actor_stops_before_any_post_or_launch(tmp_
     _interrupt_plan_second_review_after_freezing(runner, config, markers)
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.issue_comments)
-    runner.authenticated_actor = ("someone-else", 99)
+    frozen_before = _frozen_carriers(config)
+    runner.authenticated_actor = actor
     issue_loop.reset_authenticated_github_actor(runner)
 
-    with pytest.raises(PublicationResumeStop, match="id 99"):
+    # A different user ID starts fresh; a renamed invocation ID fails closed.
+    # Neither case can replay the previous actor's frozen reviewer result.
+    def fresh_planner(*args, **kwargs):
+        assert kwargs["agent"] == config.coder
+        raise RuntimeError("fresh planner reached")
+
+    monkeypatch.setattr(plan_first_loop, "_run_validated_agent", fresh_planner)
+    error, message = (
+        (AgentLoopError, "invocation actor identity drift") if actor[1] == 7
+        else (RuntimeError, "fresh planner reached")
+    )
+    with pytest.raises(error, match=message):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert runner.reviewer_launches == launches_before
     assert len(runner.issue_comments) == comments_before
-    assert len(_frozen_carriers(config)) == 1
+    assert _frozen_carriers(config) == frozen_before
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,15 @@ family projections described in [round state](round-state-and-resume.md#board-co
 Board-amendment parsing reads the human-control projection, while raw discussion
 remains prompt context. Scope blanking clears both bound projections together
 and preserves comment positions; it cannot restore an excluded record.
+Plan startup admits supplied history before contract-drift parsing; fresh issue
+reads repeat admission before resume, approval or recovery selection. Child
+routing collectors read human-control bodies for signed overrides and
+supersessions, while rebind audits and re-plan round metadata use invocation-only
+bodies. Parent and child acquisitions retain separate surface bindings. A
+separate human account requires `--human-reviewer-trusted-actor LOGIN:ID` on
+every replay; both normalized login and numeric REST ID must match. Without
+configuration only the invocation actor can publish eligible human controls.
+Foreign historical records are ignored and logged without changing comments.
 
 ## Main Lifecycle
 
@@ -429,7 +438,11 @@ implementation PRs: the assessment correlates child closing references and manag
 branches, reads complete child comment histories, and authenticates canonical child
 handoffs from every lineage, including earlier lineages displaced by a different
 PR, even when their PRs are absent from listings. Each lineage retains its
-same-PR contract supersession checks. Unreadable child histories
+same-PR contract supersession checks. Before lineage validation or endpoint
+enumeration, each child observation receives shared issue admission bound to
+that child surface. Handoffs use only the invocation-author projection; foreign
+and configured-human handoffs are ignored and logged on every restart.
+Unreadable child histories
 or PR references block retirement.
 The existing decision records retired hashes and explains terminal supersession.
 

@@ -492,3 +492,24 @@ def test_all_protocol_projections_share_owned_envelope_validation(tmp_path, proj
     else:
         with pytest.raises(AgentLoopError, match='round metadata envelope.*comment'):
             read()
+
+
+@pytest.mark.parametrize('token', [
+    'LOOP_META', 'LOOP_SIDECAR', 'PR_BOARD_CHANGE', 'PLAN_BOARD_CHANGE',
+    'PLAN_SCOPE_BOUNDARY', 'PLAN_DECOMPOSITION', 'PLAN_PHASE_IMPLEMENTATION',
+    'PLAN_TOPOLOGY_CHECKPOINT', 'PLAN_EXECUTION_DECISION', 'PLAN_ONE_SHOT_IMPL',
+    'CHILD_PLAN_REBIND', 'EXECUTION_RECOMMENDATION', 'PLAN_PHASE_IDENTITY',
+    'SPLIT_CHILD', 'SPLIT_STAGE_HANDOFF', 'SPLIT_UNFILED_WARNING', 'DISCUSS_SPLIT',
+    'ISSUE_PR_HANDOFF', 'PLAN_APPROVED_FOLLOWUPS',
+])
+def test_protocol_candidate_recognizes_registered_tokens_before_payload_parsing(token):
+    from coding_review_agent_loop.pr_round_ingestion import protocol_candidate
+    from coding_review_agent_loop.protocol_markers import MARKER_BY_TOKEN
+    token = 'AGENT_' + token
+    assert token in MARKER_BY_TOKEN
+    for spelling in (token, token.lower()):
+        assert protocol_candidate(github.IssueComment(
+            author='outsider', created_at=STAMP,
+            body=f'<!-- {spelling}: invalid -->'))
+    assert not protocol_candidate(github.IssueComment(
+        author='outsider', created_at=STAMP, body=f'<!-- {token}_EXTRA: invalid -->'))

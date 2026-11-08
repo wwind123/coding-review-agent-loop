@@ -668,11 +668,16 @@ def _strict_verify(tmp_path, issue_comments, *, pr_reviewers, expected_hash):
     from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
 
     issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
-        IssueComment(author="agent-loop", created_at=comment["createdAt"], body=comment["body"])
+        IssueComment(author="bot", created_at=comment["createdAt"], body=comment["body"])
         for comment in issue_comments
     ))
+    from agent_loop_helpers import serve_authenticated_issue_context
+    runner = FakeRunner(authenticated_actor=("agent-loop", 4242))
+    config = make_config(tmp_path, reviewer=pr_reviewers)
+    issue = serve_authenticated_issue_context(runner, config, issue)
     _verify_strict_managed_plan_binding(
-        config=make_config(tmp_path, reviewer=pr_reviewers),
+        runner=runner,
+        config=config,
         pr_number=7,
         issue_context=issue,
         metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="head-1"),
@@ -2152,10 +2157,14 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
         ManagedCiOutcome,
     )
 
+    # A resumed invocation uses the account that published this plan history.
+    first = issue_comments[0]
+    author = first["author"]
+    actor = (author["login"], first.get("_rest_author_id", author.get("id", 424242)))
     handoff = AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
-        trusted_actor_id=1, protection_mode="strict", override_nonce=None,
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56", trusted_actor_login=actor[0],
+        trusted_actor_id=actor[1], protection_mode="strict", override_nonce=None,
     )
     monkeypatch.setattr(pr_loop_module, "recover_issue_created_handoff", lambda *a, **k: handoff)
     monkeypatch.setattr(pr_loop_module, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff)
@@ -2172,7 +2181,7 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
     patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k),
     )
     runner = FakeRunner(
-        issue_comments=issue_comments,
+        issue_comments=issue_comments, authenticated_actor=actor,
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/managed-56"},
         **pr_outputs,
@@ -2183,7 +2192,7 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
     )
     config = make_config(
         tmp_path, reviewer=("claude", "antigravity"), managed_ci=True,
-        managed_ci_trusted_actor="agent-loop", auto_merge=True, pre_review_tests=False,
+        managed_ci_trusted_actor=actor[0], auto_merge=True, pre_review_tests=False,
         **fresh,
     )
     return runner, config, merges, run_pr_loop
@@ -2386,12 +2395,15 @@ def test_plan_seat_binding_history_is_validated_before_verifying_approval(
     from types import SimpleNamespace
 
     def verify(comments, plan):
+        from agent_loop_helpers import serve_authenticated_issue_context
+        runner = FakeRunner(authenticated_actor=("agent-loop", 4242))
+        config = make_config(tmp_path, reviewer=("gemini",))
+        issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+            IssueComment(author="bot", created_at=None, body=c.body) for c in comments
+        ))
+        issue = serve_authenticated_issue_context(runner, config, issue)
         _verify_strict_managed_plan_binding(
-            config=make_config(tmp_path, reviewer=("gemini",)),
-            pr_number=7,
-            issue_context=Issue(959, "OWNER/REPO", "t", "b", None, tuple(
-                IssueComment(author="agent-loop", created_at=None, body=c.body) for c in comments
-            )),
+            runner=runner, config=config, pr_number=7, issue_context=issue,
             metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),
             expected_plan_hash=approved_plan_hash(plan),
         )
@@ -2555,12 +2567,17 @@ def _strict_verify_comments(tmp_path, comments):
     )
 
     issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
-        IssueComment(author="agent-loop", created_at=c["createdAt"], body=c["body"])
+        IssueComment(author="bot", created_at=c["createdAt"], body=c["body"])
         for c in comments
     ))
     plan_text, _round = _resume_plan_round(issue.comments, configured_reviewers=())
+    from agent_loop_helpers import serve_authenticated_issue_context
+    runner = FakeRunner(authenticated_actor=("agent-loop", 4242))
+    config = make_config(tmp_path, reviewer=("claude",))
+    issue = serve_authenticated_issue_context(runner, config, issue)
     _verify_strict_managed_plan_binding(
-        config=make_config(tmp_path, reviewer=("claude",)),
+        runner=runner,
+        config=config,
         pr_number=7,
         issue_context=issue,
         metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),

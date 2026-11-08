@@ -64,6 +64,7 @@ from .issue_body_limits import (
     is_bounded_form,
     shortened_section,
 )
+from .pr_round_ingestion import record_body
 from .round_transport import MAX_GITHUB_BODY_CHARS, MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
@@ -1497,7 +1498,7 @@ def find_existing_topology_checkpoint(
 ) -> TopologyCheckpoint | None:
     found: TopologyCheckpoint | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(body):
@@ -1536,7 +1537,7 @@ def find_topology_checkpoints_for_parent(
     """
     found: list[TopologyCheckpoint] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(body):
@@ -2475,7 +2476,7 @@ def execution_decisions_for_parent(
     """
     found: list[ExecutionDecision] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
@@ -2496,7 +2497,7 @@ def issue_execution_decision_evidence(
     """
     unreadable = False
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
@@ -2543,7 +2544,7 @@ def recover_execution_recommendation(
 ) -> ExecutionStrategyRecommendation:
     """Hydrate a complete recommendation from plan comments and sidecars."""
     bodies = tuple(
-        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+        body for comment in comments if isinstance((body := record_body(comment)), str)
     )
     found: ExecutionStrategyRecommendation | None = None
     for body in bodies:
@@ -2878,7 +2879,7 @@ def find_existing_decomposition(
 ) -> DecompositionMetadata | None:
     found: DecompositionMetadata | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in DECOMPOSITION_MARKER_RE.finditer(body):
@@ -2919,7 +2920,7 @@ def find_decompositions_for_parent(
     """Return every decomposition summary for a parent, across plan hashes."""
     found: list[DecompositionMetadata] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in DECOMPOSITION_MARKER_RE.finditer(body):
@@ -2975,7 +2976,7 @@ def find_existing_phase_implementation_handoff(
 ) -> PhaseImplementationHandoffMetadata | None:
     found: PhaseImplementationHandoffMetadata | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
@@ -3006,7 +3007,7 @@ def find_phase_implementation_handoffs(
     """
     found: list[PhaseImplementationHandoffMetadata] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
@@ -3022,7 +3023,7 @@ def find_phase_implementation_handoffs_for_parent(
     """Return every phase handoff for a parent, across plan hashes."""
     found: list[PhaseImplementationHandoffMetadata] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
@@ -3629,7 +3630,7 @@ def collect_child_disposition_overrides(
         sources.append(("child issue", child_comments, child_stage_id))
     for label, comments, local_stage_id in sources:
         for index, comment in enumerate(comments, start=1):
-            body = getattr(comment, "body", None)
+            body = record_body(comment, human_control=True)
             if not isinstance(body, str):
                 continue
             locator = f"{label} comment {index}"
@@ -3866,7 +3867,7 @@ def collect_child_plan_supersessions(
     """
     by_digest: dict[str, ChildPlanSupersession] = {}
     for index, comment in enumerate(child_comments):
-        body = getattr(comment, "body", None)
+        body = record_body(comment, human_control=True)
         if not isinstance(body, str):
             continue
         locator = f"child issue #{child_issue} comment {index + 1}"
@@ -3939,7 +3940,7 @@ def find_child_plan_rebind_records(
     """Every decodable rebind audit record, tagged with its comment index."""
     found: list[ChildPlanRebindRecord] = []
     for index, comment in enumerate(comments):
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in CHILD_PLAN_REBIND_MARKER_RE.finditer(body):
@@ -4273,7 +4274,7 @@ def find_existing_one_shot_impl_handoff(
 ) -> OneShotImplementationHandoffMetadata | None:
     found: OneShotImplementationHandoffMetadata | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in ONE_SHOT_IMPL_HANDOFF_MARKER_RE.finditer(body):
@@ -4298,7 +4299,7 @@ def find_latest_one_shot_impl_handoff(
     """
     found: OneShotImplementationHandoffMetadata | None = None
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in ONE_SHOT_IMPL_HANDOFF_MARKER_RE.finditer(body):
@@ -4317,7 +4318,7 @@ def find_one_shot_impl_handoffs(
     """Return all one-shot handoffs so fresh recovery can detect ambiguity."""
     found: list[OneShotImplementationHandoffMetadata] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in ONE_SHOT_IMPL_HANDOFF_MARKER_RE.finditer(body):

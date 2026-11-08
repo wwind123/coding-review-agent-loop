@@ -24,7 +24,7 @@ import coding_review_agent_loop.issue_loop as issue_loop
 import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
-from agent_loop_helpers import patch_attr_in
+from agent_loop_helpers import patch_attr_in, serve_authenticated_issue_context
 from issue_loop_test_helpers import (
     FakeRunner,
     _M1088_ACTOR,
@@ -393,11 +393,13 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         comments=(
             IssueComment(
                 author="coding-review-agent-loop",
+                author_id=424242,
                 created_at="2026-05-01T00:00:00Z",
                 body=unrelated_child_plan_comment,
             ),
             IssueComment(
                 author="coding-review-agent-loop",
+                author_id=424242,
                 created_at="2026-05-01T00:01:00Z",
                 body=format_issue_pr_handoff_comment(
                     issue_number=56,
@@ -419,6 +421,7 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         comments=(
             IssueComment(
                 author="coding-review-agent-loop",
+                author_id=424242,
                 created_at="2026-05-01T00:00:00Z",
                 body=parent_plan_comment,
             ),
@@ -427,7 +430,8 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
 
     def issue_context_for(_runner, *, config, issue_number):
         assert config.repo == "OWNER/REPO"
-        return child if issue_number == 56 else parent
+        context = child if issue_number == 56 else parent
+        return serve_authenticated_issue_context(_runner, config, context)
 
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", issue_context_for)
     runner = _FakeRunner(
