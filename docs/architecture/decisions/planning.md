@@ -37,3 +37,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Planning startup, refreshed probes and partial-round recovery admit complete issue observations before decoding; child overrides and supersessions use the configured human control policy, while digest-bound coder lineage and rebind audits remain invocation-only (#1965).
 
 - Historical child retirement admits each complete child observation before handoff lineage validation and endpoint enumeration; human trust cannot authorize loop-published handoffs (#1965).
+
+- 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).

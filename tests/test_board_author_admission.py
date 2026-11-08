@@ -60,7 +60,11 @@ def test_board_family_partition_at_live_acquisition(tmp_path, capsys, flow, logi
     # A malformed loop payload co-located with a human amendment must stay opaque.
     body = amendment(flow).replace('\n-- Human Reviewer', '\n<!-- AGENT_LOOP_META: invalid -->\n-- Human Reviewer')
     runner, config = fixture(tmp_path, flow, [raw(body, login, user_id)], trusted=trusted)
-    comments = acquire(runner, config, flow)
+    observations = [acquire(runner, config, flow) for _ in range(3)]
+    assert all([(c.comment_id, c.body) for c in current] ==
+               [(c.comment_id, c.body) for c in observations[0]] for current in observations)
+    assert observations[0][0] is not observations[-1][0]
+    comments = observations[-1]
     kwargs = {'issue_number': 56} if flow == 'plan' else {'pr_number': 77}
     records = collect_reviewer_board_amendments(comments, flow=flow, **kwargs)
     assert bool(records) == expected

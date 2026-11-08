@@ -79,9 +79,9 @@ def test_child_controls_and_lineage_use_separate_live_family_views(
 
 
 @pytest.mark.parametrize('mode', ['plan-only', 'auto'])
-def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_path, mode):
+def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_path, capsys, mode):
     runner, config, _ = _approved_closed_history(tmp_path)
-    config = replace(config, plan_execution_mode=mode)
+    config = replace(config, plan_execution_mode=mode, quiet=False)
     # Both a malformed anchor and an unhydratable sidecar must be excluded
     # before drift, scope, approval and recovery readers see the history.
     foreign = raw('<!-- AGENT_LOOP_META: invalid -->\n<!-- AGENT_LOOP_SIDECAR: invalid -->',
@@ -98,7 +98,7 @@ def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_pa
     runner.issue_comments.append(foreign)
     expected = _extract_round_metadata_records(acquire(runner, config, 56), flow='plan')
     assert len(expected) == len(_extract_round_metadata_records(trusted, flow='plan'))
-    for _ in range(2):
+    for _ in range(3):
         with patch.object(planning, 'select_plan_reviewers', side_effect=AssertionError('scheduled')), \
              patch.object(execution, '_implement_approved_issue', return_value=0) as implement:
             assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
@@ -108,6 +108,8 @@ def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_pa
             (r.metadata.subject, r.metadata.phase) for r in expected]
         # New foreign records on refresh remain opaque too.
         runner.issue_comments.append({**foreign, 'id': 90000 + _, 'createdAt': '2026-01-02T00:00:00Z'})
+    diagnostics = [line for line in capsys.readouterr().err.splitlines() if 'ignored loop record' in line]
+    assert diagnostics and all(len(line) < 500 for line in diagnostics)
 
 
 @pytest.mark.parametrize('trusted', [False, True])
@@ -183,3 +185,41 @@ def test_plan_announcement_readers_use_live_invocation_projection(
         else:
             assert _has_plan_approved_followups_marker(
                 comments, issue_number=56, plan_hash=plan_hash, mode='comment') is eligible
+
+
+@pytest.mark.parametrize('mode', ['plan-only', 'auto'])
+@pytest.mark.parametrize('failure', ['malformed', 'sidecar', 'page', 'identity'])
+def test_plan_invalid_history_two_restarts_then_fresh_recovery(tmp_path, monkeypatch, mode, failure):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    from test_pr_round_ingestion import BAD, spilled
+    runner, config, _ = _approved_closed_history(tmp_path)
+    config = replace(config, plan_execution_mode=mode, quiet=False)
+    with patch.object(execution, '_implement_approved_issue', return_value=0):
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    baseline = list(runner.issue_comments)
+    actor, actor_id = runner.authenticated_actor or ('coding-review-agent-loop', 424242)
+    publications = len(runner.comments)
+    commands = len(runner.commands)
+    for restart in range(2):
+        with patch.object(planning, 'select_plan_reviewers', side_effect=AssertionError('scheduled')), \
+             patch.object(execution, '_implement_approved_issue', return_value=0) as implement:
+            with monkeypatch.context() as broken:
+                if failure in {'malformed', 'sidecar'}:
+                    body = BAD if failure == 'malformed' else spilled()[-1]
+                    runner.issue_comments = [*baseline, {**raw(body, actor, actor_id, 990 + restart),
+                        'createdAt': '2026-01-03T00:00:00Z'}]
+                elif failure == 'page':
+                    broken.setattr(ingestion, 'read_complete_comment_listing',
+                        lambda *a, **k: github.UnknownCommentListing('issue:56', 'truncated page'))
+                else:
+                    broken.setattr(ingestion, 'resolve_authenticated_github_actor',
+                        lambda *a, **k: (_ for _ in ()).throw(AgentLoopError('unknown identity')))
+                with pytest.raises(AgentLoopError):
+                    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+                assert implement.call_count == 0
+                assert len(runner.comments) == publications
+            runner.issue_comments = list(baseline)
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+            assert implement.call_count == (mode == 'auto')
+    assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
+                   for cmd, _ in runner.commands[commands:])

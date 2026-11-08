@@ -19,6 +19,10 @@ every replay; both normalized login and numeric REST ID must match. Without
 configuration only the invocation actor can publish eligible human controls.
 Foreign historical records are ignored and logged without changing comments.
 
+## Reader admission integration
+
+Plan and staged recovery follow the canonical [per-family replay policy](round-state-and-resume.md#per-family-replay-policy). Plan scope, approval announcements, execution decisions, topology and handoffs are invocation-only. Child overrides/supersessions admit the invocation actor plus explicitly configured human login/REST-ID pairs, while coder lineage and rebind remain invocation-only. Parent and child issue histories must be acquired independently on each restart. A separate human account requires `--human-reviewer-trusted-actor LOGIN:ID` on every replay; unconfigured historical controls are ignored/logged, with no expansion of signed-human-requirement policy.
+
 ## Main Lifecycle
 
 ```mermaid
