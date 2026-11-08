@@ -75,30 +75,14 @@ def admitted_pr_comments(
     pr_number: int,
     comments: Sequence[object],
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
-    """Comments with REST author identities, plus the actor, when links exist.
+    """Comments admitted before round or reviewer-board interpretation.
 
     Board-change links are admitted only from the authenticated orchestrator
     actor, so a PR carrying any link record needs both; an incomplete read
     fails closed rather than reading as an empty history.
     """
-    from .github import merge_pr_comment_transport_identity, resolve_authenticated_github_actor
-    from .pr_loop_support import _cached_trusted_actor
-
-    comments = tuple(comments)
-    if not comments_bear_board_change_links(comments):
-        return comments, None
-    if getattr(config, "dry_run", False):
-        actor = _cached_trusted_actor(runner)
-        if actor is None:
-            raise AgentLoopError(
-                f"PR #{pr_number} carries reviewer-board change records, but the authenticated "
-                "GitHub actor is unavailable in dry-run mode, so they cannot be admitted."
-            )
-        return comments, actor
-    merged = merge_pr_comment_transport_identity(
-        runner, config=config, pr_number=pr_number, comments=comments  # type: ignore[arg-type]
-    )
-    return tuple(merged), resolve_authenticated_github_actor(runner, config=config)  # type: ignore[arg-type]
+    from .pr_round_ingestion import admit_pr_comments
+    return admit_pr_comments(runner, config, pr_number=pr_number, comments=comments)
 
 
 def _rebind_signed_segment(config: object, lineage: BoardLineage, configured: BoardIdentity) -> object | None:
@@ -448,7 +432,7 @@ def authenticate_named_legacy_pr_entry(
     pr_view = read_authenticated_protocol_comments(
         runner, config=config, surface_kind="pr", number=pr_number  # type: ignore[arg-type]
     )
-    pr_full = sorted((*pr_view.authored, *pr_view.ignored_foreign), key=lambda c: c.comment_id)
+    pr_full = pr_view.authored
     for record in _extract_round_metadata_records(pr_full, flow="pr"):
         if record.metadata.role not in _LEGACY_ENTRY_ROLES:
             continue

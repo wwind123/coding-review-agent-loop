@@ -23,6 +23,7 @@ from .architecture_context import (
 )
 from .config import AgentLoopConfig
 from .decomposition import PlanDecomposition
+from .pr_round_errors import PrRoundHistoryError
 from .errors import AgentInvocationError, AgentLoopError
 from .github import PullRequestMetadata, post_issue_comment
 from .logging import log
@@ -165,6 +166,8 @@ def _latest_pr_approval_architecture_identity(
     """
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return None
     for record in reversed(records):
@@ -194,6 +197,8 @@ def _latest_pr_architecture_observation(
 def _pr_architecture_observation_record(comments, *, head_sha=None):
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return None
     for record in reversed(records):

@@ -956,6 +956,20 @@ class FakeRunner(Runner):
             return self.issue_comments_by_number[number]
         return self.issue_comments
 
+    def _ensure_fixture_comment_ids(self, comments, number):
+        """Simulate immutable server IDs, including deletion followed by append."""
+        counters = getattr(self, '_fixture_comment_high_water', {})
+        high = max([counters.get(number, 10_000), *(c.get('id', c.get('databaseId', 0))
+                   for c in comments if isinstance(c.get('id', c.get('databaseId')), int))])
+        for comment in comments:
+            if isinstance(comment.get('id', comment.get('databaseId')), int):
+                continue
+            locator = re.search(r'#issuecomment-(\d+)$', comment.get('url') or '')
+            high = max(high + 1, int(locator.group(1))) if locator else high + 1
+            comment['databaseId'] = int(locator.group(1)) if locator else high
+        counters[number] = high
+        self._fixture_comment_high_water = counters
+
     def _pr_payload_for(self, raw):
         number = self._requested_number(raw)
         if number is not None and number in self.pr_payloads_by_number:
@@ -1318,7 +1332,8 @@ class FakeRunner(Runner):
             if self.authenticated_actor is not None:
                 posted['createdAt'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             comments.append(posted)
-            return CommandResult(cmd, cwd_path, json_dumps({'id': 10_000 + len(comments), 'body': body,
+            self._ensure_fixture_comment_ids(comments, number)
+            return CommandResult(cmd, cwd_path, json_dumps({'id': posted['databaseId'], 'body': body,
                 'user': {'login': login, 'id': actor_id}, 'created_at': posted['createdAt']}), '', 0)
 
         if cmd[:3] == ["gh", "api", "user"] and (
@@ -1391,6 +1406,15 @@ class FakeRunner(Runner):
             if requested_pr in self.malformed_pr_view_numbers:
                 return CommandResult(cmd, cwd_path, "not json at all", "", 0)
             payload = self._pr_payload_for(cmd[3] if len(cmd) > 3 else None)
+            # Legacy body-only fixtures now model real GraphQL/REST envelopes.
+            # Tests of unavailable provenance override the REST response itself.
+            self._ensure_fixture_comment_ids(payload.get("comments", []), payload.get("number"))
+            for index, comment in enumerate(payload.get("comments", []), start=1):
+                comment.setdefault("author", {"login": "bot"})
+                if (self.authenticated_actor is None and "_rest_author_id" not in comment
+                    and comment["author"].get("login") == "bot" and "id" not in comment["author"]):
+                    comment["author"] = {"login": "coding-review-agent-loop"}
+                comment.setdefault("createdAt", "2026-01-01T00:00:00Z")
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(
                     cmd,
@@ -1486,16 +1510,20 @@ class FakeRunner(Runner):
                 )
                 else self._issue_comments_for(number)
             )
+            self._ensure_fixture_comment_ids(rest_source, number)
             rest_page = [
                 {
-                    "id": 10_000 + index,
+                    "id": comment.get("id", comment.get("databaseId", 10_000 + index)),
                     "html_url": f"https://github.com/OWNER/REPO/issues/{number}#issuecomment-{10_000 + index}",
                     "user": (
                         {**(comment.get("author") or {}), "id": comment["_rest_author_id"]}
                         if "_rest_author_id" in comment
-                        else comment.get("author")
+                        else {**(comment.get("author") or {"login": "bot"}),
+                              "id": (comment.get("author") or {}).get("id", 424242
+                                     if (comment.get("author") or {}).get("login", "bot") == (self.authenticated_actor or ("coding-review-agent-loop", 424242))[0]
+                                     else 987654)}
                     ),
-                    "created_at": comment.get("createdAt"),
+                    "created_at": comment.get("createdAt") or "2026-01-01T00:00:00Z",
                     "body": comment.get("body"),
                 }
                 for index, comment in enumerate(rest_source, start=1)

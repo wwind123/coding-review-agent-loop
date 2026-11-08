@@ -20,6 +20,7 @@ from .board_amendment import (
     ReviewerBoardAmendment, amend_contract, REVIEWER_SEAT_REMOVAL_REASON,
     REVIEWER_MIXED_REMOVAL_REASON,
 )
+from .pr_round_errors import PrRoundHistoryError
 from .errors import AgentInvocationError, AgentLoopError, QuotaResetExceededError
 from .github import PullRequestChecks
 from .logging import log
@@ -592,6 +593,8 @@ def _round_resolved_history_item_ids(
     """
     try:
         records = _extract_round_metadata_records(comments, flow=flow)
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return ()
     return tuple(

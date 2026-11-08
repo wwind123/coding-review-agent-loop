@@ -664,7 +664,7 @@ def find_actor_round_metadata_comment_ids(
                 "Managed-CI continuity could not inspect PR round metadata comments.", reason
             )
         )
-    by_index = _continuity_round_records(comments)
+    by_index = _continuity_round_records(comments, actor_id=actor_id)
     reviewers: list[int] = []
     coders: list[int] = []
     conflict_coders: list[int] = []
@@ -745,13 +745,16 @@ def find_actor_round_metadata_comment_ids(
 
 
 def _continuity_round_records(
-    comments: list[dict[str, object]],
+    comments: list[dict[str, object]], *, actor_id: int | None = None,
 ) -> dict[int, dict[str, object]]:
-    """Decode only the immutable fields needed by continuity validation."""
+    """Decode continuity fields after partitioning live REST input by actor."""
     bodies = tuple(
         comment.get("body") if isinstance(comment.get("body"), str) else ""
         for comment in comments
     )
+    if actor_id is not None:
+        from .pr_round_ingestion import owned_rest_protocol_bodies
+        bodies = owned_rest_protocol_bodies(comments, actor_id=actor_id)
     result: dict[int, dict[str, object]] = {}
     for index, body in enumerate(bodies):
         matches = tuple(ROUND_RESUME_MARKER_RE.finditer(body))
@@ -772,9 +775,8 @@ def _continuity_round_records(
             raise AgentLoopError("Managed-CI continuity round metadata is malformed.")
         if payload["flow"] != "pr":
             continue
-        # Payloads are arbitrary JSON from any commenter and are decoded before
-        # author filtering, so every raw field is type-checked before it is
-        # compared or hashed (#1367).
+        # Raw codec callers remain untrusted; live REST callers partition by
+        # actor before decoding. Every field still needs its semantic checks.
         raw_phase = payload.get("phase")
         phase = raw_phase if isinstance(raw_phase, str) else None
         seat_binding = payload.get("seat_binding")
@@ -902,7 +904,7 @@ def _ordinary_continuity_round_metadata_is_valid(
     if authorization.kind != "continuity" or not authorization.round_comment_ids:
         return False
     try:
-        by_index = _continuity_round_records(comments)
+        by_index = _continuity_round_records(comments, actor_id=authorization.actor_id)
     except AgentLoopError:
         return False
     selected: list[tuple[int, dict[str, object]]] = []
@@ -1648,7 +1650,7 @@ def _recovery_continuity_is_valid(
     ):
         return False
     try:
-        by_index = _continuity_round_records(comments)
+        by_index = _continuity_round_records(comments, actor_id=context.actor_id)
     except AgentLoopError:
         return False
     wanted = set(authorization.round_comment_ids)

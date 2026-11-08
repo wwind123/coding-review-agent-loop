@@ -64,6 +64,9 @@ def _record(page, contract, ref):
 def resolve_legacy_reference(page, contract, checkpoint):
     """Require a unique completed intent inside the authenticated failure round."""
     from .round_state import _extract_round_metadata_records
+    from .pr_round_ingestion import owned_rest_protocol_bodies
+    # Prove candidate identities before the narrower contract-author projection.
+    owned_rest_protocol_bodies(page, actor_id=contract.trusted_actor_id)
     # GitHub user objects carry extra fields; compare only the authenticated pair.
     trusted = [c for c in page if isinstance(c, dict) and isinstance(c.get('user'), dict)
                and c['user'].get('login') == contract.trusted_actor_login

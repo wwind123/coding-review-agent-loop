@@ -44,6 +44,7 @@ from .board_amendment import (
     reject_misplaced_pr_amendments,
 )
 from .decomposition import approved_plan_hash
+from .pr_round_errors import PrRoundHistoryError
 from .errors import (
     AgentLoopError,
     HumanDecisionRequiredError,
@@ -2643,27 +2644,11 @@ def _resume_pr_round_admitted(
 ) -> ResumedReviewRound | None:
     """Resume a PR round, admitting recovery records only from the authenticated actor.
 
-    REST identities and the actor are fetched only when a recovery record, a
-    head advance, or ``--review-unrecorded-head`` makes admission necessary; an
-    incomplete read stops here, before any agent call.
+    Candidate anchors and sidecars require complete REST provenance before
+    transport parsing, even in dry-run; an incomplete read stops before agents.
     """
-    trusted_actor: tuple[str, int] | None = None
-    if not config.dry_run and pr_resume_needs_author_admission(
-        comments, head_sha, config.review_unrecorded_head
-    ):
-        comments = merge_pr_comment_transport_identity(
-            runner, config=config, pr_number=pr_number, comments=tuple(comments)  # type: ignore[arg-type]
-        )
-        missing = unauthenticated_recovery_record_indexes(
-            comments, head_sha, config.review_unrecorded_head
-        )
-        if missing:
-            raise AgentLoopError(
-                "PR recovery records cannot be authenticated: the REST comment read did not "
-                f"cover recovery record(s) at comment index {', '.join(map(str, missing))}; "
-                "rerun once the complete comment history is readable."
-            )
-        trusted_actor = resolve_authenticated_github_actor(runner, config=config)
+    from .pr_round_ingestion import admit_pr_comments
+    comments, trusted_actor = admit_pr_comments(runner, config, pr_number=pr_number, comments=comments)
     return _resume_pr_round(
         comments,
         head_sha=head_sha,
@@ -3290,6 +3275,8 @@ def _post_reduced_board_completion_note(
     """Post one plain completion note per amendment digest (no round metadata)."""
     try:
         comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         comments = ()
     if any(
@@ -4100,6 +4087,8 @@ def _pr_step_back_decision(
         return PrStepBackDecision()
     try:
         snapshot = _extract_round_metadata_records(snapshot_comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         log(config, "PR step-back suppressed: round history could not be decoded")
         return PrStepBackDecision()
@@ -4110,12 +4099,16 @@ def _pr_step_back_decision(
         return PrStepBackDecision()
     try:
         fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError as exc:
         log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
     fresh_context = observe_pr_head(runner, config=config, pr_number=pr_number, context=fresh_context)
     try:
         fresh = _extract_round_metadata_records(fresh_context.comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError as exc:
         log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
@@ -4234,6 +4227,8 @@ def _pr_step_back_sweep_contexts(
         return {}
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         records = ()
     bound = _step_back.pr_sweep_entries(records, round_number=round_number, head_sha=head_sha)
@@ -4460,68 +4455,17 @@ def _authenticated_pr_comments_status(
     comments: Sequence[object] | None = None,
     resume: bool = False,
 ) -> tuple[tuple[object, ...], tuple[str, int] | None, bool]:
-    """PR comments with REST identities for evidence and visual finding authority.
+    """Admit round anchors and sidecars before any payload-dependent probe.
 
-    The one accessor every consumer of conversion or signed-evidence authority
-    uses instead of the raw GraphQL projection.  When any record carries such
-    authority, identities are merged from the REST history and the
-    authenticated actor is resolved (and cached on the runner).  On
-    ``resume`` an incomplete REST read raises before any agent runs; in a
-    mid-run reread an uncovered record simply stays unadmitted.  In dry-run
-    nothing is fetched and history grants no authority.
-
-    The third value says whether every authority-carrying record was read
-    with a covered identity and a resolved actor.  ``False`` means history is
-    *unavailable*, not rejected: callers must keep any established evidence
-    barrier rather than treat the missing authority as absent (#1325).
+    Every acquisition failure raises, including refreshes: a partial read must
+    never erase an established evidence barrier. Dry-run may acquire identities
+    through these read-only APIs but still cannot publish or launch agents.
     """
     if comments is None:
         comments = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments
-    comments = tuple(comments)
-    try:
-        records = _extract_round_metadata_records(comments, flow="pr")
-    except AgentLoopError:
-        if resume:
-            raise
-        return comments, None, False
-    authority_indexes = [
-        record.index for record in records
-        if record_carries_evidence_authority(record.metadata) or visual_candidate(record.metadata)
-    ]
-    if not authority_indexes:
-        return comments, _cached_trusted_actor(runner), True
-    if config.dry_run:
-        return comments, None, False
-    try:
-        merged = tuple(
-            merge_pr_comment_transport_identity(
-                runner, config=config, pr_number=pr_number, comments=comments  # type: ignore[arg-type]
-            )
-        )
-        actor = resolve_authenticated_github_actor(runner, config=config)
-    except AgentLoopError as exc:
-        if resume:
-            raise
-        log(config, f"Evidence-conversion authority not admitted: identity read failed ({exc})")
-        return comments, None, False
-    missing = [
-        index for index in authority_indexes
-        if index >= len(merged) or getattr(merged[index], "author_id", None) is None
-    ]
-    if (missing or actor is None) and resume:
-        raise AgentLoopError(
-            "PR evidence/visual records cannot be authenticated: the REST comment read did "
-            f"not cover record(s) at comment index {', '.join(map(str, missing))}; rerun once "
-            "the complete comment history is readable. No agent was run."
-        )
-    if missing:
-        log(
-            config,
-            "Evidence-conversion records at comment index "
-            + ", ".join(map(str, missing))
-            + " were not covered by the REST identity read and are not admitted",
-        )
-    return merged, actor, not missing and actor is not None
+    from .pr_round_ingestion import admit_pr_comments
+    hydrated, actor = admit_pr_comments(runner, config, pr_number=pr_number, comments=comments)
+    return hydrated, actor, True
 
 
 def admitted_capture_history(runner, config, *, pr_number, comments):
@@ -4533,9 +4477,6 @@ def admitted_capture_history(runner, config, *, pr_number, comments):
     """
     from .round_state import _extract_round_metadata_records, _recovery_record_admitted
 
-    records = _extract_round_metadata_records(comments, flow="pr")
-    if not any(record.metadata.evidence_conversion is not None for record in records):
-        return records, True
     hydrated, actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments,
     )
@@ -4672,6 +4613,8 @@ def _reconcile_converted_evidence(
         if comments is None:
             try:
                 fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            except PrRoundHistoryError:
+                raise
             except AgentLoopError:
                 visible_comments = None
             else:
@@ -4682,6 +4625,8 @@ def _reconcile_converted_evidence(
             visible_comments = comments
         try:
             raw_records = _extract_round_metadata_records(visible_comments or (), flow="pr")
+        except PrRoundHistoryError:
+            raise
         except AgentLoopError:
             raw_records = ()
         if not any(_is_row_converted_obligation(item) for item in ledger) and not any(
@@ -4695,6 +4640,8 @@ def _reconcile_converted_evidence(
                 records, history_complete = admitted_pr_records_status(
                     runner, config, pr_number=pr_number, comments=visible_comments
                 )
+            except PrRoundHistoryError:
+                raise
             except AgentLoopError as exc:
                 log(config, f"Converted-evidence reconciliation used no history ({exc})")
                 records, history_complete = (), False
@@ -5384,6 +5331,8 @@ def conversion_boundary_candidate_present(
     """
     try:
         raw = _extract_round_metadata_records(tuple(comments), flow="pr")
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return False
     return any(
@@ -5422,6 +5371,8 @@ def conversion_visibility_boundary(
         records, _complete = admitted_pr_records_status(
             runner, config, pr_number=pr_number, comments=comments
         )
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return None
     record = conversion_boundary_record(records, round_number=round_number, head_sha=head_sha)
@@ -5445,29 +5396,15 @@ def round_evidence_authority_records(
 
     Also returns whether the authority history was fully available.
 
-    Reads identities only when a converted obligation, a conversion record,
-    or a signed-evidence reference exists (or ``force``); otherwise there is
-    no #1325 authority to admit and nothing extra is fetched.
+    Admission precedes the content-dependent authority probe. Without converted
+    obligations this helper retains its historical empty-overlay behavior.
     """
-    try:
-        raw = _extract_round_metadata_records(comments, flow="pr")
-    except AgentLoopError:
-        return (), False
-    if not (
-        force
-        or any(_is_row_converted_obligation(item) for item in ledger)
-        or any(
-            record.metadata.phase == EVIDENCE_CONVERSION_PHASE
-            or record.metadata.signed_evidence_references
-            for record in raw
-        )
-    ):
-        return (), True
-    try:
-        return admitted_pr_records_status(runner, config, pr_number=pr_number, comments=comments)
-    except AgentLoopError as exc:
-        log(config, f"Evidence-conversion history not admitted this round ({exc})")
-        return (), False
+    records, complete = admitted_pr_records_status(runner, config, pr_number=pr_number, comments=comments)
+    if not (force or any(_is_row_converted_obligation(item) for item in ledger)
+            or any(record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+                   or record.metadata.signed_evidence_references for record in records)):
+        return (), complete
+    return records, complete
 
 
 # Plain PR pre-panel stop diagnostic; history_export recognizes posted stops by it.

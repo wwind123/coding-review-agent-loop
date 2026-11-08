@@ -3050,13 +3050,12 @@ def test_pr_partial_round_refusal_without_rest_ids_is_provisional(tmp_path):
     for path in _spool_files(config):
         path.unlink()
 
-    message = _refusal_message(runner, config)
-
-    assert "provisional list" in message
-    assert "comment ids could not be read completely" in message
-    assert "Delete these" not in message
-    assert "need not be deleted" not in message
-    assert "id could not be determined" in message
+    comments_before = len(runner.comments)
+    launches_before = list(runner.reviewer_launches)
+    with pytest.raises(AgentLoopError, match="PR round history cannot be authenticated"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(runner.comments) == comments_before
+    assert runner.reviewer_launches == launches_before
 
 
 def _unpublished_reviewer_spool_file(config, markers, runner):
@@ -4758,6 +4757,8 @@ def _clone_plan_comment(comment, serial, **changes):
     payload = dict(decode_mapping(match.group("payload")))
     payload.update(changes)
     clone = dict(comment)
+    clone.pop("id", None)
+    clone.pop("databaseId", None)
     # The fake issue view orders comments by creation time.
     clone["createdAt"] = f"2026-05-23T01:00:{serial:02d}Z"
     clone["body"] = (
@@ -5965,6 +5966,8 @@ def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp
     peer_comment = next(
         copy.deepcopy(c) for c in baseline.pr_payload["comments"] if peer_marker in c["body"]
     )
+    peer_comment.pop("id", None)
+    peer_comment.pop("databaseId", None)
     runner.pr_payload["comments"].append(peer_comment)
     next(p for p in _spool_files(config) if p.name == "Gemini.json").unlink()  # published => discarded
     assert _body_positions(runner, frozen[2]) == []  # A's anchor is still unpublished

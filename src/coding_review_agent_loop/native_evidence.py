@@ -25,16 +25,9 @@ def known_pr_heads(records, current=None):
 
 def native_history(runner, config, pr_number, comments):
     """Admit head subjects and requester votes from the orchestrator's actor."""
-    from .github import merge_pr_comment_transport_identity, resolve_authenticated_github_actor
+    from .pr_round_ingestion import admit_pr_comments
     from .round_state import _extract_round_metadata_records, _recovery_record_admitted
-    if config.dry_run or not comments:
-        return ()
-    raw = _extract_round_metadata_records(comments, flow="pr")
-    if not any(r.metadata.evidence_requests or any(native(i) for i in (*r.metadata.prior_items, *r.metadata.new_items)) for r in raw):
-        return ()
-    hydrated = tuple(merge_pr_comment_transport_identity(
-        runner, config=config, pr_number=pr_number, comments=comments))
-    actor = resolve_authenticated_github_actor(runner, config=config)
+    hydrated, actor = admit_pr_comments(runner, config, pr_number=pr_number, comments=comments)
     return tuple(r for r in _extract_round_metadata_records(hydrated, flow="pr")
                  if _recovery_record_admitted(r, hydrated, actor))
 

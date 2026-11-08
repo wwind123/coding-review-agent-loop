@@ -109,6 +109,7 @@ from .protocol import (
 )
 from .evidence_stall import approved_matrix_row_ids
 from .evidence_conversion import capture_classification_payload
+from .pr_round_errors import PrRoundHistoryError
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -3208,10 +3209,7 @@ def run_pr_loop(
             # exact head stops before any review of it, so a resumed run agrees
             # with the live stop below (#1628).
             if config.pr_step_back_rounds > 0:
-                try:
-                    approach_records = _extract_round_metadata_records(pr_comments, flow="pr")
-                except AgentLoopError:
-                    approach_records = ()
+                approach_records = _extract_round_metadata_records(pr_comments, flow="pr")
                 try:
                     _pr_step_back_approach_alternative_stop(
                         config,
@@ -3411,10 +3409,11 @@ def run_pr_loop(
                     if current_resume is not None:
                         current_resume = dataclasses_replace(current_resume, completed_reviews=())
                     discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
-                    # Refresh conversion visibility (#1664); transport failures
-                    # retain our record, but observation stops must propagate.
+                    # Re-admit conversion visibility; unsafe history never falls back.
                     try:
                         refreshed_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                    except PrRoundHistoryError:
+                        raise
                     except AgentLoopError as exc:
                         log(
                             config,
@@ -3825,6 +3824,8 @@ def run_pr_loop(
                     panel_history = drop_inert_post_reconciliation_checkpoints(
                         _extract_round_metadata_records(pr_comments, flow="pr")
                     )
+                except PrRoundHistoryError:
+                    raise
                 except AgentLoopError as exc:
                     panel_history = None
                     panel_history_error = exc
@@ -4245,6 +4246,8 @@ def run_pr_loop(
                     historical_records = drop_inert_post_reconciliation_checkpoints(
                         authority_records(_extract_round_metadata_records(pr_comments, flow="pr"))
                     )
+                except PrRoundHistoryError:
+                    raise
                 except AgentLoopError:
                     historical_records = ()
                     scheduler_metadata_recovery_full_board = True
@@ -5065,16 +5068,13 @@ def run_pr_loop(
                 and evidence_pass is None
                 and pr_posted_checkpoint is not None
             ):
-                # Panel independence is about what a launching reviewer can
-                # read, not the scheduler phase a record was published under
-                # (#1156).  Visibility is read from the complete history with
-                # this invocation's own checkpoint included, so opening
-                # evidence is never stale.
-                # Transport failure retains the posted checkpoint; an observation
-                # stop or undecodable history forbids reviewer launches.
+                # Read complete current visibility, including our checkpoint,
+                # before any peer launches. Unsafe history forbids fallback.
                 pr_fresh_records: tuple[PostedRoundRecord, ...] | None = None
                 try:
                     pr_fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                except PrRoundHistoryError:
+                    raise
                 except AgentLoopError:
                     pr_fresh_comments = None
                 else:

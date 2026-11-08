@@ -21,6 +21,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from .pr_round_errors import PrRoundHistoryError
 from .errors import AgentLoopError
 from .github import IssueComment, strip_bot_login_suffix
 from .plan_round_closure import (
@@ -411,6 +412,8 @@ def compute_partial_round_recovery(
             subject=subject, reviewer_names=reviewer_names, resume=resume,
             fingerprint=fingerprint, context=context, boundary=boundary,
         )
+    except PrRoundHistoryError:
+        raise
     except AgentLoopError:
         return PartialRoundRecovery(
             verified=False,
@@ -474,6 +477,8 @@ def _compute(
                     attachment_positions.append((position, keys))
                 else:
                     refs.update(referenced_attachment_keys(body))
+        except PrRoundHistoryError:
+            raise
         except AgentLoopError:
             return False
         original_index = [i for i in range(len(comments)) if i not in targets]

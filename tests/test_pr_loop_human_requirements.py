@@ -651,6 +651,10 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
     def next_context(*args, **kwargs):
         nonlocal context_calls
         context_calls += 1
+        if context_calls > 1 and not any(c.get('body') == str(prior_codex_review) for c in runner.pr_payload['comments']):
+            runner.pr_payload['comments'].append({'author': {'login': 'coding-review-agent-loop'},
+                'createdAt': '2026-05-18T11:00:00Z', 'body': str(prior_codex_review),
+                '_rest_author_id': 424242})
         return PullRequestReviewContext(
             metadata=metadata,
             comments=(
@@ -869,6 +873,11 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
                     "html_url": signed_url,
                     "body": signed_body,
                 }] if cmd[2].endswith("page=1") else []
+                if cmd[2].endswith('page=1'):
+                    page.extend({'id': c.get('databaseId', 10_000 + i),
+                        'user': {'login': c['author']['login'], 'id': c.get('_rest_author_id', 424242)},
+                        'created_at': c.get('createdAt'), 'body': c.get('body')}
+                        for i, c in enumerate(self.pr_payload['comments'], start=1) if c['body'] != signed_body)
                 return CommandResult(cmd, Path(cwd), json.dumps(page), "", 0)
             return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
@@ -1078,6 +1087,13 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
         snapshots.append((tuple(items), tuple(result)))
         return result
     monkeypatch.setattr(pr_loop, "_clear_human_requirements_ack_item", capture)
+    if not fresh_read:
+        launches_before = len([cmd for cmd, _ in runner.commands if cmd[0] in {'codex', 'gemini'}])
+        with pytest.raises(AgentLoopError, match='HTTP 503'):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert len([cmd for cmd, _ in runner.commands if cmd[0] in {'codex', 'gemini'}]) == launches_before
+        # Complete acquisition on the next invocation resumes the retained
+        # checkpoint and ledger, rather than continuing with stale peers.
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     after = records()
     assert len([r for r in after if r.metadata.phase == "publication"]) == 4
