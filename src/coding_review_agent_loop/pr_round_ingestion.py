@@ -91,7 +91,8 @@ def admit_pr_comments(
                 and c.created_at == getattr(comment, "created_at", None) and c.body == _canonical_body(comment)]
             if len(matches) == 1:
                 found = matches[0]
-        if protocol_candidate(comment) and (found is None or found.body != _canonical_body(comment)
+        if (protocol_candidate(comment) or protocol_candidate(found)) and (
+                found is None or found.body != _canonical_body(comment)
                 or found.created_at != getattr(comment, "created_at", None)
                 or strip_bot_login_suffix(found.author) != strip_bot_login_suffix(getattr(comment, "author", None))):
             raise AgentLoopError(f"PR round history cannot authenticate comment index {index} "

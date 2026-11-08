@@ -538,6 +538,10 @@ and locator joins. Fresh observations repeat admission; incomplete acquisition o
 contradictory binding stops before history-dependent work, including refreshes.
 Live history failures remain distinguishable from advisory parsing failures, so
 legacy advisory handlers cannot suppress them or reuse an earlier snapshot.
+This includes the late evidence-stall read before dispatch publication and coder
+launch, even when head observation wraps an admission error. Binding validation
+applies when either the projected or REST version contains protocol content;
+ordinary projected prose cannot conceal a changed REST anchor or sidecar.
 Dry-run may use read-only provenance acquisition, without publication or agents.
 The admitted projection, REST-only managed-CI readers and timestamp-preserving
 post-merge restoration share the same owned-envelope check before codec parsing.

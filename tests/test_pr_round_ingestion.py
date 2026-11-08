@@ -127,6 +127,32 @@ def test_provenance_failure_stops_startup_and_refresh_without_stale_reuse(tmp_pa
     assert not runner.comments
 
 
+@pytest.mark.parametrize('direction', ['protocol-to-prose', 'prose-to-protocol'])
+@pytest.mark.parametrize('candidate', ['anchor', 'sidecar', 'board'])
+@pytest.mark.parametrize('drift', ['body', 'author', 'timestamp'])
+def test_binding_drift_checks_protocol_content_on_either_side(tmp_path, monkeypatch, direction, candidate, drift):
+    protocol = {
+        'anchor': str(anchor()),
+        'sidecar': '<!-- AGENT_LOOP_SIDECAR: malformed -->',
+        'board': '<!-- AGENT_PR_BOARD_CHANGE: malformed -->',
+    }[candidate]
+    runner, config, _ = observation(tmp_path, [dict(raw(protocol), databaseId=101)])
+    rest = github._parse_issue_comments(runner.pr_payload['comments'])[0]
+    changes = {'body': {'body': 'Human instruction'},
+               'author': {'author': 'different-author'},
+               'timestamp': {'created_at': '2026-01-02T00:00:00Z'}}[drift]
+    projected = replace(rest, **changes)
+    if direction == 'protocol-to-prose':
+        projected, rest = rest, projected
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    # The authoritative listing and loaded projection refer to the same ID.
+    # force_probe models complete-history acquisition for a capped prose projection.
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing',
+        lambda *args, **kwargs: github.CompleteCommentListing('pr:77', None, (rest,)))
+    with pytest.raises(AgentLoopError, match='content or identity drift'):
+        admit_pr_comments(runner, config, pr_number=77, comments=(projected,), force_probe=True)
+
+
 def test_capped_projection_recovers_older_history_and_preserves_human_prose(tmp_path):
     older = dict(raw(anchor(round_number=1)), databaseId=9000)
     projected = [raw(f'Human instruction {i}') for i in range(100)]

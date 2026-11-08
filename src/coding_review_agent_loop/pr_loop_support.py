@@ -4884,19 +4884,16 @@ def _pr_evidence_stall_decision(
     bound attempt) is computed first; automatic conversion is evaluated and
     persisted next; only when nothing converted is the stall window evaluated,
     so an eligible conversion is never pre-empted by the stall stop.  Returns
-    ``None`` when no applicable approved matrix exists or history cannot be
-    read.  Raises ``HumanDecisionRequiredError`` (exit 4) when K consecutive
+    ``None`` when no applicable approved matrix exists. Live history failures
+    propagate, including acquisition failures wrapped by PR-head observation.
+    Raises ``HumanDecisionRequiredError`` (exit 4) when K consecutive
     qualifying rounds share one unsatisfied-row set.
     """
     if not _matrix_applies(approved_plan_context) or not head_sha:
         return None
     assert approved_plan_context is not None
     identity = approved_plan_context.risk_test_matrix_identity
-    try:
-        records = admitted_pr_records(runner, config, pr_number=pr_number)
-    except AgentLoopError as exc:
-        log(config, f"PR evidence stall suppressed: round history is unavailable ({exc})")
-        return None
+    records = admitted_pr_records(runner, config, pr_number=pr_number)
     history_references, _audits = evidence_authority_from_records(records)
     references = _cumulative_references((*history_references, *signed_evidence_references))
     already = _evidence_conversion.converted_rows(open_items, matrix_identity=identity)
