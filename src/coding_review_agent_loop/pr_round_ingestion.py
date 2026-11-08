@@ -32,7 +32,7 @@ def protocol_candidate(comment: object) -> bool:
     """Recognize malformed record-shaped content without decoding payloads."""
     body = getattr(comment, "body", None)
     return board_control_candidate(comment) or isinstance(body, str) and re.search(
-        r"<!--\s*AGENT_(?:LOOP_META|LOOP_SIDECAR|PR_BOARD_CHANGE|PLAN_BOARD_CHANGE)\b|reviewer-board-amendment", body, re.I) is not None
+        r"<!--\s*AGENT_(?:LOOP_META|LOOP_SIDECAR|PR_BOARD_CHANGE|PLAN_BOARD_CHANGE|PLAN_SCOPE_BOUNDARY)\b|reviewer-board-amendment", body, re.I) is not None
 
 
 

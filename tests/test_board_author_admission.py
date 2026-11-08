@@ -184,3 +184,14 @@ def test_ordinary_signed_json_keeps_the_existing_requirement_policy(tmp_path, fl
     comments = acquire(runner, config, flow)
     assert comments[0].body == body
     assert not any(cmd[:2] == ['gh', 'api'] for cmd, _ in runner.commands)
+
+
+def test_scope_only_issue_history_still_requires_complete_acquisition(tmp_path, monkeypatch):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    from coding_review_agent_loop.plan_board_state import admitted_issue_comments
+    runner, config = fixture(tmp_path, 'plan', [raw('<!-- AGENT_PLAN_SCOPE_BOUNDARY: invalid -->')])
+    source = github._parse_issue_comments(runner.issue_comments)
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing',
+                        lambda *a, **k: github.UnknownCommentListing('issue#56', 'incomplete'))
+    with pytest.raises(AgentLoopError, match='incomplete'):
+        admitted_issue_comments(runner, config=config, issue_number=56, comments=source)
