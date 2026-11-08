@@ -2741,6 +2741,7 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
     refuses before the repaired record is published, and a requirement change
     during it refuses at the approval boundary; neither approves nor hands off."""
     import datetime
+    from coding_review_agent_loop.github import TrustedHumanActor
 
     from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
     from coding_review_agent_loop.board_change import (
@@ -2805,6 +2806,7 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
         agent_max_retries=0, agent_retry_backoff_seconds=0,
+        human_reviewer_trusted_actors=(TrustedHumanActor("operator", 81),),
     )
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         with pytest.raises(AgentLoopError, match=refusal):

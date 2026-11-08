@@ -6,7 +6,7 @@ import pytest
 
 from agent_loop_helpers import FakeRunner, approved_plan_comments, make_config, structured_pr_review
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.github import IssueContext
+from coding_review_agent_loop.github import IssueContext, TrustedHumanActor
 from coding_review_agent_loop.reviewer_floor import (
     BoardSeat,
     SignedBoardAuthorization,
@@ -250,6 +250,7 @@ def _amended_named_pr(
     board = dict(
         reviewer=("codex", "gemini", flash, opus), reviewer_seats=(flash, opus),
         pr_review_policy="selective-intermediate", pre_review_tests=False, agent_max_retries=0,
+        human_reviewer_trusted_actors=(TrustedHumanActor("human-reviewer", 81),),
     )
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **board)) == 0
     runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
@@ -848,11 +849,13 @@ def test_direct_staged_child_entry_floor_uses_the_parent_plan(tmp_path, monkeypa
     from issue_loop_test_helpers import _fresh_child_route_fixture
 
     seats, approved = _three_provider_plan(tmp_path)
+    parent_history = _named_plan_comments(
+        approved, _named_config(tmp_path, seats), removed=("c",), issue=55,
+    )
     parent_comments = tuple(
-        IssueComment(author="bot", created_at=comment["createdAt"], body=comment["body"])
-        for comment in _named_plan_comments(
-            approved, _named_config(tmp_path, seats), removed=("c",), issue=55,
-        )
+        IssueComment(author="coding-review-agent-loop", created_at=comment["createdAt"],
+                     body=comment["body"])
+        for comment in parent_history
     )
     fresh, child, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
     child = dc_replace(child, body="Child phase issue for parent #55.\n\nImplement child.")
@@ -871,7 +874,7 @@ def test_direct_staged_child_entry_floor_uses_the_parent_plan(tmp_path, monkeypa
         monkeypatch.setattr(
             issue_loop, name, lambda *_a, _n=name, **_k: pytest.fail(f"{_n} ran before the floor"),
         )
-    runner = FakeRunner()
+    runner = FakeRunner(issue_comments_by_number={55: parent_history})
     if board == "signed-reduction":
         # The parent's signed 3 -> 2 reduction excuses the reviewer count.
         with pytest.raises(_Reached):

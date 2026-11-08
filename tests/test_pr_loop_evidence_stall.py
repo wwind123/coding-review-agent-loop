@@ -136,7 +136,9 @@ def test_late_evidence_stall_history_failure_stops_before_dispatch(tmp_path, mon
         if failure.startswith('owned-'):
             bad = {'owned-envelope': corruptions()[1], 'owned-payload': corruptions()[2],
                    'owned-sidecar': corruptions()[3]}[failure]
-            runner.pr_payload['comments'].append(raw(bad))
+            runner.pr_payload['comments'].append({
+                **raw(bad), 'author': {'login': 'coding-review-agent-loop'},
+            })
         in_late_read = True
         try:
             return original_decision(*args, **kwargs)

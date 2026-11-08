@@ -979,9 +979,10 @@ def _m943_decoded(body):
     return _decode_round_metadata(match.group("payload")) if match else None
 
 
-def _m943_interrupted_history(tmp_path):
+def _m943_interrupted_history(tmp_path, *, actor=None):
     """Round 3 is partial: Codex's remediation review is posted, Antigravity never ran."""
     runner = _m943_runner()
+    runner.authenticated_actor = actor
     config = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8)
     real_post = architecture_contract.post_issue_comment
 
@@ -1004,6 +1005,8 @@ def _m943_interrupted_history(tmp_path):
 
 
 def _m943_post_amendment(runner, *, effective_from_round, removed=("Antigravity",), **overrides):
+    import datetime
+
     values = dict(
         flow="plan",
         issue=56,
@@ -1020,7 +1023,9 @@ def _m943_post_amendment(runner, *, effective_from_round, removed=("Antigravity"
     runner.issue_comments.append(
         {
             "author": {"login": (runner.authenticated_actor or ("coding-review-agent-loop", 424242))[0]},
-            "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
+            "createdAt": (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                          if runner.authenticated_actor else
+                          f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z"),
             "body": _m943_amendment_comment(**values),
         }
     )

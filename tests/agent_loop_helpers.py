@@ -287,19 +287,21 @@ class FakeRunner(Runner):
         serve_rest_issue_comments=None,
     ):
         super().__init__(dry_run=False)
-        # Opt-in REST issue-comment history (#1018): the paginated
+        # Complete REST issue-comment history: the paginated
         # `issues/N/comments` endpoint answers with the same comments the
         # `gh issue view` projection shows, in REST shape (`user`, numeric
         # `id`, `created_at`), so only REST carries the immutable author ID.
-        self.serve_rest_issue_comments = serve_rest_issue_comments
+        self.serve_rest_issue_comments = (
+            True if serve_rest_issue_comments is None else serve_rest_issue_comments
+        )
         # Opt-in `gh api user` identity (#1018): a (login, id) pair.  When set,
         # issue comments this runner posts carry that immutable author ID, so
         # author-authenticated records can be recovered.  Unset keeps the
-        # historical unresolvable-actor behavior.
+        # default loop identity.
         self.authenticated_actor = authenticated_actor
         # PR recovery admission (#1292) resolves the authenticated actor on head
-        # advances; PR-mode fixtures answer with a default identity unless a test
-        # supplies its own.  Issue-mode fixtures keep the unresolvable behavior.
+        # advances; fixtures answer with a default identity unless a test
+        # supplies its own.
         self.default_pr_actor = True
         self.claude_outputs = list(claude_outputs or [])
         self.codex_outputs = list(codex_outputs or [])
@@ -962,6 +964,13 @@ class FakeRunner(Runner):
         high = max([counters.get(number, 10_000), *(c.get('id', c.get('databaseId', 0))
                    for c in comments if isinstance(c.get('id', c.get('databaseId')), int))])
         for comment in comments:
+            # Legacy body-only fixtures represent loop publications on either
+            # surface. Explicit identities remain untouched for admission tests.
+            comment.setdefault("author", {"login": "bot"})
+            if ("_rest_author_id" not in comment
+                and comment["author"].get("login") == "bot" and "id" not in comment["author"]):
+                comment["author"] = {"login": (self.authenticated_actor or ("coding-review-agent-loop", 424242))[0]}
+            comment.setdefault("createdAt", "2026-01-01T00:00:00Z")
             if isinstance(comment.get('id', comment.get('databaseId')), int):
                 continue
             locator = re.search(r'#issuecomment-(\d+)$', comment.get('url') or '')
@@ -1409,12 +1418,6 @@ class FakeRunner(Runner):
             # Legacy body-only fixtures now model real GraphQL/REST envelopes.
             # Tests of unavailable provenance override the REST response itself.
             self._ensure_fixture_comment_ids(payload.get("comments", []), payload.get("number"))
-            for index, comment in enumerate(payload.get("comments", []), start=1):
-                comment.setdefault("author", {"login": "bot"})
-                if (self.authenticated_actor is None and "_rest_author_id" not in comment
-                    and comment["author"].get("login") == "bot" and "id" not in comment["author"]):
-                    comment["author"] = {"login": "coding-review-agent-loop"}
-                comment.setdefault("createdAt", "2026-01-01T00:00:00Z")
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(
                     cmd,
@@ -1444,6 +1447,7 @@ class FakeRunner(Runner):
             if number in self.malformed_issue_view_numbers:
                 return CommandResult(cmd, cwd_path, "not json at all", "", 0)
             source = self._issue_payload_for(number)
+            self._ensure_fixture_comment_ids(self._issue_comments_for(number), number)
             payload = {
                 "number": source.get("number", 56),
                 "title": source.get("title"),
@@ -1519,7 +1523,7 @@ class FakeRunner(Runner):
                         {**(comment.get("author") or {}), "id": comment["_rest_author_id"]}
                         if "_rest_author_id" in comment
                         else {**(comment.get("author") or {"login": "bot"}),
-                              "id": (comment.get("author") or {}).get("id", 424242
+                              "id": (comment.get("author") or {}).get("id", (self.authenticated_actor or ("coding-review-agent-loop", 424242))[1]
                                      if (comment.get("author") or {}).get("login", "bot") == (self.authenticated_actor or ("coding-review-agent-loop", 424242))[0]
                                      else 987654)}
                     ),

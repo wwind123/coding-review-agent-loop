@@ -888,7 +888,7 @@ def test_m1390_pending_amendment_activates_at_the_fresh_scope_start(tmp_path):
     after the boundary and its audit duplicates neither."""
     from dataclasses import replace as dc_replace
 
-    history_runner = _m943_interrupted_history(tmp_path)
+    history_runner = _m943_interrupted_history(tmp_path, actor=_M1390_ACTOR)
     reduced = dc_replace(_m943_reduced_config(tmp_path), min_reviewers=2)
 
     # An amendment naming the archived re-entry round is refused by the shared
@@ -944,7 +944,7 @@ def test_m1390_pending_amendment_activates_at_the_fresh_scope_start(tmp_path):
 
 def test_m1390_amendment_used_before_the_edit_stays_active_and_is_not_pending(tmp_path):
     """`board-lineage-survives` (active signed amendment)."""
-    runner = _m943_interrupted_history(tmp_path)
+    runner = _m943_interrupted_history(tmp_path, actor=_M1390_ACTOR)
     _m943_post_amendment(runner, effective_from_round=3)
     real_post = architecture_contract.post_issue_comment
 

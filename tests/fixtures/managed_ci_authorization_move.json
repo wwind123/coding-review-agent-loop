@@ -530,7 +530,7 @@
         ]
       },
       "_continuity_link_shape": {
-        "sha256": "fc52414f71aa5d628b82496f585c8a535fd74618467475d78e0cf3c76496741f",
+        "sha256": "f3858e85c051af02661051399d080239603f5a3d0ff1ecedd4f436ff2e41e995",
         "original_lines": [
           1391,
           1431
@@ -547,7 +547,7 @@
         "consumer_candidates": []
       },
       "_ordinary_continuity_round_metadata_is_valid": {
-        "sha256": "b22a5591f901849e013a0729cf1d286bddfc6b86daa2fd384a0d792776bcb9f7",
+        "sha256": "eab4862f7e81ca964e407e17da771e36fd15f75df12f08c91a44cd699f32db77",
         "original_lines": [
           1434,
           1503
@@ -827,7 +827,7 @@
         "consumer_candidates": []
       },
       "_historical_bindings_match": {
-        "sha256": "da787fb28f7da279800c197e844fadce9621524adedd309bc7608d54dac0a0ea",
+        "sha256": "7d04a35cbcb54b8babed810cd4c51b6425de1c88566b53afec62dee128e9e34e",
         "original_lines": [
           1946,
           1974
@@ -841,7 +841,7 @@
         "consumer_candidates": []
       },
       "_rejected_recovery_round_ids": {
-        "sha256": "de542d58d7fec2980705abdd69ce9d976c712e91afcbbc303cd6793a42d50638",
+        "sha256": "71b45bf72a9a2ce736b89cbebf2a4bb0cb555d8ec1020e3cae513a9967c4dbeb",
         "original_lines": [
           1977,
           2121
@@ -863,7 +863,7 @@
         ]
       },
       "_correlate_rejected_recovery": {
-        "sha256": "8d03fd268e61035f59df0b6a31bfdaad9b0a6ea4eeb4bc72fa85ba74d675c7d8",
+        "sha256": "65087d48ee512d17924695d24d45afa88678dd789864df4be34ddeea579eb164",
         "original_lines": [
           2124,
           2164
@@ -1007,7 +1007,7 @@
         "consumer_candidates": []
       },
       "publish_issue_created_continuity_authorization": {
-        "sha256": "f7b7c534f78a3ad6b0574974e4aadc42b4a53d4339d585fecec54359eba01186",
+        "sha256": "df5587b8efe75fe49e28baa18fd513095d88d39abcbbae6498614f2da5872b01",
         "original_lines": [
           2467,
           2795

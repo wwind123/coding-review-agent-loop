@@ -579,7 +579,7 @@ def test_config_from_args_rejects_malformed_entry_before_orchestration(tmp_path,
 # --- other signed records ----------------------------------------------------
 
 
-def test_signed_board_amendment_is_unchanged_and_triggers_no_verification(tmp_path):
+def test_signed_board_amendment_uses_board_admission_without_becoming_a_requirement(tmp_path):
     amendment = format_reviewer_board_amendment_comment(
         flow="plan",
         issue=ISSUE,
@@ -595,14 +595,19 @@ def test_signed_board_amendment_is_unchanged_and_triggers_no_verification(tmp_pa
         projection=_issue_projection(body="plain", comments=[
             _gql_comment(9, "outsider", amendment, url=_issue_comment_url(9))
         ]),
+        rest={"user": {"login": "loop", "id": 42},
+              _comments_path(ISSUE): [_rest_comment(
+                  9, "outsider", 7, amendment, url=_issue_comment_url(9))]},
     )
     context = get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
     assert context.human_requirements == ()
-    assert runner.rest_reads == []
+    assert "user" in runner.rest_reads
+    assert any(path.startswith(_comments_path(ISSUE)) for path in runner.rest_reads)
     amendments = collect_reviewer_board_amendments(
-        [SimpleNamespace(body=amendment)], flow="plan", issue_number=ISSUE
+        context.comments, flow="plan", issue_number=ISSUE
     )
-    assert len(amendments) == 1
+    assert amendments == ()
+    assert context.comments[0].body == amendment
 
 
 @pytest.mark.parametrize("stdout", ["", "  \n"])
