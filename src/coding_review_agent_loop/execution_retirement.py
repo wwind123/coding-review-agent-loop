@@ -69,7 +69,8 @@ class ExecutionHistory:
             spans = [(start, end) for owner, start, end in self.removed_records if owner == identity]
             for start, end in sorted(set(spans), reverse=True):
                 body = body[:start] + body[end:]
-            comments.append(replace(comment, body=body))
+            from .pr_round_ingestion import redact_comment_body
+            comments.append(redact_comment_body(comment, body))
         return replace(context, comments=tuple(comments))
 
 
@@ -100,7 +101,8 @@ def _authenticate_child_pr_history(runner, *, config, context):
             record = decode_issue_pr_handoff_record(match["payload"])
             if record.issue_number != context.number:
                 continue
-            prefix = (*context.comments[:index], replace(comment, body=comment.body[:match.end()]))
+            from .pr_round_ingestion import redact_comment_body
+            prefix = (*context.comments[:index], redact_comment_body(comment, comment.body[:match.end()]))
             if endpoints and endpoints[-1][0] == record.pr_number:
                 endpoints[-1] = (record.pr_number, prefix)
             else:

@@ -205,7 +205,7 @@ def _m943_amendment_from_error(message):
     )
 
 
-def _m943_append(runner, body, login="operator"):
+def _m943_append(runner, body, login="coding-review-agent-loop"):
     comments = runner.pr_payload.setdefault("comments", [])
     comments.append(
         {

@@ -1037,7 +1037,7 @@ def _run_plan_first_loop_body(
     # always comparable.
     plan_amendment_diagnostics: list[str] = []
     plan_board_amendments = collect_reviewer_board_amendments(
-        issue_context.comments,
+        plan_admitted_comments,
         flow="plan",
         issue_number=issue_number,
         ignored_sink=plan_amendment_diagnostics,

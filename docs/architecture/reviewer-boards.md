@@ -4,6 +4,16 @@ How reviewer boards are configured and changed: named reviewer seat preflight, t
 
 Source paths: `src/coding_review_agent_loop/reviewer_seats.py`, `src/coding_review_agent_loop/reviewer_floor.py`, `src/coding_review_agent_loop/board_change.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/pr_board_state.py`, `src/coding_review_agent_loop/plan_board_state.py`, `src/coding_review_agent_loop/plan_verification.py`, `tests/test_reviewer_floor.py`, `tests/test_board_change.py`, `tests/test_board_amendment.py`, `tests/test_pr_loop_reviewer_boards.py`.
 
+Reviewer-board amendment readers consume the shared `amendment_body` projection,
+including PR entry preflight, plan board resolution, plan verification, rerun
+hints and managed continuity lineage reconstruction. Invocation authors and
+configured human LOGIN:ID pairs are eligible; signature text alone grants no
+authority. A separate human account must remain configured on replay, or its
+historical amendments are ignored and logged. Raw prompt discussion is retained.
+The invocation-only round projection is independent, so human amendments cannot
+authenticate co-located scheduler records or sidecars. See
+[board-control admission](round-state-and-resume.md#board-control-author-admission).
+
 ## Named reviewer seat preflight
 
 `reviewer_seats.py` defines an immutable seat configuration with a stable ID,

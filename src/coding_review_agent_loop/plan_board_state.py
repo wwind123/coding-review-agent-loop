@@ -79,57 +79,16 @@ def admitted_issue_comments(
     issue_number: int,
     comments: Sequence[object],
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
-    """Issue comments with REST author identities, plus the actor, when plan links exist.
+    """Acquire complete board-control history with separate family projections.
 
-    Plan board-change links and planning-scope boundary records (#1390) are
-    admitted only from the authenticated orchestrator actor, so an issue
-    carrying either record needs both.  An incomplete REST read fails closed
-    rather than reading as an empty history.  Without such records nothing is
-    read and no actor is needed.
+    Amendments admit invocation or configured human identities; board links
+    and round transport stay invocation-only. Incomplete acquisition fails
+    closed before authoritative parsing, including in read-only preflight.
     """
-    from .github import (
-        _merge_transport_comments,
-        read_rest_issue_comments,
-        resolve_authenticated_github_actor,
+    from .pr_round_ingestion import admit_issue_board_comments
+    return admit_issue_board_comments(
+        runner, config, issue_number=issue_number, comments=comments,
     )
-    from .plan_issue_scope import comments_bear_scope_boundary
-    from .pr_loop_support import _cached_trusted_actor
-
-    comments = tuple(comments)
-    links = comments_bear_board_change_links(comments, surface=PLAN_SURFACE)
-    if not links and not comments_bear_scope_boundary(comments):
-        return comments, None
-    records = (
-        "plan reviewer-board change records" if links else "planning-scope boundary records"
-    )
-    if runner is None:
-        raise AgentLoopError(
-            f"Issue #{issue_number} carries {records}, but no "
-            "authenticated GitHub read is available to admit them."
-        )
-    if getattr(config, "dry_run", False):
-        actor = _cached_trusted_actor(runner)
-        if actor is None:
-            raise AgentLoopError(
-                f"Issue #{issue_number} carries {records}, but the "
-                "authenticated GitHub actor is unavailable in dry-run mode, so they cannot be "
-                "admitted."
-            )
-        return comments, actor
-    if all(getattr(comment, "author_id", None) is not None for comment in comments):
-        merged = comments
-    else:
-        transport = read_rest_issue_comments(
-            runner,  # type: ignore[arg-type]
-            config=config,  # type: ignore[arg-type]
-            issue_number=issue_number,
-            purpose=f"{records} cannot be authenticated",
-            reject_empty_output=True,
-        )
-        merged = _merge_transport_comments(
-            comments, transport, issue_number=issue_number  # type: ignore[arg-type]
-        )
-    return tuple(merged), resolve_authenticated_github_actor(runner, config=config)  # type: ignore[arg-type]
 
 
 def plan_drift_error(issue_number: int) -> Callable[[object, str], AgentLoopError]:

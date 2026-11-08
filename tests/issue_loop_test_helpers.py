@@ -1016,9 +1016,10 @@ def _m943_post_amendment(runner, *, effective_from_round, removed=("Antigravity"
         rationale="Antigravity weekly quota exhausted.",
     )
     values.update(overrides)
+    runner.serve_rest_issue_comments = True
     runner.issue_comments.append(
         {
-            "author": {"login": "operator"},
+            "author": {"login": (runner.authenticated_actor or ("coding-review-agent-loop", 424242))[0]},
             "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
             "body": _m943_amendment_comment(**values),
         }

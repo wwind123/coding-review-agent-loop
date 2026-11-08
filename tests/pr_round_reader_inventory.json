@@ -18,6 +18,24 @@
     "provenance": "Pure architecture reducers: live PR qualification and startup pass the admitted observed context."
   },
   {
+    "module": "board_amendment",
+    "function": "collect_reviewer_board_amendments",
+    "call": "codec(body, comment_locator=f'{surface} comment {index + 1}', comment_index=index)",
+    "provenance": "Offline parser internals and signed-requirement classification retain raw bodies. Live amendment collection and misplaced-record rejection read only amendment_body on the immutable shared admission projection; raw inputs remain available for offline codec tests."
+  },
+  {
+    "module": "board_amendment",
+    "function": "reject_misplaced_pr_amendments",
+    "call": "codec(body, comment_locator=f'issue #{issue_number} comment {index + 1}', comment_index=index)",
+    "provenance": "Offline parser internals and signed-requirement classification retain raw bodies. Live amendment collection and misplaced-record rejection read only amendment_body on the immutable shared admission projection; raw inputs remain available for offline codec tests."
+  },
+  {
+    "module": "board_amendment",
+    "function": "restoration_rounds_from_comments",
+    "call": "codec(body, comment_locator=f'comment {index + 1}', comment_index=index)",
+    "provenance": "Offline parser internals and signed-requirement classification retain raw bodies. Live amendment collection and misplaced-record rejection read only amendment_body on the immutable shared admission projection; raw inputs remain available for offline codec tests."
+  },
+  {
     "module": "board_change",
     "function": "board_reentry_round",
     "call": "codec(comments, flow=surface.flow)",
@@ -28,6 +46,12 @@
     "function": "lineage_binding_resolver",
     "call": "codec(namespaced, flow='pr')",
     "provenance": "board_reentry_round is a pure dynamic-flow reducer supplied admitted PR comments or plan comments; lineage_binding_resolver validates REST candidate identities and binds a protocol-only actor partition while retaining raw board-link prose for lineage authorization."
+  },
+  {
+    "module": "board_change",
+    "function": "lineage_binding_resolver",
+    "call": "codec(namespaced, flow='pr', pr_number=pr_number, ignored_sink=[])",
+    "provenance": "lineage_binding_resolver receives complete REST comments from managed continuity, partitions amendments with human_control_eligibility using the invocation configuration and login/ID, and masks round metadata separately before decoding."
   },
   {
     "module": "child_plan_binding",
@@ -187,9 +211,21 @@
   },
   {
     "module": "plan_board_state",
+    "function": "resolve_plan_board_state",
+    "call": "codec(comments, flow='plan', issue_number=issue_number, ignored_sink=diagnostics if diagnostics is not None else [])",
+    "provenance": "resolve_plan_board_state acquires through admitted_issue_comments; resolve_plan_lineage receives that admitted observation from live preflight and plan lifecycle callers. amendment_body is separate from protocol_body."
+  },
+  {
+    "module": "plan_board_state",
     "function": "resolve_plan_lineage",
     "call": "codec(comments, flow='plan')",
     "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_board_state",
+    "function": "resolve_plan_lineage",
+    "call": "codec(comments, flow='plan', issue_number=issue_number, ignored_sink=diagnostics if diagnostics is not None else [])",
+    "provenance": "resolve_plan_board_state acquires through admitted_issue_comments; resolve_plan_lineage receives that admitted observation from live preflight and plan lifecycle callers. amendment_body is separate from protocol_body."
   },
   {
     "module": "plan_execution",
@@ -202,6 +238,12 @@
     "function": "_run_plan_first_loop_body",
     "call": "codec(issue_context.comments, flow='plan')",
     "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body",
+    "call": "codec(plan_admitted_comments, flow='plan', issue_number=issue_number, ignored_sink=plan_amendment_diagnostics)",
+    "provenance": "Planning acquisition calls admitted_issue_comments before board resolution; this collection explicitly uses plan_admitted_comments rather than raw scoped prompt context."
   },
   {
     "module": "plan_first_loop",
@@ -265,6 +307,12 @@
   },
   {
     "module": "plan_verification",
+    "function": "derive_plan_verification_context",
+    "call": "codec(comments, flow='plan', issue_number=issue_number)",
+    "provenance": "derive_plan_verification_context receives admitted_issue_comments from live board preflight, handoff and canonical plan verification; offline reducers may retain raw inputs. Amendment discovery reads the family-specific amendment_body projection."
+  },
+  {
+    "module": "plan_verification",
     "function": "plan_verification_inputs",
     "call": "codec(comments, flow='plan')",
     "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
@@ -280,6 +328,12 @@
     "function": "restore",
     "call": "codec(comments, flow='pr')",
     "provenance": "restore admits through _authenticated_pr_comments_status or read_authenticated_protocol_comments; find_publication receives view.authored from exhaustive REST."
+  },
+  {
+    "module": "pr_board_entry",
+    "function": "_enforce_pr_board_floor",
+    "call": "codec(pr_context.comments, flow='pr', pr_number=pr_number, ignored_sink=[])",
+    "provenance": "_enforce_pr_board_floor first calls admitted_pr_comments before testing for amendments or performing any write; resolve_pr_board_state repeats the bound acquisition."
   },
   {
     "module": "pr_board_state",
@@ -300,6 +354,12 @@
     "provenance": "resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view."
   },
   {
+    "module": "pr_board_state",
+    "function": "resolve_pr_board_state",
+    "call": "codec(comments, flow='pr', pr_number=pr_number, ignored_sink=diagnostics if diagnostics is not None else [])",
+    "provenance": "resolve_pr_board_state calls admitted_pr_comments before this collection. The amendment_body projection admits invocation or configured human login/ID pairs; protocol_body remains invocation-only."
+  },
+  {
     "module": "pr_loop",
     "function": "run_pr_loop",
     "call": "codec(initial_pr_context.comments, flow='pr')",
@@ -308,8 +368,26 @@
   {
     "module": "pr_loop",
     "function": "run_pr_loop",
+    "call": "codec(initial_pr_context.comments, flow='pr', pr_number=pr_number, ignored_sink=[])",
+    "provenance": "initial_pr_context comes from get_pr_review_context and its shared admission binding; owning issue_context comes from get_issue_context, which admits amendment candidates before misplaced-record diagnostics."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(initial_pr_context.comments, flow='pr', pr_number=pr_number, ignored_sink=pr_amendment_diagnostics)",
+    "provenance": "initial_pr_context comes from get_pr_review_context and its shared admission binding; owning issue_context comes from get_issue_context, which admits amendment candidates before misplaced-record diagnostics."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
     "call": "codec(issue_context.comments, flow='plan')",
     "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(issue_context.comments, issue_number=issue_context.number)",
+    "provenance": "initial_pr_context comes from get_pr_review_context and its shared admission binding; owning issue_context comes from get_issue_context, which admits amendment candidates before misplaced-record diagnostics."
   },
   {
     "module": "pr_loop",
@@ -370,6 +448,18 @@
     "function": "_fresh_pr_qualification_snapshot",
     "call": "codec(context.comments, flow='pr')",
     "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_fresh_pr_qualification_snapshot",
+    "call": "codec(fresh_issue.comments, issue_number=fresh_issue.number)",
+    "provenance": "The PR hint receives acquired get_pr_review_context comments; qualification refresh obtains fresh_issue via get_issue_context before misplaced amendment rejection. Both read amendment_body, never grant authority to raw discussion."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_pr_amendment_plan_board_hint",
+    "call": "codec(pr_comments, flow='pr', pr_number=pr_number)",
+    "provenance": "The PR hint receives acquired get_pr_review_context comments; qualification refresh obtains fresh_issue via get_issue_context before misplaced amendment rejection. Both read amendment_body, never grant authority to raw discussion."
   },
   {
     "module": "pr_loop_support",

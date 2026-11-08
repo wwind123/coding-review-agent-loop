@@ -4,6 +4,12 @@ The main lifecycle diagram and the plan-first path up to the implementation PR: 
 
 Source paths: `src/coding_review_agent_loop/plan_ownership.py`, `tests/test_plan_ownership.py`, `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/plan_execution.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
 
+Plan board-control acquisition uses `admitted_issue_comments` and the shared
+family projections described in [round state](round-state-and-resume.md#board-control-author-admission).
+Board-amendment parsing reads the human-control projection, while raw discussion
+remains prompt context. Scope blanking clears both bound projections together
+and preserves comment positions; it cannot restore an excluded record.
+
 ## Main Lifecycle
 
 ```mermaid

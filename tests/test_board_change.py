@@ -104,7 +104,7 @@ def _named(tmp_path, *seats, **overrides):
     )
 
 
-def _append(runner, body, *, login="operator", author_id=None):
+def _append(runner, body, *, login="coding-review-agent-loop", author_id=None):
     comments = runner.pr_payload.setdefault("comments", [])
     entry = {
         "author": {"login": login},
@@ -432,7 +432,7 @@ def test_inconsistent_link_records_fail_closed_at_startup_and_qualification(tmp_
                    "foreign-illegal-characters": "!!not*base64!!"}[corruption]
         author = 9 if corruption.startswith("foreign") else _ACTOR_ID
         _append(runner, f"Board change.\n\n<!-- {BOARD_CHANGE_LINK_MARKER}: {payload} -->",
-                login="mallory" if author == 9 else "operator", author_id=author)
+                login="mallory" if author == 9 else "coding-review-agent-loop", author_id=author)
     comments = len(runner.pr_payload["comments"])
     start = len(runner.commands)
     with pytest.raises(AgentLoopError, match="lineage is inconsistent|not authored"):
@@ -2424,7 +2424,7 @@ def test_named_legacy_all_reviewers_signed_reduction(tmp_path, floor, flags):
     assert len(runner.pr_payload["comments"]) == comments and _agents(runner, before) == []
     # REST attributes the operator's signed amendment to its own user ID; the
     # named legacy entry check (#1365) reads every comment's author.
-    _append(runner, _amendment_from(str(refused.value)), author_id=81)
+    _append(runner, _amendment_from(str(refused.value)), author_id=_ACTOR_ID)
     start = len(runner.commands)
     _queue_reviews(runner, kept)
     assert run_pr_loop(runner, pr_number=77, config=reduced if flags == "reduced" else original) == 0
@@ -2562,7 +2562,7 @@ def _gemini_blocks_round_one(tmp_path, reviewers=("codex", "gemini")):
     return runner
 
 
-def _append_issue_comment(runner, body, *, login="operator", author_id=81):
+def _append_issue_comment(runner, body, *, login="agent-loop", author_id=4242):
     """An operator comment created now, after every comment the run posted."""
     import datetime
 

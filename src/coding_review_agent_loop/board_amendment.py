@@ -513,7 +513,7 @@ def collect_reviewer_board_amendments(
         raise AgentLoopError(f"Unknown reviewer-board amendment flow {flow!r}.")
     by_digest: dict[str, ReviewerBoardAmendment] = {}
     for index, comment in enumerate(comments):
-        body = getattr(comment, "body", None)
+        body = getattr(comment, "amendment_body", getattr(comment, "body", None))
         if not isinstance(body, str):
             continue
         records, ignored = parse_reviewer_board_amendment_records(
@@ -563,7 +563,7 @@ def reject_misplaced_pr_amendments(
     amendment is only valid on the PR itself.
     """
     for index, comment in enumerate(issue_comments):
-        body = getattr(comment, "body", None)
+        body = getattr(comment, "amendment_body", getattr(comment, "body", None))
         if not isinstance(body, str):
             continue
         records, _ignored = parse_reviewer_board_amendment_records(
@@ -1083,7 +1083,7 @@ def restoration_rounds_from_comments(
     """
     rounds: dict[str, int] = {}
     for index, comment in enumerate(comments):
-        body = getattr(comment, "body", None)
+        body = getattr(comment, "amendment_body", getattr(comment, "body", None))
         if not isinstance(body, str):
             continue
         records, _ignored = parse_reviewer_board_amendment_records(

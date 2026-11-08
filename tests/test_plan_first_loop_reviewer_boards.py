@@ -256,7 +256,7 @@ def test_board_amendment_rejects_an_old_board_checkpoint_after_the_record(tmp_pa
     stale = replace(_m943_decoded(old_checkpoint["body"]), scheduler_reasons=("stale board",))
     runner.issue_comments.append(
         {
-            "author": {"login": "bot"},
+            "author": {"login": "coding-review-agent-loop"},
             "createdAt": "2026-05-23T00:59:00Z",
             "body": _attach_round_metadata("Plan review scheduling audit.\n\n-- Orchestrator", stale),
         }
@@ -270,6 +270,7 @@ def test_board_amendment_rejects_an_old_board_checkpoint_after_the_record(tmp_pa
 def test_board_amendment_invalid_records_fail_closed_or_are_ignored(tmp_path):
     """Row record-invalid at the orchestrator: no partial amendment is applied."""
     unsigned = _m943_interrupted_history(tmp_path)
+    unsigned.serve_rest_issue_comments = True
     unsigned.issue_comments.append(
         {
             "author": {"login": "operator"},

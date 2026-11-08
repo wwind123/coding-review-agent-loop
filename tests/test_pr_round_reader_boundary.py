@@ -13,7 +13,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'src/coding_review_agent_loop'
-CODECS = {'_extract_round_metadata_records', '_decode_round_metadata_records', '_continuity_round_records'}
+CODECS = {'_extract_round_metadata_records', '_decode_round_metadata_records', '_continuity_round_records',
+          'collect_reviewer_board_amendments', 'reject_misplaced_pr_amendments',
+          'parse_reviewer_board_amendment_records'}
 
 
 def calls(source, exports=None):
@@ -82,6 +84,8 @@ def test_round_reader_call_sites_have_reviewed_input_provenance():
 
 
 @pytest.mark.parametrize('source', [
+    'def new_reader(comments):\n return collect_reviewer_board_amendments(comments, flow="pr", pr_number=77)',
+    'from .board_amendment import collect_reviewer_board_amendments as read\ndef new_reader(comments, flow):\n return read(comments, flow=flow)',
     'def new_reader(comments):\n return _extract_round_metadata_records(comments, flow="pr")',
     'from .round_state import _extract_round_metadata_records as read\ndef new_reader(comments, flow):\n return read(comments, flow=flow)',
     'from . import orchestrator as loop\ndef new_reader(comments, flow):\n read = loop._extract_round_metadata_records\n return read(comments, flow=flow)',

@@ -21,6 +21,7 @@ from coding_review_agent_loop.board_amendment import (
     reviewer_board_amendment_payload,
 )
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.github import TrustedHumanActor
 from coding_review_agent_loop.plan_review_scheduling import (
     PlanReviewSchedulingContract,
     make_plan_contract,
@@ -356,12 +357,14 @@ def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, p
         codex_outputs=[structured_plan_review()],
         gemini_outputs=[structured_plan_review(reviewer="Google Gemini")],
         antigravity_outputs=[unavailable, unavailable],
+        serve_rest_issue_comments=True,
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini", flash, opus),
         reviewer_seats=(flash, opus), review_parallel=True,
         plan_review_policy=policy,
         primary_plan_reviewer="codex" if policy == "primary-then-panel" else None,
+        human_reviewer_trusted_actors=(TrustedHumanActor("operator", 81),),
         plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=4,
     )
     with pytest.raises(AgentLoopError) as initial_error:
@@ -605,7 +608,7 @@ def test_named_pr_two_local_failures_template_recovers_on_original_board(tmp_pat
     assert record.removed_reviewers == ("flash", "opus")
     comment_index = len(runner.pr_payload["comments"])
     runner.pr_payload["comments"].append({
-        "body": template, "author": {"login": "operator", "id": 81},
+        "body": template, "author": {"login": "coding-review-agent-loop", "id": 424242},
         "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z", "id": 991,
     })
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -663,7 +666,7 @@ def test_named_pr_mixed_stop_template_recovers_on_original_board(tmp_path):
     assert set(record.removed_reviewers) == {"Gemini", "flash", "opus"}
     comment_index = len(runner.pr_payload["comments"])
     runner.pr_payload["comments"].append({
-        "body": template, "author": {"login": "operator", "id": 81},
+        "body": template, "author": {"login": "coding-review-agent-loop", "id": 424242},
         "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z", "id": 991,
     })
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -754,6 +757,7 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini", flash, opus), reviewer_seats=(flash, opus),
+        human_reviewer_trusted_actors=(TrustedHumanActor("human-reviewer", 81),),
         pr_review_policy="selective-intermediate", max_rounds=4,
         pre_review_tests=False, agent_max_retries=0,
     )
