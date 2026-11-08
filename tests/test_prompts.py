@@ -6808,6 +6808,7 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     and the ``small-host`` variant proves the comparison does not depend on
     the machine running it.  The worker estimate is pinned to the recorded
     budget so the worker-dependent guidance sentences stay comparable.
+    The baseline includes intentional reviewer-guidance updates from #1954.
     """
     import json as _golden_json
     import os as _golden_os
