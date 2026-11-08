@@ -489,7 +489,8 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
     if has_git:
         release_orphaned_admin_response_roots(store)
         _git(runner, store, "worktree", "prune", check=False)
-    if store.is_dir() and _is_stale_default_workdir(store):
+    if (store.is_dir() and _is_stale_default_workdir(store)
+            and not (has_git and _store_has_empty_commit(store, runner))):
         # Without a .git there can be no linked worktrees, so skip the enumeration.
         if has_git and len(_linked_worktrees(store, runner)) > 1:
             pass  # live linked worktrees: never delete the store under them
@@ -544,10 +545,49 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             f"Shared store {store} exists but is not a git checkout. Remove it so it can be re-cloned."
         )
     _validate_repo_remote(store, label="Shared store", config=config, runner=runner)
-    if free:
+    if free and not _store_is_unborn(store, runner):
         detach = _git(runner, store, "checkout", "--detach", check=False)
         if detach.returncode != 0:
             log(config, f"Could not detach the shared store HEAD at {store}; leaving it as is.")
+
+
+def _store_is_unborn(store: Path, runner: Any) -> bool:
+    """Recognize only a missing, valid symbolic HEAD with an empty index."""
+    head = _git(runner, store, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
+    if head.returncode == 0:
+        return False
+    symbolic = _git(runner, store, "symbolic-ref", "-q", "HEAD", check=False)
+    ref = symbolic.stdout.strip()
+    if (head.returncode != 1 or symbolic.returncode != 0 or not ref.startswith("refs/heads/")
+            or _git(runner, store, "check-ref-format", ref, check=False).returncode != 0
+            or _git(runner, store, "show-ref", "--verify", "--quiet", ref, check=False).returncode != 1):
+        raise AgentLoopError(f"Cannot safely inspect unborn shared store HEAD at {store}.")
+    index = _git(runner, store, "ls-files", "--stage", "-z", check=False)
+    if index.returncode != 0 or index.stdout:
+        raise AgentLoopError(f"Cannot bootstrap unborn shared store {store}: index is not verified empty.")
+    return True
+
+
+def _store_has_empty_commit(store: Path, runner: Any) -> bool:
+    """Exempt only born empty-tree stores from artifact-only staleness."""
+    head = _git(runner, store, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
+    if head.returncode != 0:
+        return False
+    tree = _git(runner, store, "ls-tree", "-z", head.stdout.strip(), check=False)
+    index = _git(runner, store, "ls-files", "--stage", "-z", check=False)
+    return tree.returncode == 0 and not tree.stdout and index.returncode == 0 and not index.stdout
+
+
+def _bootstrap_store(store: Path, sha: str, runner: Any) -> None:
+    if not _store_is_unborn(store, runner):
+        return
+    checkout = _git(runner, store, "checkout", "--detach", "--no-overwrite-ignore", sha, check=False)
+    if checkout.returncode != 0:
+        raise AgentLoopError(f"Could not bootstrap shared store {store} at the imported base.")
+    head = _git(runner, store, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+    symbolic = _git(runner, store, "symbolic-ref", "-q", "HEAD", check=False)
+    if head.returncode != 0 or head.stdout.strip() != sha or symbolic.returncode != 1:
+        raise AgentLoopError(f"Could not verify detached bootstrap of shared store {store}.")
 
 
 def _store_tracks_paths(store: Path, runner: Any) -> bool:
@@ -612,7 +652,10 @@ def _fetch_and_pin(store: Path, base: str, *, config: Any, runner: Any, free: bo
         local_origin=config.trusted_local_origin,
         **_transport_options(config),
     )
+    if not free and _store_is_unborn(store, runner):
+        raise AgentLoopError(_held_store_message(store, "needs unborn checkout bootstrap"))
     if free:
+        _bootstrap_store(store, sha, runner)
         _fast_forward_base(store, base, sha, config=config, runner=runner)
     return sha
 

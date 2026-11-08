@@ -34,7 +34,10 @@ root. Base and PR syncs check out an immutable SHA pinned under the store lock,
 so a concurrent fetch cannot move another run's checkout; the PR path still
 compares the pin with the advertised head. The local `<base>` ref moves only by
 a guarded compare-and-swap `git update-ref` fast-forward, skipped when `<base>` is checked out in
-any worktree. The outermost `workdir_claim_scope` runs registered finalizers
+any worktree. After import, free stores with verified unborn symbolic HEADs and empty
+indexes bootstrap non-forced and detached before base publication and setup,
+even with linked worktrees. Conflicts refuse; linked checkouts stay intact.
+Born empty-tree stores with empty indexes bypass shared-store staleness only. The outermost `workdir_claim_scope` runs registered finalizers
 (identity-verified worktree removal) before releasing claims, on success and
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
