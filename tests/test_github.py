@@ -894,7 +894,7 @@ def test_patch_malformed_readback_never_authorizes_replay(tmp_path, quiet, sleep
 
 class _PaginatedIssueCommentsRunner(_FakeRunner):
     def __init__(self, pages):
-        super().__init__(issue_comments=[])
+        super().__init__(issue_comments=[], authenticated_actor=("agent", 7))
         self.pages = pages
         self.rest_comment_requests = []
 
@@ -958,7 +958,7 @@ def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(t
         {
             "id": index + 1,
             "body": f"ordinary {index}",
-            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "created_at": f"2026-09-17T04:{index // 60:02d}:{index % 60:02d}Z",
             "user": {"login": "agent", "id": 7},
         }
         for index in range(100)
@@ -975,7 +975,7 @@ def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(t
     runner.issue_comments = [
         {
             "author": {"login": "agent", "id": 7},
-            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "createdAt": f"2026-09-17T04:{index // 60:02d}:{index % 60:02d}Z",
             "body": f"ordinary {index}",
         }
         for index in range(100)
@@ -987,7 +987,8 @@ def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(t
     assert recovered.comment_id == 101
     assert recovered.author == "agent"
     assert recovered.author_id == 7
-    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+    # Transport recovery and author admission independently read complete pages.
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"] * 2
 
 
 def test_issue_comment_recovery_discovers_canonical_round_transport(
@@ -1012,7 +1013,7 @@ def test_issue_comment_recovery_discovers_canonical_round_transport(
         {
             "id": index + 1,
             "body": f"ordinary {index}",
-            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "created_at": f"2026-09-17T04:{index // 60:02d}:{index % 60:02d}Z",
             "user": {"login": "agent", "id": 7},
         }
         for index in range(100)
@@ -1029,7 +1030,7 @@ def test_issue_comment_recovery_discovers_canonical_round_transport(
     runner.issue_comments = [
         {
             "author": {"login": "agent", "id": 7},
-            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "createdAt": f"2026-09-17T04:{index // 60:02d}:{index % 60:02d}Z",
             "body": f"ordinary {index}",
         }
         for index in range(100)
@@ -1041,7 +1042,8 @@ def test_issue_comment_recovery_discovers_canonical_round_transport(
     assert recovered.comment_id == 101
     assert recovered.author == "agent"
     assert recovered.author_id == 7
-    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+    # Transport recovery and author admission independently read complete pages.
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"] * 2
 
 
 def test_issue_comment_recovery_fails_closed_when_a_later_rest_page_is_unavailable(tmp_path):

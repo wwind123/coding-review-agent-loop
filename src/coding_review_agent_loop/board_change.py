@@ -2115,6 +2115,8 @@ def lineage_binding_resolver(
     comments: Sequence[Mapping[str, object]],
     *,
     actor_id: int | None,
+    actor_login: str = "orchestrator",
+    config: object = None,
 ) -> Callable[[int, int], tuple[Mapping[str, object] | None, ...]] | None:
     """Historical seat bindings from the validated board lineage, for managed CI.
 
@@ -2143,7 +2145,7 @@ def lineage_binding_resolver(
     def refuse(_index: int, _round: int) -> tuple[Mapping[str, object] | None, ...]:
         return ()
 
-    from .pr_round_ingestion import AdmittedPrComment, owned_rest_protocol_bodies
+    from .pr_round_ingestion import AdmittedPrComment, owned_rest_protocol_bodies, human_control_eligibility, board_control_candidate
     try:
         owned_rest_protocol_bodies(comments, actor_id=actor_id)
     except AgentLoopError:
@@ -2152,10 +2154,20 @@ def lineage_binding_resolver(
     for comment in comments:
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
         raw = body(comment)
+        identity = SimpleNamespace(author=user.get("login"), author_id=user.get("id"))
+        try:
+            eligible, reason = human_control_eligibility(
+                identity, actor=(actor_login, actor_id), config=config)
+        except AgentLoopError:
+            return refuse
+        if board_control_candidate(SimpleNamespace(body=raw)) and not eligible and config is not None:
+            from .logging import log
+            log(config, f"PR history comment {comment.get('id')}: ignored reviewer-board amendment: {reason}.")
         namespaced.append(AdmittedPrComment(
             body=raw, author=user.get("login"), author_id=user.get("id"),
             created_at=comment.get("created_at"), comment_id=comment.get("id"),
-            invocation_actor_id=actor_id, admitted_body=raw, admitted_protocol_body=raw))
+            invocation_actor_id=actor_id, admitted_body=raw, admitted_protocol_body=raw,
+            amendment_eligible=eligible))
     try:
         match = next(
             found for item in namespaced if (found := BOARD_CHANGE_LINK_RE.search(item.body))
@@ -2172,7 +2184,7 @@ def lineage_binding_resolver(
             ),
             configured=root,
             pr_number=pr_number,
-            trusted_actor=("orchestrator", actor_id) if actor_id is not None else None,
+            trusted_actor=(actor_login, actor_id) if actor_id is not None else None,
             contract_from_metadata=_scheduler_contract_from_metadata,
             drift_error=lambda _persisted, detail: AgentLoopError(detail),
         )

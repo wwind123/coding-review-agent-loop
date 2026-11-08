@@ -24,6 +24,35 @@ points and patched-name lookups remain in `github.py`. The extraction preserves
 reference grammar, Markdown exclusions and existing import identities without
 changing the trust or persistence contracts.
 
+## Board-control author admission
+
+`pr_round_ingestion.py` owns the shared issue/PR acquisition and immutable
+family projections. Amendment-only candidates trigger a complete REST comment
+listing and invocation-actor resolution before parsing. REST-only candidates
+join that observation; incomplete pagination, missing identities or disagreement
+with the loaded comment's body, login or numeric ID fails closed, including in
+read-only preflight. Raw discussion and full-list comment indices remain available.
+
+Reviewer-board amendments admit the authenticated invocation actor plus
+`config.human_reviewer_trusted_actors`, using the existing normalized login AND
+numeric REST user ID matcher. Empty human configuration admits only the
+invocation actor. Operators using a separate account must configure
+`--human-reviewer-trusted-actor LOGIN:ID`, including for historical replay.
+Ineligible historical amendments are ignored with a bounded diagnostic naming
+the surface, comment and rejection reason; comments are never rewritten.
+Signature, payload, chronology, floor and misplaced-record checks still apply
+to admitted amendments. Source-managed continuity publication and restart pass
+the invocation configuration into historical board reconstruction, so both use
+the same configured human identities as ordinary PR admission.
+
+The amendment projection grants no authority to loop-published records sharing
+the same comment. Round anchors and sidecars use a separate invocation-only
+projection before decoding or hydration. Human trust configuration never
+expands that author set. The later plan/decomposition and contract/recovery
+stages own migration of their remaining readers; this board stage does not
+claim those readers are complete. Signed human requirements retain their
+separate author policy and unconfigured behavior.
+
 ## Legacy PR acknowledgement recovery
 
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,

@@ -861,6 +861,7 @@ def _continuity_link_shape(
     comments_by_id: Mapping[int, Mapping[str, object]] | None = None,
     chain_context: "ChainAuthContext | None" = None,
     expected_seat_binding: Mapping[str, object] | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> Literal["ordinary", "recovery"] | None:
     """Classify a continuity link as ordinary, rejected-coder recovery, or invalid.
 
@@ -868,7 +869,10 @@ def _continuity_link_shape(
     than the predecessor authorization, the recovery shape binds a review
     older than the fresh predecessor grant.
     """
-    if _ordinary_continuity_round_metadata_is_valid(comments, authorization=authorization):
+    if _ordinary_continuity_round_metadata_is_valid(
+        comments, authorization=authorization,
+        config=config or (chain_context.config if chain_context is not None else None),
+    ):
         return "ordinary"
     if (
         predecessor is None
@@ -899,6 +903,7 @@ def _ordinary_continuity_round_metadata_is_valid(
     comments: list[dict[str, object]],
     *,
     authorization: ManagedCiIssueAuthorization,
+    config: AgentLoopConfig | None = None,
 ) -> bool:
     """Reauthenticate the exact round records referenced by a continuity grant."""
     if authorization.kind != "continuity" or not authorization.round_comment_ids:
@@ -934,7 +939,7 @@ def _ordinary_continuity_round_metadata_is_valid(
     # once the PR has recorded board changes (#1376).
     if _historical_bindings_match(
         comments, [comment_id for comment_id, _metadata in selected], by_index,
-        actor_id=authorization.actor_id,
+        actor_id=authorization.actor_id, actor_login=authorization.actor_login, config=config,
     ) is False:
         return False
     coders = [
@@ -1416,6 +1421,8 @@ def _historical_bindings_match(
     by_index: Mapping[int, Mapping[str, object]],
     *,
     actor_id: int | None,
+    config: AgentLoopConfig | None = None,
+    actor_login: str = "orchestrator",
 ) -> bool | None:
     """Whether every listed round record carries its governing board's binding.
 
@@ -1425,7 +1432,8 @@ def _historical_bindings_match(
     """
     from .board_change import lineage_binding_resolver
 
-    resolver = lineage_binding_resolver(comments, actor_id=actor_id)
+    resolver = lineage_binding_resolver(
+        comments, actor_id=actor_id, actor_login=actor_login, config=config)
     if resolver is None:
         return None
     wanted = set(comment_ids)
@@ -1455,6 +1463,7 @@ def _rejected_recovery_round_ids(
     new_head: str,
     round_number: int,
     expected_seat_binding: Mapping[str, object] | None,
+    config: AgentLoopConfig | None = None,
 ) -> tuple[int, ...] | None:
     """Return the exact round records of one rejected-coder recovery transition.
 
@@ -1575,7 +1584,7 @@ def _rejected_recovery_round_ids(
     # recorded board change (#1376) may have rebound the board since.
     historical = _historical_bindings_match(
         comments, [comment_id for comment_id, _metadata in reviewers],
-        by_index, actor_id=actor_id,
+        by_index, actor_id=actor_id, actor_login=actor_login, config=config,
     )
     if historical is not None:
         if not historical:
@@ -1620,6 +1629,7 @@ def _correlate_rejected_recovery(
         by_index,
         actor_login=context.actor_login,
         actor_id=context.actor_id,
+        config=context.config,
         root_comment_id=root_id,
         root_head=root_record.head_sha,
         fresh_comment_id=fresh_comment_id,
@@ -2100,6 +2110,7 @@ def publish_issue_created_continuity_authorization(
             predecessor=predecessor,
             records_by_id=records_by_id,
             chain_context=recovery_context,
+            config=config,
             expected_seat_binding=recovery_seat_binding,
         )
         if shape == "recovery":

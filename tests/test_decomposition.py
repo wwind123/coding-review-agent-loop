@@ -2932,8 +2932,9 @@ def _completion_comment_by(author, record_body, *, rest_only=False):
         "createdAt": "2026-09-21T00:00:00Z",
         "body": record_body,
     }
-    if "id" in author:
-        comment["_rest_author_id"] = author["id"]
+    # None explicitly models an absent REST ID; omission lets FakeRunner
+    # supply the invocation ID for legacy loop-publication fixtures.
+    comment["_rest_author_id"] = author.get("id")
     if rest_only:
         comment["_rest_only"] = True
     return comment

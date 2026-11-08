@@ -9084,6 +9084,15 @@ Only a human may sign. An agent must never add the signature on its own
 initiative; when an operator instructs an agent to relay their decision, the
 comment must disclose the relay.
 
+
+Reviewer-board amendments use a stricter author policy than ordinary signed
+requirements: only the authenticated invocation account and configured human
+LOGIN:ID pairs are eligible. With no trusted humans configured, only the
+invocation account can amend a board. To replay amendments posted by a separate
+human account, configure that account with `--human-reviewer-trusted-actor`;
+unconfigured historical amendments are ignored and logged. Human admission
+never authorizes round metadata or sidecars sharing that comment.
+
 **Who may sign: trusted human reviewer identities.** By default nothing
 verifies who wrote a signed comment. The signature is an honour-system
 convention, and anyone with write access to the repository (including the

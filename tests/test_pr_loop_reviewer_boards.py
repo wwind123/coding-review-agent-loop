@@ -203,8 +203,9 @@ def test_pr_board_amendment_on_the_owning_issue_fails_closed(tmp_path):
     )
     runner = FakeRunner(
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        serve_rest_issue_comments=True,
         issue_comments=[
-            {"author": {"login": "operator"}, "createdAt": "2026-06-01T00:00:00Z", "body": record}
+            {"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-06-01T00:00:00Z", "body": record}
         ],
         pr_payload={"body": "Fixes #56"},
     )
@@ -605,7 +606,7 @@ def test_1133_unreadable_amendment_posted_during_managed_ci_does_not_block_quali
     monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
 
     def wait_and_inject(*args, **kwargs):
-        _m943_append(runner, unreadable, login="operator")
+        _m943_append(runner, unreadable, login="coding-review-agent-loop")
         return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
@@ -659,6 +660,7 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     runner = _m943_partial_pr_round(
         tmp_path,
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        serve_rest_issue_comments=True,
         pr_payload={"body": "Fixes #56"},
     )
     reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
@@ -857,6 +859,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     runner = _m943_partial_pr_round(
         tmp_path,
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        serve_rest_issue_comments=True,
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/managed-56"},
     )
     reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)

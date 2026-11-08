@@ -333,7 +333,8 @@ def resolve_plan_scope(
 
 def _blank(comment: object) -> object:
     if dataclasses.is_dataclass(comment) and not isinstance(comment, type):
-        return dataclasses.replace(comment, body="")
+        from .pr_round_ingestion import redact_comment_body
+        return redact_comment_body(comment, "")
     if isinstance(comment, dict):
         return {**comment, "body": ""}
     clone = copy.copy(comment)

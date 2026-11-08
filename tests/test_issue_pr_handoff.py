@@ -2666,7 +2666,7 @@ def _lineage_plan_comments(tmp_path):
             removed_reviewers=("Gemini",), effective_from_round=3,
             rationale="Gemini quota exhausted.",
         ),
-        "author": {"login": "operator"}, "_rest_author_id": 81,
+        "author": {"login": _PLAN_ACTOR[0]}, "_rest_author_id": _PLAN_ACTOR[1],
         "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
     resolved = [{"item_id": "item-1", "disposition": "resolved"}, {"item_id": "item-2", "disposition": "resolved"}, {"item_id": "item-3", "disposition": "resolved"}, {"item_id": "item-4", "disposition": "resolved"}]

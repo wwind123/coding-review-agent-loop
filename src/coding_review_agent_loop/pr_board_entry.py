@@ -31,6 +31,12 @@ def _enforce_pr_board_floor(
     floor, signed amendments or link records there is nothing to refuse
     early: startup resolves the lineage before any agent invocation.
     """
+    from dataclasses import replace
+    from .pr_board_state import admitted_pr_comments
+    comments, _actor = admitted_pr_comments(
+        runner, config=config, pr_number=pr_number, comments=pr_context.comments,
+    )
+    pr_context = replace(pr_context, comments=comments)
     if not (
         board_floor_enabled(config)
         or comments_bear_board_change_links(pr_context.comments)
