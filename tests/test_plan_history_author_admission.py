@@ -151,3 +151,35 @@ def test_live_plan_recovery_excludes_foreign_reviews_and_attachments(tmp_path):
     assert recovery.verified
     assert {target.comment_id for target in recovery.targets} == {comments[1].comment_id}
     assert not recovery.uncertain
+
+
+@pytest.mark.parametrize('reader', ['hashes', 'announcement-exists'])
+@pytest.mark.parametrize('login,user_id,trusted,eligible', [
+    ('loop', 42, (), True),
+    ('operator', 81, (HUMAN,), False),
+    ('operator', 81, (), False),
+    ('outsider', 99, (HUMAN,), False),
+])
+def test_plan_announcement_readers_use_live_invocation_projection(
+    tmp_path, reader, login, user_id, trusted, eligible,
+):
+    from coding_review_agent_loop.followups import (
+        _plan_approved_followups_marker, _has_plan_approved_followups_marker,
+        approved_plan_hashes_for_issue,
+    )
+    plan_hash = _m936_plan_hash('Approved plan.')
+    body = _plan_approved_followups_marker(56, plan_hash, 'comment')
+    runner = FakeRunner(authenticated_actor=('loop', 42),
+                        issue_comments=[raw(body, login, user_id)])
+    config = make_config(tmp_path, human_reviewer_trusted_actors=trusted)
+    # This announcement is the only candidate in a short thread: acquisition
+    # must authenticate it even without round metadata or control records.
+    for _ in range(2):
+        comments = acquire(runner, config, 56)
+        assert comments[0].body == body
+        if reader == 'hashes':
+            assert approved_plan_hashes_for_issue(comments, issue_number=56) == (
+                (plan_hash,) if eligible else ())
+        else:
+            assert _has_plan_approved_followups_marker(
+                comments, issue_number=56, plan_hash=plan_hash, mode='comment') is eligible

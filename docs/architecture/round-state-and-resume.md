@@ -50,8 +50,10 @@ the same comment. Round anchors and sidecars use a separate invocation-only
 projection before decoding or hydration. Human trust configuration never
 expands that author set. Plan startup and every refreshed issue observation now admit round metadata
 before drift, scope, approval, scheduler and recovery probes. Parent and child
-observations are authenticated separately. Decomposition reducers read the
-invocation-only projection for topology, handoff, rebind audits and digest-bound
+observations are authenticated separately. Plan-approval announcement readers
+use the invocation-only projection for plain-mode refusal and publication
+idempotency. Decomposition reducers read that projection for topology, handoff,
+rebind audits and digest-bound
 re-plan coder lineage. Signed child-disposition overrides and child-plan
 supersessions read the human-control projection with the same author set and
 empty-configuration behavior as amendments. A trusted human supersession does

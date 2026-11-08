@@ -27,6 +27,7 @@ from .logging import log
 from .github_retry import GitHubAmbiguousWriteError, GitHubTransientExhaustedError
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
 from .comment_rendering import render_canonical_plan_steps
+from .pr_round_ingestion import record_body
 from .round_state import find_approved_plan_comment
 from .round_transport import MAX_GITHUB_BODY_CHARS
 from .runner import Runner
@@ -560,7 +561,7 @@ def _has_plan_approved_followups_marker(
     mode: str,
 ) -> bool:
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PLAN_APPROVED_FOLLOWUP_MARKER_RE.finditer(body):
@@ -585,7 +586,7 @@ def approved_plan_hashes_for_issue(
     """
     hashes: list[str] = []
     for comment in comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in PLAN_APPROVED_FOLLOWUP_MARKER_RE.finditer(body):
