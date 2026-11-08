@@ -48,3 +48,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Issue-created authorization, continuity and recovery now live in an acyclic authorization owner with temporary identity-preserving driver imports. Comment ingestion is shared through the API owner; body hashes and import-order checks protect the move window (#1907).
 
 - Original-baseline repair handoff waits within the existing CI timeout and poll settings, revalidating identity and trust on every observation. Pre-dispatch managed repair checkpoints retain their current round so timeout and resume preserve the coder budget (#1938).
+
+- Source-managed creation publication filters existing audit candidates by the live actor's exact login and integer ID before body inspection, so foreign quotations cannot suppress creation. Trusted candidates still require full authentication and cannot be replaced on refusal (#1951).

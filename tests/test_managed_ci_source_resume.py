@@ -128,6 +128,73 @@ def assert_no_qualification(runner):
     assert not any(cmd[:3] in (["gh", "pr", "merge"], ["gh", "workflow", "run"]) for cmd, _ in runner.commands)
 
 
+def copied_root_body():
+    return str(source_auth._root_body(dict(nonce="opening-nonce", repo="OWNER/REPO",
+        base="main", head=SHA, protection="voluntary"), 7))
+
+
+@pytest.mark.parametrize("user", [
+    {"login": "other", "id": 9},
+    {"login": "agent-loop", "id": 9},
+    {"login": "other", "id": 1},
+    {"login": "Agent-loop", "id": 1},
+    "missing", None, "agent-loop", {},
+    {"login": "agent-loop"},
+    {"login": "agent-loop", "id": "1"},
+    {"login": "agent-loop", "id": True},
+])
+@pytest.mark.parametrize("copied", [False, True])
+def test_creation_ignores_foreign_candidates_and_retry_reuses_trusted_root(tmp_path, user, copied):
+    runner = SourceRunner()
+    comment = {"id": 17, "body": copied_root_body() if copied else "Quoted " + UNPROTECTED_OVERRIDE_TRAILER}
+    if user != "missing":
+        comment["user"] = user
+    runner.intent_comments.append(comment)
+    handoff = create(runner, tmp_path)
+    authority = handoff.source_authority
+    assert authority.root_id in runner.audit_comments
+    assert authority.root_id != comment["id"]
+    assert len(runner.audit_comments) == 1
+    assert runner.audit_comments[authority.root_id]["user"] == {"login": "agent-loop", "id": 1}
+    source = (authority.source_branch, authority.source_sha, authority.branch, authority.opening_nonce)
+    assert source_auth.publish_source_creation_root(runner, config=config(tmp_path), pr_number=7,
+        source=source, protection="voluntary") == authority
+    assert len(runner.audit_comments) == 1
+    assert runner.rest_pr["state"] == "open"
+    assert not any("DELETE" in cmd or "PATCH" in cmd for cmd, _ in runner.commands)
+    assert_no_qualification(runner)
+
+
+@pytest.mark.parametrize("candidate", ["malformed", "conflicting", "valid-and-conflicting"])
+def test_trusted_invalid_publication_candidates_refuse_without_replacement(tmp_path, candidate):
+    runner = SourceRunner()
+    if candidate == "valid-and-conflicting":
+        root(runner, tmp_path)
+    body = ("Quoted " + UNPROTECTED_OVERRIDE_TRAILER if candidate == "malformed"
+        else copied_root_body().replace("opening-nonce", "other-nonce"))
+    runner.intent_comments.append({"id": 17, "body": body, "user": {"login": "agent-loop", "id": 1}})
+    before = copy.deepcopy(runner.audit_comments)
+    with pytest.raises(AgentLoopError):
+        root(runner, tmp_path)
+    assert runner.audit_comments == before
+    assert_no_qualification(runner)
+
+
+@pytest.mark.parametrize("entry", ["authenticate", "activate"])
+def test_foreign_copied_root_cannot_authorize_restart(tmp_path, entry):
+    runner = SourceRunner()
+    runner.intent_comments.append({"id": 17, "body": copied_root_body(),
+        "user": {"login": "other", "id": 9}})
+    with pytest.raises(AgentLoopError, match="No verified source-managed creation audit"):
+        if entry == "authenticate":
+            source_auth.authenticate_source_authority(runner, config=config(tmp_path), pr_number=7)
+        else:
+            activate(runner, tmp_path)
+    assert not runner.audit_comments
+    assert not any("POST" in cmd for cmd, _ in runner.commands)
+    assert_no_qualification(runner)
+
+
 def test_creation_publishes_verified_root_before_return_and_first_activation_reuses_it(tmp_path):
     runner = SourceRunner()
     handoff = create(runner, tmp_path)
