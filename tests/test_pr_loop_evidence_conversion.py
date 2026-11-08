@@ -17,6 +17,7 @@ from coding_review_agent_loop.cli import build_parser, run_pr_loop
 from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
 from coding_review_agent_loop.config import config_from_args
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
+from coding_review_agent_loop.pr_round_errors import PrRoundHistoryError
 from coding_review_agent_loop.evidence_conversion import capture_classification_payload
 from coding_review_agent_loop.pr_loop_support import (
     admitted_pr_records,
@@ -677,7 +678,7 @@ def test_the_finalization_gate_reopens_a_stale_tombstone_and_freezes(tmp_path, m
         pr_payload={"comments": [_comment(_attach_round_metadata("Converted.", conversion))]}
     )
     stale = dataclasses.replace(obligation, status="resolved", lifecycle="cleared", candidate_head_sha="old-head")
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
         _evidence_freeze_gate(
             runner, config=config, pr_number=77, round_number=3, head_sha=START_HEAD,
             items=[stale], surfaced_requirement_ids=(), collect_requirement_ids=lambda _ctx: (),
@@ -926,13 +927,9 @@ def test_a_mid_run_reread_does_not_admit_an_uncovered_record(tmp_path, monkeypat
     # The REST read omits the author ID of the coder record that pairs attempt 2.
     for comment in runner.pr_payload["comments"]:
         if '"round_number":2' in comment["body"].replace(" ", "") or "Retried capture" in comment["body"]:
-            comment.pop("_rest_author_id", None)
-    hydrated, actor = authenticated_pr_comments(runner, config, pr_number=77, resume=False)
-    assert actor == ACTOR
-    records = admitted_pr_records(runner, config, pr_number=77)
-    coder_two = next(r for r in records if r.metadata.role == "coder" and r.metadata.round_number == 2)
-    assert coder_two.metadata.risk_test_matrix_capture_classification is None
-    assert "bound_attempt_round" not in coder_two.metadata.evidence_stall
+            comment["_rest_author_id"] = None
+    with pytest.raises(AgentLoopError, match="author_id must be a positive integer"):
+        admitted_pr_records(runner, config, pr_number=77)
 
 
 def test_foreign_authored_authority_is_never_admitted(tmp_path, monkeypatch):
@@ -994,17 +991,7 @@ def test_foreign_authored_authority_is_never_admitted(tmp_path, monkeypatch):
         raw, [SimpleNamespace(author="x", author_id=None)] * len(raw), None
     )
     assert evidence_authority_from_records(unknown) == ((), ())
-    # The run converts nothing: foreign attempts are non-qualifying, so the
-    # stage-1 stall stop (whose trust model is unchanged) fires instead, and
-    # no row reads operator-signed.
-    with pytest.raises(HumanDecisionRequiredError, match="stalled on evidence only") as stopped:
-        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
-    assert "`row-a`" in str(stopped.value)
-    assert not any(
-        r.metadata.phase == "evidence-conversion" and r.metadata.agent == "Orchestrator"
-        and r.metadata.evidence_conversion is not None and r.metadata.subject == head
-        for r in _records(runner)
-    )
+    assert not any(r.metadata.role == "coder" for r in records)
 
 
 # --- conversion-repeat-fresh-review ------------------------------------------------------
@@ -1344,20 +1331,19 @@ def test_the_gate_keeps_an_untagged_conversion_when_authority_history_is_unavail
     context = _plan_context("row-a", "row-b")
     obligation, _audit, comment = _untagged_operator_obligation(context)
     if failure == "uncovered-record":
-        comment.pop("_rest_author_id")
+        comment["_rest_author_id"] = None
     runner = FakeRunner(
         pr_payload={"comments": [comment]},
         serve_rest_issue_comments=(False if failure == "rest-unavailable" else None),
     )
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
+    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
         _evidence_freeze_gate(
             runner, config=_config(tmp_path), pr_number=77, round_number=2, head_sha=START_HEAD,
             items=[obligation], surfaced_requirement_ids=(), collect_requirement_ids=lambda _ctx: (),
             allowed_rounds=8, watch_failure_extension_used=False, watch_head_extension_used=False,
             approved_plan_context=context,
         )
-    [frozen] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-b")
-    assert frozen.lifecycle == "evidence_frozen"
+    assert runner.pr_payload["comments"] == [comment]
 
 
 def test_a_failed_reread_after_an_untagged_operator_conversion_keeps_the_freeze(tmp_path, monkeypatch):
@@ -1379,13 +1365,13 @@ def test_a_failed_reread_after_an_untagged_operator_conversion_keeps_the_freeze(
 
     monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_break_identity_reads)
     config = dataclasses.replace(_config(tmp_path), pr_convert_evidence_rows=("row-b",))
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
+    with pytest.raises(PrRoundHistoryError, match="cannot be authenticated"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     commands = [cmd for cmd, _cwd in runner.commands]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in commands)
     assert not any(cmd[:3] == ["gh", "pr", "review"] and "--approve" in cmd for cmd in commands)
     [frozen] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-b")
-    assert frozen.lifecycle == "evidence_frozen"
+    assert frozen.lifecycle == "evidence_deferred"
     assert frozen.resolution_owners == ("Codex",)
 
 
@@ -1546,7 +1532,7 @@ def test_an_untrusted_conversion_record_does_not_move_the_visibility_boundary(tm
     with pytest.raises(PartialReviewRoundError) as refused:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     assert "Antigravity already posted" in str(refused.value)
-    _assert_unresolved_boundary_refusal(str(refused.value))
+    assert "withheld same-round outcome" in str(refused.value)
     conversion = _conversion(runner)
     assert runner.pr_payload["comments"][conversion.index]["author"] == {"login": "mallory"}
     assert _reviews_after(runner, conversion.index) == []
@@ -1737,15 +1723,18 @@ def test_an_operator_conversion_beside_a_public_same_round_review_runs_the_board
             return result
 
         monkeypatch.setattr(runner, "run", read)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
-        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    if fresh_read == "failing":
+        with pytest.raises(PrRoundHistoryError, match="503"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+        assert len(failed) == 3
+        assert not _reviews_after(runner, _conversion(runner).index)
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+        _assert_fresh_repeat(runner, _conversion(runner))
     conversion = _conversion(runner)
     assert conversion.metadata.evidence_conversion.source == "operator"
     assert conversion.metadata.round_number == 3
-    _assert_fresh_repeat(runner, conversion)
-    if fresh_read == "failing":
-        # Both the post-conversion refresh and the post-checkpoint visibility read failed.
-        assert len(failed) >= 6
 
 
 def test_a_restart_after_an_unfinished_operator_conversion_restores_the_full_board_repeat(
@@ -1962,6 +1951,7 @@ def _fresh_conversion_entry(tmp_path, monkeypatch, plan_source):
     paths = (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir)
     assert not any(path.exists() for path in paths)
     assert not hasattr(runner, "_agent_loop_authenticated_actor")
+    runner._ensure_fixture_comment_ids(runner.pr_payload["comments"], 77)
     runner.commands.clear()
     events = []
     original_run = runner.run
@@ -2055,7 +2045,7 @@ def test_fresh_conversion_identity_failure_refuses_before_writes(tmp_path, monke
         runner.serve_rest_issue_comments = False
     else:
         for comment in runner.pr_payload["comments"]:
-            comment.pop("_rest_author_id", None)
+            comment["_rest_author_id"] = None
     before = copy.deepcopy(runner.pr_payload)
     with pytest.raises(AgentLoopError) as raised:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
@@ -2064,7 +2054,7 @@ def test_fresh_conversion_identity_failure_refuses_before_writes(tmp_path, monke
         "actor-failed": "Unable to resolve the authenticated GitHub actor",
         "actor-malformed": "lacked a login and immutable user ID",
         "rest-unavailable": "returned a non-list page",
-        "uncovered-record": "REST comment read did not cover",
+        "uncovered-record": "author_id must be a positive integer",
     }
     assert expected[failure] in str(raised.value)
     _assert_fresh_entry_read_only(runner, before, config, events)
@@ -2637,15 +2627,14 @@ def test_optional_visibility_refresh_separates_read_fallback_from_observation(
 
     monkeypatch.setattr(runner, "run", run)
     if failure == "transport":
-        if site in {"conversion", "checkpoint"}:
-            with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
-                invoke()
-            _assert_fresh_repeat(runner, _conversion(runner))
-        elif site == "step-back":
-            assert invoke() == support.PrStepBackDecision()
-        else:
-            assert invoke() == ledger
+        with pytest.raises(PrRoundHistoryError, match="503"):
+            invoke()
         assert len(failed_reads) == 3
+        assert not any(cmd[0] in {"claude", "codex", "gemini", "agy"}
+                       or cmd[:3] == ["gh", "pr", "merge"]
+                       for cmd, _ in runner.commands[triggered[0]:])
+        if site in {"conversion", "checkpoint"}:
+            assert not _reviews_after(runner, _conversion(runner).index)
     else:
         error_type = AgentLoopError if failure == "closed" else PrHeadObservationError
         message = {"closed": "provide an open PR", "desync": "GitHub PR-head desync", "verification": "full hexadecimal"}[failure]

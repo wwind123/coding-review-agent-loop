@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_loop_helpers import make_config, structured_plan_review, structured_plan_state
+from agent_loop_helpers import FakeRunner, make_config, structured_plan_review, structured_plan_state
 from issue_loop_test_helpers import _IssueRecoveryWorkflowRunner
 from coding_review_agent_loop import managed_ci, pr_loop, issue_loop
 from coding_review_agent_loop.runner import CommandResult
@@ -28,7 +28,14 @@ def server(path, command, cwd, input_text):
         setattr(fixture, field, state[field])
     if not state.get("opened") and any("/issues/56/timeline?" in part for part in command):
         return {"stdout": "[]", "stderr": "", "returncode": 0}
-    result = fixture.run(command, cwd=Path(cwd), check=False, input_text=input_text)
+    if any("/issues/77/comments?" in part and "&page=" in part for part in command):
+        result = FakeRunner._run_locked(fixture, command, cwd=Path(cwd), check=False, input_text=input_text)
+        comments = {c["id"]: c for c in json.loads(result.stdout)}
+        for comment in fixture.authorization_comments:
+            comments.setdefault(comment["id"], comment)
+        result = CommandResult(result.args, result.cwd, json.dumps(list(comments.values())), "", 0)
+    else:
+        result = fixture.run(command, cwd=Path(cwd), check=False, input_text=input_text)
     path.write_text(json.dumps({**{field: getattr(fixture, field) for field in FIELDS}, "opened": state.get("opened", False)}))
     return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 

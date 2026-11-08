@@ -7,6 +7,7 @@ test files.
 """
 
 import json
+import datetime
 import re
 from types import SimpleNamespace
 
@@ -274,7 +275,8 @@ def _with_code_classification(output, requirements):
 def _signed(body, index):
     return {
         "author": {"login": "maintainer"},
-        "createdAt": f"2026-05-24T00:{index:02d}:00Z",
+        "createdAt": (datetime.datetime(2026, 5, 24, tzinfo=datetime.timezone.utc)
+                      + datetime.timedelta(minutes=index)).isoformat().replace("+00:00", "Z"),
         "url": f"https://github.com/OWNER/REPO/pull/77#issuecomment-{900 + index}",
         "body": f"{body}\n\n-- Human Reviewer",
     }

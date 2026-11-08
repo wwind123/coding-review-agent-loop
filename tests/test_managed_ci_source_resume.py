@@ -95,7 +95,8 @@ class SourceRunner(ManualQualificationRunner):
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             if self.fail_readback and self.audit_comments:
                 return result([])
-            return result(self.intent_comments + list(self.audit_comments.values()))
+            return result([dict(c, created_at=c.get("created_at") or "2026-01-01T00:00:00Z")
+                           for c in self.intent_comments + list(self.audit_comments.values())])
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
 
 

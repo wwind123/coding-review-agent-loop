@@ -581,11 +581,13 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
                 "id": comment_id,
                 "body": body,
                 "user": {"login": "agent-loop", "id": 1},
+                "created_at": f"2026-05-23T00:00:{comment_id:02d}Z",
             }
             self.authorization_comments.append(comment)
             self.pr_payload.setdefault("comments", []).append({
                 "author": {"login": "agent-loop"},
-                "createdAt": f"2026-05-23T00:00:{comment_id:02d}Z",
+                "databaseId": comment_id,
+                "createdAt": comment["created_at"],
                 "body": body,
             })
             return CommandResult(recorded, cwd_path, json.dumps(comment), "", 0)
