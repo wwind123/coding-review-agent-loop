@@ -204,6 +204,24 @@
     "provenance": "Offline export: strict raw codec; never supplies live PR authority."
   },
   {
+    "module": "issue_implementation",
+    "function": "_implement_approved_issue_unscoped",
+    "call": "codec(implementation_config.log_dir, salvage_comments, repo=implementation_config.repo, issue_number=issue_number, scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE, approved_plan_hash=plan_hash)",
+    "provenance": "Approved-plan implementation calls admit_issue_board_comments on its supplied issue snapshot before latest_salvage_context; remote selection reads invocation-only record_body while preserving plan-hash matching."
+  },
+  {
+    "module": "issue_loop",
+    "function": "run_issue_loop",
+    "call": "codec(config.log_dir, salvage_comments, repo=config.repo, issue_number=issue_number, scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE)",
+    "provenance": "Issue implementation calls admit_issue_board_comments on the current issue observation immediately before latest_salvage_context; remote selection reads invocation-only record_body and local fallback stays local."
+  },
+  {
+    "module": "issue_pr_handoff",
+    "function": "authenticate_canonical_issue_pr",
+    "call": "codec(pr_context.comments, repository=config.repo, pr_number=canonical.pr_number)",
+    "provenance": "authenticate_canonical_issue_pr obtains get_pr_review_context authenticated observations; the legacy contract reducer selects invocation-only record_body before validating the closing scope."
+  },
+  {
     "module": "managed_ci_authorization",
     "function": "_ordinary_continuity_round_metadata_is_valid",
     "call": "codec(comments, actor_id=authorization.actor_id)",
@@ -445,6 +463,18 @@
   },
   {
     "module": "pr_board_state",
+    "function": "authenticate_named_legacy_pr_entry",
+    "call": "codec(pr_full, repository=repo, pr_number=pr_number)",
+    "provenance": "Named-board preflight reads read_authenticated_protocol_comments and passes only pr_view.authored, preserving the existing transaction actor partition."
+  },
+  {
+    "module": "pr_board_state",
+    "function": "authenticate_named_legacy_pr_entry",
+    "call": "codec(pr_view.authored, repository=repo, pr_number=pr_number)",
+    "provenance": "Named-board preflight reads read_authenticated_protocol_comments and passes only pr_view.authored, preserving the existing transaction actor partition."
+  },
+  {
+    "module": "pr_board_state",
     "function": "named_legacy_entry_required",
     "call": "codec(comments, flow='pr')",
     "provenance": "resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view."
@@ -463,6 +493,12 @@
   },
   {
     "module": "pr_loop",
+    "function": "_entry_plan_handoff_board::recorded_primary_issue_number",
+    "call": "codec(pr_context.comments, repository=config.repo, pr_number=pr_number)",
+    "provenance": "PR startup and owning-issue lookup receive get_observed_pr_review_context comments bound by admit_pr_comments; find_latest_pr_contract selects record_body invocation-only bytes before decoding."
+  },
+  {
+    "module": "pr_loop",
     "function": "run_pr_loop",
     "call": "codec(initial_pr_context.comments, flow='pr')",
     "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
@@ -478,6 +514,12 @@
     "function": "run_pr_loop",
     "call": "codec(initial_pr_context.comments, flow='pr', pr_number=pr_number, ignored_sink=pr_amendment_diagnostics)",
     "provenance": "initial_pr_context comes from get_pr_review_context and its shared admission binding; owning issue_context comes from get_issue_context, which admits amendment candidates before misplaced-record diagnostics."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(initial_pr_context.comments, repository=config.repo, pr_number=pr_number)",
+    "provenance": "PR startup and owning-issue lookup receive get_observed_pr_review_context comments bound by admit_pr_comments; find_latest_pr_contract selects record_body invocation-only bytes before decoding."
   },
   {
     "module": "pr_loop",
@@ -597,7 +639,7 @@
     "module": "pr_loop_support",
     "function": "admitted_capture_history",
     "call": "codec(hydrated, flow='pr')",
-    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+    "provenance": "admitted_capture_history calls _authenticated_pr_comments_status before this codec; shared ingestion masks foreign anchors and sidecars for every role. Complete reviewer records have no author exemption; refreshed qualification reacquires the observation."
   },
   {
     "module": "pr_loop_support",
@@ -684,6 +726,12 @@
     "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
   },
   {
+    "module": "salvage",
+    "function": "latest_salvage_context",
+    "call": "codec(comments, repo=repo, issue_number=issue_number, scope=scope, approved_plan_hash=approved_plan_hash)",
+    "provenance": "latest_salvage_context is a pure local/remote reducer; both live implementation callers bind issue observations before entry, and find_latest_remote_salvage selects record_body before decoding. Raw unit fixtures are explicitly offline."
+  },
+  {
     "module": "workflow_transaction",
     "function": "_plan_carrying_pr_records",
     "call": "codec(view.authored, flow='pr')",
@@ -694,5 +742,11 @@
     "function": "_plan_records",
     "call": "codec(issue_view.authored, flow='plan')",
     "provenance": "AuthenticatedCommentView.authored from exhaustive actor-bound REST acquisition; foreign bodies are absent before hydration."
+  },
+  {
+    "module": "workflow_transaction",
+    "function": "resolve_pr_contract_lineage",
+    "call": "codec(v1_comments, repository=repository, pr_number=pr_number)",
+    "provenance": "resolve_pr_contract_lineage requires an AuthenticatedCommentView and splits only view.authored by schema version; aborted and committed transaction checks remain intact."
   }
 ]

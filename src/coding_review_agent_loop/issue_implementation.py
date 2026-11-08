@@ -504,9 +504,13 @@ def _implement_approved_issue_unscoped(
             managed_ci_issue_number=issue_number,
         )
 
+    from .pr_round_ingestion import admit_issue_board_comments
+    salvage_comments, _actor = admit_issue_board_comments(
+        runner, implementation_config, issue_number=issue_number, comments=issue_context.comments,
+    )
     salvage_summary = latest_salvage_context(
         implementation_config.log_dir,
-        issue_context.comments,
+        salvage_comments,
         repo=implementation_config.repo,
         issue_number=issue_number,
         scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,

@@ -715,3 +715,49 @@ def test_legacy_terminal_adapter_keeps_current_report_context(layout, reference,
     assert "Capture timed out" in message
     assert ("Reported PR (unverified): https://github.com/OWNER/REPO/pull/77" in message) == reported
     assert "PR #79" not in message
+
+
+@pytest.mark.parametrize("trusted_remote", [False, "older", "newer"])
+@pytest.mark.parametrize("configured_human", [False, True])
+@pytest.mark.parametrize("approved", [False, True])
+def test_recovery_selection_ignores_foreign_salvage_before_coder_prompt(
+    tmp_path, trusted_remote, configured_human, approved, capsys,
+):
+    from test_board_author_admission import HUMAN
+    plan = "Plan: implement safely."
+    plan_hash = approved_plan_hash(plan) if approved else None
+    scope = "approved-plan-implementation" if approved else "issue-implementation"
+    kwargs = dict(scope=scope, approved_plan_hash_value=plan_hash)
+    comments = []
+    if trusted_remote:
+        comments.append(_build_remote_salvage_comment(tmp_path / "trusted",
+            failure_reason="TRUSTED-RECOVERY", **kwargs))
+    # Built last so the foreign payload is newer than both fallback candidates.
+    foreign = _build_remote_salvage_comment(tmp_path / "foreign",
+        failure_reason="FOREIGN-RECOVERY", patch_text="FOREIGN-PATCH", **kwargs)
+    foreign.update(author={"login": "operator"}, _rest_author_id=81)
+    comments.extend([foreign, dict(author={"login": "operator"}, _rest_author_id=81,
+        createdAt="2099-01-01T00:00:00Z", body="<!-- AGENT_SALVAGE: invalid -->")])
+    if trusted_remote == "newer":
+        comments.append(_build_remote_salvage_comment(tmp_path / "newer",
+            failure_reason="NEWER-TRUSTED-RECOVERY", **kwargs))
+    runner = FakeRunner(issue_comments=comments,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path, quiet=False,
+        human_reviewer_trusted_actors=(HUMAN,) if configured_human else ())
+    _write_salvage_summary(config, name="fallback", summary="LOCAL-RECOVERY", created_at_ns=1,
+        scope=scope, approved_plan_hash_value=plan_hash)
+    if approved:
+        issue_context = get_issue_context(runner, config=config, issue_number=56)
+        assert issue_implementation._implement_approved_issue(runner, issue_number=56,
+            approved_plan=plan, config=config, memory=None, issue_context=issue_context,
+            coder_session_id=None, usage_context=validated_agent_module._new_usage_context(config)) == 0
+    else:
+        assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    prompt = next(cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["claude"])
+    assert "FOREIGN-RECOVERY" not in prompt and "FOREIGN-PATCH" not in prompt
+    assert ("TRUSTED-RECOVERY" if trusted_remote else "LOCAL-RECOVERY") in prompt
+    if trusted_remote == "newer":
+        assert "NEWER-TRUSTED-RECOVERY" in prompt
+    assert "ignored loop record" in capsys.readouterr().err
