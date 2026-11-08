@@ -967,7 +967,10 @@ class FakeRunner(Runner):
             # Legacy body-only fixtures represent loop publications on either
             # surface. Explicit identities remain untouched for admission tests.
             comment.setdefault("author", {"login": "bot"})
+            if isinstance(comment["author"], str):
+                comment["author"] = {"login": comment["author"]}
             if ("_rest_author_id" not in comment
+                and isinstance(comment["author"], dict)
                 and comment["author"].get("login") == "bot" and "id" not in comment["author"]):
                 comment["author"] = {"login": (self.authenticated_actor or ("coding-review-agent-loop", 424242))[0]}
             comment.setdefault("createdAt", "2026-01-01T00:00:00Z")

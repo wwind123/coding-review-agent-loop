@@ -52,7 +52,8 @@ def test_patch_object_in_rejects_a_module_that_does_not_bind_the_name():
 @pytest.mark.parametrize("flow", ["plan", "pr"])
 @pytest.mark.parametrize("actor", [None, ("loop", 42)])
 @pytest.mark.parametrize("identity", ["legacy", "rest-id", "author-id", "foreign", "missing-rest-id", "missing-author-id"])
-def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, actor, identity):
+@pytest.mark.parametrize("author_shape", ["mapping", "string"])
+def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, actor, identity, author_shape):
     """Legacy publications get the actor; explicit foreign identities stay foreign."""
     from agent_loop_helpers import FakeRunner, make_config
     from coding_review_agent_loop import github
@@ -83,6 +84,12 @@ def test_fixture_comment_identity_is_consistent_across_surfaces(tmp_path, flow, 
     expected = expected_actor if identity == "legacy" else (
         comment["author"]["login"], 81 if identity != "foreign" else 987654
     )
+    if author_shape == "string":
+        # String logins have no nested ID; carry explicit identity overrides
+        # through the REST fixture field, including deliberately absent IDs.
+        if "id" in comment["author"]:
+            comment["_rest_author_id"] = comment["author"]["id"]
+        comment["author"] = comment["author"]["login"]
     runner = FakeRunner(authenticated_actor=actor, issue_comments=[comment],
                         pr_payload={"comments": [comment]})
     config = make_config(tmp_path)
