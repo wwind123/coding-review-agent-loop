@@ -181,6 +181,12 @@ conflict-resolution coder turn; it does not revoke failure authority. Completed
 historical failures retain their repair authority across newer same-target
 intents; supersession rejection applies to the separate live failure path.
 
+A no-push coder turn leaves the failed head in repair-required state, even with
+reviewer approval or a coder claim that the item is addressed. Only a strictly
+different head becomes a qualification candidate. Same-head replacement below
+recovers an already-existing authenticated newer failure; it does not authorize
+a new qualification dispatch from that repair-required state.
+
 A superseded attached baseline can be replaced by a unique newer authenticated
 same-target failed run discovered through bounded comment-page reads. The old
 attachment is authenticated independently; rejection by the live supersession

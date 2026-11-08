@@ -550,7 +550,7 @@ def test_superseded_replacement_refuses_invalid_evidence(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize('auto_merge', [True, False])
-def test_no_push_coder_then_supersession_reaches_repair_again(tmp_path, monkeypatch, auto_merge):
+def test_no_push_coder_discovers_existing_superseding_failure(tmp_path, monkeypatch, auto_merge):
     from agent_loop_helpers import structured_coder_followup
     fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge, allowed_rounds=4)
     config, runner, metadata, contract, cp, item, ref = fixture
@@ -564,7 +564,8 @@ def test_no_push_coder_then_supersession_reaches_repair_again(tmp_path, monkeypa
         real_advance(cmd)
         if cmd[0] != 'claude':
             return
-        # Model the independently authenticated qualification publisher's R2.
+        # An external publisher supplied R2 before the loop resumes.
+        # This covers discovery, not the loop's normal qualification dispatch.
         runner.intent_comments.append(v2_intent_comment(
             comment_id=runner._next_comment_id(), nonce='z'*32, generation='replacement-generation',
             run_id=101, run_attempt=1))
@@ -592,6 +593,49 @@ def test_no_push_coder_then_supersession_reaches_repair_again(tmp_path, monkeypa
     assert latest.obligation_identity == cp.obligation_identity and latest.watch_failure_extension_used
     assert latest.allowed_rounds == cp.allowed_rounds and runner.dispatch_count == 0
     assert runner.intent_comments[1] == old and latest.verified_managed_result is None
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('disposition', ['addressed', 'remaining'])
+def test_no_push_coder_keeps_failed_head_out_of_qualification(tmp_path, monkeypatch, auto_merge, disposition):
+    """Same-head review approval cannot turn a repair obligation into qualification."""
+    from agent_loop_helpers import structured_coder_followup
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge, allowed_rounds=4)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs = [structured_coder_followup(**{
+        f'{disposition}_items': [item.item_id],
+    })]
+    runner.codex_outputs = [structured_pr_review(
+        state='approved', prior_item_dispositions=[{'item_id': item.item_id, 'disposition': 'resolved'}])]
+    # Real activation and qualification are left enabled. Only agent execution
+    # is stopped, immediately before the second repair turn would consume budget.
+    old = copy.deepcopy(runner.intent_comments[1])
+    real = runner._run_with_log_locked
+    calls = []
+    def stop(args, **kwargs):
+        if args[0] == 'claude':
+            calls.append(list(args))
+            if len(calls) == 2:
+                latest = replacement_checkpoints(runner)[-1]
+                assert latest.failed_managed_run == ref
+                assert latest.lifecycle == 'repair_required'
+                assert latest.candidate_head_sha is None
+                assert latest.obligation_identity == cp.obligation_identity
+                assert latest.allowed_rounds == cp.allowed_rounds
+                assert latest.watch_failure_extension_used == cp.watch_failure_extension_used
+                assert latest.watch_head_extension_used == cp.watch_head_extension_used
+                assert latest.verified_managed_result is None
+                assert runner.dispatch_count == 0
+                raise RepairReached('same-head repair still required')
+        return real(args, **kwargs)
+    monkeypatch.setattr(runner, '_run_with_log_locked', stop)
+    with pytest.raises(RepairReached, match='same-head repair still required'):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 2 and runner.pr_payload['headRefOid'] == ref.head_sha
+    assert len(runner.workflow_runs) == 1 and runner.intent_comments[1] == old
+    assert not any('rerun' in cmd or 'cancel' in cmd or cmd[:3] == ['gh', 'pr', 'merge']
+                   for cmd, _ in runner.commands)
 
 
 @pytest.mark.parametrize('auto_merge', [True, False])
