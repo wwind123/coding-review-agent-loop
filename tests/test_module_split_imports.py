@@ -746,11 +746,14 @@ def test_plan_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(mon
     for module in reachable:
         monkeypatch.setattr(module, 'get_issue_context', intercept)
     config = make_config(tmp_path)
-    from types import SimpleNamespace
+    from coding_review_agent_loop.github import IssueContext
+    context = IssueContext(number=1, repo=config.repo, title="Issue", body="",
+                           url="https://github.com/OWNER/REPO/issues/1", comments=(),
+                           human_requirements=())
     monkeypatch.setattr(plan_first_loop, '_infer_staged_parent_issue', lambda context: 77)
     with pytest.raises(RuntimeError, match='local context intercepted'):
         plan_first_loop._run_plan_first_loop(None, issue_number=1, config=config,
-                                             memory=None, issue_context=SimpleNamespace(), usage_context=None)
+                                             memory=None, issue_context=context, usage_context=None)
     with pytest.raises(RuntimeError, match='local context intercepted'):
         plan_execution._run_child_planning_cycle(None, config=config, memory=None,
                                                 usage_context=None, parent_issue=1, child_issue_number=88,

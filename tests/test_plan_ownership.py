@@ -103,7 +103,8 @@ def test_published_invalid_owner_forces_planner_feedback(tmp_path, monkeypatch, 
                         claude_outputs=[candidate().replace('"kind": "plan_state"', '"kind": "plan_revision", "prior_plan_item_dispositions": []')] * 5)
     if blocking:
         import coding_review_agent_loop.plan_first_loop as loop
-        seed_runner = FakeRunner(issue_comments=runner.issue_comments, codex_outputs=[review])
+        seed_runner = FakeRunner(issue_comments=runner.issue_comments, codex_outputs=[review],
+                                 authenticated_actor=runner.authenticated_actor)
         original = loop._run_validated_agent
         def stop_seed(*args, **kwargs):
             if kwargs["agent"] == config.coder:
@@ -349,7 +350,8 @@ def test_valid_and_legacy_approved_resume_reuses_approval(tmp_path, versioned):
     raw = candidate("one-shot") if versioned else structured_plan_state()
     runner = FakeRunner(claude_outputs=[raw], codex_outputs=[structured_plan_review(state="approved")])
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-    resumed = FakeRunner(issue_comments=runner.issue_comments)
+    resumed = FakeRunner(issue_comments=runner.issue_comments,
+                         authenticated_actor=runner.authenticated_actor)
     assert run_issue_loop(resumed, issue_number=56, config=config, plan_first=True) == 0
     assert not any(cmd[0] in {"claude", "codex"} for cmd, _ in resumed.commands)
 
@@ -413,7 +415,8 @@ def test_invalid_published_plan_remains_correctable_after_stop(tmp_path, monkeyp
     assert not any(cmd[0] == "codex" for cmd, _ in runner.commands)
     assert not any('AGENT_PLAN_STATE: approved' in body for body in runner.comments)
     # Persist every comment, including any correction diagnostic, into a fresh run.
-    resumed = FakeRunner(issue_comments=runner.issue_comments)
+    resumed = FakeRunner(issue_comments=runner.issue_comments,
+                         authenticated_actor=runner.authenticated_actor)
     prompts = []
     def capture(*args, **kwargs):
         assert kwargs["agent"] == config.coder
@@ -440,7 +443,8 @@ def test_reconciled_primary_invalid_owner_skips_rollover(tmp_path, monkeypatch, 
         with pytest.raises(AgentLoopError, match="reviewer-only plan phase advance"):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert any("reconciliation" in body for body in runner.comments)
-    resumed = FakeRunner(issue_comments=runner.issue_comments)
+    resumed = FakeRunner(issue_comments=runner.issue_comments,
+                         authenticated_actor=runner.authenticated_actor)
     prompts = []
     def capture(*args, **kwargs):
         assert kwargs["agent"] == config.coder

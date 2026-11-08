@@ -37,6 +37,7 @@ from coding_review_agent_loop.protocol import (
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
+    serve_authenticated_issue_context,
     structured_coder_followup,
     structured_pr_review,
 )
@@ -742,7 +743,8 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
     def changing_issue(*args, **kwargs):
         nonlocal issue_fetches
         issue_fetches += 1
-        return initial_issue if issue_fetches == 1 else changed_issue
+        return serve_authenticated_issue_context(
+            runner, config, initial_issue if issue_fetches == 1 else changed_issue)
 
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", changing_issue)
     migration_calls = []
@@ -771,7 +773,7 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
             runner,
             pr_number=77,
             config=config,
-            issue_context=initial_issue,
+            issue_context=serve_authenticated_issue_context(runner, config, initial_issue),
             approved_plan_context=plan_context,
         )
     assert migration_calls == []
@@ -856,7 +858,8 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
     def changing_issue(*args, **kwargs):
         nonlocal issue_fetches
         issue_fetches += 1
-        return initial_issue if issue_fetches == 1 else replacement_issue
+        return serve_authenticated_issue_context(
+            runner, config, initial_issue if issue_fetches == 1 else replacement_issue)
 
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", changing_issue)
     migration_calls = []
@@ -889,7 +892,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         runner,
         pr_number=77,
         config=config,
-        issue_context=initial_issue,
+        issue_context=serve_authenticated_issue_context(runner, config, initial_issue),
         approved_plan_context=old_plan_context,
     ) == 0
 
