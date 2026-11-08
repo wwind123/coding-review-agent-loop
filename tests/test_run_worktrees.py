@@ -1348,3 +1348,214 @@ def test_pr_sync_dry_run_never_fetches_or_reads_api(tmp_path, monkeypatch):
     sync_checkout_to_pr(config, Runner(dry_run=True), path=tmp_path / "absent",
                         label="dry", default_owned=True, pr_number=7,
                         pr_metadata=SimpleNamespace(head_sha="a" * 40))
+
+
+# Shared-store unborn bootstrap and reuse (#1975). All transitions use real Git.
+def unborn_store(env, *, linked=False, base="main"):
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    store.mkdir(parents=True)
+    git(store, "init", "-q", "-b", base)
+    git(store, "remote", "add", "origin", str(env.bare))
+    if linked:
+        git(store, "fetch", "-q", "origin", base)
+        path = env.tmp / "retained-run"
+        git(store, "worktree", "add", "-q", "--detach", str(path), "FETCH_HEAD")
+        (path / "a.txt").write_text("retained staged content")
+        git(path, "add", "a.txt")
+        (path / "a.txt").write_text("retained unstaged content")
+        return store, path
+    return store, None
+
+
+def linked_snapshot(store, linked):
+    return (
+        next(entry for entry in git(store, "worktree", "list", "--porcelain").split("\n\n")
+             if entry.startswith(f"worktree {linked}\n")),
+        (linked / ".git").read_bytes(), git(linked, "rev-parse", "HEAD"),
+        git(linked, "ls-files", "--stage"), (linked / "a.txt").read_bytes(),
+        git(linked, "diff"), git(linked, "diff", "--cached"),
+    )
+
+
+@pytest.mark.parametrize("base", ["main", "release"])
+@pytest.mark.parametrize("initial", ["missing", "artifacts", "unborn", "retained"])
+def test_unborn_store_bootstrap_reuse_and_reviewer_diff(tmp_path, monkeypatch, base, initial):
+    env = Env(tmp_path, monkeypatch)
+    if base != "main":
+        git(env.seed, "push", "-q", "origin", f"HEAD:refs/heads/{base}")
+    config = env.config(extra=("--base", base))
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    linked = None
+    if initial in ("unborn", "retained"):
+        store, linked = unborn_store(env, linked=initial == "retained", base=base)
+    elif initial == "artifacts":
+        (store / ".agent-loop-logs").mkdir(parents=True)
+    snapshot = linked_snapshot(store, linked) if linked else None
+    logs = []
+    monkeypatch.setattr(run_worktrees, "log", lambda config, message: logs.append(message))
+    store_calls = []
+    runner = RecordingRunner(hook=lambda args, cwd: store_calls.append(args) if cwd == store else None)
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, runner)
+        sha = git(env.seed, "rev-parse", "HEAD")
+        assert git(store, "rev-parse", "HEAD") == sha
+        assert git(store, "symbolic-ref", "-q", "HEAD", check=False) == ""
+        assert git(store, "rev-parse", f"refs/heads/{base}") == sha
+        assert git(store, "rev-parse", f"refs/remotes/origin/{base}") == sha
+        assert (store / "a.txt").read_text() == "one"
+        assert git(store, "ls-files") == "a.txt"
+        assert not any("skipping its fast-forward" in message for message in logs)
+        if linked:
+            assert linked_snapshot(store, linked) == snapshot
+        head = env.commit("pr.txt", "PR change")
+        git(env.bare, "update-ref", "refs/heads/main", sha)
+        env.set_pr_head(7, head)
+        sync_checkout_to_pr(
+            config, runner, path=config.codex_dir, label="reviewer", default_owned=True,
+            pr_number=7, pr_metadata=SimpleNamespace(head_sha=head),
+        )
+        assert git(config.codex_dir, "rev-parse", base) == sha
+        assert git(config.codex_dir, "diff", "--name-only", f"{base}...HEAD") == "pr.txt"
+    # Cleanup leaves a healthy store; neither unchanged nor advancing prep recreates it.
+    identity = (store.stat().st_dev, store.stat().st_ino, (store / ".git").stat().st_ino)
+    logs.clear()
+    assert run_worktrees.prepare_store(store, config=config, runner=runner) == sha
+    git(env.seed, "push", "-q", "origin", f"HEAD:refs/heads/{base}")
+    assert run_worktrees.prepare_store(store, config=config, runner=runner) == head
+    assert git(store, "rev-parse", base) == head
+    assert git(store, "rev-parse", "HEAD") == sha  # populated HEAD is not refreshed
+    assert identity == (store.stat().st_dev, store.stat().st_ino, (store / ".git").stat().st_ino)
+    assert not any("Stale shared store" in message for message in logs)
+    assert not any("--force" in call or "-f" in call or call[:2] == ("git", "clean")
+                   for call in store_calls if call[:3] != ("git", "worktree", "remove"))
+    if linked:
+        assert linked_snapshot(store, linked) == snapshot
+
+
+def test_empty_tree_store_is_reused_but_ordinary_staleness_is_unchanged(tmp_path, monkeypatch):
+    from coding_review_agent_loop.config import _is_stale_default_workdir
+
+    env = Env(tmp_path, monkeypatch)
+    git(env.seed, "rm", "a.txt")
+    git(env.seed, "commit", "-qm", "empty tree")
+    git(env.seed, "push", "-q", "origin", "main")
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    sha = run_worktrees.prepare_store(store, config=config, runner=Runner())
+    identity = (store / ".git").stat().st_ino
+    assert _is_stale_default_workdir(store)
+    logs = []
+    monkeypatch.setattr(run_worktrees, "log", lambda config, message: logs.append(message))
+    assert run_worktrees.prepare_store(store, config=config, runner=Runner()) == sha
+    assert (store / ".git").stat().st_ino == identity
+    assert git(store, "rev-parse", "main") == sha
+    assert git(store, "ls-files") == ""
+    assert not any("Stale shared store" in message for message in logs)
+    (store / ".git" / "HEAD").write_text("broken\n")
+    assert not run_worktrees._store_has_empty_commit(store, Runner())
+
+
+@pytest.mark.parametrize("unsafe", ["index", "malformed", "inspection", "untracked", "ignored"])
+def test_retained_unborn_store_refuses_unsafe_bootstrap(tmp_path, monkeypatch, unsafe):
+    env = Env(tmp_path, monkeypatch)
+    store, linked = unborn_store(env, linked=True)
+    if unsafe in ("index", "untracked", "ignored"):
+        (store / "a.txt").write_text("must survive")
+    if unsafe == "index":
+        git(store, "add", "a.txt")
+    if unsafe == "ignored":
+        (store / ".git" / "info" / "exclude").write_text("/a.txt\n")
+    if unsafe == "malformed":
+        (store / ".git" / "HEAD").write_text("ref: refs/heads/bad..name\n")
+    snapshot = linked_snapshot(store, linked)
+    before_head = (store / ".git" / "HEAD").read_bytes()
+    before_index = (store / ".git" / "index").read_bytes() if (store / ".git" / "index").exists() else None
+    runner = FailingGitRunner(("ls-files", "--stage")) if unsafe == "inspection" else Runner()
+    with pytest.raises(AgentLoopError):
+        run_worktrees.prepare_store(store, config=env.config(), runner=runner)
+    assert (store / ".git" / "HEAD").read_bytes() == before_head
+    assert ((store / ".git" / "index").read_bytes() if (store / ".git" / "index").exists() else None) == before_index
+    assert git(store, "show-ref", "--verify", "--quiet", "refs/heads/main", check=False) == ""
+    assert not (store / ".git" / "refs" / "heads" / "main").exists()
+    if unsafe in ("index", "untracked", "ignored"):
+        assert (store / "a.txt").read_text() == "must survive"
+    assert linked_snapshot(store, linked) == snapshot
+
+
+@pytest.mark.parametrize("initial", ["missing", "stale", "retained"])
+def test_held_claim_prevents_unborn_store_mutation(tmp_path, monkeypatch, initial):
+    env = Env(tmp_path, monkeypatch)
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    linked = None
+    if initial == "retained":
+        store, linked = unborn_store(env, linked=True)
+    elif initial == "stale":
+        store, _ = unborn_store(env)
+    snapshot = linked_snapshot(store, linked) if linked else None
+    holder = subprocess.Popen(
+        [sys.executable, "-c", STORE_HOLDER, str(workdir_claims.claim_root()), str(store)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=child_env(),
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(AgentLoopError, match="holds its claim"):
+            run_worktrees.prepare_store(store, config=env.config(), runner=Runner())
+        if initial == "missing":
+            assert not store.exists()
+        else:
+            assert (store / ".git" / "HEAD").read_text() == "ref: refs/heads/main\n"
+            assert not (store / ".git" / "index").exists()
+            assert not (store / "a.txt").exists()
+        if linked:
+            assert linked_snapshot(store, linked) == snapshot
+            assert git(store, "rev-parse", "origin/main") == git(linked, "rev-parse", "HEAD")
+    finally:
+        stop(holder)
+
+
+@pytest.mark.parametrize("failure", ["import", "checkout"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_bootstrap_failure_stops_and_retry_recovers(tmp_path, monkeypatch, failure, retained):
+    from coding_review_agent_loop import git_transport
+
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    linked = None
+    if retained:
+        store, linked = unborn_store(env, linked=True)
+    snapshot = linked_snapshot(store, linked) if linked else None
+    with monkeypatch.context() as patch:
+        if failure == "import":
+            def fail_import(*args, **kwargs):
+                raise AgentLoopError("injected import failure")
+            patch.setattr(git_transport, "import_ref", fail_import)
+        runner = FailingGitRunner(("checkout", "--detach")) if failure == "checkout" else Runner()
+        with pytest.raises(AgentLoopError):
+            run_worktrees.prepare_store(store, config=config, runner=runner)
+    assert not (store / ".git" / "refs" / "heads" / "main").exists()
+    sha = run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert git(store, "rev-parse", "HEAD") == git(store, "rev-parse", "main") == sha
+    assert (store / "a.txt").read_text() == "one"
+    if linked:
+        assert linked_snapshot(store, linked) == snapshot
+
+
+def test_divergent_unoccupied_base_is_not_destroyed(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    git(store, "checkout", "-qb", "local-change")
+    (store / "local.txt").write_text("keep local commit")
+    git(store, "add", "local.txt")
+    git(store, "commit", "-qm", "local divergence")
+    local = git(store, "rev-parse", "HEAD")
+    git(store, "update-ref", "refs/heads/main", local)
+    git(store, "checkout", "--detach")
+    env.commit("a.txt", "origin advances")
+    with pytest.raises(AgentLoopError, match="diverged"):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert git(store, "rev-parse", "main") == local
+    assert (store / "local.txt").read_text() == "keep local commit"
