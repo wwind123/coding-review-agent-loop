@@ -6,12 +6,15 @@ from .github import HumanReviewRequirement
 
 
 def normalize_empty_text(entry):
-    """Copy an association, canonicalizing only the two empty text spellings."""
+    """Copy an association, canonicalizing empty text and redundant non-mixed leftovers."""
     result = dict(entry)
     for field in ("request", "leftover_instructions"):
         value = result[field]
         if value is None or (type(value) is list and not value):
             result[field] = ""
+    if (result.get("role") in ("code", "human-only", "evidence-only")
+            and isinstance(result["leftover_instructions"], str)):
+        result["leftover_instructions"] = ""
     return result
 
 
@@ -144,7 +147,7 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
         from .errors import HumanDecisionRequiredError
         sources = [{"requirement_id": r.requirement_id, "body": r.body} for r in requirements]
         prompt = ("Continue the PR review with semantic signed-source classification. Return a complete "
-            "structured pr_review and its normal footer. Preserve code findings. Classify every signed "
+            "structured pr_review and its normal footer. Preserve code findings in blocking_items. Classify every signed "
             "source in requirement_evidence using exactly requirement_id, role (code, human-only, "
             "evidence-only, mixed), request (a string: your exact emitted request for human-only, otherwise \"\"), "
             "answered_item_ids (a list: your own prior evidence items only, otherwise []), leftover_instructions "

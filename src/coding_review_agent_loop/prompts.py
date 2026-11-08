@@ -138,7 +138,9 @@ repeated omission stops the run before coder dispatch. Roles: `code` (ordinary c
 (answered prior item IDs, no remaining instructions), or `mixed` (answered prior
 item IDs plus explicit leftover code instruction text). `request` and
 `leftover_instructions` are strings (`""` when inapplicable); `answered_item_ids`
-is a list (`[]` when inapplicable). You may classify answers only to your own native evidence
+is a list (`[]` when inapplicable). Use explicit nonblank `leftover_instructions`
+only for `mixed`; use `""` for `code`, `human-only` and `evidence-only`. Put code
+findings in `blocking_items`. You may classify answers only to your own native evidence
 items. Mixed sources retain their original signed ID. Do not invent leftover
 instructions or acknowledge human acceptance as coder work. A classification
 never grants clearance: dispose answered items resolved with live surfaced

@@ -213,7 +213,7 @@ def test_identity_is_not_normalized(value):
         parse_associations([entry])
 
 
-@pytest.mark.parametrize("value", [[], None])
+@pytest.mark.parametrize("value", ["", "  ", [], None])
 @pytest.mark.parametrize("role,field,message", [
     ("human-only", "request", "Human-only requirements"),
     ("mixed", "leftover_instructions", "Only mixed sources")])
@@ -222,6 +222,9 @@ def test_normalized_empty_text_retains_required_content(role, field, message, va
     entry[field] = value
     with pytest.raises(AgentLoopError, match=message):
         parse_associations([entry])
+    with pytest.raises(AgentLoopError, match=message):
+        parse_structured_pr_review(_classified_review([entry]), reviewer="Codex",
+                                   architecture_status_mode="legacy")
 
 
 @pytest.mark.parametrize("request_value", ["", [], None])
@@ -241,3 +244,59 @@ def test_empty_text_metadata_replay(request_value, leftover):
     foreign = dataclasses.replace(again, prior_items=(dataclasses.replace(items[0], reviewer="Gemini"),))
     assert historical_projection([SOURCE], [SimpleNamespace(metadata=foreign)]) == (SOURCE,)
     assert entry == original
+
+
+@pytest.mark.parametrize("role", ["code", "human-only", "evidence-only"])
+def test_nonmixed_leftovers_live_review_equivalence(role):
+    from coding_review_agent_loop.requirement_evidence import normalize_empty_text
+    canonical = _association(SOURCE.requirement_id, role,
+        request="Accept the run" if role == "human-only" else "",
+        answers=["item-1"] if role == "evidence-only" else [])
+    entry = {**canonical, "leftover_instructions": "Fix retries. Preserve ownership checks."}
+    before = deepcopy(entry)
+    assert normalize_empty_text(entry) == canonical
+    assert normalize_empty_text(normalize_empty_text(entry)) == canonical
+    assert parse_associations([entry]) == (canonical,)
+    kwargs = dict(state="blocking", blocking=["Fix retries.", "Preserve ownership checks."],
+                  evidence=["Accept the run"] if role == "human-only" else [])
+    parse = lambda e: parse_structured_pr_review(_classified_review([e], **kwargs),
+        reviewer="Codex", architecture_status_mode="legacy")
+    parsed = parse(entry)
+    assert parsed == parse(canonical)
+    assert len(parsed.blocking_items) == 2
+    assert entry == before
+
+
+@pytest.mark.parametrize("role", ["code", "human-only", "evidence-only"])
+def test_nonmixed_leftovers_metadata_replay(role):
+    items, _, _, _ = setup_role("evidence-only")
+    canonical = _association(SOURCE.requirement_id, role,
+        request="Accept the run" if role == "human-only" else "",
+        answers=["item-1"] if role == "evidence-only" else [])
+    entry = {**canonical, "leftover_instructions": "Redundant instructions"}
+    meta = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=1,
+        subject="a" * 40, prior_items=tuple(items), requirement_evidence=(entry,),
+        evidence_requests=("Accept the run",) if role == "human-only" else ())
+    before = deepcopy(meta)
+    encoded = _encode_round_metadata(meta)
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.requirement_evidence == (canonical,)
+    again = _decode_round_metadata(_encode_round_metadata(decoded))
+    assert again == decoded
+    replay = lambda m: historical_projection([SOURCE], [SimpleNamespace(metadata=m)])
+    assert replay(again) == ((SOURCE,) if role == "code" else ())
+    if role == "evidence-only":
+        foreign = dataclasses.replace(again, prior_items=(dataclasses.replace(items[0], reviewer="Gemini"),))
+        assert replay(foreign) == (SOURCE,)
+    elif role == "human-only":
+        assert replay(dataclasses.replace(again, evidence_requests=())) == (SOURCE,)
+    assert meta == before
+    assert _encode_round_metadata(meta) == encoded
+
+
+def test_valid_mixed_leftovers_preserved_in_complete_review():
+    _, entry, text, parsed = setup_role()
+    before = deepcopy(entry)
+    assert parse_associations([entry]) == (entry,)
+    assert parsed.requirement_evidence == (entry,)
+    assert entry == before

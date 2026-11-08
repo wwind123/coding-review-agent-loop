@@ -242,8 +242,10 @@ evidence-only, mixed), request, answered_item_ids and leftover_instructions.
 The parser checks shape; routing checks surfaced source identity, native target
 existence and requester ownership. Only `request` and `leftover_instructions`
 normalize empty lists or null to empty strings before strict validation; invalid
-text types report the indexed field and observed type (#1943). Repair compares
-copies under that same narrow empty-text equivalence only when both collections
+text types report the indexed field and observed type (#1943). String leftovers
+for `code`, `human-only` and `evidence-only` are cleared on copies (#1954), without
+relocating text into findings or requests; mixed leftovers must remain nonblank.
+Repair compares copies under this same role-aware normalization only when both collections
 parse, retaining raw equality otherwise. Collection shape, order and all other
 content stay protected. A real bounded reviewer continuation owns missing
 classification. Mixed-source prompt and disposition validation use the original
