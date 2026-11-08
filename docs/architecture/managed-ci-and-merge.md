@@ -621,6 +621,13 @@ label event. Race comparisons project only these authenticated fields and strict
 names; asynchronous GitHub mergeability metadata, timestamps and counters are excluded.
 Publication failure uses the partial-draft/ref cleanup path.
 
+Before inspecting comment bodies for an existing creation audit, publication filters
+authors by the live authenticated actor's exact login and integer ID (excluding
+boolean IDs). Foreign quotations and copied audits cannot suppress publication or
+establish authority. Matching-author trailer text still triggers full authentication,
+including malformed or conflicting candidates; publication does not replace a
+trusted candidate merely because it fails parsing or authentication.
+
 PR-mode activation independently reads persisted facts. Editable body records
 nominate a source identity, while actor-owned creation comments establish authority.
 The compatible original-head audit format remains readable; new roots additionally

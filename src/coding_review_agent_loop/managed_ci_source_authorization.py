@@ -372,7 +372,14 @@ def publish_source_creation_root(runner, *, config, pr_number, source, protectio
     if assessment.state != protection or protection not in waivable_protection_states(config):
         raise AgentLoopError("Source-managed creation protection or current waiver changed.")
     comments = _comments(runner, config, pr_number)
-    relevant = any(UNPROTECTED_OVERRIDE_TRAILER in api._normalized_comment_body(c, config=None) for c in comments)
+    def is_creation_candidate(comment):
+        user = comment.get("user")
+        if (not isinstance(user, dict) or user.get("login") != before[2]
+            or type(user.get("id")) is not int or user.get("id") != before[3]):
+            return False
+        return UNPROTECTED_OVERRIDE_TRAILER in api._normalized_comment_body(comment, config=None)
+
+    relevant = any(is_creation_candidate(c) for c in comments)
     if relevant:
         return authenticate_source_authority(runner, config=config, pr_number=pr_number,
             expected_head=source[1], source=source, protection=protection)
