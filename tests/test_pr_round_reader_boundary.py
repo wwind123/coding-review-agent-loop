@@ -15,7 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'src/coding_review_agent_loop'
 CODECS = {'_extract_round_metadata_records', '_decode_round_metadata_records', '_continuity_round_records',
           'collect_reviewer_board_amendments', 'reject_misplaced_pr_amendments',
-          'parse_reviewer_board_amendment_records'}
+          'parse_reviewer_board_amendment_records', 'collect_child_disposition_overrides',
+          'collect_child_plan_supersessions', 'find_child_plan_rebind_records',
+          'authorized_replan_lineage', 'parse_child_disposition_override_records',
+          'parse_child_plan_supersession_records'}
 
 
 def calls(source, exports=None):
@@ -84,6 +87,8 @@ def test_round_reader_call_sites_have_reviewed_input_provenance():
 
 
 @pytest.mark.parametrize('source', [
+    'from .decomposition import collect_child_plan_supersessions as read\ndef new_reader(comments):\n return read(comments)',
+    'def new_reader(comments):\n return find_child_plan_rebind_records(comments)',
     'def new_reader(comments):\n return collect_reviewer_board_amendments(comments, flow="pr", pr_number=77)',
     'from .board_amendment import collect_reviewer_board_amendments as read\ndef new_reader(comments, flow):\n return read(comments, flow=flow)',
     'def new_reader(comments):\n return _extract_round_metadata_records(comments, flow="pr")',

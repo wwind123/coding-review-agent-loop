@@ -806,7 +806,7 @@ def test_m1390_rescope_never_inherits_an_archived_panel_opening(tmp_path):
     """`boundary-filters-staged-history` (panel opening): the archived scope opened
     the panel and a secondary blocked; the fresh scope starts in the primary phase
     and opens its own panel only after its own exact-plan primary approval."""
-    history = list(_m943_interrupted_history(tmp_path).issue_comments)
+    history = list(_m943_interrupted_history(tmp_path, actor=_M1390_ACTOR).issue_comments)
     archived = _plan_round_records(SimpleNamespace(issue_comments=history))
     assert any(
         record.phase == "scheduler-prelaunch" and record.scheduler_phase != "primary"
@@ -842,6 +842,11 @@ def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(t
     first, _error = _m1251_run(
         tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=5
     )
+    # This scenario replays the same invocation account, as real resume requires.
+    for comment in first.issue_comments:
+        if comment.get("author", {}).get("login") == "coding-review-agent-loop":
+            comment["author"] = {"login": _M1390_ACTOR[0]}
+            comment["_rest_author_id"] = _M1390_ACTOR[1]
     history = list(first.issue_comments)
     archived = _plan_round_records(SimpleNamespace(issue_comments=history))
     assert any(record.step_back_entries for record in archived)

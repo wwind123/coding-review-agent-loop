@@ -344,8 +344,9 @@ def resolve_issue_pr_handoff_lineage(
     replacement_index = -1
     found_index = -1
     edges: list[tuple[IssuePrHandoffMetadata, IssuePrHandoffMetadata, int]] = []
+    from .pr_round_ingestion import record_body
     for comment_index, comment in enumerate(comments):
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if not isinstance(body, str):
             continue
         for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):

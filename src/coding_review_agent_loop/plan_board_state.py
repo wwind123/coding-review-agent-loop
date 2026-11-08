@@ -79,7 +79,7 @@ def admitted_issue_comments(
     issue_number: int,
     comments: Sequence[object],
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
-    """Acquire complete board-control history with separate family projections.
+    """Acquire complete planning/control history with separate family projections.
 
     Amendments admit invocation or configured human identities; board links
     and round transport stay invocation-only. Incomplete acquisition fails

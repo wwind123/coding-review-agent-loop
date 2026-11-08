@@ -821,7 +821,9 @@ def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_pat
             ),
         ),
     )
+    from agent_loop_helpers import serve_authenticated_issue_context
     runner = _FakeRunner()
+    issue_context = serve_authenticated_issue_context(runner, config, issue_context)
 
     with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         plan_first_loop_module._run_plan_first_loop(

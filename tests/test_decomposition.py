@@ -2970,8 +2970,16 @@ def test_unauthenticated_completion_claim_does_not_suppress_the_record(
 
     _run_merge_hook(runner, tmp_path)
 
-    assert len(_completion_records(runner)) == 1
-    assert "recorded the staged completion on the parent" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    if "id" not in author:
+        # Missing identity makes the complete observation unusable; it cannot
+        # be treated as an empty history and followed by a successful write.
+        assert _completion_records(runner) == []
+        assert "no completion record was written" in output
+        assert "author_id must be a positive integer" in output
+    else:
+        assert len(_completion_records(runner)) == 1
+        assert "recorded the staged completion on the parent" in output
 
 
 def test_authenticated_record_with_different_stages_does_not_suppress_the_record(tmp_path):
@@ -4820,10 +4828,10 @@ def test_parent_resume_recovers_canonical_child_pr(
         )
         real_get = get_issue_context
         def contexts(runner, *, config, issue_number):
-            if issue_number == 55:
-                return parent
-            if issue_number == 56:
-                return child
+            if issue_number in (55, 56):
+                from agent_loop_helpers import serve_authenticated_issue_context
+                return serve_authenticated_issue_context(
+                    runner, config, parent if issue_number == 55 else child)
             return real_get(runner, config=config, issue_number=issue_number)
         patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop,
                                    plan_execution, plan_first_loop, pr_loop,

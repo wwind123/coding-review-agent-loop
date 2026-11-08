@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.parse
+from .pr_round_ingestion import record_body, protocol_candidate
 from .execution_retirement import _strict_gh_listing, _REALIZATION_LISTING_LIMIT
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -372,7 +373,7 @@ def _current_execution_recommendation(
     bodies = [current_plan]
     bodies.extend(
         body for comment in issue_comments
-        if isinstance((body := getattr(comment, "body", None)), str)
+        if isinstance((body := record_body(comment)), str)
     )
     recommendation = decode_execution_recommendation_marker(
         marker.group("payload"), bodies=bodies
@@ -616,7 +617,7 @@ def resolve_child_execution_route(
 def _fresh_phase_marker_payload(issue_context: IssueContext) -> dict[str, object] | None:
     """Return the fresh approved-plan-v1 phase identity payload carried by an issue."""
     bodies = [issue_context.body or ""]
-    bodies.extend(comment.body or "" for comment in issue_context.comments)
+    bodies.extend(record_body(comment) or "" for comment in issue_context.comments)
     payloads: list[dict[str, object]] = []
     for body in bodies:
         for match in PHASE_IDENTITY_MARKER_RE.finditer(body):
@@ -824,31 +825,12 @@ def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
     projection is capped, so a full projection may have dropped older
     records and always triggers the authenticated read.
     """
-    if len(comments) >= _REST_ISSUE_COMMENT_PAGE_SIZE:
-        return True
-    for comment in comments:
-        body = getattr(comment, "body", None)
-        if not isinstance(body, str):
-            continue
-        if PLAN_APPROVED_FOLLOWUP_MARKER_RE.search(body) or EXECUTION_DECISION_MARKER_RE.search(body):
-            return True
-        for match in ROUND_RESUME_MARKER_RE.finditer(body):
-            try:
-                flow = decode_mapping(match.group("payload")).get("flow")
-            except Exception:  # noqa: BLE001 - malformed text only widens the read
-                return True
-            if flow == "plan":
-                return True
-        # An approved-plan handoff can be the only planning record left in
-        # view; a direct-flow handoff is ordinary resume state and is not.
-        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
-            try:
-                handoff = decode_issue_pr_handoff_record(match.group("payload"))
-            except Exception:  # noqa: BLE001 - malformed text only widens the read
-                return True
-            if handoff.flow == "approved-plan-implementation":
-                return True
-    return False
+    return len(comments) >= _REST_ISSUE_COMMENT_PAGE_SIZE or any(
+        protocol_candidate(comment) or isinstance(record_body(comment), str)
+        and (PLAN_APPROVED_FOLLOWUP_MARKER_RE.search(record_body(comment))
+             or AGENT_ISSUE_PR_HANDOFF_RE.search(record_body(comment)))
+        for comment in comments
+    )
 
 
 def _refuse_plain_mode_over_planning(
@@ -876,17 +858,11 @@ def _refuse_plain_mode_over_planning(
     """
     if not _projection_may_carry_planning_record(issue_context.comments):
         return
-    login, actor_id = resolve_authenticated_github_actor(runner, config=config)
-    comments = tuple(
-        comment
-        for comment in read_rest_issue_comments(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            purpose="plain issue mode cannot confirm the issue has no approved plan",
-        )
-        if comment.author_id == actor_id
-        and strip_bot_login_suffix(comment.author) == strip_bot_login_suffix(login)
+    from .pr_round_ingestion import admit_pr_comments
+    from .github import ISSUE_THREAD_SURFACE
+    comments, (login, actor_id) = admit_pr_comments(
+        runner, config, pr_number=issue_number, comments=issue_context.comments,
+        force_probe=True, surface_kind=ISSUE_THREAD_SURFACE,
     )
     unreadable_message = (
         f"Issue #{issue_number} carries planning round records that cannot be read ({{}}); "
@@ -943,7 +919,7 @@ def _refuse_plain_mode_over_planning(
     approved_handoff_prs: list[int] = []
     unreadable_handoff = False
     for comment in comments:
-        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(comment.body or ""):
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(record_body(comment) or ""):
             try:
                 handoff = decode_issue_pr_handoff_record(match.group("payload"))
             except AgentLoopError:
@@ -1852,7 +1828,7 @@ def _preflight_fresh_split_topology(
 
     comment_keys: set[str] = set()
     for comment in issue_context.comments:
-        body = getattr(comment, "body", None)
+        body = record_body(comment)
         if isinstance(body, str):
             marker = SPLIT_CHILD_MARKER_RE.search(body)
             if marker is not None and int(marker.group("parent")) == issue_number:
@@ -2279,7 +2255,7 @@ def _infer_staged_parent_issue(issue_context: IssueContext) -> int | None:
     candidates: set[int] = set()
     issue_body = issue_context.body or ""
     bodies = [issue_body]
-    bodies.extend(comment.body or "" for comment in issue_context.comments)
+    bodies.extend(record_body(comment) or "" for comment in issue_context.comments)
     for body in bodies:
         for match in SPLIT_CHILD_MARKER_RE.finditer(body):
             candidates.add(int(match.group("parent")))

@@ -48,9 +48,17 @@ the same configured human identities as ordinary PR admission.
 The amendment projection grants no authority to loop-published records sharing
 the same comment. Round anchors and sidecars use a separate invocation-only
 projection before decoding or hydration. Human trust configuration never
-expands that author set. The later plan/decomposition and contract/recovery
-stages own migration of their remaining readers; this board stage does not
-claim those readers are complete. Signed human requirements retain their
+expands that author set. Plan startup and every refreshed issue observation now admit round metadata
+before drift, scope, approval, scheduler and recovery probes. Parent and child
+observations are authenticated separately. Decomposition reducers read the
+invocation-only projection for topology, handoff, rebind audits and digest-bound
+re-plan coder lineage. Signed child-disposition overrides and child-plan
+supersessions read the human-control projection with the same author set and
+empty-configuration behavior as amendments. A trusted human supersession does
+not authenticate subsequent coder rounds or rebind audits. Ineligible child
+controls are ignored and logged before parsing, including historical records;
+trusted payload, chronology, hash, digest and surface guards remain unchanged.
+Contract, salvage and capture reader migration belongs to the later recovery stage. Signed human requirements retain their
 separate author policy and unconfigured behavior.
 
 ## Legacy PR acknowledgement recovery

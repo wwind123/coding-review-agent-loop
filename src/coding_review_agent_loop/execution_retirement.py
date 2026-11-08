@@ -10,6 +10,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass, replace
 
+from .pr_round_ingestion import record_body
 from . import decomposition as d
 from . import split_materialization as s
 from .errors import AgentLoopError
@@ -97,7 +98,7 @@ def _authenticate_child_pr_history(runner, *, config, context):
     )
     endpoints = []
     for index, comment in enumerate(context.comments):
-        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(comment.body or ""):
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(record_body(comment) or ""):
             record = decode_issue_pr_handoff_record(match["payload"])
             if record.issue_number != context.number:
                 continue
@@ -145,7 +146,7 @@ def _records(comments, parent, repo):
     result = []
     for index, comment in enumerate(comments):
         for pattern, decode, kind in codecs:
-            for match in pattern.finditer(comment.body or ""):
+            for match in pattern.finditer(record_body(comment) or ""):
                 # Legacy decoders sometimes coerce numeric strings or booleans.
                 # Retirement needs the original, strictly typed references.
                 payload = d._decode_json_payload(match["payload"], marker_name="execution history")
@@ -196,7 +197,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
 
     decisions = []
     for index, comment in enumerate(comments):
-        for match in d.EXECUTION_DECISION_MARKER_RE.finditer(comment.body or ""):
+        for match in d.EXECUTION_DECISION_MARKER_RE.finditer(record_body(comment) or ""):
             decision = d._decode_execution_decision(match["payload"])
             if decision.parent_issue == issue_number:
                 decisions.append(((index, match.start()), decision))
@@ -218,7 +219,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     retired_split_keys = set()
     split_records = []
     for index, comment in enumerate(comments):
-        for marker in s.DISCUSS_SPLIT_MARKER_RE.finditer(comment.body or ""):
+        for marker in s.DISCUSS_SPLIT_MARKER_RE.finditer(record_body(comment) or ""):
             metadata = s._decode_split_metadata(marker["payload"])
             if metadata.parent_issue == issue_number:
                 position = (index, marker.start())
@@ -336,7 +337,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
         # checkpoint's recomputed phase identity, not by their display title.
         checkpoints = []
         for index, comment in enumerate(comments):
-            for marker in d.TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(comment.body or ""):
+            for marker in d.TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(record_body(comment) or ""):
                 if ((index, marker.start()), marker[0]) not in historical:
                     checkpoint = d._decode_checkpoint(marker["payload"])
                     if checkpoint.parent_issue == issue_number and checkpoint.plan_hash == plan_hash:
@@ -431,7 +432,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     # A bare split marker must map to a child; a checkpoint may be unrealized
     # only after the complete inventories and explicit references above agree.
     for index, comment in enumerate(comments):
-        for marker in s.SPLIT_CHILD_MARKER_RE.finditer(comment.body or ""):
+        for marker in s.SPLIT_CHILD_MARKER_RE.finditer(record_body(comment) or ""):
             if int(marker["parent"]) != issue_number:
                 continue
             matches = [n for n, item in child_items.items() if marker[0] in item.get("body", "")]

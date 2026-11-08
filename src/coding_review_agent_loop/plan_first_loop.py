@@ -446,6 +446,10 @@ def _run_plan_first_loop_body(
 ) -> int:
     if config.review_parallel:
         _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
+    admitted_comments, _actor = admitted_issue_comments(
+        runner, config=config, issue_number=issue_number, comments=issue_context.comments,
+    )
+    issue_context = dataclasses_replace(issue_context, comments=admitted_comments)
     staged_parent_number = _infer_staged_parent_issue(issue_context)
     parent_issue_context = (
         get_issue_context(runner, config=config, issue_number=staged_parent_number)
@@ -867,7 +871,6 @@ def _run_plan_first_loop_body(
     # --- Planning scope across an edited issue (#1390) ------------------
     # An undecodable planning history keeps its class-D stop ahead of every
     # scope, approval and board read.
-    planning_contract_drift_records()
     # Admission comes first: plan board-change links and planning-scope
     # boundary records are admitted only from the authenticated orchestrator
     # actor.  Board lineage is always resolved from these full admitted
@@ -875,6 +878,8 @@ def _run_plan_first_loop_body(
     plan_admitted_comments, plan_trusted_actor = admitted_issue_comments(
         runner, config=config, issue_number=issue_number, comments=issue_context.comments,
     )
+    issue_context = dataclasses_replace(issue_context, comments=plan_admitted_comments)
+    planning_contract_drift_records()
     invocation_config = config
     # The same live inputs the issue preflight and recovery derive: the issue
     # and authoritative-parent requirement sets, the inherited admissibility
@@ -3067,11 +3072,14 @@ def _run_plan_first_loop_body(
         def _plan_round_recovery() -> PartialRoundRecovery:
             return compute_partial_round_recovery(
                 snapshot=issue_context.comments,
-                read_rest=lambda: read_rest_issue_comments(
+                read_rest=lambda: admitted_issue_comments(
                     runner, config=config, issue_number=issue_number,
-                    purpose="the partial review round's comment ids cannot be listed",
-                    reject_empty_output=True,
-                ),
+                    comments=read_rest_issue_comments(
+                        runner, config=config, issue_number=issue_number,
+                        purpose="the partial review round's comment ids cannot be listed",
+                        reject_empty_output=True,
+                    ),
+                )[0],
                 flow="plan", round_number=round_number, subject=current_plan_subject,
                 context=plan_recovery_context,
                 reviewer_names=[agent_display_name(r) for r in configured_reviewers],

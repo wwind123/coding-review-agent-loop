@@ -21,6 +21,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from .pr_round_ingestion import record_body
 from .pr_round_errors import PrRoundHistoryError
 from .errors import AgentLoopError
 from .github import IssueComment, strip_bot_login_suffix
@@ -113,10 +114,10 @@ def _snapshot_covered(
     needed = Counter(
         _comment_key(comment)
         for comment in snapshot
-        if isinstance(comment.body, str)
+        if isinstance(record_body(comment), str)
         and (
-            ROUND_RESUME_MARKER_RE.search(comment.body)
-            or is_round_transport_sidecar(comment.body)
+            ROUND_RESUME_MARKER_RE.search(record_body(comment))
+            or is_round_transport_sidecar(record_body(comment))
         )
     )
     return all(available[key] >= count for key, count in needed.items())
@@ -259,9 +260,9 @@ def _plan(
         index for index, comment in enumerate(comments)
         if index < first_in_round
         and index not in round_indexes
-        and isinstance(comment.body, str)
-        and ROUND_RESUME_MARKER_RE.search(comment.body)
-        and not is_round_transport_sidecar(comment.body)
+        and isinstance(record_body(comment), str)
+        and ROUND_RESUME_MARKER_RE.search(record_body(comment))
+        and not is_round_transport_sidecar(record_body(comment))
     ]
     lower_bound = max(earlier) if earlier else None
     retained_gates = [index for index in gate_indices if index < min(targets)]
@@ -287,17 +288,17 @@ def _plan(
 
     attachments = [
         index for index, comment in enumerate(comments)
-        if isinstance(comment.body, str) and is_round_transport_sidecar(comment.body)
+        if isinstance(record_body(comment), str) and is_round_transport_sidecar(record_body(comment))
     ]
     attachment_set = set(attachments)
     undecodable = False
     retained_refs: set[tuple[str, str]] = set()
     targeted_refs: set[tuple[str, str]] = set()
     for index, comment in enumerate(comments):
-        if index in attachment_set or not isinstance(comment.body, str):
+        if index in attachment_set or not isinstance(record_body(comment), str):
             continue
         try:
-            refs = referenced_attachment_keys(comment.body)
+            refs = referenced_attachment_keys(record_body(comment))
         except AgentLoopError:
             # Keep the known targets; no attachment may be called unreferenced.
             undecodable = True
@@ -319,7 +320,7 @@ def _plan(
 
     uncertain: dict[int, str] = {}
     for index in attachments:
-        keys = attachment_keys(comments[index].body or "")
+        keys = attachment_keys(record_body(comments[index]) or "")
         if any(referenced(retained_refs, key) for key in keys):
             continue
         if any(referenced(targeted_refs, key) for key in keys):
@@ -470,7 +471,7 @@ def _compute(
             held: set[tuple[str, str]] = set()
             attachment_positions: list[tuple[int, tuple[tuple[str, str], ...]]] = []
             for position, comment in enumerate(remaining):
-                body = comment.body if isinstance(comment.body, str) else ""
+                body = record_body(comment) or ""
                 if is_round_transport_sidecar(body):
                     keys = attachment_keys(body)
                     held.update(keys)

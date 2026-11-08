@@ -2685,7 +2685,7 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         issue_number=issue_number,
         comments=_parse_issue_comments(data.get("comments")),
     )
-    # Board controls use a separate author projection from raw discussion.
+    # Planning history and human controls use separate projections from raw discussion.
     from .pr_round_ingestion import admit_issue_board_comments
     comments, _actor = admit_issue_board_comments(
         runner, config, issue_number=issue_number, comments=comments,

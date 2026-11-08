@@ -16,10 +16,14 @@ from .github import (IssueComment, CompleteCommentListing, PR_THREAD_SURFACE,
     resolve_authenticated_github_actor)
 
 
-# Match literal or JSON-unicode-escaped kind bytes without decoding any payload.
-_BOARD_CONTROL_CANDIDATE_RE = re.compile("".join(
-    rf"(?:{re.escape(char)}|\\u{ord(char):04x})" for char in "reviewer-board-amendment"
-), re.I)
+# Recognize control kinds without parsing untrusted JSON, including escaped bytes.
+def _kind_pattern(kind: str) -> str:
+    return "".join(rf"(?:{re.escape(char)}|\\u{ord(char):04x})" for char in kind)
+
+
+_BOARD_CONTROL_CANDIDATE_RE = re.compile(_kind_pattern("reviewer-board-amendment"), re.I)
+_CHILD_CONTROL_CANDIDATE_RE = re.compile("|".join(map(_kind_pattern, (
+    "child-execution-disposition-override", "child-plan-supersession"))), re.I)
 
 
 def board_control_candidate(comment: object) -> bool:
@@ -28,12 +32,17 @@ def board_control_candidate(comment: object) -> bool:
     return isinstance(body, str) and _BOARD_CONTROL_CANDIDATE_RE.search(body) is not None
 
 
+def child_control_candidate(comment: object) -> bool:
+    """Recognize human child-routing controls without decoding their payloads."""
+    body = getattr(comment, "body", None)
+    return isinstance(body, str) and _CHILD_CONTROL_CANDIDATE_RE.search(body) is not None
+
+
 def protocol_candidate(comment: object) -> bool:
     """Recognize malformed record-shaped content without decoding payloads."""
     body = getattr(comment, "body", None)
-    return board_control_candidate(comment) or isinstance(body, str) and re.search(
-        r"<!--\s*AGENT_(?:LOOP_META|LOOP_SIDECAR|PR_BOARD_CHANGE|PLAN_BOARD_CHANGE|PLAN_SCOPE_BOUNDARY)\b|reviewer-board-amendment", body, re.I) is not None
-
+    return board_control_candidate(comment) or child_control_candidate(comment) or isinstance(body, str) and re.search(
+        r"<!--\s*AGENT_(?:LOOP_META|LOOP_SIDECAR|PR_BOARD_CHANGE|PLAN_BOARD_CHANGE|PLAN_SCOPE_BOUNDARY|PLAN_DECOMPOSITION|PLAN_PHASE_IMPLEMENTATION|PLAN_TOPOLOGY_CHECKPOINT|PLAN_EXECUTION_DECISION|PLAN_ONE_SHOT_IMPL|CHILD_PLAN_REBIND|EXECUTION_RECOMMENDATION|PLAN_PHASE_IDENTITY|SPLIT_CHILD|SPLIT_MATERIALIZATION|DISCUSS_SPLIT|ISSUE_PR_HANDOFF|PLAN_APPROVED_FOLLOWUP)\b", body, re.I) is not None
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,11 @@ class AdmittedPrComment(IssueComment):
         if self.body != self.admitted_body:
             raise AgentLoopError(f"Comment {self.comment_id} changed after admission.")
         return self.admitted_protocol_body if self.amendment_eligible else ""
+
+    @property
+    def child_control_body(self) -> str | None:
+        """Human controls share the board author policy, never loop authority."""
+        return self.amendment_body
 
     @property
     def protocol_body(self) -> str | None:
@@ -153,12 +167,24 @@ def admit_pr_comments(
         if board_control_candidate(comment) and not eligible:
             log(config, f"{surface_kind} #{pr_number} comment {getattr(comment, 'comment_id', None)}: "
                 f"ignored reviewer-board amendment candidate: {reason}.")
+        if child_control_candidate(comment) and not eligible:
+            log(config, f"{surface_kind} #{pr_number} comment {getattr(comment, 'comment_id', None)}: "
+                f"ignored child control candidate: {reason}.")
         if protocol_candidate(comment) and not owned and re.search(r"<!--\s*AGENT_", body, re.I):
             log(config, f"{surface_kind} #{pr_number} comment {getattr(comment, 'comment_id', None)}: "
                 "ignored loop record: author is not the invocation actor.")
-        return _project(comment, actor[1], raw_body=raw_body,
-                        amendment_eligible=eligible, human_trust=human_trust,
-                        actor_login=actor[0], surface=surface)
+        projected = _project(comment, actor[1], raw_body=raw_body,
+                             amendment_eligible=eligible, human_trust=human_trust,
+                             actor_login=actor[0], surface=surface)
+        # Complete authenticated envelopes intentionally omit presentation
+        # URLs. Reconstruct the permalink from the verified surface and ID so
+        # recovery targets retain their required stable locator.
+        from dataclasses import replace
+        if projected.comment_id is not None:
+            projected = replace(projected, url=(
+                f"https://github.com/{config.repo}/issues/{pr_number}"
+                f"#issuecomment-{projected.comment_id}"))
+        return projected
 
     by_id = {c.comment_id: c for c in listing.comments}
     used, result = set(), []
@@ -256,14 +282,15 @@ def owned_rest_protocol_bodies(
 def admit_issue_board_comments(runner: Runner, config: AgentLoopConfig, *,
                                issue_number: int, comments: Sequence[object],
                                force_probe: bool = False):
-    """Shared complete acquisition for issue board-control projections."""
-    from .board_change import PLAN_SURFACE, comments_bear_board_change_links
-    from .plan_issue_scope import comments_bear_scope_boundary
-    if not force_probe and len(comments) < 100 and not (
-        any(map(board_control_candidate, comments))
-        or comments_bear_board_change_links(comments, surface=PLAN_SURFACE)
-        or comments_bear_scope_boundary(comments)
-    ):
+    """Shared complete acquisition for issue planning and control projections."""
+    if not force_probe and len(comments) < 100 and not any(map(protocol_candidate, comments)):
         return tuple(comments), None
     return admit_pr_comments(runner, config, pr_number=issue_number,
         comments=comments, force_probe=force_probe, surface_kind=ISSUE_THREAD_SURFACE)
+
+
+def record_body(comment: object, *, human_control: bool = False) -> str | None:
+    """Select a bound family projection; raw inputs are for offline reducers."""
+    if isinstance(comment, AdmittedPrComment):
+        return comment.child_control_body if human_control else comment.protocol_body
+    return getattr(comment, "body", None)

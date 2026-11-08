@@ -2524,3 +2524,28 @@ def long_plan_revision_pair(*, seed: int = 1516, changed_lines: int = 60) -> tup
         tokens[rng.randrange(1, len(tokens))] = "REVISED"
         revised[index] = " ".join(tokens)
     return "\n".join(lines), "\n".join(revised)
+
+
+def serve_authenticated_issue_context(runner, config, context):
+    """Back a mocked issue snapshot with the same complete REST observation.
+
+    Body-only legacy fixtures are invocation publications. Explicit author
+    identities stay explicit so admission regressions cannot gain authority.
+    """
+    from dataclasses import replace
+    from coding_review_agent_loop.github import _parse_issue_comments
+    from coding_review_agent_loop.pr_round_ingestion import admit_issue_board_comments
+
+    login, actor_id = runner.authenticated_actor or ('coding-review-agent-loop', 424242)
+    rows = []
+    for index, comment in enumerate(context.comments, 1):
+        legacy = comment.author == 'bot' and comment.author_id is None
+        author = login if legacy else comment.author
+        user_id = actor_id if legacy else comment.author_id
+        rows.append({'body': comment.body, 'author': {'login': author},
+                     '_rest_author_id': user_id, 'id': comment.comment_id or 10000 + index,
+                     'createdAt': comment.created_at or '2026-05-01T00:00:00Z', 'url': comment.url})
+    runner.issue_comments_by_number[context.number] = rows
+    comments, _ = admit_issue_board_comments(
+        runner, config, issue_number=context.number, comments=_parse_issue_comments(rows))
+    return replace(context, comments=comments)
