@@ -3069,3 +3069,35 @@ def test_repair_empty_text_raw_fallback(invalid_side):
         target[0]["leftover_instructions"] = None
     with pytest.raises(AgentLoopError, match="classification"):
         _repair_classifications(source, target)
+
+
+@pytest.mark.parametrize("role", ["code", "human-only", "evidence-only"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_repair_nonmixed_leftover_equivalence(role, reverse):
+    from pr_loop_test_helpers import _association
+    canonical = [_association("source", role,
+        request="Accept run" if role == "human-only" else "",
+        answers=["item-1"] if role == "evidence-only" else [])]
+    variant = deepcopy(canonical)
+    variant[0]["leftover_instructions"] = "Redundant instructions"
+    source, target = (canonical, variant) if reverse else (variant, canonical)
+    before = deepcopy((source, target))
+    _repair_classifications(source, target)
+    assert (source, target) == before
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "content"])
+def test_nonmixed_normalization_does_not_authorize_finding_changes(change):
+    from pr_loop_test_helpers import _association
+    source = _classification_repair_payload([_association("source", "code", leftover="Invent a third finding")])
+    source.update(state="blocking", blocking_items=["Fix retries", "Preserve ownership checks"])
+    target = deepcopy(source)
+    target["requirement_evidence"][0]["leftover_instructions"] = ""
+    if change == "add":
+        target["blocking_items"].append("Invent a third finding")
+    elif change == "remove":
+        target["blocking_items"].pop()
+    else:
+        target["blocking_items"][0] = "Replace the storage backend"
+    with pytest.raises(AgentLoopError):
+        check(source, target)
