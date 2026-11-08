@@ -557,3 +557,16 @@ def test_excluded_1868_keeps_strict_partition(defect):
     parsed = dataclasses.replace(_followup_1388(), addressed_items=claims[defect])
     with pytest.raises(AgentLoopError, match={"duplicate": "more than once", "missing": "did not classify", "unknown": "unknown"}[defect]):
         _validate_structured_coder_followup_items(parsed, unresolved_items=(_item_1388("item-1"), _excluded_1868("future")))
+
+
+@pytest.mark.parametrize('kind', ['managed-exact-head-ci', 'github-pr-checks'])
+@pytest.mark.parametrize('same_head', [True, False])
+def test_managed_same_head_failure_retains_original_source_round(kind, same_head):
+    original = _upsert_machine_obligation(
+        [], item_number=1, kind=kind, source_round=1, text='First failure.', failed_head_sha=H1)
+    updated = _upsert_machine_obligation(
+        original, item_number=2, kind=kind, source_round=4, text='Later failure.',
+        failed_head_sha=H1 if same_head else H2)
+    assert updated[0].source_round == (1 if kind == 'managed-exact-head-ci' and same_head else 4)
+    assert updated[0].obligation_identity == original[0].obligation_identity
+    assert updated[0].item_id == original[0].item_id

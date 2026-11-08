@@ -181,6 +181,20 @@ conflict-resolution coder turn; it does not revoke failure authority. Completed
 historical failures retain their repair authority across newer same-target
 intents; supersession rejection applies to the separate live failure path.
 
+A superseded attached baseline can be replaced by a unique newer authenticated
+same-target failed run discovered through bounded comment-page reads. The old
+attachment is authenticated independently; rejection by the live supersession
+gate alone is insufficient. Replacement requires fresh intent, workflow,
+actor, exact-attempt, non-plumbing failure and live authorization checks. It
+never patches or cancels the old attachment, dispatches CI for discovery, or
+replaces completed historical references. The existing qualification checkpoint
+persists the replacement before coder handoff, preserving obligation identity,
+source round, review/input bindings and spent budgets while dropping old
+verified-result provenance. Failed persistence prevents dispatch; restart can
+rediscover a replacement before publication or reconstruct it afterward. The
+existing handoff gate rechecks the replacement against fresh authority and
+attempt state. Insufficient or stale evidence leaves repair unresolved.
+
 When the authenticated original baseline is still `in_progress` without a
 conclusion or correlated terminal status, repair handoff waits locally using
 `--ci-poll-interval-seconds` and `--ci-timeout-seconds`. A finite poll budget and

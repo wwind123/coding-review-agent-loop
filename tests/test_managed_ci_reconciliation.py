@@ -101,9 +101,9 @@ def _status(attempt=2, state='success'):
             'target_url': 'https://github.com/OWNER/REPO/actions/runs/100'}
 
 
-def recovery(tmp_path, *, legacy=False, auto_merge=True):
+def recovery(tmp_path, *, legacy=False, auto_merge=True, allowed_rounds=3):
     config = make_config(tmp_path, managed_ci=True, managed_ci_pr_mode=True,
-                         managed_ci_trusted_actor='agent-loop', auto_merge=auto_merge, max_rounds=3,
+                         managed_ci_trusted_actor='agent-loop', auto_merge=auto_merge, max_rounds=allowed_rounds,
                          invocation_argv=('agent-loop', 'pr', '7', '--managed-ci',
                                           '--managed-ci-trusted-actor', 'agent-loop'))
     run = valid_v2_run(run_id=100, attempt=2, status='completed', conclusion='success')
@@ -126,7 +126,7 @@ def recovery(tmp_path, *, legacy=False, auto_merge=True):
         acquisition_digest=support._qualification_digest(
             {'Codex': (invocation.configured_model, invocation.resolved_effort, 'codex')}),
         scheduler_digest=support._qualification_digest(support._prior_item_ledger_signature((item,))),
-        allowed_rounds=3, watch_failure_extension_used=True,
+        allowed_rounds=allowed_rounds, watch_failure_extension_used=True,
     )
     runner.add_round(_attach_round_metadata(
         'Approved.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex',
@@ -936,3 +936,27 @@ def test_handoff_without_wait_logs_nothing(tmp_path, monkeypatch, capsys):
     assert sleeps == []
     err = capsys.readouterr().err
     assert 'waiting up to' not in err and 'after waiting' not in err
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+def test_replacement_preserves_checkpoint_bindings_and_original_source(tmp_path, monkeypatch, auto_merge):
+    from test_managed_ci_live_failure import superseded_fixture
+    fixture = superseded_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    # A previous verified result must not follow the replacement reference.
+    cp = dataclasses.replace(cp, verified_managed_result=VerifiedManagedResult(ref, 2))
+    from coding_review_agent_loop.unresolved_items import _upsert_machine_obligation
+    refreshed = _upsert_machine_obligation(
+        [item], item_number=2, kind='managed-exact-head-ci', source_round=7,
+        text='New qualification failed on the same head.', failed_head_sha=ref.head_sha)
+    assert refreshed[0].source_round == item.source_round
+    old = copy.deepcopy(runner.intent_comments)
+    result, updated, items = reconcile_repair_checkpoint(
+        runner, config=config, pr_number=7, metadata=metadata, contract=contract, checkpoint=cp, items=refreshed)
+    assert result is None and items == refreshed and items[0].source_round == ref.source_round
+    expected = dataclasses.replace(ref, audit_comment_id=19, nonce='z'*32, run_id=101,
+                                   generation='replacement-generation')
+    assert updated == dataclasses.replace(cp, failed_managed_run=expected, verified_managed_result=None)
+    assert updated == QualificationCheckpoint.from_mapping(updated.as_dict())
+    assert runner.intent_comments == old and runner.dispatch_count == 0
+    assert not any('PATCH' in cmd or 'rerun' in cmd or 'cancel' in cmd for cmd, _ in runner.commands)

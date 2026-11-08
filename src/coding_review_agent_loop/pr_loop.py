@@ -16,7 +16,7 @@ from .pr_restart import checkpoint_restart, review_inputs_changed
 from .review_rounds import _normalize_evidence_only_approval
 from .managed_ci_reconciliation import (
     observe_repair_result, reconcile_repair_checkpoint, historical_outcome,
-    historical_qualification_fields, require_repair_handoff_failure,
+    historical_qualification_fields, require_repair_handoff_failure, refresh_repair_reference,
 )
 
 import datetime
@@ -9209,6 +9209,7 @@ def run_pr_loop(
                     _scheduler_item_ledger_signature(unresolved_items)
                 ),
             )
+            qualification_checkpoint = refresh_repair_reference(runner, config=config, pr_number=pr_number, metadata=pr_metadata, contract=managed_ci, checkpoint=qualification_checkpoint)
             if observe_repair_result(
                 runner, config=config, pr_number=pr_number, metadata=pr_metadata,
                 contract=managed_ci, checkpoint=qualification_checkpoint,
