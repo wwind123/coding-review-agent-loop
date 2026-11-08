@@ -1040,7 +1040,7 @@ def test_pr_loop_dispute_resolved_when_reviewer_reconsiders(tmp_path):
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
 
-    assert run_pr_loop(runner, pr_number=55, config=config) == 0
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     followup_comments = [c for c in runner.comments if "## Coder follow-up" in c]
     assert len(followup_comments) == 1
@@ -1096,7 +1096,7 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
 
     def capture_posted_comment(args, *, cwd, **kwargs):
         command = [str(arg) for arg in args]
-        if command[:4] == ["gh", "pr", "comment", "55"]:
+        if command[:4] == ["gh", "pr", "comment", "77"]:
             body_path = Path(command[command.index("--body-file") + 1])
             posted_comment_calls.append((command, body_path.read_text(encoding="utf-8")))
         return original_run(args, cwd=cwd, **kwargs)
@@ -1108,7 +1108,7 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         HumanDecisionRequiredError,
         match="Reviewer did not resolve 1 disputed item",
     ) as excinfo:
-        run_pr_loop(runner, pr_number=55, config=config)
+        run_pr_loop(runner, pr_number=77, config=config)
 
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
     release_command = [
@@ -1116,7 +1116,7 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         "api",
         "--method",
         "DELETE",
-        "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
+        "repos/OWNER/REPO/issues/77/labels/agent-loop-managed",
     ]
     commands = [command for command, _cwd in runner.commands]
     release_index = commands.index(release_command)
@@ -1127,7 +1127,7 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
     ]
     assert len(human_decision_comment_calls) == 1
     comment_command, human_decision_comment = human_decision_comment_calls[0]
-    assert comment_command[:4] == ["gh", "pr", "comment", "55"]
+    assert comment_command[:4] == ["gh", "pr", "comment", "77"]
     assert "--body-file" in comment_command
     assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
@@ -1173,7 +1173,7 @@ def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp
         AgentLoopError,
         match="Reviewer did not resolve 1 disputed item",
     ):
-        run_pr_loop(runner, pr_number=55, config=config)
+        run_pr_loop(runner, pr_number=77, config=config)
 
 
 def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
@@ -1209,7 +1209,7 @@ def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
         ],
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
-    run_pr_loop(runner, pr_number=55, config=config)
+    run_pr_loop(runner, pr_number=77, config=config)
 
     # The prior_items stored in the coder's PR comment should include dispute notes
     # runner.pr_payload["comments"] retains the raw body with AGENT_LOOP_META intact

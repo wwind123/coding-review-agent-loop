@@ -360,8 +360,38 @@ class V2ManagedRunner(ManagedRunner):
         ]
         return max(ids, default=100) + 1
 
+    def _complete_round_fixtures(self):
+        """Give legacy GraphQL-only fixture publications real REST envelopes.
+
+        Explicit IDs are never repaired: tests can still model deletion, drift
+        and contradictory identity by editing either projection independently.
+        """
+        if not isinstance(self.intent_comments, list):
+            return
+        for comment in self.pr_payload.get('comments', []):
+            if 'id' in comment or 'databaseId' in comment:
+                continue
+            matches = [c for c in self.intent_comments if isinstance(c, dict)
+                       and c.get('body') == comment.get('body')]
+            if len(matches) == 1:
+                rest = matches[0]
+            elif not matches:
+                login = (comment.get('author') or {}).get('login')
+                user = ({'login': self.actor_login, 'id': self.actor_id}
+                        if login in {None, 'bot', 'coding-review-agent-loop'} else
+                        {'login': login, 'id': comment.get('_rest_author_id', 987654)})
+                rest = {'id': self._next_comment_id(), 'user': user, 'body': comment['body']}
+                self.intent_comments.append(rest)
+            else:
+                continue
+            rest.setdefault('created_at', comment.get('createdAt') or '2026-01-01T00:00:00Z')
+            comment.update(databaseId=rest['id'], author={'login': rest['user']['login']},
+                           _rest_author_id=rest['user']['id'], createdAt=rest['created_at'])
+
     def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = list(args)
+        if cmd[:3] == ['gh', 'pr', 'view']:
+            self._complete_round_fixtures()
         endpoint = next(
             (part for part in cmd if isinstance(part, str) and part.startswith("repos/")), ""
         )
@@ -425,7 +455,9 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps({"sha": self.base_sha}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
+            comments = [dict(c, created_at=c.get('created_at') or '2026-01-01T00:00:00Z')
+                        if isinstance(c, dict) else c for c in self.intent_comments] if isinstance(self.intent_comments, list) else self.intent_comments
+            return CommandResult(cmd, cwd_path, json.dumps(comments), "", 0)
         if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
             body = self._form_value(cmd, "body")
@@ -15512,10 +15544,17 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
             comment for comment in runner.intent_comments if comment["id"] == review_ids[0]
         ]
         runner.intent_comments.remove(review)
+        if predecessor_review == "absent":
+            runner.pr_payload['comments'] = [c for c in runner.pr_payload['comments']
+                if c.get('id', c.get('databaseId')) != review['id']]
+        else:
+            for c in runner.pr_payload['comments']:
+                if c.get('id', c.get('databaseId')) == review['id']:
+                    c.update(author={'login': 'mallory'}, _rest_author_id=9)
         if predecessor_review == "foreign":
             # The same review body, but authored by another account.
             runner.intent_comments.append({
-                **review, "user": {"login": "mallory", "id": 9}, "created_at": None,
+                **review, "user": {"login": "mallory", "id": 9},
             })
             runner.intent_comments.sort(key=lambda comment: comment["id"])
 

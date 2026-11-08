@@ -178,7 +178,11 @@ def _context(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path | None = None,
 ) -> PullRequestReviewContext:
     try:
-        return read_pr_context(runner, config=config, pr_number=pr_number, cwd=cwd)
+        from dataclasses import replace
+        from .pr_round_ingestion import admit_pr_comments
+        context = read_pr_context(runner, config=config, pr_number=pr_number, cwd=cwd)
+        comments, _actor = admit_pr_comments(runner, config, pr_number=pr_number, comments=context.comments)
+        return replace(context, comments=comments)
     except (AgentLoopError, OSError) as exc:
         raise PrHeadObservationError(f"PR-head context verification failed: {exc}") from exc
 

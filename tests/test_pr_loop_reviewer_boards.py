@@ -1096,6 +1096,8 @@ def _affected_issue_created_pr_1365(tmp_path, monkeypatch):
         "coder", "authoritative", runner.pr_payload.get("headRefOid", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     assert coder.metadata.seat_binding is None and coder.metadata.pr_board_root is None
+    runner._ensure_fixture_comment_ids(runner.pr_payload["comments"], 77)
+    runner._ensure_fixture_comment_ids(runner.issue_comments, 56)
     return runner, seats, config
 
 
@@ -1162,8 +1164,8 @@ def test_coder_only_named_pr_under_changed_board_posts_one_audit_and_no_link(tmp
 
 
 @pytest.mark.parametrize("floor", [None, 3], ids=["no-floor", "floor"])
-def test_foreign_legacy_coder_record_is_refused_at_named_pr_entry(tmp_path, monkeypatch, floor):
-    """Row foreign-coder-refused: the unconditional entry check, with and without a floor."""
+def test_foreign_legacy_coder_record_is_excluded_at_named_pr_entry(tmp_path, monkeypatch, floor):
+    """Foreign history cannot seed a named board, with or without a floor."""
     runner, seats, config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
     (coder,) = runner.pr_payload["comments"]
     coder["_rest_author_id"] = _FOREIGN_1365
@@ -1172,11 +1174,11 @@ def test_foreign_legacy_coder_record_is_refused_at_named_pr_entry(tmp_path, monk
         config = dataclasses.replace(config, min_reviewers=floor)
     _queue_1365(runner, seats)
     start = len(runner.commands)
-    with pytest.raises(AgentLoopError, match="Human decision required") as refused:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "coder round record" in str(refused.value) and "intruder" in str(refused.value)
-    assert len(runner.pr_payload["comments"]) == 1
-    assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agents_1365(runner, start) == ["codex", "agy", "agy"]
+    prompts = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"codex", "agy"}]
+    assert all("Implemented approved plan." not in prompt for prompt in prompts)
+    assert runner.pr_payload["comments"][0] == coder
 
 
 def test_foreign_canonical_handoff_record_is_refused_at_named_pr_entry(tmp_path, monkeypatch):

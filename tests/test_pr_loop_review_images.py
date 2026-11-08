@@ -728,8 +728,11 @@ def test_visual_restart_requires_authenticated_author(visual_setup, monkeypatch,
         # The shared accessor imports the resolver directly.
         monkeypatch.setattr(__import__('coding_review_agent_loop.pr_loop_support', fromlist=['x']),
             'resolve_authenticated_github_actor', github.resolve_authenticated_github_actor)
+    if attack == 'unavailable':
+        monkeypatch.setattr(__import__('coding_review_agent_loop.pr_round_ingestion', fromlist=['x']),
+            'resolve_authenticated_github_actor', github.resolve_authenticated_github_actor)
     if attack == 'missing-identity':
-        runner.pr_payload['comments'][0].pop('_rest_author_id')
+        runner.pr_payload['comments'][0]['_rest_author_id'] = None
     config = replace(config, review_images_paths=('ui/*',) if enabled else ())
     monkeypatch.setattr(visual, 'capture', lambda *a: CaptureResult('failed','unavailable'))
     if attack == 'inject':
@@ -883,9 +886,9 @@ def test_authenticated_history_admission_at_production_seam(visual_setup, kind):
         append_visual_record(runner)
     else:
         _append_lifecycle(runner,head='a'*40 if kind=='old' else 'unknown' if kind=='unknown' else None)
-        if kind=='incomplete': runner.pr_payload['comments'][0].pop('_rest_author_id')
+        if kind=='incomplete': runner.pr_payload['comments'][0]['_rest_author_id'] = None
     if kind in {'unknown','incomplete'}:
-        with pytest.raises(HumanDecisionRequiredError): run_pr_loop(runner,pr_number=77,config=config)
+        with pytest.raises(AgentLoopError): run_pr_loop(runner,pr_number=77,config=config)
     else:
         assert run_pr_loop(runner,pr_number=77,config=config)==0
     assert len([c for c in calls if c[0]=='images']) == int(kind=='old')
@@ -993,9 +996,12 @@ def test_shared_transport_failure_stops_before_visual_admission(visual_setup, mo
     elif mode=='nonmatching':
         monkeypatch.setattr(github_changed_paths,'get_pr_changed_paths',lambda *a,**kw:
             PullRequestChangedPaths(kw['head_sha'],True,(ChangedPath('modified','server.py'),)))
-    with pytest.raises(AgentLoopError): run_pr_loop(runner,pr_number=77,config=config)
-    assert not any(c[0] in {'capture','images','ci','diff'} for c in calls)
-    assert len(runner.pr_payload['comments'])==1
+    if foreign:
+        assert run_pr_loop(runner,pr_number=77,config=config) == 0
+    else:
+        with pytest.raises(AgentLoopError): run_pr_loop(runner,pr_number=77,config=config)
+        assert not any(c[0] in {'capture','images','ci','diff'} for c in calls)
+        assert len(runner.pr_payload['comments'])==1
     from coding_review_agent_loop.code_approval import (
         _latest_pr_approved_reviews_for_head,
     )

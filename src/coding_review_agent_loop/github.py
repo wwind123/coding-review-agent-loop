@@ -32,6 +32,7 @@ from .ci_health import (
     classify_ci_infrastructure_stall,
     is_wholly_infrastructure_blocked,
 )
+from .pr_round_errors import pr_history_boundary
 from .errors import AgentLoopError
 from .github_issue_references import (
     _GITHUB_ISSUE_URL_RE,
@@ -1089,6 +1090,7 @@ def _optional_str(raw: object) -> str | None:
     return str(raw) if raw is not None else None
 
 
+@pr_history_boundary
 def get_pr_review_context(
     runner: Runner,
     *,
@@ -1128,6 +1130,8 @@ def get_pr_review_context(
     data = _load_json_object(result, description=f"pull request #{pr_number}")
     comments = _parse_issue_comments(data.get("comments"))
     metadata = _parse_pr_metadata(data, config=config, pr_number=pr_number)
+    from .pr_round_ingestion import admit_pr_comments
+    comments, _actor = admit_pr_comments(runner, config, pr_number=pr_number, comments=comments)
     log_untrusted_marker_neutralization(
         config,
         surface=f"Pull request #{pr_number} text",
@@ -3207,6 +3211,7 @@ def resolve_authenticated_github_actor(
     runner: Runner,
     *,
     config: AgentLoopConfig,
+    allow_dry_run_read: bool = False,
 ) -> tuple[str, int]:
     """Resolve and cache the invocation actor used by trusted issue records."""
     cached = getattr(runner, "_agent_loop_authenticated_actor", None)
@@ -3220,7 +3225,7 @@ def resolve_authenticated_github_actor(
             and actor_id > 0
         ):
             return login, actor_id
-    if config.dry_run:
+    if config.dry_run and not allow_dry_run_read:
         raise AgentLoopError("Authenticated GitHub actor is unavailable in dry-run mode.")
     result = run_gh_read(
         runner,

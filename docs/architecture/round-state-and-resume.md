@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 `round_metadata.py` owns round value types, semantic validation, field codecs,
 diagnostic transport and recovery, board stamp contexts, attach/strip helpers,
@@ -528,8 +528,29 @@ that anchor is verified. Sidecars alone, incomplete anchors, duplicate results o
 conflicting provenance cannot authorize acceptance; publication recovery never
 relaunches the model.
 
-Shared extraction still stops the run for undecodable envelopes, invalid shared
-payloads or missing required sidecars, for every author and mode. Successfully
+Live PR observations admit round transport before shared decoding. A cheap
+candidate scan includes malformed anchors and sidecars; capped projections also
+probe the complete REST thread. The authenticated actor's immutable numeric ID
+partitions candidates only after complete pagination and body/identity binding.
+Foreign anchors and sidecars cannot supply, poison or complete actor-owned
+history. Raw human prose and original indices remain available for instructions
+and locator joins. Fresh observations repeat admission; incomplete acquisition or
+contradictory binding stops before history-dependent work, including refreshes.
+Live history failures remain distinguishable from advisory parsing failures, so
+legacy advisory handlers cannot suppress them or reuse an earlier snapshot.
+This includes the late evidence-stall read before dispatch publication and coder
+launch, even when head observation wraps an admission error. Binding validation
+applies when either the projected or REST version contains protocol content;
+ordinary projected prose cannot conceal a changed REST anchor or sidecar.
+Dry-run may use read-only provenance acquisition, without publication or agents.
+The admitted projection, REST-only managed-CI readers and timestamp-preserving
+post-merge restoration share the same owned-envelope check before codec parsing.
+Foreign envelopes remain opaque in all three paths.
+Shared extraction still stops for actor-owned undecodable envelopes, invalid
+shared payloads or missing required sidecars regardless of claimed flow or head.
+Pure codecs and plan/discuss/offline readers retain their strict behavior.
+A call-site structural regression inventories live-reader admission provenance
+and rejects new raw readers, including aliases and dynamic-flow calls. Successfully
 decoded lifecycle content preserves its raw value and presence (including null)
 through transport. Broad candidate classification quarantines it from code,
 scheduler, sweep and evidence authority before lifecycle validation. REST identity
@@ -549,7 +570,8 @@ If the head moves during a verified result publication, the live ledger retains
 all newly published findings and reserves their IDs before refreshing. Stale
 dispositions, acceptance and coder opportunities are withheld; an unchanged-image
 skip at the new head therefore carries the same obligations as restart replay.
-Author-aware recovery from shared transport corruption remains separate work.
+Approval, native evidence, capture, board, managed-CI and post-merge readers use
+the same observation boundary; their downstream authorization gates remain in force.
 
 Lifecycle corruption stops apply only to enabled, non-dry-run, matching heads.
 Disabled, dry-run and nonmatching paths do not gain lifecycle stops or runtime

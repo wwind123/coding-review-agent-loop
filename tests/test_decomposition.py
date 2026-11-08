@@ -2461,7 +2461,7 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
         },
         issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "open"}},
         pr_payloads_by_number={912: pr_payload_for_state(912, "MERGED")},
-        pr_payload={"body": "Fixes #100"},
+        pr_payload={"number": 78, "body": "Fixes #100"},
     )
     config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
     # Order the durable handoff against the coder invocation without relying on

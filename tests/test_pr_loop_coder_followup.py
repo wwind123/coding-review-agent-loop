@@ -946,15 +946,14 @@ def test_stranded_checkpoint_history_gets_an_ordinary_review_round_of_the_new_he
     assert "[item-1]" in reviewer_prompt
 
 
-def test_stranded_checkpoint_history_with_a_forged_anchor_still_refuses(tmp_path):
+def test_stranded_checkpoint_history_excludes_a_foreign_anchor(tmp_path):
     runner = _stranded_runner_1292(
-        [*_history_1292(), _checkpoint_1292()], _B_1292, forged=(2,)
+        [*_history_1292(), _checkpoint_1292()], _B_1292, forged=(2,),
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
     )
     config = make_config(tmp_path, reviewer="codex", coder="claude")
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "Do not hand-author" in str(raised.value)
-    assert _agent_order_1292(runner) == []
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_order_1292(runner) == ["claude", "codex"]
     assert _records_1292(runner, "head-review-recovery") == []
 
 
@@ -1094,12 +1093,12 @@ def test_incomplete_rest_identity_read_stops_before_any_agent_call(tmp_path, fai
 
     runner.run = broken_run
     config = make_config(tmp_path, reviewer="codex", coder="claude")
-    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+    with pytest.raises(AgentLoopError, match="cannot (?:be authenticated|authenticate comment)"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []
 
 
-def test_ordinary_resume_on_a_head_with_records_makes_no_identity_calls(tmp_path, monkeypatch):
+def test_ordinary_resume_authenticates_even_when_the_head_has_records(tmp_path, monkeypatch):
     import coding_review_agent_loop.pr_loop_support as support
 
     merges = []
@@ -1116,7 +1115,7 @@ def test_ordinary_resume_on_a_head_with_records_makes_no_identity_calls(tmp_path
     config = make_config(tmp_path, reviewer="codex", coder="claude")
     run_pr_loop(runner, pr_number=77, config=config)
     assert merges == []
-    assert not any(
+    assert any(
         cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2] and "&since=" not in cmd[2]
         for cmd, _cwd in runner.commands
     )
@@ -1133,7 +1132,9 @@ def test_ordinary_resume_on_a_head_with_records_makes_no_identity_calls(tmp_path
         ],
     )
     run_pr_loop(advanced, pr_number=77, config=config)
-    assert merges == [True]
+    assert merges == []
+    assert any(cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2]
+               for cmd, _cwd in advanced.commands)
 
 
 @pytest.mark.parametrize(
@@ -1505,7 +1506,7 @@ def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agen
 
     runner.run = omitting_run
     config = make_config(tmp_path, reviewer="codex", coder="claude")
-    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+    with pytest.raises(AgentLoopError, match="cannot (?:be authenticated|authenticate comment)"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []  # no coder, no reviewer, no ordinary fallback
     assert _records_1292(runner, "head-review-recovery") == []
@@ -1560,7 +1561,7 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
 
     runner.run = omitting_run
     config = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=flag)
-    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+    with pytest.raises(AgentLoopError, match="cannot (?:be authenticated|authenticate comment)"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []
     assert _records_1292(runner, "head-review-recovery") == []

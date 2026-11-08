@@ -2143,10 +2143,19 @@ def lineage_binding_resolver(
     def refuse(_index: int, _round: int) -> tuple[Mapping[str, object] | None, ...]:
         return ()
 
+    from .pr_round_ingestion import AdmittedPrComment, owned_rest_protocol_bodies
+    try:
+        owned_rest_protocol_bodies(comments, actor_id=actor_id)
+    except AgentLoopError:
+        return refuse
     namespaced = []
     for comment in comments:
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-        namespaced.append(SimpleNamespace(body=body(comment), author_id=user.get("id")))
+        raw = body(comment)
+        namespaced.append(AdmittedPrComment(
+            body=raw, author=user.get("login"), author_id=user.get("id"),
+            created_at=comment.get("created_at"), comment_id=comment.get("id"),
+            invocation_actor_id=actor_id, admitted_body=raw, admitted_protocol_body=raw))
     try:
         match = next(
             found for item in namespaced if (found := BOARD_CHANGE_LINK_RE.search(item.body))

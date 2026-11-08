@@ -98,7 +98,9 @@ def _append_bot_record(runner, body):
     )
     comments = runner.pr_payload["comments"]
     comments.append(
-        dict(template, body=body, createdAt=f"2026-05-23T00:00:{len(comments):02d}Z")
+        dict({key: value for key, value in template.items()
+              if key not in {"id", "databaseId", "url"}},
+             body=body, createdAt=f"2026-05-23T00:00:{len(comments):02d}Z")
     )
 
 

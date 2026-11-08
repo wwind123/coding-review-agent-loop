@@ -63,10 +63,8 @@ _RESOLVED_1 = [{"item_id": "item-1", "disposition": "resolved"}]
 
 
 def _comments(runner):
-    return [
-        SimpleNamespace(body=c["body"], author_id=c.get("_rest_author_id"))
-        for c in runner.pr_payload.get("comments", [])
-    ]
+    from coding_review_agent_loop.github import _parse_issue_comments
+    return _parse_issue_comments(runner.pr_payload.get("comments", []))
 
 
 def _records(runner):
@@ -4829,8 +4827,8 @@ def test_named_legacy_entry_check_requires_actor_authored_records(tmp_path):
 
     foreign = _legacy_runner([body])
     foreign.pr_payload["comments"][0].update(_rest_author_id=999, author={"login": "intruder"})
-    with pytest.raises(AgentLoopError, match="Human decision required: PR #77 has unanchored"):
-        _entry_check(foreign, config, [body])
+    _entry_check(foreign, config, [body])
+    assert not foreign.comments  # Foreign legacy rounds supply no board authority.
 
 
 # --- Shared owning-issue resolution for the named legacy entry (#1418) -----------------

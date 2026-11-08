@@ -1,0 +1,500 @@
+[
+  {
+    "module": "approved_plan_resume",
+    "function": "approved_plan_resume_view",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "architecture_contract",
+    "function": "_latest_pr_approval_architecture_identity",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure architecture reducers: live PR qualification and startup pass the admitted observed context."
+  },
+  {
+    "module": "architecture_contract",
+    "function": "_pr_architecture_observation_record",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure architecture reducers: live PR qualification and startup pass the admitted observed context."
+  },
+  {
+    "module": "board_change",
+    "function": "board_reentry_round",
+    "call": "codec(comments, flow=surface.flow)",
+    "provenance": "board_reentry_round is a pure dynamic-flow reducer supplied admitted PR comments or plan comments; lineage_binding_resolver validates REST candidate identities and binds a protocol-only actor partition while retaining raw board-link prose for lineage authorization."
+  },
+  {
+    "module": "board_change",
+    "function": "lineage_binding_resolver",
+    "call": "codec(namespaced, flow='pr')",
+    "provenance": "board_reentry_round is a pure dynamic-flow reducer supplied admitted PR comments or plan comments; lineage_binding_resolver validates REST candidate identities and binds a protocol-only actor partition while retaining raw board-link prose for lineage authorization."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_plan_contract_shape",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_rebind_growth_advisory",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_require_authorized_replan_state",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "child_plan_binding",
+    "function": "_resumed_inherited_replan_force_full",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "code_approval",
+    "function": "_latest_pr_approved_reviews_for_head",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure approval reducer: live callers in qualification and capture_dispatch pass comments from get_observed_pr_review_context, admitted before startup or refresh."
+  },
+  {
+    "module": "converted_capture",
+    "function": "recovery_capture",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "recovery_capture calls _authenticated_pr_comments_status before decoding; upstream acquisition also admits the complete context."
+  },
+  {
+    "module": "decomposition",
+    "function": "authorized_replan_lineage",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "discuss_loop",
+    "function": "_recover_final_discuss_split_proposals",
+    "call": "codec(issue_context.comments, flow='discuss')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "execution_policy",
+    "function": "_prior_discuss_split_proposals",
+    "call": "codec(issue_context.comments, flow='discuss')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "execution_policy",
+    "function": "_refuse_plain_mode_over_planning",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "history_export",
+    "function": "_read_thread",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Offline export: strict raw codec; never supplies live PR authority."
+  },
+  {
+    "module": "managed_ci_authorization",
+    "function": "_ordinary_continuity_round_metadata_is_valid",
+    "call": "codec(comments, actor_id=authorization.actor_id)",
+    "provenance": "Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context."
+  },
+  {
+    "module": "managed_ci_authorization",
+    "function": "_recovery_continuity_is_valid",
+    "call": "codec(comments, actor_id=context.actor_id)",
+    "provenance": "Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context."
+  },
+  {
+    "module": "managed_ci_authorization",
+    "function": "find_actor_round_metadata_comment_ids",
+    "call": "codec(comments, actor_id=actor_id)",
+    "provenance": "Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context."
+  },
+  {
+    "module": "managed_ci_reconciliation",
+    "function": "resolve_legacy_reference",
+    "call": "codec([SimpleNamespace(body=c.get('body')) for c in trusted], flow='pr')",
+    "provenance": "resolve_legacy_reference validates candidate REST identities, then partitions the complete page by the contract actor login and immutable ID before projecting bodies."
+  },
+  {
+    "module": "native_evidence",
+    "function": "native_history",
+    "call": "codec(hydrated, flow='pr')",
+    "provenance": "native_history calls admit_pr_comments before decoding; the same observation is used for original-index authentication."
+  },
+  {
+    "module": "panel_evidence",
+    "function": "_plan_growth_verdict_for_hash",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "panel_evidence",
+    "function": "_planner_candidate_rounds",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "panel_evidence",
+    "function": "_require_complete_canonical_plan_approval",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "panel_evidence",
+    "function": "_resumed_plan_transition_inputs",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "partial_round_recovery",
+    "function": "_compute",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+  },
+  {
+    "module": "partial_round_recovery",
+    "function": "_compute::check",
+    "call": "codec(remaining, flow=flow)",
+    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+  },
+  {
+    "module": "partial_round_recovery",
+    "function": "_frame",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+  },
+  {
+    "module": "partial_round_recovery",
+    "function": "_plan",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+  },
+  {
+    "module": "partial_round_recovery",
+    "function": "compute_partial_round_recovery",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow publication recovery: live PR callers supply admitted observations; plan callers retain strict plan transport and independent publication checks."
+  },
+  {
+    "module": "plan_board_state",
+    "function": "resolve_plan_board_state",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_board_state",
+    "function": "resolve_plan_lineage",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_execution",
+    "function": "_execute_approved_plan",
+    "call": "codec(scope_plan_comments(refreshed_issue_context.comments, plan_scope_start_round), flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body",
+    "call": "codec(issue_context.comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body",
+    "call": "codec(plan_fresh_comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body",
+    "call": "codec(scope_plan_comments(round_outcome_issue_context.comments, plan_scope_start_round), flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body::plan_history_records",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body::planning_contract_drift_records",
+    "call": "codec(issue_context.comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_first_loop",
+    "function": "_run_plan_first_loop_body::planning_contract_drift_records",
+    "call": "codec(issue_context.comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_issue_scope",
+    "function": "_archived_indexes",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_issue_scope",
+    "function": "plan_scope_decision",
+    "call": "codec(admitted_comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_verification",
+    "function": "classify_plan_approval",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_verification",
+    "function": "classify_plan_approval",
+    "call": "codec(plan_comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_verification",
+    "function": "derive_plan_verification_context",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "plan_verification",
+    "function": "plan_verification_inputs",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Plan/discuss-only strict codec call; this function does not ingest live PR round history."
+  },
+  {
+    "module": "post_merge_runtime",
+    "function": "find_publication",
+    "call": "codec(view.authored, flow='pr')",
+    "provenance": "restore admits through _authenticated_pr_comments_status or read_authenticated_protocol_comments; find_publication receives view.authored from exhaustive REST."
+  },
+  {
+    "module": "post_merge_runtime",
+    "function": "restore",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "restore admits through _authenticated_pr_comments_status or read_authenticated_protocol_comments; find_publication receives view.authored from exhaustive REST."
+  },
+  {
+    "module": "pr_board_state",
+    "function": "authenticate_named_legacy_pr_entry",
+    "call": "codec(pr_full, flow='pr')",
+    "provenance": "resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view."
+  },
+  {
+    "module": "pr_board_state",
+    "function": "named_legacy_entry_required",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view."
+  },
+  {
+    "module": "pr_board_state",
+    "function": "resolve_pr_board_state",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(initial_pr_context.comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(issue_context.comments, flow='plan')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop",
+    "call": "codec(pr_fresh_comments, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop",
+    "function": "run_pr_loop::_pr_recovery_fingerprint",
+    "call": "codec(remaining, flow='pr')",
+    "provenance": "Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_fresh_pr_qualification_snapshot",
+    "call": "codec(context.comments, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_fresh_pr_qualification_snapshot",
+    "call": "codec(context.comments, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_pr_step_back_decision",
+    "call": "codec(fresh_context.comments, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_pr_step_back_decision",
+    "call": "codec(snapshot_comments, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_pr_step_back_sweep_contexts",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "_reconcile_converted_evidence",
+    "call": "codec(visible_comments or (), flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "admitted_capture_history",
+    "call": "codec(hydrated, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "admitted_pr_records_status",
+    "call": "codec(hydrated, flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_loop_support",
+    "function": "conversion_boundary_candidate_present",
+    "call": "codec(tuple(comments), flow='pr')",
+    "provenance": "Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context."
+  },
+  {
+    "module": "pr_round_ingestion",
+    "function": "extract_admitted_round_records",
+    "call": "codec(protocol_comments(comments), flow=flow)",
+    "provenance": "Sole admitted extraction boundary: validates per-comment bindings and projects only actor-owned protocol bytes before invoking the strict codec."
+  },
+  {
+    "module": "review_images",
+    "function": "admitted_visual_history",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "admitted_visual_history calls _authenticated_pr_comments_status before extraction, even with capture disabled."
+  },
+  {
+    "module": "review_rounds",
+    "function": "_round_ledger_may_be_incomplete",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow ledger helpers: live PR review receives admitted observations, while plan flows retain strict raw parsing."
+  },
+  {
+    "module": "review_rounds",
+    "function": "_round_resolved_history_item_ids",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure dynamic-flow ledger helpers: live PR review receives admitted observations, while plan flows retain strict raw parsing."
+  },
+  {
+    "module": "round_state",
+    "function": "_extract_round_metadata_records",
+    "call": "codec(comments, flow=flow)",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "_resume_discuss_round",
+    "call": "codec(comments, flow='discuss')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "_resume_plan_round",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "_resume_pr_round",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "find_approved_plan_comment",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "pr_resume_needs_author_admission",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "recover_approved_plan_context",
+    "call": "codec(comments, flow='plan')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "round_state",
+    "function": "unauthenticated_recovery_record_indexes",
+    "call": "codec(comments, flow='pr')",
+    "provenance": "Pure raw reducers for unit/offline and plan/discuss callers; live PR resume and recovery probes receive admitted comments through _resume_pr_round_admitted or the observed PR context. The facade dispatches bound inputs through the admitted extractor."
+  },
+  {
+    "module": "workflow_transaction",
+    "function": "_plan_carrying_pr_records",
+    "call": "codec(view.authored, flow='pr')",
+    "provenance": "AuthenticatedCommentView.authored from exhaustive actor-bound REST acquisition; foreign bodies are absent before hydration."
+  },
+  {
+    "module": "workflow_transaction",
+    "function": "_plan_records",
+    "call": "codec(issue_view.authored, flow='plan')",
+    "provenance": "AuthenticatedCommentView.authored from exhaustive actor-bound REST acquisition; foreign bodies are absent before hydration."
+  }
+]

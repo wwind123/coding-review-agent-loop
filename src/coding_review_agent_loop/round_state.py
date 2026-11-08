@@ -77,6 +77,18 @@ from .legacy_machine_items import (
 
 
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[round_metadata.PostedRoundRecord, ...]:
+    """Strict codec facade; live PR inputs carry an explicit admission binding.
+
+    Pure and non-PR callers retain the raw codec. The call-site inventory guards
+    their provenance; adding a live raw reader requires an explicit review.
+    """
+    from .pr_round_ingestion import AdmittedPrComment, extract_admitted_round_records
+    if any(isinstance(c, AdmittedPrComment) for c in comments):
+        return extract_admitted_round_records(comments, flow=flow)
+    return _decode_round_metadata_records(comments, flow=flow)
+
+
+def _decode_round_metadata_records(comments, *, flow):
     records: list[round_metadata.PostedRoundRecord] = []
     bodies = tuple(body for comment in comments if isinstance((body := getattr(comment, "body", None)), str))
     for index, comment in enumerate(comments):
@@ -86,7 +98,10 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
         matches = list(ROUND_RESUME_MARKER_RE.finditer(body))
         if not matches:
             continue
-        payload, missing = hydrate_mapping(decode_mapping(matches[-1].group("payload")), bodies)
+        try:
+            payload, missing = hydrate_mapping(decode_mapping(matches[-1].group("payload")), bodies)
+        except AgentLoopError as exc:
+            raise AgentLoopError(f"Round metadata at comment index {index} (comment {getattr(comment, 'comment_id', None)}): {exc}") from exc
         # Synthesis is advisory. A missing synthesis sidecar must not make a
         # durable vote or legacy agenda unrecoverable; those fields simply
         # decode as None. Existing PR/review spill fields remain strict.
@@ -103,9 +118,12 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
             raise AgentLoopError(
                 "Incomplete round metadata: "
                 f"{', '.join(sorted(required_missing))} sidecars are unavailable; "
-                "restore sidecars or remove the incomplete anchor and rerun."
+                f"restore sidecars or remove the incomplete anchor and rerun (comment index {index})."
             )
-        metadata = round_metadata._decode_round_metadata_mapping(payload)
+        try:
+            metadata = round_metadata._decode_round_metadata_mapping(payload)
+        except AgentLoopError as exc:
+            raise AgentLoopError(f"Round metadata at comment index {index} (comment {getattr(comment, 'comment_id', None)}): {exc}") from exc
         if metadata.flow != flow:
             continue
         records.append(

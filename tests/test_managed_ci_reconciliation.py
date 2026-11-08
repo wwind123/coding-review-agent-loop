@@ -267,6 +267,7 @@ def test_legacy_records_fail_closed(tmp_path, mutation):
         runner.intent_comments.append(v2_intent_comment(comment_id=175, nonce='z'*32, run_id=101, run_attempt=1, state='completed'))
         for c in runner.intent_comments:
             if c['id'] == 18: c['id'] = 180
+        runner.pr_payload['comments'][-1].update(id=180, databaseId=180)
     else: runner.intent_comments[1]['user'] = {'login': 'attacker', 'id': 5}
     assert observe(fixture) is None
 
@@ -452,6 +453,7 @@ def test_legacy_unprovable_history_keeps_repair_route(tmp_path, monkeypatch, leg
         runner.intent_comments.append(v2_intent_comment(comment_id=175, nonce='z'*32, run_id=101, run_attempt=1, state='completed'))
         for c in runner.intent_comments:
             if c['id'] == 18: c['id'] = 180
+        runner.pr_payload['comments'][-1].update(id=180, databaseId=180)
     calls = _stop_at_agent(monkeypatch, runner)
     monkeypatch.setattr(support, 'merge_pr', lambda *a, **k: pytest.fail('ambiguous merge'))
     monkeypatch.setattr(pr_loop, 'dispatch_final_qualification', lambda *a, **k: pytest.fail('ambiguous dispatch'))

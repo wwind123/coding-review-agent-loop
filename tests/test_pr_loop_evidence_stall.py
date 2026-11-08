@@ -100,6 +100,60 @@ def _posted_records(runner, config):
     )
 
 
+@pytest.mark.parametrize('failure', ['actor', 'page', 'owned-envelope', 'owned-payload', 'owned-sidecar'])
+def test_late_evidence_stall_history_failure_stops_before_dispatch(tmp_path, monkeypatch, failure):
+    from coding_review_agent_loop import pr_loop, pr_loop_support as support
+    from coding_review_agent_loop import pr_round_ingestion as ingestion
+    from coding_review_agent_loop import github
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    from coding_review_agent_loop.pr_round_errors import PrRoundHistoryError
+    from test_pr_round_ingestion import raw, corruptions
+
+    runner = FakeRunner(claude_outputs=[_coder(1)], codex_outputs=[_review([_tagged()])])
+    config = _config(tmp_path)
+    original_decision = support._pr_evidence_stall_decision
+    original_listing = ingestion.read_complete_comment_listing
+    original_actor = ingestion.resolve_authenticated_github_actor
+    reached = []
+    in_late_read = False
+
+    def actor(*args, **kwargs):
+        if in_late_read and failure == 'actor':
+            raise AgentLoopError('late actor unavailable')
+        return original_actor(*args, **kwargs)
+
+    def listing(*args, **kwargs):
+        if in_late_read and failure == 'page':
+            return github.UnknownCommentListing('pr:77', 'late incomplete REST page')
+        return original_listing(*args, **kwargs)
+
+    def late_decision(*args, **kwargs):
+        nonlocal in_late_read
+        # Earlier acquisition, review publication and decoding all succeeded.
+        records = support.admitted_pr_records(runner, config, pr_number=77)
+        assert any(r.metadata.role == 'reviewer' and r.metadata.state == 'blocking' for r in records)
+        reached.append(len(runner.comments))
+        if failure.startswith('owned-'):
+            bad = {'owned-envelope': corruptions()[1], 'owned-payload': corruptions()[2],
+                   'owned-sidecar': corruptions()[3]}[failure]
+            runner.pr_payload['comments'].append(raw(bad))
+        in_late_read = True
+        try:
+            return original_decision(*args, **kwargs)
+        finally:
+            in_late_read = False
+
+    monkeypatch.setattr(ingestion, 'resolve_authenticated_github_actor', actor)
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing', listing)
+    monkeypatch.setattr(pr_loop, '_pr_evidence_stall_decision', late_decision)
+    expected = PrHeadObservationError if failure in {'actor', 'page'} else PrRoundHistoryError
+    with pytest.raises(expected):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context('row-a'))
+    assert reached and len(runner.comments) == reached[0]  # no subsequent dispatch publication
+    assert _coder_count(runner) == 0
+    assert runner.claude_outputs == [_coder(1)]
+
+
 def test_two_consecutive_evidence_only_reviews_stop_before_the_next_coder_turn(tmp_path):
     """`stall-trigger`, `stall-round-mapping`, `tag-carry-forward`, `stall-row-explanation`."""
     runner = FakeRunner(
