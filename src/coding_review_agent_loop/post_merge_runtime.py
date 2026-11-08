@@ -30,6 +30,9 @@ def restore(runner, config, pr, comments, *, admitted_before=None):
     if admitted_before is not None:
         view = read_authenticated_protocol_comments(runner, config=config, surface_kind=PR_THREAD_SURFACE, number=pr)
         comments, actor, complete = view.authored, (view.actor_login, view.actor_id), True
+        from .pr_round_ingestion import validate_owned_round_envelope
+        for index, comment in enumerate(comments):
+            validate_owned_round_envelope(comment.body, index=index, comment_id=comment.comment_id)
     from .round_state import _extract_round_metadata_records, _recovery_record_admitted
     if admitted_before is None:
         comments, actor, complete = _authenticated_pr_comments_status(

@@ -219,7 +219,8 @@ def test_no_history_fast_path_and_binding_drift(tmp_path):
 
 
 @pytest.mark.parametrize('admitted_before', [None, '2026-01-02T00:00:00Z'])
-def test_post_merge_restore_both_branches_exclude_foreign_transport(tmp_path, admitted_before):
+@pytest.mark.parametrize('bad', [BAD, '<!-- AGENT_LOOP_META: @@@ -->'])
+def test_post_merge_restore_both_branches_exclude_foreign_transport(tmp_path, monkeypatch, admitted_before, bad):
     from test_post_merge_obligations import admission
     from coding_review_agent_loop.post_merge_runtime import restore
     registry = admission()
@@ -240,6 +241,17 @@ def test_post_merge_restore_both_branches_exclude_foreign_transport(tmp_path, ad
     comments = github._parse_issue_comments(runner.pr_payload['comments'])
     assert restore(runner, config, 1, comments, admitted_before=admitted_before) == baseline
     assert not runner.comments
+    runner.pr_payload['comments'].append(raw(bad))
+    comments = github._parse_issue_comments(runner.pr_payload['comments'])
+    with pytest.raises(AgentLoopError, match='[Rr]ound metadata|Invalid AGENT_LOOP_META payload'):
+        restore(runner, config, 1, comments, admitted_before=admitted_before)
+    from coding_review_agent_loop import post_merge_runtime as runtime
+    monkeypatch.setattr(runtime, 'read_api', lambda *args: {
+        'merged': True, 'merged_at': '2026-01-02T00:00:00Z'})
+    with pytest.raises(AgentLoopError, match='[Rr]ound metadata|Invalid AGENT_LOOP_META payload'):
+        runtime.reconcile(runner, config, 1)
+    assert not runner.comments
+
 
 
 def test_managed_reconciliation_and_board_entry_ignore_foreign_round_bytes(tmp_path, monkeypatch):
@@ -279,7 +291,8 @@ def test_converted_capture_preserves_owned_barrier_with_foreign_transport(tmp_pa
     assert all(r.metadata.round_number < 90 for r in admitted)
 
 
-def test_managed_continuity_decodes_only_owned_anchors_and_chunks(tmp_path):
+@pytest.mark.parametrize('bad', [BAD, '<!-- AGENT_LOOP_META: @@@ -->'])
+def test_managed_continuity_decodes_only_owned_anchors_and_chunks(tmp_path, bad):
     from test_managed_ci import AuthorizationCommentRunner, _ci_repair_round_comment
     from coding_review_agent_loop.managed_ci_authorization import find_actor_round_metadata_comment_ids
     from coding_review_agent_loop.round_metadata import _decode_round_metadata, _strip_round_metadata
@@ -305,6 +318,10 @@ def test_managed_continuity_decodes_only_owned_anchors_and_chunks(tmp_path):
     runner.intent_comments.extend({'id': i, 'user': {'login': 'outsider', 'id': 99},
         'created_at': STAMP, 'body': part} for i, part in enumerate([BAD, poison], start=900))
     assert select() == baseline
+    runner.intent_comments.append({'id': 999, 'user': {'login': 'agent-loop', 'id': 1},
+        'created_at': STAMP, 'body': bad})
+    with pytest.raises(AgentLoopError, match='[Rr]ound metadata|Invalid AGENT_LOOP_META payload'):
+        select()
     assert not runner.comments
 
 
@@ -412,3 +429,40 @@ def test_rest_only_readers_refuse_unproven_candidates_before_decoding(tmp_path, 
         owned_rest_protocol_bodies([comment], actor_id=1)
     with pytest.raises(AgentLoopError, match='cannot authenticate REST'):
         resolve_legacy_reference([comment], SimpleNamespace(trusted_actor_id=1), None)
+
+
+@pytest.mark.parametrize('bad', [BAD, '<!-- AGENT_LOOP_META: @@@ -->'])
+def test_legacy_reconciliation_rejects_owned_corruption_with_valid_baseline(tmp_path, bad):
+    from test_managed_ci_reconciliation import recovery
+    from coding_review_agent_loop.managed_ci_reconciliation import resolve_legacy_reference
+    config, runner, metadata, contract, checkpoint, item, ref = recovery(tmp_path, legacy=True)
+    from coding_review_agent_loop import managed_ci as ci
+    page = ci._read_intent_comment_page(runner, config, 7)
+    baseline = resolve_legacy_reference(page, contract, checkpoint)
+    assert baseline is not None
+    corrupt = {'id': 9999, 'user': {'login': 'outsider', 'id': 99}, 'body': bad}
+    page.append(corrupt)
+    assert resolve_legacy_reference(page, contract, checkpoint) == baseline
+    corrupt['user'] = {'login': contract.trusted_actor_login, 'id': contract.trusted_actor_id}
+    with pytest.raises(AgentLoopError, match='[Rr]ound metadata|Invalid AGENT_LOOP_META payload'):
+        resolve_legacy_reference(page, contract, checkpoint)
+    assert not runner.comments
+
+
+@pytest.mark.parametrize('projection', ['admitted', 'rest'])
+@pytest.mark.parametrize('foreign', [False, True])
+@pytest.mark.parametrize('bad', ['<!-- AGENT_LOOP_META: -->', '<!-- AGENT_LOOP_META: @@@ -->'])
+def test_all_protocol_projections_share_owned_envelope_validation(tmp_path, projection, foreign, bad):
+    from coding_review_agent_loop.pr_round_ingestion import owned_rest_protocol_bodies, protocol_comments
+    if projection == 'rest':
+        comments = [{'id': 1, 'user': {'id': 424242}, 'body': str(anchor())},
+                    {'id': 2, 'user': {'id': 99 if foreign else 424242}, 'body': bad}]
+        read = lambda: owned_rest_protocol_bodies(comments, actor_id=424242)
+    else:
+        _, _, context = observation(tmp_path, [raw(anchor()), raw(bad, foreign=foreign)])
+        read = lambda: tuple(c.body for c in protocol_comments(context.comments))
+    if foreign:
+        assert read() == (str(anchor()), '')
+    else:
+        with pytest.raises(AgentLoopError, match='round metadata envelope.*comment'):
+            read()

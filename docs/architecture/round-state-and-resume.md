@@ -539,6 +539,9 @@ contradictory binding stops before history-dependent work, including refreshes.
 Live history failures remain distinguishable from advisory parsing failures, so
 legacy advisory handlers cannot suppress them or reuse an earlier snapshot.
 Dry-run may use read-only provenance acquisition, without publication or agents.
+The admitted projection, REST-only managed-CI readers and timestamp-preserving
+post-merge restoration share the same owned-envelope check before codec parsing.
+Foreign envelopes remain opaque in all three paths.
 Shared extraction still stops for actor-owned undecodable envelopes, invalid
 shared payloads or missing required sidecars regardless of claimed flow or head.
 Pure codecs and plan/discuss/offline readers retain their strict behavior.

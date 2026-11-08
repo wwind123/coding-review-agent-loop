@@ -107,19 +107,27 @@ def admit_pr_comments(
     return tuple(result), actor
 
 
+def validate_owned_round_envelope(body: str | None, *, index: int, comment_id: object) -> None:
+    """Reject malformed owned anchors before any codec can silently skip them.
+
+    Call only after author partitioning; foreign payloads must remain opaque.
+    """
+    from .round_transport import ROUND_RESUME_MARKER_RE
+    if body and re.search(r"<!--\s*AGENT_LOOP_META\b", body, re.I) and not ROUND_RESUME_MARKER_RE.search(body):
+        raise AgentLoopError(f"Invalid round metadata envelope at comment index {index} "
+                             f"(comment {comment_id}).")
+
+
 def protocol_comments(comments: Sequence[object]) -> tuple[object, ...]:
     """Codec projection retaining original indices and excluding foreign bytes."""
     from types import SimpleNamespace
-    from .round_transport import ROUND_RESUME_MARKER_RE
     result = []
     for index, comment in enumerate(comments):
         if not isinstance(comment, AdmittedPrComment):
             result.append(comment)
             continue
         body = comment.protocol_body
-        if body and re.search(r"<!--\s*AGENT_LOOP_META\b", body, re.I) and not ROUND_RESUME_MARKER_RE.search(body):
-            raise AgentLoopError(f"Invalid round metadata envelope at comment index {index} "
-                                 f"(comment {comment.comment_id}).")
+        validate_owned_round_envelope(body, index=index, comment_id=comment.comment_id)
         result.append(SimpleNamespace(body=body, comment_id=comment.comment_id))
     return tuple(result)
 
@@ -157,5 +165,7 @@ def owned_rest_protocol_bodies(
                 not isinstance(author_id, int) or isinstance(author_id, bool) or author_id < 1
                 or not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1):
             raise AgentLoopError(f"PR round history cannot authenticate REST comment index {index}.")
-        bodies.append(body if author_id == actor_id and isinstance(body, str) else "")
+        owned_body = body if author_id == actor_id and isinstance(body, str) else ""
+        validate_owned_round_envelope(owned_body, index=index, comment_id=comment_id)
+        bodies.append(owned_body)
     return tuple(bodies)
