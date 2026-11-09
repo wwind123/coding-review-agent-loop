@@ -297,6 +297,15 @@ def owned_rest_protocol_bodies(
     return tuple(bodies)
 
 
+def synthetic_dry_run_observation(runner: Runner, config: AgentLoopConfig) -> bool:
+    """True only when both the configuration and the runner are dry-run.
+
+    A dry-run ``Runner`` answers every command with empty output, so no
+    GitHub observation exists to authenticate (#1984).
+    """
+    return bool(getattr(config, "dry_run", False)) and getattr(runner, "dry_run", False) is True
+
+
 def admit_issue_board_comments(runner: Runner, config: AgentLoopConfig, *,
                                issue_number: int, comments: Sequence[object],
                                force_probe: bool = False):
@@ -304,7 +313,16 @@ def admit_issue_board_comments(runner: Runner, config: AgentLoopConfig, *,
 
     Admission is unconditional: the same history yields the same bound
     projections regardless of comment count or candidate presence.
+
+    The single offline exception is the synthetic dry-run context: under
+    ``--dry-run`` the CLI runner performs no GitHub reads, so
+    ``get_issue_context`` returns no history and there is nothing to admit or
+    authenticate. That empty, unobserved history passes through unbound. Any
+    runner that can read (including read-only dry-run fakes) and any non-empty
+    history still take mandatory admission.
     """
+    if not comments and synthetic_dry_run_observation(runner, config):
+        return (), None
     return admit_pr_comments(runner, config, pr_number=issue_number,
         comments=comments, force_probe=force_probe, surface_kind=ISSUE_THREAD_SURFACE,
         require_admission=True)
