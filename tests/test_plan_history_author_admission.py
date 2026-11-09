@@ -307,3 +307,68 @@ def test_plan_history_changed_inside_one_invocation_is_reacquired(tmp_path, monk
             assert implement.call_count == (mode == 'auto')
     assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
                    for cmd, _ in runner.commands[commands:])
+
+
+# --- #1984: issue-thread admission is independent of count and candidates ---
+
+def _issue_raw(body, login, user_id, index):
+    return dict(body=body, author={'login': login}, _rest_author_id=user_id,
+                createdAt=f'2026-01-01T{index // 60:02d}:{index % 60:02d}:00Z', id=100 + index)
+
+
+def _padded(history, total=105):
+    return [*history, *(_issue_raw(f'Ordinary note {i}', 'loop', 42, i)
+                        for i in range(len(history), total))]
+
+
+def _acquire_issue(tmp_path, comments):
+    from coding_review_agent_loop.pr_round_ingestion import AdmittedPrComment
+    runner = FakeRunner(authenticated_actor=('loop', 42), issue_comments=comments,
+                        serve_rest_issue_comments=True)
+    config = make_config(tmp_path)
+    admitted = acquire(runner, config, 56)
+    assert all(isinstance(c, AdmittedPrComment) for c in admitted)
+    assert any(cmd[:2] == ['gh', 'api'] and 'comments' in ' '.join(cmd)
+               for cmd, _ in runner.commands)
+    return admitted
+
+
+def _projection(comments, count):
+    from coding_review_agent_loop.pr_round_ingestion import record_body
+    return [(c.comment_id, c.body, c.invocation_actor_id, c.observation_surface,
+             record_body(c), c.protocol_body) for c in comments[:count]]
+
+
+def test_candidate_free_small_issue_history_is_admitted_like_padded_history(tmp_path):
+    from coding_review_agent_loop.pr_round_ingestion import protocol_candidate
+    history = [
+        _issue_raw('Please implement this.', 'loop', 42, 0),
+        _issue_raw('Foreign prose that must not gain protocol authority.', 'outsider', 99, 1),
+        _issue_raw('Follow-up note.', 'loop', 42, 2),
+    ]
+    snapshot = github._parse_issue_comments(history)
+    assert not any(protocol_candidate(c) for c in snapshot)
+    small = _acquire_issue(tmp_path / 'small', history)
+    padded = _acquire_issue(tmp_path / 'padded', _padded(history))
+    assert len(small) == 3 and len(padded) == 105
+    assert _projection(small, 3) == _projection(padded, 3)
+    foreign = small[1]
+    assert foreign.body != foreign.protocol_body and foreign.protocol_body == ''
+    assert {c.invocation_actor_id for c in small} == {42}
+
+
+def test_plan_round_metadata_selection_is_unchanged_by_padding(tmp_path):
+    from coding_review_agent_loop.pr_round_ingestion import extract_admitted_round_records
+    history = [
+        _issue_raw(_m936_round('Plan one.', 1), 'loop', 42, 0),
+        _issue_raw(_m936_round('Foreign plan.', 2), 'outsider', 99, 1),
+        _issue_raw('Ordinary discussion.', 'operator', 81, 2),
+    ]
+    small = _acquire_issue(tmp_path / 'small', history)
+    padded = _acquire_issue(tmp_path / 'padded', _padded(history))
+    small_records = extract_admitted_round_records(small, flow='plan')
+    padded_records = extract_admitted_round_records(padded, flow='plan')
+    assert [(r.index, r.metadata) for r in small_records] == [
+        (r.index, r.metadata) for r in padded_records]
+    assert [r.metadata.round_number for r in small_records] == [1]
+    assert _projection(small, 3) == _projection(padded, 3)

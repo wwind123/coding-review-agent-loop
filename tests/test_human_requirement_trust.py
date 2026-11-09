@@ -51,6 +51,9 @@ def _issue_comment_url(comment_id: int) -> str:
     return f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-{comment_id}"
 
 
+DEFAULT_ACTOR = {"login": "agent-loop-invoker", "id": 4242}
+
+
 class RawOutput:
     """A REST reply served verbatim, e.g. an empty successful response."""
 
@@ -82,6 +85,9 @@ class RoutedRunner:
                     if isinstance(payload, RawOutput):
                         return CommandResult(cmd, Path("."), payload.stdout, "", 0)
                     return CommandResult(cmd, Path("."), json.dumps(payload), "", 0)
+            if path == "user":
+                # Issue-thread admission always binds the invocation actor (#1984).
+                return CommandResult(cmd, Path("."), json.dumps(DEFAULT_ACTOR), "", 0)
             raise AssertionError(f"unexpected REST read: {path}")
         raise AssertionError(f"unexpected command: {cmd}")
 
@@ -347,7 +353,7 @@ def _rest_issue(*, login="maintainer", user_id=101, body="Do the thing." + SIGNA
 def test_issue_body_is_verified_through_issue_rest_record(tmp_path):
     runner = RoutedRunner(
         projection=_issue_projection(),
-        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue()},
+        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue(), _comments_path(ISSUE): []},
     )
     context = get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
     (requirement,) = context.human_requirements
@@ -359,7 +365,8 @@ def test_issue_body_is_verified_through_issue_rest_record(tmp_path):
 def test_issue_body_from_outside_author_is_excluded(tmp_path):
     runner = RoutedRunner(
         projection=_issue_projection(author="outsider"),
-        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue(login="outsider", user_id=7)},
+        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue(login="outsider", user_id=7),
+              _comments_path(ISSUE): []},
     )
     context = get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
     assert context.human_requirements == ()
@@ -481,7 +488,7 @@ def test_issue_comment_drift_fails_closed(tmp_path, rest_login, rest_body):
 def test_issue_body_drift_fails_closed(tmp_path, rest_kwargs):
     runner = RoutedRunner(
         projection=_issue_projection(),
-        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue(**rest_kwargs)},
+        rest={f"repos/{REPO}/issues/{ISSUE}": _rest_issue(**rest_kwargs), _comments_path(ISSUE): []},
     )
     with pytest.raises(AgentLoopError, match="changed during author verification"):
         get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
@@ -630,7 +637,7 @@ def test_empty_successful_rest_output_fails_closed(tmp_path, source, stdout):
     else:
         runner = RoutedRunner(
             projection=_issue_projection(),
-            rest={f"repos/{REPO}/issues/{ISSUE}": RawOutput(stdout)},
+            rest={f"repos/{REPO}/issues/{ISSUE}": RawOutput(stdout), _comments_path(ISSUE): []},
         )
         load = lambda: get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
     with pytest.raises(AgentLoopError, match="empty response|read is incomplete"):

@@ -631,3 +631,151 @@ def test_pr_history_changed_after_startup_is_reacquired_at_refresh(tmp_path, pol
     runner.codex_outputs.extend(outputs()['codex_outputs'])
     runner.gemini_outputs.extend(outputs()['gemini_outputs'])
     assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+
+
+# --- #1984: issue admission without the count shortcut; snapshot/REST twin ---
+
+def test_small_candidate_free_issue_with_incomplete_listing_fails_closed(tmp_path, monkeypatch):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    from coding_review_agent_loop.pr_round_ingestion import admit_issue_board_comments, protocol_candidate
+    runner = FakeRunner(authenticated_actor=('bot', 424242))
+    config = make_config(tmp_path)
+    comments = github._parse_issue_comments([raw('Plain prose'), raw('More prose', foreign=True)])
+    assert not any(map(protocol_candidate, comments))
+    calls = []
+
+    def incomplete(*args, **kwargs):
+        calls.append(kwargs.get('surface'))
+        return github.UnknownCommentListing('issue:56', 'page 2 failed')
+
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing', incomplete)
+    with pytest.raises(AgentLoopError, match='cannot be authenticated: page 2 failed'):
+        admit_issue_board_comments(runner, config, issue_number=56, comments=comments)
+    assert calls and 'issue' in str(calls[0]).lower()
+
+
+def _twin_setup(monkeypatch, rest):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    calls = []
+
+    def listing(*args, **kwargs):
+        calls.append(kwargs.get('surface'))
+        return github.CompleteCommentListing('pr:77', None, tuple(rest))
+
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing', listing)
+    return calls
+
+
+def _rest(body, comment_id, *, stamp=STAMP, login='bot', user_id=424242):
+    return github._parse_issue_comments([{'author': {'login': login}, '_rest_author_id': user_id,
+        'createdAt': stamp, 'body': body, 'databaseId': comment_id}])[0]
+
+
+def _snapshot(body, *, stamp=STAMP):
+    comment = github._parse_issue_comments([{'author': {'login': 'bot'}, 'createdAt': stamp,
+                                             'body': body}])[0]
+    assert comment.comment_id is None
+    return comment
+
+
+def test_edited_noncandidate_snapshot_comment_appears_once_with_rest_body(tmp_path, monkeypatch):
+    runner = FakeRunner(authenticated_actor=('bot', 424242))
+    config = make_config(tmp_path)
+    calls = _twin_setup(monkeypatch, [_rest('v2', 501)])
+    admitted, actor = admit_pr_comments(runner, config, pr_number=77,
+                                        comments=(_snapshot('v1'),), force_probe=True)
+    assert calls and actor == ('bot', 424242)
+    assert [(c.body, c.comment_id) for c in admitted] == [('v2', 501)]
+
+
+def test_edited_noncandidate_twin_reconciled_when_candidate_triggers_acquisition(tmp_path, monkeypatch):
+    runner = FakeRunner(authenticated_actor=('bot', 424242))
+    config = make_config(tmp_path)
+    owned = str(anchor())
+    later = '2026-01-01T00:01:00Z'
+    rest_candidate = _rest(owned, 600, stamp=later)
+    calls = _twin_setup(monkeypatch, [_rest('v2', 501), rest_candidate])
+    admitted, _ = admit_pr_comments(runner, config, pr_number=77,
+                                    comments=(_snapshot('v1'), rest_candidate))
+    assert calls
+    assert [(c.body, c.comment_id) for c in admitted] == [('v2', 501), (owned, 600)]
+
+
+def test_ambiguous_noncandidate_twin_keeps_status_quo_without_error(tmp_path, monkeypatch):
+    runner = FakeRunner(authenticated_actor=('bot', 424242))
+    config = make_config(tmp_path)
+    calls = _twin_setup(monkeypatch, [_rest('v2', 501), _rest('v3', 502)])
+    admitted, _ = admit_pr_comments(runner, config, pr_number=77,
+                                    comments=(_snapshot('v1'),), force_probe=True)
+    assert calls
+    assert sorted((c.body, c.comment_id) for c in admitted) == [
+        ('v1', None), ('v2', 501), ('v3', 502)]
+
+
+def test_edited_candidate_snapshot_comment_still_raises_drift(tmp_path, monkeypatch):
+    runner = FakeRunner(authenticated_actor=('bot', 424242))
+    config = make_config(tmp_path)
+    calls = _twin_setup(monkeypatch, [_rest('Ordinary rewrite', 501)])
+    with pytest.raises(AgentLoopError, match='content or identity drift'):
+        admit_pr_comments(runner, config, pr_number=77,
+                          comments=(_snapshot(str(anchor())),), force_probe=True)
+    assert calls
+
+
+# --- #1984 review item-1: --dry-run issue flows keep reaching their preview ---
+
+class _ReachedAgentTurn(Exception):
+    pass
+
+
+@pytest.mark.parametrize('plan_first', [False, True])
+def test_dry_run_issue_flows_reach_their_agent_turn_with_the_real_dry_run_runner(
+        tmp_path, monkeypatch, plan_first):
+    """The CLI's Runner(dry_run=True) answers every command with empty output, so
+    get_issue_context returns a synthetic empty history; admission must not try to
+    authenticate it. The run reaches the coder or planner turn instead of failing."""
+    import coding_review_agent_loop.config as config_module
+    from coding_review_agent_loop import (
+        discuss_loop, issue_implementation, issue_loop, plan_first_loop, triage, validated_agent,
+    )
+    from agent_loop_helpers import patch_attr_in
+    from coding_review_agent_loop.cli import run_issue_loop
+    from coding_review_agent_loop.runner import Runner
+
+    def reached(*args, **kwargs):
+        raise _ReachedAgentTurn()
+
+    # The temp workdirs are not git checkouts, and a dry-run runner cannot sync them.
+    monkeypatch.setattr(config_module, '_sync_base_branch', lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation,
+                                plan_first_loop, triage, issue_loop), '_run_validated_agent', reached)
+    with pytest.raises(_ReachedAgentTurn):
+        run_issue_loop(Runner(dry_run=True), issue_number=56,
+                       config=make_config(tmp_path, dry_run=True), plan_first=plan_first)
+
+
+def test_dry_run_exception_is_limited_to_the_synthetic_empty_observation(tmp_path):
+    from coding_review_agent_loop.plan_board_state import admitted_issue_comments
+    from coding_review_agent_loop.pr_round_ingestion import (
+        admit_issue_board_comments,
+    )
+    from coding_review_agent_loop.runner import Runner
+
+    config = make_config(tmp_path, dry_run=True)
+    dry = Runner(dry_run=True)
+    context = github.get_issue_context(dry, config=config, issue_number=56)
+    assert context.comments == ()
+    assert admit_issue_board_comments(dry, config, issue_number=56, comments=context.comments) == ((), None)
+    assert admitted_issue_comments(dry, config=config, issue_number=56, comments=()) == ((), None)
+    # Non-empty history under a dry-run runner is never passed through unbound.
+    with pytest.raises(AgentLoopError):
+        admit_issue_board_comments(dry, config, issue_number=56,
+                                   comments=github._parse_issue_comments([raw('Plain prose')]))
+    # A dry-run configuration with a runner that can read still admits.
+    reader = FakeRunner(authenticated_actor=('bot', 424242), serve_rest_issue_comments=True)
+    admitted, actor = admit_issue_board_comments(reader, config, issue_number=56, comments=())
+    assert actor == ('bot', 424242) and admitted == ()
+    assert any(cmd[:2] == ['gh', 'api'] and '/comments' in cmd[2] for cmd, _ in reader.commands)
+    # A dry-run runner without a dry-run configuration still requires admission.
+    with pytest.raises(AgentLoopError):
+        admit_issue_board_comments(dry, make_config(tmp_path / 'live'), issue_number=56, comments=())

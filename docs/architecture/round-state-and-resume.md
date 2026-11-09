@@ -49,7 +49,15 @@ The amendment projection grants no authority to loop-published records sharing
 the same comment. Round anchors and sidecars use a separate invocation-only
 projection before decoding or hydration. Human trust configuration never
 expands that author set. Plan startup and every refreshed issue observation now admit round metadata
-before drift, scope, approval, scheduler and recovery probes. Parent and child
+before drift, scope, approval, scheduler and recovery probes. Issue-thread
+admission is unconditional: unlike the PR surface, it has no comment-count or
+candidate-presence shortcut, so the same history yields the same projections
+at any length. The only exception is the synthetic empty history of a
+`--dry-run` invocation whose runner performs no GitHub reads; it passes through
+unbound because nothing was observed. When a snapshot comment without an ID was edited before the REST
+read, admission adopts its unique non-candidate REST twin (same author and
+creation time) so raw discussion holds it once; protocol candidates keep the
+strict drift check. Parent and child
 observations are authenticated separately. Plan-approval announcement readers
 use the invocation-only projection for plain-mode refusal and publication
 idempotency. Decomposition reducers read that projection for topology, handoff,

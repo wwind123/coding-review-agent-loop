@@ -1348,16 +1348,21 @@ class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
         super().__init__(**kwargs)
         self._approval = approval
         self.issue_view_calls = 0
+        self._injected = False
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         result = super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
         if list(args[:3]) == ["gh", "issue", "view"]:
             self.issue_view_calls += 1
-            if self.issue_view_calls == 1:
-                if isinstance(self._approval, list):
-                    self.issue_comments.extend(self._approval)
-                else:
-                    self.issue_comments.append(self._approval)
+        # The first snapshot is complete once its issue-thread admission has
+        # read the REST listing (#1984); the approval lands right after it.
+        if (self.issue_view_calls == 1 and not self._injected and list(args[:2]) == ["gh", "api"]
+                and "/issues/" in args[2] and "/comments" in args[2]):
+            self._injected = True
+            if isinstance(self._approval, list):
+                self.issue_comments.extend(self._approval)
+            else:
+                self.issue_comments.append(self._approval)
         return result
 
 

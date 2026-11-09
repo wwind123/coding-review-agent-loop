@@ -5327,3 +5327,36 @@ def test_neutral_summary_cannot_seed_legacy_root_bindings():
     after = _resolve_neutral_plan(bodies, board)
     assert after.root == before.root
     assert after.inits == before.inits == {}
+
+
+def test_named_legacy_entry_ignores_a_foreign_pr_contract_and_follows_the_actor_record(tmp_path):
+    """Row named-entry-foreign-contract (#1984): a later foreign contract naming another
+    issue neither refuses entry nor redirects the owning issue away from the actor's."""
+    import inspect
+
+    from coding_review_agent_loop import pr_board_state
+    from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+
+    def contract(issue):
+        return format_pr_contract_comment(make_pr_contract(
+            repository="OWNER/REPO", pr_number=77, origin_flow="issue-implementation",
+            expected_closing_issue_ids=[issue], primary_issue_number=issue,
+        ))
+
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash)
+    body = _legacy("coder", "Claude", 1)
+    runner = _managed_entry_runner(body, {56: [_owning_handoff()], 57: [_owning_handoff(issue_number=57)]},
+                                   head_branch="feature/unmanaged")
+    runner.pr_payload["comments"].extend([
+        {"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-05-20T10:00:00Z",
+         "body": contract(56), "_rest_author_id": _ACTOR_ID},
+        {"author": {"login": "intruder"}, "createdAt": "2026-05-20T11:00:00Z",
+         "body": contract(57), "_rest_author_id": 999},
+    ])
+    _owning_entry_check(runner, config, body, head_branch="feature/unmanaged")
+    assert _issue_rest_reads(runner, 56)
+    assert not _issue_rest_reads(runner, 57)
+    assert not runner.comments
+    source = inspect.getsource(pr_board_state.authenticate_named_legacy_pr_entry)
+    assert "PR contract record was not written" not in source

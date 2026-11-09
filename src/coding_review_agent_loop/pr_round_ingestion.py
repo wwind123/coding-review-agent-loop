@@ -123,13 +123,15 @@ def _project(comment: object, actor_id: int, *, raw_body: str | None,
 def admit_pr_comments(
     runner: Runner, config: AgentLoopConfig, *, pr_number: int,
     comments: Sequence[object], force_probe: bool = False,
-    surface_kind: str = PR_THREAD_SURFACE,
+    surface_kind: str = PR_THREAD_SURFACE, require_admission: bool = False,
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
     """Bind candidates to exhaustive REST history; never cache across reads.
 
     Reuse is limited to immutable objects from this acquisition. Original raw
     prose stays intact; REST-only protocol records join the ordered observation.
     Its indices belong to the full raw list, never a compacted actor-only list.
+    ``require_admission`` skips only the count/candidate shortcut, so callers
+    that need count-independent projections always get a bound observation.
     """
     comments = tuple(comments)
     human_trust = tuple(getattr(config, "human_reviewer_trusted_actors", ()) or ())
@@ -148,7 +150,8 @@ def admit_pr_comments(
                for c in comments):
             raise AgentLoopError("PR observation belongs to a different invocation actor.")
         return comments, actor
-    if not force_probe and len(comments) < 100 and not any(map(protocol_candidate, comments)):
+    if (not force_probe and not require_admission and len(comments) < 100
+            and not any(map(protocol_candidate, comments))):
         return comments, None
     if runner is None:
         raise AgentLoopError(f"{surface} candidates require authenticated GitHub acquisition.")
@@ -196,6 +199,21 @@ def admit_pr_comments(
                 and c.created_at == getattr(comment, "created_at", None) and c.body == _canonical_body(comment)]
             if len(matches) == 1:
                 found = matches[0]
+            elif (not matches and not protocol_candidate(comment)
+                  and getattr(comment, "created_at", None) is not None):
+                # An ordinary comment edited between the snapshot and the REST
+                # read has no ID to join on. Adopt its unique non-candidate
+                # REST twin (same author and creation time) so the discussion
+                # holds it once; ambiguity or a candidate on either side keeps
+                # the strict path, where drift detection is unchanged.
+                twins = [c for c in listing.comments if c.comment_id not in used
+                    and _identity_login_key(c.author) == _identity_login_key(getattr(comment, "author", None))
+                    and c.created_at == getattr(comment, "created_at", None)
+                    and not protocol_candidate(c)]
+                if len(twins) == 1:
+                    used.add(twins[0].comment_id)
+                    result.append(project(twins[0], twins[0].body))
+                    continue
         if (protocol_candidate(comment) or protocol_candidate(found)) and (
                 found is None or found.body != _canonical_body(comment)
                 or found.created_at != getattr(comment, "created_at", None)
@@ -279,14 +297,35 @@ def owned_rest_protocol_bodies(
     return tuple(bodies)
 
 
+def synthetic_dry_run_observation(runner: Runner, config: AgentLoopConfig) -> bool:
+    """True only when both the configuration and the runner are dry-run.
+
+    A dry-run ``Runner`` answers every command with empty output, so no
+    GitHub observation exists to authenticate (#1984).
+    """
+    return bool(getattr(config, "dry_run", False)) and getattr(runner, "dry_run", False) is True
+
+
 def admit_issue_board_comments(runner: Runner, config: AgentLoopConfig, *,
                                issue_number: int, comments: Sequence[object],
                                force_probe: bool = False):
-    """Shared complete acquisition for issue planning and control projections."""
-    if not force_probe and len(comments) < 100 and not any(map(protocol_candidate, comments)):
-        return tuple(comments), None
+    """Shared complete acquisition for issue planning and control projections.
+
+    Admission is unconditional: the same history yields the same bound
+    projections regardless of comment count or candidate presence.
+
+    The single offline exception is the synthetic dry-run context: under
+    ``--dry-run`` the CLI runner performs no GitHub reads, so
+    ``get_issue_context`` returns no history and there is nothing to admit or
+    authenticate. That empty, unobserved history passes through unbound. Any
+    runner that can read (including read-only dry-run fakes) and any non-empty
+    history still take mandatory admission.
+    """
+    if not comments and synthetic_dry_run_observation(runner, config):
+        return (), None
     return admit_pr_comments(runner, config, pr_number=issue_number,
-        comments=comments, force_probe=force_probe, surface_kind=ISSUE_THREAD_SURFACE)
+        comments=comments, force_probe=force_probe, surface_kind=ISSUE_THREAD_SURFACE,
+        require_admission=True)
 
 
 def record_body(comment: object, *, human_control: bool = False) -> str | None:

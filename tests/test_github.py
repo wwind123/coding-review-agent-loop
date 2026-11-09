@@ -920,7 +920,13 @@ class _PaginatedIssueCommentsRunner(_FakeRunner):
 def test_issue_comment_recovery_parses_rest_user_identity_across_all_pages(tmp_path):
     marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
     first_page = [
-        {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            # Complete issue-thread admission requires REST timestamps (#1984).
+            "created_at": f"2026-09-17T04:{index // 60:02d}:{index % 60:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
         for index in range(100)
     ]
     second_page = [
@@ -949,7 +955,9 @@ def test_issue_comment_recovery_parses_rest_user_identity_across_all_pages(tmp_p
     assert recovered.author == "agent"
     assert recovered.author_id == 7
     assert recovered.comment_id == 101
-    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+    # The transport-identity merge, then issue-thread admission (#1984), each
+    # read every page.
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"] * 2
 
 
 def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(tmp_path):
