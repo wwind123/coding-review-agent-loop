@@ -1714,20 +1714,15 @@ def test_1981_pr_route_and_repost_clauses_print_no_round(lookup):
         _STALE_DETAIL_1981, lookup, pr_flow=True
     )
     assert "Delete the amendment comment at PR #77 comment 9" in repost
-    if lookup is _unsafe_lookup:
-        # The unread record's removal set is unknown: the round is named only
-        # with the removal that makes it resumable.
-        assert "effective_from_round 2 only if it removes Claude" in repost
-    else:
-        _assert_no_round(repost)
-        assert "only once a safe effective round can be determined" in repost
+    _assert_no_round(repost)
+    assert "only once a safe effective round can be determined" in repost
     error = str(pr_loop_support._pr_contract_drift_error(
         PR_C0, _STALE_DETAIL_1981, pr_number=77, configured=PR_C1,
         start_round_number=lookup, amendments_recognized=True,
     ))
     # The authoritative drift stop is unchanged; only the advice differs.
     assert error.startswith("PR review scheduler contract changed during resume;")
-    assert "Reviewer board amendment:" not in error and "<N:" not in error
+    _assert_no_round(error)
 
 
 def test_1981_pr_route_prints_the_template_when_the_removal_makes_the_round_safe():
@@ -1843,56 +1838,134 @@ def _record_1981(index, round_number, role, agent, phase, **extra):
     )
 
 
-def _open_round_records_1981(*, decision=True):
-    records = [
-        _record_1981(0, 1, "summary", "Orchestrator", "scheduler-prelaunch"),
-        _record_1981(1, 1, "reviewer", "Codex", "publication", state="approved"),
+def _open_round_records_1981(*, decision=True, earlier_codex=True, force_full=False, claude=None):
+    records = [_record_1981(0, 1, "summary", "Orchestrator", "scheduler-prelaunch")]
+    if earlier_codex:
+        records.append(_record_1981(1, 1, "reviewer", "Codex", "publication", state="approved"))
+    records += [
         _record_1981(2, 1, "summary", "Orchestrator", "reconciliation"),
         _record_1981(
             3, 2, "summary", "Orchestrator", "scheduler-prelaunch",
-            **({"scheduler_selected_reviewers": ("Claude", "Antigravity")} if decision else {}),
+            **({"scheduler_selected_reviewers": ("Claude", "Antigravity"),
+                "scheduler_force_full": force_full} if decision else {}),
         ),
-        _record_1981(4, 2, "reviewer", "Claude", "publication", state="approved"),
+        _record_1981(4, 2, "reviewer", "Claude", "publication", state="approved", **(claude or {})),
     ]
     return records
 
 
-def test_1981_open_round_facts_follow_the_rounds_scheduler_selection(monkeypatch):
-    """Safety helper: a seat the round never selected is not missing from it."""
-    records = _open_round_records_1981()
+def _facts_1981(monkeypatch, records, *, config=None, invalid=(), prior_items=(), resumed=None):
+    """Open-round facts with the PR loop's resume checks stubbed to ``invalid`` names."""
+    import coding_review_agent_loop.response_validation as response_validation
+
     monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records", lambda *a, **k: records)
-    facts = pr_loop_support._pr_open_round_facts
-    resumed = _resumed_1981(2, reconciled=False, completed=(records[4],))
-    # Codex (round-1 primary) was not selected in round 2; Antigravity was.
-    assert facts((), head_sha=_HEAD_1981, round_number=2, resumed=resumed,
-                 candidates=BOARD) == (("Claude",), ("Antigravity",))
-    # All published reviewers are PR-resumed remaining seats: nothing fresh.
-    assert facts((), head_sha=_HEAD_1981, round_number=2, resumed=resumed,
-                 candidates=("Codex", "Claude")) == (("Claude",), ())
-    # A reconciled round is always safe.
-    assert facts((), head_sha=_HEAD_1981, round_number=2,
-                 resumed=_resumed_1981(2, reconciled=True), candidates=BOARD) == ((), ())
-    # A round nobody published in is safe.
-    assert facts((), head_sha=_HEAD_1981, round_number=3, resumed=None,
-                 candidates=BOARD) == ((), ())
-    # Without a valid decision record every remaining seat counts.
-    plain = _open_round_records_1981(decision=False)
-    monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records", lambda *a, **k: plain)
-    assert facts((), head_sha=_HEAD_1981, round_number=2, resumed=resumed,
-                 candidates=BOARD)[1] == ("Codex", "Antigravity")
+    monkeypatch.setattr(pr_loop_support, "_pr_reviewer_acquisition_contract", lambda config: {})
+    monkeypatch.setattr(pr_loop_support, "reviewer_seat_binding", lambda config: None)
+    monkeypatch.setattr(
+        response_validation, "_resumed_pr_reviewer_matches_requirements",
+        lambda record, *a, **k: record.metadata.agent not in invalid,
+    )
+    if resumed is None:
+        claude = next(r for r in records if r.metadata.agent == "Claude")
+        resumed = dataclasses.replace(
+            _resumed_1981(2, reconciled=False, completed=(claude,)), prior_items=tuple(prior_items),
+        )
+    return pr_loop_support._pr_open_round_facts(
+        (), head_sha=_HEAD_1981, round_number=2, resumed=resumed, candidates=BOARD,
+        config=(SimpleNamespace(pr_review_force_full=False) if config is None else config),
+    )
+
+
+import dataclasses  # noqa: E402
+
+
+def test_1981_open_round_facts_carry_only_an_unselected_exact_head_approval(monkeypatch):
+    """Safety helper: an unselected seat with a verified exact-head approval is not missing."""
+    # Codex (round-1 primary) approved this head and was not selected in round 2.
+    assert _facts_1981(monkeypatch, _open_round_records_1981()) == (("Claude",), ("Antigravity",))
+    # Without that approval Codex would need a fresh turn beside Claude.
+    assert _facts_1981(monkeypatch, _open_round_records_1981(earlier_codex=False))[1] == (
+        "Codex", "Antigravity",
+    )
+    # A reconciled round, or a round nobody published in, is always safe.
+    records = _open_round_records_1981()
+    assert _facts_1981(
+        monkeypatch, records, resumed=_resumed_1981(2, reconciled=True)
+    ) == ((), ())
+    assert _facts_1981(monkeypatch, records[:4], resumed=_resumed_1981(2, reconciled=False)) == ((), ())
+
+
+@pytest.mark.parametrize("case", [
+    "operator-force-full", "recorded-force-full", "no-decision-record", "pending-owner",
+    "stale-published-review", "plan-bound-published-review", "stale-carried-approval",
+    "unverifiable-config",
+])
+def test_1981_open_round_facts_count_every_unverifiable_seat_as_fresh(monkeypatch, case):
+    """Items 1 and 2 (#1985): selection and reuse are honoured only when verified."""
+    kwargs, records = {}, None
+    if case == "operator-force-full":
+        kwargs["config"] = SimpleNamespace(pr_review_force_full=True)
+    elif case == "recorded-force-full":
+        records = _open_round_records_1981(force_full=True)
+    elif case == "no-decision-record":
+        records = _open_round_records_1981(decision=False)
+    elif case == "pending-owner":
+        kwargs["prior_items"] = (UnresolvedReviewItem(
+            item_id="item-1", reviewer="Codex", source_round=1, text="Fix the retry.",
+            status="blocking", source_status="blocking",
+        ),)
+    elif case == "stale-published-review":
+        kwargs["invalid"] = ("Claude",)
+    elif case == "plan-bound-published-review":
+        records = _open_round_records_1981(claude={"approved_plan_hash": "abc123"})
+    elif case == "stale-carried-approval":
+        kwargs["invalid"] = ("Codex",)
+    else:
+        monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records",
+                            lambda *a, **k: _open_round_records_1981())
+        records = _open_round_records_1981()
+        claude = records[-1]
+        peers, fresh = pr_loop_support._pr_open_round_facts(
+            (), head_sha=_HEAD_1981, round_number=2,
+            resumed=_resumed_1981(2, reconciled=False, completed=(claude,)),
+            candidates=BOARD, config=None,
+        )
+        assert (peers, fresh) == (("Claude",), BOARD)
+        return
+    peers, fresh = _facts_1981(monkeypatch, records or _open_round_records_1981(), **kwargs)
+    assert peers == ("Claude",)
+    expected = {
+        "operator-force-full": ("Codex", "Antigravity"),
+        "recorded-force-full": ("Codex", "Antigravity"),
+        "no-decision-record": BOARD,
+        "pending-owner": ("Codex", "Antigravity"),
+        "stale-published-review": ("Claude", "Antigravity"),
+        "plan-bound-published-review": ("Claude", "Antigravity"),
+        "stale-carried-approval": ("Codex", "Antigravity"),
+    }[case]
+    assert fresh == expected
+    lookup = lambda: PrAmendmentRound(2, peers=peers, fresh=fresh)  # noqa: E731
+    if "Codex" in fresh:
+        # Removing only Antigravity leaves Codex needing a turn beside Claude.
+        assert pr_amendment_template_round(lookup, removed=("Antigravity",)).status == "unsafe"
+    else:
+        # Claude's own stale publication is not its peer; Antigravity still is
+        # unless the amendment removes it.
+        assert pr_amendment_template_round(lookup).status == "unsafe"
+        assert pr_amendment_template_round(lookup, removed=("Antigravity",)).status == "ok"
 
 
 def test_1981_activation_replacement_for_an_unsafe_open_round_names_no_round(monkeypatch):
     """Row template-unsafe-open-round: require_amendment_activation PR replacement."""
     records = _open_round_records_1981()
-    monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records", lambda *a, **k: records)
+    _facts_1981(monkeypatch, records)  # install the record and resume-check stubs
     lineage = _pending_lineage_1981(effective_from_round=1)
     # The amendment removes Codex, so Antigravity still needs a fresh turn.
     lineage.pending_amendments[0].removed_reviewers = ("Codex",)
-    resumed = _resumed_1981(2, reconciled=False, completed=(records[4],))
+    resumed = _resumed_1981(2, reconciled=False, completed=(records[-1],))
     template = lambda amendment, n: pr_loop_support._pr_amendment_activation_template(  # noqa: E731
         amendment, n, lineage=lineage, pr_number=77, resumed=resumed,
-        pr_context=_pr_context_1981(),
+        pr_context=_pr_context_1981(), config=SimpleNamespace(pr_review_force_full=False),
     )
     assert template(lineage.pending_amendments[0], 2) is None
     with pytest.raises(AgentLoopError) as excinfo:

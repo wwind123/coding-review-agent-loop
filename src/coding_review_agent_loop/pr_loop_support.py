@@ -3297,6 +3297,22 @@ def _post_reduced_board_completion_note(
     )
 
 
+def _pr_reviewer_acquisition_contract(config: AgentLoopConfig) -> dict[str, tuple[object, ...]]:
+    """The configured reviewers' acquisition identities, as the PR loop computes them."""
+    from .config import resolve_invocation
+    from .reviewer_seats import SeatAgent, seat_backend
+
+    contract: dict[str, tuple[object, ...]] = {}
+    for reviewer in reviewers(config):
+        invocation = resolve_invocation(config, provider=reviewer, role="reviewer")
+        contract[agent_display_name(reviewer)] = (
+            reviewer.model_chain if isinstance(reviewer, SeatAgent) else invocation.configured_model,
+            invocation.resolved_effort,
+            seat_backend(reviewer),
+        )
+    return contract
+
+
 def _pr_open_round_facts(
     comments: Sequence[object],
     *,
@@ -3304,28 +3320,45 @@ def _pr_open_round_facts(
     round_number: int,
     resumed: ResumedReviewRound | None,
     candidates: Sequence[str],
+    config: AgentLoopConfig | None = None,
+    human_requirements: Sequence[object] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """``(published peers, seats needing a fresh turn)`` of the re-entered round (#1981).
 
     A reconciled round has neither: its re-entry settles it and opens the next
     round.  Otherwise the peers are the reviewers with a published verdict in
-    the round after any head-review, conversion or acknowledgement boundary,
-    and a candidate needs a fresh turn when the round's recorded scheduler
-    decision selected it (every candidate, without a valid decision record)
-    and the PR resume does not reuse it (its record is not in the resumed
-    round's completed reviews).  A panel seat the round never selected is not
-    missing from it.
+    the round after any head-review, conversion or acknowledgement boundary.
+    Every check below is conservative: when reuse or carry cannot be
+    established here, the seat counts as needing a fresh turn, so an unsafe
+    round is never offered.
+
+    A candidate needs no fresh turn when either holds:
+
+    - **Verified reuse.** Its record is in the resumed round's completed
+      reviews, was published after the round's recorded scheduler decision
+      selected it, and passes the PR loop's resume checks: a resumable
+      review, the current signed requirements, the configured acquisition
+      identity and seat binding.  A record bound to an approved plan cannot
+      be checked against the current plan here, so it is never counted.
+    - **Verified carry.** The recorded decision did not select it, nothing
+      forces a full board (no recorded or operator force-full), it already
+      approved this exact head in an earlier round with a record passing the
+      same checks, and it owns no pending finding.  A panel seat the round
+      never selected is then not missing from it.
     """
+    from .capture_dispatch import is_resumable_capture_review
+    from .response_validation import _resumed_pr_reviewer_matches_requirements
     from .round_state import _is_acknowledgement_failure_boundary
 
     same_round = resumed is not None and resumed.round_number == round_number
     if same_round and resumed.reconciled:
         return (), ()
-    records = [
+    head_records = [
         record
         for record in _extract_round_metadata_records(comments, flow="pr")
-        if record.metadata.subject == head_sha and record.metadata.round_number == round_number
+        if record.metadata.subject == head_sha
     ]
+    records = [r for r in head_records if r.metadata.round_number == round_number]
     boundary = max(
         (
             record.index
@@ -3346,12 +3379,28 @@ def _pr_open_round_facts(
     }))
     if not peers:
         return (), ()
-    reused = (
-        {record.metadata.agent for record in resumed.completed_reviews} if same_round else set()
-    )
-    decision = next(
+    acquisition = _pr_reviewer_acquisition_contract(config) if config is not None else None
+    binding = reviewer_seat_binding(config) if config is not None else None
+
+    def verified(record: PostedRoundRecord) -> bool:
+        metadata = record.metadata
+        if acquisition is None or metadata.approved_plan_hash is not None:
+            return False
+        try:
+            return bool(
+                is_resumable_capture_review(metadata)
+                and _resumed_pr_reviewer_matches_requirements(
+                    record, tuple(human_requirements), None,
+                    reviewer_acquisition_contract=acquisition,
+                )
+                and (binding is None or metadata.seat_binding == binding)
+            )
+        except Exception:  # noqa: BLE001 - unverifiable counts as not reusable
+            return False
+
+    decision_record = next(
         (
-            record.metadata
+            record
             for record in reversed(records)
             if record.metadata.phase == "scheduler-prelaunch"
             and record.metadata.scheduler_metadata_status == "valid"
@@ -3359,12 +3408,48 @@ def _pr_open_round_facts(
         ),
         None,
     )
-    selected = set(decision.scheduler_selected_reviewers) if decision is not None else None
-    fresh = tuple(
-        name
-        for name in candidates
-        if name not in reused and (selected is None or name in selected)
+    selected = (
+        set(decision_record.metadata.scheduler_selected_reviewers)
+        if decision_record is not None else set()
     )
+    reused = {
+        record.metadata.agent
+        for record in (resumed.completed_reviews if same_round else ())
+        if decision_record is not None
+        and record.index > max(boundary, decision_record.index)
+        and record.metadata.agent in selected
+        and verified(record)
+    }
+    forced = (
+        decision_record is None
+        or bool(decision_record.metadata.scheduler_force_full)
+        or bool(config is not None and config.pr_review_force_full)
+    )
+
+    def owns_pending_finding(name: str) -> bool:
+        for item in (resumed.prior_items if resumed is not None else ()):
+            if item.status not in {"blocking", "same-pr"}:
+                continue
+            owners = tuple(item.resolution_owners or (item.reviewer,))
+            states = dict(item.owner_states or ())
+            if name in owners and states.get(name, "pending") == "pending":
+                return True
+        return False
+
+    def carried(name: str) -> bool:
+        if forced or name in selected or owns_pending_finding(name):
+            return False
+        return any(
+            record.metadata.agent == name
+            and record.metadata.round_number < round_number
+            and is_complete_code_review(record.metadata)
+            and record.metadata.state == "approved"
+            and not record.metadata.new_items
+            and verified(record)
+            for record in head_records
+        )
+
+    fresh = tuple(name for name in candidates if name not in reused and not carried(name))
     return peers, fresh
 
 
@@ -3451,6 +3536,8 @@ def _pr_amendment_start_round(
         round_number=round_number,
         resumed=resumed,
         candidates=tuple(agent_display_name(agent) for agent in configured_reviewers),
+        config=config,
+        human_requirements=getattr(pr_context, "human_requirements", ()),
     )
     return PrAmendmentRound(round_number, peers=peers, fresh=fresh)
 
@@ -3463,6 +3550,7 @@ def _pr_amendment_activation_template(
     pr_number: int,
     resumed: ResumedReviewRound | None,
     pr_context: PullRequestReviewContext,
+    config: AgentLoopConfig | None = None,
 ) -> str | None:
     """Replacement template for a stale PR amendment, or None when unsafe (#1981)."""
     persisted = getattr(lineage, "contract_before")(amendment)
@@ -3478,6 +3566,8 @@ def _pr_amendment_activation_template(
             round_number=round_number,
             resumed=resumed,
             candidates=remaining,
+            config=config,
+            human_requirements=getattr(pr_context, "human_requirements", ()),
         )
     except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
         return None

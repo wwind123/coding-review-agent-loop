@@ -2690,7 +2690,7 @@ def run_pr_loop(
             start_round_number=pr_amendment_start_round,
             template=lambda amendment, round_number: _pr_amendment_activation_template(
                 amendment, round_number, lineage=pr_contract_lineage, pr_number=pr_number,
-                resumed=resumed_round, pr_context=initial_pr_context,
+                resumed=resumed_round, pr_context=initial_pr_context, config=config,
             ),
         )
         pr_amendment_note: str | None = None

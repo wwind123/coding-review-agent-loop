@@ -422,7 +422,14 @@ def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
             run_pr_loop(runner, pr_number=77, config=config)
         message = str(stale.value)
         assert "Delete the amendment comment at PR #77 comment" in message
-        assert re.search(r"effective_from_round \d+", message)
+        if config is reduced:
+            assert re.search(r"effective_from_round \d+", message)
+        else:
+            # With the original board configured the unread record's removal
+            # set is unknown, so open round 2 (Gemini published, Antigravity
+            # selected) is not offered (#1981).
+            assert "effective_from_round" not in message
+            assert "only once a safe effective round can be determined" in message
         assert "was not recognized" not in message
     # Delete the unread comment and repost at the printed round: the resume
     # then proceeds on the amended board.
@@ -1505,4 +1512,68 @@ def test_1981_floor_refusal_prints_no_round_when_the_lookup_fails_or_is_unsafe(
     assert [
         cmd[0] for cmd, _cwd in runner.commands[commands_before:]
         if cmd and cmd[0] in {"claude", "codex", "agy", "gemini"}
+    ] == []
+
+
+def _floor_message_1981(runner, config):
+    with pytest.raises(AgentLoopError, match="below the floor") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    return str(error.value)
+
+
+def test_1981_operator_force_full_suppresses_the_open_round_template(tmp_path):
+    """Item 1 (#1985): force-full would select the carried primary beside Gemini."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3)
+    # Control: Codex's round-1 exact-head approval carries, so round 2 is offered.
+    assert '"effective_from_round": 2' in _floor_message_1981(runner, reduced)
+    forced = dataclasses.replace(reduced, pr_review_force_full=True)
+    message = _floor_message_1981(runner, forced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Codex would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+
+
+def test_1981_stale_published_review_suppresses_the_open_round_template(tmp_path, monkeypatch):
+    """Item 2 (#1985): a published review the resume would not reuse blocks the round."""
+    from pr_loop_test_helpers import _signed
+
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+    )
+    full = _staged_config(tmp_path, pr_review_force_full=True)
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=full)
+    round1 = [
+        r.metadata.agent for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 1
+    ]
+    assert sorted(round1) == ["Codex", "Gemini"]
+    reduced = dataclasses.replace(full, reviewer=("codex", "gemini"), min_reviewers=3)
+    control = _floor_message_1981(runner, reduced)
+    assert '"effective_from_round": 1' in control
+    # A new signed requirement makes both published reviews stale: each would
+    # need a fresh turn beside the other's public verdict.
+    runner.pr_payload["comments"].append(_signed("Also document the retry bound.", 1))
+    message = _floor_message_1981(runner, reduced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a pending amendment whose round does not match fails closed,
+    # and its replacement names no round while the stale reviews block it.
+    stale_round = _m943_amendment_from_error(control).replace(
+        '"effective_from_round": 1', '"effective_from_round": 5'
+    )
+    _m943_append(runner, stale_round)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert "effective_from_round" not in str(error.value).split("No safe replacement", 1)[1]
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
     ] == []

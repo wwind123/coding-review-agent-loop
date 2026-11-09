@@ -409,8 +409,16 @@ clause, the reviewer-floor refusal from both the resume and board-entry paths,
 and the activation replacement) comes from the same admitted reader as the
 resume, with no round-1 fallback, and passes one safety check. A round is
 offered only when it is reconciled, nobody has published in it, or the
-amendment removes every seat the round's scheduler decision selected that would
-otherwise need a fresh turn beside a published same-round peer. Otherwise, and
+amendment removes every seat that would otherwise need a fresh turn beside a
+published same-round peer. A seat needs no fresh turn only when the check can
+confirm it. Either its published review was posted under the round's recorded
+selection and passes the PR resume checks (resumable review, current signed
+requirements, configured acquisition identity, seat binding, and no
+approved-plan binding that cannot be checked there), or the round did not
+select it, no recorded or operator force-full applies, it owns no pending
+finding, and a record passing the same checks shows it already approved the
+head in an earlier round. Any seat the check cannot confirm counts as needing
+a fresh turn. Otherwise, and
 when the lookup fails, PR notices say that no safe amendment round can be
 determined yet and print no round or template. Plan-flow templates are
 unchanged.

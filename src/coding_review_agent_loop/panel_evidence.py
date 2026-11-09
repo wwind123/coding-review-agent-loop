@@ -476,11 +476,14 @@ class PrAmendmentRound(int):
     def blocked_seats(
         self, removed: Sequence[str] = (), restored: Sequence[str] = ()
     ) -> tuple[str, ...]:
-        """Seats an amendment removing ``removed`` would still run beside a public peer."""
-        if not self.peers:
-            return ()
+        """Seats an amendment removing ``removed`` would still run beside a public peer.
+
+        A seat needing a fresh turn is blocked only when another reviewer has
+        published in the round; its own stale publication is not a peer.
+        """
         kept = tuple(name for name in self.fresh if name not in set(removed))
-        return kept + tuple(name for name in restored if name not in kept)
+        kept += tuple(name for name in restored if name not in kept)
+        return tuple(name for name in kept if set(self.peers) - {name})
 
 
 @dataclass(frozen=True)
@@ -490,10 +493,6 @@ class AmendmentRoundOutcome:
     status: str
     round_number: int | None = None
     reason: str = ""
-    # For ``unsafe`` only: the re-entered round and the seats still blocked,
-    # so a caller without a removal set can state the condition precisely.
-    candidate_round: int | None = None
-    blocked: tuple[str, ...] = ()
 
 
 def pr_amendment_template_round(
@@ -530,8 +529,6 @@ def pr_amendment_template_round(
                 "the round this resume re-enters is open and already holds published reviews "
                 f"by {', '.join(round_number.peers)}, so {', '.join(blocked)} would need a "
                 "fresh turn beside them",
-                candidate_round=int(round_number),
-                blocked=blocked,
             )
     return AmendmentRoundOutcome("ok", int(round_number))
 
@@ -631,21 +628,14 @@ def _stale_amendment_repost_clause(
     if locator is None:
         return ""
     if pr_flow:
-        # The unread record's removal set is not known here: name the round
-        # only when an amendment can take effect in it, and say which seats it
-        # must remove when the round is open and partly published.
+        # The unread record's removal set is not known here, so the round is
+        # checked with no removal: an unsafe or failed lookup keeps the
+        # instruction but names no round or placeholder (#1981).
         outcome = pr_amendment_template_round(start_round_number)
-        if outcome.status == "lookup-failed":
+        if outcome.status != "ok":
             return (
                 f" Delete the amendment comment at {locator}, but post a fresh signed record "
                 f"only once a safe effective round can be determined: {outcome.reason}."
-            )
-        if outcome.status == "unsafe":
-            return (
-                f" Delete the amendment comment at {locator} and post a fresh signed record "
-                f"with effective_from_round {outcome.candidate_round} only if it removes "
-                f"{', '.join(outcome.blocked)}: {outcome.reason}. Otherwise no safe "
-                "effective round can be determined yet."
             )
         return (
             f" Delete the amendment comment at {locator} and post a fresh signed record with "

@@ -504,6 +504,11 @@ Reviewer board amendment:
   only for a round the amendment can resume: the round is reconciled, nobody
   has published in it yet, or the amendment removes every reviewer that would
   otherwise need a fresh turn beside a review already published in that round.
+  A reviewer needs no fresh turn only when its published review in that round
+  still passes the resume checks, or when the round did not select it and it
+  already approved the same head in an earlier round, with no force-full board
+  and no pending finding of its own. When that cannot be confirmed, the
+  reviewer counts as needing a fresh turn.
   When no such round exists, or the round cannot be determined, the notice says
   that no safe amendment round can be determined yet and prints no round or
   template; restore the reviewer backend or inspect the PR's round records.
@@ -526,9 +531,10 @@ Reviewer board amendment:
   records after an amendment comment it could not read, those records are never
   reinterpreted. The drift error then tells you to delete the unread amendment
   comment and post a fresh signed record with the printed `effective_from_round`.
-  On a PR, when the re-entered round is open and partly published, the round is
-  printed together with the reviewers the fresh record must remove; when the
-  round cannot be determined, no round is printed.
+  On a PR, no round is printed when the re-entered round cannot be determined,
+  or when it is open and partly published beside a reviewer that would need a
+  fresh turn. The notice then says that no safe effective round can be
+  determined yet.
 - **Named plan boards.** Under `all-reviewers`, named plan rounds persist the
   bound board even though they do not schedule a subset. Signed plan amendments
   can remove every seat on an unavailable backend and restore them in a later round.

@@ -102,7 +102,7 @@ def _enforce_pr_board_floor(
             _pr_amendment_activation_template(
                 amendment, round_number, lineage=lineage, pr_number=pr_number,
                 resumed=resumed_holder[0] if resumed_holder else None,  # type: ignore[arg-type]
-                pr_context=pr_context,
+                pr_context=pr_context, config=config,
             )
         ),
         floor_refusal_hint=lambda persisted, refused: _board_amendment_route_clause(
