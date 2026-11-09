@@ -225,6 +225,7 @@ from .architecture_contract import (
 from .response_validation import _build_requirements_context
 from .panel_evidence import (
     _board_amendment_route_clause,
+    _board_amendment_template,
     _stale_amendment_repost_clause,
     _require_complete_canonical_plan_approval,
 )
@@ -3247,7 +3248,7 @@ def _pr_contract_drift_error(
         + (
             ""
             if during == "qualification"
-            else _stale_amendment_repost_clause(detail, start_round_number)
+            else _stale_amendment_repost_clause(detail, start_round_number, pr_flow=True)
             + _board_amendment_route_clause(
                 flow="pr",
                 issue_number=None,
@@ -3296,6 +3297,77 @@ def _post_reduced_board_completion_note(
     )
 
 
+def _pr_open_round_facts(
+    comments: Sequence[object],
+    *,
+    head_sha: str | None,
+    round_number: int,
+    resumed: ResumedReviewRound | None,
+    candidates: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(published peers, seats needing a fresh turn)`` of the re-entered round (#1981).
+
+    A reconciled round has neither: its re-entry settles it and opens the next
+    round.  Otherwise the peers are the reviewers with a published verdict in
+    the round after any head-review, conversion or acknowledgement boundary,
+    and a candidate needs a fresh turn when the round's recorded scheduler
+    decision selected it (every candidate, without a valid decision record)
+    and the PR resume does not reuse it (its record is not in the resumed
+    round's completed reviews).  A panel seat the round never selected is not
+    missing from it.
+    """
+    from .round_state import _is_acknowledgement_failure_boundary
+
+    same_round = resumed is not None and resumed.round_number == round_number
+    if same_round and resumed.reconciled:
+        return (), ()
+    records = [
+        record
+        for record in _extract_round_metadata_records(comments, flow="pr")
+        if record.metadata.subject == head_sha and record.metadata.round_number == round_number
+    ]
+    boundary = max(
+        (
+            record.index
+            for record in records
+            if record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            or (
+                record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+                and record.metadata.evidence_conversion is not None
+            )
+            or _is_acknowledgement_failure_boundary(record.metadata)
+        ),
+        default=-1,
+    )
+    peers = tuple(sorted({
+        record.metadata.agent
+        for record in records
+        if record.index > boundary and is_complete_code_review(record.metadata)
+    }))
+    if not peers:
+        return (), ()
+    reused = (
+        {record.metadata.agent for record in resumed.completed_reviews} if same_round else set()
+    )
+    decision = next(
+        (
+            record.metadata
+            for record in reversed(records)
+            if record.metadata.phase == "scheduler-prelaunch"
+            and record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_selected_reviewers
+        ),
+        None,
+    )
+    selected = set(decision.scheduler_selected_reviewers) if decision is not None else None
+    fresh = tuple(
+        name
+        for name in candidates
+        if name not in reused and (selected is None or name in selected)
+    )
+    return peers, fresh
+
+
 def _pr_amendment_start_round(
     pr_context: PullRequestReviewContext,
     configured_reviewers: Sequence[AgentName],
@@ -3304,28 +3376,121 @@ def _pr_amendment_start_round(
     runner: Runner | None = None,
     config: AgentLoopConfig | None = None,
 ) -> int:
-    """The round a PR resume would re-enter; only used to fill an error template."""
-    try:
+    """The round a PR resume re-enters, for amendment templates only (#1981).
+
+    Uses the admitted reader the real resume and the board-entry
+    ``resume_round`` use, with no silent round-1 fallback: a reader error
+    propagates, and an unexplained no-resume result while reviewer verdicts or
+    a reconciliation exist on the head raises.  The result carries the
+    re-entered round's open-round facts; every PR emitter judges it against
+    its own removal set through ``pr_amendment_template_round``.
+    """
+    from .board_change import board_reentry_round, comments_bear_board_change_links
+    from .panel_evidence import PrAmendmentRound
+
+    head_sha = pr_context.metadata.head_sha
+    reconciliation_mode = (
+        "owner-scoped"
+        if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
+        else "aggregate"
+    )
+    comments: Sequence[object] = pr_context.comments
+    if runner is not None and config is not None:
+        from .pr_round_ingestion import admit_pr_comments
+
+        # The scans below read the same authenticated admission the resume
+        # reader uses (the board-entry path re-admits an admitted context too).
+        comments, _actor = admit_pr_comments(
+            runner, config, pr_number=pr_context.metadata.number, comments=comments
+        )
+        resumed = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_context.metadata.number,
+            comments=comments,
+            head_sha=head_sha,
+            configured_reviewers=configured_reviewers,
+            reconciliation_mode=reconciliation_mode,
+        )
+    else:
         resumed = _resume_pr_round(
             pr_context.comments,
-            head_sha=pr_context.metadata.head_sha,
+            head_sha=head_sha,
             configured_reviewers=configured_reviewers,
-            reconciliation_mode=(
-                "owner-scoped"
-                if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
-                else "aggregate"
-            ),
-            trusted_actor=_cached_trusted_actor(runner) if runner is not None else None,
+            reconciliation_mode=reconciliation_mode,
+            trusted_actor=None,
             review_unrecorded_head=bool(config is not None and config.review_unrecorded_head),
         )
-    except AgentLoopError:
-        # Only filling an error template; the real resume reports the refusal.
-        return 1
-    from .board_change import board_reentry_round
-
-    return board_reentry_round(
-        pr_context.comments, resumed.round_number if resumed is not None else None,
+    if resumed is None and not comments_bear_board_change_links(comments):
+        # Checkpoint-only first-round startup, or no current-head records:
+        # round 1, as the real resume.  Anything else is unexplained.
+        unexplained = [
+            record
+            for record in _extract_round_metadata_records(comments, flow="pr")
+            if record.metadata.subject == head_sha
+            and (
+                is_complete_code_review(record.metadata)
+                or (
+                    record.metadata.role == "summary"
+                    and record.metadata.phase == "reconciliation"
+                )
+            )
+        ]
+        if unexplained:
+            raise AgentLoopError(
+                "the PR resume found no round to re-enter although reviewer verdicts or a "
+                "reconciliation exist on the current head"
+            )
+    round_number = board_reentry_round(
+        comments, resumed.round_number if resumed is not None else None,
         signed_amendment=True,
+    )
+    peers, fresh = _pr_open_round_facts(
+        comments,
+        head_sha=head_sha,
+        round_number=round_number,
+        resumed=resumed,
+        candidates=tuple(agent_display_name(agent) for agent in configured_reviewers),
+    )
+    return PrAmendmentRound(round_number, peers=peers, fresh=fresh)
+
+
+def _pr_amendment_activation_template(
+    amendment: object,
+    round_number: int,
+    *,
+    lineage: object,
+    pr_number: int,
+    resumed: ResumedReviewRound | None,
+    pr_context: PullRequestReviewContext,
+) -> str | None:
+    """Replacement template for a stale PR amendment, or None when unsafe (#1981)."""
+    persisted = getattr(lineage, "contract_before")(amendment)
+    removed = tuple(getattr(amendment, "removed_reviewers", ()))
+    restored = tuple(getattr(amendment, "restored_reviewers", ()))
+    remaining = tuple(
+        name for name in getattr(persisted, "required_reviewers") if name not in removed
+    ) + tuple(name for name in restored if name not in getattr(persisted, "required_reviewers"))
+    try:
+        peers, fresh = _pr_open_round_facts(
+            pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            round_number=round_number,
+            resumed=resumed,
+            candidates=remaining,
+        )
+    except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
+        return None
+    if peers and fresh:
+        return None
+    return _board_amendment_template(
+        flow="pr",
+        issue_number=None,
+        pr_number=pr_number,
+        persisted=persisted,
+        removed=removed,
+        restored=restored,
+        start_round_number=round_number,
     )
 
 

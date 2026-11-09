@@ -540,7 +540,7 @@ from .pr_loop_support import (
     _observe_pr_transition,
     _pr_contract_drift_error,
     _post_reduced_board_completion_note,
-    _pr_amendment_start_round,
+    _pr_amendment_start_round, _pr_amendment_activation_template,
     _managed_binding_retired_plan_hashes,
     _managed_binding_protection_mode,
     _pr_amendment_plan_board_hint,
@@ -2688,14 +2688,9 @@ def run_pr_loop(
         require_amendment_activation(
             pr_contract_lineage,
             start_round_number=pr_amendment_start_round,
-            template=lambda amendment, round_number: _board_amendment_template(
-                flow="pr",
-                issue_number=None,
-                pr_number=pr_number,
-                persisted=pr_contract_lineage.contract_before(amendment),
-                removed=amendment.removed_reviewers,
-                restored=amendment.restored_reviewers,
-                start_round_number=round_number,
+            template=lambda amendment, round_number: _pr_amendment_activation_template(
+                amendment, round_number, lineage=pr_contract_lineage, pr_number=pr_number,
+                resumed=resumed_round, pr_context=initial_pr_context,
             ),
         )
         pr_amendment_note: str | None = None

@@ -400,6 +400,20 @@ round-end settlement, then opens round N+1 under the normal round bound. If
 the round still needs fresh turns while that activation is due, it is posted
 first as an activation-only record that selects nobody. A reconciled resume
 with no fresh turns continues in place and posts no scheduler checkpoint.
+A same-head reconciliation summary anchors the resume even when the round holds
+no reviewer or coder record because every settlement was a carried exact-head
+approval; any later same-head qualification checkpoint is kept, and the resume
+never falls back to round 1 (#1981). Every PR amendment round suggestion (the
+unavailable-reviewer advisory, contract drift, the stale-amendment repost
+clause, the reviewer-floor refusal from both the resume and board-entry paths,
+and the activation replacement) comes from the same admitted reader as the
+resume, with no round-1 fallback, and passes one safety check. A round is
+offered only when it is reconciled, nobody has published in it, or the
+amendment removes every seat the round's scheduler decision selected that would
+otherwise need a fresh turn beside a published same-round peer. Otherwise, and
+when the lookup fails, PR notices say that no safe amendment round can be
+determined yet and print no round or template. Plan-flow templates are
+unchanged.
 Recovery, qualification, evidence, conflict, conversion, board-change re-entry
 and pre-panel history recovery resumes keep their own routes. A
 `scheduler-prelaunch` record posted into a reconciled round (a stray checkpoint

@@ -125,11 +125,14 @@ def resolve_pr_board_state(
     resume_round: Callable[[object, BoardLineage], int] | None = None,
     floor_refusal_hint: Callable[[object, object], str] | None = None,
     diagnostics: list[str] | None = None,
+    activation_template: Callable[[object, BoardLineage, int], str | None] | None = None,
 ) -> PrBoardState:
     """Resolve the PR board read-only and refuse a below-floor board (D4).
 
     ``resume_round(effective_config, lineage)`` returns the round a resume
     re-enters; it is consulted only to validate a pending signed amendment.
+    ``activation_template(amendment, lineage, round)`` replaces the default
+    replacement template; returning None marks the round unsafe (#1981).
     """
     from .pr_loop_support import _scheduler_contract_from_metadata
     from .panel_evidence import _board_amendment_template
@@ -181,14 +184,18 @@ def resolve_pr_board_state(
         require_amendment_activation(
             lineage,  # type: ignore[arg-type]
             start_round_number=start_round,
-            template=lambda amendment, round_number: _board_amendment_template(
-                flow="pr",
-                issue_number=None,
-                pr_number=pr_number,
-                persisted=lineage.contract_before(amendment),
-                removed=amendment.removed_reviewers,
-                restored=amendment.restored_reviewers,
-                start_round_number=round_number,
+            template=lambda amendment, round_number: (
+                activation_template(amendment, lineage, round_number)
+                if activation_template is not None
+                else _board_amendment_template(
+                    flow="pr",
+                    issue_number=None,
+                    pr_number=pr_number,
+                    persisted=lineage.contract_before(amendment),
+                    removed=amendment.removed_reviewers,
+                    restored=amendment.restored_reviewers,
+                    start_round_number=round_number,
+                )
             ),
         )
     try:

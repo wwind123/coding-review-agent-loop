@@ -61,7 +61,9 @@ from .architecture_contract import (
     _accept_candidate,
     _accepted_validated_response,
 )
-from .panel_evidence import _board_amendment_template, _PR_AMENDMENT_RERUN_CLAUSE
+from .panel_evidence import (
+    _board_amendment_template, _PR_AMENDMENT_RERUN_CLAUSE, pr_amendment_template_round,
+)
 
 
 def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullRequestChecks) -> bool:
@@ -389,10 +391,12 @@ def _unavailable_reviewer_remedy(
             + _PR_AMENDMENT_RERUN_CLAUSE + degraded
         )
     elif route == "amendment-lookup-failed":
+        # No round, placeholder or template when the lookup failed or the
+        # round the rerun re-enters cannot take an amendment safely (#1981).
         lines.append(
-            "- Or, for this run only, a human operator may remove the reviewer with a signed "
-            f"reviewer-board amendment posted on {surface}, effective from the round the "
-            "rerun resumes into." + _PR_AMENDMENT_RERUN_CLAUSE + degraded
+            "- No safe reviewer-board amendment round can be determined yet for "
+            f"{surface}, so no amendment is offered for this stop; inspect the PR's round "
+            "records before posting a signed reviewer-board amendment."
         )
     elif route == "flags":
         lines.append(
@@ -435,7 +439,11 @@ def _unavailable_reviewer_amendment_advisory(
     ``rejected`` or ``lookup-failed``.  Never raises.
     """
     try:
-        round_number = fetch_start_round()
+        outcome = pr_amendment_template_round(fetch_start_round, removed=tuple(removed))
+        if outcome.status != "ok" or outcome.round_number is None:
+            # No round or template for an unsafe or failed lookup (#1981).
+            return "lookup-failed", None, None
+        round_number = outcome.round_number
         amendment = ReviewerBoardAmendment(
             flow="pr",
             issue=None,

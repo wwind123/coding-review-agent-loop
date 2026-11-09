@@ -240,6 +240,86 @@ def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
     assert resumed.qualification_checkpoint == checkpoint
 
 
+_HEAD_1981 = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+
+
+def _carried_only_round_comments_1981(*, checkpoint=None):
+    """Round 2 reconciled with a finding; round 3 settled on carried approvals only."""
+    item = UnresolvedReviewItem(
+        item_id="item-4",
+        reviewer="Codex",
+        source_round=2,
+        text="Document the retry bound.",
+        status="same-pr",
+        source_status="same-pr",
+    )
+
+    def summary(round_number, phase, prior_items, **extra):
+        return _attach_round_metadata(
+            f"Round {round_number} {phase}.",
+            PostedRoundMetadata(
+                flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
+                subject=_HEAD_1981, prior_items=prior_items, phase=phase, **extra,
+            ),
+        )
+
+    bodies = [
+        summary(2, "scheduler-prelaunch", ()),
+        summary(2, "reconciliation", (), new_items=(item,)),
+        summary(3, "scheduler-prelaunch", (item,)),
+        summary(3, "reconciliation", (item,)),
+    ]
+    if checkpoint is not None:
+        bodies.append(summary(
+            3, "qualification-checkpoint", (item,), state="blocking",
+            qualification_checkpoint=checkpoint,
+        ))
+    return item, [
+        IssueComment(author="bot", created_at=f"2026-11-08T00:00:{i:02d}Z", body=body)
+        for i, body in enumerate(bodies)
+    ]
+
+
+def test_1981_carried_only_reconciled_round_anchors_resume():
+    """Row reader-carried-only-reconciled."""
+    item, comments = _carried_only_round_comments_1981()
+    resumed = _resume_pr_round(
+        comments, head_sha=_HEAD_1981, configured_reviewers=("codex", "gemini"),
+    )
+    assert resumed is not None
+    assert resumed.round_number == 3
+    assert resumed.reconciled is True
+    assert resumed.completed_reviews == ()
+    assert resumed.coder_output is None
+    assert resumed.prior_items == (item,)
+    # The global finding-ID high-water mark is kept.
+    assert resumed.next_unresolved_item_number == 5
+    assert resumed.qualification_checkpoint is None
+
+
+def test_1981_carried_only_reconciled_round_keeps_a_later_qualification_checkpoint():
+    """Row reader-carried-only-with-qualification-checkpoint."""
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity="managed-exact-head-ci:item-5",
+        lifecycle="repair_required",
+        failed_head_sha=_HEAD_1981,
+        candidate_head_sha=None,
+        base_branch="main",
+        watch_failure_extension_used=False,
+        allowed_rounds=2,
+    )
+    item, comments = _carried_only_round_comments_1981(checkpoint=checkpoint)
+    resumed = _resume_pr_round(
+        comments, head_sha=_HEAD_1981, configured_reviewers=("codex", "gemini"),
+    )
+    assert resumed is not None
+    assert resumed.round_number == 3
+    assert resumed.reconciled is True
+    assert resumed.prior_items == (item,)
+    assert resumed.qualification_checkpoint == checkpoint
+
+
 def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
     tmp_path, monkeypatch
 ):
