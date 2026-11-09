@@ -79,9 +79,9 @@ def test_child_controls_and_lineage_use_separate_live_family_views(
 
 
 @pytest.mark.parametrize('mode', ['plan-only', 'auto'])
-def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_path, mode):
+def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_path, capsys, mode):
     runner, config, _ = _approved_closed_history(tmp_path)
-    config = replace(config, plan_execution_mode=mode)
+    config = replace(config, plan_execution_mode=mode, quiet=False)
     # Both a malformed anchor and an unhydratable sidecar must be excluded
     # before drift, scope, approval and recovery readers see the history.
     foreign = raw('<!-- AGENT_LOOP_META: invalid -->\n<!-- AGENT_LOOP_SIDECAR: invalid -->',
@@ -98,7 +98,7 @@ def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_pa
     runner.issue_comments.append(foreign)
     expected = _extract_round_metadata_records(acquire(runner, config, 56), flow='plan')
     assert len(expected) == len(_extract_round_metadata_records(trusted, flow='plan'))
-    for _ in range(2):
+    for _ in range(3):
         with patch.object(planning, 'select_plan_reviewers', side_effect=AssertionError('scheduled')), \
              patch.object(execution, '_implement_approved_issue', return_value=0) as implement:
             assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
@@ -108,6 +108,8 @@ def test_plan_start_refresh_and_two_restarts_keep_foreign_payloads_opaque(tmp_pa
             (r.metadata.subject, r.metadata.phase) for r in expected]
         # New foreign records on refresh remain opaque too.
         runner.issue_comments.append({**foreign, 'id': 90000 + _, 'createdAt': '2026-01-02T00:00:00Z'})
+    diagnostics = [line for line in capsys.readouterr().err.splitlines() if 'ignored loop record' in line]
+    assert diagnostics and all(len(line) < 500 for line in diagnostics)
 
 
 @pytest.mark.parametrize('trusted', [False, True])
@@ -183,3 +185,125 @@ def test_plan_announcement_readers_use_live_invocation_projection(
         else:
             assert _has_plan_approved_followups_marker(
                 comments, issue_number=56, plan_hash=plan_hash, mode='comment') is eligible
+
+
+@pytest.mark.parametrize('mode', ['plan-only', 'auto'])
+@pytest.mark.parametrize('failure', ['malformed', 'sidecar', 'page', 'identity'])
+def test_plan_invalid_history_two_restarts_then_fresh_recovery(tmp_path, monkeypatch, mode, failure):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    from test_pr_round_ingestion import BAD, spilled
+    runner, config, _ = _approved_closed_history(tmp_path)
+    config = replace(config, plan_execution_mode=mode, quiet=False)
+    with patch.object(execution, '_implement_approved_issue', return_value=0):
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    baseline = list(runner.issue_comments)
+    actor, actor_id = runner.authenticated_actor or ('coding-review-agent-loop', 424242)
+    publications = len(runner.comments)
+    commands = len(runner.commands)
+    for restart in range(2):
+        with patch.object(planning, 'select_plan_reviewers', side_effect=AssertionError('scheduled')), \
+             patch.object(execution, '_implement_approved_issue', return_value=0) as implement:
+            with monkeypatch.context() as broken:
+                if failure in {'malformed', 'sidecar'}:
+                    body = BAD if failure == 'malformed' else spilled()[-1]
+                    runner.issue_comments = [*baseline, {**raw(body, actor, actor_id, 990 + restart),
+                        'createdAt': '2026-01-03T00:00:00Z'}]
+                elif failure == 'page':
+                    broken.setattr(ingestion, 'read_complete_comment_listing',
+                        lambda *a, **k: github.UnknownCommentListing('issue:56', 'truncated page'))
+                else:
+                    broken.setattr(ingestion, 'resolve_authenticated_github_actor',
+                        lambda *a, **k: (_ for _ in ()).throw(AgentLoopError('unknown identity')))
+                with pytest.raises(AgentLoopError):
+                    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+                assert implement.call_count == 0
+                assert len(runner.comments) == publications
+            runner.issue_comments = list(baseline)
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+            assert implement.call_count == (mode == 'auto')
+    assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
+                   for cmd, _ in runner.commands[commands:])
+
+
+
+def _assert_refusal_diagnostics_only(bodies):
+    """The only publication allowed after a refused refresh is the existing
+    explicit scheduler refusal diagnostic; it never carries round authority."""
+    from types import SimpleNamespace
+    for body in bodies:
+        assert 'scheduling diagnostic' in body
+        assert not _extract_round_metadata_records([SimpleNamespace(body=body)], flow='plan')
+
+
+@pytest.mark.parametrize('mode', ['plan-only', 'auto'])
+@pytest.mark.parametrize('failure', ['foreign', 'malformed', 'sidecar', 'page'])
+def test_plan_history_changed_inside_one_invocation_is_reacquired(tmp_path, monkeypatch, capsys, mode, failure):
+    """History changes after the invocation's first successful acquisition,
+    so a startup snapshot cannot be reused at the later refreshed readers."""
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    from test_pr_round_ingestion import BAD, spilled
+    runner, config, _ = _approved_closed_history(tmp_path)
+    config = replace(config, plan_execution_mode=mode, quiet=False)
+    baseline = list(runner.issue_comments)
+    actor = baseline[0]['author']['login']
+    actor_id = (runner.authenticated_actor or (actor, 424242))[1]
+    commands = len(runner.commands)
+    if failure == 'foreign':
+        bodies = [raw(BAD, 'outsider', 99, 90), raw(str(baseline[0]['body']), 'outsider', 99, 91),
+                  raw('Ordinary operator discussion', 'outsider', 99, 92)]
+    elif failure in {'malformed', 'sidecar'}:
+        bodies = [raw(BAD if failure == 'malformed' else spilled()[-1], actor, actor_id, 90)]
+    else:
+        bodies = []
+    for body in bodies:
+        body['createdAt'] = '2026-01-03T00:00:00Z'
+    # Each authenticated acquisition goes through the complete listing read;
+    # change remote history right after the first one completes.
+    state = {'reads': 0, 'published_at_refresh': None}
+    listing = ingestion.read_complete_comment_listing
+    def observed_listing(*args, **kwargs):
+        state['reads'] += 1
+        if state['reads'] == 2:
+            state['published_at_refresh'] = len(runner.comments)
+        if failure == 'page' and state['reads'] > 1:
+            return github.UnknownCommentListing('issue:56', 'truncated page')
+        result = listing(*args, **kwargs)
+        if state['reads'] == 1:
+            runner.issue_comments = [*baseline, *bodies]
+        return result
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing', observed_listing)
+    with patch.object(planning, 'select_plan_reviewers', side_effect=AssertionError('scheduled')), \
+         patch.object(execution, '_implement_approved_issue', return_value=0) as implement:
+        if failure == 'foreign':
+            # Foreign records arriving mid-run stay opaque: the run finishes on
+            # trusted state with no foreign authority.
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+            assert state['reads'] >= 2, 'no refreshed acquisition inside the invocation'
+            assert implement.call_count == (mode == 'auto')
+            monkeypatch.undo()
+            reread = acquire(runner, config, 56)
+            assert 'Ordinary operator discussion' in [c.body for c in reread]
+            records = _extract_round_metadata_records(reread, flow='plan')
+            assert records and all(reread[r.index].author != 'outsider' for r in records)
+            diagnostics = [line for line in capsys.readouterr().err.splitlines()
+                           if 'ignored loop record' in line]
+            assert diagnostics and all(len(line) < 500 for line in diagnostics)
+        else:
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+            assert state['published_at_refresh'] is not None, 'no refreshed acquisition inside the invocation'
+            assert implement.call_count == 0
+            _assert_refusal_diagnostics_only(runner.comments[state['published_at_refresh']:])
+            # A restart against the persisting failure refuses as well, with
+            # no stale-baseline fallback, implementation or round publication.
+            stopped = len(runner.comments)
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+            assert implement.call_count == 0
+            _assert_refusal_diagnostics_only(runner.comments[stopped:])
+            monkeypatch.undo()
+            runner.issue_comments = [*baseline, *runner.issue_comments[len(baseline) + len(bodies):]]
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+            assert implement.call_count == (mode == 'auto')
+    assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
+                   for cmd, _ in runner.commands[commands:])

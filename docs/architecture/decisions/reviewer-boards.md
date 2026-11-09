@@ -12,3 +12,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Approved resume keeps historical approving-board links effective, leaves pending post-approval links inactive, and restores the invocation PR board only at execution (#1805).
 
 - Neutral staged plan advances recover existing history through a narrow read-only lineage exception; substantive records, pending links and amendment activation retain their validation and authority boundaries (#1827).
+
+- 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).

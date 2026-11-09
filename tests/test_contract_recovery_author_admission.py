@@ -43,7 +43,7 @@ def test_recovery_fixture_preserves_complete_comment_history(tmp_path, transport
         'repos/OWNER/REPO/issues/77/comments?per_page=100')
     assert reason == ''
     assert len(managed_comments) == existing_count + 2
-    for _ in range(2):
+    for _ in range(3):
         context = github.get_pr_review_context(runner, config=config, pr_number=77)
         assert len(context.comments) == existing_count + 2
         assert len({c.comment_id for c in context.comments}) == existing_count + 2
@@ -78,7 +78,7 @@ def test_legacy_contract_live_acquisition_and_owning_issue_lookup(
     runner = FakeRunner(authenticated_actor=('loop', 42), pr_payload={'comments': comments})
     config = make_config(tmp_path, quiet=False,
         human_reviewer_trusted_actors=(HUMAN,) if trusted_human else ())
-    for _ in range(2):
+    for _ in range(3):
         context = github.get_pr_review_context(runner, config=config, pr_number=77)
         assert find_latest_pr_contract(context.comments, repository=config.repo, pr_number=77) == (extension if owned else None)
     # Drive the startup owning-issue callback; the verified contract supplies
@@ -110,7 +110,7 @@ def test_capture_history_has_no_reviewer_role_exemption(tmp_path, trusted_human)
         raw(anchor(round_number=5, role='coder'), 'outsider', 99, 2),
     ]})
     config = make_config(tmp_path, human_reviewer_trusted_actors=(HUMAN,) if trusted_human else ())
-    for _ in range(2):
+    for _ in range(3):
         context = github.get_pr_review_context(runner, config=config, pr_number=77)
         records, complete = admitted_capture_history(runner, config, pr_number=77, comments=context.comments)
         assert complete

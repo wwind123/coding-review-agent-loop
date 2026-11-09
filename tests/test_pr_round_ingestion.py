@@ -169,8 +169,8 @@ def test_capped_projection_recovers_older_history_and_preserves_human_prose(tmp_
 
 @pytest.mark.parametrize('parallel', [False, True])
 @pytest.mark.parametrize('policy', ['all-reviewers', 'selective-intermediate', 'primary-then-panel'])
-def test_live_loop_foreign_injection_after_publication_and_restart(tmp_path, parallel, policy):
-    values = dict(review_parallel=parallel, pr_review_policy=policy)
+def test_live_loop_foreign_injection_after_publication_and_restart(tmp_path, capsys, parallel, policy):
+    values = dict(review_parallel=parallel, pr_review_policy=policy, quiet=False)
     if policy == 'primary-then-panel':
         values['primary_reviewer'] = 'codex'
         values['reviewer'] = ('codex', 'gemini')
@@ -191,10 +191,22 @@ def test_live_loop_foreign_injection_after_publication_and_restart(tmp_path, par
     assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
     launches = sum(cmd[0] == 'codex' for cmd, _ in runner.commands)
     assert injected
-    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert sum(cmd[0] == 'codex' for cmd, _ in runner.commands) == launches
+    durable = [r.metadata for r in support.admitted_pr_records(runner, config, pr_number=77)]
+    for restart in range(2):
+        runner.pr_payload['comments'].append(dict(raw(BAD, foreign=True), id=80000 + restart * 1000,
+            createdAt='2026-01-02T00:00:00Z'))
+        runner.pr_payload['comments'].extend([
+            dict(raw(anchor(round_number=90 + restart), foreign=True),
+                 id=80200 + restart * 1000, createdAt='2026-01-02T00:00:00Z'),
+            dict(raw('Ordinary discussion', foreign=True),
+                 id=80400 + restart * 1000, createdAt='2026-01-02T00:00:00Z')])
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert sum(cmd[0] == 'codex' for cmd, _ in runner.commands) == launches
+        assert [r.metadata for r in support.admitted_pr_records(runner, config, pr_number=77)] == durable
     records = support.admitted_pr_records(runner, config, pr_number=77)
     assert records and all(r.metadata.subject == HEAD for r in records)
+    diagnostics = [line for line in capsys.readouterr().err.splitlines() if 'ignored loop record' in line]
+    assert diagnostics and all(len(line) < 500 for line in diagnostics)
 
 
 def test_native_approval_visual_and_capture_readers_share_admission(tmp_path, monkeypatch):
@@ -513,3 +525,109 @@ def test_protocol_candidate_recognizes_registered_tokens_before_payload_parsing(
             body=f'<!-- {spelling}: invalid -->'))
     assert not protocol_candidate(github.IssueComment(
         author='outsider', created_at=STAMP, body=f'<!-- {token}_EXTRA: invalid -->'))
+
+
+@pytest.mark.parametrize('failure', ['malformed', 'sidecar', 'page', 'identity'])
+def test_pr_invalid_history_repeated_restart_and_restored_transport(tmp_path, monkeypatch, failure):
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    runner = FakeRunner(authenticated_actor=('bot', 424242),
+                        codex_outputs=[structured_pr_review()])
+    config = make_config(tmp_path)
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+    baseline = list(runner.pr_payload['comments'])
+    before = len(runner.commands)
+    publication_count = len(runner.comments)
+    for _ in range(2):
+        with monkeypatch.context() as broken:
+            runner.pr_payload['comments'] = list(baseline)
+            if failure in {'malformed', 'sidecar'}:
+                body = BAD if failure == 'malformed' else spilled()[-1]
+                runner.pr_payload['comments'].append(dict(raw(body), id=90000,
+                    createdAt='2026-01-02T00:00:00Z'))
+            elif failure == 'page':
+                broken.setattr(ingestion, 'read_complete_comment_listing',
+                    lambda *a, **k: github.UnknownCommentListing('pr:77', 'truncated page'))
+            else:
+                broken.setattr(ingestion, 'resolve_authenticated_github_actor',
+                    lambda *a, **k: (_ for _ in ()).throw(AgentLoopError('unknown identity')))
+            with pytest.raises(AgentLoopError):
+                pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+            with pytest.raises(AgentLoopError):
+                support.admitted_pr_records(runner, config, pr_number=77)
+            assert len(runner.comments) == publication_count
+        # Fresh invocation-local projections; the fake remote baseline persists.
+        runner.pr_payload['comments'] = list(baseline)
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert len(runner.comments) == publication_count
+    assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
+                   for cmd, _ in runner.commands[before:])
+
+
+@pytest.mark.parametrize('failure', ['malformed', 'sidecar', 'foreign'])
+@pytest.mark.parametrize('policy', ['selective-intermediate', 'primary-then-panel'])
+def test_pr_history_changed_after_startup_is_reacquired_at_refresh(tmp_path, policy, failure):
+    """Remote history changes inside one invocation, after startup admission
+    and the first publication, so a stale startup snapshot cannot be reused."""
+    def outputs():
+        return dict(codex_outputs=[structured_pr_review()],
+                    gemini_outputs=[structured_pr_review(reviewer='Google Gemini')])
+    config = make_config(tmp_path, reviewer=('codex', 'gemini'), pr_review_policy=policy, auto_merge=True,
+        primary_reviewer='codex' if policy == 'primary-then-panel' else None)
+    runner = FakeRunner(authenticated_actor=('bot', 424242), **outputs())
+    injected = []
+    if failure == 'malformed':
+        bodies = [BAD]
+    elif failure == 'sidecar':
+        bodies = [spilled()[-1]]
+    else:
+        bodies = [BAD, str(anchor(round_number=90)), 'Ordinary discussion']
+    original = runner._run_locked
+    launches_at_injection = None
+    def inject(args, **kwargs):
+        nonlocal launches_at_injection
+        result = original(args, **kwargs)
+        if not injected and list(args)[:3] == ['gh', 'pr', 'comment']:
+            launches_at_injection = sum(c[0] in {'codex', 'gemini', 'claude'} for c, _ in runner.commands)
+            for offset, body in enumerate(bodies):
+                comment = dict(raw(body, foreign=failure == 'foreign'), id=95000 + offset,
+                               createdAt='2026-01-02T00:00:00Z')
+                runner.pr_payload['comments'].append(comment)
+                injected.append(comment)
+        return result
+    runner._run_locked = inject
+    launches = lambda: sum(c[0] in {'codex', 'gemini', 'claude'} for c, _ in runner.commands)
+    if failure == 'foreign':
+        # Foreign records arriving mid-run are opaque: the run completes on
+        # trusted state and the foreign anchor never becomes authority.
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert injected
+        records = support.admitted_pr_records(runner, config, pr_number=77)
+        assert records and all(r.metadata.round_number != 90 for r in records)
+        assert all(r.metadata.subject == HEAD for r in records)
+        bodies_now = [c['body'] for c in runner.pr_payload['comments']]
+        assert 'Ordinary discussion' in bodies_now
+        return
+    # Admitted corruption that appears after startup fails closed at the
+    # refreshed acquisition before any later agent launch or merge.
+    with pytest.raises(AgentLoopError):
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+    assert injected and launches_at_injection is not None
+    assert launches() == launches_at_injection
+    assert not any(c[:3] == ['gh', 'pr', 'merge'] for c, _ in runner.commands)
+    publications = len(runner.comments)
+    # The corruption persists remotely: each restart refuses too. The only
+    # permitted publication is the existing explicit scheduler refusal
+    # diagnostic, which carries no round record or approval authority.
+    for _ in range(2):
+        with pytest.raises(AgentLoopError):
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+        assert launches() == launches_at_injection
+    for body in runner.comments[publications:]:
+        assert body.startswith('PR review scheduling diagnostic')
+        assert not _extract_round_metadata_records([SimpleNamespace(body=body)], flow='pr')
+    assert not any(c[:3] == ['gh', 'pr', 'merge'] for c, _ in runner.commands)
+    # Restoring valid remote history lets a fresh acquisition recover.
+    runner.pr_payload['comments'] = [c for c in runner.pr_payload['comments'] if c not in injected]
+    runner.codex_outputs.extend(outputs()['codex_outputs'])
+    runner.gemini_outputs.extend(outputs()['gemini_outputs'])
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0

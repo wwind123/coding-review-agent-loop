@@ -43,3 +43,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Plan and decomposition readers use the shared author-bound family projections, preserving separate parent/child surfaces, raw discussion and stable indices; historical foreign controls are ignored and logged before payload parsing (#1965).
 
 - Legacy PR contracts and remote salvage select invocation-only body projections before decoding; capture reconstruction has no reviewer-role exemption. Complete authenticated acquisition preserves raw discussion, trusted transaction semantics and local salvage fallback (#1966).
+
+- 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).

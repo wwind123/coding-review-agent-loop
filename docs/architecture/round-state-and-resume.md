@@ -71,6 +71,52 @@ historical candidates are ignored and logged without rewriting discussion;
 trusted contract supersession, transaction handling and local salvage remain unchanged. Signed human requirements retain their
 separate author policy and unconfigured behavior.
 
+## Per-family replay policy
+
+The reader inventory in `tests/pr_round_reader_inventory.json` records the
+reviewed reader families, each call's acquisition source, and structural reader
+or exemption definitions. The following table is the canonical author policy.
+Here **I** means exactly the authenticated invocation account; shared family
+projections require normalized login and immutable numeric REST user ID, while
+independent authenticated views partition by immutable actor ID. **H** means exactly the configured
+`human_reviewer_trusted_actors` login/ID pairs. Neither a model signature nor a
+copied payload authenticates an author. An empty H is an empty set.
+
+| Record family | Exact admitted author set | Admission owner and live input |
+| --- | --- | --- |
+| PR, plan and discuss round anchors, sidecars, scheduler checkpoints, diagnostics, visual/evidence projections and capture history | I | `github` acquires complete observations; `pr_round_ingestion.protocol_comments` partitions before round decoding/hydration. `pr_loop_support.admitted_capture_history` reacquires before capture selection, for every role. |
+| Reviewer-board amendments and restoration | I union H | `pr_round_ingestion` binds `amendment_body`; `board_amendment` collectors, including `restoration_rounds_from_comments` in `panel_evidence`, select that projection. |
+| Board links and lineage | Invocation actor ID for links; I union H only for amendment controls | `board_change.lineage_binding_resolver` authenticates the source surface and partitions round history separately from amendments. Link parsing is a pure codec; foreign or malformed board-link claims refuse under the existing independent lineage policy. |
+| Plan scope boundaries and approval announcements | I | `plan_first_loop` admits startup and refreshed issue history; `plan_issue_scope` preserves family bindings during redaction; `followups` selects `record_body`. |
+| Execution recommendation/decision, topology/decomposition, phase and one-shot handoffs | I | `execution_policy` and `plan_execution` acquire issue contexts; `decomposition` selects `record_body` before parsing. Issue-body phase identities used for adoption also undergo child identity and provenance checks. |
+| Discuss split, typed split, split-stage handoff and unfiled warning | I | `discuss_loop`/`execution_policy` acquire history; `split_materialization` selects `record_body`. Child body search is candidate discovery, followed by identity validation. |
+| Child disposition overrides and plan supersessions | I union H | Independent parent and child `github.get_issue_context` acquisitions; `decomposition` selects `child_control_body` before parsing controls. |
+| Child rebind and digest-bound coder lineage | I | `decomposition` selects invocation-only history; a human supersession never authenticates its later coder/rebind records. |
+| Issue-to-PR handoffs, legacy and transaction PR contracts | I | Handoff and transaction resolvers require a surface-bound `github.AuthenticatedCommentView` from complete REST acquisition. Legacy `pr_contract` selects `protocol_body`. |
+| Remote salvage | I | Issue/plan implementation and PR recovery acquire authenticated history; `salvage` selects `protocol_body`. Local salvage selection remains a separate filesystem policy. |
+| Staged completion | I | `phase_progress.record_staged_completion` independently reads complete REST history, resolves the invocation actor and checks login/ID on codec candidates before suppressing publication. |
+| Managed continuity and managed-CI authorization | Invocation actor for continuity history; configured managed actor for CI authorization | `managed_ci_authorization` partitions continuity round bodies by invocation identity; managed intent readers independently enforce configured managed-actor ID, complete pages, exact head and lifecycle binding (the intent validator requires the configured login and checks its numeric ID when supplied). H does not expand either set; see the managed-CI detail. |
+| Signed human requirements | H when configured; all signed candidates surfaced unverified when H is empty | `github.verify_human_requirement_authors` independently joins signed content to exact REST locators and matches normalized login plus numeric ID when configured. Board/child projection eligibility is never a signed-requirement grant; the existing unconfigured policy is unchanged. |
+
+For shared projections, historical foreign records are ignored before payload
+decoding and logged with bounded surface/comment diagnostics. Raw discussion,
+comment IDs and full-list indices stay available. Independent board-link, handoff,
+transaction, managed-CI and completion readers apply their own documented
+candidate/author checks; their raw codecs do not grant authority. Trusted
+malformed payloads, missing required sidecars and incomplete authenticated
+pages/identity retain their refusal or explicit recovery behavior. A previous
+valid observation cannot substitute for a failed fresh acquisition.
+
+Operators who publish board or child controls from a separate human account
+must pass `--human-reviewer-trusted-actor LOGIN:ID` on **every replay**, including
+restarts of old threads. Both normalized login and numeric REST ID must match.
+Without that configuration, historical human controls are ignored and logged;
+they are not grandfathered by chronology or signatures. Adding H authorizes
+only board/child controls, never rounds, rebinds, contracts, salvage or capture.
+Parent observations cannot bind child surfaces, and changing the invocation
+account requires a fresh authenticated acquisition rather than reusing a prior
+projection. No historical migration or comment rewrite is performed.
+
 ## Legacy PR acknowledgement recovery
 
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,

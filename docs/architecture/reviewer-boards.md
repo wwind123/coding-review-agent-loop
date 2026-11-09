@@ -14,6 +14,10 @@ The invocation-only round projection is independent, so human amendments cannot
 authenticate co-located scheduler records or sidecars. See
 [board-control admission](round-state-and-resume.md#board-control-author-admission).
 
+## Reader admission integration
+
+Board reconstruction follows the canonical [per-family replay policy](round-state-and-resume.md#per-family-replay-policy). Amendments and restoration admit exactly the invocation actor plus configured human normalized-login/REST-ID pairs through `amendment_body`. A separate human account requires `--human-reviewer-trusted-actor LOGIN:ID` on every historical replay. Unconfigured historical human controls are ignored/logged. Board link/round lineage retains independent invocation-only admission; a trusted amendment does not authenticate a copied anchor or sidecar.
+
 ## Named reviewer seat preflight
 
 `reviewer_seats.py` defines an immutable seat configuration with a stable ID,
