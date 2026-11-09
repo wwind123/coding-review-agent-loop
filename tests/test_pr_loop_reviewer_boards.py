@@ -1630,3 +1630,56 @@ def test_1981_unqualified_premature_secondary_suppresses_the_open_round_template
         cmd[0] for cmd, _cwd in runner.commands[commands_before:]
         if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
     ] == []
+
+
+def test_1981_versionless_carried_approval_suppresses_the_open_round_template(tmp_path):
+    """Item 6 (#1985): an approval the carried-approval reader rejects never carries."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(
+            tmp_path, architecture_context_enabled=False,
+        ))
+    # Legacy history: Codex's round-1 approval carries no architecture contract.
+    _rewrite_pr_metadata(runner, lambda payload: (
+        {k: v for k, v in payload.items() if k != "architecture_contract_version"}
+        if payload.get("agent") == "Codex" and "architecture_contract_version" in payload
+        else None
+    ))
+    codex = [
+        r.metadata for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.agent == "Codex"
+    ]
+    assert codex and all(m.architecture_contract_version is None for m in codex)
+    legacy = _staged_config(
+        tmp_path, reviewer=("codex", "gemini"), min_reviewers=3,
+        architecture_context_enabled=False,
+    )
+    # Control: without architecture context the approval carries, round 2 is offered.
+    assert '"effective_from_round": 2' in _floor_message_1981(runner, legacy)
+    current = dataclasses.replace(legacy, architecture_context_enabled=True)
+    message = _floor_message_1981(runner, current)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Codex would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a mismatched pending amendment fails closed with no replacement round.
+    _m943_append(runner, _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=5,
+        rationale="Antigravity quota exhausted.",
+    ))
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=current)
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
+    ] == []

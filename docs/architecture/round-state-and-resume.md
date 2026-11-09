@@ -416,8 +416,10 @@ selection and passes the PR resume checks (resumable review, current signed
 requirements, configured acquisition identity, seat binding, staged-policy
 panel qualification, and no approved-plan binding that cannot be checked
 there), or the round did not select it, no recorded or operator force-full
-applies, it owns no pending finding, and its latest complete review of the
-head is an earlier-round approval passing the same checks. A seat needing a
+applies, it owns no pending finding, and the PR loop's own carried-approval
+reader (latest complete review, verdict, acquisition identity, signed
+requirements and architecture contract) yields an earlier-round approval that
+also passes the same checks. A seat needing a
 fresh turn blocks the round only beside another reviewer's publication, and
 the activation replacement uses the same predicate. Any seat the check cannot confirm counts as needing
 a fresh turn. Otherwise, and

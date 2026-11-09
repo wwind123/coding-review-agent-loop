@@ -1829,6 +1829,8 @@ def test_1981_stale_amendment_round_fails_closed_with_the_reconciled_round():
 
 
 def _record_1981(index, round_number, role, agent, phase, **extra):
+    if role == "reviewer":
+        extra.setdefault("acquisition_outcome", "success")
     return PostedRoundRecord(
         index=index, body="",
         metadata=PostedRoundMetadata(
@@ -1871,7 +1873,13 @@ def _facts_1981(
     import coding_review_agent_loop.response_validation as response_validation
 
     monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records", lambda *a, **k: records)
-    monkeypatch.setattr(pr_loop_support, "_pr_reviewer_acquisition_contract", lambda config: {})
+    # The real carried-approval reader runs over the same stub records.
+    monkeypatch.setattr(round_state, "_extract_round_metadata_records", lambda *a, **k: records)
+    monkeypatch.setattr(pr_loop_support, "reviewers", lambda config: ("codex", "claude", "antigravity"))
+    monkeypatch.setattr(
+        pr_loop_support, "_pr_reviewer_acquisition_contract",
+        lambda config: {name: (None, None) for name in BOARD},
+    )
     monkeypatch.setattr(pr_loop_support, "reviewer_seat_binding", lambda config: None)
     monkeypatch.setattr(
         pr_loop_support, "_pr_panel_qualification",
@@ -1890,8 +1898,14 @@ def _facts_1981(
         )
     return pr_loop_support._pr_open_round_facts(
         (), head_sha=_HEAD_1981, round_number=2, resumed=resumed, candidates=BOARD,
-        config=(SimpleNamespace(pr_review_force_full=False) if config is None else config),
+        config=(_config_1981() if config is None else config),
     )
+
+
+def _config_1981(**overrides):
+    values = {"pr_review_force_full": False, "architecture_context_enabled": False}
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 import dataclasses  # noqa: E402
@@ -1917,13 +1931,17 @@ def test_1981_open_round_facts_carry_only_an_unselected_exact_head_approval(monk
     "operator-force-full", "recorded-force-full", "no-decision-record", "pending-owner",
     "stale-published-review", "plan-bound-published-review", "stale-carried-approval",
     "newer-ineligible-review", "newer-blocking-review", "unqualified-carried-approval",
-    "unqualified-published-review", "unverifiable-config",
+    "unqualified-published-review", "versionless-carried-approval", "unverifiable-config",
 ])
 def test_1981_open_round_facts_count_every_unverifiable_seat_as_fresh(monkeypatch, case):
     """Items 1 and 2 (#1985): selection and reuse are honoured only when verified."""
     kwargs, records = {}, None
     if case == "operator-force-full":
-        kwargs["config"] = SimpleNamespace(pr_review_force_full=True)
+        kwargs["config"] = _config_1981(pr_review_force_full=True)
+    elif case == "versionless-carried-approval":
+        # Item 6: with architecture context enabled the carried-approval
+        # reader excludes an approval without the architecture contract.
+        kwargs["config"] = _config_1981(architecture_context_enabled=True)
     elif case == "recorded-force-full":
         records = _open_round_records_1981(force_full=True)
     elif case == "no-decision-record":
@@ -1977,6 +1995,7 @@ def test_1981_open_round_facts_count_every_unverifiable_seat_as_fresh(monkeypatc
         "newer-blocking-review": ("Codex", "Antigravity"),
         "unqualified-carried-approval": ("Codex", "Antigravity"),
         "unqualified-published-review": ("Claude", "Antigravity"),
+        "versionless-carried-approval": ("Codex", "Antigravity"),
     }[case]
     assert fresh == expected
     lookup = lambda: PrAmendmentRound(2, peers=peers, fresh=fresh)  # noqa: E731
@@ -2000,7 +2019,7 @@ def test_1981_activation_replacement_for_an_unsafe_open_round_names_no_round(mon
     resumed = _resumed_1981(2, reconciled=False, completed=(records[-1],))
     template = lambda amendment, n: pr_loop_support._pr_amendment_activation_template(  # noqa: E731
         amendment, n, lineage=lineage, pr_number=77, resumed=resumed,
-        pr_context=_pr_context_1981(), config=SimpleNamespace(pr_review_force_full=False),
+        pr_context=_pr_context_1981(), config=_config_1981(),
     )
     assert template(lineage.pending_amendments[0], 2) is None
     with pytest.raises(AgentLoopError) as excinfo:
@@ -2103,7 +2122,7 @@ def test_1981_activation_replacement_uses_the_peer_aware_predicate(monkeypatch):
     resumed = _resumed_1981(2, reconciled=False, completed=(records[-1],))
     template = lambda amendment, n: pr_loop_support._pr_amendment_activation_template(  # noqa: E731
         amendment, n, lineage=lineage, pr_number=77, resumed=resumed,
-        pr_context=_pr_context_1981(), config=SimpleNamespace(pr_review_force_full=False),
+        pr_context=_pr_context_1981(), config=_config_1981(),
     )
     replacement = template(lineage.pending_amendments[0], 2)
     assert replacement is not None and '"effective_from_round": 2' in replacement
@@ -2113,3 +2132,16 @@ def test_1981_activation_replacement_uses_the_peer_aware_predicate(monkeypatch):
     # Keeping Antigravity, it would need a fresh turn beside Claude's verdict.
     lineage.pending_amendments[0].removed_reviewers = ("Codex",)
     assert template(lineage.pending_amendments[0], 2) is None
+
+
+def test_1981_versioned_carried_approval_still_carries_with_architecture_context(monkeypatch):
+    """Item 6 control: a version-1 approval carries when architecture context is on."""
+    records = _open_round_records_1981()
+    records[1] = _record_1981(
+        1, 1, "reviewer", "Codex", "publication", state="approved",
+        architecture_contract_version=1,
+    )
+    peers, fresh = _facts_1981(
+        monkeypatch, records, config=_config_1981(architecture_context_enabled=True),
+    )
+    assert (peers, fresh) == (("Claude",), ("Antigravity",))

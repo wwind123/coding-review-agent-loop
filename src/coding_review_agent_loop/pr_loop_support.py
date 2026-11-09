@@ -3479,24 +3479,38 @@ def _pr_open_round_facts(
                 return True
         return False
 
+    # Carry eligibility comes from the PR loop's own carried-approval reader
+    # (latest complete review per seat, verdict, acquisition identity, signed
+    # requirements and architecture contract), then the same resume checks as
+    # reuse.  Any failure to compute it carries nothing.
+    try:
+        from .code_approval import _latest_pr_approved_reviews_for_head
+
+        carry_approvals = (
+            _latest_pr_approved_reviews_for_head(
+                comments,
+                head_sha=head_sha,
+                configured_reviewers=reviewers(config),
+                human_requirements=tuple(human_requirements),
+                reviewer_acquisition_contract=acquisition,
+                require_architecture_contract=bool(
+                    getattr(config, "architecture_context_enabled", True)
+                ),
+            )
+            if config is not None and acquisition is not None else {}
+        )
+    except Exception:  # noqa: BLE001 - unverifiable carries nothing
+        carry_approvals = {}
+
     def carried(name: str) -> bool:
         if forced or name in selected or owns_pending_finding(name):
             return False
-        # Like the carried-approval reader, only the seat's latest complete
-        # review of this head counts; an older matching approval never does.
-        latest = next(
-            (
-                record for record in reversed(head_records)
-                if record.metadata.agent == name and is_complete_code_review(record.metadata)
-            ),
-            None,
-        )
+        record = carry_approvals.get(name)
         return bool(
-            latest is not None
-            and latest.metadata.round_number < round_number
-            and latest.metadata.state == "approved"
-            and not latest.metadata.new_items
-            and verified(latest)
+            record is not None
+            and record.metadata.round_number < round_number
+            and not record.metadata.new_items
+            and verified(record)
         )
 
     fresh = tuple(name for name in candidates if name not in reused and not carried(name))
