@@ -2201,7 +2201,15 @@ def _resume_pr_round_from_records(
             _is_acknowledgement_failure_boundary(record.metadata)
             for record in current_round_records
         )
-        if not (open_prelaunch or open_ack_failure):
+        # A round reconciled at this head anchors resume even when every
+        # settlement was a carried exact-head approval and so left no reviewer
+        # or coder record (#1981): the reconciled re-entry settles it and opens
+        # the next round instead of restarting at round 1.
+        reconciled_anchor = (
+            reconciliation_record is not None
+            and reconciliation_record.index > superseded_below
+        )
+        if not (open_prelaunch or open_ack_failure or reconciled_anchor):
             if checkpoint_record is None:
                 return None
             # Preserve first-round startup and qualification recovery. A later

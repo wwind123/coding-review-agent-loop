@@ -225,6 +225,7 @@ from .architecture_contract import (
 from .response_validation import _build_requirements_context
 from .panel_evidence import (
     _board_amendment_route_clause,
+    _board_amendment_template,
     _stale_amendment_repost_clause,
     _require_complete_canonical_plan_approval,
 )
@@ -3247,7 +3248,7 @@ def _pr_contract_drift_error(
         + (
             ""
             if during == "qualification"
-            else _stale_amendment_repost_clause(detail, start_round_number)
+            else _stale_amendment_repost_clause(detail, start_round_number, pr_flow=True)
             + _board_amendment_route_clause(
                 flow="pr",
                 issue_number=None,
@@ -3296,6 +3297,226 @@ def _post_reduced_board_completion_note(
     )
 
 
+def _pr_reviewer_acquisition_contract(config: AgentLoopConfig) -> dict[str, tuple[object, ...]]:
+    """The configured reviewers' acquisition identities, as the PR loop computes them."""
+    from .config import resolve_invocation
+    from .reviewer_seats import SeatAgent, seat_backend
+
+    contract: dict[str, tuple[object, ...]] = {}
+    for reviewer in reviewers(config):
+        invocation = resolve_invocation(config, provider=reviewer, role="reviewer")
+        contract[agent_display_name(reviewer)] = (
+            reviewer.model_chain if isinstance(reviewer, SeatAgent) else invocation.configured_model,
+            invocation.resolved_effort,
+            seat_backend(reviewer),
+        )
+    return contract
+
+
+def _pr_panel_qualification(
+    comments: Sequence[object], config: AgentLoopConfig | None
+) -> Callable[[PostedRoundRecord], bool]:
+    """The staged-policy panel-qualification test the PR loop applies to resumed reviews.
+
+    Mirrors ``_pr_record_is_panel_qualified`` over the comment-ordered panel
+    evidence.  Without a config, under recorded board-change links (whose
+    primary epoch this check does not model) or when the history cannot be
+    derived, nothing counts as qualified (#1981).
+    """
+    from .board_change import comments_bear_board_change_links
+    from .panel_evidence import _derive_pr_panel_evidence, _pr_record_is_panel_qualified
+    from .review_scheduling import policy_capabilities
+    from .round_state import drop_inert_post_reconciliation_checkpoints
+
+    if config is None:
+        return lambda _record: False
+    try:
+        if not policy_capabilities(config.pr_review_policy).requires_primary:
+            return lambda _record: True
+        if comments_bear_board_change_links(comments):
+            return lambda _record: False
+        primary = (
+            agent_display_name(config.primary_reviewer)
+            if config.primary_reviewer is not None else None
+        )
+        evidence = _derive_pr_panel_evidence(
+            drop_inert_post_reconciliation_checkpoints(
+                _extract_round_metadata_records(comments, flow="pr")
+            ),
+            primary_reviewer=primary,
+            required_reviewers=tuple(agent_display_name(agent) for agent in reviewers(config)),
+        )
+    except Exception:  # noqa: BLE001 - unverifiable counts as unqualified
+        return lambda _record: False
+    return lambda record: _pr_record_is_panel_qualified(
+        record, evidence, primary_reviewer=primary,
+        operator_force_full=bool(config.pr_review_force_full),
+    )
+
+
+def _pr_open_round_facts(
+    comments: Sequence[object],
+    *,
+    head_sha: str | None,
+    round_number: int,
+    resumed: ResumedReviewRound | None,
+    candidates: Sequence[str],
+    config: AgentLoopConfig | None = None,
+    human_requirements: Sequence[object] = (),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(published peers, seats needing a fresh turn)`` of the re-entered round (#1981).
+
+    A reconciled round has neither: its re-entry settles it and opens the next
+    round.  Otherwise the peers are the reviewers with a published verdict in
+    the round after any head-review, conversion or acknowledgement boundary.
+    Every check below is conservative: when reuse or carry cannot be
+    established here, the seat counts as needing a fresh turn, so an unsafe
+    round is never offered.
+
+    A candidate needs no fresh turn when either holds:
+
+    - **Verified reuse.** Its record is in the resumed round's completed
+      reviews, was published after the round's recorded scheduler decision
+      selected it, and passes the PR loop's resume checks: a resumable
+      review, the current signed requirements, the configured acquisition
+      identity and seat binding.  A record bound to an approved plan cannot
+      be checked against the current plan here, so it is never counted.
+    - **Verified carry.** The recorded decision did not select it, nothing
+      forces a full board (no recorded or operator force-full), it already
+      approved this exact head in an earlier round with a record passing the
+      same checks, and it owns no pending finding.  A panel seat the round
+      never selected is then not missing from it.
+    """
+    from .capture_dispatch import is_resumable_capture_review
+    from .response_validation import _resumed_pr_reviewer_matches_requirements
+    from .round_state import _is_acknowledgement_failure_boundary
+
+    same_round = resumed is not None and resumed.round_number == round_number
+    if same_round and resumed.reconciled:
+        return (), ()
+    head_records = [
+        record
+        for record in _extract_round_metadata_records(comments, flow="pr")
+        if record.metadata.subject == head_sha
+    ]
+    records = [r for r in head_records if r.metadata.round_number == round_number]
+    boundary = max(
+        (
+            record.index
+            for record in records
+            if record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            or (
+                record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+                and record.metadata.evidence_conversion is not None
+            )
+            or _is_acknowledgement_failure_boundary(record.metadata)
+        ),
+        default=-1,
+    )
+    peers = tuple(sorted({
+        record.metadata.agent
+        for record in records
+        if record.index > boundary and is_complete_code_review(record.metadata)
+    }))
+    if not peers:
+        return (), ()
+    acquisition = _pr_reviewer_acquisition_contract(config) if config is not None else None
+    binding = reviewer_seat_binding(config) if config is not None else None
+    panel_qualified = _pr_panel_qualification(comments, config)
+
+    def verified(record: PostedRoundRecord) -> bool:
+        metadata = record.metadata
+        if acquisition is None or metadata.approved_plan_hash is not None:
+            return False
+        try:
+            return bool(
+                is_resumable_capture_review(metadata)
+                and _resumed_pr_reviewer_matches_requirements(
+                    record, tuple(human_requirements), None,
+                    reviewer_acquisition_contract=acquisition,
+                )
+                and (binding is None or metadata.seat_binding == binding)
+                and panel_qualified(record)
+            )
+        except Exception:  # noqa: BLE001 - unverifiable counts as not reusable
+            return False
+
+    decision_record = next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.phase == "scheduler-prelaunch"
+            and record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_selected_reviewers
+        ),
+        None,
+    )
+    selected = (
+        set(decision_record.metadata.scheduler_selected_reviewers)
+        if decision_record is not None else set()
+    )
+    reused = {
+        record.metadata.agent
+        for record in (resumed.completed_reviews if same_round else ())
+        if decision_record is not None
+        and record.index > max(boundary, decision_record.index)
+        and record.metadata.agent in selected
+        and verified(record)
+    }
+    forced = (
+        decision_record is None
+        or bool(decision_record.metadata.scheduler_force_full)
+        or bool(config is not None and config.pr_review_force_full)
+    )
+
+    def owns_pending_finding(name: str) -> bool:
+        for item in (resumed.prior_items if resumed is not None else ()):
+            if item.status not in {"blocking", "same-pr"}:
+                continue
+            owners = tuple(item.resolution_owners or (item.reviewer,))
+            states = dict(item.owner_states or ())
+            if name in owners and states.get(name, "pending") == "pending":
+                return True
+        return False
+
+    # Carry eligibility comes from the PR loop's own carried-approval reader
+    # (latest complete review per seat, verdict, acquisition identity, signed
+    # requirements and architecture contract), then the same resume checks as
+    # reuse.  Any failure to compute it carries nothing.
+    try:
+        from .code_approval import _latest_pr_approved_reviews_for_head
+
+        carry_approvals = (
+            _latest_pr_approved_reviews_for_head(
+                comments,
+                head_sha=head_sha,
+                configured_reviewers=reviewers(config),
+                human_requirements=tuple(human_requirements),
+                reviewer_acquisition_contract=acquisition,
+                require_architecture_contract=bool(
+                    getattr(config, "architecture_context_enabled", True)
+                ),
+            )
+            if config is not None and acquisition is not None else {}
+        )
+    except Exception:  # noqa: BLE001 - unverifiable carries nothing
+        carry_approvals = {}
+
+    def carried(name: str) -> bool:
+        if forced or name in selected or owns_pending_finding(name):
+            return False
+        record = carry_approvals.get(name)
+        return bool(
+            record is not None
+            and record.metadata.round_number < round_number
+            and not record.metadata.new_items
+            and verified(record)
+        )
+
+    fresh = tuple(name for name in candidates if name not in reused and not carried(name))
+    return peers, fresh
+
+
 def _pr_amendment_start_round(
     pr_context: PullRequestReviewContext,
     configured_reviewers: Sequence[AgentName],
@@ -3304,28 +3525,129 @@ def _pr_amendment_start_round(
     runner: Runner | None = None,
     config: AgentLoopConfig | None = None,
 ) -> int:
-    """The round a PR resume would re-enter; only used to fill an error template."""
-    try:
+    """The round a PR resume re-enters, for amendment templates only (#1981).
+
+    Uses the admitted reader the real resume and the board-entry
+    ``resume_round`` use, with no silent round-1 fallback: a reader error
+    propagates, and an unexplained no-resume result while reviewer verdicts or
+    a reconciliation exist on the head raises.  The result carries the
+    re-entered round's open-round facts; every PR emitter judges it against
+    its own removal set through ``pr_amendment_template_round``.
+    """
+    from .board_change import board_reentry_round, comments_bear_board_change_links
+    from .panel_evidence import PrAmendmentRound
+
+    head_sha = pr_context.metadata.head_sha
+    reconciliation_mode = (
+        "owner-scoped"
+        if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
+        else "aggregate"
+    )
+    comments: Sequence[object] = pr_context.comments
+    if runner is not None and config is not None:
+        from .pr_round_ingestion import admit_pr_comments
+
+        # The scans below read the same authenticated admission the resume
+        # reader uses (the board-entry path re-admits an admitted context too).
+        comments, _actor = admit_pr_comments(
+            runner, config, pr_number=pr_context.metadata.number, comments=comments
+        )
+        resumed = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_context.metadata.number,
+            comments=comments,
+            head_sha=head_sha,
+            configured_reviewers=configured_reviewers,
+            reconciliation_mode=reconciliation_mode,
+        )
+    else:
         resumed = _resume_pr_round(
             pr_context.comments,
-            head_sha=pr_context.metadata.head_sha,
+            head_sha=head_sha,
             configured_reviewers=configured_reviewers,
-            reconciliation_mode=(
-                "owner-scoped"
-                if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
-                else "aggregate"
-            ),
-            trusted_actor=_cached_trusted_actor(runner) if runner is not None else None,
+            reconciliation_mode=reconciliation_mode,
+            trusted_actor=None,
             review_unrecorded_head=bool(config is not None and config.review_unrecorded_head),
         )
-    except AgentLoopError:
-        # Only filling an error template; the real resume reports the refusal.
-        return 1
-    from .board_change import board_reentry_round
-
-    return board_reentry_round(
-        pr_context.comments, resumed.round_number if resumed is not None else None,
+    if resumed is None and not comments_bear_board_change_links(comments):
+        # Checkpoint-only first-round startup, or no current-head records:
+        # round 1, as the real resume.  Anything else is unexplained.
+        unexplained = [
+            record
+            for record in _extract_round_metadata_records(comments, flow="pr")
+            if record.metadata.subject == head_sha
+            and (
+                is_complete_code_review(record.metadata)
+                or (
+                    record.metadata.role == "summary"
+                    and record.metadata.phase == "reconciliation"
+                )
+            )
+        ]
+        if unexplained:
+            raise AgentLoopError(
+                "the PR resume found no round to re-enter although reviewer verdicts or a "
+                "reconciliation exist on the current head"
+            )
+    round_number = board_reentry_round(
+        comments, resumed.round_number if resumed is not None else None,
         signed_amendment=True,
+    )
+    peers, fresh = _pr_open_round_facts(
+        comments,
+        head_sha=head_sha,
+        round_number=round_number,
+        resumed=resumed,
+        candidates=tuple(agent_display_name(agent) for agent in configured_reviewers),
+        config=config,
+        human_requirements=getattr(pr_context, "human_requirements", ()),
+    )
+    return PrAmendmentRound(round_number, peers=peers, fresh=fresh)
+
+
+def _pr_amendment_activation_template(
+    amendment: object,
+    round_number: int,
+    *,
+    lineage: object,
+    pr_number: int,
+    resumed: ResumedReviewRound | None,
+    pr_context: PullRequestReviewContext,
+    config: AgentLoopConfig | None = None,
+) -> str | None:
+    """Replacement template for a stale PR amendment, or None when unsafe (#1981)."""
+    persisted = getattr(lineage, "contract_before")(amendment)
+    removed = tuple(getattr(amendment, "removed_reviewers", ()))
+    restored = tuple(getattr(amendment, "restored_reviewers", ()))
+    remaining = tuple(
+        name for name in getattr(persisted, "required_reviewers") if name not in removed
+    ) + tuple(name for name in restored if name not in getattr(persisted, "required_reviewers"))
+    try:
+        peers, fresh = _pr_open_round_facts(
+            pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            round_number=round_number,
+            resumed=resumed,
+            candidates=remaining,
+            config=config,
+            human_requirements=getattr(pr_context, "human_requirements", ()),
+        )
+    except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
+        return None
+    from .panel_evidence import PrAmendmentRound
+
+    # The same peer-aware predicate every other PR emitter uses (#1981).
+    if PrAmendmentRound(round_number, peers=peers, fresh=fresh).blocked_seats():
+        return None
+    return _board_amendment_template(
+        flow="pr",
+        issue_number=None,
+        pr_number=pr_number,
+        persisted=persisted,
+        removed=removed,
+        restored=restored,
+        start_round_number=round_number,
     )
 
 

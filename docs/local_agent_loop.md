@@ -499,7 +499,21 @@ Reviewer board amendment:
   prints. That is the round the resume re-enters, whether the round is only
   partly recorded or already reconciled, and it is not always the latest
   visible round number. Any other value stops before any agent turn or comment
-  and prints the corrected template.
+  and prints the corrected template. A reconciled round counts even when every
+  approval in it was carried over unchanged. For a PR, a template is printed
+  only for a round the amendment can resume: the round is reconciled, nobody
+  has published in it yet, or the amendment removes every reviewer that would
+  otherwise need a fresh turn beside a review already published in that round.
+  A reviewer needs no fresh turn only when its published review in that round
+  still passes the resume checks (including panel qualification under a staged
+  policy), or when the round did not select it and its latest review of the
+  same head is an approval from an earlier round that the run would carry
+  (including the architecture contract when architecture context is enabled),
+  with no force-full board and no pending finding of its own. When that cannot be confirmed, the
+  reviewer counts as needing a fresh turn.
+  When no such round exists, or the round cannot be determined, the notice says
+  that no safe amendment round can be determined yet and prints no round or
+  template; restore the reviewer backend or inspect the PR's round records.
 - **Which board to rerun with.** Posting the record is what removes the
   reviewer. For a PR run, keep the original reviewer board configured
   (recommended); the run derives the amended board from the signed record and
@@ -519,6 +533,10 @@ Reviewer board amendment:
   records after an amendment comment it could not read, those records are never
   reinterpreted. The drift error then tells you to delete the unread amendment
   comment and post a fresh signed record with the printed `effective_from_round`.
+  On a PR, no round is printed when the re-entered round cannot be determined,
+  or when it is open and partly published beside a reviewer that would need a
+  fresh turn. The notice then says that no safe effective round can be
+  determined yet.
 - **Named plan boards.** Under `all-reviewers`, named plan rounds persist the
   bound board even though they do not schedule a subset. Signed plan amendments
   can remove every seat on an unavailable backend and restore them in a later round.

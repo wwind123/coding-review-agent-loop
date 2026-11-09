@@ -45,3 +45,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Legacy PR contracts and remote salvage select invocation-only body projections before decoding; capture reconstruction has no reviewer-role exemption. Complete authenticated acquisition preserves raw discussion, trusted transaction semantics and local salvage fallback (#1966).
 
 - 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).
+
+- 2026-11-08: A same-head reconciled PR round anchors resume even when all settlements were carried exact-head approvals. PR amendment round suggestions share the admitted resume reader without a round-1 fallback and a resumability check, and say no safe round exists instead of printing an unsafe template; the partial-round peer-independence guard is unchanged (#1981).

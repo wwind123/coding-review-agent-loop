@@ -454,6 +454,94 @@ _PR_AMENDMENT_RERUN_CLAUSE = (
 )
 
 
+class PrAmendmentRound(int):
+    """A PR amendment round plus the re-entered round's open-round facts (#1981).
+
+    ``peers`` are reviewers with a published same-round verdict and ``fresh``
+    the seats that would need a fresh turn beside them; both are empty for a
+    reconciled round or a round nobody has published in.
+    """
+
+    peers: tuple[str, ...]
+    fresh: tuple[str, ...]
+
+    def __new__(
+        cls, value: int, *, peers: Sequence[str] = (), fresh: Sequence[str] = ()
+    ) -> "PrAmendmentRound":
+        obj = super().__new__(cls, value)
+        obj.peers = tuple(peers)
+        obj.fresh = tuple(fresh)
+        return obj
+
+    def blocked_seats(
+        self, removed: Sequence[str] = (), restored: Sequence[str] = ()
+    ) -> tuple[str, ...]:
+        """Seats an amendment removing ``removed`` would still run beside a public peer.
+
+        A seat needing a fresh turn is blocked only when another reviewer has
+        published in the round; its own stale publication is not a peer.
+        """
+        kept = tuple(name for name in self.fresh if name not in set(removed))
+        kept += tuple(name for name in restored if name not in kept)
+        return tuple(name for name in kept if set(self.peers) - {name})
+
+
+@dataclass(frozen=True)
+class AmendmentRoundOutcome:
+    """Result of a PR amendment-round lookup: ``ok``, ``unsafe`` or ``lookup-failed``."""
+
+    status: str
+    round_number: int | None = None
+    reason: str = ""
+
+
+def pr_amendment_template_round(
+    start_round_number: Callable[[], int | None],
+    *,
+    removed: Sequence[str] = (),
+    restored: Sequence[str] = (),
+) -> AmendmentRoundOutcome:
+    """Classify a PR amendment-round lookup for one removal set; never raises (#1981).
+
+    The round is ``ok`` when it is reconciled, nobody has published in it, or
+    the amendment removes every seat that would otherwise need a fresh turn
+    beside a published same-round peer.  Otherwise it is ``unsafe``; a lookup
+    error or None is ``lookup-failed``.  Neither may print a round,
+    placeholder or template.
+    """
+    try:
+        round_number = start_round_number()
+    except Exception as exc:  # noqa: BLE001 - advisory text only
+        return AmendmentRoundOutcome(
+            "lookup-failed", None,
+            "the round this resume re-enters could not be determined"
+            + (f" ({str(exc).splitlines()[0][:300]})" if str(exc).strip() else ""),
+        )
+    if round_number is None:
+        return AmendmentRoundOutcome(
+            "lookup-failed", None, "the round this resume re-enters could not be determined"
+        )
+    if isinstance(round_number, PrAmendmentRound):
+        blocked = round_number.blocked_seats(removed, restored)
+        if blocked:
+            return AmendmentRoundOutcome(
+                "unsafe", None,
+                "the round this resume re-enters is open and already holds published reviews "
+                f"by {', '.join(round_number.peers)}, so {', '.join(blocked)} would need a "
+                "fresh turn beside them",
+            )
+    return AmendmentRoundOutcome("ok", int(round_number))
+
+
+def no_safe_amendment_round_clause(surface: str, outcome: AmendmentRoundOutcome) -> str:
+    """Advisory text for a PR amendment route with no safe round (#1981)."""
+    return (
+        f" No safe reviewer-board amendment round can be determined yet for {surface}: "
+        f"{outcome.reason}. No amendment template is printed; restore the reviewer "
+        "backend and rerun, or inspect the PR's round records first."
+    )
+
+
 def _board_amendment_route_clause(
     *,
     flow: str,
@@ -469,13 +557,24 @@ def _board_amendment_route_clause(
     restored = added_in_config(persisted, configured) if removed is None else None
     if removed is None and restored is None:
         return ""
-    try:
-        round_number: int | str | None = start_round_number()
-    except Exception:  # noqa: BLE001 - the template is advisory text only
-        round_number = None
-    if round_number is None:
-        round_number = "<N: the round this resume re-enters>"
     surface = f"issue #{issue_number}" if flow == "plan" else f"PR #{pr_number}"
+    round_number: int | str | None
+    if flow == "pr":
+        # A PR route prints only a round the shared safety check accepted
+        # (#1981); no placeholder or unchecked round.
+        outcome = pr_amendment_template_round(
+            start_round_number, removed=removed or (), restored=restored or ()
+        )
+        if outcome.status != "ok":
+            return no_safe_amendment_round_clause(surface, outcome)
+        round_number = outcome.round_number
+    else:
+        try:
+            round_number = start_round_number()
+        except Exception:  # noqa: BLE001 - the template is advisory text only
+            round_number = None
+        if round_number is None:
+            round_number = "<N: the round this resume re-enters>"
     template = _board_amendment_template(
         flow=flow,
         issue_number=issue_number,
@@ -518,12 +617,31 @@ def _board_amendment_route_clause(
 
 
 def _stale_amendment_repost_clause(
-    detail: str, start_round_number: Callable[[], int | None]
+    detail: str, start_round_number: Callable[[], int | None], *, pr_flow: bool = False
 ) -> str:
-    """Delete-and-repost instruction for records posted under an unread amendment (#1133)."""
+    """Delete-and-repost instruction for records posted under an unread amendment (#1133).
+
+    On the PR path (``pr_flow``) the round comes from the shared safety check
+    (#1981): an unsafe or failed lookup keeps the instruction but names no round.
+    """
     locator = stale_unread_amendment_locator(detail)
     if locator is None:
         return ""
+    if pr_flow:
+        # The unread record's removal set is not known here, so the round is
+        # checked with no removal: an unsafe or failed lookup keeps the
+        # instruction but names no round or placeholder (#1981).
+        outcome = pr_amendment_template_round(start_round_number)
+        if outcome.status != "ok":
+            return (
+                f" Delete the amendment comment at {locator}, but post a fresh signed record "
+                f"only once a safe effective round can be determined: {outcome.reason}."
+            )
+        return (
+            f" Delete the amendment comment at {locator} and post a fresh signed record with "
+            f"effective_from_round {outcome.round_number}; the fresh record is read from the "
+            "start of the next run."
+        )
     try:
         round_number: int | str | None = start_round_number()
     except Exception:  # noqa: BLE001 - advisory text only

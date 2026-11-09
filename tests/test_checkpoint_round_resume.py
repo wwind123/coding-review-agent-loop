@@ -216,6 +216,10 @@ def test_pending_amendment_after_prelaunch_interrupt(tmp_path, monkeypatch, late
     assert all(tuple(r.scheduler_contract["required_reviewers"]) == ("Claude", "Codex") for r in activated if r.scheduler_contract)
     assert activated[0].phase == "scheduler-prelaunch"
     assert activated[0].round_number == effective_round
+    # Row template-checkpoint-only-round1 (#1981): checkpoint-only first-round
+    # startup still prints a round-1 template; the open round-2 prelaunch with
+    # no published peer prints its own round.
+    assert effective_round == (2 if later_round else 1)
 
 
 @pytest.mark.parametrize("damage", ["missing", "invalid", "malformed", "foreign-round", "foreign-head"])
@@ -264,3 +268,30 @@ def test_partial_publication_never_launches_against_unsafe_spool(tmp_path, monke
         assert path.read_bytes() == retained
     if foreign is not None:
         assert foreign._path(unpublished).read_bytes() == foreign_before
+
+
+def test_1981_round_one_checkpoint_only_startup_still_resumes_nothing(tmp_path, monkeypatch):
+    """Row reader-round1-checkpoint-only: no reconciliation, so no anchor."""
+    config = _config(tmp_path)
+    runner = FakeRunner()
+    original_post = pr_loop.post_pr_comment
+
+    def interrupt(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        if "PR review scheduling audit:" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch_attr_in(patch, (pr_loop, pr_loop_support), "post_pr_comment", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    records = _records(runner)
+    assert [(r.metadata.round_number, r.metadata.phase) for r in records] == [
+        (1, "scheduler-prelaunch")
+    ]
+    resumed = _resume_pr_round(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]],
+        head_sha=records[0].metadata.subject, configured_reviewers=config.reviewer,
+    )
+    assert resumed is None

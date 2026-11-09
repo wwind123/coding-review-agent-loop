@@ -519,7 +519,8 @@ def test_unavailable_reviewer_advisory_lookup_failure_keeps_the_stop(tmp_path, m
 
     assert "lookup exploded" not in message
     assert "Signed amendment template" not in message
-    assert "the round the rerun resumes into" in message
+    assert "No safe reviewer-board amendment round can be determined yet" in message
+    assert "effective from round" not in message
     incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
     assert len(incomplete) == 1
 
@@ -602,7 +603,9 @@ def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
         tmp_path,
         reviewer=("codex", "gemini", "antigravity"),
         pr_review_policy="selective-intermediate",
-        max_rounds=3,
+        # The reconciled round-2 checkpoint anchors resume (#1981), so review
+        # continues in round 3 (owner) and round 4 (final sweep).
+        max_rounds=5,
     )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -2803,7 +2806,8 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
     message = str(excinfo.value)
     assert "context fetch exploded" not in message
     assert "Reviewer board amendment:" not in message
-    assert "the round the rerun resumes into" in message
+    assert "No safe reviewer-board amendment round can be determined yet" in message
+    assert "effective from round" not in message
     assert len(_incomplete_comments(runner)) == 1
 
 

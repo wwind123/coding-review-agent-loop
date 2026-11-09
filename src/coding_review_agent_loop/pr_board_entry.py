@@ -11,7 +11,10 @@ from .github import PullRequestReviewContext
 from .runner import Runner
 from .review_scheduling import make_contract, policy_capabilities
 from .panel_evidence import _board_amendment_route_clause
-from .pr_loop_support import _resume_pr_round_admitted, _pr_contract_drift_error, _pr_amendment_start_round
+from .pr_loop_support import (
+    _resume_pr_round_admitted, _pr_contract_drift_error, _pr_amendment_start_round,
+    _pr_amendment_activation_template,
+)
 
 
 def _enforce_pr_board_floor(
@@ -58,6 +61,8 @@ def _enforce_pr_board_floor(
         ),
     )
 
+    resumed_holder: list[object] = []
+
     def resume_round(effective_config: object, _lineage: object) -> int:
         resumed = _resume_pr_round_admitted(
             runner,
@@ -70,6 +75,7 @@ def _enforce_pr_board_floor(
                 "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
             ),
         )
+        resumed_holder[:] = [resumed]
         return board_reentry_round(
             pr_context.comments, resumed.round_number if resumed is not None else None,
             signed_amendment=True,
@@ -92,6 +98,13 @@ def _enforce_pr_board_floor(
         ),
         handoff_authorizations=handoff_authorizations,
         resume_round=resume_round,
+        activation_template=lambda amendment, lineage, round_number: (
+            _pr_amendment_activation_template(
+                amendment, round_number, lineage=lineage, pr_number=pr_number,
+                resumed=resumed_holder[0] if resumed_holder else None,  # type: ignore[arg-type]
+                pr_context=pr_context, config=config,
+            )
+        ),
         floor_refusal_hint=lambda persisted, refused: _board_amendment_route_clause(
             flow="pr",
             issue_number=None,

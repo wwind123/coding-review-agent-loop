@@ -869,7 +869,7 @@ def require_amendment_activation(
     lineage: ContractLineage,
     *,
     start_round_number: int,
-    template: Callable[[ReviewerBoardAmendment, int], str],
+    template: Callable[[ReviewerBoardAmendment, int], str | None],
 ) -> None:
     """An amendment no digest-bound record has used must start at round N.
 
@@ -877,16 +877,29 @@ def require_amendment_activation(
     earlier round would reinterpret scheduler decisions already final; a later
     round would force the reduced board into a round the record does not
     cover.  Both fail closed before any agent invocation or comment post.
+    A ``template`` returning None marks round N unsafe for an amendment
+    (#1981): the error then names no replacement round and prints no template.
     """
     for amendment in lineage.pending_amendments:
         if amendment.effective_from_round != start_round_number:
+            replacement = template(amendment, start_round_number)
+            if replacement is None:
+                raise AgentLoopError(
+                    "Human decision required: signed reviewer-board amendment at "
+                    f"{amendment.comment_locator} is effective from round "
+                    f"{amendment.effective_from_round}, which is not the round this resume "
+                    "re-enters. No safe replacement amendment round can be determined yet: "
+                    "the round this resume re-enters is open and partly published beside a "
+                    "seat that would need a fresh turn. No template is printed; inspect the "
+                    "PR's round records before posting a replacement."
+                )
             raise AgentLoopError(
                 "Human decision required: signed reviewer-board amendment at "
                 f"{amendment.comment_locator} is effective from round "
                 f"{amendment.effective_from_round}, but this resume re-enters round "
                 f"{start_round_number}, the first round whose scheduler decision can use "
                 "the amended board. Replace the record with one effective from round "
-                f"{start_round_number}:\n\n{template(amendment, start_round_number)}"
+                f"{start_round_number}:\n\n{replacement}"
             )
 
 

@@ -422,7 +422,14 @@ def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
             run_pr_loop(runner, pr_number=77, config=config)
         message = str(stale.value)
         assert "Delete the amendment comment at PR #77 comment" in message
-        assert re.search(r"effective_from_round \d+", message)
+        if config is reduced:
+            assert re.search(r"effective_from_round \d+", message)
+        else:
+            # With the original board configured the unread record's removal
+            # set is unknown, so open round 2 (Gemini published, Antigravity
+            # selected) is not offered (#1981).
+            assert "effective_from_round" not in message
+            assert "only once a safe effective round can be determined" in message
         assert "was not recognized" not in message
     # Delete the unread comment and repost at the printed round: the resume
     # then proceeds on the amended board.
@@ -1310,3 +1317,369 @@ def test_issue_created_named_pr_below_floor_board_change_is_refused_before_any_w
         run_pr_loop(runner, pr_number=77, config=reduced)
     assert len(runner.pr_payload["comments"]) == comments and _links_1365(runner) == []
     assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+
+
+# --- Amendment template round after carried-only rounds (#1981) -----------
+
+_HEAD_1981 = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+
+
+def _config_1981(tmp_path, **overrides):
+    """The issue's board: Claude primary, Codex and Antigravity as the panel."""
+    values = dict(
+        reviewer=("claude", "codex", "antigravity"), primary_reviewer="claude",
+        pr_review_policy="primary-then-panel", review_parallel=True,
+        pre_review_tests=False, agent_max_retries=0, auto_merge=True,
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def _records_1981(runner):
+    return architecture_contract._extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+    )
+
+
+def _template_round_1981(message):
+    return int(re.search(r'"effective_from_round": (\d+)', message).group(1))
+
+
+def _first_run_1981(tmp_path):
+    """Round 1: Claude alone; round 2: Antigravity approves, Codex is unavailable."""
+    runner = FakeRunner(
+        claude_outputs=[structured_pr_review(reviewer="Anthropic Claude")],
+        codex_outputs=[_unavailable("OpenAI Codex")],
+        antigravity_outputs=[structured_pr_review(reviewer="Antigravity")],
+    )
+    config = _config_1981(tmp_path)
+    with pytest.raises(AgentLoopError, match="Codex") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    reviews = [
+        (r.metadata.round_number, r.metadata.agent)
+        for r in _records_1981(runner) if r.metadata.role == "reviewer"
+    ]
+    assert reviews == [(1, "Claude"), (2, "Antigravity")]
+    return runner, config, str(error.value)
+
+
+def _second_run_1981(runner, config):
+    """Unchanged rerun: round 3 settles on carried approvals; Codex unavailable again."""
+    runner.codex_outputs.append(_unavailable("OpenAI Codex"))
+    reviewers_before = [r for r in _records_1981(runner) if r.metadata.role == "reviewer"]
+    with pytest.raises(AgentLoopError, match="Codex") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    records = _records_1981(runner)
+    # Round 3 holds only scheduler and reconciliation records: both approvals
+    # were carried exact-head approvals, so no reviewer record was posted.
+    round3 = [r.metadata for r in records if r.metadata.round_number == 3]
+    assert {(m.role, m.phase) for m in round3} == {
+        ("summary", "scheduler-prelaunch"), ("summary", "reconciliation"),
+    }
+    assert [r for r in records if r.metadata.role == "reviewer"] == reviewers_before
+    return str(error.value)
+
+
+def _assert_amended_resume_1981(runner, config, monkeypatch, *, effective_round):
+    """Resume after posting the printed template: no refusal, no deletion, merge."""
+    comments_before = [c["body"] for c in runner.pr_payload["comments"]]
+    commands_before = len(runner.commands)
+    merges = []
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: merges.append(k))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    new_commands = [cmd for cmd, _cwd in runner.commands[commands_before:] if cmd]
+    assert not any("DELETE" in cmd or "delete" in cmd for cmd in new_commands)
+    # Nothing published was deleted or rewritten.
+    bodies = [c["body"] for c in runner.pr_payload["comments"]]
+    assert bodies[: len(comments_before)] == comments_before
+    assert "codex" not in [cmd[0] for cmd in new_commands]
+    assert not any("partially published" in c for c in runner.comments)
+    assert merges == [{"expected_head_sha": _HEAD_1981}]
+    activated = [
+        r.metadata for r in _records_1981(runner) if r.metadata.reviewer_board_amendment_digest
+    ]
+    assert activated and activated[0].round_number == effective_round
+    assert all(
+        tuple(m.scheduler_contract["required_reviewers"]) == ("Claude", "Antigravity")
+        for m in activated if m.scheduler_contract
+    )
+    # The reconciled round is re-entered and settled: the activation-only
+    # record lands in it, every remaining seat's exact-head approval carries,
+    # and no reviewer runs beside public same-round peers.
+    assert activated[0].phase == "scheduler-prelaunch"
+    assert [cmd[0] for cmd in new_commands if cmd[0] in {"claude", "codex", "agy"}] == []
+
+
+def test_1981_template_amendment_after_carried_round_resumes_without_deletion(
+    tmp_path, monkeypatch
+):
+    """Rows amended-resume-issue-sequence and template-round-after-carried-round."""
+    runner, config, first = _first_run_1981(tmp_path)
+    assert _template_round_1981(first) == 2
+    second = _second_run_1981(runner, config)
+    incomplete = [c for c in runner.comments if "**Review status: Incomplete**" in c]
+    # The template names the reconciled carried-only round 3, not round 1.
+    assert _template_round_1981(second) == 3
+    assert "effective from round 3" in incomplete[-1]
+    _m943_append(runner, _m943_amendment_from_error(second).replace(
+        "<why the removed reviewer cannot be reached>", "Codex store is unavailable."
+    ))
+    _assert_amended_resume_1981(runner, config, monkeypatch, effective_round=3)
+
+
+def test_1981_round_two_template_amendment_resumes_without_deletion(tmp_path, monkeypatch):
+    """Row amended-resume-round2-template: the first run's template, posted at once."""
+    runner, config, first = _first_run_1981(tmp_path)
+    assert _template_round_1981(first) == 2
+    _m943_append(runner, _m943_amendment_from_error(first).replace(
+        "<why the removed reviewer cannot be reached>", "Codex store is unavailable."
+    ))
+    _assert_amended_resume_1981(runner, config, monkeypatch, effective_round=2)
+
+
+def test_1981_unchanged_rerun_after_carried_round_opens_the_next_round(tmp_path, monkeypatch):
+    """Row rerun-no-amendment-after-carried-round: the backend is restored."""
+    runner, config, _first = _first_run_1981(tmp_path)
+    _second_run_1981(runner, config)
+    runner.codex_outputs.append(structured_pr_review(reviewer="OpenAI Codex"))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: None)
+    records_before = len(_records_1981(runner))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    new = [r.metadata for r in _records_1981(runner)[records_before:]]
+    assert new and min(m.round_number for m in new) == 4
+    assert [(m.agent, m.round_number) for m in new if m.role == "reviewer"] == [("Codex", 4)]
+    assert not any("partially published" in c for c in runner.comments)
+
+
+def test_1981_stale_round_one_amendment_fails_closed_with_the_reconciled_round(tmp_path):
+    """Row stale-amendment-round-mismatch: no agent, no comment, replacement names round 3."""
+    runner, config, _first = _first_run_1981(tmp_path)
+    second = _second_run_1981(runner, config)
+    stale = _m943_amendment_from_error(second).replace(
+        "<why the removed reviewer cannot be reached>", "Codex store is unavailable."
+    ).replace('"effective_from_round": 3', '"effective_from_round": 1')
+    _m943_append(runner, stale)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="re-enters round 3") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert '"effective_from_round": 3' in str(error.value)
+    assert "partially published" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "agy", "gemini"}
+    ] == []
+
+
+@pytest.mark.parametrize("entry", ["pr-loop", "board-entry"])
+@pytest.mark.parametrize("failure", ["lookup-failed", "unsafe"])
+def test_1981_floor_refusal_prints_no_round_when_the_lookup_fails_or_is_unsafe(
+    tmp_path, monkeypatch, entry, failure
+):
+    """Rows template-lookup-failure and template-unsafe-open-round (both floor call sites)."""
+    import coding_review_agent_loop.pr_board_entry as pr_board_entry
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.panel_evidence import PrAmendmentRound
+
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3)
+
+    def lookup(*args, **kwargs):
+        if failure == "lookup-failed":
+            raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
+        # Gemini published; Codex would need a fresh turn beside it.
+        return PrAmendmentRound(2, peers=("Gemini",), fresh=("Codex",))
+
+    patch_attr_in(
+        monkeypatch, (pr_loop_support, pr_loop, pr_board_entry), "_pr_amendment_start_round", lookup
+    )
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="below the floor") as error:
+        if entry == "pr-loop":
+            run_pr_loop(runner, pr_number=77, config=reduced)
+        else:
+            context = get_pr_review_context(runner, config=reduced, pr_number=77)
+            pr_board_entry._enforce_pr_board_floor(
+                runner, config=reduced, pr_number=77, pr_context=context
+            )
+    message = str(error.value)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "effective_from_round" not in message and "<N:" not in message
+    assert "Reviewer board amendment:" not in message
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "agy", "gemini"}
+    ] == []
+
+
+def _floor_message_1981(runner, config):
+    with pytest.raises(AgentLoopError, match="below the floor") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    return str(error.value)
+
+
+def test_1981_operator_force_full_suppresses_the_open_round_template(tmp_path):
+    """Item 1 (#1985): force-full would select the carried primary beside Gemini."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3)
+    # Control: Codex's round-1 exact-head approval carries, so round 2 is offered.
+    assert '"effective_from_round": 2' in _floor_message_1981(runner, reduced)
+    forced = dataclasses.replace(reduced, pr_review_force_full=True)
+    message = _floor_message_1981(runner, forced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Codex would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+
+
+def test_1981_stale_published_review_suppresses_the_open_round_template(tmp_path, monkeypatch):
+    """Item 2 (#1985): a published review the resume would not reuse blocks the round."""
+    from pr_loop_test_helpers import _signed
+
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+    )
+    full = _staged_config(tmp_path, pr_review_force_full=True)
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=full)
+    round1 = [
+        r.metadata.agent for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 1
+    ]
+    assert sorted(round1) == ["Codex", "Gemini"]
+    reduced = dataclasses.replace(full, reviewer=("codex", "gemini"), min_reviewers=3)
+    control = _floor_message_1981(runner, reduced)
+    assert '"effective_from_round": 1' in control
+    # A new signed requirement makes both published reviews stale: each would
+    # need a fresh turn beside the other's public verdict.
+    runner.pr_payload["comments"].append(_signed("Also document the retry bound.", 1))
+    message = _floor_message_1981(runner, reduced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a pending amendment whose round does not match fails closed,
+    # and its replacement names no round while the stale reviews block it.
+    stale_round = _m943_amendment_from_error(control).replace(
+        '"effective_from_round": 1', '"effective_from_round": 5'
+    )
+    _m943_append(runner, stale_round)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert "effective_from_round" not in str(error.value).split("No safe replacement", 1)[1]
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
+    ] == []
+
+
+def _legacy_latch_1981(payload):
+    """Strip the operator attribution so a full-board latch reads as pre-#840 automatic."""
+    if payload.get("scheduler_force_full_source") is None:
+        return None
+    payload = dict(payload)
+    del payload["scheduler_force_full_source"]
+    return payload
+
+
+def test_1981_unqualified_premature_secondary_suppresses_the_open_round_template(tmp_path):
+    """Item 2 (#1985): a premature secondary review is not reused, so it blocks the round."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        # No Antigravity output: an invocation failure leaves round 1 open.
+        antigravity_outputs=[],
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pr_review_force_full=True))
+    _rewrite_pr_metadata(runner, _legacy_latch_1981)
+    published = sorted(
+        r.metadata.agent for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 1
+    )
+    assert published == ["Codex", "Gemini"]
+    assert not any(
+        r.metadata.phase == "reconciliation" for r in _records_1981(runner)
+    )
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3)
+    message = _floor_message_1981(runner, reduced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Gemini would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a mismatched pending amendment fails closed with no replacement round.
+    _m943_append(runner, _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=5,
+        rationale="Antigravity quota exhausted.",
+    ))
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
+    ] == []
+
+
+def test_1981_versionless_carried_approval_suppresses_the_open_round_template(tmp_path):
+    """Item 6 (#1985): an approval the carried-approval reader rejects never carries."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(
+            tmp_path, architecture_context_enabled=False,
+        ))
+    # Legacy history: Codex's round-1 approval carries no architecture contract.
+    _rewrite_pr_metadata(runner, lambda payload: (
+        {k: v for k, v in payload.items() if k != "architecture_contract_version"}
+        if payload.get("agent") == "Codex" and "architecture_contract_version" in payload
+        else None
+    ))
+    codex = [
+        r.metadata for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.agent == "Codex"
+    ]
+    assert codex and all(m.architecture_contract_version is None for m in codex)
+    legacy = _staged_config(
+        tmp_path, reviewer=("codex", "gemini"), min_reviewers=3,
+        architecture_context_enabled=False,
+    )
+    # Control: without architecture context the approval carries, round 2 is offered.
+    assert '"effective_from_round": 2' in _floor_message_1981(runner, legacy)
+    current = dataclasses.replace(legacy, architecture_context_enabled=True)
+    message = _floor_message_1981(runner, current)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Codex would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a mismatched pending amendment fails closed with no replacement round.
+    _m943_append(runner, _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=5,
+        rationale="Antigravity quota exhausted.",
+    ))
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=current)
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
+    ] == []
