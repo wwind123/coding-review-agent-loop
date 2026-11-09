@@ -561,3 +561,73 @@ def test_pr_invalid_history_repeated_restart_and_restored_transport(tmp_path, mo
         assert len(runner.comments) == publication_count
     assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'}
                    for cmd, _ in runner.commands[before:])
+
+
+@pytest.mark.parametrize('failure', ['malformed', 'sidecar', 'foreign'])
+@pytest.mark.parametrize('policy', ['selective-intermediate', 'primary-then-panel'])
+def test_pr_history_changed_after_startup_is_reacquired_at_refresh(tmp_path, policy, failure):
+    """Remote history changes inside one invocation, after startup admission
+    and the first publication, so a stale startup snapshot cannot be reused."""
+    def outputs():
+        return dict(codex_outputs=[structured_pr_review()],
+                    gemini_outputs=[structured_pr_review(reviewer='Google Gemini')])
+    config = make_config(tmp_path, reviewer=('codex', 'gemini'), pr_review_policy=policy, auto_merge=True,
+        primary_reviewer='codex' if policy == 'primary-then-panel' else None)
+    runner = FakeRunner(authenticated_actor=('bot', 424242), **outputs())
+    injected = []
+    if failure == 'malformed':
+        bodies = [BAD]
+    elif failure == 'sidecar':
+        bodies = [spilled()[-1]]
+    else:
+        bodies = [BAD, str(anchor(round_number=90)), 'Ordinary discussion']
+    original = runner._run_locked
+    launches_at_injection = None
+    def inject(args, **kwargs):
+        nonlocal launches_at_injection
+        result = original(args, **kwargs)
+        if not injected and list(args)[:3] == ['gh', 'pr', 'comment']:
+            launches_at_injection = sum(c[0] in {'codex', 'gemini', 'claude'} for c, _ in runner.commands)
+            for offset, body in enumerate(bodies):
+                comment = dict(raw(body, foreign=failure == 'foreign'), id=95000 + offset,
+                               createdAt='2026-01-02T00:00:00Z')
+                runner.pr_payload['comments'].append(comment)
+                injected.append(comment)
+        return result
+    runner._run_locked = inject
+    launches = lambda: sum(c[0] in {'codex', 'gemini', 'claude'} for c, _ in runner.commands)
+    if failure == 'foreign':
+        # Foreign records arriving mid-run are opaque: the run completes on
+        # trusted state and the foreign anchor never becomes authority.
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert injected
+        records = support.admitted_pr_records(runner, config, pr_number=77)
+        assert records and all(r.metadata.round_number != 90 for r in records)
+        assert all(r.metadata.subject == HEAD for r in records)
+        bodies_now = [c['body'] for c in runner.pr_payload['comments']]
+        assert 'Ordinary discussion' in bodies_now
+        return
+    # Admitted corruption that appears after startup fails closed at the
+    # refreshed acquisition before any later agent launch or merge.
+    with pytest.raises(AgentLoopError):
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+    assert injected and launches_at_injection is not None
+    assert launches() == launches_at_injection
+    assert not any(c[:3] == ['gh', 'pr', 'merge'] for c, _ in runner.commands)
+    publications = len(runner.comments)
+    # The corruption persists remotely: each restart refuses too. The only
+    # permitted publication is the existing explicit scheduler refusal
+    # diagnostic, which carries no round record or approval authority.
+    for _ in range(2):
+        with pytest.raises(AgentLoopError):
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+        assert launches() == launches_at_injection
+    for body in runner.comments[publications:]:
+        assert body.startswith('PR review scheduling diagnostic')
+        assert not _extract_round_metadata_records([SimpleNamespace(body=body)], flow='pr')
+    assert not any(c[:3] == ['gh', 'pr', 'merge'] for c, _ in runner.commands)
+    # Restoring valid remote history lets a fresh acquisition recover.
+    runner.pr_payload['comments'] = [c for c in runner.pr_payload['comments'] if c not in injected]
+    runner.codex_outputs.extend(outputs()['codex_outputs'])
+    runner.gemini_outputs.extend(outputs()['gemini_outputs'])
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0

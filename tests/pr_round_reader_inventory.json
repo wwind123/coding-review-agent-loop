@@ -2558,6 +2558,12 @@
     },
     {
       "module": "execution_policy",
+      "function": "_resolve_fresh_child_provenance",
+      "classification": "reader",
+      "admission": "_resolve_fresh_child_provenance reads the child phase identity through record_body and the parent history from an independent github.get_issue_context acquisition, then delegates parent plan, recommendation, decomposition and phase-handoff selection to registered codecs whose call sites are inventoried; parent observations never bind child surfaces and mismatched identity refuses."
+    },
+    {
+      "module": "execution_policy",
       "function": "_retirable_execution_decision_hashes",
       "classification": "reader",
       "admission": "execution_policy reads github.get_issue_context before plan recommendation, topology, phase and handoff preflights; record_body selects invocation-only history. Child-body identities are separately validated for adoption."
@@ -3146,6 +3152,12 @@
     },
     {
       "module": "plan_verification",
+      "function": "_build_plan_approval_inputs::supersession_check",
+      "classification": "reader",
+      "admission": "supersession_check passes the child issue's own authenticated github.get_issue_context comments to the registered collect_child_plan_supersessions codec, which selects child_control_body (invocation actor plus configured human login/REST ID) before parsing; the parent observation is not reused for the child surface."
+    },
+    {
+      "module": "plan_verification",
       "function": "board_change_audit_already_posted",
       "classification": "reader",
       "admission": "plan_verification receives plan histories from plan_first_loop authenticated acquisition; board audit checks use board projection, while round lineage and issue handoff checks retain invocation-only authority."
@@ -3254,6 +3266,12 @@
     },
     {
       "module": "pr_round_ingestion",
+      "function": "amendment_body",
+      "classification": "acquisition",
+      "admission": "AdmittedPrComment.amendment_body is the board/child control projection: it refuses a body changed after admission and returns the protocol body only for comments admitted as invocation actor or configured human login plus REST ID; all other authors project an empty body."
+    },
+    {
+      "module": "pr_round_ingestion",
       "function": "board_control_candidate",
       "classification": "acquisition",
       "admission": "pr_round_ingestion.board_control_candidate owns authenticated transport or immutable family binding; complete REST identities are required before protocol authority."
@@ -3275,6 +3293,12 @@
       "function": "owned_rest_protocol_bodies",
       "classification": "acquisition",
       "admission": "pr_round_ingestion.owned_rest_protocol_bodies owns authenticated transport or immutable family binding; complete REST identities are required before protocol authority."
+    },
+    {
+      "module": "pr_round_ingestion",
+      "function": "protocol_body",
+      "classification": "acquisition",
+      "admission": "AdmittedPrComment.protocol_body is the invocation-only projection: it refuses a body changed after admission and returns the protocol body only when the immutable author ID equals the authenticated invocation actor ID."
     },
     {
       "module": "pr_round_ingestion",
@@ -3635,6 +3659,12 @@
       "function": "classify_transaction_era",
       "classification": "reader",
       "admission": "workflow_transaction requires github.AuthenticatedCommentView for record parsing and lineage resolution; authored entries are invocation-ID bound and surface-checked before legacy or transaction records can authorize a transition."
+    },
+    {
+      "module": "workflow_transaction",
+      "function": "comment_ids",
+      "classification": "acquisition",
+      "admission": "_Group.comment_ids projects immutable IDs of comments already authenticated by the surface-bound transaction resolver; it reads no bodies and grants no authority."
     },
     {
       "module": "workflow_transaction",

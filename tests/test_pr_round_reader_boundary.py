@@ -120,11 +120,23 @@ def structural_readers(source):
                     self.history |= any(k in child.id.lower() for k in ('comment', 'history'))
                 def visit_Attribute(self, child):
                     self.body |= child.attr in {'body', 'protocol_body', 'amendment_body', 'child_control_body'}
+                    # History reached through an attribute (ctx.comments,
+                    # context.history) is as durable as a bare name.
+                    self.history |= any(k in child.attr.lower() for k in ('comment', 'history'))
                     self.generic_visit(child)
                 def visit_Constant(self, child):
                     if isinstance(child.value, str):
                         self.body |= child.value in {'body', 'protocol_body', 'amendment_body', 'child_control_body'}
+                def history_key(self, key):
+                    return (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            and any(k in key.value.lower() for k in ('comment', 'history')))
+                def visit_Subscript(self, child):
+                    # ctx['comments'] reaches durable history like ctx.comments.
+                    self.history |= self.history_key(child.slice)
+                    self.generic_visit(child)
                 def visit_Call(self, child):
+                    if isinstance(child.func, ast.Name) and child.func.id == 'getattr' and len(child.args) > 1:
+                        self.history |= self.history_key(child.args[1])
                     if isinstance(child.func, ast.Attribute) and child.func.attr in {'finditer', 'search', 'match', 'fullmatch'}:
                         callee = ast.unparse(child.func.value)
                         self.marker |= any(k in callee for k in ('MARKER_RE', 'RESUME_MARKER', 'SIDECAR_RE', 'LINK_RE', 'SCOPE_BOUNDARY_RE'))
@@ -224,6 +236,22 @@ def test_new_reader_definitions_and_nested_modules_need_review(module, source):
     augmented = sources()
     augmented[module] = source
     with pytest.raises(AssertionError, match='Reader changed|Unreviewed'):
+        assert_inventory(augmented)
+
+
+@pytest.mark.parametrize('source', [
+    # Every way an unregistered helper can reach durable history must be seen:
+    # a bare name, an attribute, a subscript key and a getattr name.
+    'def unseen(comments):\n return [c.body for c in comments]',
+    'def unseen(ctx):\n return [c.body for c in ctx.comments]',
+    'def unseen(ctx):\n return [c.body for c in ctx.issue_history]',
+    'def unseen(ctx):\n return [c["body"] for c in ctx["comments"]]',
+    'def unseen(ctx):\n return [c.body for c in getattr(ctx, "comments", ())]',
+])
+def test_history_consumer_reached_by_any_expression_needs_review(source):
+    augmented = sources()
+    augmented['unreviewed_history_reader'] = source
+    with pytest.raises(AssertionError, match='Unreviewed durable-history consumer'):
         assert_inventory(augmented)
 
 

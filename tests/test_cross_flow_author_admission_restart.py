@@ -112,3 +112,95 @@ def test_staged_parent_child_two_restarts_and_transport_recovery(tmp_path, monke
     assert diagnostics and all(len(line) < 500 for line in diagnostics)
     assert not runner.issues
     assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'} for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize('surface,failure', [(surface, failure)
+    for surface in (56, 99)
+    for failure in ('foreign', 'malformed', 'sidecar', 'page', 'topology')
+    if failure != 'topology' or surface == 56])
+def test_staged_history_changed_inside_one_invocation_is_reacquired(tmp_path, monkeypatch, capsys, surface, failure):
+    """Parent or child history changes after that surface's first successful
+    acquisition inside one staged invocation, so a stale snapshot cannot route."""
+    import coding_review_agent_loop.pr_round_ingestion as ingestion
+    runner, config = staged_remote(tmp_path)
+    dispatched = []
+    def pr_boundary(_runner, **kwargs):
+        dispatched.append((kwargs['issue_context'].number,
+                           kwargs['parent_issue_context'].number,
+                           kwargs['approved_plan_context'].plan_hash))
+        return 0
+    monkeypatch.setattr(issue_implementation, 'run_pr_loop', pr_boundary)
+    # A clean baseline invocation establishes the expected routing.
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    expected = dispatched[-1]
+    def remote(comments=None):
+        if surface == 56:
+            if comments is not None:
+                runner.issue_comments = comments
+            return runner.issue_comments
+        if comments is not None:
+            runner.issue_comments_by_number[surface] = comments
+        return runner.issue_comments_by_number[surface]
+    baseline = list(remote())
+    if failure == 'foreign':
+        changed = [*baseline, raw(BAD, 'outsider', 99, 80), raw(str(baseline[0]['body']), 'outsider', 99, 81),
+                   raw('Ordinary operator discussion', 'outsider', 99, 82)]
+    elif failure in {'malformed', 'sidecar'}:
+        body = BAD if failure == 'malformed' else spilled()[-1]
+        changed = [*baseline, raw(body, 'coding-review-agent-loop', 424242, 90)]
+    elif failure == 'topology':
+        changed = []
+        for comment in baseline:
+            match = DECOMPOSITION_MARKER_RE.search(comment['body'])
+            if match:
+                payload = _decode_json_payload(match.group('payload'), marker_name='AGENT_PLAN_DECOMPOSITION')
+                payload['children'] = payload['children'][:-1]
+                comment = {**comment, 'body': comment['body'].replace(
+                    match.group('payload'), _encode_json_payload(payload))}
+            changed.append(comment)
+    else:
+        changed = baseline
+    for comment in changed[len(baseline):]:
+        comment['createdAt'] = '2026-01-03T00:00:00Z'
+    state = {'reads': 0, 'published_at_refresh': None}
+    listing = ingestion.read_complete_comment_listing
+    def observed_listing(*args, **kwargs):
+        if kwargs.get('surface') != f'issue#{surface}':
+            return listing(*args, **kwargs)
+        state['reads'] += 1
+        if state['reads'] == 2:
+            state['published_at_refresh'] = len(runner.comments)
+        if failure == 'page' and state['reads'] > 1:
+            return github.UnknownCommentListing(f'issue#{surface}', 'incomplete identity/page')
+        result = listing(*args, **kwargs)
+        if state['reads'] == 1:
+            remote(list(changed))
+        return result
+    monkeypatch.setattr(ingestion, 'read_complete_comment_listing', observed_listing)
+    before = len(dispatched)
+    publications = len(runner.comments)
+    if failure == 'foreign':
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+        assert state['reads'] >= 2, 'no refreshed acquisition inside the invocation'
+        assert dispatched[before:] == [expected]
+        assert len(runner.comments) == publications
+        diagnostics = [line for line in capsys.readouterr().err.splitlines() if 'ignored loop record' in line]
+        assert diagnostics and all(len(line) < 500 for line in diagnostics)
+    else:
+        with pytest.raises(AgentLoopError, match='incomplete' if failure == 'topology' else None):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert state['published_at_refresh'] is not None, 'no refreshed acquisition inside the invocation'
+        assert len(dispatched) == before
+        assert len(runner.comments) == publications
+        # A restart against the persisting failure refuses identically.
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert len(dispatched) == before and len(runner.comments) == publications
+        monkeypatch.undo()
+        monkeypatch.setattr(issue_implementation, 'run_pr_loop', pr_boundary)
+        remote(list(baseline))
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+        assert dispatched[before:] == [expected]
+        assert len(runner.comments) == publications
+    assert not runner.issues
+    assert not any(cmd[0] in {'claude', 'codex', 'gemini', 'agy'} for cmd, _ in runner.commands)
