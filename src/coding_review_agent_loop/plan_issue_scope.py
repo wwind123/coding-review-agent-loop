@@ -299,31 +299,25 @@ def resolve_plan_scope(
     comments: Sequence[object],
     trusted_actor: tuple[str, int] | None,
     *,
-    runner: object | None = None,
-    config: object | None = None,
     issue_number: int | None = None,
     ignored_sink: list[str] | None = None,
 ) -> int:
     """The current planning scope start: the admitted boundary's, or 1.
 
-    With no boundary-shaped record this makes no network call.  When one is
-    present and no trusted actor was supplied, the comments are admitted
-    through :func:`~coding_review_agent_loop.plan_board_state.admitted_issue_comments`;
-    an incomplete REST read, or no authenticated read at all, fails closed.
+    This never acquires history itself.  Callers admit the comments first,
+    through :func:`~coding_review_agent_loop.plan_board_state.admitted_issue_comments`,
+    and pass the authenticated actor that admission returned.  With no
+    boundary-shaped record this returns 1 without needing an actor.  A
+    boundary-bearing history with no authenticated actor fails closed rather
+    than silently resolving to scope 1, which would resurrect archived rounds.
     """
     comments = tuple(comments)
     if not comments_bear_scope_boundary(comments):
         return 1
     if trusted_actor is None:
-        if runner is None or issue_number is None:
-            raise AgentLoopError(
-                "The issue carries a planning-scope boundary record, but no authenticated "
-                "GitHub read is available to admit it."
-            )
-        from .plan_board_state import admitted_issue_comments
-
-        comments, trusted_actor = admitted_issue_comments(
-            runner, config=config, issue_number=issue_number, comments=comments,
+        raise AgentLoopError(
+            "The issue carries a planning-scope boundary record, but no authenticated "
+            "GitHub read is available to admit it."
         )
     boundary = latest_scope_boundary(
         comments, trusted_actor, issue_number=issue_number, ignored_sink=ignored_sink,

@@ -100,6 +100,10 @@ def structural_readers(source):
     """
     found = []
     def visit(node, scope=()):
+        # Key rows by enclosing class and function, exactly as calls() does,
+        # so same-named methods on two classes in one module stay distinct.
+        if isinstance(node, ast.ClassDef):
+            scope = (*scope, node.name)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = (*scope, node.name)
             # Exclude nested definitions from the enclosing function's signals.
@@ -285,3 +289,59 @@ def test_inventory_rejects_invalid_review_rows(mutation):
         next(iter(reviewed['families'].values()))['admission'] = ''
     with pytest.raises(AssertionError):
         assert_inventory(sources(), reviewed)
+
+
+TWO_CLASS_SOURCE = (
+    'class A:\n'
+    '    def read(self, comments):\n'
+    '        return [c.body for c in comments]\n'
+    'class B:\n'
+    '    def read(self, comments):\n'
+    '        return [c.body for c in comments]\n'
+)
+
+
+@pytest.mark.parametrize('source,expected', [
+    # Same-named history methods on two classes must not collapse to one row.
+    (TWO_CLASS_SOURCE, ['A::read', 'B::read']),
+    # Nested definitions keep the class segment, matching calls().
+    ('class A:\n'
+     '    def m(self):\n'
+     '        def inner(comments):\n'
+     '            return [c.body for c in comments]\n'
+     '        return inner\n', ['A::m::inner']),
+    # A class contributes a scope segment, never a row of its own.
+    ('class A:\n    comments = []\n    bodies = [c.body for c in comments]\n', []),
+])
+def test_structural_readers_key_rows_by_class_and_function(source, expected):
+    assert structural_readers(source) == expected
+
+
+def test_structural_reader_scopes_match_calls_scopes():
+    source = ('class A:\n'
+              '    def m(self, comments):\n'
+              '        return [find_latest_remote_salvage(comments), [c.body for c in comments]]\n')
+    assert [scope for scope, _ in calls(source, set(CODECS))] == structural_readers(source) == ['A::m']
+
+
+def _two_class_inventory(functions):
+    reviewed = inventory()
+    reviewed['boundaries'].extend(
+        {'module': 'two_class_reader', 'function': function, 'classification': 'offline',
+         'admission': f'{function}: synthetic two-class collision fixture.'}
+        for function in functions)
+    return reviewed
+
+
+def test_two_class_rows_pass_when_each_qualified_row_is_reviewed():
+    augmented = sources()
+    augmented['two_class_reader'] = TWO_CLASS_SOURCE
+    assert_inventory(augmented, _two_class_inventory(['A::read', 'B::read']))
+
+
+@pytest.mark.parametrize('functions', [['read'], ['read', 'A::read'], ['A::read']])
+def test_unqualified_or_partial_class_rows_are_rejected(functions):
+    augmented = sources()
+    augmented['two_class_reader'] = TWO_CLASS_SOURCE
+    with pytest.raises(AssertionError, match='Unreviewed durable-history consumer definition'):
+        assert_inventory(augmented, _two_class_inventory(functions))

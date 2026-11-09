@@ -111,15 +111,25 @@ def recover_issue_execution(
             # This is a comment-only reconstruction. It must happen before
             # memory preparation or any agent invocation so an existing
             # plan can be checked without re-planning.
-            from .plan_issue_scope import resolve_plan_scope
+            from .plan_issue_scope import comments_bear_scope_boundary, resolve_plan_scope
 
             # Only the current planning scope's plan is reconstructed (#1390).
+            # Admit explicitly, and only when a boundary-shaped record is
+            # present: a history without one needs no GitHub read (#1987).
+            scope_comments: tuple[object, ...] = tuple(issue_context.comments)
+            scope_actor: tuple[str, int] | None = None
+            if comments_bear_scope_boundary(scope_comments):
+                from .plan_board_state import admitted_issue_comments
+
+                scope_comments, scope_actor = admitted_issue_comments(
+                    runner, config=config, issue_number=issue_number,
+                    comments=scope_comments,
+                )
             recovered_plan_state = _resume_plan_round(
                 issue_context.comments,
                 configured_reviewers=reviewers(config),
                 min_round_number=resolve_plan_scope(
-                    issue_context.comments, None, runner=runner, config=config,
-                    issue_number=issue_number,
+                    scope_comments, scope_actor, issue_number=issue_number,
                 ),
             )
             if recovered_plan_state is not None:
