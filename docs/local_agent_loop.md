@@ -505,9 +505,10 @@ Reviewer board amendment:
   has published in it yet, or the amendment removes every reviewer that would
   otherwise need a fresh turn beside a review already published in that round.
   A reviewer needs no fresh turn only when its published review in that round
-  still passes the resume checks, or when the round did not select it and it
-  already approved the same head in an earlier round, with no force-full board
-  and no pending finding of its own. When that cannot be confirmed, the
+  still passes the resume checks (including panel qualification under a staged
+  policy), or when the round did not select it and its latest review of the
+  same head is an approval from an earlier round, with no force-full board and
+  no pending finding of its own. When that cannot be confirmed, the
   reviewer counts as needing a fresh turn.
   When no such round exists, or the round cannot be determined, the notice says
   that no safe amendment round can be determined yet and prints no round or

@@ -1577,3 +1577,56 @@ def test_1981_stale_published_review_suppresses_the_open_round_template(tmp_path
         cmd[0] for cmd, _cwd in runner.commands[commands_before:]
         if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
     ] == []
+
+
+def _legacy_latch_1981(payload):
+    """Strip the operator attribution so a full-board latch reads as pre-#840 automatic."""
+    if payload.get("scheduler_force_full_source") is None:
+        return None
+    payload = dict(payload)
+    del payload["scheduler_force_full_source"]
+    return payload
+
+
+def test_1981_unqualified_premature_secondary_suppresses_the_open_round_template(tmp_path):
+    """Item 2 (#1985): a premature secondary review is not reused, so it blocks the round."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        # No Antigravity output: an invocation failure leaves round 1 open.
+        antigravity_outputs=[],
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pr_review_force_full=True))
+    _rewrite_pr_metadata(runner, _legacy_latch_1981)
+    published = sorted(
+        r.metadata.agent for r in _records_1981(runner)
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 1
+    )
+    assert published == ["Codex", "Gemini"]
+    assert not any(
+        r.metadata.phase == "reconciliation" for r in _records_1981(runner)
+    )
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3)
+    message = _floor_message_1981(runner, reduced)
+    assert "No safe reviewer-board amendment round can be determined yet for PR #77" in message
+    assert "Gemini would need a fresh turn" in message
+    assert "effective_from_round" not in message and "Reviewer board amendment:" not in message
+    # Resume path: a mismatched pending amendment fails closed with no replacement round.
+    _m943_append(runner, _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=5,
+        rationale="Antigravity quota exhausted.",
+    ))
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="No safe replacement amendment round") as error:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert "Replace the record" not in str(error.value)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands[commands_before:]
+        if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
+    ] == []

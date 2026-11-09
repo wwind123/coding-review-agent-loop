@@ -3313,6 +3313,47 @@ def _pr_reviewer_acquisition_contract(config: AgentLoopConfig) -> dict[str, tupl
     return contract
 
 
+def _pr_panel_qualification(
+    comments: Sequence[object], config: AgentLoopConfig | None
+) -> Callable[[PostedRoundRecord], bool]:
+    """The staged-policy panel-qualification test the PR loop applies to resumed reviews.
+
+    Mirrors ``_pr_record_is_panel_qualified`` over the comment-ordered panel
+    evidence.  Without a config, under recorded board-change links (whose
+    primary epoch this check does not model) or when the history cannot be
+    derived, nothing counts as qualified (#1981).
+    """
+    from .board_change import comments_bear_board_change_links
+    from .panel_evidence import _derive_pr_panel_evidence, _pr_record_is_panel_qualified
+    from .review_scheduling import policy_capabilities
+    from .round_state import drop_inert_post_reconciliation_checkpoints
+
+    if config is None:
+        return lambda _record: False
+    try:
+        if not policy_capabilities(config.pr_review_policy).requires_primary:
+            return lambda _record: True
+        if comments_bear_board_change_links(comments):
+            return lambda _record: False
+        primary = (
+            agent_display_name(config.primary_reviewer)
+            if config.primary_reviewer is not None else None
+        )
+        evidence = _derive_pr_panel_evidence(
+            drop_inert_post_reconciliation_checkpoints(
+                _extract_round_metadata_records(comments, flow="pr")
+            ),
+            primary_reviewer=primary,
+            required_reviewers=tuple(agent_display_name(agent) for agent in reviewers(config)),
+        )
+    except Exception:  # noqa: BLE001 - unverifiable counts as unqualified
+        return lambda _record: False
+    return lambda record: _pr_record_is_panel_qualified(
+        record, evidence, primary_reviewer=primary,
+        operator_force_full=bool(config.pr_review_force_full),
+    )
+
+
 def _pr_open_round_facts(
     comments: Sequence[object],
     *,
@@ -3381,6 +3422,7 @@ def _pr_open_round_facts(
         return (), ()
     acquisition = _pr_reviewer_acquisition_contract(config) if config is not None else None
     binding = reviewer_seat_binding(config) if config is not None else None
+    panel_qualified = _pr_panel_qualification(comments, config)
 
     def verified(record: PostedRoundRecord) -> bool:
         metadata = record.metadata
@@ -3394,6 +3436,7 @@ def _pr_open_round_facts(
                     reviewer_acquisition_contract=acquisition,
                 )
                 and (binding is None or metadata.seat_binding == binding)
+                and panel_qualified(record)
             )
         except Exception:  # noqa: BLE001 - unverifiable counts as not reusable
             return False
@@ -3439,14 +3482,21 @@ def _pr_open_round_facts(
     def carried(name: str) -> bool:
         if forced or name in selected or owns_pending_finding(name):
             return False
-        return any(
-            record.metadata.agent == name
-            and record.metadata.round_number < round_number
-            and is_complete_code_review(record.metadata)
-            and record.metadata.state == "approved"
-            and not record.metadata.new_items
-            and verified(record)
-            for record in head_records
+        # Like the carried-approval reader, only the seat's latest complete
+        # review of this head counts; an older matching approval never does.
+        latest = next(
+            (
+                record for record in reversed(head_records)
+                if record.metadata.agent == name and is_complete_code_review(record.metadata)
+            ),
+            None,
+        )
+        return bool(
+            latest is not None
+            and latest.metadata.round_number < round_number
+            and latest.metadata.state == "approved"
+            and not latest.metadata.new_items
+            and verified(latest)
         )
 
     fresh = tuple(name for name in candidates if name not in reused and not carried(name))
@@ -3571,7 +3621,10 @@ def _pr_amendment_activation_template(
         )
     except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
         return None
-    if peers and fresh:
+    from .panel_evidence import PrAmendmentRound
+
+    # The same peer-aware predicate every other PR emitter uses (#1981).
+    if PrAmendmentRound(round_number, peers=peers, fresh=fresh).blocked_seats():
         return None
     return _board_amendment_template(
         flow="pr",

@@ -413,11 +413,13 @@ amendment removes every seat that would otherwise need a fresh turn beside a
 published same-round peer. A seat needs no fresh turn only when the check can
 confirm it. Either its published review was posted under the round's recorded
 selection and passes the PR resume checks (resumable review, current signed
-requirements, configured acquisition identity, seat binding, and no
-approved-plan binding that cannot be checked there), or the round did not
-select it, no recorded or operator force-full applies, it owns no pending
-finding, and a record passing the same checks shows it already approved the
-head in an earlier round. Any seat the check cannot confirm counts as needing
+requirements, configured acquisition identity, seat binding, staged-policy
+panel qualification, and no approved-plan binding that cannot be checked
+there), or the round did not select it, no recorded or operator force-full
+applies, it owns no pending finding, and its latest complete review of the
+head is an earlier-round approval passing the same checks. A seat needing a
+fresh turn blocks the round only beside another reviewer's publication, and
+the activation replacement uses the same predicate. Any seat the check cannot confirm counts as needing
 a fresh turn. Otherwise, and
 when the lookup fails, PR notices say that no safe amendment round can be
 determined yet and print no round or template. Plan-flow templates are

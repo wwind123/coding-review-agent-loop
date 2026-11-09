@@ -1999,6 +1999,14 @@
       "occurrence": 1
     },
     {
+      "module": "pr_loop_support",
+      "function": "_pr_panel_qualification",
+      "call": "_extract_round_metadata_records(comments, flow='pr')",
+      "family": "rounds",
+      "provenance": "pr_loop_support._pr_panel_qualification: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. It receives the same admitted or acquired observed PR comments as _pr_open_round_facts and derives staged panel evidence only to withhold an unsafe amendment round or template (#1981); it never selects an anchor, approval or authority.",
+      "occurrence": 1
+    },
+    {
       "module": "pr_round_ingestion",
       "function": "extract_admitted_round_records",
       "call": "_decode_round_metadata_records(protocol_comments(comments), flow=flow)",
