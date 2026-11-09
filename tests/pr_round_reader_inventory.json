@@ -2596,9 +2596,9 @@
     },
     {
       "module": "execution_retirement",
-      "function": "view",
+      "function": "ExecutionHistory::view",
       "classification": "reader",
-      "admission": "execution_retirement._authenticate_child_pr_history uses github.read_authenticated_protocol_comments for each child PR; assess_execution_history receives those independent invocation-bound views before retirement."
+      "admission": "ExecutionHistory.view: execution_retirement._authenticate_child_pr_history uses github.read_authenticated_protocol_comments for each child PR; assess_execution_history receives those independent invocation-bound views before retirement."
     },
     {
       "module": "finding_history",
@@ -2644,9 +2644,9 @@
     },
     {
       "module": "github",
-      "function": "__post_init__",
+      "function": "AuthenticatedComment::__post_init__",
       "classification": "acquisition",
-      "admission": "github owns complete REST transport and authenticated views; get_issue_context/get_pr_review_context call pr_round_ingestion before returning protocol history. Signed human requirement verification is independent of board control projection."
+      "admission": "AuthenticatedComment.__post_init__: github owns complete REST transport and authenticated views; get_issue_context/get_pr_review_context call pr_round_ingestion before returning protocol history. Signed human requirement verification is independent of board control projection."
     },
     {
       "module": "github",
@@ -3190,9 +3190,9 @@
     },
     {
       "module": "plan_verification",
-      "function": "verification_comments",
+      "function": "PlanVerificationContext::verification_comments",
       "classification": "reader",
-      "admission": "plan_verification receives plan histories from plan_first_loop authenticated acquisition; board audit checks use board projection, while round lineage and issue handoff checks retain invocation-only authority."
+      "admission": "PlanVerificationContext.verification_comments: plan_verification receives plan histories from plan_first_loop authenticated acquisition; board audit checks use board projection, while round lineage and issue handoff checks retain invocation-only authority."
     },
     {
       "module": "post_merge_runtime",
@@ -3286,7 +3286,7 @@
     },
     {
       "module": "pr_round_ingestion",
-      "function": "amendment_body",
+      "function": "AdmittedPrComment::amendment_body",
       "classification": "acquisition",
       "admission": "AdmittedPrComment.amendment_body is the board/child control projection: it refuses a body changed after admission and returns the protocol body only for comments admitted as invocation actor or configured human login plus REST ID; all other authors project an empty body."
     },
@@ -3316,7 +3316,7 @@
     },
     {
       "module": "pr_round_ingestion",
-      "function": "protocol_body",
+      "function": "AdmittedPrComment::protocol_body",
       "classification": "acquisition",
       "admission": "AdmittedPrComment.protocol_body is the invocation-only projection: it refuses a body changed after admission and returns the protocol body only when the immutable author ID equals the authenticated invocation actor ID."
     },
@@ -3382,15 +3382,15 @@
     },
     {
       "module": "publication_resume",
-      "function": "_check_legacy",
+      "function": "RoundPublication::_check_legacy",
       "classification": "reader",
-      "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
+      "admission": "RoundPublication._check_legacy: publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
     },
     {
       "module": "publication_resume",
-      "function": "_freeze",
+      "function": "RoundPublication::_freeze",
       "classification": "reader",
-      "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
+      "admission": "RoundPublication._freeze: publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
     },
     {
       "module": "publication_resume",
@@ -3682,7 +3682,7 @@
     },
     {
       "module": "workflow_transaction",
-      "function": "comment_ids",
+      "function": "_Group::comment_ids",
       "classification": "acquisition",
       "admission": "_Group.comment_ids projects immutable IDs of comments already authenticated by the surface-bound transaction resolver; it reads no bodies and grants no authority."
     },

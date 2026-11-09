@@ -1269,3 +1269,120 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     assert "non-authoritative diagnostic, not qualification" in noted[0]
     # Never qualification: the orchestrator's exact-head dispatch still runs once.
     assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
+
+
+# --- #1987: issue recovery admits explicitly before resolving the plan scope ---
+
+
+class _ReachedPlanReconstruction(Exception):
+    pass
+
+
+def _recover_scope_start(tmp_path, runner, issue_context, *, config=None):
+    """Drive recover_issue_execution's comment-only branch up to plan reconstruction.
+
+    Returns the scope start passed to ``_resume_plan_round`` and the number of
+    explicit admissions the recovery performed for the plan scope.
+    """
+    import coding_review_agent_loop.issue_recovery as issue_recovery
+    import coding_review_agent_loop.plan_board_state as plan_board_state
+    captured = {}
+
+    def stop(comments, *, configured_reviewers, min_round_number):
+        captured["min_round_number"] = min_round_number
+        raise _ReachedPlanReconstruction()
+
+    real_admit = plan_board_state.admitted_issue_comments
+    with patch.object(issue_recovery, "_resume_plan_round", stop), patch.object(
+        plan_board_state, "admitted_issue_comments", wraps=real_admit,
+    ) as admit:
+        with pytest.raises(_ReachedPlanReconstruction):
+            issue_recovery.recover_issue_execution(
+                runner, config=config or _m1390_config(tmp_path, max_rounds=5),
+                issue_number=56, issue_context=issue_context,
+                parent_issue_context=None, staged_parent_issue=None, fresh_child=None,
+                plan_first=True, requested_policy="one-shot",
+                implement_after_approval=True,
+                usage_context=SimpleNamespace(), run_plan_first_loop=lambda *a, **k: 0,
+            )
+    return captured["min_round_number"], admit.call_count
+
+
+def _m1390_boundary_history(tmp_path):
+    history = _m1390_history(tmp_path)
+    crashed, result, _messages = _m1390_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT, claude_outputs=[],
+    )
+    assert isinstance(result, AgentLoopError)
+    assert len(_m1390_boundaries(crashed)) == 1
+    return list(crashed.issue_comments)
+
+
+def _unadmitted(context):
+    """The same history as raw comments, so admission must perform a REST read."""
+    from coding_review_agent_loop.github import IssueComment
+
+    return replace(context, comments=tuple(
+        IssueComment(
+            author=getattr(c, "author", None), created_at=getattr(c, "created_at", None),
+            body=getattr(c, "body", None), comment_id=getattr(c, "comment_id", None),
+            author_id=getattr(c, "author_id", None),
+        )
+        for c in context.comments
+    ))
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_m1987_recovery_with_a_boundary_admits_once_and_resumes_at_its_scope(tmp_path, raw):
+    """`recovery-boundary-admitted`: explicit admission, the boundary's scope start."""
+    history = _m1390_boundary_history(tmp_path)
+    runner = _m1390_runner(history, issue_payload=_M1390_EDIT)
+    config = _m1390_config(tmp_path, max_rounds=5)
+    context = get_issue_context(runner, config=config, issue_number=56)
+    if raw:
+        context = _unadmitted(context)
+    scope_start, admissions = _recover_scope_start(tmp_path, runner, context, config=config)
+    # The archived round-3 plan is not reconstructed: the scope starts at 4.
+    assert (scope_start, admissions) == (4, 1)
+
+
+def test_m1987_recovery_without_a_boundary_makes_no_admission_read(tmp_path):
+    """`recovery-no-boundary-no-read`: scope 1 with no admission command."""
+    history = _m1390_history(tmp_path)
+    runner = _m1390_runner(history)
+    config = _m1390_config(tmp_path, max_rounds=5)
+    context = get_issue_context(runner, config=config, issue_number=56)
+    before = len(runner.commands)
+    scope_start, admissions = _recover_scope_start(tmp_path, runner, context, config=config)
+    assert (scope_start, admissions) == (1, 0)
+    assert not any(
+        "issues/56/comments" in " ".join(map(str, command))
+        for command in runner.commands[before:]
+    )
+
+
+def test_m1987_recovery_with_an_incomplete_admission_read_fails_closed(tmp_path):
+    """`recovery-incomplete-read`: an incomplete REST listing raises, never scope 1."""
+    history = _m1390_boundary_history(tmp_path)
+    config = _m1390_config(tmp_path, max_rounds=5)
+    context = _unadmitted(get_issue_context(
+        _m1390_runner(history, issue_payload=_M1390_EDIT), config=config, issue_number=56,
+    ))
+    incomplete = _M1390Runner(
+        issue_comments=list(history), authenticated_actor=_M1390_ACTOR,
+        serve_rest_issue_comments=False, issue_payload=_M1390_EDIT,
+    )
+    # The AgentLoopError escapes before plan reconstruction is reached.
+    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+        _recover_scope_start(tmp_path, incomplete, context, config=config)
+
+
+def test_m1987_recovery_of_the_dry_run_empty_history_needs_no_admission(tmp_path):
+    """`dry-run-empty-history`: the synthetic empty history resolves to scope 1."""
+    from coding_review_agent_loop.runner import Runner
+
+    config = make_config(tmp_path, reviewer="codex", dry_run=True)
+    dry = Runner(dry_run=True)
+    context = get_issue_context(dry, config=config, issue_number=56)
+    assert context.comments == ()
+    assert _recover_scope_start(tmp_path, dry, context, config=config) == (1, 0)

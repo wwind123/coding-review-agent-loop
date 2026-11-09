@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from agent_loop_helpers import FakeRunner, make_config
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.plan_issue_scope import (
@@ -228,23 +227,35 @@ def test_scope_decision_outcomes():
     assert second.recorded_digest == DIGEST_B
 
 
-def test_resolve_plan_scope_reads_nothing_without_a_boundary_and_fails_closed(tmp_path):
-    runner = FakeRunner()
-    assert resolve_plan_scope(_history(), None, runner=runner, issue_number=56) == 1
-    assert runner.commands == []
+def test_resolve_plan_scope_reads_nothing_without_a_boundary_and_fails_closed():
+    """`scope-none-actor-boundary` / `scope-lookalike-boundary` (unit).
+
+    ``resolve_plan_scope`` no longer acquires history itself (#1987): it has no
+    runner/config parameters, so it cannot make a network call.
+    """
+    import inspect
+
+    params = inspect.signature(resolve_plan_scope).parameters
+    assert "runner" not in params and "config" not in params
+    # No boundary: scope 1 without needing an actor.
+    assert resolve_plan_scope(_history(), None, issue_number=56) == 1
+    # A boundary with no authenticated actor fails closed rather than scope 1.
     unauthenticated = tuple(
         IssueComment(author=c.author, created_at=c.created_at, body=c.body)
         for c in (*_history(), _boundary())
     )
     with pytest.raises(AgentLoopError, match="no authenticated GitHub read"):
         resolve_plan_scope(unauthenticated, None, issue_number=56)
-    # An incomplete REST read fails closed instead of reading as no boundary.
-    with pytest.raises(AgentLoopError):
-        resolve_plan_scope(
-            unauthenticated, None, runner=FakeRunner(serve_rest_issue_comments=False),
-            config=make_config(tmp_path),
-            issue_number=56,
-        )
+    with pytest.raises(AgentLoopError, match="no authenticated GitHub read"):
+        resolve_plan_scope((*_history(), _boundary()), None, issue_number=56)
+    # The boundary authored by the admitted actor is honoured.
+    assert resolve_plan_scope((*_history(), _boundary()), ACTOR, issue_number=56) == 4
+    # A lookalike by another author is ignored and reported; the scope stays at 1.
+    ignored: list[str] = []
+    assert resolve_plan_scope(
+        (*_history(), _boundary(author_id=999)), ACTOR, issue_number=56, ignored_sink=ignored,
+    ) == 1
+    assert ignored and "not authored by the authenticated orchestrator actor" in ignored[0]
 
 
 def _diagnostic(target_round, *, comment_id):

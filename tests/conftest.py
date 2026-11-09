@@ -45,6 +45,19 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _restore_process_environment():
+    """Undo direct ``os.environ`` writes that bypass ``monkeypatch`` (#1990 CI).
+
+    Defined first so it is set up first and torn down last, after every
+    ``monkeypatch`` teardown.
+    """
+    from process_env_isolation import restored_process_environment
+
+    with restored_process_environment():
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_repair():
     """Prevent attempt_repair from calling the real Gemini CLI in all tests.
 

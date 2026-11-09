@@ -221,8 +221,13 @@ agree on the scope.
 identities and the authenticated actor whenever a boundary or a plan
 board-change link is present. A boundary is honoured only when its author is
 that actor; a lookalike by anyone else is ignored and logged, and retires
-nothing. `resolve_plan_scope` makes no network call without a boundary-shaped
-record and fails closed on an incomplete read.
+nothing. Callers admit through `admitted_issue_comments` and pass the returned
+actor; `resolve_plan_scope` no longer acquires history itself and takes no
+runner (#1987). Issue recovery admits only when a boundary-shaped record is
+present, so a history without one makes no network call, and an incomplete
+read fails closed in that admission. A boundary that reaches
+`resolve_plan_scope` without an authenticated actor fails closed rather than
+resolving to scope 1.
 
 **Two inputs.** Reviewer-board lineage (root anchor, binding initialization,
 links, signed amendments) is always resolved from the full admitted history.
