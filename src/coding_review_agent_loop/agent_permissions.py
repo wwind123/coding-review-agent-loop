@@ -1528,7 +1528,9 @@ def inspect_forms(config: AgentLoopConfig, *, base_branch: str | None = None) ->
     """Prompt text naming the exact inspect forms the read-only grant allows."""
     provenance = require_inspect_provenance(config)
     prefix = provenance.prefix_text
-    diff_target = f"{base_branch}...HEAD" if base_branch else "<base>...HEAD"
+    from .review_diff import review_diff_target
+
+    diff_target = review_diff_target(base_branch)
     lines = [
         "Sandboxed permissions are active. Your only shell command is the read-only "
         f"inspector, invoked exactly as `{prefix} <tool> <args>` (one command per call, "

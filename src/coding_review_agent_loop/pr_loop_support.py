@@ -3517,6 +3517,29 @@ def _pr_open_round_facts(
     return peers, fresh
 
 
+def _pr_amendment_comments(
+    pr_context: PullRequestReviewContext,
+    *,
+    runner: Runner | None,
+    config: AgentLoopConfig | None,
+) -> Sequence[object]:
+    """The one record set every PR amendment emitter evaluates (#1986).
+
+    With a runner and config this is the authenticated ``admit_pr_comments``
+    output the resume reader uses (idempotent on an already-admitted context);
+    without them it is the context's comments, as the no-runner resume reads.
+    An admission error propagates: callers decide whether it is fatal.
+    """
+    if runner is None or config is None:
+        return pr_context.comments
+    from .pr_round_ingestion import admit_pr_comments
+
+    comments, _actor = admit_pr_comments(
+        runner, config, pr_number=pr_context.metadata.number, comments=pr_context.comments
+    )
+    return comments
+
+
 def _pr_amendment_start_round(
     pr_context: PullRequestReviewContext,
     configured_reviewers: Sequence[AgentName],
@@ -3543,15 +3566,10 @@ def _pr_amendment_start_round(
         if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
         else "aggregate"
     )
-    comments: Sequence[object] = pr_context.comments
+    # The scans below read the same authenticated admission the resume reader
+    # uses, through the helper the activation template shares (#1986).
+    comments = _pr_amendment_comments(pr_context, runner=runner, config=config)
     if runner is not None and config is not None:
-        from .pr_round_ingestion import admit_pr_comments
-
-        # The scans below read the same authenticated admission the resume
-        # reader uses (the board-entry path re-admits an admitted context too).
-        comments, _actor = admit_pr_comments(
-            runner, config, pr_number=pr_context.metadata.number, comments=comments
-        )
         resumed = _resume_pr_round_admitted(
             runner,
             config=config,
@@ -3615,8 +3633,14 @@ def _pr_amendment_activation_template(
     resumed: ResumedReviewRound | None,
     pr_context: PullRequestReviewContext,
     config: AgentLoopConfig | None = None,
+    runner: Runner | None = None,
 ) -> str | None:
-    """Replacement template for a stale PR amendment, or None when unsafe (#1981)."""
+    """Replacement template for a stale PR amendment, or None when unsafe (#1981).
+
+    The open-round facts come from the same admitted record set
+    ``_pr_amendment_start_round`` reads (#1986); an admission failure yields no
+    template, never facts from unadmitted records.
+    """
     persisted = getattr(lineage, "contract_before")(amendment)
     removed = tuple(getattr(amendment, "removed_reviewers", ()))
     restored = tuple(getattr(amendment, "restored_reviewers", ()))
@@ -3624,8 +3648,9 @@ def _pr_amendment_activation_template(
         name for name in getattr(persisted, "required_reviewers") if name not in removed
     ) + tuple(name for name in restored if name not in getattr(persisted, "required_reviewers"))
     try:
+        comments = _pr_amendment_comments(pr_context, runner=runner, config=config)
         peers, fresh = _pr_open_round_facts(
-            pr_context.comments,
+            comments,
             head_sha=pr_context.metadata.head_sha,
             round_number=round_number,
             resumed=resumed,

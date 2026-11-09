@@ -204,7 +204,8 @@ def test_claude_reviewer_gets_restricted_read_only_grant(tmp_path, sandbox):
     assert "run-tests" not in " ".join(argv)
     # The prompt names the same inspect forms.
     guidance = _coder_workdir_guidance(config, implementation=False, agent="claude")
-    assert f"`{expected_prefix} git diff main...HEAD`" in guidance
+    assert f"`{expected_prefix} git diff origin/main...HEAD`" in guidance
+    assert f"`{expected_prefix} git diff main...HEAD`" not in guidance
 
 
 @pytest.mark.parametrize("role", [None, "summary", "analyzer", "semantic-dedupe", "unknown-role"])
@@ -831,6 +832,19 @@ def test_no_gh_omits_gh_option_and_prompt_says_unavailable(tmp_path, sandbox):
     assert provenance.gh is None
     assert not any(item.startswith("--gh=") for item in provenance.prefix)
     assert "gh inspection is unavailable" in ap.inspect_forms(config)
+
+
+def test_inspect_forms_name_the_remote_tracking_base(tmp_path, sandbox):
+    """#1977: the sandboxed diff form names origin/<base>, never a bare local base."""
+    config = sandboxed_config(tmp_path)
+    provenance = sandbox["establish"](config)
+    prefix = provenance.prefix_text
+    resolved = ap.inspect_forms(config, base_branch="main")
+    assert f"`{prefix} git diff origin/main...HEAD`" in resolved
+    assert f"`{prefix} git diff main...HEAD`" not in resolved
+    unresolved = ap.inspect_forms(config)
+    assert f"`{prefix} git diff origin/<base>...HEAD`" in unresolved
+    assert f"`{prefix} git diff <base>...HEAD`" not in unresolved
 
 
 def test_missing_git_fails_fast(tmp_path, sandbox):

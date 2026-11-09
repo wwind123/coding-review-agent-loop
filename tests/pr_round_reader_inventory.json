@@ -1971,7 +1971,7 @@
       "function": "_pr_amendment_start_round",
       "call": "_extract_round_metadata_records(comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop_support._pr_amendment_start_round: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. With a runner it reads the comments returned by pr_round_ingestion.admit_pr_comments, the same admission the _resume_pr_round_admitted reader it calls uses (#1981). The scan only decides whether a no-resume result is unexplained, which suppresses an amendment template; it never selects a round anchor, approval or authority.",
+      "provenance": "pr_loop_support._pr_amendment_start_round: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. With a runner it reads the comments returned by pr_round_ingestion.admit_pr_comments through _pr_amendment_comments, the same admission the _resume_pr_round_admitted reader it calls uses (#1981) and the activation template shares (#1986). The scan only decides whether a no-resume result is unexplained, which suppresses an amendment template; it never selects a round anchor, approval or authority.",
       "occurrence": 1
     },
     {
@@ -1979,7 +1979,7 @@
       "function": "_pr_open_round_facts",
       "call": "_extract_round_metadata_records(comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop_support._pr_open_round_facts: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. Callers pass admit_pr_comments output (_pr_amendment_start_round, the board-entry activation template) or the acquired observed PR context the real resume reads (pr_loop activation template). It derives published same-round peers and the round's scheduler selection only to withhold an unsafe amendment round or template (#1981); it never selects an anchor, approval or authority.",
+      "provenance": "pr_loop_support._pr_open_round_facts: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. Every caller (_pr_amendment_start_round and _pr_amendment_activation_template at both its pr_loop and board-entry call sites) passes the one shared record set from _pr_amendment_comments: admit_pr_comments output with a runner, or the context comments the no-runner resume reads (#1986). It derives published same-round peers and the round's scheduler selection only to withhold an unsafe amendment round or template (#1981); it never selects an anchor, approval or authority.",
       "occurrence": 1
     },
     {
@@ -1987,7 +1987,7 @@
       "function": "_pr_panel_qualification",
       "call": "_extract_round_metadata_records(comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop_support._pr_panel_qualification: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. It receives the same admitted or acquired observed PR comments as _pr_open_round_facts and derives staged panel evidence only to withhold an unsafe amendment round or template (#1981); it never selects an anchor, approval or authority.",
+      "provenance": "pr_loop_support._pr_panel_qualification: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition. It receives the same shared _pr_amendment_comments record set as _pr_open_round_facts (#1986) and derives staged panel evidence only to withhold an unsafe amendment round or template (#1981); it never selects an anchor, approval or authority.",
       "occurrence": 1
     },
     {
@@ -3258,7 +3258,7 @@
       "module": "pr_loop_support",
       "function": "_pr_open_round_facts",
       "classification": "reader",
-      "admission": "pr_loop_support._pr_open_round_facts reads admitted or acquired observed PR comments to withhold an unsafe amendment round; it supplies no approval, anchor or authority (#1981)."
+      "admission": "pr_loop_support._pr_open_round_facts reads the shared _pr_amendment_comments record set (admitted with a runner) that every PR amendment emitter evaluates, to withhold an unsafe amendment round; it supplies no approval, anchor or authority (#1981, #1986)."
     },
     {
       "module": "pr_round_ingestion",

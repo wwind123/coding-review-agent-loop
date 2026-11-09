@@ -32,6 +32,7 @@ from .protocol_common import (
 )
 from .protocol import HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK
 from .protocol_markers import sanitize_historical_text
+from .review_diff import review_diff_target
 from .workdirs import agent_workdir
 from .test_runtime import (
     CITABLE_TEST_RUNNERS_SUMMARY,
@@ -998,6 +999,16 @@ REVIEW_INDEPENDENCE_RULE = (
 )
 
 
+# Issue #1977: the bare local base branch may be missing, checked out
+# elsewhere or lagging in the shared store; origin/<base> is the ref the
+# orchestrator fetches and pins before every review.
+_REVIEW_DIFF_BASE_NOTE = (
+    "The `origin/` ref is the base the orchestrator already fetched for this "
+    "checkout; a missing or stale local base branch is not a reason to refuse "
+    "the review."
+)
+
+
 def _review_command_policy(
     config: AgentLoopConfig, pr_metadata: PullRequestMetadata | None = None
 ) -> str:
@@ -1015,13 +1026,15 @@ def _review_command_policy(
     elif base_branch and "\n" not in base_branch and "\r" not in base_branch:
         diff_guidance = (
             "For this PR, inspect the authoritative local diff with "
-            f"`git diff {shlex.quote(f'{base_branch}...HEAD')}`."
+            f"`git diff {shlex.quote(review_diff_target(base_branch))}`. "
+            + _REVIEW_DIFF_BASE_NOTE
         )
     else:
         diff_guidance = (
             "When the base branch is available, replace `<base>` in "
-            "`git diff <base>...HEAD` with that resolved branch name; do not run "
-            "the placeholder literally or discover branches speculatively."
+            f"`git diff {review_diff_target(None)}` with that resolved branch name; "
+            "do not run the placeholder literally or discover branches speculatively. "
+            + _REVIEW_DIFF_BASE_NOTE
         )
     if is_sandboxed(config):
         # The sandboxed grant allows no raw git/rg/sed; the workdir guidance
