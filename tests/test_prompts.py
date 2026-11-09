@@ -2284,7 +2284,7 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     assert "Use this PR metadata as authoritative." in prompt
     assert "Do not spend time discovering the\nPR branch." in prompt
     assert "gh pr view 77 --repo OWNER/REPO --json comments,reviews" in prompt
-    assert "`git diff main...HEAD`" in prompt
+    assert "`git diff origin/main...HEAD`" in prompt
     assert "gh pr diff" not in prompt
     assert "If a read-only shell/tool command requires confirmation" in prompt
     assert "non-interactive\nmode" in prompt
@@ -2959,7 +2959,9 @@ def test_review_prompt_allows_read_only_local_inspection_but_prohibits_execution
     config = make_config(tmp_path)
     prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact_context)
     assert "Do not defer your review to wait for CI" in prompt
-    assert "`git diff main...HEAD`" in prompt
+    assert "`git diff origin/main...HEAD`" in prompt
+    assert "`git diff main...HEAD`" not in prompt
+    assert "a missing or stale local base branch is not a reason to refuse" in prompt
     for command in ("`git diff`", "`git show`", "`git status`", "`git log`", "`rg`", "`sed`"):
         assert command in prompt
     assert "Do not run tests, builds, compilation" in prompt
@@ -2992,8 +2994,10 @@ def test_review_prompt_uses_safe_base_placeholder_when_base_is_unknown(
         compact_context=compact_context,
     )
 
-    assert "`git diff <base>...HEAD`" in prompt
+    assert "`git diff origin/<base>...HEAD`" in prompt
+    assert "`git diff <base>...HEAD`" not in prompt
     assert "do not run the placeholder literally" in prompt
+    assert "a missing or stale local base branch is not a reason to refuse" in prompt
 
 def test_review_prompt_mentions_branch_protection_forbidden_when_checks_exist(tmp_path):
     runner = FakeRunner(
@@ -3313,7 +3317,7 @@ def test_codex_review_prompt_prefers_pinned_checkout_local_diff(tmp_path):
     assert review_cwd == config.codex_dir
     assert f"Assigned checkout: `{config.codex_dir.resolve()}`" in prompt
     assert "- Head SHA: 6367c48dd193d56ea7b0baad25b19455e529f5ee" in prompt
-    assert "`git diff main...HEAD`" in prompt
+    assert "`git diff origin/main...HEAD`" in prompt
     assert "Prefer the verified local checkout and direct file reads over web search" in prompt
     assert "gh pr diff" not in prompt
 
@@ -6808,7 +6812,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     and the ``small-host`` variant proves the comparison does not depend on
     the machine running it.  The worker estimate is pinned to the recorded
     budget so the worker-dependent guidance sentences stay comparable.
-    The baseline includes intentional reviewer-guidance updates from #1954.
+    The baseline includes intentional reviewer-guidance updates from #1954
+    and the remote-tracking review diff base from #1977.
     """
     import json as _golden_json
     import os as _golden_os

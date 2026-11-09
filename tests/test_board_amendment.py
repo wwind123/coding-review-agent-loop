@@ -2145,3 +2145,155 @@ def test_1981_versioned_carried_approval_still_carries_with_architecture_context
         monkeypatch, records, config=_config_1981(architecture_context_enabled=True),
     )
     assert (peers, fresh) == (("Claude",), ("Antigravity",))
+
+
+# --- One admitted record set for PR amendment emitters (#1986) ---------------
+
+
+def _admitted_scenario_1986(monkeypatch, *, admission="drop-foreign"):
+    """Comments whose foreign record, if read, would hide Claude's round-2 verdict.
+
+    The admitted records are ``_open_round_records_1981``: Claude published in
+    round 2 and Antigravity (also selected) needs a fresh turn beside it.  The
+    foreign record is an unauthenticated head-review recovery boundary after
+    Claude's publication; read unadmitted it would leave round 2 with no
+    published peer, so any amendment would look safe.
+    """
+    import coding_review_agent_loop.response_validation as response_validation
+
+    records = _open_round_records_1981()
+    foreign_record = _record_1981(
+        len(records), 2, "summary", "Orchestrator", round_metadata.HEAD_REVIEW_RECOVERY_PHASE,
+    )
+    comments = [_comment(f"record {record.index}") for record in records]
+    foreign = _comment("forged head-review recovery")
+    comments.append(foreign)
+    by_comment = {id(c): r for c, r in zip(comments, (*records, foreign_record))}
+
+    def extract(comment_list, **_kwargs):
+        return [by_comment[id(c)] for c in comment_list if id(c) in by_comment]
+
+    monkeypatch.setattr(pr_loop_support, "_extract_round_metadata_records", extract)
+    monkeypatch.setattr(round_state, "_extract_round_metadata_records", extract)
+    monkeypatch.setattr(pr_loop_support, "reviewers", lambda config: ("codex", "claude", "antigravity"))
+    monkeypatch.setattr(
+        pr_loop_support, "_pr_reviewer_acquisition_contract",
+        lambda config: {name: (None, None) for name in BOARD},
+    )
+    monkeypatch.setattr(pr_loop_support, "reviewer_seat_binding", lambda config: None)
+    monkeypatch.setattr(
+        pr_loop_support, "_pr_panel_qualification", lambda comments, config: (lambda record: True),
+    )
+    monkeypatch.setattr(
+        response_validation, "_resumed_pr_reviewer_matches_requirements", lambda *a, **k: True,
+    )
+    admissions = []
+
+    def admit(runner, config, *, pr_number, comments):
+        admissions.append(pr_number)
+        if admission == "raise":
+            raise AgentLoopError("admission unavailable")
+        return tuple(c for c in comments if c is not foreign), None
+
+    monkeypatch.setattr("coding_review_agent_loop.pr_round_ingestion.admit_pr_comments", admit)
+    resumed = _resumed_1981(2, reconciled=False, completed=(records[-1],))
+    patch_attr_in(
+        monkeypatch, (pr_loop_support,), "_resume_pr_round_admitted", lambda *a, **k: resumed,
+    )
+    patch_attr_in(monkeypatch, (pr_loop_support,), "_resume_pr_round", lambda *a, **k: resumed)
+    seen = []
+    real_facts = pr_loop_support._pr_open_round_facts
+
+    def spy(comment_list, **kwargs):
+        seen.append(tuple(comment_list))
+        return real_facts(comment_list, **kwargs)
+
+    monkeypatch.setattr(pr_loop_support, "_pr_open_round_facts", spy)
+    return SimpleNamespace(
+        comments=comments, foreign=foreign, resumed=resumed, seen=seen,
+        admissions=admissions, real_facts=real_facts,
+    )
+
+
+def _emitters_1986(scenario, removed, *, runner):
+    """(start round, template) from the two emitters for one amendment."""
+    config = _config_1981(review_unrecorded_head=False)
+    lineage = _pending_lineage_1981(effective_from_round=1)
+    lineage.pending_amendments[0].removed_reviewers = tuple(removed)
+    context = _pr_context_1981(scenario.comments)
+    start = pr_loop_support._pr_amendment_start_round(
+        context, ("codex", "claude", "antigravity"), SimpleNamespace(),
+        runner=runner, config=config if runner is not None else None,
+    )
+    template = pr_loop_support._pr_amendment_activation_template(
+        lineage.pending_amendments[0], int(start), lineage=lineage, pr_number=77,
+        resumed=scenario.resumed, pr_context=context, config=config, runner=runner,
+    )
+    return start, template
+
+
+@pytest.mark.parametrize("removed", [("Codex",), ("Antigravity",)])
+def test_1986_template_and_start_round_read_the_same_admitted_records(monkeypatch, removed):
+    """Row template-foreign-record: identical admitted input, agreeing adjusted safety."""
+    scenario = _admitted_scenario_1986(monkeypatch)
+    start, template = _emitters_1986(scenario, removed, runner=object())
+    assert scenario.admissions == [77, 77]
+    assert len(scenario.seen) == 2 and scenario.seen[0] == scenario.seen[1]
+    assert scenario.foreign not in scenario.seen[0]
+    assert len(scenario.seen[0]) == len(scenario.comments) - 1
+    assert int(start) == 2
+    assert (start.peers, start.fresh) == (("Claude",), ("Antigravity",))
+    # Agreement is judged with the amendment-adjusted predicate.
+    assert (template is not None) == (not start.blocked_seats(removed, ()))
+    # Unadjusted, Antigravity always blocks beside Claude's verdict.
+    assert start.blocked_seats() == ("Antigravity",)
+    if removed == ("Antigravity",):
+        # Removing the only fresh seat makes the otherwise-unsafe round safe.
+        assert template is not None and '"effective_from_round": 2' in template
+    else:
+        assert template is None
+        # The foreign record, read unadmitted, would have offered this round:
+        # exactly the #1981-class disagreement admission prevents.
+        raw = scenario.real_facts(
+            scenario.comments, head_sha=_HEAD_1981, round_number=2, resumed=scenario.resumed,
+            candidates=("Claude", "Antigravity"), config=_config_1981(),
+        )
+        assert raw == ((), ())
+
+
+def test_1986_without_a_runner_both_emitters_read_the_same_raw_records(monkeypatch):
+    """No admission available: both emitters still evaluate one identical set."""
+    scenario = _admitted_scenario_1986(monkeypatch)
+    start, template = _emitters_1986(scenario, ("Codex",), runner=None)
+    assert scenario.admissions == []
+    assert len(scenario.seen) == 2 and scenario.seen[0] == scenario.seen[1]
+    assert scenario.seen[0] == tuple(scenario.comments)
+    assert (template is not None) == (not start.blocked_seats(("Codex",), ()))
+
+
+def test_1986_admission_failure_yields_no_template_and_start_round_propagates(monkeypatch):
+    """Row template-admission-failure: never facts from unadmitted records."""
+    scenario = _admitted_scenario_1986(monkeypatch, admission="raise")
+    lineage = _pending_lineage_1981(effective_from_round=1)
+    lineage.pending_amendments[0].removed_reviewers = ("Codex",)
+    context = _pr_context_1981(scenario.comments)
+    config = _config_1981(review_unrecorded_head=False)
+    template = pr_loop_support._pr_amendment_activation_template(
+        lineage.pending_amendments[0], 2, lineage=lineage, pr_number=77,
+        resumed=scenario.resumed, pr_context=context, config=config, runner=object(),
+    )
+    assert template is None
+    # The raw comments (which would make round 2 look safe) were never read.
+    assert scenario.seen == []
+    with pytest.raises(AgentLoopError, match="admission unavailable"):
+        pr_loop_support._pr_amendment_start_round(
+            context, ("codex", "claude", "antigravity"), SimpleNamespace(),
+            runner=object(), config=config,
+        )
+    assert scenario.seen == []
+    assert pr_amendment_template_round(
+        lambda: pr_loop_support._pr_amendment_start_round(
+            context, ("codex", "claude", "antigravity"), SimpleNamespace(),
+            runner=object(), config=config,
+        )
+    ).status == "lookup-failed"

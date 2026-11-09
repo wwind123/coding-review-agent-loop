@@ -1559,3 +1559,79 @@ def test_divergent_unoccupied_base_is_not_destroyed(tmp_path, monkeypatch):
         run_worktrees.prepare_store(store, config=config, runner=Runner())
     assert git(store, "rev-parse", "main") == local
     assert (store / "local.txt").read_text() == "keep local commit"
+
+
+def _rendered_review_diff_ref(config, base):
+    """The base ref the real reviewer command policy names for ``base`` (#1977)."""
+    import re
+
+    from coding_review_agent_loop.github import PullRequestMetadata
+    from coding_review_agent_loop.prompt_support import _review_command_policy
+    from coding_review_agent_loop.review_diff import review_diff_base_ref
+
+    metadata = PullRequestMetadata(
+        number=7, repo="OWNER/REPO", title="t", head_branch="feature", base_branch=base,
+        head_sha="0" * 40, url=None,
+    )
+    policy = _review_command_policy(config, metadata)
+    match = re.search(r"`git diff ([^`\s]+)\.\.\.HEAD`", policy)
+    assert match is not None, policy
+    assert match.group(1) == review_diff_base_ref(base) == f"origin/{base}"
+    return match.group(1)
+
+
+@pytest.mark.parametrize("local_base", ["missing", "checked-out-elsewhere"])
+def test_reviewer_diff_ref_resolves_without_a_current_local_base(tmp_path, monkeypatch, local_base):
+    """#1977: the prompt's diff ref resolves in the per-run reviewer worktree.
+
+    ``missing`` deletes ``refs/heads/main`` from the shared store, so a bare
+    ``main...HEAD`` cannot resolve.  ``checked-out-elsewhere`` checks local
+    ``main`` out in another linked worktree, so the store's fast-forward is
+    skipped and the local branch lags the merged base, making a bare
+    ``main...HEAD`` diff stale.  In both cases the rendered ``origin/main``
+    ref lists only the PR change.
+    """
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "codex").resolve()
+    logs = []
+    monkeypatch.setattr(run_worktrees, "log", lambda config, message: logs.append(message))
+    runner = RecordingRunner()
+    base_sha = git(env.seed, "rev-parse", "HEAD")
+    assert run_worktrees.prepare_store(store, config=config, runner=runner) == base_sha
+    assert git(store, "rev-parse", "refs/heads/main") == base_sha
+    if local_base == "missing":
+        expected_base = base_sha
+    else:
+        elsewhere = env.tmp / "elsewhere"
+        git(store, "worktree", "add", "-q", str(elsewhere), "main")
+        expected_base = env.commit("merged.txt", "already merged base change")
+        assert run_worktrees.prepare_store(store, config=config, runner=runner) == expected_base
+        assert any("skipping its fast-forward" in message for message in logs)
+        assert git(store, "rev-parse", "refs/heads/main") == base_sha  # lagging
+    head = env.commit("pr.txt", "PR change")
+    git(env.bare, "update-ref", "refs/heads/main", expected_base)
+    env.set_pr_head(7, head)
+    ref = _rendered_review_diff_ref(config, "main")
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, runner)
+        if local_base == "missing":
+            # The review-time pin (a held claim) never recreates the local branch.
+            git(store, "update-ref", "-d", "refs/heads/main")
+        sync_checkout_to_pr(
+            config, runner, path=config.codex_dir, label="reviewer", default_owned=True,
+            pr_number=7, pr_metadata=SimpleNamespace(head_sha=head),
+        )
+        checkout = config.codex_dir
+        assert git(checkout, "rev-parse", "HEAD") == head
+        assert git(checkout, "rev-parse", ref) == expected_base
+        assert git(checkout, "diff", "--name-only", f"{ref}...HEAD") == "pr.txt"
+        bare = git(checkout, "diff", "--name-only", "main...HEAD", check=False)
+        if local_base == "missing":
+            assert git(store, "rev-parse", "--verify", "--quiet", "refs/heads/main",
+                       check=False) == ""
+            assert bare != "pr.txt"
+        else:
+            # The lagging local branch drags the already-merged base change in.
+            assert sorted(bare.split()) == ["merged.txt", "pr.txt"]

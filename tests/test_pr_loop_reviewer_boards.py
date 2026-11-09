@@ -1683,3 +1683,66 @@ def test_1981_versionless_carried_approval_suppresses_the_open_round_template(tm
         cmd[0] for cmd, _cwd in runner.commands[commands_before:]
         if cmd and cmd[0] in {"claude", "codex", "gemini", "agy"}
     ] == []
+
+
+def test_1986_board_entry_activation_template_receives_the_runner(tmp_path, monkeypatch):
+    """The board-entry template admits through the run's runner (#1986).
+
+    Reached both from ``run_pr_loop`` startup and from a direct board-entry call.
+    """
+    import coding_review_agent_loop.pr_board_entry as pr_board_entry
+    from coding_review_agent_loop.github import get_pr_review_context
+
+    runner, config, _first = _first_run_1981(tmp_path)
+    second = _second_run_1981(runner, config)
+    stale = _m943_amendment_from_error(second).replace(
+        "<why the removed reviewer cannot be reached>", "Codex store is unavailable."
+    ).replace('"effective_from_round": 3', '"effective_from_round": 1')
+    _m943_append(runner, stale)
+    real = pr_loop_support._pr_amendment_activation_template
+    calls = []
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    patch_attr_in(
+        monkeypatch, (pr_loop_support, pr_loop, pr_board_entry),
+        "_pr_amendment_activation_template", recording,
+    )
+    with pytest.raises(AgentLoopError, match="re-enters round 3"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert calls and all(call.get("runner") is runner for call in calls)
+    calls.clear()
+    context = get_pr_review_context(runner, config=config, pr_number=77)
+    with pytest.raises(AgentLoopError, match="re-enters round 3"):
+        pr_board_entry._enforce_pr_board_floor(
+            runner, config=config, pr_number=77, pr_context=context
+        )
+    assert calls and all(call.get("runner") is runner for call in calls)
+
+
+@pytest.mark.parametrize("module_name", ["pr_loop", "pr_board_entry"])
+def test_1986_activation_template_call_sites_pass_runner_structurally(module_name):
+    """Every source call site passes ``runner=runner`` (#1986).
+
+    The runtime test above reaches the board-entry site; the PR loop's own
+    startup site sits behind it, so its keyword is pinned structurally.
+    """
+    import ast
+    import importlib
+    import inspect as _inspect
+
+    module = importlib.import_module(f"coding_review_agent_loop.{module_name}")
+    tree = ast.parse(_inspect.getsource(module))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_pr_amendment_activation_template"
+    ]
+    assert calls
+    for call in calls:
+        runner_kw = [kw for kw in call.keywords if kw.arg == "runner"]
+        assert len(runner_kw) == 1
+        assert isinstance(runner_kw[0].value, ast.Name) and runner_kw[0].value.id == "runner"

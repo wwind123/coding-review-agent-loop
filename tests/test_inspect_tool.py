@@ -119,6 +119,8 @@ def test_build_subprocess_env_is_closed_allowlist():
     [
         ["git", "diff", "--stat"],
         ["git", "diff", "--name-only", "main...HEAD"],
+        ["git", "diff", "origin/main...HEAD"],
+        ["git", "diff", "--name-only", "origin/main...HEAD"],
         ["git", "diff", "-U3", "--", "src/x.py"],
         ["git", "diff", "--unified=5", "--numstat"],
         ["git", "log", "-n", "5", "--oneline"],

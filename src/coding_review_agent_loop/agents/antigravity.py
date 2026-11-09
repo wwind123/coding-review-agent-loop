@@ -59,6 +59,7 @@ from ..runner import CommandResult, Runner, strip_ansi
 from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment
 from .. import workdir_claims
+from ..review_diff import review_diff_target
 from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
@@ -803,8 +804,15 @@ def _legacy_injection_length(data: bytes) -> int | None:
     if not text.startswith("# Agent Loop Single-Shot Session"):
         return None
     match = _LEGACY_BASE_RE.search(text)
-    candidates = [single_shot_session_instruction(match.group(1) if match else None)]
+    candidates = []
+    if match:
+        # The captured ref is rendered verbatim, so one candidate covers both a
+        # historical bare-base header (`main`) and a current remote-tracking
+        # header (`origin/main`) without ever producing `origin/origin/main`.
+        candidates.append(_render_single_shot_session_instruction(f"`git diff {match.group(1)}...HEAD`"))
+    # The regex excludes `<>`, so both placeholder headers are explicit (#1977).
     candidates.append(single_shot_session_instruction(None))
+    candidates.append(_render_single_shot_session_instruction(_HISTORICAL_UNRESOLVED_DIFF_CMD))
     for candidate in candidates:
         if text.startswith(candidate):
             # A legacy oversized prompt carried its whole task section; that
@@ -916,14 +924,30 @@ _REVIEWER_QUOTED_COMMAND_RULE = (
 )
 
 
+# The unresolved-base diff command written by versions before #1977; frozen so
+# a killed run's leftover header is still recognized and recovered.
+_HISTORICAL_UNRESOLVED_DIFF_CMD = (
+    "`git diff <base>...HEAD` (replace `<base>` with the resolved base branch)"
+)
+
+
 def single_shot_session_instruction(base: str | None) -> str:
-    """GEMINI.md prefix pinning agy to one synchronous, non-background turn."""
+    """GEMINI.md prefix pinning agy to one synchronous, non-background turn.
+
+    The diff names ``origin/<base>`` (#1977): the remote-tracking ref the
+    orchestrator pins resolves even when the local base branch does not.
+    """
     resolved_base = (base or "").strip()
     diff_cmd = (
-        f"`git diff {resolved_base}...HEAD`"
+        f"`git diff {review_diff_target(resolved_base)}`"
         if resolved_base
-        else "`git diff <base>...HEAD` (replace `<base>` with the resolved base branch)"
+        else f"`git diff {review_diff_target(None)}` (replace `<base>` with the resolved base branch)"
     )
+    return _render_single_shot_session_instruction(diff_cmd)
+
+
+def _render_single_shot_session_instruction(diff_cmd: str) -> str:
+    """The single-shot header around an exact, already-rendered diff command."""
     return (
         "# Agent Loop Single-Shot Session\n\n"
         "You are running in a single-shot, non-interactive `agy --print` session"
