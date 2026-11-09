@@ -279,8 +279,12 @@ def _snapshot(
     config = make_config(
         tmp_path, managed_ci=managed_ci, managed_ci_trusted_actor="agent-loop", **extra
     )
+    # Issue-thread admission always binds the invocation actor and reads the
+    # complete (here empty) issue listing (#1984).
+    from agent_loop_helpers import FakeRunner
+    runner = FakeRunner(authenticated_actor=("agent-loop", 1), serve_rest_issue_comments=True)
     result = pr_loop_support._fresh_pr_qualification_snapshot(
-        object(), config=config, pr_number=7, issue_context=issue,
+        runner, config=config, pr_number=7, issue_context=issue,
         parent_issue_context=None, approved_plan_context=plan,
         managed_protection_mode=managed_protection_mode,
         plan_binding_reviewers=plan_binding_reviewers,

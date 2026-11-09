@@ -702,6 +702,9 @@ def shim_config(tmp_path, monkeypatch):
     return config, serve
 
 
+INVOKER = {"login": "agent-loop-invoker", "id": 4242}
+
+
 def _gql_comment(cid, body, login, created):
     return {"id": f"IC_{cid}", "author": {"login": login}, "body": body, "createdAt": created,
             "url": f"https://github.com/{REPO}/issues/1#issuecomment-{cid}"}
@@ -715,6 +718,7 @@ def test_bot_authored_diagnostic_recovers_through_shim_and_parsers(shim_config):
     comments = [rest_comment(501, body, login="agent-app[bot]", uid=77, bot=True, created="2026-09-01T00:00:05Z")]
     routes = issue_routes(comments)
     routes[("GET", f"repos/{REPO}/issues/1/comments?per_page=100&page=1")] = comments
+    routes[("GET", "user")] = INVOKER  # issue admission binds the actor (#1984)
     serve(routes)
 
     context = get_issue_context(Runner(), config=config, issue_number=1)
@@ -742,6 +746,7 @@ def test_signed_requirement_ids_match_across_transports(shim_config):
         "id": 71, "node_id": "PRR_71", "user": user("reviewer-app[bot]", uid=5, bot=True), "body": signed,
         "state": "COMMENTED", "submitted_at": "2026-09-03T00:00:00Z", "commit_id": "a" * 40,
     }]
+    routes[("GET", "user")] = INVOKER  # issue admission binds the actor (#1984)
     serve(routes)
     runner = Runner()
     issue = get_issue_context(runner, config=config, issue_number=1)
@@ -798,6 +803,8 @@ def _projection_runner(projection_comments, rest_comments):
                              "createdAt": "2026-01-01T00:00:00Z", "comments": projection_comments})
     return RoutedRunner([
         (lambda a: a[1:3] == ["issue", "view"], projection),
+        # Issue-thread admission always binds the invocation actor (#1984).
+        (lambda a: a[1:3] == ["api", "user"], json.dumps(INVOKER)),
         (lambda a: a[1] == "api" and "/comments?" in a[2], json.dumps(rest_comments)),
     ])
 

@@ -1561,22 +1561,6 @@
     {
       "module": "pr_board_state",
       "function": "authenticate_named_legacy_pr_entry",
-      "call": "_extract_round_metadata_records(pr_full, flow='pr')",
-      "family": "rounds",
-      "provenance": "pr_board_state.authenticate_named_legacy_pr_entry: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. resolve_pr_board_state admits via admitted_pr_comments; named legacy probes receive admitted PR context, and authenticate_named_legacy_pr_entry uses the actor-owned REST view.",
-      "occurrence": 1
-    },
-    {
-      "module": "pr_board_state",
-      "function": "authenticate_named_legacy_pr_entry",
-      "call": "find_latest_pr_contract(pr_full, repository=repo, pr_number=pr_number)",
-      "family": "contracts",
-      "provenance": "pr_board_state.authenticate_named_legacy_pr_entry: pr_contract uses invocation-only protocol_body for legacy records; workflow_transaction requires github.AuthenticatedCommentView bound to invocation actor, surface and complete REST listing for transaction records. Named-board preflight reads read_authenticated_protocol_comments and passes only pr_view.authored, preserving the existing transaction actor partition.",
-      "occurrence": 1
-    },
-    {
-      "module": "pr_board_state",
-      "function": "authenticate_named_legacy_pr_entry",
       "call": "find_latest_pr_contract(pr_view.authored, repository=repo, pr_number=pr_number)",
       "family": "contracts",
       "provenance": "pr_board_state.authenticate_named_legacy_pr_entry: pr_contract uses invocation-only protocol_body for legacy records; workflow_transaction requires github.AuthenticatedCommentView bound to invocation actor, surface and complete REST listing for transaction records. Named-board preflight reads read_authenticated_protocol_comments and passes only pr_view.authored, preserving the existing transaction actor partition.",

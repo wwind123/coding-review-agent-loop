@@ -187,7 +187,9 @@ def test_ordinary_signed_json_keeps_the_existing_requirement_policy(tmp_path, fl
     runner, config = fixture(tmp_path, flow, [raw(body)])
     comments = acquire(runner, config, flow)
     assert comments[0].body == body
-    assert not any(cmd[:2] == ['gh', 'api'] for cmd, _ in runner.commands)
+    # Issue threads always admit (#1984); the PR surface keeps its shortcut.
+    rest_read = any(cmd[:2] == ['gh', 'api'] for cmd, _ in runner.commands)
+    assert rest_read == (flow == 'plan')
 
 
 def test_scope_only_issue_history_still_requires_complete_acquisition(tmp_path, monkeypatch):

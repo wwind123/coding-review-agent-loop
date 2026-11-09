@@ -439,19 +439,10 @@ def authenticate_named_legacy_pr_entry(
     pr_view = read_authenticated_protocol_comments(
         runner, config=config, surface_kind="pr", number=pr_number  # type: ignore[arg-type]
     )
-    pr_full = pr_view.authored
-    for record in _extract_round_metadata_records(pr_full, flow="pr"):
-        if record.metadata.role not in _LEGACY_ENTRY_ROLES:
-            continue
-        comment = pr_full[record.index]
-        if comment.author_id != pr_view.actor_id:
-            raise refuse(
-                f"the {record.metadata.role} round record in comment {comment.comment_id} was "
-                f"written by {comment.author_login}, not {pr_view.actor_login}"
-            )
-    recorded = find_latest_pr_contract(pr_full, repository=repo, pr_number=pr_number)
-    if recorded != find_latest_pr_contract(pr_view.authored, repository=repo, pr_number=pr_number):
-        raise refuse("its PR contract record was not written by the authenticated actor")
+    # ``authored`` holds only comments written by the invocation actor, so a
+    # foreign round record or PR contract record never reaches these readers;
+    # foreign records sit in ``ignored_foreign`` and carry no authority.
+    recorded = find_latest_pr_contract(pr_view.authored, repository=repo, pr_number=pr_number)
     owning_issue_number = resolve_pr_owning_issue(
         config,
         caller_issue_number=owning_issue_number,

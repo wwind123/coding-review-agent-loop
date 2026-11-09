@@ -50,6 +50,27 @@ class ScriptedRunner(Runner):
         return result
 
 
+class IssueAdmissionRunner(ScriptedRunner):
+    """Scripted issue views plus the actor and complete listing that issue-thread
+    admission always reads (#1984); admission reads are kept in ``admission_calls``."""
+
+    def __init__(self, script, *, rest_comments=()):
+        super().__init__(script)
+        self.rest_comments = list(rest_comments)
+        self.admission_calls = []
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        args = list(args)
+        if args[1:3] == ["api", "user"]:
+            self.admission_calls.append(args)
+            return CommandResult(args, cwd, json.dumps({"login": "bot", "id": 7}), "", 0)
+        if args[1] == "api" and "/comments?" in args[2]:
+            self.admission_calls.append(args)
+            page = self.rest_comments if args[2].endswith("page=1") else []
+            return CommandResult(args, cwd, json.dumps(page), "", 0)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
 @pytest.fixture
 def sleeps(monkeypatch):
     recorded = []
@@ -189,10 +210,11 @@ def test_get_issue_context_retries_transient_then_succeeds(tmp_path, sleeps):
     payload = json.dumps(
         {"number": 5, "title": "t", "body": "b", "url": "u", "state": "OPEN", "comments": []}
     )
-    runner = ScriptedRunner([(1, "", "HTTP 504 Gateway Timeout"), (0, payload, "")])
+    runner = IssueAdmissionRunner([(1, "", "HTTP 504 Gateway Timeout"), (0, payload, "")])
     context = get_issue_context(runner, config=config, issue_number=5)
     assert context.number == 5
     assert len(runner.calls) == 2
+    assert runner.admission_calls  # issue-thread admission ran on the retried read
 
 
 def test_gh_api_json_exhaustion_and_404(tmp_path, sleeps):
@@ -530,7 +552,10 @@ def test_get_issue_context_omits_comments_flag_and_parses_json_comments(tmp_path
             ],
         }
     )
-    runner = ScriptedRunner([(0, payload, "")])
+    runner = IssueAdmissionRunner([(0, payload, "")], rest_comments=[{
+        "id": 11, "user": {"login": "bob", "id": 3}, "created_at": "2026-10-02T00:00:00Z",
+        "body": "hello",
+    }])
     context = get_issue_context(runner, config=config, issue_number=5)
     view_calls = [call for call in runner.calls if call[1:3] == ["issue", "view"]]
     assert len(view_calls) == 1

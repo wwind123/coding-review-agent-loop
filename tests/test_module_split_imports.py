@@ -733,7 +733,7 @@ def test_combined_split_sizes_and_original_policy():
 
 def test_plan_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(monkeypatch, tmp_path):
     from coding_review_agent_loop import plan_first_loop, plan_execution
-    from agent_loop_helpers import make_config
+    from agent_loop_helpers import FakeRunner, make_config
 
     reachable = (plan_first_loop, plan_execution)
     assert missing_patch_owners((plan_first_loop,), reachable, 'get_issue_context') == {plan_execution.__name__}
@@ -752,7 +752,10 @@ def test_plan_patch_coverage_detects_omitted_owner_and_intercepts_both_calls(mon
                            human_requirements=())
     monkeypatch.setattr(plan_first_loop, '_infer_staged_parent_issue', lambda context: 77)
     with pytest.raises(RuntimeError, match='local context intercepted'):
-        plan_first_loop._run_plan_first_loop(None, issue_number=1, config=config,
+        # Issue-thread admission always binds the actor, so a real fake runner
+        # serves the actor and the complete issue listing (#1984).
+        plan_first_loop._run_plan_first_loop(FakeRunner(authenticated_actor=('loop', 42)),
+                                             issue_number=1, config=config,
                                              memory=None, issue_context=context, usage_context=None)
     with pytest.raises(RuntimeError, match='local context intercepted'):
         plan_execution._run_child_planning_cycle(None, config=config, memory=None,
