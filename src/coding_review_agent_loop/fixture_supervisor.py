@@ -12,8 +12,9 @@ Protocol (one JSON object per line on stdout, commands on stdin):
 * a ``setup`` line reports the setup status, duration and bounded log tail;
 * ``teardown`` (or stdin EOF) runs ``<fixture> teardown``; the same command
   during setup interrupts setup first;
-* a ``teardown`` line, then the sweep and the host-wide census, then one
-  final ``cleanup`` line.
+* a ``teardown`` line, then the sweep and the run-scoped census (issue
+  #1995), then one final ``cleanup`` line, which also lists processes proven
+  to be in an operator-declared foreign scope (diagnostic only).
 
 The authority proof and the census are also imported by the broker process
 (``fixture_runtime``) so both use one implementation.
@@ -34,7 +35,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 try:  # Linux-only; importing this module must still work elsewhere (#1326).
     import fcntl
@@ -270,6 +271,8 @@ class CensusResult:
     cleanup: str
     escaped: list[dict[str, object]] = field(default_factory=list)
     reason: str = ""
+    # Issue #1995: provably foreign processes (diagnostic only).
+    foreign: list[dict[str, object]] = field(default_factory=list)
 
 
 def _uid_from_status(text: str) -> int | None:
@@ -322,6 +325,166 @@ def _cgroup(pid: int, proc_root: Path) -> str:
         return ""
 
 
+# Run-scoped attribution (issue #1995) ----------------------------------------
+
+MAX_ANCESTRY_DEPTH = 4096
+MAX_FOREIGN_REPORTED = MAX_ESCAPED_REPORTED
+ATTRIBUTION_RUN = "run"
+ATTRIBUTION_UNDETERMINED = "undetermined"
+
+
+def unified_cgroup_path(text: str) -> str | None:
+    """The cgroup-v2 path of a ``/proc/<pid>/cgroup`` text, or ``None``.
+
+    ``None`` when there is no ``0::`` line, or the path is empty, relative or
+    has a ``..`` component (outside the reader's cgroup namespace).
+    """
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            path = line[3:].strip()
+            if not path.startswith("/") or ".." in path.split("/") or "\x00" in path:
+                return None
+            return path
+    return None
+
+
+def read_unified_cgroup(pid: int | str, proc_root: Path = Path("/proc")) -> str | None:
+    try:
+        text = (proc_root / str(pid) / "cgroup").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return unified_cgroup_path(text)
+
+
+def cgroup_within(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or below it."""
+    if path == root:
+        return True
+    prefix = root.rstrip("/") + "/"
+    return path.startswith(prefix)
+
+
+def _strict_ancestors(path: str) -> list[str]:
+    parts = [part for part in path.split("/") if part]
+    return ["/" + "/".join(parts[:index]) for index in range(len(parts))]
+
+
+def effective_foreign_scopes(
+    patterns: Iterable[str], run_cgroup: str | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(kept patterns, warnings)`` for operator-declared foreign scopes.
+
+    A pattern matching a strict ancestor of the run cgroup covers the whole
+    subtree that contains the run, so it can never be a sibling-only
+    declaration and is discarded.  A pattern matching the run cgroup itself
+    is kept: run attribution always takes precedence, so the run cgroup
+    stays attributed.  Without a known run cgroup nothing is kept.
+    """
+    if run_cgroup is None:
+        return (), ()
+    import fnmatch
+
+    kept: list[str] = []
+    warnings: list[str] = []
+    ancestors = _strict_ancestors(run_cgroup)
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern.startswith("/"):
+            warnings.append(f"foreign scope {pattern!r} discarded: not an absolute cgroup path pattern")
+            continue
+        if any(fnmatch.fnmatchcase(ancestor, pattern) for ancestor in ancestors):
+            warnings.append(
+                f"foreign scope {pattern!r} discarded: it matches an ancestor of the run cgroup {run_cgroup}"
+            )
+            continue
+        if fnmatch.fnmatchcase(run_cgroup, pattern):
+            warnings.append(
+                f"foreign scope {pattern!r} also matches the run cgroup {run_cgroup}; "
+                "processes in the run cgroup stay attributed to the run"
+            )
+        kept.append(pattern)
+    return tuple(dict.fromkeys(kept)), tuple(warnings)
+
+
+class _CensusExpired(Exception):
+    pass
+
+
+def _classify_candidate(
+    entry: ProcEntry,
+    *,
+    table: dict[int, ProcEntry],
+    window_start: int,
+    roots: set[tuple[int, int]],
+    run_cgroup: str | None,
+    foreign_scopes: tuple[str, ...],
+    proc_root: Path,
+    check: Callable[[], None],
+) -> tuple[str, str | None]:
+    """Return ``(attribution, cgroup path)``; attribution is run, undetermined or foreign.
+
+    ``check`` raises ``_CensusExpired`` once the census deadline has passed.
+    """
+    import fnmatch
+
+    check()
+    cgroup = read_unified_cgroup(entry.pid, proc_root) if run_cgroup is not None else None
+    if cgroup is not None and run_cgroup is not None and cgroup_within(cgroup, run_cgroup):
+        return ATTRIBUTION_RUN, cgroup
+    # (a) Ancestry through a run root, matched by exact (pid, start) identity.
+    seen = {entry.pid}
+    current = entry
+    for _ in range(MAX_ANCESTRY_DEPTH):
+        check()
+        parent = table.get(current.ppid)
+        if parent is None or parent.pid in seen:
+            break
+        if (parent.pid, parent.start) in roots:
+            return ATTRIBUTION_RUN, cgroup
+        seen.add(parent.pid)
+        current = parent
+    # (b) Everything else stays undetermined unless (c) a bounded,
+    # self-consistent structural proof places it in a declared foreign scope.
+    if run_cgroup is None or not foreign_scopes or cgroup is None:
+        return ATTRIBUTION_UNDETERMINED, cgroup
+    if not any(fnmatch.fnmatchcase(cgroup, pattern) for pattern in foreign_scopes):
+        return ATTRIBUTION_UNDETERMINED, cgroup
+    chain: list[ProcEntry] = [entry]
+    seen = {entry.pid}
+    current = entry
+    anchor: ProcEntry | None = None
+    for _ in range(MAX_ANCESTRY_DEPTH):
+        check()
+        if current.ppid <= 0:
+            return ATTRIBUTION_UNDETERMINED, cgroup
+        parent = table.get(current.ppid)
+        if parent is None or parent.pid in seen:
+            return ATTRIBUTION_UNDETERMINED, cgroup
+        if parent.start > current.start:
+            # Impossible order: the parent PID was recycled.
+            return ATTRIBUTION_UNDETERMINED, cgroup
+        if parent.pid == 1 or parent.ppid <= 0:
+            # Reparented to init, or delegated to a unit/shim: origin unknown.
+            return ATTRIBUTION_UNDETERMINED, cgroup
+        check()
+        if read_unified_cgroup(parent.pid, proc_root) != cgroup:
+            return ATTRIBUTION_UNDETERMINED, cgroup
+        chain.append(parent)
+        seen.add(parent.pid)
+        if parent.start < window_start:
+            anchor = parent
+            break
+        current = parent
+    if anchor is None:
+        return ATTRIBUTION_UNDETERMINED, cgroup
+    # Re-verify every identity of the proof after its cgroup was read.
+    for item in chain:
+        check()
+        again = read_entry(item.pid, proc_root)
+        if again is None or (again.pid, again.start) != (item.pid, item.start) or again.ppid != item.ppid:
+            return ATTRIBUTION_UNDETERMINED, cgroup
+    return "foreign", cgroup
+
+
 def census(
     *,
     window_start: int,
@@ -329,15 +492,25 @@ def census(
     self_identity: tuple[int, int],
     proc_root: Path = Path("/proc"),
     deadline: float | None = None,
+    run_cgroup: str | None = None,
+    run_roots: Iterable[tuple[int, int]] = (),
+    foreign_scopes: Sequence[str] = (),
 ) -> CensusResult:
-    """Flag every live non-kernel process of any uid started in the window.
+    """Flag every live non-kernel process started in the window that the run could own.
 
     The exclusions are the census process's own exact (pid, start) identity,
     the owned inventory, and entries that have already exited and only await
     reaping (a single-thread entry that both stat and status report as
-    zombie or dead), which are not live processes.  There is no uid, ancestry
-    or scope exemption.  A recycled PID with a different start time is still
-    flagged.
+    zombie or dead), which are not live processes.  A recycled PID with a
+    different start time is still flagged.
+
+    Issue #1995: every other in-window process is classified.  It is ``run``
+    when it sits in or below ``run_cgroup`` or descends from the supervisor,
+    a ``run_roots`` identity or an owned identity, and ``undetermined`` unless
+    a bounded, self-consistent structural proof places it in an
+    operator-declared ``foreign_scopes`` cgroup.  Only provably foreign
+    processes are left out of ``escaped`` (they are listed in ``foreign``).
+    Without ``run_cgroup`` the census stays host-wide: nothing is foreign.
     """
     owned_set = set(owned)
     try:
@@ -346,10 +519,12 @@ def census(
         return CensusResult("unconfirmed", reason="process table is unreadable")
     if len(names) > MAX_CENSUS_ENTRIES:
         return CensusResult("unconfirmed", reason="process table exceeds the census bound")
-    escaped: list[dict[str, object]] = []
+    bound_reason = "census exceeded its bound"
+    table: dict[int, ProcEntry] = {}
+    candidates: list[tuple[ProcEntry, int | None]] = []
     for name in names:
         if deadline is not None and time.monotonic() > deadline:
-            return CensusResult("unconfirmed", reason="census exceeded its bound")
+            return CensusResult("unconfirmed", reason=bound_reason)
         if not name.isdigit():
             continue
         path = proc_root / name / "stat"
@@ -378,6 +553,7 @@ def census(
             if not (proc_root / name).exists():
                 continue
             return CensusResult("unconfirmed", reason=f"/proc entry {name} status is unreadable")
+        table[entry.pid] = entry
         if is_kernel_thread(entry):
             continue
         if _is_reapable_dead(entry, status_text):
@@ -387,17 +563,40 @@ def census(
         identity = (entry.pid, entry.start)
         if identity == tuple(self_identity) or identity in owned_set:
             continue
-        escaped.append(
-            {
+        candidates.append((entry, _uid_from_status(status_text)))
+    scopes, _warnings = effective_foreign_scopes(foreign_scopes, run_cgroup)
+    roots = {tuple(self_identity), *owned_set, *(tuple(item) for item in run_roots)}
+
+    def check() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise _CensusExpired()
+
+    escaped: list[dict[str, object]] = []
+    foreign: list[dict[str, object]] = []
+    try:
+        for entry, uid in candidates:
+            attribution, _path = _classify_candidate(
+                entry, table=table, window_start=window_start, roots=roots,  # type: ignore[arg-type]
+                run_cgroup=run_cgroup, foreign_scopes=scopes, proc_root=proc_root, check=check,
+            )
+            check()
+            item: dict[str, object] = {
                 "pid": entry.pid,
-                "uid": _uid_from_status(status_text),
+                "uid": uid,
                 "comm": entry.comm,
                 "cgroup": _cgroup(entry.pid, proc_root),
             }
-        )
+            if attribution == "foreign":
+                foreign.append(item)
+            else:
+                item["attribution"] = attribution
+                escaped.append(item)
+    except _CensusExpired:
+        # Never a partial classification.
+        return CensusResult("unconfirmed", reason=bound_reason)
     if escaped:
-        return CensusResult("escaped", escaped=escaped)
-    return CensusResult("confirmed")
+        return CensusResult("escaped", escaped=escaped, foreign=foreign)
+    return CensusResult("confirmed", foreign=foreign)
 
 
 # Supervisor ------------------------------------------------------------------
@@ -426,6 +625,15 @@ class _Supervisor:
         self.self_start = own.start if own is not None else 0
         # Recorded before setup is forked.
         self.window_start = self.self_start
+        # Issue #1995: the broker spawned this process directly, so the parent
+        # is the broker; identities are always compared as (pid, start).
+        parent = read_entry(os.getppid())
+        self.broker_identity: tuple[int, int] | None = (
+            (parent.pid, parent.start) if parent is not None and parent.pid > 1 else None
+        )
+        self.declared_foreign_scopes: tuple[str, ...] = tuple(getattr(args, "foreign_scope", None) or ())
+        self.run_cgroup: str | None = None
+        self.foreign_scopes: tuple[str, ...] = ()
         self.inventory: dict[int, int] = {}
         self.teardown_requested = False
         self.stdin_closed = False
@@ -598,6 +806,78 @@ class _Supervisor:
         empty = not descendants(self.pid, process_table()) and not self._inventory_alive()
         return len(swept), empty
 
+    def resolve_run_scope(self, proc_root: Path = Path("/proc")) -> None:
+        """Read the run cgroup after the broker's cgroup attachment (issue #1995).
+
+        Without a readable cgroup-v2 path or broker identity the census stays
+        host-wide.  Declared foreign scopes that would cover the run's own
+        subtree are discarded here, with a visible warning.
+        """
+        run_cgroup = read_unified_cgroup("self", proc_root)
+        if self.broker_identity is None:
+            run_cgroup = None
+        self.run_cgroup = run_cgroup
+        kept, warnings = effective_foreign_scopes(self.declared_foreign_scopes, run_cgroup)
+        if self.declared_foreign_scopes and run_cgroup is None:
+            warnings = (
+                "run cgroup is unknown; declared foreign scopes are ignored and the census stays host-wide",
+            )
+        self.foreign_scopes = kept
+        try:
+            for warning in warnings:
+                sys.stderr.write(f"agent-loop fixture: warning: {warning}\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+    def run_census(self, deadline: float, proc_root: Path = Path("/proc")) -> CensusResult:
+        return census(
+            window_start=self.window_start,
+            owned=self.inventory.items(),
+            self_identity=(self.pid, self.self_start),
+            proc_root=proc_root,
+            deadline=deadline,
+            run_cgroup=self.run_cgroup,
+            run_roots=(() if self.broker_identity is None else (self.broker_identity,)),
+            foreign_scopes=self.foreign_scopes,
+        )
+
+    def emit_cleanup(self, result: CensusResult, *, swept: int) -> None:
+        hint = (
+            "" if self.foreign_scopes
+            else " (no foreign scope declared; see --fixture-foreign-scope)"
+        )
+        try:
+            for item in result.escaped[:MAX_ESCAPED_REPORTED]:
+                attribution = item.get("attribution", ATTRIBUTION_UNDETERMINED)
+                sys.stderr.write(
+                    "agent-loop fixture: escaped process pid={pid} uid={uid} comm={comm} cgroup={cgroup}".format(**item)
+                    + f" attribution={attribution}"
+                    + (hint if attribution == ATTRIBUTION_UNDETERMINED else "")
+                    + "\n"
+                )
+            for item in result.foreign[:MAX_FOREIGN_REPORTED]:
+                sys.stderr.write(
+                    "agent-loop fixture: foreign process (declared foreign scope) "
+                    "pid={pid} uid={uid} comm={comm} cgroup={cgroup}\n".format(**item)
+                )
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        _emit(
+            {
+                "event": "cleanup",
+                "cleanup": result.cleanup,
+                "reason": result.reason,
+                "inventoried": len(self.inventory),
+                "swept": swept,
+                "escaped": result.escaped[:MAX_ESCAPED_REPORTED],
+                "escaped_count": len(result.escaped),
+                "foreign": result.foreign[:MAX_FOREIGN_REPORTED],
+                "foreign_count": len(result.foreign),
+            }
+        )
+
     def _inventory_alive(self) -> bool:
         for pid, start in self.inventory.items():
             entry = read_entry(pid)
@@ -641,6 +921,8 @@ class _Supervisor:
             if line.strip() == b"start":
                 setup_status = None
                 break
+        # After the go-ahead, which follows the broker's cgroup attachment.
+        self.resolve_run_scope()
         if setup_status is None and time.monotonic() >= self.setup_deadline:
             # The go-ahead was consumed after the absolute setup deadline
             # (for example the supervisor was descheduled): never start setup.
@@ -683,31 +965,8 @@ class _Supervisor:
             except HostAuthorityError as exc:
                 result = CensusResult("unconfirmed", reason=f"census authority lost: {exc}")
             else:
-                result = census(
-                    window_start=self.window_start,
-                    owned=self.inventory.items(),
-                    self_identity=(self.pid, self.self_start),
-                    deadline=sweep_deadline,
-                )
-        try:
-            for item in result.escaped[:MAX_ESCAPED_REPORTED]:
-                sys.stderr.write(
-                    "agent-loop fixture: escaped process pid={pid} uid={uid} comm={comm} cgroup={cgroup}\n".format(**item)
-                )
-            sys.stderr.flush()
-        except (OSError, ValueError):
-            pass
-        _emit(
-            {
-                "event": "cleanup",
-                "cleanup": result.cleanup,
-                "reason": result.reason,
-                "inventoried": len(self.inventory),
-                "swept": swept,
-                "escaped": result.escaped[:MAX_ESCAPED_REPORTED],
-                "escaped_count": len(result.escaped),
-            }
-        )
+                result = self.run_census(sweep_deadline)
+        self.emit_cleanup(result, swept=swept)
         return 0
 
 
@@ -719,6 +978,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--teardown-timeout", required=True, type=float)
     parser.add_argument("--sweep-allowance", required=True, type=float)
     parser.add_argument("--mount-id", required=True)
+    # Issue #1995: operator-declared foreign cgroup scopes, from orchestrator
+    # config only (the broker never takes them from a run-tests client).
+    parser.add_argument("--foreign-scope", action="append", default=[])
     args = parser.parse_args(argv)
     return _Supervisor(args).run()
 

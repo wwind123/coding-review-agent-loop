@@ -4,8 +4,10 @@ The broker validates fixture provenance before anything launches, then runs
 ``<fixture> setup``, the unchanged recognized inner command and
 ``<fixture> teardown`` under one absolute request deadline.  A Linux
 child-subreaper supervisor (:mod:`fixture_supervisor`) owns every fixture
-descendant; cleanup is confirmed only when its owned tree is empty and a
-host-wide census finds no process started in the window outside that tree.
+descendant; cleanup is confirmed only when its owned tree is empty and the
+census finds no process started in the window that the run could own
+(issue #1995: processes proven to be in an operator-declared foreign scope
+are reported as diagnostics only).
 
 The fixture is never probed or recorded as a launcher: launch integrity
 still authenticates only the inner command.
@@ -24,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .errors import AgentLoopError
 from .fixture_supervisor import (
@@ -292,6 +294,15 @@ def log_excerpt(redacted: str) -> str:
 # Supervisor handle --------------------------------------------------------------
 
 
+def supervisor_scope_arguments(foreign_scopes: Sequence[str]) -> list[str]:
+    """Repeated ``--foreign-scope`` arguments for valid absolute patterns."""
+    arguments: list[str] = []
+    for pattern in dict.fromkeys(foreign_scopes or ()):
+        if isinstance(pattern, str) and pattern.startswith("/") and "\x00" not in pattern and "\n" not in pattern:
+            arguments.extend(("--foreign-scope", pattern))
+    return arguments
+
+
 @dataclass
 class SetupDecision:
     """What the runner does after the post-admission setup hook."""
@@ -338,11 +349,13 @@ class FixtureSupervisor:
         request_deadline: float,
         teardown_seconds: float,
         mount_id: str,
+        foreign_scopes: Sequence[str] = (),
     ) -> "FixtureSupervisor":
         """Spawn the supervisor; deadlines are absolute ``time.monotonic()`` values.
 
         CLOCK_MONOTONIC is system-wide on Linux, so the supervisor enforces
-        the same absolute deadlines as the broker.
+        the same absolute deadlines as the broker.  ``foreign_scopes`` comes
+        from parent-owned orchestrator config only (issue #1995).
         """
         spawn_cwd: str | Path = cwd
         preexec: Callable[[], None] | None = None
@@ -358,6 +371,7 @@ class FixtureSupervisor:
                 "--teardown-timeout", f"{max(0.1, teardown_seconds):.3f}",
                 "--sweep-allowance", f"{SWEEP_ALLOWANCE_SECONDS:.3f}",
                 "--mount-id", mount_id,
+                *supervisor_scope_arguments(foreign_scopes),
             ],
             cwd=spawn_cwd,
             preexec_fn=preexec,
@@ -556,7 +570,11 @@ class FixtureSupervisor:
                     escaped.append(
                         _safe_text(
                             f"pid={item.get('pid')} uid={item.get('uid')} comm={item.get('comm')} "
-                            f"cgroup={item.get('cgroup')}",
+                            + (
+                                f"attribution={item.get('attribution')} "
+                                if item.get("attribution") in {"run", "undetermined"} else ""
+                            )
+                            + f"cgroup={item.get('cgroup')}",
                             160,
                         )
                     )

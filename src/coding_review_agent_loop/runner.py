@@ -1951,6 +1951,8 @@ class Runner:
         self._active_procs: dict[int, subprocess.Popen] = {}
         self._interrupted = False
         self.containment_policy = containment_policy
+        # Issue #1995: operator-declared foreign scopes for the fixture census.
+        self.fixture_foreign_scopes: tuple[str, ...] = ()
         self._containment_manifest = None
         self._active_handles: dict[str, InvocationHandle] = {}
         self._active_test_brokers: dict[str, TestBrokerServer] = {}
@@ -1989,6 +1991,7 @@ class Runner:
         self.test_workers = workers
         self.test_worker_memory = memory
         self.test_worker_enforcement = mode or "clamp"
+        self.fixture_foreign_scopes = tuple(values.get("fixture_foreign_scopes") or ())
         self._containment_manifest = None
 
     def preflight_containment(self):
@@ -2120,6 +2123,8 @@ class Runner:
                 # Issue #1651: the backend override env is built in this
                 # process from parent config, never from the agent's process.
                 dependency_remedy=_broker_dependency_remedy(env),
+                # Issue #1995: parent config only, never the agent's request.
+                fixture_foreign_scopes=getattr(self, "fixture_foreign_scopes", ()),
             ).start()
         except (OSError, ValueError, AgentLoopError) as exc:
             # Broker setup is infrastructure telemetry. A coder can still use

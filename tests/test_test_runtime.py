@@ -8011,3 +8011,387 @@ def test_exported_launcher_is_recognized_only_in_reports(launcher):
     assert parsed.memory_dir == Path("/outside/cache")
     with pytest.raises(runtime.TestRuntimeConfigurationError):
         runtime.parse_managed_test_invocation([launcher, "run-tests", "--unknown", "--", "pytest"], allow_command_name_launcher=True)
+
+
+# --- #1995: run-scoped fixture census -----------------------------------------
+
+_SCOPE_APP = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+_SCOPE_RUN = f"{_SCOPE_APP}/tmux-spawn-A.scope"
+_SCOPE_SIBLING = f"{_SCOPE_APP}/tmux-spawn-B.scope"
+_SCOPE_TMUX_GLOB = f"{_SCOPE_APP}/tmux-spawn-*.scope"
+_BROKER_1995 = (90, 90)
+
+
+def _proc_1995(root: Path, extra: dict[int, dict]) -> Path:
+    """Init, a broker and the supervisor in the run cgroup, plus a sibling claude session."""
+    base = {
+        1: {"start": 1, "ppid": 0, "cgroup": "0::/init.scope"},
+        2: {"start": 1, "ppid": 0, "comm": "kthreadd"},
+        10: {"start": 5, "ppid": 1, "comm": "tmux", "cgroup": f"0::{_SCOPE_APP}/tmux.service"},
+        20: {"start": 20, "ppid": 10, "comm": "claude", "cgroup": f"0::{_SCOPE_SIBLING}"},
+        90: {"start": 90, "ppid": 1, "comm": "broker", "cgroup": f"0::{_SCOPE_RUN}"},
+        100: {"start": 100, "ppid": 90, "comm": "supervisor", "cgroup": f"0::{_SCOPE_RUN}"},
+    }
+    base.update(extra)
+    return _fx_fake_proc(root, base)
+
+
+def _census_1995(proc: Path, *, scopes=(_SCOPE_TMUX_GLOB,), run_cgroup=_SCOPE_RUN, owned=(), roots=(_BROKER_1995,),
+                 deadline=None):
+    return fx_supervisor.census(
+        window_start=100, owned=owned, self_identity=(100, 100), proc_root=proc, deadline=deadline,
+        run_cgroup=run_cgroup, run_roots=roots, foreign_scopes=scopes,
+    )
+
+
+_SIBLING_TREE_1995 = {
+    300: {"start": 150, "ppid": 20, "comm": "bash", "cgroup": f"0::{_SCOPE_SIBLING}"},
+    301: {"start": 151, "ppid": 300, "comm": "bash", "cgroup": f"0::{_SCOPE_SIBLING}"},
+    302: {"start": 152, "ppid": 301, "comm": "sleep", "cgroup": f"0::{_SCOPE_SIBLING}"},
+}
+
+
+def test_census_foreign_session_in_declared_scope_is_confirmed_1995(tmp_path, monkeypatch):
+    """Matrix row `census-foreign-same-scope-confirmed`."""
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(fx_supervisor.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    proc = _proc_1995(tmp_path / "proc", dict(_SIBLING_TREE_1995))
+    result = _census_1995(proc)
+    assert result.cleanup == "confirmed", result
+    assert result.escaped == []
+    assert sorted(item["pid"] for item in result.foreign) == [300, 301, 302]
+    for item in result.foreign:
+        assert set(item) == {"pid", "uid", "comm", "cgroup"}
+        assert item["uid"] == 1000 and _SCOPE_SIBLING in item["cgroup"]
+    assert sorted(item["comm"] for item in result.foreign) == ["bash", "bash", "sleep"]
+    assert signals == []
+
+
+@pytest.mark.parametrize("scopes", [(), ("/system.slice/other.service",)])
+def test_census_undeclared_local_delegation_stays_flagged_1995(tmp_path, scopes):
+    """Matrix row `census-undeclared-local-delegation-flagged`."""
+    manager_cgroup = "0::/system.slice/manager.service"
+    tree = {
+        50: {"start": 50, "ppid": 1, "comm": "manager", "cgroup": manager_cgroup},
+        200: {"start": 150, "ppid": 50, "comm": "intermediate", "cgroup": manager_cgroup},
+        201: {"start": 151, "ppid": 200, "comm": "worker", "cgroup": manager_cgroup},
+    }
+    result = _census_1995(_proc_1995(tmp_path / "a", tree), scopes=scopes)
+    assert result.cleanup == "escaped" and result.foreign == []
+    assert {(item["pid"], item["attribution"]) for item in result.escaped} == {
+        (200, "undetermined"), (201, "undetermined"),
+    }
+    declared = _census_1995(_proc_1995(tmp_path / "b", tree), scopes=("/system.slice/manager.service",))
+    assert declared.cleanup == "confirmed"
+    assert sorted(item["pid"] for item in declared.foreign) == [200, 201]
+
+
+def test_census_run_attributable_leaks_are_flagged_before_foreign_scope_1995(tmp_path):
+    """Matrix row `census-run-attributable-flagged`."""
+    tree = {
+        101: {"start": 101, "ppid": 100, "cgroup": f"0::{_SCOPE_RUN}"},              # owned
+        400: {"start": 160, "ppid": 1, "cgroup": f"0::{_SCOPE_RUN}/child"},          # run cgroup, reparented
+        401: {"start": 161, "ppid": 100, "cgroup": f"0::{_SCOPE_SIBLING}"},          # supervisor child moved
+        402: {"start": 162, "ppid": 90, "cgroup": f"0::{_SCOPE_SIBLING}"},           # broker child moved
+        403: {"start": 163, "ppid": 101, "cgroup": f"0::{_SCOPE_SIBLING}"},          # owned descendant moved
+    }
+    result = _census_1995(_proc_1995(tmp_path / "proc", tree), owned={(101, 101)})
+    assert result.cleanup == "escaped"
+    assert result.foreign == []
+    assert {(item["pid"], item["attribution"]) for item in result.escaped} == {
+        (400, "run"), (401, "run"), (402, "run"), (403, "run"),
+    }
+
+
+def test_census_delegated_or_reparented_work_is_undetermined_1995(tmp_path):
+    """Matrix row `census-delegated-shapes-flagged`."""
+    tree = {
+        60: {"start": 60, "ppid": 1, "comm": "containerd", "cgroup": "0::/system.slice/containerd.service"},
+        500: {"start": 170, "ppid": 1, "comm": "unit", "cgroup": "0::/system.slice/run-u5.scope"},
+        501: {"start": 171, "ppid": 60, "comm": "container", "cgroup": "0::/system.slice/docker-abc.scope"},
+        502: {"start": 172, "ppid": 1, "comm": "orphan", "cgroup": f"0::{_SCOPE_SIBLING}"},
+    }
+    result = _census_1995(
+        _proc_1995(tmp_path / "proc", tree),
+        scopes=("/system.slice/*", _SCOPE_TMUX_GLOB),
+    )
+    assert result.cleanup == "escaped" and result.foreign == []
+    assert {(item["pid"], item["attribution"]) for item in result.escaped} == {
+        (500, "undetermined"), (501, "undetermined"), (502, "undetermined"),
+    }
+
+
+def test_census_unprovable_origin_in_declared_scope_is_undetermined_1995(tmp_path):
+    """Matrix row `census-unprovable-origin-flagged`."""
+    sibling = f"0::{_SCOPE_SIBLING}"
+    tree = {
+        600: {"start": 150, "ppid": 20, "cgroup": sibling},                       # cgroup file removed below
+        601: {"start": 151, "ppid": 20, "cgroup": "1:name=systemd:/user.slice"},  # no v2 line
+        602: {"start": 152, "ppid": 20, "cgroup": f"0::{_SCOPE_APP}/../tmux-spawn-B.scope"},
+        603: {"start": 153, "ppid": 20, "cgroup": "0::/user.slice/other.scope"},  # intermediate elsewhere
+        604: {"start": 154, "ppid": 603, "cgroup": sibling},
+        605: {"start": 155, "ppid": 4242, "cgroup": sibling},                     # missing parent
+        610: {"start": 156, "ppid": 611, "cgroup": sibling},                      # cycle
+        611: {"start": 156, "ppid": 610, "cgroup": sibling},
+        **_SIBLING_TREE_1995,                                                   # control: still foreign
+    }
+    proc = _proc_1995(tmp_path / "proc", tree)
+    (proc / "600" / "cgroup").unlink()
+    result = _census_1995(proc)
+    assert result.cleanup == "escaped"
+    flagged = {item["pid"]: item["attribution"] for item in result.escaped}
+    assert flagged == {pid: "undetermined" for pid in (600, 601, 602, 603, 604, 605, 610, 611)}
+    assert sorted(item["pid"] for item in result.foreign) == [300, 301, 302]
+
+
+def test_census_ancestry_depth_bound_is_undetermined_1995(tmp_path, monkeypatch):
+    """Matrix row `census-unprovable-origin-flagged` (depth bound)."""
+    monkeypatch.setattr(fx_supervisor, "MAX_ANCESTRY_DEPTH", 2)
+    result = _census_1995(_proc_1995(tmp_path / "proc", dict(_SIBLING_TREE_1995)))
+    assert result.cleanup == "escaped"
+    # 300 and 301 reach their pre-window anchor within two steps; 302 needs three.
+    assert sorted(item["pid"] for item in result.foreign) == [300, 301]
+    assert [(item["pid"], item["attribution"]) for item in result.escaped] == [(302, "undetermined")]
+
+
+def test_census_without_run_cgroup_stays_host_wide_1995(tmp_path):
+    """Matrix row `census-host-wide-fallback`."""
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        1: {"start": 1, "ppid": 0},
+        2: {"start": 1, "ppid": 0, "comm": "kthreadd"},
+        50: {"start": 50, "ppid": 1, "comm": "manager"},
+        100: {"start": 100, "ppid": 1, "comm": "supervisor"},
+        101: {"start": 101, "ppid": 100},
+        200: {"start": 150, "ppid": 50, "comm": "intermediate"},
+        201: {"start": 151, "ppid": 200, "comm": "worker"},
+        300: {"start": 160, "ppid": 1, "cgroup": "0::/user.slice/agent-loop-foreign.scope"},
+        400: {"start": 170, "ppid": 1, "uid": 0, "comm": "containerd-shim"},
+    })
+    result = fx_supervisor.census(
+        window_start=100, owned={(101, 101)}, self_identity=(100, 100), proc_root=proc,
+        run_cgroup=None, run_roots={(90, 90)}, foreign_scopes=("/user.slice", "/user.slice/*"),
+    )
+    assert result.cleanup == "escaped"
+    assert {item["pid"] for item in result.escaped} == {200, 201, 300, 400}
+    assert result.foreign == []
+
+
+def _supervisor_args_1995(scopes=()):
+    import argparse
+
+    return argparse.Namespace(
+        fixture="/bin/true", setup_deadline=0.0, request_deadline=0.0, teardown_timeout=1.0,
+        sweep_allowance=1.0, mount_id="1", foreign_scope=list(scopes),
+    )
+
+
+def test_supervisor_unknown_run_cgroup_or_broker_keeps_host_wide_1995(tmp_path, capsys):
+    """Matrix row `census-host-wide-fallback` (supervisor inputs)."""
+    supervisor = fx_supervisor._Supervisor(_supervisor_args_1995([_SCOPE_TMUX_GLOB]))
+    # (a) /proc/self/cgroup unreadable.
+    supervisor.broker_identity = _BROKER_1995
+    supervisor.resolve_run_scope(proc_root=tmp_path / "empty")
+    assert supervisor.run_cgroup is None and supervisor.foreign_scopes == ()
+    # (b) readable cgroup, but the broker identity is unknown.
+    (tmp_path / "proc" / "self").mkdir(parents=True)
+    (tmp_path / "proc" / "self" / "cgroup").write_text(f"0::{_SCOPE_RUN}\n")
+    supervisor.broker_identity = None
+    supervisor.resolve_run_scope(proc_root=tmp_path / "proc")
+    assert supervisor.run_cgroup is None and supervisor.foreign_scopes == ()
+    assert "census stays host-wide" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("unreadable", ["stat", "status"])
+def test_scoped_census_unreadable_entry_is_still_unconfirmed_1995(tmp_path, unreadable):
+    """Matrix row `census-unreadable-proc-unconfirmed`."""
+    proc = _proc_1995(tmp_path / "proc", dict(_SIBLING_TREE_1995))
+    target = proc / "301" / unreadable
+    target.unlink()
+    target.mkdir()
+    result = _census_1995(proc)
+    assert result.cleanup == "unconfirmed"
+    assert result.reason == (
+        "/proc entry 301 is unreadable" if unreadable == "stat" else "/proc entry 301 status is unreadable"
+    )
+    assert result.foreign == []
+
+
+def test_census_recycled_or_changing_identities_are_not_trusted_1995(tmp_path, monkeypatch):
+    """Matrix row `census-recycled-root-pid`."""
+    sibling = f"0::{_SCOPE_SIBLING}"
+    # (a) The broker's pid with a different start time is not a run root.
+    proc = _proc_1995(tmp_path / "a", {
+        90: {"start": 95, "ppid": 1, "comm": "recycled", "cgroup": "0::/user.slice/x.scope"},
+        700: {"start": 150, "ppid": 90, "cgroup": sibling},
+    })
+    result = _census_1995(proc)
+    assert [(item["pid"], item["attribution"]) for item in result.escaped] == [(700, "undetermined")]
+    # (b) A recycled intermediate parent that started after its child.
+    proc = _proc_1995(tmp_path / "b", {
+        711: {"start": 160, "ppid": 20, "cgroup": sibling},
+        710: {"start": 150, "ppid": 711, "cgroup": sibling},
+    })
+    result = _census_1995(proc)
+    assert {(item["pid"], item["attribution"]) for item in result.escaped} == {(710, "undetermined")}
+    assert sorted(item["pid"] for item in result.foreign) == [711]
+    # (c) An identity that changes while its cgroup is read.
+    proc = _proc_1995(tmp_path / "c", dict(_SIBLING_TREE_1995))
+    original = fx_supervisor.read_unified_cgroup
+
+    def mutate(pid, proc_root=Path("/proc")):
+        if str(pid) == "301":
+            stat = proc_root / "301" / "stat"
+            stat.write_text(stat.read_text().replace(" 151\n", " 999\n"))
+        return original(pid, proc_root)
+
+    monkeypatch.setattr(fx_supervisor, "read_unified_cgroup", mutate)
+    result = _census_1995(proc)
+    assert result.cleanup == "escaped"
+    flagged = {item["pid"] for item in result.escaped}
+    assert 301 in flagged and 302 in flagged
+    assert all(item["attribution"] == "undetermined" for item in result.escaped)
+
+
+def test_census_deadline_during_classification_is_unconfirmed_1995(tmp_path, monkeypatch):
+    """Matrix row `census-deadline-during-classification`."""
+    proc = _proc_1995(tmp_path / "proc", dict(_SIBLING_TREE_1995))
+    clock = {"now": 0.0}
+    original = fx_supervisor.read_unified_cgroup
+
+    def slow(pid, proc_root=Path("/proc")):
+        clock["now"] = 10.0  # the deadline passes during a phase-2 read
+        return original(pid, proc_root)
+
+    monkeypatch.setattr(fx_supervisor, "read_unified_cgroup", slow)
+    monkeypatch.setattr(fx_supervisor.time, "monotonic", lambda: clock["now"])
+    result = _census_1995(proc, deadline=5.0)
+    assert result.cleanup == "unconfirmed"
+    assert result.reason == "census exceeded its bound"
+    assert result.foreign == [] and result.escaped == []
+
+
+def test_supervisor_cleanup_event_reports_foreign_without_changing_the_record_1995(tmp_path, capsys):
+    """Matrix row `supervisor-cleanup-event-foreign`."""
+    from types import SimpleNamespace
+
+    supervisor = fx_supervisor._Supervisor(_supervisor_args_1995([_SCOPE_TMUX_GLOB]))
+    supervisor.foreign_scopes = (_SCOPE_TMUX_GLOB,)
+    foreign = [{"pid": 1000 + i, "uid": 1000, "comm": "sleep", "cgroup": f"0::{_SCOPE_SIBLING}"} for i in range(20)]
+    supervisor.emit_cleanup(fx_supervisor.CensusResult("confirmed", foreign=foreign), swept=2)
+    captured = capsys.readouterr()
+    event = json.loads(captured.out.strip().splitlines()[-1])
+    assert event["event"] == "cleanup" and event["cleanup"] == "confirmed"
+    assert event["foreign_count"] == 20
+    assert len(event["foreign"]) == fx_supervisor.MAX_FOREIGN_REPORTED
+    assert event["escaped"] == [] and event["escaped_count"] == 0
+    assert "foreign process (declared foreign scope) pid=1000 " in captured.err
+    provenance = fx_runtime.FixtureProvenance("tests/fx.sh", tmp_path / "fx.sh", "100755", "a" * 40)
+    handle = fx_runtime.FixtureSupervisor(provenance, SimpleNamespace(pid=1), 5.0, None)
+    handle.setup_event = {"event": "setup", "status": 0, "duration": 0.1, "log": "", "ran": True}
+    handle.teardown_event = {"event": "teardown", "status": 0, "duration": 0.1, "log": "", "ran": True}
+    handle.cleanup_event = event
+    record, _excerpts = handle.record()
+    assert record.cleanup == "confirmed" and record.clean
+    assert record.escaped == 0 and record.escaped_processes == ()
+    assert fx_evidence.FIXTURE_RECORD_FIELDS == frozenset({
+        "path", "digest", "setup_status", "setup_duration_seconds", "setup_log_digest",
+        "teardown_status", "teardown_duration_seconds", "teardown_log_digest", "cleanup",
+        "inventoried", "swept", "escaped", "escaped_processes",
+    })
+    assert set(record.to_dict()) == fx_evidence.FIXTURE_RECORD_FIELDS
+    assert fx_evidence.FixtureRecord.from_mapping(record.to_dict()) == record
+    # An escaped entry carries its attribution in the bounded record string.
+    escaped = {"pid": 7, "uid": 1000, "comm": "leak", "cgroup": f"0::{_SCOPE_RUN}", "attribution": "run"}
+    supervisor.emit_cleanup(fx_supervisor.CensusResult("escaped", escaped=[escaped]), swept=0)
+    captured = capsys.readouterr()
+    assert "escaped process pid=7 " in captured.err and "attribution=run" in captured.err
+    handle.cleanup_event = json.loads(captured.out.strip().splitlines()[-1])
+    record, _excerpts = handle.record()
+    assert record.cleanup == "escaped" and "attribution=run" in record.escaped_processes[0]
+
+
+def test_foreign_scopes_are_operator_owned_and_subordinate_to_run_1995(tmp_path, monkeypatch, capsys):
+    """Matrix row `foreign-scope-operator-only`."""
+    import dataclasses
+    from types import SimpleNamespace
+    from coding_review_agent_loop.config import validate_fixture_foreign_scopes
+    from coding_review_agent_loop.runner import Runner
+
+    # Orchestrator flag -> config -> runner -> broker.
+    args = build_parser().parse_args([
+        "pr", "5", "--fixture-foreign-scope", _SCOPE_TMUX_GLOB, "--fixture-foreign-scope", _SCOPE_APP,
+    ])
+    assert args.fixture_foreign_scope == [_SCOPE_TMUX_GLOB, _SCOPE_APP]
+    assert validate_fixture_foreign_scopes(args.fixture_foreign_scope) == (_SCOPE_TMUX_GLOB, _SCOPE_APP)
+    with pytest.raises(AgentLoopError):
+        validate_fixture_foreign_scopes(["relative/*.scope"])
+    # The run-tests client has no such option.
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run-tests", "--fixture-foreign-scope", "/x", "--", "pytest"])
+    capsys.readouterr()
+    config = dataclasses.replace(make_config(tmp_path), fixture_foreign_scopes=(_SCOPE_TMUX_GLOB, _SCOPE_APP))
+    runner = Runner()
+    runner.configure_from_config(config)
+    assert runner.fixture_foreign_scopes == (_SCOPE_TMUX_GLOB, _SCOPE_APP)
+    broker, _turn = runner._start_test_broker(
+        cwd=tmp_path, role="coder", env={"AGENT_LOOP_FIXTURE_FOREIGN_SCOPE": "/client/*"},
+    )
+    try:
+        assert broker is not None
+        assert broker.fixture_foreign_scopes == (_SCOPE_TMUX_GLOB, _SCOPE_APP)
+        # A client request naming a scope is refused before anything runs.
+        with pytest.raises(fx_evidence.BrokerProtocolError, match="unknown or missing fields"):
+            fx_evidence._validate_broker_request(
+                {"turn_id": "t", "nonce": "n", "argv": ["pytest"], "timeout_seconds": 60, "cwd": ".",
+                 "environment": {}, "foreign_scopes": ["/client/*"]},
+                turn_id="t", capability="c", root=tmp_path, ceiling=1800,
+            )
+        # The supervisor launch takes the scopes from the broker, never from the request environment.
+        launched: list[dict] = []
+
+        def fake_launch(*_args, **kwargs):
+            launched.append(kwargs)
+            raise OSError("not launched in this test")
+
+        monkeypatch.setattr(fx_runtime.FixtureSupervisor, "launch", staticmethod(fake_launch))
+        run = SimpleNamespace(
+            provenance=None, request_deadline=time.monotonic() + 600, timeout_seconds=600.0,
+            mount_id="1", reserve=10.0, supervisor=None, decision=None,
+        )
+        hook = broker._fixture_setup_hook(
+            run, cwd=tmp_path, cwd_fd=0, environment={"AGENT_LOOP_FIXTURE_FOREIGN_SCOPE": "/client/*"},
+            parent_cgroup=None,
+        )
+        with pytest.raises(OSError):
+            hook(time.monotonic() + 300)
+        assert launched and launched[0]["foreign_scopes"] == (_SCOPE_TMUX_GLOB, _SCOPE_APP)
+    finally:
+        if broker is not None:
+            broker.stop()
+    assert fx_runtime.supervisor_scope_arguments([_SCOPE_TMUX_GLOB, "relative"]) == [
+        "--foreign-scope", _SCOPE_TMUX_GLOB,
+    ]
+    # Supervisor start: the strict-ancestor pattern is discarded, the tmux glob kept.
+    supervisor = fx_supervisor._Supervisor(_supervisor_args_1995([_SCOPE_TMUX_GLOB, _SCOPE_APP]))
+    supervisor.broker_identity = _BROKER_1995
+    (tmp_path / "proc" / "self").mkdir(parents=True)
+    (tmp_path / "proc" / "self" / "cgroup").write_text(f"0::{_SCOPE_RUN}\n")
+    supervisor.resolve_run_scope(proc_root=tmp_path / "proc")
+    assert supervisor.run_cgroup == _SCOPE_RUN
+    assert supervisor.foreign_scopes == (_SCOPE_TMUX_GLOB,)
+    err = capsys.readouterr().err
+    assert f"foreign scope '{_SCOPE_APP}' discarded" in err
+    assert f"foreign scope '{_SCOPE_TMUX_GLOB}' also matches the run cgroup" in err
+    # Census: the sibling tree is foreign; a leak in the run's own tmux scope is run.
+    proc = _proc_1995(tmp_path / "census", {
+        **_SIBLING_TREE_1995,
+        800: {"start": 180, "ppid": 1, "comm": "leak", "cgroup": f"0::{_SCOPE_RUN}"},
+    })
+    result = fx_supervisor.census(
+        window_start=100, owned=(), self_identity=(100, 100), proc_root=proc,
+        run_cgroup=supervisor.run_cgroup, run_roots=(_BROKER_1995,),
+        foreign_scopes=(_SCOPE_TMUX_GLOB, _SCOPE_APP),
+    )
+    assert sorted(item["pid"] for item in result.foreign) == [300, 301, 302]
+    assert [(item["pid"], item["attribution"]) for item in result.escaped] == [(800, "run")]
+    assert result.cleanup == "escaped"

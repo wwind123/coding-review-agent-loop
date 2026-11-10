@@ -7687,17 +7687,30 @@ def test_acquisition_citation_retained_under_count_and_byte_pressure_1758(count,
     assert "truncated" in " ".join(projected.caveats)
 
 
-@pytest.mark.parametrize("long_rows", [False, True])
-def test_protected_capacity_overflow_stops_handoff_explicitly_1758(long_rows):
+def test_protected_capacity_overflow_stops_handoff_explicitly_1758():
     from dataclasses import replace
     registry = EnvironmentIdentityRegistry()
     row = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
                        receipt_id="p", registry=registry)
-    rows = [replace(row, receipt_id=f"p{i}", identifiers=tuple("x" * 240 for _ in range(12))
-                    if long_rows else ()) for i in range(12 if long_rows else 33)]
+    rows = [replace(row, receipt_id=f"p{i}") for i in range(33)]
     evidence = reconcile_test_observations(rows, registry=registry)
     with pytest.raises(evidence_module.AgentLoopError, match="capacity; evidence handoff stopped"):
         bounded_evidence_for_round(evidence, protected_receipt_ids={row.receipt_id for row in rows})
+
+
+def test_protected_byte_overflow_is_compacted_not_stopped_1995():
+    """#1758's byte stop now degrades: long cited rows are compacted and published."""
+    from dataclasses import replace
+    registry = EnvironmentIdentityRegistry()
+    row = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
+                       receipt_id="p", registry=registry)
+    rows = [replace(row, receipt_id=f"p{i}", identifiers=tuple("x" * 240 for _ in range(12)))
+            for i in range(12)]
+    evidence = reconcile_test_observations(rows, registry=registry)
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids={row.receipt_id for row in rows})
+    assert len(encoded.encode()) <= evidence_module.MAX_ROUND_BYTES
+    decoded = decode_bounded_evidence(encoded)
+    assert {item.receipt_id for item in decoded.observations} == {row.receipt_id for row in rows}
 
 
 def test_prior_legacy_declarations_are_replaced_not_accumulated_1758(tmp_path):
@@ -7842,3 +7855,243 @@ def test_forwarded_output_receipt_authority_and_failure_attribution(tmp_path, ou
         [marked], assigned_workdir=tmp_path, selectable=True)) == (resolution == "valid")
     evidence = reconcile_test_observations([marked], current_head="head-a", cwd=tmp_path)
     assert ("capture" in evidence.authoritative_failures) == (outcome == "failed")
+
+
+# --- #1995: cited receipts compacted into the round byte cap ---------------------
+
+from coding_review_agent_loop.comment_rendering import (  # noqa: E402
+    _render_test_observation_citations as _render_citations_1995,
+)
+from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
+    FixtureRecord as _FixtureRecord1995,
+    LocalTestEvidence as _Evidence1995,
+    ToolIdentity as _ToolIdentity1995,
+    tool_identity_diagnostic as _tool_diagnostic_1995,
+    unsuperseded_receipts_sentence as _unsuperseded_1995,
+)
+
+
+def _cited_row_1995(i, registry, *, outcome="passed", heavy_ids=True, long_caveats=True, tool_status="match",
+                    turn="turn-opaque"):
+    from dataclasses import replace
+
+    row = _observation(outcome=outcome, timestamp=f"2026-11-10T00:{i:02d}:00Z", receipt_id=f"cited-{i}",
+                       registry=registry)
+    return replace(
+        row,
+        turn_id=turn,
+        identifiers=tuple(f"{i}-{k}-" + "x" * 230 for k in range(8)) if heavy_ids else (),
+        caveats=tuple(f"caveat {k} " + "c" * 220 for k in range(4)) if long_caveats else (),
+        fixture=_FixtureRecord1995(
+            path="tests/fixtures/cluster.sh", digest="100755:" + "a" * 40, setup_status=0, teardown_status=0,
+            cleanup="confirmed" if outcome == "passed" else "escaped",
+            escaped_processes=tuple(f"pid={k} uid=1000 comm=sleep cgroup=0::/user.slice/x{k}" for k in range(8)),
+        ),
+        tool_identity=_ToolIdentity1995(
+            status=tool_status, client_commit="a" * 40,
+            orchestrator_commit="a" * 40 if tool_status == "match" else "b" * 40,
+        ),
+    )
+
+
+def _evidence_1995(rows):
+    return _Evidence1995(observations=tuple(rows))
+
+
+def _resolved_1995(encoded):
+    decoded = decode_bounded_evidence(encoded)
+    return (
+        {row.receipt_id for row in decoded.observations},
+        {item.receipt_id for item in decoded.cited_receipt_references},
+        decoded,
+    )
+
+
+def test_cited_rows_that_fit_are_encoded_unchanged_1995():
+    """Matrix row `compaction-fits-unchanged`."""
+    registry = EnvironmentIdentityRegistry()
+    rows = [_cited_row_1995(i, registry) for i in range(3)]
+    evidence = _evidence_1995(rows)
+    protected = bounded_evidence_for_round(evidence, protected_receipt_ids={row.receipt_id for row in rows})
+    # Byte-identical to the unprotected (pre-#1995) encoding of the same rows.
+    assert protected == bounded_evidence_for_round(evidence)
+    payload = json.loads(protected)
+    assert "cited_receipt_references" not in payload
+    assert payload["caveats"] == [] and payload["capture_incomplete"] is False
+    for row in payload["observations"]:
+        assert len(row["identifiers"]) == 8 and "tool_identity" in row
+        assert len(row["fixture"]["escaped_processes"]) == 8
+    assert "cited_receipt_references" not in evidence.to_dict()
+
+
+def test_nine_cited_receipts_over_the_cap_are_published_resolvably_1995():
+    """Matrix row `compaction-nine-receipts-published-and-rendered` (encoder level)."""
+    registry = EnvironmentIdentityRegistry()
+    cited = [_cited_row_1995(i, registry) for i in range(9)]
+    others = [
+        _cited_row_1995(20 + i, registry, outcome="failed" if i % 2 else "passed", turn="earlier-turn")
+        for i in range(6)
+    ]
+    others = [__import__("dataclasses").replace(row, receipt_id=f"other-{i}") for i, row in enumerate(others)]
+    evidence = _evidence_1995([*others, *cited])
+    cited_ids = {row.receipt_id for row in cited}
+    full = json.dumps([row.to_dict() for row in cited], separators=(",", ":"))
+    assert len(full.encode()) > evidence_module.MAX_ROUND_BYTES
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids=cited_ids)
+    assert len(encoded.encode()) <= evidence_module.MAX_ROUND_BYTES
+    observed, referenced, decoded = _resolved_1995(encoded)
+    assert cited_ids <= observed | referenced
+    assert referenced, "nine rows with long authority fields need tier-2 references"
+    assert not observed & referenced
+    # Unprotected rows are evicted before any citation.
+    assert not any(receipt.startswith("other-") for receipt in observed)
+    assert any("compacted for transport" in caveat for caveat in decoded.caveats)
+    assert decoded.capture_incomplete
+    # Canonicalization (the round_metadata publication path) keeps every id.
+    canonical = evidence_module.canonicalize_bounded_evidence(encoded)
+    assert len(canonical.encode()) <= evidence_module.MAX_ROUND_BYTES
+    c_observed, c_referenced, _decoded = _resolved_1995(canonical)
+    assert cited_ids <= c_observed | c_referenced
+    assert evidence_module.canonicalize_bounded_evidence(canonical) == canonical
+    # Rendering: a reference is never an unknown citation.
+    citations = [
+        SimpleNamespace(receipt_id=row.receipt_id, command="python -m pytest tests/test_protocol.py -q",
+                        claim="current-result")
+        for row in cited
+    ]
+    rendered = _render_citations_1995(citations, local_test_evidence=canonical, current_test_turn_id="turn-opaque")
+    assert "unknown or cross-turn" not in rendered
+    for receipt in c_referenced:
+        assert f"receipt `{receipt}` — `current-result` (passed (details compacted for transport);" in rendered
+
+
+def test_tier1_keeps_authority_fields_and_tool_diagnostics_1995(monkeypatch):
+    """Matrix row `compaction-tier1-authority-preserved`."""
+    registry = EnvironmentIdentityRegistry()
+    # (a) Tier 1 alone: identifiers and diagnostic fields are dropped, authority kept.
+    rows = [_cited_row_1995(i, registry, long_caveats=False) for i in range(6)]
+    flagged = _cited_row_1995(9, registry, long_caveats=False, tool_status="mismatch")
+    rows.append(flagged)
+    evidence = _evidence_1995(rows)
+    full = decode_bounded_evidence(json.dumps(evidence.to_dict()))
+    monkeypatch.setattr(evidence_module, "MAX_ROUND_BYTES", 8 * 1024)
+    assert len(json.dumps(evidence.to_dict()).encode()) > 8 * 1024
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids={row.receipt_id for row in rows})
+    assert len(encoded.encode()) <= 8 * 1024
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded.cited_receipt_references == ()
+    by_id = {row.receipt_id: row for row in decoded.observations}
+    for original in full.observations:
+        row = by_id[original.receipt_id]
+        for name in ("outcome", "provenance", "turn_id", "timestamp", "scope", "attribution", "caveats",
+                     "command", "returncode", "claim"):
+            assert getattr(row, name) == getattr(original, name), name
+        assert row.fixture.clean == original.fixture.clean and row.fixture.cleanup == original.fixture.cleanup
+        assert (row.fixture.inventoried, row.fixture.swept, row.fixture.escaped) == (
+            original.fixture.inventoried, original.fixture.swept, original.fixture.escaped,
+        )
+    assert by_id[flagged.receipt_id].tool_identity is not None
+    assert _tool_diagnostic_1995(by_id[flagged.receipt_id]) is not None
+    assert not any("tool identity diagnostic" in caveat for caveat in decoded.caveats)
+    # (b) A failed cited row with a diagnostic stays full; a passing one becomes a reference.
+    failed = _cited_row_1995(10, registry, outcome="failed", heavy_ids=False, long_caveats=False,
+                             tool_status="mismatch")
+    passing = _cited_row_1995(11, registry, heavy_ids=True, long_caveats=True, tool_status="mismatch")
+    small = [_cited_row_1995(12 + i, registry, heavy_ids=False, long_caveats=False) for i in range(2)]
+    evidence = _evidence_1995([failed, passing, *small])
+    cited_ids = {row.receipt_id for row in (failed, passing, *small)}
+    monkeypatch.setattr(evidence_module, "MAX_ROUND_BYTES", 4 * 1024)
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids=cited_ids)
+    observed, referenced, decoded = _resolved_1995(encoded)
+    assert referenced == {passing.receipt_id}
+    assert observed == cited_ids - {passing.receipt_id}
+    kept = next(row for row in decoded.observations if row.receipt_id == failed.receipt_id)
+    assert _tool_diagnostic_1995(kept) is not None and kept.outcome == "failed"
+    assert "1 dropped row(s) carried a run-tests tool identity diagnostic" in decoded.caveats
+    rendered = _render_citations_1995(
+        [SimpleNamespace(receipt_id=failed.receipt_id, command="python -m pytest tests/test_protocol.py -q",
+                         claim="current-result")],
+        local_test_evidence=encoded, current_test_turn_id="turn-opaque",
+    )
+    assert "run-tests-tool-mismatch" in rendered
+
+
+def test_cited_failure_is_never_a_reference_and_survives_restart_1995(monkeypatch):
+    """Matrix row `compaction-failed-cited-row-survives-resume`."""
+    registry = EnvironmentIdentityRegistry()
+    # The failure is the newest receipt, so no earlier pass supersedes it.
+    failed = _cited_row_1995(50, registry, outcome="failed")
+    passes = [_cited_row_1995(1 + i, registry) for i in range(8)]
+    evidence = reconcile_test_observations([failed, *passes], registry=registry)
+    cited_ids = {row.receipt_id for row in (failed, *passes)}
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids=cited_ids)
+    observed, referenced, decoded = _resolved_1995(encoded)
+    assert failed.receipt_id in observed and failed.receipt_id not in referenced
+    assert referenced and referenced <= {row.receipt_id for row in passes}
+    assert failed.receipt_id in decoded.authoritative_failures
+    assert "unsuperseded failure receipts" in _unsuperseded_1995(encoded)
+    assert "(failed)" in _unsuperseded_1995(encoded)
+    # The next round, and a restart (a fresh runner), still hold the failure.
+    for runner in (Runner(), Runner()):
+        runner.render_local_test_evidence(prior_local_test_evidence=encoded)
+        live = runner.last_reconciled_local_test_evidence
+        row = next(item for item in live.observations if item.receipt_id == failed.receipt_id)
+        assert row.outcome == "failed" and row.superseded_by is None
+        assert failed.receipt_id in live.authoritative_failures
+        assert not any(item.receipt_id in referenced for item in live.observations)
+    # When the failure itself cannot fit, the stop is raised instead.
+    monkeypatch.setattr(evidence_module, "MAX_ROUND_BYTES", 1200)
+    with pytest.raises(evidence_module.AgentLoopError, match="1 non-passing kept in full"):
+        bounded_evidence_for_round(evidence, protected_receipt_ids=cited_ids)
+
+
+def test_reference_stubs_never_become_authority_1995():
+    """Matrix row `compaction-reference-not-reconciled`."""
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(outcome="failed", timestamp="2026-11-10T00:00:00Z", receipt_id="fail-1",
+                           registry=registry)
+    payload = json.loads(bounded_evidence_for_round(_evidence_1995([failure])))
+    stub = {
+        "receipt_id": "pass-stub", "turn_id": "turn-opaque", "timestamp": "2026-11-10T01:00:00Z",
+        "outcome": "passed", "provenance": "parent-observed", "returncode": 0,
+        "fixture_cleanup": "confirmed", "fixture_clean": True,
+    }
+    payload["cited_receipt_references"] = [
+        stub,
+        {**stub, "receipt_id": "extra-field", "command": "pytest"},
+        {**stub, "receipt_id": "failed-stub", "outcome": "failed"},
+        {**stub, "receipt_id": "bad-provenance", "provenance": "forged"},
+        {**stub, "receipt_id": "bool-code", "returncode": True},
+        "not-a-mapping",
+    ]
+    encoded = json.dumps(payload)
+    decoded = decode_bounded_evidence(encoded)
+    assert [item.receipt_id for item in decoded.cited_receipt_references] == ["pass-stub"]
+    assert [row.receipt_id for row in decoded.observations] == ["fail-1"]
+    for runner in (Runner(), Runner()):
+        runner.render_local_test_evidence(prior_local_test_evidence=encoded)
+        live = runner.last_reconciled_local_test_evidence
+        assert {row.receipt_id for row in live.observations} == {"fail-1"}
+        assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by is None
+        assert "fail-1" in live.authoritative_failures
+        assert live.cited_receipt_references == ()
+    # Canonicalization keeps the valid stub and only the valid stub.
+    canonical = json.loads(evidence_module.canonicalize_bounded_evidence(encoded))
+    assert [item["receipt_id"] for item in canonical["cited_receipt_references"]] == ["pass-stub"]
+
+
+def test_capacity_stop_names_counts_and_sizes_1995(monkeypatch):
+    """Matrix row `compaction-overflow-actionable-stop` (encoder level)."""
+    registry = EnvironmentIdentityRegistry()
+    rows = [_cited_row_1995(i, registry) for i in range(3)]
+    monkeypatch.setattr(evidence_module, "MAX_ROUND_BYTES", 300)
+    with pytest.raises(evidence_module.AgentLoopError) as raised:
+        bounded_evidence_for_round(_evidence_1995(rows), protected_receipt_ids={row.receipt_id for row in rows})
+    message = str(raised.value)
+    assert "cited receipts exceed round byte capacity; evidence handoff stopped" in message
+    assert "(3 cited receipts, 0 non-passing kept in full; full " in message
+    assert "cap 300)" in message
+    import re as _re
+
+    sizes = _re.search(r"full (\d+) bytes, compacted (\d+) bytes", message)
+    assert sizes is not None and int(sizes.group(1)) > int(sizes.group(2)) > 300

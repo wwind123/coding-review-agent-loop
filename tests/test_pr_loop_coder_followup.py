@@ -2072,13 +2072,14 @@ def _evidence_reviews_1626(carried_rounds, *, final="approved"):
 
 def _run_evidence_loop_1626(
     tmp_path, monkeypatch, *, coder_outputs, turn_receipts, reviews, repair_output=None,
+    runner_class=None,
 ):
     """Drive run_pr_loop through the real validated turn and execute_repair.
 
     The stubbed repair model stands in for a real repair launch: it replaces
     the runner's latest test turn and captures no receipts.
     """
-    runner = _EvidenceRunner1626(
+    runner = (runner_class or _EvidenceRunner1626)(
         turn_receipts=turn_receipts, tmp_path=tmp_path,
         codex_outputs=reviews, claude_outputs=coder_outputs,
     )
@@ -2256,6 +2257,14 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
     )
     assert isinstance(outcome, AgentLoopError), outcome
     assert "cited receipts exceed round byte capacity; evidence handoff stopped" in str(outcome)
+    # Issue #1995: the stop is actionable: cited count, byte sizes and the cap.
+    assert "(1 cited receipts, 0 non-passing kept in full; full " in str(outcome)
+    assert re.search(r"full \d+ bytes, compacted \d+ bytes; cap 300\)", str(outcome)), str(outcome)
+    # Nothing citing the receipt was posted.
+    assert not any(
+        "pass-2" in (record.local_test_evidence or "")
+        for record in _records_1292(runner) if record.role == "coder"
+    )
     live = runner.last_reconciled_local_test_evidence
     assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by is None
     bounded = _evidence_module_1626.decode_bounded_evidence(
@@ -2892,3 +2901,63 @@ def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatc
     assert evidence and all(item.lifecycle != "cleared" for item in evidence)
     assert all(_deserialize_unresolved_item(_serialize_unresolved_item(item)) == item for item in evidence)
     assert "listed excluded ledger item(s) " + ("item-3" if repair_future else "item-2") in "\n".join(logs)
+
+
+class _LargeReceiptRunner1995(_EvidenceRunner1626):
+    """Receipts as large as real fixture runs: long caveats, identifiers and fixture records."""
+
+    def _receipt(self, receipt_id, outcome, environment, *, turn, minute):
+        from coding_review_agent_loop.local_test_evidence import FixtureRecord
+
+        row = super()._receipt(receipt_id, outcome, environment, turn=turn, minute=minute)
+        # One fixture identity for every row, so a pass can supersede the failure.
+        row = dataclasses.replace(row, fixture=FixtureRecord(
+            path="tests/fixtures/postgres_migration_cluster.sh", digest="100755:" + "a" * 40,
+            setup_status=0, teardown_status=0, cleanup="confirmed",
+        ))
+        if receipt_id == "fail-1":
+            return row
+        return dataclasses.replace(
+            row,
+            identifiers=tuple(f"{receipt_id}-{k}-" + "x" * 230 for k in range(8)),
+            caveats=tuple(f"caveat {k} " + "c" * 220 for k in range(4)),
+        )
+
+
+def test_nine_cited_fixture_receipts_over_the_cap_publish_and_resolve_1995(tmp_path, monkeypatch):
+    """Matrix row `compaction-nine-receipts-published-and-rendered` (loop level).
+
+    The follow-up cites nine current-acquisition passing fixture receipts whose
+    full rows exceed MAX_ROUND_BYTES.  The handoff is compacted, not stopped,
+    and the posted metadata, after round_metadata canonicalization, resolves
+    every cited receipt id.
+    """
+    receipts = [(f"pass-{i}", "passed", {"PATH": "/usr/bin"}) for i in range(9)]
+    cited = [_citation_1626(receipt_id) for receipt_id, _outcome, _env in receipts]
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626(cited)],
+        turn_receipts=[(), receipts],
+        reviews=_evidence_reviews_1626(1),
+        runner_class=_LargeReceiptRunner1995,
+    )
+    assert outcome == 0, outcome
+    cited_ids = {receipt_id for receipt_id, _outcome, _env in receipts}
+    frozen = [row for row in runner.local_test_observations() if row.receipt_id in cited_ids]
+    full = json.dumps([row.to_dict() for row in frozen], separators=(",", ":"))
+    assert len(frozen) == 9 and len(full.encode()) > _evidence_module_1626.MAX_ROUND_BYTES
+    records = [record for record in _records_1292(runner) if record.role == "coder"]
+    posted = next(record for record in reversed(records) if "pass-0" in (record.local_test_evidence or ""))
+    # _records_1292 decodes through round_metadata, which canonicalizes the field.
+    assert len(posted.local_test_evidence.encode()) <= _evidence_module_1626.MAX_ROUND_BYTES
+    decoded = _evidence_module_1626.decode_bounded_evidence(posted.local_test_evidence)
+    observed = {row.receipt_id for row in decoded.observations}
+    referenced = {item.receipt_id for item in decoded.cited_receipt_references}
+    assert cited_ids <= observed | referenced, (observed, referenced)
+    assert referenced, "long authority fields force tier-2 references"
+    assert _evidence_module_1626.canonicalize_bounded_evidence(posted.local_test_evidence) == posted.local_test_evidence
+    bodies = "\n".join(item["body"] for item in runner.pr_payload["comments"] if isinstance(item, dict))
+    assert "passed (details compacted for transport)" in bodies
+    for receipt in referenced:
+        line = next(line for line in bodies.splitlines() if f"receipt `{receipt}`" in line)
+        assert "unknown or cross-turn" not in line

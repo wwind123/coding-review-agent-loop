@@ -1942,8 +1942,11 @@ The test broker checks that the script is a tracked `100755` blob identical to
 and `<script> teardown` in one supervised scope with a shared
 `AGENT_LOOP_FIXTURE_STATE_DIR`. Only a run whose setup and teardown exit 0 and
 whose cleanup is confirmed (Linux, initial PID namespace, no hidepid) is
-citable. `--fixture` needs at least 30 seconds and the broker; it never runs
-locally. See
+citable. Cleanup flags any in-window process the run could own; on a shared
+host, an operator can declare other sessions' cgroup scopes with the
+orchestrator's repeatable `--fixture-foreign-scope GLOB` so their processes are
+reported as foreign diagnostics instead. `--fixture` needs at least 30 seconds
+and the broker; it never runs locally. See
 [Multi-process fixtures](docs/local_agent_loop.md#multi-process-fixtures-run-tests---fixture).
 
 Every agent subprocess resolves this install's `agent-loop`: the orchestrator
