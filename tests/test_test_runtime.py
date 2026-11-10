@@ -8395,3 +8395,88 @@ def test_foreign_scopes_are_operator_owned_and_subordinate_to_run_1995(tmp_path,
     assert sorted(item["pid"] for item in result.foreign) == [300, 301, 302]
     assert [(item["pid"], item["attribution"]) for item in result.escaped] == [(800, "run")]
     assert result.cleanup == "escaped"
+
+
+def test_census_deadline_during_final_diagnostic_cgroup_read_is_unconfirmed_1995(tmp_path, monkeypatch):
+    """Matrix row `census-deadline-during-classification` (last candidate's diagnostic read)."""
+    proc = _proc_1995(tmp_path / "proc", dict(_SIBLING_TREE_1995))
+    clock = {"now": 0.0, "reads": 0}
+    original = fx_supervisor._cgroup
+
+    def slow_last(pid, proc_root):
+        clock["reads"] += 1
+        if clock["reads"] == len(_SIBLING_TREE_1995):
+            clock["now"] = 10.0  # the deadline passes during the final diagnostic read
+        return original(pid, proc_root)
+
+    monkeypatch.setattr(fx_supervisor, "_cgroup", slow_last)
+    monkeypatch.setattr(fx_supervisor.time, "monotonic", lambda: clock["now"])
+    result = _census_1995(proc, deadline=5.0)
+    assert clock["reads"] == len(_SIBLING_TREE_1995)
+    assert result.cleanup == "unconfirmed" and result.reason == "census exceeded its bound"
+    assert result.foreign == [] and result.escaped == []
+
+
+def test_fixture_diagnostics_reach_the_run_tests_client_1995(tmp_path):
+    """Matrix rows `supervisor-cleanup-event-foreign` / `foreign-scope-operator-only` (diagnostic path)."""
+    from types import SimpleNamespace
+
+    supervisor = fx_supervisor._Supervisor(_supervisor_args_1995([_SCOPE_TMUX_GLOB, _SCOPE_APP]))
+    supervisor.broker_identity = _BROKER_1995
+    (tmp_path / "proc" / "self").mkdir(parents=True)
+    (tmp_path / "proc" / "self" / "cgroup").write_text(f"0::{_SCOPE_RUN}\n")
+    supervisor.resolve_run_scope(proc_root=tmp_path / "proc")
+    foreign = [{"pid": 300 + i, "uid": 1000, "comm": "sleep", "cgroup": f"0::{_SCOPE_SIBLING}"} for i in range(20)]
+    escaped = [{"pid": 7, "uid": 1000, "comm": "x", "cgroup": "0::/other", "attribution": "undetermined"}]
+    import io
+    import contextlib as _contextlib
+
+    out = io.StringIO()
+    with _contextlib.redirect_stdout(out):
+        supervisor.emit_cleanup(fx_supervisor.CensusResult("escaped", escaped=escaped, foreign=foreign), swept=0)
+    event = json.loads(out.getvalue().strip().splitlines()[-1])
+    assert event["foreign_scopes_declared"] is True
+    assert any(f"'{_SCOPE_APP}' discarded" in item for item in event["scope_warnings"])
+    provenance = fx_runtime.FixtureProvenance("tests/fx.sh", tmp_path / "fx.sh", "100755", "a" * 40)
+    handle = fx_runtime.FixtureSupervisor(provenance, SimpleNamespace(pid=1), 5.0, None)
+    handle.cleanup_event = event
+    lines = handle.diagnostics()
+    warnings = [line for line in lines if line.startswith("warning: foreign scope ")]
+    assert any(f"'{_SCOPE_APP}' discarded" in line for line in warnings)
+    assert any("also matches the run cgroup" in line for line in warnings)
+    assert sum("foreign process (declared foreign scope) pid=" in line for line in lines) == 16
+    assert "4 more foreign process(es) not listed" in lines
+    assert not any("--fixture-foreign-scope" in line for line in lines)  # a scope is declared
+    handle.cleanup_event = {**event, "foreign_scopes_declared": False, "scope_warnings": [], "foreign": [],
+                            "foreign_count": 0}
+    assert any("--fixture-foreign-scope" in line for line in handle.diagnostics())
+    # The record stays schema-identical; diagnostics travel beside it.
+    record, _excerpts = handle.record()
+    assert set(record.to_dict()) == fx_evidence.FIXTURE_RECORD_FIELDS
+    # The broker frame field decodes defensively on the client.
+    assert fx_evidence._fixture_diagnostics(["a", 3, {"x": 1}, "b"]) == ("a", "b")
+    assert fx_evidence._fixture_diagnostics({"not": "a list"}) == ()
+    run = SimpleNamespace(supervisor=handle)
+    assert fx_evidence._FixtureRun.diagnostics(run) == handle.diagnostics()
+
+
+@_FX_HOST_SKIP
+def test_real_broker_launch_forwards_discarded_scope_warning_1995(tmp_path, monkeypatch, capsys):
+    """Item: diagnostics survive the real supervisor subprocess, whose stderr is discarded."""
+    with _fx_host_window(exclusive=False):
+        root, markers = _fx_repo(tmp_path, count=1)
+        if not sys.platform.startswith("linux"):
+            pytest.skip("a real test broker requires Linux")
+        server = fx_evidence.TestBrokerServer(
+            root=root, turn_id="turn-fixture", fixture_foreign_scopes=("/",),
+        ).start()
+        try:
+            _fx_cli(monkeypatch, server, root, _FX_PYTEST)
+            row = _fx_row(server)
+        finally:
+            server.stop()
+        _fx_assert_gone(_fx_pids(markers))
+    err = capsys.readouterr().err
+    # "/" covers the run's own subtree: discarded (or ignored without a run cgroup), and said so.
+    assert "agent-loop fixture: warning: " in err, err
+    assert set(row.fixture.to_dict()) == fx_evidence.FIXTURE_RECORD_FIELDS

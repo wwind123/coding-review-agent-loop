@@ -2296,7 +2296,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "phase": metadata.phase,
         "canonical_reviewer_response": metadata.canonical_reviewer_response,
         "local_test_evidence": (
-            canonicalize_bounded_evidence(metadata.local_test_evidence)
+            # Issue #1995: publication never silently drops a citation.
+            canonicalize_bounded_evidence(metadata.local_test_evidence, strict=True)
             if metadata.local_test_evidence is not None else None
         ),
         "risk_test_matrix_evidence": metadata.risk_test_matrix_evidence,

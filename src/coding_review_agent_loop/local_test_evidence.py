@@ -1478,6 +1478,20 @@ def _can_supersede(
     return True, None
 
 
+def _member(value: object, allowed: frozenset[str]) -> bool:
+    """Closed-set membership for untrusted decoded values (issue #1995).
+
+    A JSON array or object is unhashable, so a bare ``in`` on a frozenset
+    would raise ``TypeError`` instead of rejecting the value.
+    """
+    return isinstance(value, str) and value in allowed
+
+
+def _json_list(value: object) -> list[object]:
+    """A decoded JSON array, or ``[]`` for any other JSON type (issue #1995)."""
+    return value if isinstance(value, list) else []
+
+
 CITED_REFERENCE_FIELDS = frozenset(
     {
         "receipt_id", "turn_id", "timestamp", "outcome", "provenance", "returncode",
@@ -1528,9 +1542,9 @@ class CitedReceiptReference:
             not isinstance(receipt_id, str) or not receipt_id
             or not isinstance(turn_id, str) or not isinstance(timestamp, str)
             or value["outcome"] != "passed"
-            or value["provenance"] not in PROVENANCES
+            or not _member(value["provenance"], PROVENANCES)
             or not (returncode is None or (isinstance(returncode, int) and not isinstance(returncode, bool)))
-            or not (cleanup is None or cleanup in FIXTURE_CLEANUP_STATES)
+            or not (cleanup is None or _member(cleanup, FIXTURE_CLEANUP_STATES))
             or not (clean is None or isinstance(clean, bool))
         ):
             return None
@@ -2275,7 +2289,9 @@ def bounded_evidence_for_round(
             redact_observation(observation_from_mapping(row)).to_dict(), row
         )
         for row in rows
-        if isinstance(row, Mapping) and row.get("outcome") in OUTCOMES
+        if isinstance(row, Mapping)
+        and _member(row.get("outcome"), OUTCOMES)
+        and _member(row.get("provenance"), PROVENANCES)
     ]
     source_references = [
         item.to_dict() for item in _decode_cited_references(source.get("cited_receipt_references"))
@@ -2397,15 +2413,31 @@ def bounded_evidence_for_round(
             value["capture_incomplete"] = True
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
+    restart_environment = environment_comparison_for_restart()
+
+    def size_of(candidate: list[Mapping[str, object]], *, truncated: bool) -> int:
+        """Encoded bytes, restart-stable whenever citations are protected.
+
+        Decoding replaces every row's environment label with the restart
+        label, so a payload that fits only before decode would be evicted
+        by round_metadata canonicalization.  With cited rows, size for the
+        larger of the two forms (issue #1995).
+        """
+        size = len(encode(candidate, truncated=truncated).encode())
+        if not protected:
+            return size
+        restored = [{**row, "environment": restart_environment} for row in candidate]
+        return max(size, len(encode(restored, truncated=truncated).encode()))
+
     def fits(candidate: list[Mapping[str, object]]) -> bool:
-        return len(encode(candidate, truncated=True).encode()) <= MAX_ROUND_BYTES
+        return size_of(candidate, truncated=True) <= MAX_ROUND_BYTES
 
     # Never silently evict a known acquisition citation.  Issue #1995: when
     # the cited rows do not fit at full size, compact them; stop only when
     # even the compacted form cannot fit, never publishing a handoff whose
     # citations would misleadingly look unknown.
     if protected_rows and not fits(protected_rows):
-        full_bytes = len(encode(protected_rows, truncated=True).encode())
+        full_bytes = size_of(protected_rows, truncated=True)
         positions = [index for index, row in enumerate(all_details) if row.get("receipt_id") in protected]
         working = {index: all_details[index] for index in positions}
         referenced: dict[int, dict[str, object]] = {}
@@ -2437,7 +2469,7 @@ def bounded_evidence_for_round(
             referenced[index] = _cited_reference(working[index])
             with_references()
         if not fits(current()):
-            compacted_bytes = len(encode(current(), truncated=True).encode())
+            compacted_bytes = size_of(current(), truncated=True)
             kept = sum(1 for index in positions if not _reference_eligible(all_details[index]))
             raise AgentLoopError(
                 "Current-acquisition cited receipts exceed round byte capacity; evidence handoff stopped "
@@ -2459,11 +2491,9 @@ def bounded_evidence_for_round(
             retained = [item for item in retained if item[0] != drop_index]
         return encode([row for _, row in retained], truncated=True)
     encoded = encode(details, truncated=count_truncated)
-    if len(encoded.encode()) > MAX_ROUND_BYTES:
+    if size_of(details, truncated=count_truncated) > MAX_ROUND_BYTES:
         retained = list(enumerate(details))
-        while retained and len(
-            encode([row for _, row in retained], truncated=True).encode()
-        ) > MAX_ROUND_BYTES:
+        while retained and size_of([row for _, row in retained], truncated=True) > MAX_ROUND_BYTES:
             drop_index, _ = min(
                 retained,
                 key=lambda item: (retention_priority(item[1]), item[0]),
@@ -2500,13 +2530,16 @@ def _resolvable_receipt_ids(evidence: LocalTestEvidence | None) -> frozenset[str
     )
 
 
-def canonicalize_bounded_evidence(value: object) -> str | None:
+def canonicalize_bounded_evidence(value: object, *, strict: bool = False) -> str | None:
     """Tolerantly normalize a legacy/malformed metadata value.
 
     Issue #1995: re-encoding a decoded string never drops a receipt id that
-    the input resolved.  Decoding changes each row's environment label, so a
-    payload near the byte cap may grow; then the decoded receipts are
-    protected (compacted, not evicted) when that fits.
+    the input resolved.  The encoder sizes cited payloads for their decoded
+    form, so this normally re-encodes losslessly; otherwise the decoded
+    receipts are protected (compacted, not evicted).  When even that cannot
+    fit, ``strict`` (the publication path) raises the actionable capacity
+    stop instead of publishing unknown citations; the tolerant read path
+    keeps the plain re-encoding.
     """
     if isinstance(value, LocalTestEvidence):
         return bounded_evidence_for_round(value)
@@ -2523,6 +2556,8 @@ def canonicalize_bounded_evidence(value: object) -> str | None:
         try:
             return bounded_evidence_for_round(parsed, protected_receipt_ids=wanted)
         except AgentLoopError:
+            if strict:
+                raise
             return plain
     return None
 
@@ -2569,19 +2604,21 @@ def decode_bounded_evidence(
         )
         for row in rows
         if isinstance(row, Mapping)
-        and row.get("outcome") in OUTCOMES
-        and row.get("provenance") in PROVENANCES
+        and _member(row.get("outcome"), OUTCOMES)
+        and _member(row.get("provenance"), PROVENANCES)
     )
     return LocalTestEvidence(
         observations=observations,
-        caveats=tuple(_safe_text(item) for item in payload.get("caveats", ()) if item is not None),
+        caveats=tuple(_safe_text(item) for item in _json_list(payload.get("caveats")) if item is not None),
         capture_incomplete=bool(payload.get("capture_incomplete", False))
         or any(
             item.startswith(_UNPARSABLE_PREFIX)
             for observation in observations
             for item in observation.caveats
         ),
-        authoritative_failures=tuple(str(item) for item in payload.get("authoritative_failures", ()) if item),
+        authoritative_failures=tuple(
+            str(item) for item in _json_list(payload.get("authoritative_failures")) if isinstance(item, str) and item
+        ),
         legacy_capture_limited=bool(payload.get("legacy_capture_limited", False)),
         # Issue #1995: strictly decoded references; never observations.
         cited_receipt_references=_decode_cited_references(payload.get("cited_receipt_references")),
@@ -3222,6 +3259,8 @@ BROKER_REQUEST_FIELDS = frozenset(
 # Issue #1326: the only optional request field.  A request carries either the
 # exact legacy field set or that set plus ``fixture``.
 BROKER_FIXTURE_FIELD = "fixture"
+# Issue #1995: optional bounded fixture diagnostics in a response frame.
+BROKER_FIXTURE_DIAGNOSTICS_FIELD = "fixture_diagnostics"
 FIXTURE_STATE_DIR_ENV = "AGENT_LOOP_FIXTURE_STATE_DIR"
 FIXTURE_MIN_TIMEOUT_SECONDS = 30.0
 BROKER_RESPONSE_FIELDS = frozenset(
@@ -3713,6 +3752,9 @@ class BrokerRunResult:
     # Issue #1651: parent-selected advisory remedy text for a launch failure.
     # Presentation only; never journaled, never part of the diagnostic.
     advisory: str = ""
+    # Issue #1995: bounded fixture census diagnostics (foreign processes,
+    # discarded scope warnings); display only, never evidence.
+    fixture_diagnostics: tuple[str, ...] = ()
 
 
 def _bounded_argv(values: Sequence[object]) -> list[str]:
@@ -3779,6 +3821,15 @@ class _FixtureRun:
                         self.request.fixtures.pop(id(self.supervisor), None)
         finally:
             self.close()
+
+    def diagnostics(self) -> tuple[str, ...]:
+        """Bounded census diagnostics for the response frame (issue #1995)."""
+        if self.supervisor is None:
+            return ()
+        try:
+            return tuple(self.supervisor.diagnostics())
+        except Exception:  # noqa: BLE001 - diagnostics never fail a request
+            return ()
 
     def fold(
         self, outcome: str, *, inner_exec: str, shutdown: bool, diagnostic: str,
@@ -4993,6 +5044,10 @@ class TestBrokerServer:
             response["suite_start_reason"] = suite_start_reason
         if fixture_record is not None:
             response[BROKER_FIXTURE_FIELD] = fixture_record.to_dict()
+            # Issue #1995: diagnostics only, never part of the record.
+            diagnostics = fixture_run.diagnostics() if fixture_run is not None else ()
+            if diagnostics:
+                response[BROKER_FIXTURE_DIAGNOSTICS_FIELD] = list(diagnostics)
         if self.dependency_remedy and (result_outcome == "launch-failed" or inner_exec == "failed"):
             response[BROKER_ADVISORY_FIELD] = _safe_text(self.dependency_remedy, 1024)
         return response
@@ -5168,7 +5223,14 @@ class TestBrokerClient:
                         str(response[BROKER_ADVISORY_FIELD])
                         if isinstance(response.get(BROKER_ADVISORY_FIELD), str) else ""
                     ),
+                    fixture_diagnostics=_fixture_diagnostics(response.get(BROKER_FIXTURE_DIAGNOSTICS_FIELD)),
                 )
+
+
+def _fixture_diagnostics(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(_safe_text(item, 480) for item in value[:24] if isinstance(item, str))
 
 
 def _send_ack(connection: socket.socket, restore_timeout: float) -> bool:

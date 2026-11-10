@@ -2491,6 +2491,9 @@ def _run_fixture_tests(
     )
     for item in record.get("escaped_processes") or ():
         print(f"agent-loop fixture: escaped process {item}", file=sys.stderr, flush=True)
+    # Issue #1995: census diagnostics (scope warnings, foreign processes).
+    for line in getattr(result, "fixture_diagnostics", ()) or ():
+        print(f"agent-loop fixture: {line}", file=sys.stderr, flush=True)
     if result.outcome == "timed_out":
         print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
     # Timing and launcher health describe only the inner command; a fixture

@@ -328,6 +328,7 @@ def _cgroup(pid: int, proc_root: Path) -> str:
 # Run-scoped attribution (issue #1995) ----------------------------------------
 
 MAX_ANCESTRY_DEPTH = 4096
+MAX_DIAGNOSTIC_CHARS = 400
 MAX_FOREIGN_REPORTED = MAX_ESCAPED_REPORTED
 ATTRIBUTION_RUN = "run"
 ATTRIBUTION_UNDETERMINED = "undetermined"
@@ -586,6 +587,9 @@ def census(
                 "comm": entry.comm,
                 "cgroup": _cgroup(entry.pid, proc_root),
             }
+            # The diagnostic cgroup read is a /proc read too: never let it
+            # cross the deadline unnoticed, including for the last candidate.
+            check()
             if attribution == "foreign":
                 foreign.append(item)
             else:
@@ -634,6 +638,7 @@ class _Supervisor:
         self.declared_foreign_scopes: tuple[str, ...] = tuple(getattr(args, "foreign_scope", None) or ())
         self.run_cgroup: str | None = None
         self.foreign_scopes: tuple[str, ...] = ()
+        self.scope_warnings: tuple[str, ...] = ()
         self.inventory: dict[int, int] = {}
         self.teardown_requested = False
         self.stdin_closed = False
@@ -823,6 +828,9 @@ class _Supervisor:
                 "run cgroup is unknown; declared foreign scopes are ignored and the census stays host-wide",
             )
         self.foreign_scopes = kept
+        # Issue #1995: also carried in the cleanup event, because the broker
+        # discards this process's stderr.
+        self.scope_warnings = tuple(str(item)[:MAX_DIAGNOSTIC_CHARS] for item in warnings[:MAX_ESCAPED_REPORTED])
         try:
             for warning in warnings:
                 sys.stderr.write(f"agent-loop fixture: warning: {warning}\n")
@@ -875,6 +883,8 @@ class _Supervisor:
                 "escaped_count": len(result.escaped),
                 "foreign": result.foreign[:MAX_FOREIGN_REPORTED],
                 "foreign_count": len(result.foreign),
+                "scope_warnings": list(self.scope_warnings),
+                "foreign_scopes_declared": bool(self.foreign_scopes),
             }
         )
 

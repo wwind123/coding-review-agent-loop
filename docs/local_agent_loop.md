@@ -2325,7 +2325,10 @@ handoff: first only diagnostic fields (identifiers, the escaped-process list,
 the suite-start reason and a tool identity without a diagnostic) are dropped;
 then cited **passing** receipts, largest first, move into a
 `cited_receipt_references` list that keeps the receipt id, turn, timestamp,
-outcome, provenance, return code and fixture cleanup state. A cited failure,
+outcome, provenance, return code and fixture cleanup state. Cited payloads are
+sized for their decoded form, whose environment labels are longer, so
+publication-time canonicalization never evicts a citation; if it ever would,
+publication stops instead. A cited failure,
 timeout, interruption or incomplete run always stays a full observation, so
 its failure obligation survives the next round and a restart. A reference
 renders as `passed (details compacted for transport)`, never as an unknown
@@ -2563,7 +2566,10 @@ is then classified:
 to stderr with their PIDs, uids, command names, cgroups and attribution, and
 recorded (bounded) on the fixture record. Foreign processes are listed as
 `foreign process (declared foreign scope)` diagnostics and never change
-cleanup. No flagged or foreign process is killed. When the run cgroup or the
+cleanup. These diagnostics, the foreign-scope warnings below and a hint to
+declare a scope when undetermined processes remain travel in the broker's
+response beside the fixture record (never inside it) and `run-tests` prints
+them as `agent-loop fixture:` lines. No flagged or foreign process is killed. When the run cgroup or the
 broker identity cannot be read (for example without cgroup v2) the census
 stays host-wide: every in-window process is flagged as before and nothing is
 foreign. An unreadable `/proc` entry, a census that exceeds its bound

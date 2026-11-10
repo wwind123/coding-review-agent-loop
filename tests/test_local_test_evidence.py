@@ -8095,3 +8095,78 @@ def test_capacity_stop_names_counts_and_sizes_1995(monkeypatch):
 
     sizes = _re.search(r"full (\d+) bytes, compacted (\d+) bytes", message)
     assert sizes is not None and int(sizes.group(1)) > int(sizes.group(2)) > 300
+
+
+@pytest.mark.parametrize("cited", ["failed-only", "failed-and-passed"])
+def test_citations_survive_decode_drift_near_the_cap_1995(monkeypatch, cited):
+    """Item: canonicalization never publishes unknown citations after the environment-label drift."""
+    from dataclasses import replace
+
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        replace(_cited_row_1995(i, registry, outcome="failed" if cited == "failed-only" or i % 2 else "passed",
+                                heavy_ids=False, long_caveats=True),
+                tool_identity=None, environment_state="equivalent")
+        for i in range(6)
+    ]
+    # No diagnostic-only field left for tier 1 to drop.
+    rows = [replace(row, fixture=replace(row.fixture, escaped_processes=())) for row in rows]
+    evidence = _evidence_1995(rows)
+    cited_ids = {row.receipt_id for row in rows}
+    legacy = bounded_evidence_for_round(evidence)  # what a size-only encoder would publish
+    drifted = evidence_module.canonicalize_bounded_evidence(legacy)
+    assert len(drifted.encode()) > len(legacy.encode()), "decode lengthens every environment label"
+    # Cap where the rows fit before decode but not after.
+    monkeypatch.setattr(evidence_module, "MAX_ROUND_BYTES", len(legacy.encode()))
+    try:
+        encoded = bounded_evidence_for_round(evidence, protected_receipt_ids=cited_ids)
+    except evidence_module.AgentLoopError as exc:
+        # Nothing compactable (all cited rows failed): the actionable stop, never a lossy handoff.
+        assert cited == "failed-only"
+        assert "cited receipts exceed round byte capacity" in str(exc) and "6 non-passing kept in full" in str(exc)
+    else:
+        assert cited == "failed-and-passed"
+        canonical = evidence_module.canonicalize_bounded_evidence(encoded, strict=True)
+        observed, referenced, decoded = _resolved_1995(canonical)
+        assert cited_ids <= observed | referenced
+        failures = {row.receipt_id for row in rows if row.outcome == "failed"}
+        assert failures <= observed and not failures & referenced
+    # A lossy payload published by the old size-only sizing: strict publication stops,
+    # the tolerant read path never raises.
+    if cited == "failed-only":
+        with pytest.raises(evidence_module.AgentLoopError, match="cited receipts exceed round byte capacity"):
+            evidence_module.canonicalize_bounded_evidence(legacy, strict=True)
+        assert evidence_module.canonicalize_bounded_evidence(legacy) is not None
+
+
+_GOOD_STUB_1995 = {
+    "receipt_id": "pass-stub", "turn_id": "turn-opaque", "timestamp": "2026-11-10T01:00:00Z",
+    "outcome": "passed", "provenance": "parent-observed", "returncode": 0,
+    "fixture_cleanup": "confirmed", "fixture_clean": True,
+}
+
+
+@pytest.mark.parametrize("field", sorted(_GOOD_STUB_1995))
+@pytest.mark.parametrize("bad", [[], {}, ["parent-observed"], {"x": 1}, 1.5])
+def test_malformed_reference_and_row_types_are_dropped_not_raised_1995(field, bad):
+    """Item: every JSON type in every reference field is rejected without raising."""
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(outcome="failed", timestamp="2026-11-10T00:00:00Z", receipt_id="fail-1",
+                           registry=registry)
+    payload = json.loads(bounded_evidence_for_round(_evidence_1995([failure])))
+    payload["cited_receipt_references"] = [_GOOD_STUB_1995, {**_GOOD_STUB_1995, "receipt_id": "bad", field: bad}]
+    if field == "receipt_id":
+        payload["cited_receipt_references"] = [{**_GOOD_STUB_1995, field: bad}]
+    # The same class for observation rows and payload lists.
+    payload["observations"].append({**payload["observations"][0], "outcome": bad})
+    payload["observations"].append({**payload["observations"][0], "provenance": bad})
+    payload["caveats"] = bad if not isinstance(bad, list) else payload["caveats"]
+    payload["authoritative_failures"] = bad if not isinstance(bad, list) else payload["authoritative_failures"]
+    encoded = json.dumps(payload)
+    decoded = decode_bounded_evidence(encoded)
+    expected = [] if field == "receipt_id" else ["pass-stub"]
+    assert [item.receipt_id for item in decoded.cited_receipt_references] == expected
+    assert [row.receipt_id for row in decoded.observations] == ["fail-1"]
+    canonical = evidence_module.canonicalize_bounded_evidence(encoded, strict=True)
+    assert decode_bounded_evidence(canonical) is not None
+    assert bounded_evidence_for_round(payload)

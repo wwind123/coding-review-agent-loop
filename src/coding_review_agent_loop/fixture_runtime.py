@@ -49,6 +49,9 @@ MIN_SETUP_AND_INNER_SECONDS = 10.0
 MAX_TEARDOWN_BUDGET_SECONDS = 55.0
 MIN_TEARDOWN_BUDGET_SECONDS = 5.0
 LOG_EXCERPT_BYTES = 1024
+# Issue #1995: bounded operator diagnostics forwarded beside the record.
+MAX_DIAGNOSTIC_LINES = 24
+MAX_DIAGNOSTIC_BYTES = 480
 SUPERVISOR_START_SECONDS = 10.0
 # The supervisor stops setup this long before the inner deadline, so its
 # SIGTERM/SIGKILL grace still ends by that deadline.
@@ -544,6 +547,40 @@ class FixtureSupervisor:
             return status, 0.0, "", ""
         redacted = redact_log_tail(str(event.get("log") or ""), cwd=self.cwd)
         return status, round(duration, 3), log_digest(redacted), log_excerpt(redacted)
+
+    def diagnostics(self) -> tuple[str, ...]:
+        """Bounded, sanitized operator diagnostics from the cleanup event (issue #1995).
+
+        The supervisor's stderr is discarded, so its scope warnings, foreign
+        processes and the undeclared-scope hint travel in the cleanup event
+        and reach the run-tests client beside the record, never inside it.
+        """
+        with self._lock:
+            event = self.cleanup_event
+        if event is None or self.forced:
+            return ()
+        lines: list[str] = []
+        for warning in list(event.get("scope_warnings") or [])[:MAX_DIAGNOSTIC_LINES]:
+            if isinstance(warning, str):
+                lines.append("warning: " + warning)
+        foreign = [item for item in list(event.get("foreign") or [])[:MAX_DIAGNOSTIC_LINES] if isinstance(item, Mapping)]
+        for item in foreign:
+            lines.append(
+                f"foreign process (declared foreign scope) pid={item.get('pid')} uid={item.get('uid')} "
+                f"comm={item.get('comm')} cgroup={item.get('cgroup')}"
+            )
+        count = event.get("foreign_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count > len(foreign):
+            lines.append(f"{count - len(foreign)} more foreign process(es) not listed")
+        escaped = [item for item in list(event.get("escaped") or []) if isinstance(item, Mapping)]
+        if event.get("foreign_scopes_declared") is not True and any(
+            item.get("attribution") == "undetermined" for item in escaped
+        ):
+            lines.append(
+                "undetermined processes may belong to other sessions; an operator can declare their "
+                "cgroup scope with --fixture-foreign-scope on the orchestrator command"
+            )
+        return tuple(_safe_text(line, MAX_DIAGNOSTIC_BYTES) for line in lines[:MAX_DIAGNOSTIC_LINES])
 
     def record(self) -> tuple[FixtureRecord, str]:
         """The bounded record and the private (never projected) excerpts."""
