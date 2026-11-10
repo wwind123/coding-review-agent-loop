@@ -65,6 +65,8 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-aggregate-memory-high", "--containment-aggregate-memory-max",
     "--containment-aggregate-memory-swap-max", "--containment-aggregate-tasks-max",
     "--containment-os-headroom-percent", "--containment-slice", "--containment-cache-dir",
+    # Issue #1995: operator-declared foreign scopes replay with the run.
+    "--fixture-foreign-scope",
     "--containment-coder-memory-high", "--containment-coder-memory-max",
     "--containment-coder-memory-swap-max", "--containment-coder-tasks-max",
     "--containment-reviewer-memory-high", "--containment-reviewer-memory-max",
