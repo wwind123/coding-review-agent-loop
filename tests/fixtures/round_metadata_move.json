@@ -182,7 +182,7 @@
     "decode_round_metadata_mapping": "f338fcea836d6c2e95dd382ca585646c27001e315d753bb3ebb9e54ed2a8dc57",
     "_decode_recovery_fields": "e25d0a62405dee342c2b3b98f24fc9b95205b2a3a6359d45a4d289cb989e430f",
     "_encode_recovery_fields": "1859b1817ca7596b8cebcf24f86ebcc4e6a7a3112737b1df9436bd545bcac83a",
-    "_encode_round_metadata": "4618134b17c2bb07766589d7fbe8ff146e67d454b97c63abf46556c8fab73c69",
+    "_encode_round_metadata": "341b50c8ec8794434a32307aeadc9dad23a4176bd1cd7f17b568e2bb6e65055d",
     "_decode_parse_degradations": "992afdaa68430783a45449518af944c3be17fd8ad942f6dfab6c9a823a98a2d6",
     "_FOLLOWUP_DISPATCH_HEAD_RE": "0e54c2f1e427510acc1881b2d04642da3964b6442b40b694100efa60da403cfe",
     "EVIDENCE_STALL_INVALID": "2d08dd55b0e01a0b86794ee41995d67a641341070f5e4254f2dc5d16b3d77407",
