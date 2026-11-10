@@ -2319,6 +2319,24 @@ existing per-secret redaction digests.
 
 Durable metadata contains only bounded, sanitized projections: at most 32
 detailed observations and 16 KiB, with unresolved failures retained longest.
+Receipts cited by the current acquisition are never evicted. When they do not
+fit at full size (issue #1995), they are compacted instead of stopping the
+handoff: first only diagnostic fields (identifiers, the escaped-process list,
+the suite-start reason and a tool identity without a diagnostic) are dropped;
+then cited **passing** receipts, largest first, move into a
+`cited_receipt_references` list that keeps the receipt id, turn, timestamp,
+outcome, provenance, return code and fixture cleanup state. Cited payloads are
+sized for their decoded form, whose environment labels are longer, so
+publication-time canonicalization never evicts a citation; if it ever would,
+publication stops instead. A cited failure,
+timeout, interruption or incomplete run always stays a full observation, so
+its failure obligation survives the next round and a restart. A reference
+renders as `passed (details compacted for transport)`, never as an unknown
+citation, but it is display only: it is not reconciliation or supersession
+input and not a restored pass, so a restart must re-collect that pass. If even
+the compacted form cannot fit, the handoff stops with the cited count, the
+full and compacted byte sizes and the cap, so the coder can cite fewer
+receipts.
 Paths, credentials, DSNs, environment-assignment values, unknown positional
 arguments, parametrized identifiers, ANSI/control data, and diagnostics are
 redacted or hashed before persistence. Oversized or failed journal/sidecar
@@ -2503,10 +2521,10 @@ teardown it sweeps the owned tree (SIGTERM, a short wait, SIGKILL, reap).
 Cleanup is `confirmed` only when both of these hold:
 
 - the owned tree is empty and every inventoried `(pid, start time)` is gone;
-- a host-wide census of `/proc`, reading both `stat` and `status` for every
-  process, finds no live non-kernel process, of any uid,
-  started at or after the supervisor's start, other than the supervisor itself
-  and the owned inventory. An entry that has already exited and only awaits
+- a census of `/proc`, reading both `stat` and `status` for every
+  process, finds no live non-kernel process, of any uid, that the run could
+  own and that started at or after the supervisor's start, other than the
+  supervisor itself and the owned inventory (attribution rules below). An entry that has already exited and only awaits
   reaping is not a live process and is skipped: both `stat` and the `status`
   `State:` line must report the same zombie or dead state (`Z`, `X` or `x`)
   and `status` must report `Threads: 1`. The `status` state is the single
@@ -2519,17 +2537,68 @@ Cleanup is `confirmed` only when both of these hold:
 A zombie thread-group leader whose other threads are still running
 (`Threads:` above 1), an entry with a missing or unparsable `State:` or
 `Threads:` line, and an entry whose `stat` and `status` states disagree are
-still flagged. The census has no uid, scope or ancestry exemption, so work delegated to
-`systemd-run --user`, a session manager, cron, another agent-loop scope or a
-daemon of another uid is flagged. Flagged processes yield `cleanup=escaped` and
-are printed to stderr with their PIDs, uids, command names and cgroups. They
-are not killed, because they cannot be attributed safely. An unreadable `/proc`
-entry, a census that exceeds its bound, or a host-authority check that fails
-again at census time yields `cleanup=unconfirmed`. Both states are never
-citable. The census also flags unrelated long-lived processes that happen to
-start anywhere on the host during the window, such as another agent-loop turn
-or a timer unit. Collect fixture evidence on a quiet host and rerun when the
-listed PIDs are unrelated.
+still flagged.
+
+**Run attribution (issue #1995).** After the broker attaches the supervisor to
+the coder cgroup, the supervisor reads its own cgroup-v2 path as the *run
+cgroup* and records the broker's `(pid, start time)`. Every in-window process
+is then classified:
+
+- `run`: it sits in or below the run cgroup, or its parent chain reaches the
+  supervisor, the broker or an owned `(pid, start time)` identity (including a
+  child that moved to another cgroup). Identities are always compared with
+  the start time, so a recycled PID never counts.
+- `undetermined`: anything else, unless the proof below succeeds. This
+  includes work delegated to `systemd-run --user`, a session manager, cron, a
+  container shim or any process reparented to PID 1, a process whose nearest
+  pre-window ancestor sits in a different cgroup, a local daemon's worker in
+  its own cgroup, and any process whose cgroup or ancestry cannot be read
+  consistently (an unreadable cgroup file, no `0::` line, a `..` path, a
+  missing parent, a cycle, an ancestry deeper than 4096 steps, a parent that
+  started after its child, or an identity that changes while it is read).
+- `foreign`: nothing outside the run is foreign by structure alone. A process
+  is foreign only when its cgroup matches an operator-declared foreign scope,
+  every in-window ancestor shares that cgroup, the nearest pre-window ancestor
+  is not PID 1 and shares it too, and every identity of that chain is re-read
+  unchanged after its cgroup was read.
+
+`run` and `undetermined` processes yield `cleanup=escaped`; they are printed
+to stderr with their PIDs, uids, command names, cgroups and attribution, and
+recorded (bounded) on the fixture record. Foreign processes are listed as
+`foreign process (declared foreign scope)` diagnostics and never change
+cleanup. These diagnostics, the foreign-scope warnings below and a hint to
+declare a scope when undetermined processes remain travel in the broker's
+response beside the fixture record (never inside it) and `run-tests` prints
+them as `agent-loop fixture:` lines. No flagged or foreign process is killed. When the run cgroup or the
+broker identity cannot be read (for example without cgroup v2) the census
+stays host-wide: every in-window process is flagged as before and nothing is
+foreign. An unreadable `/proc` entry, a census that exceeds its bound
+(including during classification, which never returns a partial result), or a
+host-authority check that fails again at census time yields
+`cleanup=unconfirmed`. Both states are never citable.
+
+**Declaring foreign scopes.** On a shared host, other sessions' long-lived
+processes that start during the window are `undetermined` until the operator
+declares their scope. Declare it on the orchestrator command (`issue`, `task`,
+`pr`, `managed-pr`, `discuss`), never on `run-tests`:
+
+```bash
+agent-loop pr 123 --fixture-foreign-scope '/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-*.scope'
+```
+
+`--fixture-foreign-scope GLOB` is repeatable and is matched with `fnmatch`
+against the full unified cgroup path. It reaches the test broker from the
+parent's configuration only; a `run-tests` client request, its environment
+and the fixture can never supply or widen it. At supervisor start a pattern
+that matches a strict ancestor of the run cgroup (for example
+`.../app.slice`) is discarded with a warning, because it would cover the
+run's own subtree. A pattern that matches the run cgroup itself is kept with
+a warning: run attribution always wins, so when the loop itself runs in a
+`tmux-spawn-A.scope` without managed containment, a sibling session in
+`tmux-spawn-B.scope` is foreign while a leak left in `tmux-spawn-A.scope` is
+still `escaped` as `run`. Declaring a scope asserts that nothing the run asks
+for executes in it: do not declare a tmux scope when the fixture itself uses
+tmux, or a service scope the fixture delegates to.
 
 The cleanup authority covers the local host's process table. Work requested
 from a daemon on another machine over the network is outside it.

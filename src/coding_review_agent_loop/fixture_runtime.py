@@ -4,8 +4,10 @@ The broker validates fixture provenance before anything launches, then runs
 ``<fixture> setup``, the unchanged recognized inner command and
 ``<fixture> teardown`` under one absolute request deadline.  A Linux
 child-subreaper supervisor (:mod:`fixture_supervisor`) owns every fixture
-descendant; cleanup is confirmed only when its owned tree is empty and a
-host-wide census finds no process started in the window outside that tree.
+descendant; cleanup is confirmed only when its owned tree is empty and the
+census finds no process started in the window that the run could own
+(issue #1995: processes proven to be in an operator-declared foreign scope
+are reported as diagnostics only).
 
 The fixture is never probed or recorded as a launcher: launch integrity
 still authenticates only the inner command.
@@ -24,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .errors import AgentLoopError
 from .fixture_supervisor import (
@@ -47,6 +49,9 @@ MIN_SETUP_AND_INNER_SECONDS = 10.0
 MAX_TEARDOWN_BUDGET_SECONDS = 55.0
 MIN_TEARDOWN_BUDGET_SECONDS = 5.0
 LOG_EXCERPT_BYTES = 1024
+# Issue #1995: bounded operator diagnostics forwarded beside the record.
+MAX_DIAGNOSTIC_LINES = 24
+MAX_DIAGNOSTIC_BYTES = 480
 SUPERVISOR_START_SECONDS = 10.0
 # The supervisor stops setup this long before the inner deadline, so its
 # SIGTERM/SIGKILL grace still ends by that deadline.
@@ -292,6 +297,15 @@ def log_excerpt(redacted: str) -> str:
 # Supervisor handle --------------------------------------------------------------
 
 
+def supervisor_scope_arguments(foreign_scopes: Sequence[str]) -> list[str]:
+    """Repeated ``--foreign-scope`` arguments for valid absolute patterns."""
+    arguments: list[str] = []
+    for pattern in dict.fromkeys(foreign_scopes or ()):
+        if isinstance(pattern, str) and pattern.startswith("/") and "\x00" not in pattern and "\n" not in pattern:
+            arguments.extend(("--foreign-scope", pattern))
+    return arguments
+
+
 @dataclass
 class SetupDecision:
     """What the runner does after the post-admission setup hook."""
@@ -338,11 +352,13 @@ class FixtureSupervisor:
         request_deadline: float,
         teardown_seconds: float,
         mount_id: str,
+        foreign_scopes: Sequence[str] = (),
     ) -> "FixtureSupervisor":
         """Spawn the supervisor; deadlines are absolute ``time.monotonic()`` values.
 
         CLOCK_MONOTONIC is system-wide on Linux, so the supervisor enforces
-        the same absolute deadlines as the broker.
+        the same absolute deadlines as the broker.  ``foreign_scopes`` comes
+        from parent-owned orchestrator config only (issue #1995).
         """
         spawn_cwd: str | Path = cwd
         preexec: Callable[[], None] | None = None
@@ -358,6 +374,7 @@ class FixtureSupervisor:
                 "--teardown-timeout", f"{max(0.1, teardown_seconds):.3f}",
                 "--sweep-allowance", f"{SWEEP_ALLOWANCE_SECONDS:.3f}",
                 "--mount-id", mount_id,
+                *supervisor_scope_arguments(foreign_scopes),
             ],
             cwd=spawn_cwd,
             preexec_fn=preexec,
@@ -531,6 +548,40 @@ class FixtureSupervisor:
         redacted = redact_log_tail(str(event.get("log") or ""), cwd=self.cwd)
         return status, round(duration, 3), log_digest(redacted), log_excerpt(redacted)
 
+    def diagnostics(self) -> tuple[str, ...]:
+        """Bounded, sanitized operator diagnostics from the cleanup event (issue #1995).
+
+        The supervisor's stderr is discarded, so its scope warnings, foreign
+        processes and the undeclared-scope hint travel in the cleanup event
+        and reach the run-tests client beside the record, never inside it.
+        """
+        with self._lock:
+            event = self.cleanup_event
+        if event is None or self.forced:
+            return ()
+        lines: list[str] = []
+        for warning in list(event.get("scope_warnings") or [])[:MAX_DIAGNOSTIC_LINES]:
+            if isinstance(warning, str):
+                lines.append("warning: " + warning)
+        foreign = [item for item in list(event.get("foreign") or [])[:MAX_DIAGNOSTIC_LINES] if isinstance(item, Mapping)]
+        for item in foreign:
+            lines.append(
+                f"foreign process (declared foreign scope) pid={item.get('pid')} uid={item.get('uid')} "
+                f"comm={item.get('comm')} cgroup={item.get('cgroup')}"
+            )
+        count = event.get("foreign_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count > len(foreign):
+            lines.append(f"{count - len(foreign)} more foreign process(es) not listed")
+        escaped = [item for item in list(event.get("escaped") or []) if isinstance(item, Mapping)]
+        if event.get("foreign_scopes_declared") is not True and any(
+            item.get("attribution") == "undetermined" for item in escaped
+        ):
+            lines.append(
+                "undetermined processes may belong to other sessions; an operator can declare their "
+                "cgroup scope with --fixture-foreign-scope on the orchestrator command"
+            )
+        return tuple(_safe_text(line, MAX_DIAGNOSTIC_BYTES) for line in lines[:MAX_DIAGNOSTIC_LINES])
+
     def record(self) -> tuple[FixtureRecord, str]:
         """The bounded record and the private (never projected) excerpts."""
         with self._lock:
@@ -556,7 +607,11 @@ class FixtureSupervisor:
                     escaped.append(
                         _safe_text(
                             f"pid={item.get('pid')} uid={item.get('uid')} comm={item.get('comm')} "
-                            f"cgroup={item.get('cgroup')}",
+                            + (
+                                f"attribution={item.get('attribution')} "
+                                if item.get("attribution") in {"run", "undetermined"} else ""
+                            )
+                            + f"cgroup={item.get('cgroup')}",
                             160,
                         )
                     )

@@ -5395,6 +5395,22 @@ def test_recovery_renderer_keeps_architecture_membership_values(tmp_path):
     assert args.architecture_default_excludes is False
 
 
+def test_recovery_renderer_keeps_fixture_foreign_scopes_1995(tmp_path):
+    parser = build_parser()
+    scope = "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-*.scope"
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--fixture-foreign-scope", scope,
+            "--fixture-foreign-scope", "/system.slice/other.service", "643",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.issue_number == 643
+    assert args.fixture_foreign_scope == [scope, "/system.slice/other.service"]
+
+
 def test_recovery_value_option_table_covers_all_recovery_subparsers():
     parser = build_parser()
     subparsers = next(action for action in parser._actions if action.dest == "command")

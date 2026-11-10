@@ -41,3 +41,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Preserve static facade protection for the standalone `review_images_worker.py` sandbox supervisor when merging the package import guard with its sealed `/trusted` execution layout (#1806).
 
 - Managed-CI support bindings are consumed directly from types, API and protection owners; compatibility-only driver exports are removed while required internal imports remain (#1906).
+
+- Scope the fixture census to the run: attribute by run cgroup and (pid, start) ancestry to the supervisor, broker or owned identities, keep every other in-window process `undetermined` and failing, and exempt only processes with a bounded, re-verified same-cgroup proof in an operator-declared foreign scope supplied through parent config; a PID namespace was rejected because the host gate assumes no privileges or unprivileged user namespaces. Compact cited round receipts over the byte cap (diagnostic fields, then passing rows to display-only references; non-passing citations stay full observations) instead of splitting the handoff across rounds (#1995, 2026-11-10).

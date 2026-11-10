@@ -100,6 +100,7 @@ from .test_runtime import (
 from .local_test_evidence import (
     CROSS_RESTART_SUPERSESSION_CAVEAT,
     TREE_CHANGE_SUPERSESSION,
+    COMPACTED_REFERENCE_LABEL,
     decode_bounded_evidence,
     tool_identity_diagnostic,
     redact_test_command,
@@ -258,11 +259,22 @@ def _render_test_observation_citations(
         claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
         observed = by_receipt.get(receipt_id)
+        # Issue #1995: a cited pass compacted for transport is display-only;
+        # it resolves the citation but never acts as an observation.
+        reference = (
+            evidence.reference_for(receipt_id)
+            if observed is None and evidence is not None else None
+        )
         supported = observed is not None
         reason = "verified against the parent journal"
         if len(citation_uses.get(receipt_id, ())) > 1:
             supported = False
             reason = "unverified: conflicting uses of one receipt"
+        elif reference is not None:
+            reason = COMPACTED_REFERENCE_LABEL + (
+                "" if current_test_turn_id is not None and reference.turn_id == current_test_turn_id
+                else "; cross-turn receipt"
+            )
         elif observed is None:
             reason = "unverified: unknown or cross-turn receipt"
         elif current_test_turn_id is None or observed.turn_id != current_test_turn_id:

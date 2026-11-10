@@ -558,6 +558,9 @@ class AgentLoopConfig:
     # so CLI strings such as ``70%`` and ``2GiB`` are resolved exactly once by
     # containment.policy_from_values().
     containment_mode: str = "auto"
+    # Issue #1995: operator-declared foreign cgroup scopes (fnmatch patterns
+    # over the full unified cgroup path) for the run-tests --fixture census.
+    fixture_foreign_scopes: tuple[str, ...] = ()
     containment_memory_high: object | None = None
     containment_memory_max: object | None = None
     containment_memory_swap_max: object | None = None
@@ -2399,6 +2402,27 @@ def resolve_git_ssh_identity(args: argparse.Namespace, *, local_origin: Path | N
     return identity
 
 
+def validate_fixture_foreign_scopes(values: object) -> tuple[str, ...]:
+    """Validate operator-declared ``--fixture-foreign-scope`` patterns (issue #1995)."""
+    if not values:
+        return ()
+    if isinstance(values, str):
+        values = (values,)
+    patterns: list[str] = []
+    for value in values:  # type: ignore[union-attr]
+        if not isinstance(value, str) or not value.startswith("/") or any(
+            char in value for char in ("\x00", "\n", "\r")
+        ):
+            raise AgentLoopError(
+                "--fixture-foreign-scope must be an absolute cgroup-v2 path pattern, "
+                "for example /user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-*.scope."
+            )
+        if ".." in value.split("/"):
+            raise AgentLoopError("--fixture-foreign-scope may not contain a '..' component.")
+        patterns.append(value)
+    return tuple(dict.fromkeys(patterns))
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -2853,6 +2877,7 @@ def config_from_args(
             else worktree_setup_timeout_seconds
         ),
         containment_mode=getattr(args, "containment_mode", "auto"),
+        fixture_foreign_scopes=validate_fixture_foreign_scopes(getattr(args, "fixture_foreign_scope", None)),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),
         containment_memory_swap_max=getattr(args, "containment_memory_swap_max", None),

@@ -703,6 +703,19 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         add_containment_options(subparser)
+        subparser.add_argument(
+            "--fixture-foreign-scope",
+            dest="fixture_foreign_scope",
+            action="append",
+            default=None,
+            metavar="GLOB",
+            help=(
+                "Repeatable. Declare a cgroup-v2 scope (fnmatch over the full unified path) whose "
+                "processes the run-tests --fixture census may report as foreign diagnostics instead "
+                "of escaped leaks. Declaring a scope asserts that nothing the run asks for executes "
+                "in it; a scope covering the run's own cgroup subtree is discarded."
+            ),
+        )
         pre_review_tests_group = subparser.add_mutually_exclusive_group()
         pre_review_tests_group.add_argument(
             "--pre-review-tests",
@@ -2478,6 +2491,9 @@ def _run_fixture_tests(
     )
     for item in record.get("escaped_processes") or ():
         print(f"agent-loop fixture: escaped process {item}", file=sys.stderr, flush=True)
+    # Issue #1995: census diagnostics (scope warnings, foreign processes).
+    for line in getattr(result, "fixture_diagnostics", ()) or ():
+        print(f"agent-loop fixture: {line}", file=sys.stderr, flush=True)
     if result.outcome == "timed_out":
         print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
     # Timing and launcher health describe only the inner command; a fixture
