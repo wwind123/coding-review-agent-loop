@@ -714,6 +714,58 @@ def managed_test_wrapper_inner_command(command: str) -> str | None:
     return shlex.join(parsed.inner_argv) if parsed is not None else None
 
 
+_RERUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def parse_rerun_citation(command: object) -> str | None:
+    """Return the target receipt of an exact ``run-tests --rerun`` citation (#1999).
+
+    Accepts only the pinned wrapper or ``agent-loop`` spelling, then
+    ``run-tests``, the allowed run-tests options and exactly one ``--rerun
+    <safe-id>``, with no inner command.  Anything else is ``None``.
+    """
+    if not isinstance(command, str):
+        return None
+    try:
+        tokens = tuple(shlex.split(command))
+    except ValueError:
+        return None
+    if len(tokens) >= 2 and tokens[1] == "run-tests" and (
+        Path(tokens[0]).name == "agent-loop"
+        and _is_recognized_launcher(tokens[0], allow_command_name_launcher=True)
+        or tokens[0] in {"$AGENT_LOOP_EXECUTABLE", "${AGENT_LOOP_EXECUTABLE}", "${AGENT_LOOP_EXECUTABLE:-agent-loop}"}
+    ):
+        index = 2
+    elif (
+        len(tokens) >= 4
+        and _is_recognized_launcher(tokens[0], allow_command_name_launcher=True)
+        and tokens[1:4] == ("-m", "coding_review_agent_loop.cli", "run-tests")
+    ):
+        index = 4
+    else:
+        return None
+    target: str | None = None
+    seen: set[str] = set()
+    while index < len(tokens):
+        name, equals, value = tokens[index].partition("=")
+        if name not in _MANAGED_RUN_TESTS_OPTIONS | {"--rerun"} or name in seen:
+            return None
+        seen.add(name)
+        if not equals:
+            if index + 1 >= len(tokens):
+                return None
+            value = tokens[index + 1]
+            index += 1
+        if not value or value.startswith("-"):
+            return None
+        if name == "--rerun":
+            if not _RERUN_ID_RE.fullmatch(value):
+                return None
+            target = value
+        index += 1
+    return target
+
+
 def _pinned_launcher_prefix() -> tuple[str, ...] | None:
     """The import-pinned running-install launcher prefix (#1632), or None."""
     from .agent_executable import agent_loop_launcher

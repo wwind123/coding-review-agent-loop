@@ -1966,6 +1966,12 @@ class Runner:
         # bounded string stays the display and persistence projection.
         self.last_reconciled_local_test_evidence: LocalTestEvidence | None = None
         self._environment_registry = EnvironmentIdentityRegistry()
+        # Issue #1999: one private rerun catalog per invocation, shared by
+        # every per-turn broker so a failure recorded in one coder turn can
+        # be replayed exactly in the next.  Memory only; never persisted.
+        from .local_test_rerun import RerunCatalog
+
+        self.rerun_catalog = RerunCatalog()
         self._containment_role = "coder"
         # Operator worker-budget options (issue #848); None means derive.
         self.test_workers: int | None = None
@@ -2125,6 +2131,8 @@ class Runner:
                 dependency_remedy=_broker_dependency_remedy(env),
                 # Issue #1995: parent config only, never the agent's request.
                 fixture_foreign_scopes=getattr(self, "fixture_foreign_scopes", ()),
+                # Issue #1999: the runner-owned catalog, never client input.
+                rerun_catalog=getattr(self, "rerun_catalog", None),
             ).start()
         except (OSError, ValueError, AgentLoopError) as exc:
             # Broker setup is infrastructure telemetry. A coder can still use

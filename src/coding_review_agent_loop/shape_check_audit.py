@@ -76,7 +76,9 @@ IMPORTED_RAISERS: dict[str, frozenset[str]] = {
     "sanitize_historical_text": frozenset({"AgentLoopError"}),
     "normalize_fix_scope": frozenset({"AgentLoopError"}),
 }
-IMPORTED_NON_RAISERS: frozenset[str] = frozenset({"_managed_test_wrapper_inner_command"})
+IMPORTED_NON_RAISERS: frozenset[str] = frozenset(
+    {"_managed_test_wrapper_inner_command", "_parse_rerun_citation"}
+)
 
 
 SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {

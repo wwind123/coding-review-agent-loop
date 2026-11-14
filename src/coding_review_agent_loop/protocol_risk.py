@@ -19,6 +19,7 @@ from .protocol_markers import sanitize_historical_text
 from .test_runtime import (
     CITABLE_TEST_RUNNERS_SUMMARY,
     managed_test_wrapper_inner_command as _managed_test_wrapper_inner_command,
+    parse_rerun_citation as _parse_rerun_citation,
 )
 from .protocol_common import (
     PARSE_DEGRADATION_RENDER_LIMIT,
@@ -2148,6 +2149,12 @@ def _citation_matches_observation(
         or (observed_claim is None and citation.claim != "current-result")
     ):
         return False
+    rerun_target = _parse_rerun_citation(citation.command)
+    if rerun_target is not None:
+        # Issue #1999: a ``--rerun`` citation matches only the live replay row
+        # whose recorded ``rerun_of`` names the same failure receipt.
+        observed_rerun = observed("rerun_of")
+        return isinstance(observed_rerun, str) and observed_rerun == rerun_target
     commands: set[str] = set()
     if projected_value is not None and isinstance(projected_value.get("command"), str):
         commands.add(projected_value["command"])

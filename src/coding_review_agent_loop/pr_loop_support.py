@@ -31,6 +31,7 @@ from dataclasses import (
 from pathlib import Path
 from typing import Literal, NoReturn
 from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
+from .test_runtime import parse_rerun_citation
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .review_scope import is_complete_code_review, is_visual_item, is_visual_review, visual_candidate, authority_records
@@ -456,24 +457,38 @@ def canonical_receipt_progress(
     parsed = response.marker_value
     if not isinstance(parsed, StructuredCoderFollowup):
         return frozenset()
-    accepted: dict[str, set[tuple[str, str]]] = {}
-    for citation in parsed.test_observations:
-        accepted.setdefault(citation.receipt_id, set()).add(
-            (redact_test_command(citation.command)[0], citation.claim)
-        )
-    live = {
-        row.receipt_id for row in response.acquisition_test_observations
+    live_rows = {
+        row.receipt_id: row for row in response.acquisition_test_observations
         if getattr(row, "turn_id", None) == response.acquisition_test_turn_id
         and getattr(row, "provenance", None) == "parent-observed"
         and not getattr(row, "restored", True)
     }
+    live = set(live_rows)
+
+    def citation_command(command: str, receipt_id: str) -> str:
+        # Issue #1999: a matched ``--rerun`` citation stands for the
+        # replayed row's redacted command; any other spelling is unchanged.
+        target = parse_rerun_citation(command)
+        replay = live_rows.get(receipt_id)
+        if target is not None and replay is not None and getattr(replay, "rerun_of", None) == target:
+            return redact_test_command(getattr(replay, "command", ()))[0]
+        return redact_test_command(command)[0]
+
+    accepted: dict[str, set[tuple[str, str]]] = {}
+    for citation in parsed.test_observations:
+        accepted.setdefault(citation.receipt_id, set()).add(
+            (citation_command(citation.command, citation.receipt_id), citation.claim)
+        )
     return frozenset(
         citation.receipt_id for row in derived.evidence.rows
         if row.row_id in requested - old_verified and row.status == "verified"
         and row.evidence_source == EVIDENCE_SOURCE_TOOL_CAPTURED
         for citation in row.evidence_citations
         if citation.receipt_id in live
-        and accepted.get(citation.receipt_id) == {(citation.command, citation.claim)}
+        and accepted.get(citation.receipt_id) in (
+            {(citation.command, citation.claim)},
+            {(citation_command(citation.command, citation.receipt_id), citation.claim)},
+        )
     )
 
 
@@ -5920,3 +5935,26 @@ def _record_failed_acknowledgement(
         ),
     )
     return items
+
+
+def local_test_failure_context(runner: object, config: object) -> str:
+    """Local-only rerun block for the live unsuperseded failures (issue #1999).
+
+    Built from the runner's live reconciliation and its private rerun
+    catalog; never posted.  Empty when there is nothing to report.
+    """
+    from .local_test_evidence import LocalTestEvidence
+    from .local_test_rerun import RerunCatalog, unsuperseded_failure_rerun_block
+    from .test_runtime import resolve_wrapper_prefix
+    from .workdirs import active_workdir
+
+    evidence = getattr(runner, "last_reconciled_local_test_evidence", None)
+    if not isinstance(evidence, LocalTestEvidence):
+        return ""
+    catalog = getattr(runner, "rerun_catalog", None)
+    return unsuperseded_failure_rerun_block(
+        evidence,
+        catalog if isinstance(catalog, RerunCatalog) else None,
+        active_workdir(config),
+        resolve_wrapper_prefix(),
+    )
