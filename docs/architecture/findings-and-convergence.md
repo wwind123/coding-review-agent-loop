@@ -593,12 +593,20 @@ reviewer associations link surfaced signed IDs to that requester's native
 human-only requests or classify answers as evidence-only/mixed. The shared
 projection precedes acknowledgement repair and coder prompt/validation. Human-only
 requirements remain pending evidence; evidence-only answers leave coder work;
-mixed answers keep their original ID with only explicit leftover instructions.
+mixed answers keep their original ID. Reviewers agree on a source when they agree
+on its role (#2000); each entry's linkage is still validated against that
+requester's own requests and native items, and leftover wording never conflicts.
+An agreed mixed source carries the verbatim signed source plus every reviewer's
+`leftover_instructions`, each attributed to its reviewer and ordered by reviewer
+name, so live projection and `historical_projection` replay produce identical bodies.
 Every validated review contributes, including a blocking review with code work.
 Unacknowledged signed sources receive one real semantic classification continuation,
 including standalone sources with no evidence ledger or emitted request, never
-format repair. Missing or conflicting classifications after that continuation stop
-before acknowledgement reinjection or coder dispatch. The signed source and already
+format repair. The continuation shows prior classifications as reviewer and role
+only. Missing classifications or role conflicts after that continuation stop
+before acknowledgement reinjection or coder dispatch; a role-conflict stop names
+each reviewer's role per source and the clearing input, a follow-up signed comment
+that separates exact-head evidence answers from code requirements. The signed source and already
 published pending evidence remain available for reviewer agreement or a human decision. Invalid associations are semantic judgement errors re-asked within validated reviewer turns; replay conservatively retains the complete source. Classification
 cannot authorize acceptance: native requester citations and final live head/source
 reads retain that authority before and after freeze.

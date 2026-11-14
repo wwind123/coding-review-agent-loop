@@ -33,13 +33,16 @@ def test_mixed_projection_preserves_original_identity_and_source():
     items, entry, text, parsed = setup_role()
     (action,) = project([SOURCE], {"Codex": parsed}, items)
     assert action.requirement_id == SOURCE.requirement_id
-    assert action.body == "Fix retries."
+    assert action.body == (
+        "Signed source (verbatim):\nAccept the run. Also fix retries.\n\n"
+        "Reviewer leftover instructions (classification only; the signed source is authoritative):\n"
+        "- Codex: Fix retries.")
     assert SOURCE.body == "Accept the run. Also fix retries."
     assert action.url == SOURCE.url
 
 
 @pytest.mark.parametrize("replay", [False, True])
-@pytest.mark.parametrize("fault", ["unsurfaced", "foreign", "missing", "nonnative", "ambiguous", "unlinked", "conflict", "wording"])
+@pytest.mark.parametrize("fault", ["unsurfaced", "foreign", "missing", "nonnative", "ambiguous", "unlinked", "conflict", "mixed-invalid"])
 def test_associations_fail_closed(fault, replay):
     items, entry, text, parsed = setup_role()
     requirements = [SOURCE]
@@ -57,13 +60,13 @@ def test_associations_fail_closed(fault, replay):
     elif fault == "unlinked":
         reviews["Codex"] = dataclasses.replace(parsed, requirement_evidence=(
             _association(SOURCE.requirement_id, "human-only", request="Unemitted request"),))
+    elif fault == "conflict":
+        reviews["Gemini"] = dataclasses.replace(parsed, requirement_evidence=(_association(SOURCE.requirement_id, "code"),))
     else:
-        other_entry = _association(SOURCE.requirement_id, "code") if fault == "conflict" else {**entry, "leftover_instructions": "Repair retries."}
-        other = dataclasses.replace(parsed, requirement_evidence=(other_entry,))
-        if fault == "wording":
-            items = [*items, dataclasses.replace(items[0], item_id="item-2", reviewer="Gemini")]
-            other = dataclasses.replace(other, requirement_evidence=({**other_entry, "answered_item_ids": ["item-2"]},))
-        reviews["Gemini"] = other
+        # Same mixed role, but Gemini answers Codex's item: role agreement never
+        # overrides an invalid per-requester linkage.
+        reviews["Gemini"] = dataclasses.replace(parsed, requirement_evidence=(
+            {**entry, "leftover_instructions": "Repair retries."},))
     if replay:
         records = [SimpleNamespace(metadata=PostedRoundMetadata(flow="pr", role="reviewer", agent=name,
             round_number=index + 1, subject=("a" if index else "b") * 40, prior_items=tuple(items),
@@ -102,7 +105,9 @@ def test_round_trip_and_trusted_replay_keep_scope(role):
     projected = historical_projection([SOURCE], [SimpleNamespace(metadata=decoded)])
     assert [r.requirement_id for r in projected] == ([SOURCE.requirement_id] if role == "mixed" else [])
     if projected:
-        assert projected[0].body == "Fix retries."
+        assert projected[0].requirement_id == SOURCE.requirement_id
+        assert SOURCE.body in projected[0].body
+        assert "- Codex: Fix retries." in projected[0].body
     legacy = dataclasses.replace(meta, requirement_evidence=())
     assert historical_projection([SOURCE], [SimpleNamespace(metadata=legacy)]) == (SOURCE,)
     edited = dataclasses.replace(SOURCE, body="New instruction")
@@ -152,9 +157,73 @@ def test_conflicting_classification_gets_one_real_continuation(resolved):
         result, _ = run()
         assert project([SOURCE], {**previous, "Codex": result}, items) == (SOURCE,)
     else:
-        with pytest.raises(HumanDecisionRequiredError, match="classification remained conflicting"):
+        with pytest.raises(HumanDecisionRequiredError, match="classification remained conflicting") as error:
             run()
+        message = str(error.value)
+        assert f"{SOURCE.requirement_id}: Codex: mixed, Gemini: code" in message
+        assert "follow-up signed comment that separates exact-head evidence answers from code requirements" in message
+        assert "no coder was dispatched" in message
     assert len(calls) == 1
+    assert "Agreement is decided by role" in calls[0]
+    assert '"reviewer": "Gemini", "role": "code"' in calls[0]
+
+
+def _two_mixed_reviewers(order=("Codex", "Gemini")):
+    items, entry, _, parsed = setup_role()
+    items = [*items, dataclasses.replace(items[0], item_id="item-2", reviewer="Gemini")]
+    gemini = dataclasses.replace(parsed, requirement_evidence=(
+        {**entry, "answered_item_ids": ["item-2"], "leftover_instructions": "Repair retries."},))
+    reviews = {"Codex": parsed, "Gemini": gemini}
+    return items, {name: reviews[name] for name in order}
+
+
+def _records(reviews, items):
+    return [SimpleNamespace(metadata=PostedRoundMetadata(flow="pr", role="reviewer", agent=name,
+        round_number=1, subject="a" * 40, prior_items=tuple(items),
+        requirement_evidence=review.requirement_evidence, evidence_requests=review.exact_head_evidence_requests))
+        for name, review in reviews.items()]
+
+
+EXPECTED_MERGED = (
+    "Signed source (verbatim):\nAccept the run. Also fix retries.\n\n"
+    "Reviewer leftover instructions (classification only; the signed source is authoritative):\n"
+    "- Codex: Fix retries.\n- Gemini: Repair retries.")
+
+
+@pytest.mark.parametrize("order", [("Codex", "Gemini"), ("Gemini", "Codex")])
+@pytest.mark.parametrize("replay", [False, True])
+def test_mixed_wording_difference_merges_attributed(replay, order):
+    items, reviews = _two_mixed_reviewers(order)
+    live = project([SOURCE], reviews, items)
+    result = historical_projection([SOURCE], _records(reviews, items)) if replay else live
+    (action,) = result
+    assert action.requirement_id == SOURCE.requirement_id
+    assert action.url == SOURCE.url
+    assert action.body == EXPECTED_MERGED
+    # Replay parity: identical tuples, independent of posting order.
+    assert historical_projection([SOURCE], _records(reviews, items)) == live
+    assert project([SOURCE], dict(reversed(list(reviews.items()))), items) == live
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_role_conflict_projection_retains_source(replay):
+    items, reviews = _two_mixed_reviewers()
+    reviews["Gemini"] = dataclasses.replace(reviews["Gemini"], requirement_evidence=(
+        _association(SOURCE.requirement_id, "code"),))
+    result = historical_projection([SOURCE], _records(reviews, items)) if replay else project([SOURCE], reviews, items)
+    assert result == (SOURCE,)
+    assert type(result[0]) is HumanReviewRequirement
+
+
+def test_classify_review_wording_difference_is_not_conflict():
+    items, reviews = _two_mixed_reviewers()
+    text = _classified_review(list(reviews["Codex"].requirement_evidence))
+    def invoke(prompt):
+        raise AssertionError("wording difference must not trigger the classification re-ask")
+    result, result_text = classify_review(reviews["Codex"], text, requirements=[SOURCE], items=items,
+        reviewer_name="Codex", invoke=invoke, previous={"Gemini": reviews["Gemini"]})
+    assert result is reviews["Codex"]
+    assert result_text == text
 
 
 @pytest.mark.parametrize("acknowledged", [False, True])
