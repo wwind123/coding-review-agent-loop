@@ -5383,7 +5383,11 @@ class TestBrokerServer:
                 + str(worker_enforcement)
                 + (f"; {', '.join(worker_caveats)}" if worker_caveats else "")
                 + "; executed argv: "
-                + " ".join(str(item) for item in getattr(result, "args", argv))[:512],
+                # Issue #1999: the caveat is projected publicly, so it carries
+                # the redacted command, never raw argv such as a ``-k`` value.
+                + _redact_command_tokens(
+                    tuple(str(item) for item in (getattr(result, "args", None) or argv)), cwd=cwd,
+                )[1][:512],
             )
         pre_collection = getattr(result, "pre_collection_launch_failure", None)
         result_outcome = str(result.outcome)

@@ -1012,3 +1012,58 @@ def test_failure_from_an_earlier_coder_turn_is_replayed_by_the_next_turn_broker(
     assert evidence.observations[0].superseded_by == replay[0].receipt_id
     assert evidence.authoritative_failures == ()
     assert RAW_K not in rendered and TEMP_VALUE not in rendered and TEMP_NAME not in rendered
+
+
+@pytest.mark.parametrize(
+    ("enforcement", "worker_caveats"),
+    [
+        ("clamped", ()),
+        ("unverified", ()),
+        ("exceeded", ()),
+        ("refused-in-command", ()),
+        ("enforced", ("worker count lowered to the budget",)),
+    ],
+)
+def test_worker_budget_caveat_never_publishes_raw_argv_for_a_failure_or_its_replay(
+    tmp_path, enforcement, worker_caveats,
+):
+    """Review item-1: the worker-budget journal caveat embeds the redacted command."""
+    root = _git_repo(tmp_path / "repo")
+    registry = EnvironmentIdentityRegistry()
+    catalog = RerunCatalog()
+    outcomes = ["failed", "passed"]
+
+    def execute(argv, cwd, timeout, environment, stream):
+        outcome = outcomes.pop(0)
+        return SimpleNamespace(
+            outcome=outcome, returncode=0 if outcome == "passed" else 1,
+            elapsed_seconds=0.01, output_tail="", suite_start="verified",
+            wrapper_bootstrap="verified", inner_exec="started",
+            args=[*argv, "-n", "2"], worker_enforcement=enforcement,
+            worker_caveats=worker_caveats,
+        )
+
+    server = BrokerServer(
+        root=root, turn_id="turn-worker-1999", execute=execute, rerun_catalog=catalog,
+        environment_registry=registry,
+    ).start()
+    try:
+        first = BrokerClient(_client_env(server)).run(list(K_ARGV), timeout_seconds=5, cwd=root)
+        replay = BrokerClient(_client_env(server)).run([], timeout_seconds=5, cwd=root, rerun_of=first.receipt_id)
+        journal = list(server.journal)
+    finally:
+        server.stop()
+    assert replay.rerun_of == first.receipt_id and len(journal) == 2
+    for row in journal:
+        worker = [item for item in row.caveats if item.startswith("worker budget (top-level runner)")]
+        assert len(worker) == 1 and "<arg-sha256:" in worker[0] and RAW_K not in worker[0]
+        assert RAW_K not in json.dumps(row.public_projection())
+        assert RAW_K not in json.dumps(evidence_module.redact_observation(row).public_projection())
+    head = _git(root, "rev-parse", "HEAD").strip()
+    evidence = reconcile_test_observations(
+        journal, current_head=head, current_snapshot=stable_tracked_tree_snapshot(root), registry=registry,
+    )
+    encoded = bounded_evidence_for_round(evidence)
+    assert RAW_K not in encoded
+    assert RAW_K not in canonicalize_bounded_evidence(encoded, strict=True)
+    assert RAW_K not in replay.rerun_command and all(RAW_K not in item for item in replay.executed_argv)
