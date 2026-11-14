@@ -4949,7 +4949,9 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     if with_receipt:
         sentence = (
             " The latest local test evidence still holds unsuperseded failure receipts: "
-            "`python3 -m pytest tests/test_x.py -q -n 0` (failed). This stop may be evidence "
+            "receipt `receipt-open` `python3 -m pytest tests/test_x.py -q -n 0` (failed). "
+            "A live failure is cleared only by an identical passing rerun at the current head "
+            "via `run-tests --rerun <receipt>`; other selections never supersede it. This stop may be evidence "
             "bookkeeping rather than a missing code change; an operator can verify the command "
             "and decide whether the receipts are still meaningful."
         )

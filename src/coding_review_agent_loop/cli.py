@@ -1978,6 +1978,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Requires the broker and a timeout of at least 30s; never runs locally."
         ),
     )
+    run_tests.add_argument(
+        "--rerun",
+        default=None,
+        metavar="RECEIPT_ID",
+        help=(
+            "Replay an unsuperseded parent-observed failure receipt from this invocation "
+            "exactly: the broker reuses its recorded command, working directory, fixture and "
+            "environment. Exclusive with an inner command and --fixture; requires the broker; "
+            "never runs locally. Cite the replay as `agent-loop run-tests --rerun RECEIPT_ID`."
+        ),
+    )
     add_containment_options(run_tests)
     run_tests.add_argument(
         "inner_argv",
@@ -2422,6 +2433,96 @@ def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+RERUN_NOT_DISPATCHED_MESSAGE = (
+    "agent-loop: --rerun requires the test broker; nothing was run (not evidence)"
+)
+RERUN_CONFLICT_MESSAGE = (
+    "agent-loop: --rerun cannot be combined with an inner command, --fixture or --preflight; "
+    "nothing was run (not evidence)"
+)
+RERUN_RESULT_UNKNOWN_MESSAGE = (
+    "agent-loop: broker result unknown after dispatch; the broker owns this rerun and its "
+    "journal; not retried locally (not evidence)"
+)
+
+
+def _run_rerun_tests(args: argparse.Namespace, broker, *, rerun_of: str, chosen, policy: int, worker_budget) -> int:
+    """``run-tests --rerun`` (issue #1999): broker only, never a local fallback.
+
+    The broker replays the recorded argv, cwd, fixture and environment; this
+    client never sees the raw argv and prints only the redacted command.
+    """
+    from .local_test_evidence import BrokerNotDispatched, BrokerProtocolError, BrokerResultUnknown
+
+    if broker is None:
+        print(RERUN_NOT_DISPATCHED_MESSAGE, file=sys.stderr, flush=True)
+        return 1
+    try:
+        result = broker.run(
+            [],
+            timeout_seconds=chosen,
+            cwd=Path.cwd(),
+            environment_overrides={**worker_budget.environment(), **_client_tool_identity()},
+            rerun_of=rerun_of,
+        )
+    except BrokerNotDispatched as exc:
+        print(f"{RERUN_NOT_DISPATCHED_MESSAGE} [{exc}]", file=sys.stderr, flush=True)
+        return 1
+    except BrokerResultUnknown as exc:
+        print(f"{RERUN_RESULT_UNKNOWN_MESSAGE} [{exc}]", file=sys.stderr, flush=True)
+        return 1
+    except BrokerProtocolError as exc:
+        print(f"agent-loop: broker rerun request failed: {exc} (not evidence)", file=sys.stderr, flush=True)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"{RERUN_RESULT_UNKNOWN_MESSAGE} [{type(exc).__name__}]", file=sys.stderr, flush=True)
+        return 1
+    if result.error_code is not None:
+        print(f"agent-loop: {result.diagnostic}", file=sys.stderr, flush=True)
+        return int(result.returncode if result.returncode is not None else 2)
+    if result.execution_ref:
+        print(f"agent-loop test execution_ref: {result.execution_ref}", file=sys.stderr, flush=True)
+    if result.receipt_id:
+        print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
+    _announce_no_test_reason(result)
+    if result.rerun_of:
+        print(
+            f"agent-loop rerun: replayed failure receipt {result.rerun_of} as "
+            f"`{result.rerun_command or 'command not recorded'}`; cite this receipt with the "
+            f"command `agent-loop run-tests --rerun {result.rerun_of}`",
+            file=sys.stderr,
+            flush=True,
+        )
+    record = dict(result.fixture or {})
+    if result.fixture is not None:
+        print(
+            "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(
+                setup=record.get("setup_status", "not-run"),
+                teardown=record.get("teardown_status", "not-run"),
+                cleanup=record.get("cleanup", "unconfirmed"),
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+    if result.outcome == "timed_out":
+        print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
+    if _broker_frame_is_pre_collection(result):
+        _announce_pre_collection(result.diagnostic)
+    if result.fixture is not None:
+        from .fixture_runtime import fold_exit_code
+
+        return fold_exit_code(
+            outcome=result.outcome,
+            returncode=result.returncode,
+            inner_exec=result.inner_exec,
+            fixture=result.fixture,
+            cancelled_frame=result.outcome == "cancelled",
+        )
+    # Timing memory needs the raw argv, which a replay never returns, so a
+    # rerun records no local timing observation.
+    return int(result.returncode if result.returncode is not None else 1)
+
+
 FIXTURE_NOT_DISPATCHED_MESSAGE = (
     "agent-loop: --fixture requires the test broker; nothing was run (not evidence)"
 )
@@ -2546,6 +2647,42 @@ def _run_tests_command(args: argparse.Namespace) -> int:
     )
 
     fixture = getattr(args, "fixture", None)
+    rerun = getattr(args, "rerun", None)
+    if rerun is not None:
+        # Issue #1999: every conflict is refused before anything runs.
+        inner = list(args.inner_argv)
+        if inner[:1] == ["--"]:
+            inner = inner[1:]
+        if inner or fixture is not None or args.preflight:
+            print(RERUN_CONFLICT_MESSAGE, file=sys.stderr, flush=True)
+            return 2
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", str(rerun)):
+            print(
+                "agent-loop: --rerun requires a receipt id; nothing was run (not evidence)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        try:
+            policy = inherited_timeout_ceiling()
+            chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+            broker = broker_client_from_environment()
+            if broker is None:
+                print(RERUN_NOT_DISPATCHED_MESSAGE, file=sys.stderr, flush=True)
+                return 1
+            worker_resolution = _resolve_run_tests_worker_budget(args, broker_present=True)
+        except (TestRuntimeConfigurationError, WorkerBudgetError) as exc:
+            print(f"agent-loop: {exc}; nothing was run (not evidence)", file=sys.stderr, flush=True)
+            return 2
+        for diagnostic in worker_resolution.diagnostics:
+            print(diagnostic, file=sys.stderr, flush=True)
+        notice = prelaunch_notice(chosen, policy, os.environ)
+        if notice is not None:
+            print(notice, file=sys.stderr, flush=True)
+        return _run_rerun_tests(
+            args, broker, rerun_of=str(rerun), chosen=chosen, policy=policy,
+            worker_budget=worker_resolution.budget,
+        )
     if args.preflight:
         if fixture is not None:
             print("agent-loop: --fixture cannot be combined with --preflight", file=sys.stderr)

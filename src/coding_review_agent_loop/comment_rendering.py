@@ -94,6 +94,7 @@ from .test_runtime import (
     TestRuntimeConfigurationError,
     managed_wrapper_traversal,
     managed_test_wrapper_inner_command,
+    parse_rerun_citation,
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
@@ -251,6 +252,11 @@ def _render_test_observation_citations(
         command = sanitize_historical_text(managed_test_wrapper_inner_command(original) or original)
         claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
+        rerun_target = parse_rerun_citation(original)
+        if rerun_target is not None:
+            replay = by_receipt.get(receipt_id)
+            if replay is not None and replay.rerun_of == rerun_target:
+                safe_command = redact_test_command(replay.command)[0]
         citation_uses.setdefault(receipt_id, set()).add((safe_command, claim))
     for citation in citations:
         original = str(getattr(citation, "command", ""))
@@ -259,6 +265,13 @@ def _render_test_observation_citations(
         claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
         observed = by_receipt.get(receipt_id)
+        rerun_target = parse_rerun_citation(original)
+        if rerun_target is not None and observed is not None and observed.rerun_of == rerun_target:
+            # Issue #1999: a matched ``--rerun`` citation shows the replayed
+            # row's redacted command, never a raw argument.
+            safe_command = redact_test_command(observed.command)[0]
+        elif rerun_target is not None:
+            observed = None
         # Issue #1995: a cited pass compacted for transport is display-only;
         # it resolves the citation but never acts as an observation.
         reference = (

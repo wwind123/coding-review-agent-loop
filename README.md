@@ -1949,6 +1949,16 @@ reported as foreign diagnostics instead. `--fixture` needs at least 30 seconds
 and the broker; it never runs locally. See
 [Multi-process fixtures](docs/local_agent_loop.md#multi-process-fixtures-run-tests---fixture).
 
+Only an identical, passing, current-head rerun in an equivalent environment
+clears a recorded test failure; broader or different selections never do. A
+coder replays an unsuperseded failure exactly with
+`agent-loop run-tests --rerun <receipt-id>`: the test broker reuses the
+recorded command, working directory, fixture and environment from a private,
+invocation-scoped catalog, and nothing raw is shown or posted. Coder prompts
+list each open failure with its exact rerun handle and why the latest later
+pass did not supersede it. See
+[Exact reruns of unsuperseded failures](docs/local_agent_loop.md#exact-reruns-of-unsuperseded-failures-run-tests---rerun).
+
 Every agent subprocess resolves this install's `agent-loop`: the orchestrator
 puts a private, import-pinned launcher first on each agent's `PATH` and exports
 its absolute path as `AGENT_LOOP_EXECUTABLE`, whatever other `agent-loop` the

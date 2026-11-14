@@ -3574,6 +3574,12 @@ or:
 """
 
 
+def _local_test_failure_block(context: str) -> str:
+    """The local-only unsuperseded-failure rerun block (issue #1999), or ``""``."""
+    text = str(context or "").strip()
+    return f"\n\n{text}" if text else ""
+
+
 def build_followup_prompt(
     pr_number: int,
     round_number: int,
@@ -3592,6 +3598,7 @@ def build_followup_prompt(
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
     classifiable_item_ids: Sequence[str] | None = None,
+    local_test_failure_context: str = "",
 ) -> str:
     config = prompt_support._with_architecture_context(config, architecture_context)
     reviewer_name = prompt_support.format_agent_list(reviewers(config))
@@ -3613,7 +3620,7 @@ Do not create a new PR.
 {human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
 {prompt_support._architecture_impact_guidance(required=True, config=config)}
 {prompt_support._architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
-{prompt_support._memory_block(memory, config, include_runtime=True)}
+{prompt_support._memory_block(memory, config, include_runtime=True)}{_local_test_failure_block(local_test_failure_context)}
 
 {reviewer_name} review:
 
@@ -3660,6 +3667,7 @@ def build_same_pr_followup_prompt(
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
     classifiable_item_ids: Sequence[str] | None = None,
+    local_test_failure_context: str = "",
 ) -> str:
     config = prompt_support._with_architecture_context(config, architecture_context)
     reviewer_name = prompt_support.format_agent_list(reviewers(config))
@@ -3682,7 +3690,7 @@ same PR. Do not create a new PR.
 {human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
 {prompt_support._architecture_impact_guidance(required=True, config=config)}
 {prompt_support._architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
-{prompt_support._memory_block(memory, config, include_runtime=True)}
+{prompt_support._memory_block(memory, config, include_runtime=True)}{_local_test_failure_block(local_test_failure_context)}
 
 Same-PR follow-ups:
 

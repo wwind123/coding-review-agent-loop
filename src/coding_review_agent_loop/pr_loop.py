@@ -474,6 +474,7 @@ from .pr_loop_support import (
     cited_evidence_progress,
     render_followup_local_test_evidence,
     canonical_receipt_progress,
+    local_test_failure_context as _local_test_failure_context,
     followup_citation_diagnosis,
     _coder_followup_head_log,
     _coder_followup_review_context,
@@ -9088,6 +9089,7 @@ def run_pr_loop(
                     generalization_guidance=True,
                     finding_history=finding_history_view,
                     classifiable_item_ids=tuple(item.item_id for item in coder_followup_items),
+                    local_test_failure_context=_local_test_failure_context(runner, config),
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
@@ -9112,6 +9114,7 @@ def run_pr_loop(
                     generalization_guidance=True,
                     finding_history=finding_history_view,
                     classifiable_item_ids=tuple(item.item_id for item in coder_followup_items),
+                    local_test_failure_context=_local_test_failure_context(runner, config),
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(

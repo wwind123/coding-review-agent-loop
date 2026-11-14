@@ -103,6 +103,8 @@ CROSS_RESTART_SUPERSESSION_CAVEAT = "superseded across a restart; environment no
 ENVIRONMENT_DIFFERS_CAVEAT = "effective target environment differs"
 ENVIRONMENT_NOT_COMPARED_CAVEAT = "effective target environment could not be compared"
 _RESTART_COMMAND_DIGEST_RE = re.compile(r"^[0-9a-f]{32}$")
+# Issue #1999: a receipt id as named by ``rerun_of`` and ``--rerun``.
+_SAFE_RECEIPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _RESTART_COMMAND_DOMAIN = b"restart-command-v2\x00"
 _RESTART_ROOT_MARKER = "\x00ROOT"
 MAX_PRIVATE_DIAGNOSTIC_BYTES = 8 * 1024
@@ -833,8 +835,17 @@ class LocalTestObservation:
     # citability never read it.  Anything outside the closed set, or beside
     # another suite start, is normalized to ``None``.
     suite_start_reason: str | None = field(default=None, compare=False)
+    # Issue #1999: the failure receipt an exact ``run-tests --rerun`` replay
+    # reproduced.  Display and citation matching only: supersession never
+    # reads it.  Projected only when set, so every other projection is
+    # byte-identical.
+    rerun_of: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
+        if self.rerun_of is not None and not (
+            isinstance(self.rerun_of, str) and _SAFE_RECEIPT_ID_RE.fullmatch(self.rerun_of)
+        ):
+            object.__setattr__(self, "rerun_of", None)
         if self.suite_start_reason is not None:
             object.__setattr__(
                 self, "suite_start_reason",
@@ -938,6 +949,9 @@ class LocalTestObservation:
         if isinstance(self.tool_identity, ToolIdentity):
             # Its own field, outside the four-caveat cap (#1632).
             projection["tool_identity"] = self.tool_identity.to_dict()
+        if self.rerun_of is not None:
+            # Issue #1999: only a replay row grows; legacy rows are unchanged.
+            projection["rerun_of"] = self.rerun_of
         return projection
 
     def to_dict(self) -> dict[str, object]:
@@ -1208,7 +1222,16 @@ def observation_from_mapping(
         fixture=fixture,
         restart_command_digest=restart_digest,
         tool_identity=ToolIdentity.from_value(value.get("tool_identity")),
+        # Issue #1999: strictly a bounded safe identifier, else dropped.
+        rerun_of=decode_rerun_of(value.get("rerun_of")),
     )
+
+
+def decode_rerun_of(value: object) -> str | None:
+    """Strictly decode a ``rerun_of`` value; anything malformed is ``None``."""
+    if isinstance(value, str) and _SAFE_RECEIPT_ID_RE.fullmatch(value):
+        return value
+    return None
 
 
 def _observation_key(observation: LocalTestObservation) -> tuple[object, ...]:
@@ -1310,6 +1333,94 @@ def _restart_scope_key(observation: LocalTestObservation) -> tuple[str, tuple[st
     return EvidenceScope.from_value(observation.scope.to_dict()).normalized()
 
 
+# Issue #1999: the closed vocabulary of supersession rejection reasons.  Every
+# rejection branch returns one of these (the environment comparison is the
+# one parameterized family), so the evidence summary can name the first rule
+# that blocked a later pass.  Texts contain no argv or environment values.
+REASON_NOT_A_FAILURE_PASS_PAIR = "not a failure and later pass pair"
+REASON_PASS_NOT_PARENT_OBSERVED = "later pass was not parent-observed"
+REASON_FAILURE_NOT_PARENT_OBSERVED = "failure was not parent-observed"
+REASON_COMMAND_DIFFERS = "command differs; subset/superset or command disagreement remains visible"
+REASON_FIXTURE_DIFFERS = (
+    "fixture identity differs; a run with another fixture or none cannot supersede it"
+)
+REASON_SCOPE_DIFFERS = "scope differs; subset/superset result cannot supersede the failure"
+REASON_ATTRIBUTION_DIFFERS = "tracked-tree attribution differs"
+REASON_FAILURE_NOT_CURRENT_HEAD = "failure does not have stable current-head attribution"
+REASON_SNAPSHOT_NOT_STABLE = "tracked-tree snapshot was not stable"
+REASON_TREE_CHANGED = "tracked tree changed"
+REASON_NOT_LATER = "pass not later than the failure"
+REASON_BASE_REPRODUCTION = "base-reproduction row"
+REASON_OUT_OF_CHECKOUT = "out-of-checkout context"
+REASON_LAUNCH_FAILURE = "launch failure is not evidence"
+REASON_HEAD_NOT_KNOWN = "current head or tracked tree is not positively known"
+SUPERSESSION_REASONS = frozenset(
+    {
+        REASON_NOT_A_FAILURE_PASS_PAIR,
+        REASON_PASS_NOT_PARENT_OBSERVED,
+        REASON_FAILURE_NOT_PARENT_OBSERVED,
+        REASON_COMMAND_DIFFERS,
+        REASON_FIXTURE_DIFFERS,
+        REASON_SCOPE_DIFFERS,
+        REASON_ATTRIBUTION_DIFFERS,
+        REASON_FAILURE_NOT_CURRENT_HEAD,
+        REASON_SNAPSHOT_NOT_STABLE,
+        REASON_TREE_CHANGED,
+        REASON_NOT_LATER,
+        REASON_BASE_REPRODUCTION,
+        REASON_OUT_OF_CHECKOUT,
+        REASON_LAUNCH_FAILURE,
+        REASON_HEAD_NOT_KNOWN,
+        "later pass has no live or restored identity",
+        "restored attribution was not confirmed against the current head",
+        "row was not recorded at the current head",
+        "attribution is not stable current-head at the current tracked digest",
+        "later pass is not stable current-head at the current tracked digest",
+    }
+)
+_ENVIRONMENT_REASON_RE = re.compile(r"environment identity is [a-z][a-z-]{0,31}")
+
+
+def is_supersession_reason(value: object) -> bool:
+    """Whether ``value`` is exactly one closed-vocabulary rejection reason."""
+    return isinstance(value, str) and (
+        value in SUPERSESSION_REASONS or bool(_ENVIRONMENT_REASON_RE.fullmatch(value))
+    )
+
+
+_DIAG_ID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+_DIAG_RETAINED_RE = re.compile(
+    rf"(?P<failure>{_DIAG_ID}) retained against (?P<passing>{_DIAG_ID}): "
+    r"(?P<reason>.+?)(?P<latest> \(latest\))?"
+)
+_DIAG_SUMMARY_RE = re.compile(
+    rf"(?P<failure>{_DIAG_ID}): (?P<count>[1-9][0-9]{{0,5}}) other later pass\(es\) also rejected"
+)
+_DIAG_OMISSION_RE = re.compile(r"(?P<count>[1-9][0-9]{0,5}) further supersession caveat\(s\) omitted")
+MAX_SUPERSESSION_CAVEATS = 12
+MAX_SUPERSESSION_CAVEAT_BYTES = 2048
+
+
+def classify_supersession_diagnostic(text: object) -> tuple[str, str] | None:
+    """``(failure receipt, kind)`` for a line in a fixed diagnostic shape, else ``None``.
+
+    Anchored over safe receipt-id syntax and the closed reason vocabulary,
+    so a legacy ``<id> retained: <reason>`` caveat or any other generic
+    caveat is never mistaken for a diagnostic.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _DIAG_RETAINED_RE.fullmatch(text)
+    if match is not None and is_supersession_reason(match.group("reason")):
+        return match.group("failure"), ("latest" if match.group("latest") else "sample")
+    match = _DIAG_SUMMARY_RE.fullmatch(text)
+    if match is not None:
+        return match.group("failure"), "summary"
+    if _DIAG_OMISSION_RE.fullmatch(text):
+        return "", "omission"
+    return None
+
+
 @dataclass(frozen=True)
 class _CrossRestartContext:
     """The reconcile's validated current state for cross-restart supersession."""
@@ -1341,25 +1452,27 @@ def _can_supersede_across_restart(
     qualify only through the attribution refresh of this reconcile.
     """
     if failure.provenance != "parent-observed":
-        return False, None
+        return False, REASON_FAILURE_NOT_PARENT_OBSERVED
     if (
         context is None
         or not context.snapshot_head_matches
         or not _snapshot_positively_known(context.current_snapshot, context.current_head)
     ):
-        return False, "current head or tracked tree is not positively known"
+        return False, REASON_HEAD_NOT_KNOWN
     assert context.current_snapshot is not None
     if passing.environment_identity is None and not passing.restored:
         return False, "later pass has no live or restored identity"
     unstable_failure = failure.attribution.stable is False
-    if unstable_failure and (
-        passing.timestamp <= failure.timestamp
-        or failure.claim == "base-reproduction"
-        or failure.attribution.state == "base-reproduction"
-        or passing.claim == "base-reproduction"
-        or passing_index in context.base_reproduction_rows
-    ):
-        return False, None
+    if unstable_failure:
+        if passing.timestamp <= failure.timestamp:
+            return False, REASON_NOT_LATER
+        if (
+            failure.claim == "base-reproduction"
+            or failure.attribution.state == "base-reproduction"
+            or passing.claim == "base-reproduction"
+            or passing_index in context.base_reproduction_rows
+        ):
+            return False, REASON_BASE_REPRODUCTION
     for row, index in ((failure, failure_index), (passing, passing_index)):
         # An explicitly unstable failure cannot establish tree authority.
         # Only its side is waived; the pass must still be freshly confirmed.
@@ -1385,24 +1498,22 @@ def _can_supersede_across_restart(
         or passing.restart_command_digest is None
         or failure.restart_command_digest != passing.restart_command_digest
     ):
-        return False, "command differs; subset/superset or command disagreement remains visible"
+        return False, REASON_COMMAND_DIFFERS
     failure_fixture_ok, failure_fixture = _restart_fixture_key(failure)
     passing_fixture_ok, passing_fixture = _restart_fixture_key(passing)
     if not failure_fixture_ok or not passing_fixture_ok or failure_fixture != passing_fixture:
-        return False, "fixture identity differs; a run with another fixture or none cannot supersede it"
+        return False, REASON_FIXTURE_DIFFERS
     if _restart_scope_key(failure) != _restart_scope_key(passing):
-        return False, "scope differs; subset/superset result cannot supersede the failure"
+        return False, REASON_SCOPE_DIFFERS
     if (
         passing.environment_state == "different"
         or ENVIRONMENT_DIFFERS_CAVEAT in passing.caveats
     ):
         return False, "environment identity is different"
-    if (
-        failure.is_out_of_checkout_context
-        or passing.is_out_of_checkout_context
-        or failure.is_non_evidence_launch_failure
-    ):
-        return False, None
+    if failure.is_out_of_checkout_context or passing.is_out_of_checkout_context:
+        return False, REASON_OUT_OF_CHECKOUT
+    if failure.is_non_evidence_launch_failure:
+        return False, REASON_LAUNCH_FAILURE
     return True, None
 
 
@@ -1416,9 +1527,9 @@ def _can_supersede(
     passing_index: int = -1,
 ) -> tuple[bool, str | None]:
     if not failure.is_failure or passing.outcome != "passed":
-        return False, None
+        return False, REASON_NOT_A_FAILURE_PASS_PAIR
     if passing.provenance != "parent-observed":
-        return False, "later pass was not parent-observed"
+        return False, REASON_PASS_NOT_PARENT_OBSERVED
     if failure.restored:
         return _can_supersede_across_restart(
             failure, passing, context=context,
@@ -1427,25 +1538,27 @@ def _can_supersede(
     # A live failure keeps the strict in-process rule: a restored pass has no
     # identity, so the comparison below can never be "equivalent".
     if failure.normalized_command != passing.normalized_command:
-        return False, "command differs; subset/superset or command disagreement remains visible"
+        return False, REASON_COMMAND_DIFFERS
     if _fixture_identity(failure) != _fixture_identity(passing):
-        return False, "fixture identity differs; a run with another fixture or none cannot supersede it"
+        return False, REASON_FIXTURE_DIFFERS
     if failure.scope.normalized() != passing.scope.normalized():
-        return False, "scope differs; subset/superset result cannot supersede the failure"
+        return False, REASON_SCOPE_DIFFERS
     if failure.attribution.stable is False:
+        if failure.provenance != "parent-observed":
+            return False, REASON_FAILURE_NOT_PARENT_OBSERVED
+        if passing.timestamp <= failure.timestamp:
+            return False, REASON_NOT_LATER
         if (
-            failure.provenance != "parent-observed"
-            or passing.timestamp <= failure.timestamp
-            or failure.claim == "base-reproduction"
+            failure.claim == "base-reproduction"
             or failure.attribution.state == "base-reproduction"
             or passing.claim == "base-reproduction"
             or context is not None and passing_index in context.base_reproduction_rows
         ):
-            return False, None
+            return False, REASON_BASE_REPRODUCTION
         if context is None or not _snapshot_positively_known(
             context.current_snapshot, context.current_head
         ):
-            return False, "current head or tracked tree is not positively known"
+            return False, REASON_HEAD_NOT_KNOWN
         assert context.current_snapshot is not None
         attribution = passing.attribution
         if (
@@ -1463,13 +1576,13 @@ def _can_supersede(
             None if comparison == "equivalent" else f"environment identity is {comparison}"
         )
     if failure.attribution.state != passing.attribution.state:
-        return False, "tracked-tree attribution differs"
+        return False, REASON_ATTRIBUTION_DIFFERS
     if failure.attribution.state != "current-head":
-        return False, "failure does not have stable current-head attribution"
+        return False, REASON_FAILURE_NOT_CURRENT_HEAD
     if not failure.attribution.stable or not passing.attribution.stable:
-        return False, "tracked-tree snapshot was not stable"
+        return False, REASON_SNAPSHOT_NOT_STABLE
     if failure.attribution.tracked_digest != passing.attribution.tracked_digest:
-        return False, "tracked tree changed"
+        return False, REASON_TREE_CHANGED
     comparison = compare_environment_identities(
         passing.environment_identity, failure.environment_identity, registry=registry
     )
@@ -1581,6 +1694,35 @@ class LocalTestEvidence:
     # Issue #1995: cited passing receipts compacted for transport.  Display
     # and citation resolution only; never observations.
     cited_receipt_references: tuple[CitedReceiptReference, ...] = ()
+    # Issue #1999: live-only (failure receipt, latest rejected pass receipt,
+    # its first blocking reason, rejected count) per unsuperseded failure.
+    # Never projected or encoded; it feeds the local coder prompt.
+    supersession_rejections: tuple[tuple[str, str, str, int], ...] = field(
+        default=(), repr=False, compare=False
+    )
+    # Issue #1999: structured (failure receipt, kind, text) diagnostics, kind
+    # in {latest, sample, summary, omission}.  Never part of ``caveats`` or
+    # of ``to_dict``; only bounded transport appends them, into leftover
+    # capacity, and decoding restores them from their fixed shapes.
+    supersession_diagnostics: tuple[tuple[str, str, str], ...] = field(
+        default=(), repr=False, compare=False
+    )
+
+    def latest_rejection_for(self, receipt_id: object) -> tuple[str, str, int] | None:
+        """``(latest pass receipt, reason, count)`` from live state, else ``None``."""
+        for failure, pass_receipt, reason, count in self.supersession_rejections:
+            if failure == receipt_id:
+                return pass_receipt, reason, count
+        return None
+
+    def latest_diagnostic_reason_for(self, receipt_id: object) -> str | None:
+        """The latest rejection reason restored from a transported diagnostic."""
+        for failure, kind, text in self.supersession_diagnostics:
+            if failure == receipt_id and kind == "latest":
+                match = _DIAG_RETAINED_RE.fullmatch(text)
+                if match is not None:
+                    return match.group("reason")
+        return None
 
     def reference_for(self, receipt_id: object) -> CitedReceiptReference | None:
         for reference in self.cited_receipt_references:
@@ -1901,6 +2043,8 @@ def reconcile_test_observations(
             index for index, facts in enumerate(entry_facts) if facts.base_reproduction
         ),
     )
+    # Issue #1999: every rejected later pass, per failure index, in order.
+    rejected_passes: dict[int, list[tuple[str, str]]] = {}
     for failure_index, failure in enumerate(rows):
         if (
             not failure.is_failure
@@ -1911,7 +2055,16 @@ def reconcile_test_observations(
             continue
         for later_index in range(failure_index + 1, len(rows)):
             later = rows[later_index]
-            if later.outcome != "passed" or later.is_out_of_checkout_context:
+            if later.outcome != "passed" or later.provenance == "self-reported":
+                # A self-reported declaration (legacy tests_run) mirrors a
+                # run and can never supersede; recording it would mask the
+                # meaningful latest reason (review item-2).
+                continue
+            pass_receipt = later.receipt_id or f"observation-{later_index}"
+            if later.is_out_of_checkout_context:
+                rejected_passes.setdefault(failure_index, []).append(
+                    (pass_receipt, REASON_OUT_OF_CHECKOUT)
+                )
                 continue
             allowed, reason = _can_supersede(
                 failure, later, registry=registry, context=restart_context,
@@ -1929,15 +2082,12 @@ def reconcile_test_observations(
                     ),
                 )
                 break
-            if reason and (
-                "environment" in reason
-                or "subset" in reason
-                or "scope" in reason
-                or "tracked tree" in reason
-            ):
-                caveats.append(
-                    f"{failure.receipt_id or 'observation'} retained: {reason}"
-                )
+            # Issue #1999: every reason family is kept (structured, bounded
+            # and separate from the generic caveats); the allow/deny
+            # decision above is unchanged.
+            rejected_passes.setdefault(failure_index, []).append(
+                (pass_receipt, reason if is_supersession_reason(reason) else REASON_NOT_A_FAILURE_PASS_PAIR)
+            )
 
     # A current-head pass cannot retroactively make a changed-head failure
     # current, and restored metadata has no live identity with which to prove
@@ -1977,13 +2127,93 @@ def reconcile_test_observations(
     legacy_limited = bool(legacy_rows)
     if legacy_limited:
         caveats.append("legacy tests_run is self-reported; direct shell capture is limited")
+    rejections, diagnostics = _supersession_records(rows, rejected_passes)
     return LocalTestEvidence(
         observations=tuple(rows),
         caveats=tuple(dict.fromkeys(_safe_text(item) for item in caveats)),
         capture_incomplete=any(row.outcome == "incomplete" for row in rows),
         authoritative_failures=authoritative_failures,
         legacy_capture_limited=legacy_limited,
+        supersession_rejections=rejections,
+        supersession_diagnostics=diagnostics,
     )
+
+
+def _supersession_records(
+    rows: Sequence[LocalTestObservation],
+    rejected_passes: Mapping[int, Sequence[tuple[str, str]]],
+) -> tuple[
+    tuple[tuple[str, str, str, int], ...], tuple[tuple[str, str, str], ...]
+]:
+    """Live rejection map and bounded per-failure diagnostics (issue #1999).
+
+    Only failures that stay unsuperseded and authoritative are reported.
+    Per failure the diagnostics keep the 2 earliest rejected passes, the
+    latest (marked) and one summary count, so growth is bounded however many
+    passes are rejected; the live map keeps every failure's latest reason.
+    """
+    rejections: list[tuple[str, str, str, int]] = []
+    diagnostics: list[tuple[str, str, str]] = []
+    parent_observed = {
+        row.receipt_id or f"observation-{index}"
+        for index, row in enumerate(rows) if row.provenance == "parent-observed"
+    }
+    for index, row in enumerate(rows):
+        entries = rejected_passes.get(index)
+        if (
+            not entries
+            or not row.receipt_id
+            or not _SAFE_RECEIPT_ID_RE.fullmatch(row.receipt_id)
+            or not row.is_failure
+            or row.provenance != "parent-observed"
+            or row.superseded_by
+            or row.is_out_of_checkout_context
+            or row.is_non_evidence_launch_failure
+        ):
+            continue
+        failure = row.receipt_id
+        # The latest *parent-observed* rejected pass names the meaningful
+        # rule; an unverified later pass is the latest only when no
+        # parent-observed pass was rejected (review item-2).
+        latest_index = max(
+            (position for position, (receipt, _reason) in enumerate(entries)
+             if receipt in parent_observed),
+            default=len(entries) - 1,
+        )
+        entries = [*entries[:latest_index], *entries[latest_index + 1:], entries[latest_index]]
+        latest_pass, latest_reason = entries[-1]
+        rejections.append((failure, latest_pass, latest_reason, len(entries)))
+        samples = list(entries[:-1])[:2]
+        for pass_receipt, reason in samples:
+            diagnostics.append(
+                (failure, "sample", supersession_diagnostic_text(failure, pass_receipt, reason))
+            )
+        diagnostics.append(
+            (
+                failure,
+                "latest",
+                supersession_diagnostic_text(failure, latest_pass, latest_reason, latest=True),
+            )
+        )
+        others = len(entries) - len(samples) - 1
+        if others > 0:
+            diagnostics.append(
+                (failure, "summary", f"{failure}: {others} other later pass(es) also rejected")
+            )
+    return tuple(rejections), tuple(
+        item for item in diagnostics
+        # A line the caveat bound would truncate could not be restored from
+        # its fixed shape, so it is never emitted.
+        if len(item[2].encode("utf-8")) <= MAX_SAFE_CAVEAT_BYTES
+        and _safe_text(item[2]) == item[2]
+    )
+
+
+def supersession_diagnostic_text(
+    failure: str, pass_receipt: str, reason: str, *, latest: bool = False
+) -> str:
+    """The fixed shape of one retained-against diagnostic line (issue #1999)."""
+    return f"{failure} retained against {pass_receipt}: {reason}" + (" (latest)" if latest else "")
 
 
 def reconcile_local_test_evidence(*args: Any, **kwargs: Any) -> LocalTestEvidence:
@@ -2272,6 +2502,167 @@ def _row_bytes(row: Mapping[str, object]) -> int:
 def bounded_evidence_for_round(
     evidence: LocalTestEvidence | Mapping[str, object],
     *, protected_receipt_ids: Iterable[str] = (),
+    _verify_fixed_point: bool = True,
+) -> str:
+    """Encode a bounded canonical metadata field, degrading before transport.
+
+    Issue #1999: supersession diagnostics never take part in row selection.
+    The rows, references and capacity decision are computed exactly as
+    without them; the diagnostics are then appended only into the capacity
+    left over.  The outermost encode keeps them only when strict publication
+    re-canonicalization reproduces the same rows, references and
+    authoritative failures; otherwise it returns the diagnostics-free form.
+    """
+    protected = tuple(protected_receipt_ids)
+    if isinstance(evidence, LocalTestEvidence):
+        diagnostics = tuple(evidence.supersession_diagnostics)
+    else:
+        raw = evidence.get("supersession_diagnostics") if isinstance(evidence, Mapping) else None
+        diagnostics = tuple(
+            item for item in (raw if isinstance(raw, (list, tuple)) else ())
+            if isinstance(item, (list, tuple)) and len(item) == 3
+            and all(isinstance(part, str) for part in item)
+        )
+    base = _bounded_evidence_rows(evidence, protected_receipt_ids=protected)
+    if not diagnostics:
+        return base
+    candidate = _append_supersession_diagnostics(base, diagnostics)
+    if candidate == base or not _verify_fixed_point:
+        return candidate
+    if not _diagnostics_fixed_point(base, candidate):
+        return base
+    return candidate
+
+
+def _retained_identity(encoded: str) -> tuple[object, ...] | None:
+    evidence = decode_bounded_evidence(encoded)
+    if evidence is None:
+        return None
+    return (
+        tuple(item.receipt_id for item in evidence.observations),
+        tuple(item.to_dict() for item in evidence.cited_receipt_references),
+        tuple(evidence.authoritative_failures),
+    )
+
+
+def _diagnostics_fixed_point(base: str, candidate: str) -> bool:
+    """Whether strict re-canonicalization treats both encodings alike (#1999)."""
+    try:
+        recanonical = canonicalize_bounded_evidence(
+            candidate, strict=True, _verify_fixed_point=False
+        )
+        reference = canonicalize_bounded_evidence(base, strict=True, _verify_fixed_point=False)
+    except AgentLoopError:
+        return False
+    if recanonical is None or reference is None:
+        return False
+    if len(recanonical.encode()) > MAX_ROUND_BYTES:
+        return False
+    expected = _retained_identity(candidate)
+    return (
+        expected is not None
+        and expected == _retained_identity(base)
+        and _retained_identity(recanonical) == expected
+        and _retained_identity(reference) == expected
+    )
+
+
+def _unsuperseded_failure_receipts(observations: Iterable[object]) -> list[str]:
+    """Receipts the unchanged-head stop sentence would list, in its order."""
+    order: list[str] = []
+    for row in observations:
+        if (
+            isinstance(row, LocalTestObservation)
+            and row.receipt_id
+            and row.is_failure
+            and row.provenance == "parent-observed"
+            and not row.superseded_by
+            and not row.is_out_of_checkout_context
+            and not row.is_non_evidence_launch_failure
+            and row.receipt_id not in order
+        ):
+            order.append(row.receipt_id)
+    return order
+
+
+def _append_supersession_diagnostics(
+    base: str, diagnostics: Sequence[tuple[str, str, str]]
+) -> str:
+    """Append diagnostics into the capacity left after rows are fixed (#1999)."""
+    try:
+        payload = json.loads(base)
+    except (TypeError, ValueError):
+        return base
+    if not isinstance(payload, dict) or "counts" in payload:
+        return base
+    caveats = payload.get("caveats")
+    rows = payload.get("observations")
+    if not isinstance(caveats, list) or not isinstance(rows, list):
+        return base
+    retained = decode_bounded_evidence(base, restore_classification=True)
+    if retained is None:
+        return base
+    order = _unsuperseded_failure_receipts(retained.observations)
+    position = {receipt: index for index, receipt in enumerate(order)}
+    carried_omitted = 0
+    candidates: list[tuple[int, int, int, str]] = []
+    kind_rank = {"latest": 0, "sample": 1, "summary": 2}
+    for sequence, (failure, kind, text) in enumerate(diagnostics):
+        if kind == "omission":
+            match = _DIAG_OMISSION_RE.fullmatch(text)
+            if match is not None:
+                carried_omitted += int(match.group("count"))
+            continue
+        if kind not in kind_rank or failure not in position:
+            # A failure whose row was not retained is never named.
+            continue
+        if classify_supersession_diagnostic(text) != (failure, kind) or text in caveats:
+            continue
+        candidates.append((kind_rank[kind], position[failure], sequence, text))
+    candidates.sort()
+    if not candidates and not carried_omitted:
+        return base
+    restart_environment = environment_comparison_for_restart()
+
+    def fits(extra: list[str]) -> bool:
+        value = dict(payload)
+        value["caveats"] = [*caveats, *extra]
+        size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode())
+        value["observations"] = [
+            {**row, "environment": restart_environment} if isinstance(row, Mapping) else row
+            for row in rows
+        ]
+        restored = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode())
+        return max(size, restored) <= MAX_ROUND_BYTES
+
+    kept: list[str] = []
+    used = 0
+    skipped = carried_omitted
+    for _rank, _position, _sequence, text in candidates:
+        size = len(text.encode("utf-8"))
+        if (
+            len(kept) >= MAX_SUPERSESSION_CAVEATS
+            or used + size > MAX_SUPERSESSION_CAVEAT_BYTES
+            or not fits([*kept, text])
+        ):
+            skipped += 1
+            continue
+        kept.append(text)
+        used += size
+    if skipped:
+        omission = f"{skipped} further supersession caveat(s) omitted"
+        if fits([*kept, omission]):
+            kept.append(omission)
+    if not kept:
+        return base
+    value = dict(payload)
+    value["caveats"] = [*caveats, *kept]
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _bounded_evidence_rows(
+    evidence: LocalTestEvidence | Mapping[str, object],
+    *, protected_receipt_ids: Iterable[str] = (),
 ) -> str:
     """Encode a bounded canonical metadata field, degrading before transport.
 
@@ -2530,7 +2921,9 @@ def _resolvable_receipt_ids(evidence: LocalTestEvidence | None) -> frozenset[str
     )
 
 
-def canonicalize_bounded_evidence(value: object, *, strict: bool = False) -> str | None:
+def canonicalize_bounded_evidence(
+    value: object, *, strict: bool = False, _verify_fixed_point: bool = True
+) -> str | None:
     """Tolerantly normalize a legacy/malformed metadata value.
 
     Issue #1995: re-encoding a decoded string never drops a receipt id that
@@ -2541,20 +2934,23 @@ def canonicalize_bounded_evidence(value: object, *, strict: bool = False) -> str
     stop instead of publishing unknown citations; the tolerant read path
     keeps the plain re-encoding.
     """
+    verify = _verify_fixed_point
     if isinstance(value, LocalTestEvidence):
-        return bounded_evidence_for_round(value)
+        return bounded_evidence_for_round(value, _verify_fixed_point=verify)
     if isinstance(value, Mapping):
-        return bounded_evidence_for_round(value)
+        return bounded_evidence_for_round(value, _verify_fixed_point=verify)
     if isinstance(value, str):
         parsed = decode_bounded_evidence(value, restore_classification=True)
         if parsed is None:
             return None
-        plain = bounded_evidence_for_round(parsed)
+        plain = bounded_evidence_for_round(parsed, _verify_fixed_point=verify)
         wanted = _resolvable_receipt_ids(parsed)
         if wanted <= _resolvable_receipt_ids(decode_bounded_evidence(plain)):
             return plain
         try:
-            return bounded_evidence_for_round(parsed, protected_receipt_ids=wanted)
+            return bounded_evidence_for_round(
+                parsed, protected_receipt_ids=wanted, _verify_fixed_point=verify
+            )
         except AgentLoopError:
             if strict:
                 raise
@@ -2607,9 +3003,24 @@ def decode_bounded_evidence(
         and _member(row.get("outcome"), OUTCOMES)
         and _member(row.get("provenance"), PROVENANCES)
     )
+    generic_caveats: list[str] = []
+    restored_diagnostics: list[tuple[str, str, str]] = []
+    for item in _json_list(payload.get("caveats")):
+        if item is None:
+            continue
+        text = _safe_text(item)
+        # Issue #1999: lines in a fixed diagnostic shape go back to the
+        # structured diagnostics, so re-encoding never counts them before
+        # row selection; everything else stays a generic caveat.
+        classified = classify_supersession_diagnostic(text) if text == item else None
+        if classified is not None:
+            restored_diagnostics.append((classified[0], classified[1], text))
+        else:
+            generic_caveats.append(text)
     return LocalTestEvidence(
         observations=observations,
-        caveats=tuple(_safe_text(item) for item in _json_list(payload.get("caveats")) if item is not None),
+        caveats=tuple(generic_caveats),
+        supersession_diagnostics=tuple(restored_diagnostics),
         capture_incomplete=bool(payload.get("capture_incomplete", False))
         or any(
             item.startswith(_UNPARSABLE_PREFIX)
@@ -3261,6 +3672,21 @@ BROKER_REQUEST_FIELDS = frozenset(
 BROKER_FIXTURE_FIELD = "fixture"
 # Issue #1995: optional bounded fixture diagnostics in a response frame.
 BROKER_FIXTURE_DIAGNOSTICS_FIELD = "fixture_diagnostics"
+# Issue #1999: ``run-tests --rerun``.  A rerun request carries ``rerun_of``
+# in place of ``argv`` (and never ``fixture``); the broker replays the entry
+# recorded in the parent's private rerun catalog.  The response names the
+# replayed failure and the redacted command only.
+BROKER_RERUN_FIELD = "rerun_of"
+BROKER_RERUN_REQUEST_FIELDS = (BROKER_REQUEST_FIELDS - {"argv"}) | {BROKER_RERUN_FIELD}
+BROKER_RERUN_COMMAND_FIELD = "rerun_command"
+RERUN_REFUSAL_CODES = frozenset(
+    {
+        "rerun-catalog-unavailable",
+        "rerun-receipt-unknown",
+        "rerun-cwd-invalid",
+        "rerun-fixture-timeout-below-floor",
+    }
+)
 FIXTURE_STATE_DIR_ENV = "AGENT_LOOP_FIXTURE_STATE_DIR"
 FIXTURE_MIN_TIMEOUT_SECONDS = 30.0
 BROKER_RESPONSE_FIELDS = frozenset(
@@ -3641,6 +4067,17 @@ def _validate_broker_request(
     request: Mapping[str, object], *, turn_id: str, capability: str, root: Path, ceiling: float
 ) -> dict[str, object]:
     fields = set(request)
+    rerun_of: str | None = None
+    if BROKER_RERUN_FIELD in request:
+        # Issue #1999: exclusive with a client argv and a client fixture.
+        if fields != BROKER_RERUN_REQUEST_FIELDS:
+            raise BrokerProtocolError("broker rerun request has unknown or missing fields")
+        raw_rerun = request[BROKER_RERUN_FIELD]
+        if not isinstance(raw_rerun, str) or not _SAFE_RECEIPT_ID_RE.fullmatch(raw_rerun):
+            raise BrokerProtocolError("broker rerun receipt must be a bounded safe identifier")
+        rerun_of = raw_rerun
+        request = {**request, "argv": ["rerun"]}
+        fields = set(request) - {BROKER_RERUN_FIELD}
     if fields != BROKER_REQUEST_FIELDS and fields != BROKER_REQUEST_FIELDS | {BROKER_FIXTURE_FIELD}:
         raise BrokerProtocolError("broker request has unknown or missing fields")
     fixture: str | None = None
@@ -3722,6 +4159,10 @@ def _validate_broker_request(
     }
     if fixture is not None:
         validated[BROKER_FIXTURE_FIELD] = fixture
+    if rerun_of is not None:
+        # The placeholder argv is replaced only from the parent catalog.
+        validated.pop("argv", None)
+        validated[BROKER_RERUN_FIELD] = rerun_of
     return validated
 
 
@@ -3755,6 +4196,11 @@ class BrokerRunResult:
     # Issue #1995: bounded fixture census diagnostics (foreign processes,
     # discarded scope warnings); display only, never evidence.
     fixture_diagnostics: tuple[str, ...] = ()
+    # Issue #1999: the failure a ``--rerun`` replay reproduced, the redacted
+    # replayed command, and a closed-set refusal code when nothing ran.
+    rerun_of: str | None = None
+    rerun_command: str = ""
+    error_code: str | None = None
 
 
 def _bounded_argv(values: Sequence[object]) -> list[str]:
@@ -3876,6 +4322,7 @@ class TestBrokerServer:
         telemetry_attribution: dict | None = None,
         dependency_remedy: str | None = None,
         fixture_foreign_scopes: Sequence[str] = (),
+        rerun_catalog: "RerunCatalog | None" = None,
     ) -> None:
         if root.is_symlink():
             raise BrokerProtocolError("broker root may not be a symlink")
@@ -3891,6 +4338,9 @@ class TestBrokerServer:
         self.fixture_foreign_scopes: tuple[str, ...] = tuple(
             str(item) for item in (fixture_foreign_scopes or ()) if isinstance(item, str)
         )
+        # Issue #1999: the runner's invocation-scoped private rerun catalog,
+        # parent configuration only; a client request never supplies it.
+        self._rerun_catalog = rerun_catalog
         self.capability = uuid.uuid4().hex + uuid.uuid4().hex
         self.timeout_ceiling = float(timeout_ceiling)
         self.containment_policy = containment_policy
@@ -4145,6 +4595,21 @@ class TestBrokerServer:
                         sender.send(_legacy_refusal_frame(reason), grace=terminal, cancellable=False)
                         _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
                         return
+                    if BROKER_RERUN_FIELD in validated:
+                        # Issue #1999: resolved before any reservation, so a
+                        # refusal runs nothing and records nothing.
+                        from .local_test_rerun import _rerun_refusal_frame, resolve_rerun_request
+
+                        rebuilt, refusal = resolve_rerun_request(
+                            validated, catalog=self._rerun_catalog, root=self.root
+                        )
+                        if rebuilt is None:
+                            sender.send(
+                                _rerun_refusal_frame(str(refusal)), grace=terminal, cancellable=False
+                            )
+                            _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
+                            return
+                        validated = rebuilt
                     nonce = str(validated["nonce"])
                     digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
                     with self._journal_lock:
@@ -4615,11 +5080,48 @@ class TestBrokerServer:
                 # target is gone and its locks are released.
                 state.completing = True
                 state.phase = "completing"
-            return self._complete_request(
+            rerun_of = request.get(BROKER_RERUN_FIELD)
+            response = self._complete_request(
                 argv=argv, cwd=cwd, environment=environment, before=before,
                 result=result, fixture_run=fixture_run, root=pinned_root.path,
                 tool_identity=tool_identity, client_lost=state.client_lost,
+                rerun_of=rerun_of if isinstance(rerun_of, str) else None,
             )
+            self._record_rerun_entry(request, response, cwd=cwd)
+            return response
+
+    def _record_rerun_entry(
+        self, request: Mapping[str, object], response: Mapping[str, object], *, cwd: Path
+    ) -> None:
+        """Register a journaled parent-observed failure for exact replay (#1999)."""
+        catalog = self._rerun_catalog
+        receipt = response.get("receipt_id")
+        if catalog is None or not isinstance(receipt, str) or not receipt:
+            return
+        with self._journal_lock:
+            row = next((item for item in self._journal if item.receipt_id == receipt), None)
+        if (
+            row is None
+            or not row.is_failure
+            or row.provenance != "parent-observed"
+            or row.is_non_evidence_launch_failure
+            or row.is_out_of_checkout_context
+        ):
+            return
+        from .workdir_guard import command_targets_outside_workdir
+
+        if command_targets_outside_workdir(row.executed_command or row.command, assigned_workdir=self.root):
+            return
+        fixture = request.get(BROKER_FIXTURE_FIELD)
+        catalog.record(
+            receipt_id=receipt,
+            argv=tuple(str(item) for item in request.get("argv", ())),  # type: ignore[union-attr]
+            cwd=cwd,
+            root=self.root,
+            fixture=str(fixture) if isinstance(fixture, str) else None,
+            environment=dict(request.get("environment") or {}),  # type: ignore[call-overload]
+            restart_command_digest=row.restart_command_digest,
+        )
 
     def _tool_identity(self, client: Mapping[str, str]) -> ToolIdentity | None:
         """Compare a request's client identity with this orchestrator; never raises."""
@@ -4845,7 +5347,7 @@ class TestBrokerServer:
         self, *, argv: tuple[str, ...], cwd: Path, environment: Mapping[str, str],
         before: "TrackedTreeSnapshot", result: Any, fixture_run: "_FixtureRun | None",
         root: Path | None = None, tool_identity: ToolIdentity | None = None,
-        client_lost: bool = False,
+        client_lost: bool = False, rerun_of: str | None = None,
     ) -> dict[str, object]:
         """Snapshot, attribute, fold, journal and build the result frame.
 
@@ -4897,7 +5399,11 @@ class TestBrokerServer:
                 + str(worker_enforcement)
                 + (f"; {', '.join(worker_caveats)}" if worker_caveats else "")
                 + "; executed argv: "
-                + " ".join(str(item) for item in getattr(result, "args", argv))[:512],
+                # Issue #1999: the caveat is projected publicly, so it carries
+                # the redacted command, never raw argv such as a ``-k`` value.
+                + _redact_command_tokens(
+                    tuple(str(item) for item in (getattr(result, "args", None) or argv)), cwd=cwd,
+                )[1][:512],
             )
         pre_collection = getattr(result, "pre_collection_launch_failure", None)
         result_outcome = str(result.outcome)
@@ -4977,6 +5483,7 @@ class TestBrokerServer:
                     _restart_command_digest(argv, cwd, root) if root is not None else None
                 ),
                 tool_identity=tool_identity,
+                rerun_of=rerun_of,
             )
             if client_lost:
                 # Applied after fixture folding, so folding can never restore
@@ -5050,6 +5557,13 @@ class TestBrokerServer:
                 response[BROKER_FIXTURE_DIAGNOSTICS_FIELD] = list(diagnostics)
         if self.dependency_remedy and (result_outcome == "launch-failed" or inner_exec == "failed"):
             response[BROKER_ADVISORY_FIELD] = _safe_text(self.dependency_remedy, 1024)
+        if rerun_of is not None:
+            # Issue #1999: a replay never returns raw argv to the coder; the
+            # executed argv is the redacted token list.
+            tokens, safe_command, _ids, _caveats = _redact_command_tokens(argv, cwd=cwd)
+            response["executed_argv"] = _bounded_argv(tokens)
+            response[BROKER_RERUN_FIELD] = rerun_of
+            response[BROKER_RERUN_COMMAND_FIELD] = _bounded(safe_command, MAX_SAFE_COMMAND_BYTES)
         return response
 
     def _worker_environment_summary(self, environment: Mapping[str, str]) -> dict[str, str]:
@@ -5090,8 +5604,12 @@ class TestBrokerClient:
         cwd: Path | None = None,
         environment_overrides: Mapping[str, str] | None = None,
         fixture: str | None = None,
+        rerun_of: str | None = None,
     ) -> BrokerRunResult:
         """Run one command through the broker.
+
+        ``rerun_of`` (issue #1999) asks the broker to replay a recorded
+        failure; it is exclusive with ``argv`` and ``fixture``.
 
         ``BrokerNotDispatched`` means the request frame was never fully
         written, so nothing ran; ``BrokerResultUnknown`` means it was sent and
@@ -5100,6 +5618,8 @@ class TestBrokerClient:
         """
         if not self.available:
             raise BrokerNotDispatched("test broker is unavailable")
+        if rerun_of is not None and (list(argv) or fixture is not None):
+            raise BrokerNotDispatched("--rerun is exclusive with an inner command and --fixture")
         assert self.endpoint is not None and self.capability is not None and self.turn_id is not None
         snapshot_cwd = str(cwd or Path.cwd())
         snapshot_environment = dict(self._environment)
@@ -5128,7 +5648,12 @@ class TestBrokerClient:
             "cwd": snapshot_cwd,
             "environment": snapshot_environment,
         }
-        if fixture is not None:
+        if rerun_of is not None:
+            request.pop("argv", None)
+            request[BROKER_RERUN_FIELD] = str(rerun_of)
+            # A replayed fixture keeps the declared snapshot overhead.
+            socket_bound = float(timeout_seconds) + 2 * MAX_SNAPSHOT_SECONDS + 10.0
+        elif fixture is not None:
             # Omitted when absent so the fixture-less request (and its replay
             # digest) stays byte-identical.
             request[BROKER_FIXTURE_FIELD] = str(fixture)
@@ -5224,6 +5749,14 @@ class TestBrokerClient:
                         if isinstance(response.get(BROKER_ADVISORY_FIELD), str) else ""
                     ),
                     fixture_diagnostics=_fixture_diagnostics(response.get(BROKER_FIXTURE_DIAGNOSTICS_FIELD)),
+                    rerun_of=decode_rerun_of(response.get(BROKER_RERUN_FIELD)),
+                    rerun_command=_safe_text(
+                        response.get(BROKER_RERUN_COMMAND_FIELD) or "", MAX_SAFE_COMMAND_BYTES
+                    ),
+                    error_code=(
+                        str(response["error_code"])
+                        if response.get("error_code") in RERUN_REFUSAL_CODES else None
+                    ),
                 )
 
 
@@ -5287,12 +5820,22 @@ def unsuperseded_receipts_sentence(value: object) -> str:
     named = []
     for row in failing[:3]:
         command, _ids, _caveats = redact_test_command(row.command)
-        named.append(f"`{_bounded(command, 120)}` ({row.outcome})")
+        # Issue #1999: the receipt id and, when transported, the first rule
+        # that blocked the latest later pass.  Never unredacted argv.
+        receipt = (
+            f"receipt `{_bounded(row.receipt_id, 128)}` "
+            if row.receipt_id and _SAFE_RECEIPT_ID_RE.fullmatch(row.receipt_id) else ""
+        )
+        reason = evidence.latest_diagnostic_reason_for(row.receipt_id)
+        detail = row.outcome + (f"; latest later pass rejected: {reason}" if reason else "")
+        named.append(f"{receipt}`{_bounded(command, 120)}` ({detail})")
     more = f" and {len(failing) - 3} more" if len(failing) > 3 else ""
     return (
         " The latest local test evidence still holds unsuperseded failure receipts: "
         + ", ".join(named) + more
-        + ". This stop may be evidence bookkeeping rather than a missing code change; an operator "
+        + ". A live failure is cleared only by an identical passing rerun at the current head "
+        "via `run-tests --rerun <receipt>`; other selections never supersede it."
+        + " This stop may be evidence bookkeeping rather than a missing code change; an operator "
         "can verify the command and decide whether the receipts are still meaningful."
     )
 

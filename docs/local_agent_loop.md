@@ -2166,6 +2166,103 @@ unstable. Without a qualifying pass it remains authoritative. Missing or
 unknown stability does not select this exception; base reproduction,
 out-of-checkout context and non-evidence launch exclusions remain in effect.
 
+#### Exact reruns of unsuperseded failures (`run-tests --rerun`)
+
+Only an identical rerun clears a live failure (issue #1999): it must pass, be
+parent-observed, run at the current head and tracked tree, and run in an
+equivalent environment, with the same normalized command, fixture and scope.
+A broader, narrower or otherwise different selection never supersedes a
+failure, however many tests it passes.
+
+The redacted command in public text cannot be copied back, because a
+redacted `-k` value or other hashed argument is not the original argument. So
+the parent offers an exact replay instead:
+
+```bash
+agent-loop run-tests --rerun <receipt-id>
+```
+
+The runner keeps one private, in-memory rerun catalog per invocation. Every
+per-turn test broker shares it, so a failure recorded in one coder turn can be
+replayed in a later turn of the same invocation. For each parent-observed,
+in-checkout failure that is not a non-evidence launch failure, the catalog
+records the raw argv, the checkout-relative working directory, the fixture
+path and the validated request environment, bound to the canonical checkout
+root. It holds at most 64 entries and evicts the oldest first. It is never
+projected, journaled into round evidence, logged, put in a prompt or
+persisted.
+
+`--rerun` makes the broker replay that recipe through the normal launch,
+worker-policy, containment, attribution and environment-identity path.
+Broker-owned transport, turn and acknowledgement controls, and the names
+excluded from the environment identity, come from the current request. A
+temporary environment assignment from the original run is therefore
+reproduced without being retyped. `--timeout-seconds`, `--memory-dir` and the
+containment options still apply; a replayed fixture keeps the 30-second
+floor. The new row carries `rerun_of` (the failure receipt), which is
+projected only when set. The wrapper prints the new receipt, the redacted
+replayed command and the citation spelling
+`agent-loop run-tests --rerun <receipt-id>`. That citation is verified only
+against the current-acquisition row whose `rerun_of` names the same failure.
+`rerun_of` never grants supersession: the replay clears the failure only
+through the unchanged rules above. A replay after the tracked tree changed,
+or in a different environment, runs but does not supersede.
+
+These requests are refused before anything runs, with a not-evidence message,
+and record nothing:
+
+- `--rerun` together with an inner command, `--fixture` or `--preflight`, or
+  with a malformed receipt id (exit 2);
+- no test broker (exit 1); there is never a local fallback;
+- a receipt the catalog cannot resolve for this checkout:
+  `rerun-receipt-unknown` (unknown, evicted, restored from an earlier
+  invocation, passing, a launch failure or out of checkout);
+  `rerun-catalog-unavailable`, `rerun-cwd-invalid` and
+  `rerun-fixture-timeout-below-floor` (exit 2).
+
+Coder follow-up prompts carry a local-only block that is never posted. For
+each unsuperseded failure, the first 8 get its receipt id, outcome, redacted
+command, exact rerun handle and the latest rejection reason; then a
+receipt-to-handle line covers every failure. A handle is printed only when
+the catalog can resolve it. A failure restored from an earlier invocation, or
+evicted from the catalog, is listed with `no exact rerun handle in this
+invocation` and the reason: raw argv and environment are never persisted.
+
+**Why a rejected pass did not supersede.** Every supersession rejection
+branch returns a stable reason from a closed vocabulary, such as `command
+differs`, `fixture identity differs`, `scope differs`, `tracked tree changed`,
+`environment identity is <comparison>`, `pass not later than the failure`,
+`base-reproduction row` or `out-of-checkout context`. Reasons never contain
+argv or environment values. Reconciliation keeps, per unsuperseded failure,
+the 2 earliest rejected passes, the latest one (marked `(latest)`) and one
+summary count, as lines of the form
+`<failure> retained against <pass>: <reason>`. Self-reported `tests_run`
+declarations are never recorded as rejected passes, and the latest line names
+the latest parent-observed rejected pass whenever one exists, so an
+unverified later pass cannot hide the rule that really blocked an exact
+rerun. Round evidence appends these
+diagnostics only into the capacity left after the transported rows are fixed.
+Latest lines come first, in the order the stop sentence lists failures, with
+at most 12 lines and 2048 bytes and one
+`<N> further supersession caveat(s) omitted` line when anything was skipped.
+They never cause row eviction, compaction or a capacity stop. Decoding
+restores them from their fixed shapes, so publication re-canonicalization
+treats them the same way, and the encoder keeps them only when strict
+re-canonicalization reproduces the same rows, references and authoritative
+failures. Near the cap they shrink or disappear; the coder prompt still gets
+every latest reason from live state. The unchanged-head stop sentence names
+each listed failure by receipt id and latest reason and points to
+`run-tests --rerun <receipt>`.
+
+**Superset supersession is rejected.** A pass whose selection merely looks
+like a superset of the failed one never supersedes it. Containment cannot be
+proven from recorded data: no parent-observed collected-node-id set exists
+for either run, the recorded identifiers come from argv redaction and are
+cleared by transport compaction, and a `-k`/`-m` expression or a
+parametrization can select differently under another fixture or environment.
+Inferring containment from argv is exactly what the rule forbids, so the
+exact rerun is the path.
+
 #### Pre-collection launch failures
 
 A direct-pytest run that exits before any test could run (a pytest argument

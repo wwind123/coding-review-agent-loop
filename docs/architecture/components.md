@@ -167,7 +167,7 @@ Source paths below are relative to
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `managed_ci_types.py`, `managed_ci_api.py`, `managed_ci_protection.py`, `managed_ci_authorization.py`, `managed_ci_recovery_commands.py`, `managed_ci_intent_validation.py`, `migrations.py`, `coder_ci_guard.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. `managed_ci_recovery_commands.py` owns pure recovery command rendering; `managed_ci_intent_validation.py` owns pure workflow-mirrored intent validation. `managed_ci_types.py` owns shared records/constants; `managed_ci_api.py` owns read probes, actor reads, label history and the single thread-local list-failure state/decorator; `managed_ci_protection.py` owns protection assessment and waiver reconciliation. Consumers import these support bindings from their owners; the driver retains only support imports used internally, plus activation, dispatch and qualification. `managed_ci_authorization.py` owns issue-created authorization formatting, chain validation, continuity publication, fresh resume, recovery and record matching; consumers import authorization and extracted helper symbols directly from their owners, and the driver retains only internally used imports. Symbol-specific import/patch guards protect this ownership. Support owners never import the driver or authorization owner. Recovery-command, intent-validation, tuple/result, reconciliation, status and failure helpers also have direct owners without compatibility-only driver exports. `coder_ci_guard.py` is the turn-scoped `gh` guard that stops managed-CI coder and repair turns from dispatching CI before approval. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. A deterministic isolated-clone configuration defect in semantic follow-up dedupe is preflighted before publication and propagates as a run failure, while provider and environmental failures keep the deterministic fallback. The default classifier backend is Antigravity; when the selected backend CLI does not resolve on `PATH`, preflight marks the matcher unavailable and logs one skip line, and both call sites keep deterministic matching without a provider call (#1472). The Antigravity classification turn (`semantic-dedupe` role) is isolated like format repair: an empty temporary directory, a no-tools `GEMINI.md`, the strict empty-allowlist settings, no response-file or footer contract, and a stdout-marker JSON answer. Its per-call timeout is resolved at use time by `effective_semantic_followup_timeout_seconds` (120 s for Antigravity, 30 s otherwise, unless set explicitly). |
-| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; launched run-tests observations whose suite start stayed `unknown` may also persist a diagnostic-only, closed-set `suite_start_reason` (`unrecognized-launcher` or `probe-unavailable`) that selects operator wording and never decides admission or citability; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. `test_runtime.run_exit_code_probe` bounds every interpreter probe and tears down its process tree on every exit path; `run-tests` prints a pre-launch foreground-budget notice (suppressed only by the orchestrator-authored `AGENT_LOOP_SHELL_CAP_MS`), a pre-admission missing-xdist advisory for module launches and a timeout advisory, none of which is evidence. `fixture_runtime.py` and the standard-library `fixture_supervisor.py` implement `run-tests --fixture`: a provenance gate (tracked `100755` blob equal to `HEAD`, clean tree) and a host-process-authority gate before launch, a child-subreaper supervisor that runs the fixture's setup and teardown around the unchanged inner command under one absolute request deadline, a graceful teardown handshake on broker shutdown, and a run-scoped census before cleanup is confirmed: in-window processes in the run cgroup or descended from the supervisor, broker or an owned identity are `run`, everything else is `undetermined` and fails the receipt unless a bounded, re-verified same-cgroup ancestry proof places it in an operator-declared `--fixture-foreign-scope` (parent config only, never a run-tests request), which makes it a diagnostic-only `foreign` entry; without a readable run cgroup the census stays host-wide. Round evidence compacts current-acquisition cited receipts that exceed the 16 KiB cap (diagnostic fields first, then passing rows to display-only `cited_receipt_references` that never become observations) and stops with counts and byte sizes only when even that cannot fit; the optional fixture record on the observation feeds the citation gate, which requires a clean fixture lifecycle. |
+| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `local_test_rerun.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; launched run-tests observations whose suite start stayed `unknown` may also persist a diagnostic-only, closed-set `suite_start_reason` (`unrecognized-launcher` or `probe-unavailable`) that selects operator wording and never decides admission or citability; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. `test_runtime.run_exit_code_probe` bounds every interpreter probe and tears down its process tree on every exit path; `run-tests` prints a pre-launch foreground-budget notice (suppressed only by the orchestrator-authored `AGENT_LOOP_SHELL_CAP_MS`), a pre-admission missing-xdist advisory for module launches and a timeout advisory, none of which is evidence. `fixture_runtime.py` and the standard-library `fixture_supervisor.py` implement `run-tests --fixture`: a provenance gate (tracked `100755` blob equal to `HEAD`, clean tree) and a host-process-authority gate before launch, a child-subreaper supervisor that runs the fixture's setup and teardown around the unchanged inner command under one absolute request deadline, a graceful teardown handshake on broker shutdown, and a run-scoped census before cleanup is confirmed: in-window processes in the run cgroup or descended from the supervisor, broker or an owned identity are `run`, everything else is `undetermined` and fails the receipt unless a bounded, re-verified same-cgroup ancestry proof places it in an operator-declared `--fixture-foreign-scope` (parent config only, never a run-tests request), which makes it a diagnostic-only `foreign` entry; without a readable run cgroup the census stays host-wide. Round evidence compacts current-acquisition cited receipts that exceed the 16 KiB cap (diagnostic fields first, then passing rows to display-only `cited_receipt_references` that never become observations) and stops with counts and byte sizes only when even that cannot fit; the optional fixture record on the observation feeds the citation gate, which requires a clean fixture lifecycle. |
 
 `orchestrator.py` is a thin re-export facade over the lifecycle modules listed
 above, which were extracted from it by pure moves. The frozen historical
@@ -209,6 +209,62 @@ holder lives only as long as the live identity: observation projections, broker
 frames and catalogs, journals, bounded evidence, logs and prompts never carry
 it, and restart reconstruction cannot recover it. Verdicts, exclusions and
 failure supersession authority remain unchanged.
+
+## Exact reruns and supersession diagnostics (#1999)
+
+`local_test_rerun.py` holds the `RerunCatalog`. The runner creates one per
+invocation, beside its execution-reference and environment registries, and
+passes it to every per-turn `TestBrokerServer` as parent configuration, never
+from a request. The catalog therefore outlives each broker: a failure
+journaled by one coder turn's broker can be replayed by the next turn's
+broker. Each entry is keyed by receipt id and holds the raw argv, the
+checkout-relative cwd, the fixture path, the validated request environment
+and the canonical checkout root it was recorded under. `resolve` and
+`contains` succeed only for the same canonical root. The catalog is
+thread-safe, bounded to 64 entries (oldest evicted) and memory-only: its
+argv and environment values are in the same privacy class as
+`execution_ref` and `executed_command`. They are never projected, journaled
+into bounded evidence, logged, prompted or persisted. A broker registers only
+parent-observed, in-checkout failures that are not non-evidence launch
+failures.
+
+A `rerun_of` request field, exclusive with `argv` and `fixture`, makes the
+broker rebuild the request from the catalog. The recorded argv, revalidated
+cwd, fixture and environment are used, and only the broker-owned
+transport, turn and acknowledgement controls and the identity-excluded names
+are refreshed from the current request. Execution then follows the normal
+path. An unresolvable receipt, a missing catalog, an invalid cwd or a
+fixture timeout below the floor gets a closed-set no-test refusal frame
+before any reservation, so nothing runs or is recorded and the client never
+falls back to a local run. The replay row carries the display and citation
+field `rerun_of`, projected only when set and strictly decoded as a safe
+identifier, so existing projections stay byte-identical. A replay response
+returns only redacted argv. `parse_rerun_citation` in `test_runtime.py`
+recognizes `agent-loop run-tests --rerun <id>`. The authoritative
+risk-matrix matcher, comment rendering and receipt-progress checks accept such
+a citation only for the current-acquisition row whose `rerun_of` names the
+same failure.
+
+Every supersession rejection branch returns a closed-vocabulary reason.
+`LocalTestEvidence` carries two `repr=False` fields that never appear in
+`to_dict` or projections. The live-only `supersession_rejections` map holds,
+per unsuperseded failure, the latest rejected pass, its first blocking reason
+and the rejected count; it feeds the local coder-prompt block that
+`local_test_rerun.unsuperseded_failure_rerun_block` renders. The structured
+`supersession_diagnostics` hold the bounded `<failure> retained against
+<pass>: <reason>` lines (2 earliest, the latest marked, one summary).
+Self-reported declarations are never recorded as rejections, and the latest
+entry prefers the latest parent-observed rejected pass. They
+are kept apart from generic caveats. `bounded_evidence_for_round` fixes rows,
+references and the capacity decision without them, then appends them only into
+leftover capacity (latest first in stop-sentence order, at most 12 lines and
+2048 bytes, plus an omission line). `decode_bounded_evidence` restores them
+from their anchored fixed shapes. A fixed-point check, which skips nested
+verification, keeps them only when strict publication re-canonicalization
+reproduces the same rows, references and authoritative failures; otherwise
+the diagnostics-free encoding is published. Supersession authority is
+unchanged: `_can_supersede` never reads `rerun_of`, and superset supersession
+is rejected because no parent-observed collected-node-id set is recorded.
 
 ## Unstable local test attribution (#1753)
 

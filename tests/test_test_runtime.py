@@ -8480,3 +8480,36 @@ def test_real_broker_launch_forwards_discarded_scope_warning_1995(tmp_path, monk
     # "/" covers the run's own subtree: discarded (or ignored without a run cgroup), and said so.
     assert "agent-loop fixture: warning: " in err, err
     assert set(row.fixture.to_dict()) == fx_evidence.FIXTURE_RECORD_FIELDS
+
+
+@_FX_HOST
+def test_rerun_of_a_fixture_failure_replays_under_the_recorded_fixture_1999(tmp_path, monkeypatch):
+    """Issue #1999: ``--rerun`` replays the recorded fixture, never a client one."""
+    from coding_review_agent_loop.local_test_rerun import RerunCatalog
+
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "setup-fail")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("a real test broker requires Linux")
+    catalog = RerunCatalog()
+    server = fx_evidence.TestBrokerServer(root=root, turn_id="turn-fixture-rerun", rerun_catalog=catalog).start()
+    try:
+        client = fx_evidence.TestBrokerClient(_fx_env(server))
+        first = client.run(list(_FX_PYTEST), timeout_seconds=40, cwd=root, fixture="fixture.py")
+        assert first.outcome == "failed" and catalog.contains(first.receipt_id, root)
+        with pytest.raises(fx_evidence.BrokerNotDispatched):
+            client.run([], timeout_seconds=40, cwd=root, fixture="other.py", rerun_of=first.receipt_id)
+        too_short = client.run([], timeout_seconds=5, cwd=root, rerun_of=first.receipt_id)
+        replay = client.run([], timeout_seconds=40, cwd=root, rerun_of=first.receipt_id)
+        rows = [row for row in server.journal if row.fixture is not None]
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+    assert too_short.error_code == "rerun-fixture-timeout-below-floor" and too_short.receipt_id == ""
+    assert replay.rerun_of == first.receipt_id and replay.fixture is not None
+    assert replay.fixture["setup_status"] == 3
+    original, replayed = rows
+    assert replayed.rerun_of == original.receipt_id
+    assert replayed.fixture.identity == original.fixture.identity == ("fixture.py", replayed.fixture.digest)
+    assert replayed.normalized_command == original.normalized_command
+    assert replayed.restart_command_digest == original.restart_command_digest
