@@ -2055,7 +2055,10 @@ def reconcile_test_observations(
             continue
         for later_index in range(failure_index + 1, len(rows)):
             later = rows[later_index]
-            if later.outcome != "passed":
+            if later.outcome != "passed" or later.provenance == "self-reported":
+                # A self-reported declaration (legacy tests_run) mirrors a
+                # run and can never supersede; recording it would mask the
+                # meaningful latest reason (review item-2).
                 continue
             pass_receipt = later.receipt_id or f"observation-{later_index}"
             if later.is_out_of_checkout_context:
@@ -2151,6 +2154,10 @@ def _supersession_records(
     """
     rejections: list[tuple[str, str, str, int]] = []
     diagnostics: list[tuple[str, str, str]] = []
+    parent_observed = {
+        row.receipt_id or f"observation-{index}"
+        for index, row in enumerate(rows) if row.provenance == "parent-observed"
+    }
     for index, row in enumerate(rows):
         entries = rejected_passes.get(index)
         if (
@@ -2165,6 +2172,15 @@ def _supersession_records(
         ):
             continue
         failure = row.receipt_id
+        # The latest *parent-observed* rejected pass names the meaningful
+        # rule; an unverified later pass is the latest only when no
+        # parent-observed pass was rejected (review item-2).
+        latest_index = max(
+            (position for position, (receipt, _reason) in enumerate(entries)
+             if receipt in parent_observed),
+            default=len(entries) - 1,
+        )
+        entries = [*entries[:latest_index], *entries[latest_index + 1:], entries[latest_index]]
         latest_pass, latest_reason = entries[-1]
         rejections.append((failure, latest_pass, latest_reason, len(entries)))
         samples = list(entries[:-1])[:2]

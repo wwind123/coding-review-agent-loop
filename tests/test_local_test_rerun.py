@@ -1067,3 +1067,35 @@ def test_worker_budget_caveat_never_publishes_raw_argv_for_a_failure_or_its_repl
     assert RAW_K not in encoded
     assert RAW_K not in canonicalize_bounded_evidence(encoded, strict=True)
     assert RAW_K not in replay.rerun_command and all(RAW_K not in item for item in replay.executed_argv)
+
+
+@pytest.mark.parametrize("later", ["legacy-declaration", "telemetry-unverified"])
+def test_unverified_later_pass_never_masks_the_latest_meaningful_reason(tmp_path, later):
+    """Review item-2: tests_run declarations or unverified passes after an
+    environment-rejected exact replay leave the environment reason latest."""
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        _obs("mask-failure", "failed", 0, registry=registry, environment={"PATH": "/a"}),
+        _obs("mask-wrong", "passed", 1, registry=registry, command=_cmd(1)),
+        _obs("mask-replay", "passed", 2, registry=registry, environment={"PATH": "/b"},
+             rerun_of="mask-failure"),
+    ]
+    legacy = None
+    if later == "legacy-declaration":
+        legacy = ["python -m pytest tests/test_x.py -q", "python -m pytest tests -q"]
+    else:
+        rows.append(_obs("mask-unverified", "passed", 3, registry=registry, provenance="telemetry-unverified"))
+    evidence = reconcile_test_observations(rows, registry=registry, legacy_tests_run=legacy, cwd=Path("/checkout"))
+    env_reason = "environment identity is different"
+    ((failure, latest_pass, reason, count),) = evidence.supersession_rejections
+    assert (failure, latest_pass, reason) == ("mask-failure", "mask-replay", env_reason)
+    assert count == (2 if later == "legacy-declaration" else 3)
+    if later == "legacy-declaration":
+        assert not any("legacy" in text for text in _diagnostic_texts(evidence))
+    latest = [text for _f, kind, text in evidence.supersession_diagnostics if kind == "latest"]
+    assert latest == [f"mask-failure retained against mask-replay: {env_reason} (latest)"]
+    block = unsuperseded_failure_rerun_block(evidence, RerunCatalog(), tmp_path, PREFIX)
+    assert f"Latest rejected later pass `mask-replay`: {env_reason}" in block
+    assert evidence_module.REASON_PASS_NOT_PARENT_OBSERVED not in block.split("Receipt-to-handle")[0]
+    sentence = unsuperseded_receipts_sentence(bounded_evidence_for_round(evidence))
+    assert f"latest later pass rejected: {env_reason}" in sentence

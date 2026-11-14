@@ -2236,7 +2236,11 @@ differs`, `fixture identity differs`, `scope differs`, `tracked tree changed`,
 argv or environment values. Reconciliation keeps, per unsuperseded failure,
 the 2 earliest rejected passes, the latest one (marked `(latest)`) and one
 summary count, as lines of the form
-`<failure> retained against <pass>: <reason>`. Round evidence appends these
+`<failure> retained against <pass>: <reason>`. Self-reported `tests_run`
+declarations are never recorded as rejected passes, and the latest line names
+the latest parent-observed rejected pass whenever one exists, so an
+unverified later pass cannot hide the rule that really blocked an exact
+rerun. Round evidence appends these
 diagnostics only into the capacity left after the transported rows are fixed.
 Latest lines come first, in the order the stop sentence lists failures, with
 at most 12 lines and 2048 bytes and one

@@ -252,7 +252,9 @@ per unsuperseded failure, the latest rejected pass, its first blocking reason
 and the rejected count; it feeds the local coder-prompt block that
 `local_test_rerun.unsuperseded_failure_rerun_block` renders. The structured
 `supersession_diagnostics` hold the bounded `<failure> retained against
-<pass>: <reason>` lines (2 earliest, the latest marked, one summary). They
+<pass>: <reason>` lines (2 earliest, the latest marked, one summary).
+Self-reported declarations are never recorded as rejections, and the latest
+entry prefers the latest parent-observed rejected pass. They
 are kept apart from generic caveats. `bounded_evidence_for_round` fixes rows,
 references and the capacity decision without them, then appends them only into
 leftover capacity (latest first in stop-sentence order, at most 12 lines and
