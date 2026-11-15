@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from coding_review_agent_loop.agent_permissions import neutralized_git_env
+from coding_review_agent_loop.agent_permissions import apply_neutralized_git_env
 from process_env_isolation import restored_process_environment
 
 
@@ -23,17 +23,25 @@ def dirty_repo(tmp_path):
     return repo
 
 
-def test_neutralized_git_env_written_directly_is_restored(dirty_repo):
+def test_neutralized_git_env_written_directly_is_restored(dirty_repo, tmp_path, monkeypatch):
+    marker = tmp_path / "hook-ran"
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", f"touch {marker}")
+    monkeypatch.setenv("AGENT_LOOP_LEAK_PROBE", "inherited")
     before = dict(os.environ)
     with restored_process_environment():
         # The exact write establish_sandboxed_run performs, outside monkeypatch.
-        os.environ.update(neutralized_git_env())
+        apply_neutralized_git_env(os.environ)
         os.environ["AGENT_LOOP_LEAK_PROBE"] = "1"
-        assert os.environ["GIT_EXTERNAL_DIFF"] == ""
-        # This is what broke test_run_worktrees on the managed CI shard.
-        leaked = _git(dirty_repo, "diff")
-        assert leaked.returncode != 0 and "external diff" in leaked.stderr
+        assert "GIT_EXTERNAL_DIFF" not in os.environ
+        assert os.environ["GIT_TRACE"] == "0"
+        inside = _git(dirty_repo, "diff")
+        assert inside.returncode == 0, inside.stderr
+        assert "+unstaged" in inside.stdout
+        assert not marker.exists()
+    # The direct write (a removal plus overrides) must not leak (#1990).
     assert dict(os.environ) == before
+    assert os.environ["GIT_EXTERNAL_DIFF"] == f"touch {marker}"
+    monkeypatch.delenv("GIT_EXTERNAL_DIFF")
     assert _git(dirty_repo, "diff").returncode == 0
 
 

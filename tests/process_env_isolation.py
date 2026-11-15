@@ -1,11 +1,11 @@
 """Restore the process environment around each test.
 
 Code under test can mutate ``os.environ`` directly. For example,
-``agent_permissions.establish_sandboxed_run`` applies ``neutralized_git_env()``
-with ``os.environ.update``, and ``monkeypatch`` never sees that write. Without a
-restore, ``GIT_EXTERNAL_DIFF=""`` survives into every later test on the same
-xdist worker, and each ``git diff`` there fails with "external diff died".
-Which test meets the leak depends on shard composition (#1990 CI).
+``agent_permissions.establish_sandboxed_run`` applies the neutralized git
+environment (overrides and removals) directly to ``os.environ``, and
+``monkeypatch`` never sees that write. Without a restore, the direct write
+survives into every later test on the same xdist worker and changes how git
+behaves there. Which test meets the leak depends on shard composition (#1990 CI).
 """
 from __future__ import annotations
 

@@ -35,7 +35,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, MutableMapping
 
 from .errors import AgentLoopError
 from .scratch import make_private_dirs, mkdir_private
@@ -83,6 +83,12 @@ GIT_TRACE_VARIABLES = (
     "GIT_TRACE_SETUP",
     "GIT_TRACE_SHALLOW",
 )
+# Inherited git variables that are removed rather than overridden.
+# ``GIT_EXTERNAL_DIFF`` is a pure exec hook: git runs it for every patch diff,
+# and an empty value is not "off" -- git tries to exec the empty string and
+# fails with "external diff died" (#1994).  A no-op command such as ``true``
+# would silently produce empty diffs.  No role needs it, so it is removed.
+GIT_REMOVED_VARIABLES = ("GIT_EXTERNAL_DIFF",)
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 # gh subcommands the coder prompts instruct (PR creation/edits, body-file
 # comments, label verification, bounded CI snapshots, issue reads).
@@ -1316,18 +1322,25 @@ def inspect_prefix(config: AgentLoopConfig) -> str:
 
 
 def neutralized_git_env() -> dict[str, str]:
-    """Safe values for the inherited git variables, for agent-loop and its children.
+    """Safe override values for inherited git variables, for agent-loop and its children.
 
     ``0`` disables each trace target, and ``GIT_CONFIG_COUNT=0`` makes any
     inherited ``GIT_CONFIG_KEY_n`` / ``GIT_CONFIG_VALUE_n`` pair unreadable.
-    Values are overridden rather than removed so one mapping serves both
-    ``os.environ.update`` here and the runner's ``{**os.environ, **env}`` merge.
+    These values work for the runner's ``{**os.environ, **env}`` merge, but
+    removal cannot be expressed through that merge, so names that must be
+    removed live in ``GIT_REMOVED_VARIABLES`` and are stripped from the process
+    environment itself by ``apply_neutralized_git_env``.
     """
     env = {name: "0" for name in GIT_TRACE_VARIABLES}
     env["GIT_CONFIG_COUNT"] = "0"
-    # A pure exec hook: git runs it for every diff, and no role needs it.
-    env["GIT_EXTERNAL_DIFF"] = ""
     return env
+
+
+def apply_neutralized_git_env(environ: MutableMapping[str, str]) -> None:
+    """Apply the git overrides and removals to ``environ`` in place; idempotent."""
+    environ.update(neutralized_git_env())
+    for name in GIT_REMOVED_VARIABLES:
+        environ.pop(name, None)
 
 
 # Commands whose flows can reach a review round and so create a review-round
@@ -1361,8 +1374,11 @@ def establish_sandboxed_run(
     # GIT_TRACE2_EVENT writing trace2.json into the checkout from
     # agent-loop's own `git rev-parse HEAD` -- the trace file named
     # `python` as its parent, not the CLI.  Neutralize here, once, so every
-    # in-process git call and every child inherits the safe values.
-    os.environ.update(neutralized_git_env())
+    # in-process git call and every child inherits the safe values.  The
+    # removed names (GIT_EXTERNAL_DIFF) are stripped here too; because every
+    # runner launch path merges over os.environ, the removal also reaches
+    # agent-loop's own git calls and every child (#1994).
+    apply_neutralized_git_env(os.environ)
     establish_response_root_boundary(config)
     if any(selection.agent == "claude" for selection in configured_agent_selections(config)):
         establish_inspect_provenance(config)
@@ -1484,10 +1500,12 @@ def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None
     allowlist, constructed PATH and pinned executables apply inside
     ``inspect``, not to the CLI that calls it.  An inherited ``GIT_TRACE*`` or
     ``GIT_CONFIG_*`` therefore still reaches the CLI's own git calls, so those
-    are neutralized here.  They are overridden rather than removed because the
-    runner merges this mapping over ``os.environ``; git treats ``0`` as off and
-    ``GIT_CONFIG_COUNT=0`` makes any inherited ``GIT_CONFIG_KEY_n`` /
-    ``GIT_CONFIG_VALUE_n`` pair unreadable.
+    are overridden here, because the runner merges this mapping over
+    ``os.environ``; git treats ``0`` as off and ``GIT_CONFIG_COUNT=0`` makes
+    any inherited ``GIT_CONFIG_KEY_n`` / ``GIT_CONFIG_VALUE_n`` pair
+    unreadable.  Removed names (``GIT_REMOVED_VARIABLES``) cannot be expressed
+    in this mapping; they are stripped from ``os.environ`` itself at startup
+    and again in ``prepare_sandboxed_spawn``.
     """
     if not is_sandboxed(config):
         return {}
@@ -1499,6 +1517,9 @@ def prepare_sandboxed_spawn(config: AgentLoopConfig, provider: str, role: str | 
     path = prepare_response_file(config, provider)
     if provider == "claude" and permission_class_for_role(role) == PERMISSION_CLASS_READ_ONLY:
         verify_inspect_provenance(config)
+    # Defense in depth: re-strip removed git variables (and re-apply the
+    # overrides) in case anything re-set them after startup (#1994).
+    apply_neutralized_git_env(os.environ)
     return path
 
 
