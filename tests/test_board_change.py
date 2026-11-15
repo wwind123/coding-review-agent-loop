@@ -5360,3 +5360,51 @@ def test_named_legacy_entry_ignores_a_foreign_pr_contract_and_follows_the_actor_
     assert not runner.comments
     source = inspect.getsource(pr_board_state.authenticate_named_legacy_pr_entry)
     assert "PR contract record was not written" not in source
+
+
+# --- link re-entry anchor record set (#1991) ---------------------------------
+
+
+@pytest.mark.parametrize("candidate", ["visual", "coverage"])
+def test_board_reentry_round_anchors_on_authority_records_only(candidate):
+    """Row visual-candidate-higher-round (unit): candidate records never raise the anchor.
+
+    The real PR resume computes its link re-entry anchor from
+    ``authority_records``; the helper must read the same record set.
+    """
+    from coding_review_agent_loop.board_change import board_reentry_round
+
+    root = _identity(("a", "codex"))
+    grown = _identity(("a", "codex"), ("b", "claude"))
+    link, link_digest = _link_body(root, root.digest, root, grown, anchor=1, advance=True)
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    kind = "visible-defects" if candidate == "visual" else "screenshot-coverage"
+    scope = {"version": 1, "kind": kind, "head": head, "seat": "a"}
+    phase = "visual" if candidate == "visual" else "screenshot-coverage"
+    history = [
+        _record_body(1, root, root),
+        link,
+        _record_body(2, root, grown, change=link_digest),
+    ]
+    with_candidates = [
+        *history,
+        _record_body(3, root, grown, change=link_digest, phase=phase, review_scope=scope),
+        _record_body(4, root, grown, change=link_digest, phase=phase, review_scope=scope),
+    ]
+
+    def comments(bodies):
+        return [SimpleNamespace(body=body, author_id=_ACTOR_ID) for body in bodies]
+
+    # The candidates really are extracted records in higher rounds.
+    assert max(
+        r.metadata.round_number
+        for r in _extract_round_metadata_records(comments(with_candidates), flow="pr")
+    ) == 4
+    for bodies in (history, with_candidates):
+        assert board_reentry_round(comments(bodies), None) == 3
+        assert board_reentry_round(comments(bodies), 2, signed_amendment=True) == 3
+        # Without a signed amendment a resumed round is kept unchanged.
+        assert board_reentry_round(comments(bodies), 2) == 2
+    # Only candidate records: nothing authoritative to anchor on, so round 1.
+    only_candidates = [link, *with_candidates[3:]]
+    assert board_reentry_round(comments(only_candidates), None) == 1

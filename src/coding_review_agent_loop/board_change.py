@@ -429,9 +429,17 @@ def board_reentry_round(
     ):
         return resumed_round
     if comments_bear_board_change_links(comments, surface=surface):
+        from .review_scope import authority_records
         from .round_state import _extract_round_metadata_records
 
-        records = _extract_round_metadata_records(comments, flow=surface.flow)
+        # The anchor reads the same authority-record set the real PR resume
+        # uses (pr_loop drops visual-review and screenshot-coverage candidate
+        # records before computing its link re-entry anchor), so a candidate
+        # record in a higher round can never make this helper name a round the
+        # scheduler will not run (#1991).  Plan records carry neither scope.
+        records = authority_records(
+            _extract_round_metadata_records(comments, flow=surface.flow)
+        )
         if records:
             return board_anchor(records).round_number + 1
     return 1
