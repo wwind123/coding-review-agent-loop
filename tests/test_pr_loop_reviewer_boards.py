@@ -1746,3 +1746,194 @@ def test_1986_activation_template_call_sites_pass_runner_structurally(module_nam
         runner_kw = [kw for kw in call.keywords if kw.arg == "runner"]
         assert len(runner_kw) == 1
         assert isinstance(runner_kw[0].value, ast.Name) and runner_kw[0].value.id == "runner"
+
+
+# --- Link re-entry round agreement (#1991) ------------------------------------
+
+
+def _link_with_pending_amendment_1991(tmp_path, *, candidate=None, effective_round=9):
+    """Round 1 by two seats, a recorded add-seat link approved in round 2, then a
+    signed 3 -> 2 amendment posted with a deliberately wrong effective round.
+
+    ``candidate`` appends a visual-review or screenshot-coverage candidate record
+    in round 3 (above the code-review anchor) before the amendment is posted.
+    """
+    from test_board_change import _amendment_from, _append, _approved_two_reviewer_run, _links
+
+    runner, _ = _approved_two_reviewer_run(tmp_path, pr_review_policy="selective-intermediate")
+    larger = make_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate", min_reviewers=3,
+    )
+    runner.antigravity_outputs.append(structured_pr_review(reviewer="Antigravity"))
+    assert run_pr_loop(runner, pr_number=77, config=larger) == 0
+    assert len(_links(runner)) == 1
+    if candidate is not None:
+        _append_candidate_record_1991(runner, candidate, round_number=3)
+    reduced = make_config(
+        tmp_path, reviewer=("codex", "gemini"), pr_review_policy="selective-intermediate",
+        min_reviewers=3,
+    )
+    with pytest.raises(AgentLoopError, match="below the floor of 3") as refused:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    signed = _amendment_from(str(refused.value))
+    (printed,) = re.findall(r'"effective_from_round": (\d+)', signed)
+    if effective_round is not None:
+        signed = signed.replace(
+            f'"effective_from_round": {printed}', f'"effective_from_round": {effective_round}'
+        )
+    _append(runner, signed)
+    return runner, larger, int(printed)
+
+
+def _append_candidate_record_1991(runner, kind, *, round_number):
+    from test_board_change import _append, _records
+
+    base = [r for r in _records(runner) if r.metadata.role == "reviewer"][-1].metadata
+    head = runner.pr_payload.get("headRefOid") or base.subject
+    if kind == "visual":
+        extra = {"phase": "visual", "review_scope": {
+            "version": 1, "kind": "visible-defects", "head": head, "seat": base.agent,
+        }}
+    else:
+        extra = {"phase": "screenshot-coverage", "review_scope": {
+            "version": 1, "kind": "screenshot-coverage", "head": head, "seat": base.agent,
+        }}
+    metadata = dataclasses.replace(base, round_number=round_number, subject=head, **extra)
+    _append(runner, _attach_round_metadata("Candidate assessment.", metadata), author_id=424242)
+
+
+def _helper_rounds_1991(runner, config):
+    """The rounds both advisory helpers name over the PR's admitted comments."""
+    from coding_review_agent_loop.board_change import board_anchor
+    from coding_review_agent_loop.config import reviewers
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.pr_board_state import admitted_pr_comments
+    from coding_review_agent_loop.review_scheduling import policy_capabilities
+    from coding_review_agent_loop.review_scope import authority_records
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    context = get_pr_review_context(runner, config=config, pr_number=77)
+    start = int(pr_loop_support._pr_amendment_start_round(
+        context, reviewers(config), policy_capabilities(config.pr_review_policy),
+        runner=runner, config=config,
+    ))
+    comments, _actor = admitted_pr_comments(
+        runner, config=config, pr_number=77, comments=context.comments,
+    )
+    anchor = board_anchor(
+        authority_records(_extract_round_metadata_records(comments, flow="pr"))
+    ).round_number
+    return start, anchor + 1
+
+
+def _record_activation_rounds_1991(monkeypatch):
+    """Record every activation round; the board-entry check only records, so the
+    loop's own check (``resumed_round.round_number``) is the one that stops."""
+    import coding_review_agent_loop.board_amendment as board_amendment
+    import coding_review_agent_loop.pr_board_state as pr_board_state
+
+    seen = {"board-entry": [], "pr-loop": []}
+
+    def entry(lineage, *, start_round_number, template):
+        seen["board-entry"].append(start_round_number)
+
+    def loop(lineage, *, start_round_number, template):
+        seen["pr-loop"].append(start_round_number)
+        return board_amendment.require_amendment_activation(
+            lineage, start_round_number=start_round_number, template=template,
+        )
+
+    monkeypatch.setattr(pr_board_state, "require_amendment_activation", entry)
+    monkeypatch.setattr(pr_loop, "require_amendment_activation", loop)
+    return seen
+
+
+@pytest.mark.parametrize("candidate", [None, "visual", "coverage"])
+def test_1991_link_reentry_rounds_agree_with_a_pending_amendment(
+    tmp_path, monkeypatch, candidate,
+):
+    """Rows link-pending-amendment-agree and visual-candidate-higher-round.
+
+    After a recorded board-change link with a pending signed amendment, the
+    round the loop's activation stop names, the board-entry resume round and
+    ``_pr_amendment_start_round`` are all the authority-record anchor + 1.  A
+    visual or coverage candidate record in a higher round moves none of them.
+    """
+    runner, larger, printed = _link_with_pending_amendment_1991(tmp_path, candidate=candidate)
+    start, expected = _helper_rounds_1991(runner, larger)
+    assert expected == 3 and start == expected and printed == expected
+    seen = _record_activation_rounds_1991(monkeypatch)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="re-enters round 3,") as stop:
+        run_pr_loop(runner, pr_number=77, config=larger)
+    assert '"effective_from_round": 3' in str(stop.value)
+    assert set(seen["board-entry"]) == {3} and seen["pr-loop"] == [3]
+    # The stop is pre-invocation and pre-post.
+    from test_board_change import _agents
+
+    assert _agents(runner, commands_before) == []
+    assert len(runner.pr_payload["comments"]) == comments_before
+
+
+def test_1991_matching_amendment_activates_at_the_shared_link_reentry_round(
+    tmp_path, monkeypatch,
+):
+    """Row link-pending-amendment-agree: the printed round is the round that runs."""
+    runner, larger, printed = _link_with_pending_amendment_1991(
+        tmp_path, candidate="visual", effective_round=None,
+    )
+    seen = _record_activation_rounds_1991(monkeypatch)
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
+    runner.codex_outputs.append(structured_pr_review())
+    runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
+    assert run_pr_loop(runner, pr_number=77, config=larger) == 0
+    assert printed == 3 and set(seen["board-entry"]) == {3} and seen["pr-loop"] == [3]
+    assert any("Reviewer board amendment applied." in c for c in runner.comments)
+
+
+def test_1991_no_link_history_keeps_the_resumed_round(tmp_path, monkeypatch):
+    """Row no-link-control: without links every path keeps the resumed round."""
+    from coding_review_agent_loop.board_change import board_reentry_round
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review()],
+        gemini_outputs=[structured_pr_review(
+            reviewer="Google Gemini", state="blocking", blocking_items=["Bound the retry."]
+        )],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    original = make_config(
+        tmp_path, reviewer=("codex", "gemini"), pr_review_policy="selective-intermediate",
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=original)
+    from test_board_change import _append, _links
+
+    assert _links(runner) == []
+    reduced = make_config(
+        tmp_path, reviewer=("codex",), pr_review_policy="selective-intermediate",
+        min_reviewers=2,
+    )
+    with pytest.raises(AgentLoopError, match="below the floor of 2") as refused:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    from test_board_change import _amendment_from
+
+    signed = _amendment_from(str(refused.value))
+    (printed,) = re.findall(r'"effective_from_round": (\d+)', signed)
+    start, _ = _helper_rounds_1991(runner, original)
+    from coding_review_agent_loop.github import get_pr_review_context
+
+    comments = get_pr_review_context(runner, config=original, pr_number=77).comments
+    assert board_reentry_round(comments, int(printed), signed_amendment=True) == int(printed)
+    assert board_reentry_round(comments, None, signed_amendment=True) == 1
+    _append(runner, signed.replace(
+        f'"effective_from_round": {printed}', f'"effective_from_round": {int(printed) + 5}'
+    ))
+    seen = _record_activation_rounds_1991(monkeypatch)
+    with pytest.raises(AgentLoopError, match=f"re-enters round {printed},"):
+        run_pr_loop(runner, pr_number=77, config=original)
+    assert start == int(printed) == 2
+    assert seen["pr-loop"] == [int(printed)]
+    assert set(seen["board-entry"]) <= {int(printed)}
