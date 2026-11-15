@@ -1376,7 +1376,8 @@ def test_sandboxed_env_neutralizes_inherited_git_tracing_and_config_injection(
         assert env[name] == "0"
     assert "GIT_TRACE2_EVENT" in ap.GIT_TRACE_VARIABLES
     assert env["GIT_CONFIG_COUNT"] == "0"
-    assert env["GIT_EXTERNAL_DIFF"] == ""
+    # Removed, not overridden: an empty value makes git exec "" (#1994).
+    assert "GIT_EXTERNAL_DIFF" not in env
 
 
 def test_unsandboxed_env_is_untouched(tmp_path):
@@ -1395,21 +1396,95 @@ def test_establish_neutralizes_git_env_in_agent_loop_own_process(tmp_path, sandb
     trace = tmp_path / "trace2.json"
     monkeypatch.setenv("GIT_TRACE2_EVENT", str(trace))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/bin/false")
+    marker = tmp_path / "hook-ran"
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", f"touch {marker}")
     config = sandboxed_config(tmp_path)
     # The full startup path, not the fixture's provenance-only helper: the
     # neutralization belongs to establishing the run, before any git call.
     ap.establish_sandboxed_run(config, command="pr")
-    assert os.environ["GIT_TRACE2_EVENT"] == "0"
+    for name in ap.GIT_TRACE_VARIABLES:
+        assert os.environ[name] == "0"
     assert os.environ["GIT_CONFIG_COUNT"] == "0"
-    assert os.environ["GIT_EXTERNAL_DIFF"] == ""
+    # Removed rather than left empty or replaced with a no-op (#1994).
+    assert "GIT_EXTERNAL_DIFF" not in os.environ
+    assert not marker.exists()
+
+
+def _dirty_repo(root: Path) -> Path:
+    repo = root / "dirty-repo"
+    repo.mkdir()
+    for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                 ("config", "user.name", "t")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    (repo / "a.txt").write_text("staged\n")
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
+    (repo / "a.txt").write_text("unstaged\n")
+    return repo
+
+
+def test_inheriting_child_plain_git_diff_produces_patch_without_running_hook(
+    tmp_path, sandbox, monkeypatch
+):
+    """#1994: GIT_EXTERNAL_DIFF="" made every child's plain `git diff` die.
+
+    After sandboxed startup, an unprotected child that inherits os.environ --
+    directly or through the runner's ``{**os.environ, **role_env}`` merge --
+    must get a real patch, and the inherited hook must never execute.
+    """
+    marker = tmp_path / "hook-ran"
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", f"touch {marker}")
+    repo = _dirty_repo(tmp_path)
+    config = sandboxed_config(tmp_path)
+    ap.establish_sandboxed_run(config, command="pr")
+    merged = {**os.environ, **ap.role_permission_env(config, "claude", "coder")}
+    for env in (None, merged):
+        result = subprocess.run(
+            ["git", "-C", str(repo), "diff"], env=env, text=True, capture_output=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert "external diff" not in result.stderr
+        assert "diff --git" in result.stdout
+        assert "+unstaged" in result.stdout
+    assert not marker.exists()
+
+
+def test_prepare_sandboxed_spawn_removes_external_diff_reset_after_startup(
+    tmp_path, sandbox
+):
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    ap.apply_neutralized_git_env(os.environ)
+    # Something re-sets the hook after startup; the spawn must still strip it.
+    os.environ["GIT_EXTERNAL_DIFF"] = "/bin/false"
+    os.environ["GIT_TRACE2_EVENT"] = str(tmp_path / "trace.json")
+    ap.prepare_sandboxed_spawn(config, "claude", "coder")
+    assert "GIT_EXTERNAL_DIFF" not in os.environ
+    assert os.environ["GIT_TRACE2_EVENT"] == "0"
+
+
+def test_apply_neutralized_git_env_is_idempotent_on_plain_mapping():
+    env = {"GIT_EXTERNAL_DIFF": "hook", "GIT_TRACE": "1", "KEEP": "x"}
+    ap.apply_neutralized_git_env(env)
+    first = dict(env)
+    assert "GIT_EXTERNAL_DIFF" not in first
+    assert first["GIT_TRACE"] == "0" and first["KEEP"] == "x"
+    ap.apply_neutralized_git_env(env)
+    assert env == first
+    empty: dict[str, str] = {}
+    ap.apply_neutralized_git_env(empty)
+    assert "GIT_EXTERNAL_DIFF" not in empty
+    assert empty == ap.neutralized_git_env()
+    assert "GIT_EXTERNAL_DIFF" not in ap.neutralized_git_env()
 
 
 def test_default_mode_leaves_the_process_environment_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_TRACE2_EVENT", "/tmp/keep-me.json")
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/keep-hook")
     config = sandboxed_config(tmp_path, agent_permissions="default")
     ap.establish_sandboxed_run(config, command="pr")
     assert os.environ["GIT_TRACE2_EVENT"] == "/tmp/keep-me.json"
+    assert os.environ["GIT_EXTERNAL_DIFF"] == "/tmp/keep-hook"
+    assert ap.role_permission_env(config, "claude", "coder") == {}
 
 
 # ------------------------------------------- orchestrator's own git probes

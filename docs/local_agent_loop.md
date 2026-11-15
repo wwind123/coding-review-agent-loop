@@ -8664,6 +8664,10 @@ its role (implemented in `agent_permissions.py`):
   mode. Inherited `GIT_TRACE*`, `GIT_CONFIG_COUNT`, `GIT_EXTERNAL_DIFF`,
   alternate repository variables, and executable lookup paths do not reach
   those commands. The caller's environment is unchanged.
+  In sandboxed mode, agent-loop also overrides inherited `GIT_TRACE*` and
+  `GIT_CONFIG_COUNT` to `0` in its own process and its agent children, and
+  removes `GIT_EXTERNAL_DIFF` there, so an inherited external-diff hook never
+  runs while plain `git diff` still produces patches.
   Host prerequisites: on Linux, a root-owned Git (`/usr/bin/git`, `/bin/git`
   or `/usr/local/bin/git`), a root-owned C compiler (`/usr/bin/cc` or
   `/usr/bin/clang`), the Linux UAPI headers (`linux-libc-dev` or
