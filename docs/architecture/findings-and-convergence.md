@@ -599,6 +599,9 @@ requester's own requests and native items, and leftover wording never conflicts.
 An agreed mixed source carries the verbatim signed source plus every reviewer's
 `leftover_instructions`, each attributed to its reviewer and ordered by reviewer
 name, so live projection and `historical_projection` replay produce identical bodies.
+The merged leftover is ordinary code work: the coder may receive it while the
+answers are still unaccepted, and the requester obligations remain the deferred
+finalization barrier (#1068), stopping at the evidence freeze before merge.
 Every validated review contributes, including a blocking review with code work.
 Unacknowledged signed sources receive one real semantic classification continuation,
 including standalone sources with no evidence ledger or emitted request, never

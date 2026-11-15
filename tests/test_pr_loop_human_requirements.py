@@ -1252,7 +1252,7 @@ def test_mixed_wording_difference_needs_no_classification_continuation(tmp_path,
     The merged code leftover reaches the coder while the unaccepted answers stay
     a deferred evidence barrier: classification never grants acceptance.
     """
-    from pr_loop_test_helpers import _classified_review, _association, _signed, _resolve, _release_records
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _release_records, _freeze_records
     from agent_loop_helpers import structured_coder_followup
     from test_pr_loop_early_evidence import deferred
 
@@ -1276,10 +1276,17 @@ def test_mixed_wording_difference_needs_no_classification_continuation(tmp_path,
     runner.codex_outputs.append(_classified_review([codex_entry], hr=True, dispositions=pending, state="blocking"))
     runner.gemini_outputs.append(_classified_review([gemini_entry], reviewer="Google Gemini", hr=True,
         dispositions=pending, state="blocking"))
-    try:
+    # The deferred evidence barrier (#1068) stops finalization: the run ends at the
+    # human-evidence freeze, not at a classification conflict and not at merge.
+    with pytest.raises(HumanDecisionRequiredError) as stop:
         run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=4))
-    except HumanDecisionRequiredError as exc:
-        assert "classification remained" not in str(exc)
+    assert "classification remained" not in str(stop.value)
+    freezes = _freeze_records(runner)
+    assert freezes
+    pending_items = freezes[-1].metadata.prior_items
+    assert {(i.item_id, i.reviewer) for i in pending_items} == {("item-1", "Codex"), ("item-2", "Gemini")}
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "ready"] for cmd, _ in runner.commands)
     assert not runner.gemini_outputs and not runner.codex_outputs
     assert not any(_CLASSIFICATION_CONTINUATION in cmd[-1] for cmd, _ in runner.commands)
     prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
