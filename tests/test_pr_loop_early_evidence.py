@@ -425,7 +425,7 @@ def test_classified_partial_answer_preserves_other_owner(tmp_path, valid):
     assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
 
 
-def test_classified_mixed_answer_keeps_original_id_and_only_leftover_code(tmp_path):
+def test_classified_mixed_answer_keeps_original_id_with_source_and_attributed_leftover(tmp_path):
     from pr_loop_test_helpers import _classified_review, _association
     from agent_loop_helpers import structured_coder_followup
     runner, config = deferred(tmp_path)
@@ -443,9 +443,10 @@ def test_classified_mixed_answer_keeps_original_id_and_only_leftover_code(tmp_pa
     prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
     assert len(prompts) == 1
     assert f"Requirement {rid}:" in prompts[0]
-    assert "Fix the retry bound." in prompts[0]
-    # The requirement block's body contains only the explicit leftover instruction.
-    assert "Accepted for" not in prompts[0].split(f"Requirement {rid}:", 1)[1].split("Agent memory context:")[0]
+    # The requirement block carries the verbatim signed source plus the attributed leftover.
+    block = prompts[0].split(f"Requirement {rid}:", 1)[1]
+    assert "Accepted for " + HEAD + ". Also fix the retry bound." in block
+    assert "- Codex: Fix the retry bound." in block
 
 
 @pytest.mark.parametrize("fault", ["foreign-owner", "cross-round-conflict"])

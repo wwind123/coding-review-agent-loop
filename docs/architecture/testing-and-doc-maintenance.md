@@ -253,7 +253,7 @@ Repair compares copies under this same role-aware normalization only when both c
 parse, retaining raw equality otherwise. Collection shape, order and all other
 content stay protected. A real bounded reviewer continuation owns missing
 classification. Mixed-source prompt and disposition validation use the original
-signed ID with explicit leftover scope. Classification is separate from native
+signed ID with the verbatim source and attributed leftover scope; agreement is by role (#2000). Classification is separate from native
 evidence authorization and does not waive live citation validation. Report-side
 command parsing recognizes the exported executable spelling while continuing to
 validate inner test targets against the assigned checkout.

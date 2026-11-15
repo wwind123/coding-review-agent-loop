@@ -5,6 +5,8 @@ import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
+import dataclasses
+from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from pathlib import Path
 
 import pytest
@@ -1208,7 +1210,7 @@ def test_legacy_ack_gate_clears_after_real_evidence_classification(tmp_path, rol
 
 
 @pytest.mark.parametrize("mode", ["compact", "full"])
-@pytest.mark.parametrize("fault", ["absent", "role", "leftover"])
+@pytest.mark.parametrize("fault", ["absent", "role"])
 def test_unsettled_signed_routing_stops_before_coder(tmp_path, capsys, mode, fault):
     from pr_loop_test_helpers import (_classified_review, _association, _evidence_review,
         _signed, _EVIDENCE_TEXT, _pr_records)
@@ -1225,19 +1227,8 @@ def test_unsettled_signed_routing_stops_before_coder(tmp_path, capsys, mode, fau
         # disagrees, then leave that disagreement intact in its real continuation.
         first = _association(rid, "human-only", request=_EVIDENCE_TEXT)
         second = _association(rid, "code")
-        if fault == "leftover":
-            from test_pr_loop_early_evidence import deferred
-            runner, _ = deferred(tmp_path, mode=mode, two_owners=True)
-            runner.pr_payload["comments"].append(_signed("Accepted. Also fix retries.", 1))
-            rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
-            first = _association(rid, "mixed", answers=["item-1"], leftover="Fix retries.")
-            second = _association(rid, "mixed", answers=["item-2"], leftover="Repair retries.")
-        dispositions = [{"item_id": f"item-{i}", "disposition": "blocking", "note": "Human acceptance remains pending."}
-            for i in (1, 2)] if fault == "leftover" else []
-        runner.codex_outputs = [_classified_review([first], evidence=[_EVIDENCE_TEXT],
-            dispositions=dispositions, state="blocking" if dispositions else "approved")]
-        disagreeing = _classified_review([second], reviewer="Google Gemini",
-            dispositions=dispositions, state="blocking" if dispositions else "approved")
+        runner.codex_outputs = [_classified_review([first], evidence=[_EVIDENCE_TEXT], state="approved")]
+        disagreeing = _classified_review([second], reviewer="Google Gemini", state="approved")
         runner.gemini_outputs = [disagreeing, disagreeing]
         reviewers = ("codex", "gemini")
     config = make_config(tmp_path, pr_review_context_mode=mode, reviewer=reviewers, review_parallel=False)
@@ -1249,3 +1240,98 @@ def test_unsettled_signed_routing_stops_before_coder(tmp_path, capsys, mode, fau
     assert _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id == rid
     if fault != "absent":
         assert any(r.metadata.evidence_requests for r in _pr_records(runner))
+
+
+_CLASSIFICATION_CONTINUATION = "Continue the PR review with semantic signed-source classification"
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_mixed_wording_difference_needs_no_classification_continuation(tmp_path, mode):
+    """Agreeing mixed roles with different leftover wording are not a conflict (#2000).
+
+    The merged code leftover reaches the coder while the unaccepted answers stay
+    a deferred evidence barrier: classification never grants acceptance.
+    """
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _release_records, _freeze_records
+    from agent_loop_helpers import structured_coder_followup
+    from test_pr_loop_early_evidence import deferred
+
+    runner, config = deferred(tmp_path, mode=mode, two_owners=True)
+    runner.advance_pr_head_on_coder_followup = False
+    signed_text = "Accepted. Also fix retries."
+    runner.pr_payload["comments"].append(_signed(signed_text, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    pending = [{"item_id": f"item-{i}", "disposition": "blocking", "note": "Human acceptance remains pending."}
+        for i in (1, 2)]
+    codex_entry = _association(rid, "mixed", answers=["item-1"], leftover="Fix retries.")
+    gemini_entry = _association(rid, "mixed", answers=["item-2"], leftover="Repair retries.")
+    runner.codex_outputs = [_classified_review([codex_entry], dispositions=pending, state="blocking")]
+    # Exactly one Gemini output for this round: any classification continuation
+    # would consume the follow-up review below and exhaust the fake runner.
+    runner.gemini_outputs = [_classified_review([gemini_entry], reviewer="Google Gemini",
+        dispositions=pending, state="blocking")]
+    runner.claude_outputs = [structured_coder_followup(human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "Retries fixed; human answer is supplied separately."}])]
+    runner.codex_outputs.append(_classified_review([codex_entry], hr=True, dispositions=pending, state="blocking"))
+    runner.gemini_outputs.append(_classified_review([gemini_entry], reviewer="Google Gemini", hr=True,
+        dispositions=pending, state="blocking"))
+    # The deferred evidence barrier (#1068) stops finalization: the run ends at the
+    # human-evidence freeze, not at a classification conflict and not at merge.
+    with pytest.raises(HumanDecisionRequiredError) as stop:
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=4))
+    assert "classification remained" not in str(stop.value)
+    freezes = _freeze_records(runner)
+    assert freezes
+    pending_items = freezes[-1].metadata.prior_items
+    assert {(i.item_id, i.reviewer) for i in pending_items} == {("item-1", "Codex"), ("item-2", "Gemini")}
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "ready"] for cmd, _ in runner.commands)
+    assert not runner.gemini_outputs and not runner.codex_outputs
+    assert not any(_CLASSIFICATION_CONTINUATION in cmd[-1] for cmd, _ in runner.commands)
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    assert len(prompts) == 1
+    block = prompts[0].split(f"Requirement {rid}:", 1)[1]
+    assert signed_text in block
+    assert block.index("- Codex: Fix retries.") < block.index("- Gemini: Repair retries.")
+    # The unaccepted answers are never cleared by classification.
+    assert not any(r.metadata.evidence_release.reason == "evidence-cleared" for r in _release_records(runner))
+    assert _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id == rid
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_mixed_wording_difference_dispatches_merged_requirement(tmp_path, mode):
+    """Cleared evidence dispatches one attributed merged requirement under the original id (#2000)."""
+    from pr_loop_test_helpers import _classified_review, _association, _resolve
+    from agent_loop_helpers import structured_coder_followup
+    from test_pr_loop_early_evidence import deferred, acceptance, HEAD
+
+    runner, config = deferred(tmp_path, mode=mode, two_owners=True)
+    runner.advance_pr_head_on_coder_followup = False
+    signed_text = "Accepted for " + HEAD + ". Also fix retries."
+    rid = acceptance(runner, signed_text, two_owners=True)
+    resolved = [{**_resolve(), "evidence_requirement_ids": [rid]},
+                {**_resolve("item-2"), "evidence_requirement_ids": [rid]}]
+    codex_entry = _association(rid, "mixed", answers=["item-1"], leftover="Fix retries.")
+    gemini_entry = _association(rid, "mixed", answers=["item-2"], leftover="Repair retries.")
+    runner.codex_outputs[-1] = _classified_review([codex_entry], state="blocking", blocking=["Fix retries."],
+        dispositions=resolved)
+    runner.gemini_outputs[-1] = _classified_review([gemini_entry], reviewer="Google Gemini", state="blocking",
+        blocking=["Repair retries."], dispositions=resolved)
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-3", "item-4"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "Retries fixed; human answer is supplied separately."}])]
+    runner.codex_outputs.append(_classified_review([codex_entry], hr=True,
+        dispositions=[*resolved, _resolve("item-3"), _resolve("item-4")]))
+    runner.gemini_outputs.append(_classified_review([gemini_entry], reviewer="Google Gemini", hr=True,
+        dispositions=[*resolved, _resolve("item-3"), _resolve("item-4")]))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    assert len(prompts) == 1
+    assert not any(_CLASSIFICATION_CONTINUATION in cmd[-1] for cmd, _ in runner.commands)
+    assert f"Requirement {rid}:" in prompts[0]
+    block = prompts[0].split(f"Requirement {rid}:", 1)[1]
+    assert signed_text in block
+    codex_line = block.index("- Codex: Fix retries.")
+    gemini_line = block.index("- Gemini: Repair retries.")
+    assert codex_line < gemini_line

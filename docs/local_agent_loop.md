@@ -962,9 +962,13 @@ cannot by itself dispatch a coder. Ordinary code requirements still do.
 
 For a signed answer, the requester records `evidence-only` or `mixed`, with its
 answered prior item IDs. Evidence-only sources create no coder acknowledgement
-obligation. A mixed source keeps its original signed ID, but the coder receives
-only the reviewer's explicit `leftover_instructions`; accepting human evidence
-is never coder work. Classification alone cannot clear evidence. The requester
+obligation. A mixed source keeps its original signed ID. The coder receives the verbatim
+signed source plus every reviewer's `leftover_instructions`, each attributed to
+its reviewer; accepting human evidence is never coder work. Reviewers agree on a
+source by role, so different leftover wording is not a conflict. If reviewers
+still disagree on the role after one continuation, the run stops, names each
+reviewer's role, and asks for a follow-up signed comment that separates
+exact-head evidence answers from code requirements. Classification alone cannot clear evidence. The requester
 must also attest adequacy through live signed citations and exact-head binding,
 before or after a freeze. Missing classification triggers one real reviewer
 continuation when evidence is involved; absent or conflicting classification
