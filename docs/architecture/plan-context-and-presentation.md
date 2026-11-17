@@ -227,7 +227,8 @@ inventory (`approved_plan_handoff_reason`) over every surface recovery could act
 on: the issue's own handoff, one-shot, decomposition, phase, split-stage and
 split-materialization records; a legacy closing-reference PR found with
 recovery's own resolver (`find_open_pr_closing_issue` with the approved-plan
-provenance scope); and realized child issues whose phase identity names the
+provenance scope, in its strict mode so an unreadable or malformed PR listing
+raises); and realized child issues whose phase identity names the
 plan, found by the discovery shared with topology creation
 (`decomposition.discover_parent_child_issues` in its strict mode, where an
 unreadable, malformed or possibly truncated listing raises). The inventory

@@ -124,16 +124,28 @@ def _child_issue(plan_hash: str, *, number: int = 90, parent: int = 56) -> dict[
     }
 
 
-class _SearchFaultRunner(_M1390Runner):
-    """Serves an unreadable child-search listing (#2010 item-3)."""
+_LISTING_FAULTS = ("failure", "invalid-json", "empty", "not-a-list", "malformed-entry")
 
-    def __init__(self, *, search_fault, **kwargs):
+
+class _SearchFaultRunner(_M1390Runner):
+    """Serves one unreadable inventory listing (#2010 items 3 and 4).
+
+    ``listing`` selects the child-issue search or the open-PR listing; the
+    other listing stays readable.
+    """
+
+    def __init__(self, *, search_fault, listing="child-search", **kwargs):
         super().__init__(**kwargs)
         self.search_fault = search_fault
+        self.listing = listing
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
         command = [str(arg) for arg in args]
-        if command[:3] == ["gh", "issue", "list"] and "--search" in command:
+        child_search = command[:3] == ["gh", "issue", "list"] and "--search" in command
+        pr_list = command[:3] == ["gh", "pr", "list"]
+        if (child_search and self.listing == "child-search") or (
+            pr_list and self.listing == "pr-list"
+        ):
             from coding_review_agent_loop.runner import CommandResult
 
             recorded, cwd_path = self._record_command(args, cwd)
@@ -163,7 +175,7 @@ def _writes(runner):
 
 def _rerun(
     tmp_path, history, *, recovery=None, config_overrides=None, search_fault=None,
-    **runner_kwargs,
+    listing="child-search", **runner_kwargs,
 ):
     """Rerun issue #56 with ``--reopen-approved-plan``; spy on recovery and logs."""
     values = {"max_rounds": 5, "reopen_approved_plan": True}
@@ -172,7 +184,7 @@ def _rerun(
         runner = _m1390_runner(history, **runner_kwargs)
     else:
         runner = _SearchFaultRunner(
-            search_fault=search_fault, issue_comments=list(history),
+            search_fault=search_fault, listing=listing, issue_comments=list(history),
             authenticated_actor=_M1390_ACTOR, serve_rest_issue_comments=True, **runner_kwargs,
         )
     calls: list[dict[str, object]] = []
@@ -416,26 +428,45 @@ def test_handoff_inventory_fails_closed_on_pr_lookup_errors(tmp_path, monkeypatc
     assert "cannot be resolved" in reason
 
 
-@pytest.mark.parametrize(
-    "fault", ["failure", "invalid-json", "empty", "not-a-list", "malformed-entry"],
-)
-def test_reopen_refuses_and_posts_nothing_when_child_search_is_unreadable(tmp_path, fault):
-    """`child-discovery-failure` (item-3): every unreadable child listing refuses before posting.
+@pytest.mark.parametrize("listing", ["child-search", "pr-list"])
+@pytest.mark.parametrize("fault", _LISTING_FAULTS)
+def test_reopen_refuses_and_posts_nothing_when_an_inventory_listing_is_unreadable(
+    tmp_path, listing, fault,
+):
+    """`child-discovery-failure`, `refuse-legacy-pr` (items 3 and 4).
 
-    The real `gh issue list` decoder path runs: a failed command, output that
-    is not JSON, empty output, a non-list or a malformed entry is never read
-    as "no children".
+    Every live listing of the hand-off inventory, the child-issue search and
+    the open-PR listing behind the legacy closing-reference lookup, runs its
+    real `gh ... list` decoder: a failed command, output that is not JSON,
+    empty output, a non-list or a malformed entry refuses before posting and
+    is never read as "nothing handed off".
     """
     history, plan_hash = _approved_history(tmp_path)
     runner, result, calls, _messages = _rerun(
-        tmp_path, history, recovery="forbidden", search_fault=fault,
+        tmp_path, history, recovery="forbidden", search_fault=fault, listing=listing,
     )
     assert isinstance(result, AgentLoopError)
     message = str(result)
-    assert f"cannot verify that plan {plan_hash} was not handed off" in message
+    assert f"--reopen-approved-plan refused: plan {plan_hash}" in message
     assert "nothing was posted" in message
+    if listing == "child-search":
+        assert f"cannot verify that plan {plan_hash} was not handed off" in message
+    else:
+        assert "an open PR association for this issue cannot be resolved" in message
     assert calls == [] and runner.issue_comments == history and _writes(runner) == []
     assert _m1103_agent_calls(runner) == []
+
+
+@pytest.mark.parametrize("fault", ["invalid-json", "empty", "not-a-list", "malformed-entry"])
+def test_strict_pr_lookup_raises_where_lenient_lookup_reads_none(tmp_path, fault):
+    """`refuse-legacy-pr` (item-4): only the reopen inventory uses the strict PR lookup."""
+    config = make_config(tmp_path)
+    runner = _SearchFaultRunner(
+        search_fault=fault, listing="pr-list", authenticated_actor=_M1390_ACTOR,
+    )
+    assert github.find_open_pr_closing_issue(runner, config=config, issue_number=56) is None
+    with pytest.raises(AgentLoopError, match="open pull request listing is"):
+        github.find_open_pr_closing_issue(runner, config=config, issue_number=56, strict=True)
 
 
 def test_strict_child_discovery_raises_where_lenient_discovery_reads_empty(tmp_path):

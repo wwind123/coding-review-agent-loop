@@ -150,7 +150,9 @@ def approved_plan_handoff_reason(
     (a) the issue's own hand-off records (:func:`comment_handoff_reason`);
     (b) a legacy, metadata-free open PR strongly closing the issue, through
         ``find_open_pr_closing_issue`` with the approved-plan provenance scope
-        recovery would use for this plan.  A match refuses, and so does a
+        recovery would use for this plan, in its strict mode so an empty,
+        non-JSON, non-list, malformed or possibly truncated listing refuses.
+        A match refuses, and so does a
         raised ambiguity or provenance mismatch: after a reopen recovery would
         call the same resolver without a scope and raise on that candidate;
     (c) realized child issues in the create-before-summary window, found by
@@ -191,6 +193,7 @@ def approved_plan_handoff_reason(
                 repository=repo, issue_number=issue_number, flow="approved",
                 approved_plan_hash=plan_hash,
             ),
+            strict=True,
         )
     except _INVENTORY_ERRORS as exc:
         return f"an open PR association for this issue cannot be resolved: {exc}"
