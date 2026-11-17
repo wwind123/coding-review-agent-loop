@@ -5605,3 +5605,102 @@ def test_parent_direct_resume_keeps_managed_child_authority(tmp_path, monkeypatc
     assert_no_agent_process(runner)
     assert runner.issues == []
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in body for body in runner.comments)
+
+
+# --- #2009: staging_feasibility alias in a patch, actionable replan feedback ---
+
+from coding_review_agent_loop.errors import SemanticPatchUnknownPriorItemDispositionError  # noqa: E402
+
+
+def test_m2009_patch_with_separable_validates_as_safe_without_replan_routing(caplog):
+    """#2009: an audited alias in a patch value is normalized, never a payload rejection."""
+    fresh = _m976_full_plan_state()
+    carried = (_m979_carried_item(),)
+    accepted = _m1333_patch(fresh, recommendation_extra={"staging_feasibility": "Separable"})
+
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        parsed = response_validation._validate_plan_revision_patch_response(
+            accepted, unresolved_items=carried
+        )
+    value = parsed.operations[-1].value
+    assert value.staging_feasibility == "safe"
+    assert value.to_payload()["staging_feasibility"] == "safe"
+    assert [
+        r.getMessage() for r in caplog.records
+        if "normalized staging_feasibility" in r.getMessage()
+    ] == [
+        f"plan_revision_patch.operations[{len(parsed.operations) - 1}].value: "
+        "normalized staging_feasibility `Separable` to `safe` before validation"
+    ]
+    # The candidate text is untouched, so repair preservation's byte pinning
+    # still sees exactly what the planner wrote.
+    assert '"staging_feasibility": "Separable"' in accepted
+
+
+def test_m2009_unknown_staging_feasibility_replan_feedback_lists_allowed_values(tmp_path, monkeypatch):
+    """#2009: `maybe` stays fatal and the correction record names the fix."""
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    recommendation = json.loads(fresh.split("\n", 1)[0])["execution_recommendation"]
+    recommendation["staging_feasibility"] = "maybe"
+    rejected = _m979_patch_with(fresh, summary=WEAK_SUMMARY, extra_operations=[
+        {"op": "replace", "field": "execution_recommendation", "value": recommendation},
+    ])
+    corrected = _m976_patch(fresh, summary="Corrected revision.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, rejected, corrected],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert issue_loop.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" not in planner_prompts[1]
+    replan = planner_prompts[2]
+    assert "Trusted orchestration correction record" in replan
+    assert "staging_feasibility must be exactly `safe` (the work can be staged" in replan
+    assert "`inseparable` (it cannot be staged)" in replan
+    assert "got `maybe`" in replan
+    assert WEAK_SUMMARY not in _published(runner)
+    assert "Corrected revision." in _published(runner)
+
+
+def test_m2009_same_round_ids_dispositioned_as_carried_name_the_fix():
+    """#2009: the ledger rejection lists unknown IDs, the carried ID and the rule."""
+    fresh = _m976_full_plan_state()
+    carried = (dataclasses.replace(_m979_carried_item(), item_id="item-8"),)
+    patch = json.loads(_m976_patch(fresh, summary="Patch.").split("\n<!--", 1)[0])
+    patch["prior_plan_item_dispositions"] = [
+        {"item_id": f"item-{index}", "disposition": "resolved", "note": "Handled."}
+        for index in range(1, 9)
+    ]
+    rejected = json.dumps(patch) + PLAN_FOOTER
+    with pytest.raises(SemanticPatchUnknownPriorItemDispositionError) as error:
+        response_validation._validate_plan_revision_patch_response(
+            rejected, unresolved_items=carried
+        )
+    # The strip path still reads the structured attributes unchanged.
+    assert error.value.unknown_ids == tuple(f"item-{index}" for index in range(1, 8))
+    assert error.value.allowed_ids == ("item-8",)
+    message = str(error.value)
+    assert "Same-round findings are informational only and take no disposition" in message
+    assert "Remove ID(s) item-1, item-2, item-3, item-4, item-5, item-6, item-7" in message
+    assert "Only these carried prior IDs may take a disposition: item-8." in message
+    rejection = validated_agent._semantic_patch_payload_rejection(
+        error.value,
+        text=rejected,
+        normalized=None,
+        payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
+            payload, unresolved_items=carried
+        ),
+    )
+    assert rejection is not None
+    assert "Only these carried prior IDs may take a disposition: item-8." in rejection[1]

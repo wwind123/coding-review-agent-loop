@@ -14,6 +14,7 @@ from .errors import (
     IssueImplementationConflictError,
     MissingPriorItemDispositionError,
     UnknownPriorItemDispositionError,
+    prior_item_disposition_guidance,
 )
 from .github import PullRequestMergeability
 from .prompt_support import (
@@ -794,11 +795,12 @@ def _raise_if_maintained_disputed_items(
 def _same_round_prior_disposition_description(
     unknown: Sequence[str],
     current_round_items: Sequence[UnresolvedReviewItem],
+    allowed_ids: Sequence[str] = (),
+    field: str = "prior_plan_item_dispositions",
 ) -> str:
     same_round_ids = {item.item_id for item in current_round_items}
-    same_round_description = (
-        "Same-round findings are informational only and must not be dispositioned "
-        "as prior carried items."
+    same_round_description = prior_item_disposition_guidance(
+        tuple(unknown), tuple(allowed_ids), field
     )
     same_round_matches = [item_id for item_id in unknown if item_id in same_round_ids]
     if same_round_matches:
@@ -815,6 +817,7 @@ def _raise_unknown_prior_item_disposition(
     *,
     allowed_ids: Sequence[str],
     current_round_items: Sequence[UnresolvedReviewItem],
+    field: str = "prior_plan_item_dispositions",
 ) -> None:
     raise UnknownPriorItemDispositionError(
         unknown_ids=tuple(sorted(unknown)),
@@ -822,6 +825,8 @@ def _raise_unknown_prior_item_disposition(
         same_round_description=_same_round_prior_disposition_description(
             tuple(sorted(unknown)),
             current_round_items,
+            tuple(sorted(allowed_ids)),
+            field,
         ),
     )
 
@@ -902,6 +907,7 @@ def _validate_review_response(
             unknown,
             allowed_ids=tuple(unresolved_by_id),
             current_round_items=current_round_items,
+            field="prior_item_dispositions",
         )
     if unresolved_items:
         covered = {aliases[i].item_id if i in aliases else i for i in disposition_ids}

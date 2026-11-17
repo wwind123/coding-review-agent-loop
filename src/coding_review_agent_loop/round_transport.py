@@ -10,6 +10,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 
 from .errors import AgentLoopError
+from .protocol_common import normalize_staging_feasibility
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 
 MAX_GITHUB_BODY_CHARS = 60_000
@@ -418,10 +419,13 @@ def _prepare_execution_recommendation_transport(
     ]
     if parsed.get("strategy") in {"one-shot", "staged"}:
         compact_lines.append(f"- `strategy`: `{parsed['strategy']}`")
-    if parsed.get("staging_feasibility") in {"safe", "inseparable"}:
-        compact_lines.append(
-            f"- `staging_feasibility`: `{parsed['staging_feasibility']}`"
-        )
+    # #2009: render an accepted alias (for example `separable`) as the
+    # canonical token the parser stored, never drop it.
+    feasibility, feasibility_matched = normalize_staging_feasibility(
+        parsed.get("staging_feasibility")
+    )
+    if feasibility_matched:
+        compact_lines.append(f"- `staging_feasibility`: `{feasibility}`")
     compact_lines.extend(
         [
             "The complete validated execution recommendation is retained in the "

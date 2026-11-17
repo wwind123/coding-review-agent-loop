@@ -3266,3 +3266,36 @@ def test_ack_transport_alone_cannot_establish_origin(phase):
                                           phase=phase))
     assert records[0].metadata.prior_items[0].item_id == "item-13"
     assert records[0].metadata.prior_items[0].obligation_kind == "unknown"
+
+
+def test_2009_compact_anchor_renders_normalized_staging_feasibility_alias() -> None:
+    """#2009: a raw accepted alias renders as its canonical token, never dropped."""
+    from agent_loop_helpers import structured_v1_plan_state
+
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["execution_recommendation"]["rationale"] = _random_text(50_000)
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    rendered = comment_rendering.render_execution_recommendation_section(
+        parsed.execution_recommendation
+    )
+    marker = list(comment_rendering.EXECUTION_RECOMMENDATION_MARKER_RE.finditer(rendered))[-1]
+    old_payload = marker.group("payload")
+    raw = json.loads(base64.urlsafe_b64decode(old_payload + "=" * (-len(old_payload) % 4)))
+    raw["staging_feasibility"] = "separable"
+    new_payload = base64.urlsafe_b64encode(
+        json.dumps(raw, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    old_digest = hashlib.sha256(old_payload.encode("ascii")).hexdigest()
+    new_digest = hashlib.sha256(new_payload.encode("ascii")).hexdigest()
+    assert old_digest in rendered
+    rendered = rendered.replace(old_payload, new_payload).replace(old_digest, new_digest)
+
+    prepared = transport.prepare_round_comment(rendered)
+    anchor = str(prepared[-1])
+
+    assert "complete validated execution recommendation" in anchor
+    assert "`staging_feasibility`: `safe`" in anchor
+    assert "separable" not in anchor

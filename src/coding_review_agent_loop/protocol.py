@@ -55,6 +55,7 @@ from .protocol_common import (
     _render_flat_object,
     _require_supported_schema_version,
     normalize_response_file_structured_text,
+    normalize_staging_feasibility,
     parse_human_requirements_acknowledgement,
 )
 
@@ -2369,6 +2370,19 @@ def _expect_execution_disposition(
     )
 
 
+def _enum_got_value(value: str) -> str:
+    """A single-line, capped, marker-free echo of a rejected enum value (#2009).
+
+    Pure string handling (no raising sanitizer), so the raise sites keep their
+    own fatal classification; the bounded diagnostic is sanitized again later.
+    """
+    neutral = "".join(
+        "'" if ch in "`<>" else (ch if ch.isprintable() else " ") for ch in value
+    )
+    flat = " ".join(neutral.split())
+    return flat if len(flat) <= 40 else flat[:39] + "\u2026"
+
+
 def _expect_execution_recommendation(
     value: object, *, context: str, require_child_dispositions: bool = False
 ) -> ExecutionStrategyRecommendation:
@@ -2391,14 +2405,31 @@ def _expect_execution_recommendation(
     _expect_exact_keys(payload, context=context, required=required, optional={"one_shot_delivery"})  # shape-check: fatal:no-conservative-reading
     strategy = _expect_non_empty_string(payload["strategy"], context=f"{context}.strategy")  # shape-check: fatal:no-conservative-reading
     if strategy not in {"one-shot", "staged"}:
-        raise AgentLoopError(f"{context}.strategy must be `one-shot` or `staged`.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            f"{context}.strategy must be exactly `one-shot` (one implementation PR) or "
+            f"`staged` (independent child stages); got `{_enum_got_value(strategy)}`."
+        )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")  # shape-check: fatal:no-conservative-reading
-    feasibility = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
+    raw_feasibility = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
         payload["staging_feasibility"], context=f"{context}.staging_feasibility"
     )
-    if feasibility not in {"safe", "inseparable"}:
+    # #2009: map case/spacing variants and the audited "can be staged" aliases
+    # to the canonical token.  Like the tool-owned key drop above, this stays
+    # inside the parser, so the response text repair preservation pins is
+    # untouched; anything outside the audited set remains fatal.
+    canonical_feasibility, feasibility_matched = normalize_staging_feasibility(raw_feasibility)
+    if not feasibility_matched:
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            f"{context}.staging_feasibility must be `safe` or `inseparable`."
+            f"{context}.staging_feasibility must be exactly `safe` (the work can be "
+            "staged into independent child stages) or `inseparable` (it cannot be "
+            f"staged); got `{_enum_got_value(raw_feasibility)}`. A staged "
+            "recommendation requires `safe`."
+        )
+    feasibility = str(canonical_feasibility)
+    if feasibility != raw_feasibility:
+        _logger.warning(
+            "%s: normalized staging_feasibility `%s` to `%s` before validation",
+            context, _enum_got_value(raw_feasibility), feasibility,
         )
 
     scope_payload = payload["scope_items"]

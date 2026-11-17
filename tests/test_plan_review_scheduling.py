@@ -1593,3 +1593,28 @@ def test_post_panel_structural_patch_selects_the_full_board_and_latches():
     assert decision.latches_force_full
     assert "child_stages[stage-1]" in decision.reason
     assert "child_stages[stage-9]" in decision.reason
+
+
+@pytest.mark.parametrize("alias", ["separable", " Stageable ", "safe_to_stage", "SAFE"])
+def test_2009_staging_feasibility_alias_is_the_same_contract_as_safe(alias):
+    """#2009: an accepted alias never looks like an executable contract change."""
+    with_alias = _edited(lambda v: v.__setitem__("staging_feasibility", alias))
+    canonical = _edited(lambda v: v.__setitem__("staging_feasibility", "safe"))
+    assert execution_recommendation_contract_projection(with_alias)["staging_feasibility"] == "safe"
+    assert execution_recommendation_contract_identity(
+        with_alias
+    ) == execution_recommendation_contract_identity(canonical)
+    assert execution_recommendation_changed_components(
+        execution_recommendation_contract_projection(with_alias),
+        execution_recommendation_contract_projection(canonical),
+    ) == ()
+    # The caller's raw mapping is not mutated.
+    assert with_alias["staging_feasibility"] == alias
+
+
+def test_2009_unknown_staging_feasibility_still_changes_the_contract():
+    unknown = _edited(lambda v: v.__setitem__("staging_feasibility", "maybe"))
+    canonical = _edited(lambda v: v.__setitem__("staging_feasibility", "safe"))
+    assert execution_recommendation_contract_identity(
+        unknown
+    ) != execution_recommendation_contract_identity(canonical)

@@ -852,3 +852,27 @@ def test_assembled_record_after_tool_owned_key_patch_carries_tool_source_1333() 
     section = render_execution_recommendation_section(assembled.execution_recommendation)
     assert f"- `topology_source`: `{EXECUTION_TOPOLOGY_SOURCE}`" in section
     assert "`model`" not in section
+
+
+def test_2009_patch_with_separable_assembles_canonical_safe_payload(caplog) -> None:
+    """#2009: an alias in a patch value assembles to the canonical `safe` token."""
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.comment_rendering import render_execution_recommendation_section
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    plan_text = structured_v1_plan_state()
+    state = AuthenticatedPlanState.from_plan(validate_structured_plan_state(plan_text), round_number=1)
+    recommendation = json.loads(plan_text.partition("\n")[0])["execution_recommendation"]
+    recommendation["staging_feasibility"] = "separable"
+    patch = _patch(state, [{"op": "replace", "field": "execution_recommendation", "value": recommendation}])
+
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        assembled, _sidecar = assemble_authenticated_plan_revision(state, patch, result_round_number=2)
+
+    payload = structured_plan_revision_to_payload(assembled)
+    assert payload["execution_recommendation"]["staging_feasibility"] == "safe"
+    assert assembled.execution_recommendation.staging_feasibility == "safe"
+    assert "- `staging_feasibility`: `safe`" in render_execution_recommendation_section(
+        assembled.execution_recommendation
+    )
+    assert any("normalized staging_feasibility `separable` to `safe`" in r.getMessage() for r in caplog.records)

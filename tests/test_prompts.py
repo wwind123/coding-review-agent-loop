@@ -7324,3 +7324,37 @@ def test_signed_source_classification_guidance_covers_ordinary_work(tmp_path, co
     assert '`answered_item_ids`\nis a list (`[]` when inapplicable)' in prompt
     assert "optionally include `requirement_evidence`" not in prompt
     assert "when human-only\nevidence is involved" not in prompt
+
+
+# --- #2009: plan prompts state the exact staging_feasibility enum -----------
+
+_STAGING_ENUM_2009 = (
+    "`staging_feasibility` is exactly one of `safe` (the work can be staged) or "
+    "`inseparable` (it cannot be staged); no other value such as `separable` is "
+    "accepted. Staged recommendations require `safe`."
+)
+
+
+def test_2009_plan_prompts_state_the_staging_feasibility_enum_once(tmp_path):
+    from coding_review_agent_loop.prompts import STAGING_FEASIBILITY_ENUM_GUIDANCE
+
+    assert STAGING_FEASIBILITY_ENUM_GUIDANCE == _STAGING_ENUM_2009
+    config = make_config(tmp_path)
+    prompts = {
+        "plan_state": build_issue_plan_prompt(783, config),
+        "plan_revision": build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config),
+        "plan_revision_compact": build_plan_revision_prompt(
+            783, 2, "Previous plan", "Blocking review", config, compact_context=True
+        ),
+        "plan_review_compact": build_plan_review_prompt(
+            783, 1, "Plan.", config, reviewer="codex", compact_context=True
+        ),
+    }
+    for name, prompt in prompts.items():
+        flat = " ".join(prompt.split())
+        assert flat.count(_STAGING_ENUM_2009) == 1, name
+        assert "`staging_feasibility` may be `inseparable`" not in flat, name
+        assert "use safe feasibility" not in flat, name
+    # Planner prompts show the enum next to their JSON example.
+    for name in ("plan_state", "plan_revision", "plan_revision_compact"):
+        assert '"staging_feasibility": "inseparable"' in prompts[name], name
