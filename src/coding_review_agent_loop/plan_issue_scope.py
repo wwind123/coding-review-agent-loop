@@ -21,6 +21,13 @@ record is replaced by an empty-bodied copy rather than removed, so record and
 link comment indices stay comparable with the full-history lineage.  Without
 an admitted boundary the scope starts at round 1 and every projection is the
 identity, so a never-edited issue behaves exactly as before.
+
+An approved plan is never reopened implicitly.  The explicit per-invocation
+operator option ``--reopen-approved-plan`` (#2010) supersedes an approved plan
+that was not handed off: a single pre-recovery gate (``plan_reopen.py``)
+posts a schema-version-2 boundary whose ``reason`` is ``operator-reopen`` and
+which names the superseded plan hash.  Version 2 may carry equal digests,
+because an operator may reopen without editing the issue.
 """
 
 from __future__ import annotations
@@ -38,6 +45,10 @@ from .errors import AgentLoopError
 PLAN_SCOPE_BOUNDARY_MARKER = "AGENT_PLAN_SCOPE_BOUNDARY"
 PLAN_SCOPE_BOUNDARY_KIND = "plan-scope-boundary"
 PLAN_SCOPE_BOUNDARY_SCHEMA_VERSION = 1
+# Schema version 2 (#2010): an operator-requested supersession of an approved plan.
+PLAN_SCOPE_BOUNDARY_REOPEN_SCHEMA_VERSION = 2
+PLAN_SCOPE_BOUNDARY_REASON_OPERATOR_REOPEN = "operator-reopen"
+_BOUNDARY_REASONS = frozenset({PLAN_SCOPE_BOUNDARY_REASON_OPERATOR_REOPEN})
 PLAN_SCOPE_BOUNDARY_HEADING = "Planning scope restarted."
 PLAN_SCOPE_BOUNDARY_RE = re.compile(
     rf"<!--\s*{PLAN_SCOPE_BOUNDARY_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
@@ -58,6 +69,7 @@ _BOUNDARY_KEYS = frozenset(
         "scope_start_round",
     }
 )
+_BOUNDARY_V2_KEYS = _BOUNDARY_KEYS | frozenset({"reason", "superseded_plan_hash"})
 _HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -73,6 +85,10 @@ class PlanScopeBoundary:
     archived_round_number: int
     archived_plan_subject: str | None
     scope_start_round: int
+    # Schema version 2 only (#2010): why the scope restarted, and the
+    # approved plan an operator superseded.
+    reason: str | None = None
+    superseded_plan_hash: str | None = None
 
     def payload(self) -> dict[str, object]:
         return scope_boundary_payload(
@@ -81,6 +97,8 @@ class PlanScopeBoundary:
             current_issue_digest=self.current_issue_digest,
             archived_round_number=self.archived_round_number,
             archived_plan_subject=self.archived_plan_subject,
+            reason=self.reason,
+            superseded_plan_hash=self.superseded_plan_hash,
         )
 
 
@@ -107,16 +125,30 @@ class PlanScopeDecision:
     # plan, and a fresh scope would orphan it.
     handed_off: bool = False
     boundary: PlanScopeBoundary | None = None
+    # ``--reopen-approved-plan`` (#2010): the operator asked to supersede the
+    # approved plan.  ``reopen_refused_reason`` names the hand-off that
+    # forbids it; ``reason`` is the v2 boundary reason of a reset it opens.
+    reopen_requested: bool = False
+    reopen_refused_reason: str | None = None
+    superseded_plan_hash: str | None = None
+    reason: str | None = None
 
     def boundary_payload(self, issue_number: int) -> dict[str, object]:
-        assert self.reset_required and self.recorded_digest is not None
-        assert self.archived_round is not None
+        assert self.reset_required and self.archived_round is not None
+        if self.reason is None:
+            assert self.recorded_digest is not None
         return scope_boundary_payload(
             issue_number=issue_number,
-            previous_issue_digest=self.recorded_digest,
+            # A legacy plan without a recorded digest reopens with the
+            # current digest on both sides.
+            previous_issue_digest=(
+                self.recorded_digest if self.recorded_digest is not None else self.current_digest
+            ),
             current_issue_digest=self.current_digest,
             archived_round_number=self.archived_round,
             archived_plan_subject=self.archived_subject,
+            reason=self.reason,
+            superseded_plan_hash=self.superseded_plan_hash,
         )
 
 
@@ -147,10 +179,17 @@ def scope_boundary_payload(
     current_issue_digest: str,
     archived_round_number: int,
     archived_plan_subject: str | None,
+    reason: str | None = None,
+    superseded_plan_hash: str | None = None,
 ) -> dict[str, object]:
+    """One boundary payload: schema version 1 for an issue edit, 2 with a ``reason``."""
     payload: dict[str, object] = {
         "kind": PLAN_SCOPE_BOUNDARY_KIND,
-        "schema_version": PLAN_SCOPE_BOUNDARY_SCHEMA_VERSION,
+        "schema_version": (
+            PLAN_SCOPE_BOUNDARY_SCHEMA_VERSION
+            if reason is None and superseded_plan_hash is None
+            else PLAN_SCOPE_BOUNDARY_REOPEN_SCHEMA_VERSION
+        ),
         "issue_number": issue_number,
         "previous_issue_digest": previous_issue_digest,
         "current_issue_digest": current_issue_digest,
@@ -158,6 +197,9 @@ def scope_boundary_payload(
         "archived_plan_subject": archived_plan_subject,
         "scope_start_round": archived_round_number + 1,
     }
+    if payload["schema_version"] == PLAN_SCOPE_BOUNDARY_REOPEN_SCHEMA_VERSION:
+        payload["reason"] = reason
+        payload["superseded_plan_hash"] = superseded_plan_hash
     parse_scope_boundary(payload, comment_index=0)
     return payload
 
@@ -172,12 +214,23 @@ def render_scope_boundary(payload: dict[str, object]) -> object:
     from .protocol_markers import ISSUE_COMMENT_SURFACE, TrustedBody
 
     subject = payload["archived_plan_subject"]
+    if payload.get("reason") == PLAN_SCOPE_BOUNDARY_REASON_OPERATOR_REOPEN:
+        explanation = (
+            f"The approved plan `{payload['superseded_plan_hash']}` was superseded by "
+            "operator request (--reopen-approved-plan), so it no longer binds this issue "
+            "and its approval does not carry over. A fresh plan starts in a new planning "
+            "scope against the current issue title and body."
+        )
+    else:
+        explanation = (
+            "The issue title or body changed since plan round "
+            f"{payload['archived_round_number']}, so the earlier plan no longer binds this "
+            "issue. A fresh plan starts in a new planning scope."
+        )
     lines = [
         PLAN_SCOPE_BOUNDARY_HEADING,
         "",
-        "The issue title or body changed since plan round "
-        f"{payload['archived_round_number']}, so the earlier plan no longer binds this "
-        "issue. A fresh plan starts in a new planning scope.",
+        explanation,
         "",
         f"- Recorded issue digest: `{payload['previous_issue_digest']}`",
         f"- Current issue digest: `{payload['current_issue_digest']}`",
@@ -207,13 +260,17 @@ def parse_scope_boundary(
     payload: object, *, comment_index: int, issue_number: int | None = None
 ) -> PlanScopeBoundary:
     """Validate every field of one boundary payload; raise ``AgentLoopError`` otherwise."""
-    if not isinstance(payload, dict) or set(payload) != _BOUNDARY_KEYS:
+    if not isinstance(payload, dict) or "schema_version" not in payload:
         raise AgentLoopError("planning-scope boundary record has missing or unknown fields")
-    if (
-        payload["kind"] != PLAN_SCOPE_BOUNDARY_KIND
-        or payload["schema_version"] != PLAN_SCOPE_BOUNDARY_SCHEMA_VERSION
-        or isinstance(payload["schema_version"], bool)
+    version = payload["schema_version"]
+    if isinstance(version, bool) or version not in (
+        PLAN_SCOPE_BOUNDARY_SCHEMA_VERSION, PLAN_SCOPE_BOUNDARY_REOPEN_SCHEMA_VERSION,
     ):
+        raise AgentLoopError("planning-scope boundary record has an unsupported kind or version")
+    reopen = version == PLAN_SCOPE_BOUNDARY_REOPEN_SCHEMA_VERSION
+    if set(payload) != (_BOUNDARY_V2_KEYS if reopen else _BOUNDARY_KEYS):
+        raise AgentLoopError("planning-scope boundary record has missing or unknown fields")
+    if payload["kind"] != PLAN_SCOPE_BOUNDARY_KIND:
         raise AgentLoopError("planning-scope boundary record has an unsupported kind or version")
     if not _is_positive_int(payload["issue_number"]) or (
         issue_number is not None and payload["issue_number"] != issue_number
@@ -222,8 +279,19 @@ def parse_scope_boundary(
     for key in ("previous_issue_digest", "current_issue_digest"):
         if not isinstance(payload[key], str) or not _HEX16.match(payload[key]):
             raise AgentLoopError(f"planning-scope boundary record has an invalid {key}")
-    if payload["previous_issue_digest"] == payload["current_issue_digest"]:
+    if not reopen and payload["previous_issue_digest"] == payload["current_issue_digest"]:
         raise AgentLoopError("planning-scope boundary record names an unchanged issue digest")
+    reason: str | None = None
+    superseded: str | None = None
+    if reopen:
+        reason = payload["reason"]
+        superseded = payload["superseded_plan_hash"]
+        if not isinstance(reason, str) or reason not in _BOUNDARY_REASONS:
+            raise AgentLoopError("planning-scope boundary record has an unknown reason")
+        if not isinstance(superseded, str) or not _HEX16.match(superseded):
+            raise AgentLoopError(
+                "planning-scope boundary record has an invalid superseded plan hash"
+            )
     archived = payload["archived_round_number"]
     start = payload["scope_start_round"]
     if not _is_positive_int(archived) or not _is_positive_int(start) or start <= archived:
@@ -241,6 +309,8 @@ def parse_scope_boundary(
         archived_round_number=archived,
         archived_plan_subject=subject,
         scope_start_round=start,
+        reason=reason,
+        superseded_plan_hash=superseded,
     )
 
 
@@ -460,6 +530,9 @@ def plan_scope_decision(
     issue_number: int | None = None,
     repo: str | None = None,
     ignored_sink: list[str] | None = None,
+    reopen_approved: bool = False,
+    approved_plan_hash: str | None = None,
+    handoff_reason: str | None = None,
 ) -> PlanScopeDecision:
     """Decide, read-only, whether an edited issue opens a new planning scope.
 
@@ -469,6 +542,14 @@ def plan_scope_decision(
     (read from the issue's own handoff record when ``issue_number`` and
     ``repo`` are given).  The issue floor preflight and plan startup both call
     this one function, so they always agree on the scope.
+
+    ``reopen_approved`` is the explicit ``--reopen-approved-plan`` operator
+    option (#2010).  It affects only an approved plan: ``handoff_reason``
+    (computed by the caller's hand-off inventory, which needs GitHub reads
+    this function never makes) refuses the reopen and leaves the decision
+    unchanged; otherwise the decision opens a fresh scope after the latest
+    recorded plan round, superseding ``approved_plan_hash``, whether or not
+    the issue text changed.  Without the option nothing here changes.
     """
     from .round_state import _extract_round_metadata_records
 
@@ -489,23 +570,53 @@ def plan_scope_decision(
         current_digest=current_digest,
         boundary=boundary,
     )
+
+    def archived() -> tuple[int, str | None]:
+        latest_round = max(
+            (record.metadata.round_number for record in all_records), default=base_start - 1
+        )
+        latest_coder = next(
+            (record for record in reversed(scoped_records) if record.metadata.role == "coder"),
+            None,
+        )
+        subject = latest_coder.metadata.subject if latest_coder is not None else None
+        if subject is not None and not _HEX64.match(subject):
+            subject = None
+        return max(latest_round, base_start - 1, 1), subject
+
+    if plan_approved and reopen_approved:
+        if handoff_reason is not None:
+            return dataclasses.replace(
+                unchanged, reopen_requested=True, reopen_refused_reason=handoff_reason,
+                superseded_plan_hash=approved_plan_hash,
+            )
+        if approved_plan_hash is None or not _HEX16.match(approved_plan_hash):
+            raise AgentLoopError(
+                "--reopen-approved-plan needs the approved plan's 16-hex hash to record "
+                "its supersession; nothing was posted."
+            )
+        archived_round, archived_subject = archived()
+        return PlanScopeDecision(
+            scope_start_round=archived_round + 1,
+            reset_required=True,
+            recorded_digest=recorded,
+            current_digest=current_digest,
+            archived_round=archived_round,
+            archived_subject=archived_subject,
+            edited=recorded is not None and recorded != current_digest,
+            boundary=boundary,
+            reopen_requested=True,
+            superseded_plan_hash=approved_plan_hash,
+            reason=PLAN_SCOPE_BOUNDARY_REASON_OPERATOR_REOPEN,
+        )
     if plan_approved or recorded is None or recorded == current_digest:
-        return unchanged
-    latest_round = max(
-        (record.metadata.round_number for record in all_records), default=base_start - 1
-    )
-    archived_round = max(latest_round, base_start - 1, 1)
-    latest_coder = next(
-        (record for record in reversed(scoped_records) if record.metadata.role == "coder"),
-        None,
-    )
-    archived_subject = latest_coder.metadata.subject if latest_coder is not None else None
-    if archived_subject is not None and not _HEX64.match(archived_subject):
-        archived_subject = None
+        return dataclasses.replace(unchanged, reopen_requested=reopen_approved)
+    archived_round, archived_subject = archived()
     if keep_on_edit or plan_handed_off(admitted_comments, issue_number=issue_number, repo=repo):
         return dataclasses.replace(
             unchanged, edited=True, kept=True, handed_off=not keep_on_edit,
             archived_round=archived_round, archived_subject=archived_subject,
+            reopen_requested=reopen_approved,
         )
     return PlanScopeDecision(
         scope_start_round=archived_round + 1,
@@ -516,4 +627,5 @@ def plan_scope_decision(
         archived_subject=archived_subject,
         edited=True,
         boundary=boundary,
+        reopen_requested=reopen_approved,
     )

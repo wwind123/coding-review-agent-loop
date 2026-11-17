@@ -57,6 +57,7 @@ from .plan_issue_scope import (
     scope_plan_comments,
     scope_prompt_comments,
 )
+from .plan_reopen import approved_shortcut_reopen_hint
 from .plan_board_state import (
     admitted_issue_comments,
     plan_floor_refusal_hint,
@@ -920,16 +921,29 @@ def _run_plan_first_loop_body(
         plan_scope_boundary.scope_start_round if plan_scope_boundary is not None else 1
     )
     plan_approval = classify_current_plan(plan_scope_start_round)
+    if plan_approval.approved and config.reopen_approved_plan and not config.dry_run:
+        # Approved plans reopen only through the pre-recovery operator gate
+        # (#2010), which has already opened the new scope by now.  Reaching
+        # here means the gate was bypassed: refuse instead of posting, so
+        # operator reopen has exactly one posting site.
+        raise AgentLoopError(
+            f"Planning issue #{issue_number}: internal error: --reopen-approved-plan reached "
+            f"plan startup with plan {plan_approval.plan_hash} still approved; the "
+            "pre-recovery reopen gate did not run. Nothing was posted."
+        )
     plan_scope = plan_scope_decision(
         plan_admitted_comments,
         plan_trusted_actor,
         plan_issue_digest,
         bool(config.plan_resume_keep_on_issue_edit),
-        # An approved or handed-off plan is never reopened; the decision is
-        # shared verbatim with the issue floor preflight.
+        # An approved or handed-off plan is never reopened here: approved
+        # plans reopen only through the explicit pre-recovery operator gate
+        # (--reopen-approved-plan, #2010).  The decision is shared verbatim
+        # with the issue floor preflight.
         plan_approved=plan_approval.approved,
         issue_number=issue_number,
         repo=config.repo,
+        reopen_approved=bool(config.reopen_approved_plan),
     )
     if (
         plan_scope.recorded_digest is None
@@ -1110,7 +1124,15 @@ def _run_plan_first_loop_body(
             f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} is completely "
             "approved by its approving board "
             f"{', '.join(approving.effective_reviewers)}; planning is not reopened and "
-            "no new plan board-change link is recorded",
+            "no new plan board-change link is recorded"
+            + approved_shortcut_reopen_hint(
+                plan_admitted_comments,
+                issue_number=issue_number,
+                repo=config.repo,
+                plan_hash=plan_approval.plan_hash,
+                recorded_digest=plan_scope.recorded_digest,
+                current_digest=plan_scope.current_digest,
+            ),
         )
         config = _approving_plan_board_config(config, approving)
         seat_binding = reviewer_seat_binding(config)

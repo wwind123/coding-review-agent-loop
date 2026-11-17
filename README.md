@@ -554,6 +554,15 @@ For a typo-level edit, pass `--plan-resume-keep-on-issue-edit` to keep the
 existing plan for that invocation. See
 [edited issues during planning](docs/local_agent_loop.md#edited-issues-during-planning-1390).
 
+An approved plan is never reopened by an edit. To replace an approved plan that
+has not been handed off into a PR or child stages, rerun with
+`--reopen-approved-plan` (for example after narrowing the issue). The run posts
+a boundary record naming the superseded plan hash and starts a fresh plan at the
+next round; the old approval does not carry over. A handed-off plan is refused
+and nothing is posted. The flag applies to that invocation only and is never
+carried into child planning or recovery commands. See
+[reopening an approved plan](docs/local_agent_loop.md#reopening-an-approved-plan-2010).
+
 ### Implement a task without an issue
 
 ```bash

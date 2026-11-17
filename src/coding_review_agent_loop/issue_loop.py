@@ -376,6 +376,18 @@ def run_issue_loop(
                 issue_context=issue_context,
             )
 
+        if plan_first and config.reopen_approved_plan:
+            # The single --reopen-approved-plan gate (#2010), strictly before
+            # recovery and whatever the reviewer floor setting: a handed-off
+            # plan is refused before anything is posted, and an accepted
+            # reopen posts its boundary so recovery sees only the new scope.
+            from .plan_reopen import apply_operator_reopen
+
+            issue_context = apply_operator_reopen(
+                runner, config=config, issue_number=issue_number,
+                issue_context=issue_context, parent_issue_context=parent_issue_context,
+            )
+
         recovery = recover_issue_execution(
             runner, config=config, issue_number=issue_number,
             issue_context=issue_context, parent_issue_context=parent_issue_context,

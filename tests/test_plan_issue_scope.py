@@ -303,3 +303,170 @@ def test_fresh_scope_diagnostic_recovery_matches_only_its_own_scope():
         comment_id=300, author_id=ACTOR[1],
     )
     assert _recover((*scoped, success), 4) is None
+
+
+# --- Operator reopen of an approved plan (#2010) --------------------------------
+
+PLAN_HASH = "0123456789abcdef"
+
+
+def _reopen_payload(previous=DIGEST_A, current=DIGEST_A, archived=3, **overrides):
+    payload = scope_boundary_payload(
+        issue_number=56,
+        previous_issue_digest=previous,
+        current_issue_digest=current,
+        archived_round_number=archived,
+        archived_plan_subject=_plan_subject(_plan_text(archived)),
+        reason="operator-reopen",
+        superseded_plan_hash=PLAN_HASH,
+    )
+    payload.update(overrides)
+    return payload
+
+
+def _decoded(comment):
+    return json.loads(
+        base64.urlsafe_b64decode(PLAN_SCOPE_BOUNDARY_RE.search(comment.body).group("payload"))
+    )
+
+
+def test_v2_reopen_boundary_round_trips_with_equal_digests():
+    """`boundary-auth-schema`: v2 carries its reason and superseded hash; equal digests allowed."""
+    payload = _reopen_payload()
+    assert payload["schema_version"] == 2
+    comment = _comment(render_scope_boundary(payload))
+    assert f"The approved plan `{PLAN_HASH}` was superseded by operator request" in comment.body
+    assert "(--reopen-approved-plan)" in comment.body
+    assert "Fresh plan starts at round 4" in comment.body
+    assert "unresolved items are not carried" in comment.body
+    boundary = latest_scope_boundary((*_history(), comment), ACTOR, issue_number=56)
+    assert boundary is not None
+    assert (boundary.reason, boundary.superseded_plan_hash) == ("operator-reopen", PLAN_HASH)
+    assert boundary.previous_issue_digest == boundary.current_issue_digest == DIGEST_A
+    assert boundary.scope_start_round == 4
+    assert _decoded(comment) == boundary.payload()
+
+
+def test_v1_boundary_payload_is_byte_identical():
+    """`boundary-auth-schema`: issue-edit boundaries keep the exact v1 shape."""
+    payload = scope_boundary_payload(
+        issue_number=56, previous_issue_digest=DIGEST_A, current_issue_digest=DIGEST_B,
+        archived_round_number=3, archived_plan_subject=None,
+    )
+    assert payload == {
+        "kind": "plan-scope-boundary",
+        "schema_version": 1,
+        "issue_number": 56,
+        "previous_issue_digest": DIGEST_A,
+        "current_issue_digest": DIGEST_B,
+        "archived_round_number": 3,
+        "archived_plan_subject": None,
+        "scope_start_round": 4,
+    }
+    rendered = _comment(render_scope_boundary(payload)).body
+    assert "The issue title or body changed since plan round 3" in rendered
+    assert "superseded by operator request" not in rendered
+    with pytest.raises(AgentLoopError, match="unchanged issue digest"):
+        parse_scope_boundary({**payload, "current_issue_digest": DIGEST_A}, comment_index=0)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"reason": "issue-edit"},
+        {"reason": None},
+        {"superseded_plan_hash": "XYZ"},
+        {"superseded_plan_hash": "0123456789ABCDEF"},
+        {"superseded_plan_hash": None},
+        {"extra": 1},
+        {"schema_version": 3},
+        {"schema_version": True},
+    ],
+)
+def test_v2_boundary_decoder_rejects_invalid_fields(change):
+    """`boundary-auth-schema`: a malformed v2 record is rejected."""
+    raw = _reopen_payload(**change)
+    with pytest.raises(AgentLoopError):
+        parse_scope_boundary(raw, comment_index=0, issue_number=56)
+
+
+def test_v1_record_with_v2_fields_or_v2_without_them_is_rejected():
+    payload = _reopen_payload()
+    with pytest.raises(AgentLoopError):
+        parse_scope_boundary({**payload, "schema_version": 1}, comment_index=0)
+    stripped = {k: v for k, v in payload.items() if k not in {"reason", "superseded_plan_hash"}}
+    with pytest.raises(AgentLoopError):
+        parse_scope_boundary(stripped, comment_index=0)
+
+
+def test_forged_or_malformed_v2_boundary_retires_nothing():
+    """`boundary-auth-schema`: only orchestrator-authored, well-formed v2 records are admitted."""
+    forged = _comment(render_scope_boundary(_reopen_payload()), author_id=999)
+    ignored: list[str] = []
+    comments = (*_history(), forged)
+    assert latest_scope_boundary(comments, ACTOR, issue_number=56, ignored_sink=ignored) is None
+    assert "not authored by the authenticated orchestrator actor" in ignored[0]
+    assert resolve_plan_scope(comments, ACTOR, issue_number=56) == 1
+    good = _comment(render_scope_boundary(_reopen_payload()))
+    malformed_body = good.body.replace(
+        PLAN_SCOPE_BOUNDARY_RE.search(good.body).group("payload"),
+        base64.urlsafe_b64encode(
+            json.dumps({**_reopen_payload(), "reason": "other"}).encode()
+        ).decode(),
+    )
+    ignored = []
+    malformed = _comment(malformed_body)
+    assert latest_scope_boundary(
+        (*_history(), malformed), ACTOR, issue_number=56, ignored_sink=ignored,
+    ) is None
+    assert ignored and "unknown reason" in ignored[0]
+
+
+def test_scope_decision_reopen_outcomes():
+    """`flag-without-approved-plan`, `boundary-auth-schema` (decision unit)."""
+    history = _history()
+    # Approved + flag, not handed off: reset at the next round, edited or not.
+    for digest, edited in ((DIGEST_A, False), (DIGEST_B, True)):
+        reopen = plan_scope_decision(
+            history, None, digest, False, plan_approved=True,
+            reopen_approved=True, approved_plan_hash=PLAN_HASH,
+        )
+        assert reopen.reset_required and reopen.reopen_requested
+        assert (reopen.archived_round, reopen.scope_start_round) == (3, 4)
+        assert reopen.edited is edited
+        assert reopen.reason == "operator-reopen"
+        payload = reopen.boundary_payload(56)
+        assert payload["schema_version"] == 2
+        assert payload["superseded_plan_hash"] == PLAN_HASH
+        assert (payload["previous_issue_digest"], payload["current_issue_digest"]) == (
+            DIGEST_A, digest,
+        )
+    # Approved + flag + hand-off: refused, decision otherwise unchanged.
+    refused = plan_scope_decision(
+        history, None, DIGEST_B, False, plan_approved=True, reopen_approved=True,
+        approved_plan_hash=PLAN_HASH, handoff_reason="PR #77",
+    )
+    assert not refused.reset_required and refused.reopen_refused_reason == "PR #77"
+    assert refused.scope_start_round == 1
+    # Approved without the flag: unchanged, as before.
+    approved = plan_scope_decision(history, None, DIGEST_B, False, plan_approved=True)
+    assert not approved.reset_required and approved.reopen_refused_reason is None
+    # Unapproved + flag: today's issue-edit behaviour (a v1 reset) or resume.
+    edited = plan_scope_decision(history, None, DIGEST_B, False, reopen_approved=True)
+    assert edited.reset_required and edited.reason is None
+    assert edited.boundary_payload(56)["schema_version"] == 1
+    unchanged = plan_scope_decision(history, None, DIGEST_A, False, reopen_approved=True)
+    assert not unchanged.reset_required
+    # A legacy plan with no recorded digest reopens with the current digest twice.
+    legacy = plan_scope_decision(
+        _history(digest=None), None, DIGEST_B, False, plan_approved=True,
+        reopen_approved=True, approved_plan_hash=PLAN_HASH,
+    )
+    payload = legacy.boundary_payload(56)
+    assert payload["previous_issue_digest"] == payload["current_issue_digest"] == DIGEST_B
+    # After the v2 boundary, the new scope is empty: the flag has no effect.
+    after = plan_scope_decision(
+        (*history, _comment(render_scope_boundary(_reopen_payload()))), ACTOR, DIGEST_A,
+        False, reopen_approved=True,
+    )
+    assert (after.reset_required, after.scope_start_round) == (False, 4)

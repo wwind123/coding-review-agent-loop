@@ -124,7 +124,14 @@ def _run_child_planning_cycle(
         plan_review_force_full=False,
         plan_reset_stall_streak=False,
         plan_resume_keep_on_issue_edit=False,
+        reopen_approved_plan=False,
     )
+    if config.reopen_approved_plan:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --reopen-approved-plan",
+        )
     if config.plan_resume_keep_on_issue_edit:
         log(
             config,
@@ -552,6 +559,7 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "plan_review_force_full",
     "plan_reset_stall_streak",
     "plan_resume_keep_on_issue_edit",
+    "reopen_approved_plan",
     "plan_primary_stall_rounds",
     "plan_step_back_rounds",
     "plan_step_back_escalation_rounds",
