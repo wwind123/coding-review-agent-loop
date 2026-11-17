@@ -1939,7 +1939,11 @@ def _strict_child_search(
     found: list[FoundIssue] = []
     for item in items:
         number, body = item.get("number"), item.get("body")
-        if isinstance(number, bool) or not isinstance(number, int) or not isinstance(body, str):
+        if (
+            "number" not in item or "body" not in item
+            or isinstance(number, bool) or not isinstance(number, int)
+            or not isinstance(body, str)
+        ):
             raise AgentLoopError(f"the child issue search ({search}) returned a malformed entry")
         title, url = item.get("title"), item.get("url")
         found.append(FoundIssue(

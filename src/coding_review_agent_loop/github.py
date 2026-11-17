@@ -916,10 +916,14 @@ def find_open_pr_closing_issue(
     for item in payload:
         if strict and (
             not isinstance(item, dict)
-            or isinstance(item.get("number"), bool)
-            or not isinstance(item.get("number"), int)
-            or not isinstance(item.get("body"), (str, type(None)))
+            or "number" not in item
+            or "body" not in item
+            or isinstance(item["number"], bool)
+            or not isinstance(item["number"], int)
+            or not isinstance(item["body"], (str, type(None)))
         ):
+            # Both requested fields must be present: an entry without its
+            # body cannot be checked for closing evidence (#2010).
             raise unreadable("malformed (an entry lacks an integer number or a text body)")
         if not isinstance(item, dict):
             continue

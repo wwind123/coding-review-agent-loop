@@ -124,7 +124,9 @@ def _child_issue(plan_hash: str, *, number: int = 90, parent: int = 56) -> dict[
     }
 
 
-_LISTING_FAULTS = ("failure", "invalid-json", "empty", "not-a-list", "malformed-entry")
+_LISTING_FAULTS = (
+    "failure", "invalid-json", "empty", "not-a-list", "malformed-entry", "missing-body",
+)
 
 
 class _SearchFaultRunner(_M1390Runner):
@@ -155,6 +157,7 @@ class _SearchFaultRunner(_M1390Runner):
                 "empty": ("", 0),
                 "not-a-list": ("{}", 0),
                 "malformed-entry": ('[{"number": "90", "body": "x"}]', 0),
+                "missing-body": ('[{"number": 90}]', 0),
             }[self.search_fault]
             return CommandResult(recorded, cwd_path, stdout, "denied" if returncode else "", returncode)
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
@@ -457,7 +460,9 @@ def test_reopen_refuses_and_posts_nothing_when_an_inventory_listing_is_unreadabl
     assert _m1103_agent_calls(runner) == []
 
 
-@pytest.mark.parametrize("fault", ["invalid-json", "empty", "not-a-list", "malformed-entry"])
+@pytest.mark.parametrize(
+    "fault", ["invalid-json", "empty", "not-a-list", "malformed-entry", "missing-body"],
+)
 def test_strict_pr_lookup_raises_where_lenient_lookup_reads_none(tmp_path, fault):
     """`refuse-legacy-pr` (item-4): only the reopen inventory uses the strict PR lookup."""
     config = make_config(tmp_path)
