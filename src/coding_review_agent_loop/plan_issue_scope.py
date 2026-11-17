@@ -329,6 +329,37 @@ def latest_scope_boundary(
     same way, which keeps today's resume behaviour.
     """
     latest: PlanScopeBoundary | None = None
+    for boundary in admitted_scope_boundaries(
+        admitted_comments, trusted_actor, issue_number=issue_number, ignored_sink=ignored_sink,
+    ):
+        latest = boundary
+    return latest
+
+
+def latest_operator_reopen_boundary(
+    admitted_comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+    *,
+    issue_number: int | None = None,
+) -> PlanScopeBoundary | None:
+    """The newest admitted ``operator-reopen`` boundary (#2010), even under a later edit boundary."""
+    latest: PlanScopeBoundary | None = None
+    for boundary in admitted_scope_boundaries(
+        admitted_comments, trusted_actor, issue_number=issue_number,
+    ):
+        if boundary.reason == PLAN_SCOPE_BOUNDARY_REASON_OPERATOR_REOPEN:
+            latest = boundary
+    return latest
+
+
+def admitted_scope_boundaries(
+    admitted_comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+    *,
+    issue_number: int | None = None,
+    ignored_sink: list[str] | None = None,
+):
+    """Every well-formed boundary authored by the authenticated orchestrator actor, in order."""
     for index, comment in enumerate(admitted_comments):
         body = _body(comment)
         if not isinstance(body, str) or not PLAN_SCOPE_BOUNDARY_PRESENCE_RE.search(body):
@@ -361,8 +392,7 @@ def latest_scope_boundary(
             if ignored_sink is not None:
                 ignored_sink.append(f"ignoring the planning-scope boundary record at {locator}: {exc}")
             continue
-        latest = boundary
-    return latest
+        yield boundary
 
 
 def resolve_plan_scope(

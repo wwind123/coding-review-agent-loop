@@ -154,7 +154,8 @@ def approved_plan_handoff_reason(
         raised ambiguity or provenance mismatch: after a reopen recovery would
         call the same resolver without a scope and raise on that candidate;
     (c) realized child issues in the create-before-summary window, found by
-        the same discovery topology creation uses, whose phase-identity record
+        the same discovery topology creation uses (in its strict mode, so an
+        unreadable or malformed listing refuses), whose phase-identity record
         names this parent and ``plan_hash``.  A child for another plan hash
         does not count.
 
@@ -204,6 +205,7 @@ def approved_plan_handoff_reason(
             config=config,  # type: ignore[arg-type]
             parent_issue=issue_number,
             issue_comments=comments,
+            strict=True,
         )
         for candidate in found:
             for marker in PHASE_IDENTITY_MARKER_RE.finditer(candidate.body or ""):
@@ -392,3 +394,79 @@ def apply_operator_reopen(
             "invoked. Rerun once the record is readable."
         )
     return refreshed
+
+
+def reopen_superseded_execution_hashes(
+    runner: object,
+    *,
+    config: object,
+    issue_number: int,
+    comments: Sequence[object],
+) -> tuple[str, ...]:
+    """Plan hashes whose execution records an operator reopen superseded (#2010).
+
+    An operator reopen is accepted only when its hand-off inventory found no
+    realized work, so execution decisions and topology checkpoints posted
+    before the newest admitted ``operator-reopen`` boundary are unrealized
+    history.  Their hashes join the existing durable retirement of
+    terminal or unrealized decisions (``execution_policy``), including the
+    superseded hash itself when the new scope re-approves byte-identical
+    text, so the next execution decision records the supersession and no
+    archived decision or checkpoint is adopted.
+
+    A hash is omitted once a later decision already retires that record: the
+    retirement is position-aware from then on, so new-scope records stay
+    current on resume.  Only a boundary authored by the authenticated
+    orchestrator actor counts; without one nothing is retired.
+    """
+    from .decomposition import (
+        EXECUTION_DECISION_MARKER_RE,
+        TOPOLOGY_CHECKPOINT_MARKER_RE,
+        _decode_checkpoint,
+        _decode_execution_decision,
+    )
+    from .plan_issue_scope import comments_bear_scope_boundary, latest_operator_reopen_boundary
+
+    comments = tuple(comments)
+    if not comments_bear_scope_boundary(comments):
+        return ()
+    from .plan_board_state import admitted_issue_comments
+
+    admitted, trusted_actor = admitted_issue_comments(
+        runner, config=config, issue_number=issue_number, comments=comments,
+    )
+    boundary = latest_operator_reopen_boundary(
+        admitted, trusted_actor, issue_number=issue_number,
+    )
+    if boundary is None:
+        return ()
+    decisions: list[tuple[int, object]] = []
+    records: list[tuple[int, str]] = []
+    for index, body in enumerate(_bodies_by_position(admitted)):
+        for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
+            decision = _decode_execution_decision(match.group("payload"))
+            if decision.parent_issue == issue_number:
+                decisions.append((index, decision))
+                records.append((index, decision.plan_hash))
+        for match in TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(body):
+            checkpoint = _decode_checkpoint(match.group("payload"))
+            if checkpoint.parent_issue == issue_number:
+                records.append((index, checkpoint.plan_hash))
+    superseded = [
+        plan_hash
+        for index, plan_hash in records
+        if index < boundary.comment_index
+        and not any(
+            later > index and plan_hash in getattr(decision, "retires_plan_hashes", ())
+            for later, decision in decisions
+        )
+    ]
+    return tuple(dict.fromkeys(superseded))
+
+
+def _bodies_by_position(comments: Sequence[object]):
+    from .pr_round_ingestion import record_body
+
+    for comment in comments:
+        body = record_body(comment)
+        yield body if isinstance(body, str) else ""

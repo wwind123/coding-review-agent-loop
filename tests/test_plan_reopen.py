@@ -32,7 +32,7 @@ from coding_review_agent_loop.decomposition import (
     approved_plan_hash,
     format_execution_decision,
 )
-from coding_review_agent_loop.github import FoundIssue, IssueComment
+from coding_review_agent_loop.github import IssueComment, get_issue_context
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.plan_issue_scope import (
     PLAN_SCOPE_BOUNDARY_MARKER,
@@ -40,6 +40,7 @@ from coding_review_agent_loop.plan_issue_scope import (
     latest_scope_boundary,
 )
 from test_plan_first_loop_issue_scope import (
+    _M1390Runner,
     _M1390_ACTOR,
     _M1390_EDIT,
     _m1390_config,
@@ -109,17 +110,42 @@ def _decomposition_summary(plan_hash: str) -> dict[str, object]:
     return _orchestrator(f"Decomposition.\n\n<!-- AGENT_PLAN_DECOMPOSITION: {encoded} -->")
 
 
-def _child_issue(plan_hash: str, *, number: int = 90, parent: int = 56) -> FoundIssue:
+def _child_issue(plan_hash: str, *, number: int = 90, parent: int = 56) -> dict[str, object]:
+    """One `gh issue list` entry for a realized child issue."""
     marker = _encode_json_payload({
         "identity": "x" * 16, "parent_issue": parent, "plan_hash": plan_hash,
         "source": "model", "stage_id": 1,
     })
-    return FoundIssue(
-        number=number, title=f"Stage one (from #{parent})",
-        url=f"https://github.com/OWNER/REPO/issues/{number}",
-        body=f"Child phase issue for parent #{parent}.\n\n"
+    return {
+        "number": number, "title": f"Stage one (from #{parent})",
+        "url": f"https://github.com/OWNER/REPO/issues/{number}",
+        "body": f"Child phase issue for parent #{parent}.\n\n"
         f"<!-- AGENT_PLAN_PHASE_IDENTITY: {marker} -->",
-    )
+    }
+
+
+class _SearchFaultRunner(_M1390Runner):
+    """Serves an unreadable child-search listing (#2010 item-3)."""
+
+    def __init__(self, *, search_fault, **kwargs):
+        super().__init__(**kwargs)
+        self.search_fault = search_fault
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = [str(arg) for arg in args]
+        if command[:3] == ["gh", "issue", "list"] and "--search" in command:
+            from coding_review_agent_loop.runner import CommandResult
+
+            recorded, cwd_path = self._record_command(args, cwd)
+            stdout, returncode = {
+                "failure": ("", 1),
+                "invalid-json": ("not json", 0),
+                "empty": ("", 0),
+                "not-a-list": ("{}", 0),
+                "malformed-entry": ('[{"number": "90", "body": "x"}]', 0),
+            }[self.search_fault]
+            return CommandResult(recorded, cwd_path, stdout, "denied" if returncode else "", returncode)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
 
 
 def _boundaries(comments):
@@ -135,11 +161,20 @@ def _writes(runner):
     ]
 
 
-def _rerun(tmp_path, history, *, recovery=None, config_overrides=None, **runner_kwargs):
+def _rerun(
+    tmp_path, history, *, recovery=None, config_overrides=None, search_fault=None,
+    **runner_kwargs,
+):
     """Rerun issue #56 with ``--reopen-approved-plan``; spy on recovery and logs."""
     values = {"max_rounds": 5, "reopen_approved_plan": True}
     values.update(config_overrides or {})
-    runner = _m1390_runner(history, **runner_kwargs)
+    if search_fault is None:
+        runner = _m1390_runner(history, **runner_kwargs)
+    else:
+        runner = _SearchFaultRunner(
+            search_fault=search_fault, issue_comments=list(history),
+            authenticated_actor=_M1390_ACTOR, serve_rest_issue_comments=True, **runner_kwargs,
+        )
     calls: list[dict[str, object]] = []
     real_recover = issue_loop.recover_issue_execution
 
@@ -341,14 +376,12 @@ def test_reopen_refuses_a_plan_handed_off_into_child_stages(tmp_path):
     assert _writes(runner) == [] and _m1103_agent_calls(runner) == []
 
 
-def test_reopen_refuses_a_realized_child_without_a_parent_summary(tmp_path, monkeypatch):
+def test_reopen_refuses_a_realized_child_without_a_parent_summary(tmp_path):
     """`refuse-handed-off-children`: the create-before-summary window refuses."""
     history, plan_hash = _approved_history(tmp_path)
-    monkeypatch.setattr(
-        decomposition, "search_issues",
-        lambda runner, *, config, search, state="all": (_child_issue(plan_hash),),
+    runner, result, calls, _messages = _rerun(
+        tmp_path, history, recovery="forbidden", search_issues_payload=[_child_issue(plan_hash)],
     )
-    runner, result, calls, _messages = _rerun(tmp_path, history, recovery="forbidden")
 
     assert isinstance(result, AgentLoopError)
     assert f"child issue #90 already carries plan {plan_hash}" in str(result)
@@ -359,50 +392,66 @@ def test_reopen_refuses_a_realized_child_without_a_parent_summary(tmp_path, monk
 def test_handoff_inventory_ignores_a_child_for_another_plan(tmp_path, monkeypatch):
     """`refuse-handed-off-children`: a child for a different plan hash does not refuse."""
     config = make_config(tmp_path)
-    monkeypatch.setattr(
-        decomposition, "search_issues",
-        lambda runner, *, config, search, state="all": (
-            _child_issue("f" * 16), _child_issue("a" * 16, number=91, parent=57),
-        ),
-    )
+    runner = _m1390_runner(search_issues_payload=[
+        _child_issue("f" * 16), _child_issue("a" * 16, number=91, parent=57),
+    ])
     monkeypatch.setattr(github, "find_open_pr_closing_issue", lambda *a, **k: None)
     assert plan_reopen.approved_plan_handoff_reason(
-        object(), config=config, issue_number=56, comments=(), plan_hash="a" * 16,
+        runner, config=config, issue_number=56, comments=(), plan_hash="a" * 16,
     ) is None
 
 
-@pytest.mark.parametrize("failure", ["search", "pr-list"])
-def test_handoff_inventory_fails_closed_on_discovery_errors(tmp_path, monkeypatch, failure):
-    """`child-discovery-failure`: an infrastructure failure is never 'not handed off'."""
+def test_handoff_inventory_fails_closed_on_pr_lookup_errors(tmp_path, monkeypatch):
+    """`child-discovery-failure`: a PR lookup failure is never 'not handed off'."""
     config = make_config(tmp_path)
 
     def broken(*_args, **_kwargs):
         raise AgentLoopError("GitHub search is unavailable")
 
-    if failure == "search":
-        monkeypatch.setattr(decomposition, "search_issues", broken)
-        monkeypatch.setattr(github, "find_open_pr_closing_issue", lambda *a, **k: None)
-    else:
-        monkeypatch.setattr(github, "find_open_pr_closing_issue", broken)
+    monkeypatch.setattr(github, "find_open_pr_closing_issue", broken)
     reason = plan_reopen.approved_plan_handoff_reason(
-        object(), config=config, issue_number=56, comments=(), plan_hash="a" * 16,
+        _m1390_runner(), config=config, issue_number=56, comments=(), plan_hash="a" * 16,
     )
     assert reason is not None and "GitHub search is unavailable" in reason
-    assert ("cannot verify" in reason) if failure == "search" else ("cannot be resolved" in reason)
+    assert "cannot be resolved" in reason
 
 
-def test_reopen_refuses_and_posts_nothing_when_child_search_fails(tmp_path, monkeypatch):
-    """`child-discovery-failure` through run_issue_loop."""
-    history, _plan_hash = _approved_history(tmp_path)
+@pytest.mark.parametrize(
+    "fault", ["failure", "invalid-json", "empty", "not-a-list", "malformed-entry"],
+)
+def test_reopen_refuses_and_posts_nothing_when_child_search_is_unreadable(tmp_path, fault):
+    """`child-discovery-failure` (item-3): every unreadable child listing refuses before posting.
 
-    def broken(*_args, **_kwargs):
-        raise AgentLoopError("GitHub search is unavailable")
-
-    monkeypatch.setattr(decomposition, "search_issues", broken)
-    runner, result, calls, _messages = _rerun(tmp_path, history, recovery="forbidden")
+    The real `gh issue list` decoder path runs: a failed command, output that
+    is not JSON, empty output, a non-list or a malformed entry is never read
+    as "no children".
+    """
+    history, plan_hash = _approved_history(tmp_path)
+    runner, result, calls, _messages = _rerun(
+        tmp_path, history, recovery="forbidden", search_fault=fault,
+    )
     assert isinstance(result, AgentLoopError)
-    assert "cannot verify that plan" in str(result) and "nothing was posted" in str(result)
+    message = str(result)
+    assert f"cannot verify that plan {plan_hash} was not handed off" in message
+    assert "nothing was posted" in message
     assert calls == [] and runner.issue_comments == history and _writes(runner) == []
+    assert _m1103_agent_calls(runner) == []
+
+
+def test_strict_child_discovery_raises_where_lenient_discovery_reads_empty(tmp_path):
+    """`child-discovery-failure` (item-3): only the reopen inventory uses strict discovery."""
+    config = make_config(tmp_path)
+    runner = _SearchFaultRunner(
+        search_fault="invalid-json", authenticated_actor=_M1390_ACTOR,
+    )
+    found, _searched, _direct = decomposition.discover_parent_child_issues(
+        runner, config=config, parent_issue=56,
+    )
+    assert found == ()
+    with pytest.raises(AgentLoopError, match="unreadable or possibly truncated"):
+        decomposition.discover_parent_child_issues(
+            runner, config=config, parent_issue=56, strict=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -578,3 +627,141 @@ def test_reopen_flag_parses_only_with_issue_plan_first(capsys):
     assert "cannot be combined with --plan-resume-keep-on-issue-edit" in (
         capsys.readouterr().err
     )
+
+
+# --- execution history superseded by an operator reopen (review items 1 and 2) -------
+
+
+def _execution_runner_class():
+    from test_execution_decision_retirement import RetirementRunner
+
+    class _ReopenExecutionRunner(RetirementRunner, _M1390Runner):
+        """Execution-mode fixture that also serves the authenticated boundary POST."""
+
+    return _ReopenExecutionRunner
+
+
+def _matching_decision(history, plan_hash: str) -> dict[str, object]:
+    """An archived decision whose identity equals what re-approving the same plan records."""
+    from coding_review_agent_loop.execution_policy import (
+        _current_execution_recommendation,
+        _plan_subject,
+    )
+
+    plan = next(
+        record.canonical_plan
+        for record in _plan_round_records(SimpleNamespace(issue_comments=history))
+        if record.role == "coder"
+    )
+    comments = [SimpleNamespace(body=str(c["body"])) for c in history]
+    recommendation = _current_execution_recommendation(plan, comments)
+    identity = recommendation.identity()
+    return _orchestrator(format_execution_decision(ExecutionDecision(
+        parent_issue=56, plan_hash=plan_hash, plan_subject=_plan_subject(plan),
+        execution_strategy_contract_version=1, strategy=recommendation.strategy,
+        topology_source=str(identity["topology_source"]),
+        recommendation_digest=str(identity["recommendation_sha256"]),
+        requested_policy="implement-one-shot", current_action="implement-one-shot",
+    )))
+
+
+def _checkpoint(plan_hash: str) -> dict[str, object]:
+    phase = decomposition.PlanPhase(
+        "Old", "Old scope", "None", "None", "low", "Tests", "Parent", "agent-pr",
+    )
+    return _orchestrator(decomposition.format_topology_checkpoint(decomposition.TopologyCheckpoint(
+        56, plan_hash, "implement-by-phase", "model", (phase,),
+    )))
+
+
+@pytest.mark.parametrize(
+    "archived",
+    ["checkpoint-same-hash", "checkpoint-other-hash", "decision-same-hash",
+     "decision-and-checkpoint-same-hash"],
+)
+def test_reopen_retires_unrealized_execution_history_in_execution_mode(tmp_path, archived):
+    """`identical-plan-hash`, `reopen-approved-unhanded` (items 1 and 2, implement-one-shot).
+
+    Execution decisions and topology checkpoints posted before the operator
+    reopen are unrealized history: whatever their hash, and with or without a
+    decision, the re-approved plan records a new decision that retires them
+    and dispatches implementation, instead of adopting the archived decision
+    or failing the checkpoint conflict check.
+    """
+    from test_plan_first_loop_execution_strategy import (
+        _m1087_config,
+        _m1087_implementation_dispatched,
+        _m1087_posted_decisions,
+    )
+
+    history, plan_hash = _approved_history(tmp_path)
+    other = "0123456789abcdef"
+    extra = {
+        "checkpoint-same-hash": [_checkpoint(plan_hash)],
+        "checkpoint-other-hash": [_checkpoint(other)],
+        "decision-same-hash": [_matching_decision(history, plan_hash)],
+        "decision-and-checkpoint-same-hash": [
+            _matching_decision(history, plan_hash), _checkpoint(plan_hash),
+        ],
+    }[archived]
+    expected_retired = other if archived == "checkpoint-other-hash" else plan_hash
+    runner = _execution_runner_class()(
+        issue_comments=[*history, *extra], authenticated_actor=_M1390_ACTOR,
+    )
+    from dataclasses import replace
+
+    result = run_issue_loop(
+        runner, issue_number=56,
+        config=replace(_m1087_config(tmp_path), reopen_approved_plan=True), plan_first=True,
+    )
+
+    assert result == 0
+    assert len(_boundaries(runner.issue_comments)) == 1
+    posted = _m1087_posted_decisions(runner)
+    # A new decision is recorded, never adopted from the archived scope.
+    assert len(posted) == 1
+    assert posted[0].plan_hash == plan_hash
+    assert posted[0].retires_plan_hashes == (expected_retired,)
+    assert _m1087_implementation_dispatched(runner)
+    # Archived records stay in the issue history, unedited.
+    assert runner.issue_comments[: len(history) + len(extra)] == [*history, *extra]
+    # On resume the superseding decision already retires the archived records:
+    # nothing new is superseded, so new-scope records stay current.
+    resume_config = _m1087_config(tmp_path)
+    assert plan_reopen.reopen_superseded_execution_hashes(
+        runner, config=resume_config, issue_number=56,
+        comments=get_issue_context(runner, config=resume_config, issue_number=56).comments,
+    ) == ()
+
+
+def test_reopen_superseded_hashes_ignore_unadmitted_boundaries(tmp_path):
+    """A forged operator-reopen boundary never retires execution history (items 1 and 2)."""
+    from coding_review_agent_loop.plan_issue_scope import (
+        render_scope_boundary,
+        scope_boundary_payload,
+    )
+
+    history, plan_hash = _approved_history(tmp_path)
+    forged = {
+        "author": {"login": "mallory"}, "_rest_author_id": 999,
+        "createdAt": "2026-05-23T03:00:00Z",
+        "body": str(render_scope_boundary(scope_boundary_payload(
+            issue_number=56, previous_issue_digest="a" * 16, current_issue_digest="a" * 16,
+            archived_round_number=1, archived_plan_subject=None, reason="operator-reopen",
+            superseded_plan_hash=plan_hash,
+        ))),
+    }
+    comments = [*history, _checkpoint(plan_hash), forged]
+    runner = _m1390_runner(comments)
+    config = _m1390_config(tmp_path)
+    live = get_issue_context(runner, config=config, issue_number=56).comments
+    assert plan_reopen.reopen_superseded_execution_hashes(
+        runner, config=config, issue_number=56, comments=live,
+    ) == ()
+    # The same history with the orchestrator-authored boundary does retire it.
+    genuine = [*history, _checkpoint(plan_hash), _orchestrator(forged["body"])]
+    runner = _m1390_runner(genuine)
+    live = get_issue_context(runner, config=config, issue_number=56).comments
+    assert plan_reopen.reopen_superseded_execution_hashes(
+        runner, config=config, issue_number=56, comments=live,
+    ) == (plan_hash,)

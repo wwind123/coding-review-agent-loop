@@ -1360,10 +1360,10 @@
     },
     {
       "module": "plan_issue_scope",
-      "function": "latest_scope_boundary",
+      "function": "admitted_scope_boundaries",
       "call": "parse_scope_boundary(raw, comment_index=index, issue_number=issue_number)",
       "family": "plan-scope",
-      "provenance": "plan_issue_scope.latest_scope_boundary: plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
+      "provenance": "plan_issue_scope.admitted_scope_boundaries: plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
       "occurrence": 1
     },
     {
@@ -3170,7 +3170,19 @@
     },
     {
       "module": "plan_issue_scope",
+      "function": "admitted_scope_boundaries",
+      "classification": "reader",
+      "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
+    },
+    {
+      "module": "plan_issue_scope",
       "function": "comments_bear_scope_boundary",
+      "classification": "reader",
+      "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
+    },
+    {
+      "module": "plan_issue_scope",
+      "function": "latest_operator_reopen_boundary",
       "classification": "reader",
       "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
     },
@@ -3206,6 +3218,12 @@
     },
     {
       "module": "plan_reopen",
+      "function": "_bodies_by_position",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor); execution decisions and topology checkpoints before the newest admitted operator-reopen boundary feed the existing durable execution-retirement assessment, which still verifies terminal or unrealized history before any record is hidden."
+    },
+    {
+      "module": "plan_reopen",
       "function": "approved_plan_handoff_reason",
       "classification": "reader",
       "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."
@@ -3215,6 +3233,12 @@
       "function": "comment_handoff_reason",
       "classification": "reader",
       "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "reopen_superseded_execution_hashes",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor); execution decisions and topology checkpoints before the newest admitted operator-reopen boundary feed the existing durable execution-retirement assessment, which still verifies terminal or unrealized history before any record is hidden."
     },
     {
       "module": "plan_round_closure",

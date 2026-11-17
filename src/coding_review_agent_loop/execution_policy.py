@@ -1521,6 +1521,15 @@ def _retirable_execution_decision_hashes(
         comments = get_issue_context(
             runner, config=replace(config, execution_history=None), issue_number=issue_number,
         ).comments
+    # An operator reopen (#2010) supersedes every unrealized decision and
+    # topology checkpoint posted before its admitted boundary, whatever its
+    # hash: checkpoint-only history and a byte-identical re-approved plan are
+    # retired durably instead of being adopted or blocking the new topology.
+    from .plan_reopen import reopen_superseded_execution_hashes
+
+    stale = tuple(dict.fromkeys((*stale, *reopen_superseded_execution_hashes(
+        runner, config=config, issue_number=issue_number, comments=comments,
+    ))))
     history = assess_execution_history(
         runner, config=config, issue_number=issue_number, comments=comments,
         approved_split_keys=_approved_one_shot_split_keys,

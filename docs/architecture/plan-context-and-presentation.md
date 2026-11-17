@@ -229,8 +229,10 @@ split-materialization records; a legacy closing-reference PR found with
 recovery's own resolver (`find_open_pr_closing_issue` with the approved-plan
 provenance scope); and realized child issues whose phase identity names the
 plan, found by the discovery shared with topology creation
-(`decomposition.discover_parent_child_issues`). The inventory fails closed: a
-lookup error refuses, and an unauthenticated artifact can only cause a refusal.
+(`decomposition.discover_parent_child_issues` in its strict mode, where an
+unreadable, malformed or possibly truncated listing raises). The inventory
+fails closed: a lookup error refuses, and an unauthenticated artifact can only
+cause a refusal.
 A hand-off raises before any post. Otherwise `plan_scope_decision`
 (`reopen_approved=True`) opens a scope after the latest recorded round and the
 gate posts a **schema-version-2 boundary** with `reason: operator-reopen` and
@@ -242,6 +244,15 @@ scope. Plan startup never posts an operator reopen: reaching it with an approved
 plan and the flag (outside dry run) is an internal error. The floor preflight
 calls the same inventory and decision, refuses with the same message and judges
 the board at the new scope start. Under `--dry-run` the gate is a logged no-op.
+Execution decisions and topology checkpoints posted before the newest admitted
+operator-reopen boundary are unrealized by construction.
+`plan_reopen.reopen_superseded_execution_hashes` adds their hashes, including
+the superseded hash itself, to the existing durable execution retirement
+(`execution_policy._retirable_execution_decision_hashes`). The next execution
+decision therefore records their supersession instead of adopting an archived
+decision, and checkpoint-only history no longer blocks the new topology. A hash
+that a later decision already retires is omitted, so retirement stays
+position-aware on resume.
 
 **Admission.** `plan_board_state.admitted_issue_comments` reads REST author
 identities and the authenticated actor whenever a boundary or a plan

@@ -4634,8 +4634,14 @@ counts as a hand-off and refuses the reopen:
 
 A refusal names the hand-off, posts nothing and invokes no agent. A GitHub
 lookup failure also refuses (`cannot verify that plan <hash> was not handed
-off`): it is never treated as "not handed off". An execution decision or
-topology checkpoint whose children and PR were never created does not count.
+off`): it is never treated as "not handed off". That includes a child-issue
+search that fails, returns output that is not a JSON list, has a malformed
+entry, or may be truncated. An execution decision or topology checkpoint whose
+children and PR were never created does not count. When the new plan is
+approved for implementation, its execution decision retires those unrealized
+records, whatever their plan hash and even with no earlier decision, so they
+are never adopted and never block the new topology. This also holds when the
+new planner writes byte-identical plan text.
 
 Otherwise the run floor-checks the plan board at the new scope start, posts one
 orchestrator-authored planning-scope boundary that says the approved plan

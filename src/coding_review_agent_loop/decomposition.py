@@ -1876,17 +1876,23 @@ def discover_parent_child_issues(
     config: AgentLoopConfig,
     parent_issue: int,
     issue_comments: Sequence[object] = (),
+    strict: bool = False,
 ) -> tuple[tuple[FoundIssue, ...], tuple[FoundIssue, ...], list[FoundIssue]]:
     """Read-only discovery of a parent's realized child issues.
 
     Returns ``(found, searched, direct_reads)``.  Shared by topology creation
     and the ``--reopen-approved-plan`` hand-off inventory (#2010), so both see
     the same children.  A search failure propagates to the caller.
+
+    ``strict`` is for callers that must fail closed (#2010): an unreadable,
+    malformed or possibly truncated search listing, a malformed entry, or an
+    unreadable recorded child reference raises ``AgentLoopError`` instead of
+    reading as "no children".
     """
     # Search is read-only and intentionally includes every issue state.  It
     # closes the create-before-summary crash window without trusting authorship.
     searched = merge_found_issues(
-        search_issues(
+        (_strict_child_search if strict else search_issues)(
             runner,
             config=config,
             search=query,
@@ -1905,16 +1911,43 @@ def discover_parent_child_issues(
                 number = int(match.group(1)) if match else None
             if number is not None and number not in recorded_numbers:
                 recorded_numbers.append(number)
-    direct_reads = [
-        issue
-        for issue in (
-            get_issue_found(runner, config=config, issue_number=number)
-            for number in recorded_numbers
-        )
-        if issue is not None
-    ]
+    direct_reads: list[FoundIssue] = []
+    for number in recorded_numbers:
+        issue = get_issue_found(runner, config=config, issue_number=number)
+        if issue is not None:
+            direct_reads.append(issue)
+        elif strict:
+            raise AgentLoopError(f"recorded child issue #{number} cannot be read")
     found = merge_found_issues([searched], prefer=direct_reads)
     return found, searched, direct_reads
+
+
+def _strict_child_search(
+    runner: Runner, *, config: AgentLoopConfig, search: str, state: str = "all",
+) -> tuple[FoundIssue, ...]:
+    """One complete child search listing, or ``AgentLoopError`` (#2010)."""
+    from .execution_retirement import _REALIZATION_LISTING_LIMIT, _strict_gh_listing
+
+    items = _strict_gh_listing(runner, config=config, args=[
+        "issue", "list", "--repo", config.repo, "--search", search, "--state", state,
+        "--limit", str(_REALIZATION_LISTING_LIMIT), "--json", "number,title,url,body",
+    ])
+    if items is None:
+        raise AgentLoopError(
+            f"the child issue search ({search}) is unreadable or possibly truncated"
+        )
+    found: list[FoundIssue] = []
+    for item in items:
+        number, body = item.get("number"), item.get("body")
+        if isinstance(number, bool) or not isinstance(number, int) or not isinstance(body, str):
+            raise AgentLoopError(f"the child issue search ({search}) returned a malformed entry")
+        title, url = item.get("title"), item.get("url")
+        found.append(FoundIssue(
+            number=number, body=body,
+            title=title if isinstance(title, str) else None,
+            url=url if isinstance(url, str) else None,
+        ))
+    return tuple(found)
 
 
 def create_decomposition_child_issues(
