@@ -25,6 +25,7 @@ from .errors import (
     SemanticPatchPayloadRejection,
     SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
+    prior_item_disposition_guidance,
 )
 from .github import (
     IssueContext,
@@ -1145,9 +1146,8 @@ def _validate_plan_revision_response(
             raise UnknownPriorItemDispositionError(
                 unknown_ids=tuple(sorted(unknown)),
                 allowed_ids=tuple(sorted(allowed_ids)),
-                same_round_description=(
-                    "Same-round findings are informational only and must not be "
-                    "dispositioned as prior carried items."
+                same_round_description=prior_item_disposition_guidance(
+                    tuple(sorted(unknown)), tuple(sorted(allowed_ids))
                 ),
             )
         return parsed
@@ -1235,9 +1235,8 @@ def _check_plan_revision_patch_ledger(
         raise SemanticPatchUnknownPriorItemDispositionError(
             unknown_ids=tuple(sorted(unknown)),
             allowed_ids=tuple(sorted(allowed_ids)),
-            same_round_description=(
-                "Same-round findings are informational only and must not be dispositioned "
-                "as prior carried items."
+            same_round_description=prior_item_disposition_guidance(
+                tuple(sorted(unknown)), tuple(sorted(allowed_ids))
             ),
         )
 

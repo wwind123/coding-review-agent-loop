@@ -730,6 +730,7 @@ boundaries, and meaningful test combinations. Reject missing, duplicated,
 unknown, uncovered, or split scope IDs and any mismatch between strategy and
 conditional delivery fields. This recommendation does not select the current
 execution mode (see the execution-mode runtime fact) or change issue count in Stage 1.
+""" + STAGING_FEASIBILITY_ENUM_GUIDANCE + """
 
 For every child stage, review the planner's semantic execution disposition as
 part of the implementation contract. Approve `direct-implementation` only
@@ -756,6 +757,15 @@ PLANNER_CAPTURED_EVIDENCE_RULE = (
     "`agent-loop run-tests -- <command>`. Repository rules such as 'run pytest directly' "
     "or 'no wrapper' apply to the inner command, so do not require an uncaptured direct "
     "run as the evidence of record."
+)
+
+
+# #2009: the exact staging_feasibility enum with meanings, stated once in the
+# shared contract guidance that accompanies every plan JSON example.
+STAGING_FEASIBILITY_ENUM_GUIDANCE = (
+    "`staging_feasibility` is exactly one of `safe` (the work can be staged) or "
+    "`inseparable` (it cannot be staged); no other value such as `separable` is "
+    "accepted. Staged recommendations require `safe`."
 )
 
 
@@ -787,8 +797,8 @@ execution_disposition}`. The disposition object has exactly
 For one-shot, set `child_stages` to an empty array, use a delivery covering
 every scope-item ID exactly once, and set retained-parent and final-integration
 work to `none`.
-`staging_feasibility` may be `inseparable`. For staged, omit one-shot delivery,
-use safe feasibility, order dependencies by earlier stage position, allocate
+""" + STAGING_FEASIBILITY_ENUM_GUIDANCE + """ For staged, omit one-shot delivery,
+order dependencies by earlier stage position, allocate
 every scope item exactly once across children and required retained/final work,
 keep coupling groups together, and provide at least two real allocations. A
 single child with no retained or final work is invalid; recommend one-shot.

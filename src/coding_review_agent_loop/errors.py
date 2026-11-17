@@ -147,6 +147,31 @@ class ReviewSubstanceIntegrityError(AgentLoopError):
     """
 
 
+def prior_item_disposition_guidance(
+    unknown_ids: tuple[str, ...] | list[str],
+    allowed_ids: tuple[str, ...] | list[str],
+    field: str = "prior_plan_item_dispositions",
+) -> str:
+    """Name the fix for an unknown prior-item disposition (#2009).
+
+    The text becomes the bounded-replan diagnostic word for word, so it says
+    which IDs to remove, which carried IDs may take a disposition, and that
+    same-round findings take no disposition.
+    """
+    unknown = ", ".join(sorted(unknown_ids)) or "(none)"
+    allowed = sorted(allowed_ids)
+    carried = (
+        "Only these carried prior IDs may take a disposition: " + ", ".join(allowed) + "."
+        if allowed
+        else f"No prior items are carried, so {field} must be empty."
+    )
+    return (
+        "Same-round findings are informational only and take no disposition; "
+        "they must not be dispositioned as prior carried items. "
+        f"Remove ID(s) {unknown} from {field}. {carried}"
+    )
+
+
 class UnknownPriorItemDispositionError(AgentLoopError):
     """Raised when an agent dispositions a non-carried prior item ID."""
 

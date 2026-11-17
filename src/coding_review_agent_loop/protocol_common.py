@@ -448,3 +448,32 @@ def _require_supported_schema_version(payload: dict[str, object]) -> None:
     version = _expect_int(payload["schema_version"], context="schema_version")  # shape-check: fatal:kind-or-version-mismatch
     if version != 1:
         raise AgentLoopError(f"Unsupported structured response schema_version: {version}")  # shape-check: fatal:kind-or-version-mismatch
+
+
+# #2009: the only accepted ``staging_feasibility`` tokens and their meanings.
+STAGING_FEASIBILITY_VALUES = ("safe", "inseparable")
+# A fixed, audited alias set that unambiguously means "can be staged".  Add a
+# token only with evidence of a real planner slip; never fuzzy-match.  Nothing
+# except the canonical token's own case/spacing variants maps to
+# ``inseparable``, so normalization never invents an unsafe-to-stage claim.
+STAGING_FEASIBILITY_SAFE_ALIASES = frozenset(
+    {"separable", "stageable", "stagable", "safe-to-stage", "can-stage"}
+)
+
+
+def normalize_staging_feasibility(value: object) -> tuple[object, bool]:
+    """Return ``(canonical, matched)`` for a raw ``staging_feasibility`` value.
+
+    Strips, lowercases and turns runs of whitespace/underscores into ``-``.
+    Canonical tokens map to themselves and audited aliases map to ``safe``.
+    Any other value, including a non-string, comes back unchanged with
+    ``matched`` false so the caller keeps rejecting it.
+    """
+    if not isinstance(value, str):
+        return value, False
+    folded = re.sub(r"[\s_]+", "-", value.strip().lower())
+    if folded in STAGING_FEASIBILITY_VALUES:
+        return folded, True
+    if folded in STAGING_FEASIBILITY_SAFE_ALIASES:
+        return "safe", True
+    return value, False

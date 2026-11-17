@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from .errors import AgentLoopError
+from .protocol_common import normalize_staging_feasibility
 from .review_scheduling import (
     POST_PANEL_PREFIX,
     STRICT_PRE_PANEL_PREFIX,
@@ -265,6 +266,12 @@ def execution_recommendation_contract_projection(value: object) -> dict | None:
     projection = copy.deepcopy(value)
     projection.pop("rationale", None)
     projection.pop("caveats", None)
+    # #2009: an accepted alias is the same contract as its canonical token.
+    feasibility, feasibility_matched = normalize_staging_feasibility(
+        projection.get("staging_feasibility")
+    )
+    if feasibility_matched:
+        projection["staging_feasibility"] = feasibility
     constraints = projection.get("coupling_constraints")
     if isinstance(constraints, list):
         for entry in constraints:

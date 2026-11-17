@@ -8237,3 +8237,110 @@ def test_wrapped_citation_matches_only_exact_inner_journal_argv(launcher):
         TestObservationCitation(command.replace("--timeout-seconds 180", "--unknown 180"), "r", "current-result"),
     ]:
         assert not _citation_matches_observation(citation, observation)
+
+
+# --- #2009: staging_feasibility normalization and actionable enum feedback ---
+
+from coding_review_agent_loop.protocol_common import normalize_staging_feasibility  # noqa: E402
+from coding_review_agent_loop.errors import prior_item_disposition_guidance  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("separable", "safe"),
+        (" Separable ", "safe"),
+        ("STAGEABLE", "safe"),
+        ("stagable", "safe"),
+        ("safe_to_stage", "safe"),
+        ("Safe To Stage", "safe"),
+        ("can-stage", "safe"),
+        ("Safe", "safe"),
+        ("safe", "safe"),
+        (" Inseparable", "inseparable"),
+        ("inseparable", "inseparable"),
+    ],
+)
+def test_2009_normalize_staging_feasibility_maps_audited_aliases(raw, canonical):
+    assert normalize_staging_feasibility(raw) == (canonical, True)
+
+
+@pytest.mark.parametrize("raw", ["maybe", "not-separable", "unsafe", "", None, 3])
+def test_2009_normalize_staging_feasibility_leaves_unknown_values_unmatched(raw):
+    assert normalize_staging_feasibility(raw) == (raw, False)
+
+
+def test_2009_staged_separable_plan_state_validates_as_safe_with_one_warning(caplog):
+    payload = _execution_plan_payload(strategy="staged")
+    payload["execution_recommendation"]["staging_feasibility"] = "separable"
+    text = _execution_plan_text(payload)
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        parsed = validate_structured_plan_state(text, require_execution_strategy_contract=1)
+    recommendation = parsed.execution_recommendation
+    assert recommendation.strategy == "staged"
+    assert recommendation.staging_feasibility == "safe"
+    assert recommendation.to_payload()["staging_feasibility"] == "safe"
+    messages = [r.getMessage() for r in caplog.records if "normalized staging_feasibility" in r.getMessage()]
+    assert messages == [
+        "plan_state.execution_recommendation: normalized staging_feasibility "
+        "`separable` to `safe` before validation"
+    ]
+    # The response text itself is never rewritten.
+    assert '"staging_feasibility": "separable"' in text
+
+
+def test_2009_canonical_staging_feasibility_emits_no_normalization_warning(caplog):
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        validate_structured_plan_state(
+            _execution_plan_text(_execution_plan_payload(strategy="staged")),
+            require_execution_strategy_contract=1,
+        )
+    assert not [r for r in caplog.records if "normalized staging_feasibility" in r.getMessage()]
+
+
+@pytest.mark.parametrize("raw", ["maybe", "not-separable"])
+def test_2009_unknown_staging_feasibility_is_rejected_with_allowed_values(raw):
+    payload = _execution_plan_payload()
+    payload["execution_recommendation"]["staging_feasibility"] = raw
+    with pytest.raises(AgentLoopError) as error:
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+    message = str(error.value)
+    assert "staging_feasibility must be exactly `safe` (the work can be staged" in message
+    assert "`inseparable` (it cannot be staged)" in message
+    assert f"got `{raw}`" in message
+    assert "A staged recommendation requires `safe`." in message
+
+
+def test_2009_unknown_strategy_message_names_allowed_values_and_received_value():
+    payload = _execution_plan_payload()
+    payload["execution_recommendation"]["strategy"] = "phased"
+    with pytest.raises(AgentLoopError) as error:
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+    message = str(error.value)
+    assert "strategy must be exactly `one-shot`" in message
+    assert "`staged`" in message
+    assert "got `phased`" in message
+
+
+def test_2009_rejected_value_echo_is_single_line_and_capped():
+    payload = _execution_plan_payload()
+    payload["execution_recommendation"]["staging_feasibility"] = "x`y\n" + "z" * 200
+    with pytest.raises(AgentLoopError) as error:
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+    got = str(error.value).split("got `", 1)[1].split("`", 1)[0]
+    assert "\n" not in got and len(got) <= 40
+
+
+def test_2009_prior_item_guidance_names_carried_ids_and_same_round_rule():
+    text = prior_item_disposition_guidance(("item-1", "item-2"), ("item-8",))
+    assert "take no disposition" in text
+    assert "Remove ID(s) item-1, item-2 from prior_plan_item_dispositions." in text
+    assert "Only these carried prior IDs may take a disposition: item-8." in text
+    empty = prior_item_disposition_guidance(("item-1",), (), "prior_item_dispositions")
+    assert "No prior items are carried, so prior_item_dispositions must be empty." in empty
