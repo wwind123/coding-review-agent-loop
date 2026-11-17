@@ -841,18 +841,27 @@ def validate_pr_body_does_not_close_issue(
 _UNSET_PROVENANCE_SCOPE = object()
 
 
+_OPEN_PR_LISTING_LIMIT = 100000
+
+
 def find_open_pr_closing_issue(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     issue_number: int,
     expected_scope: IssuePrProvenanceScope | None | object = _UNSET_PROVENANCE_SCOPE,
+    strict: bool = False,
 ) -> OpenPrClosingMatch | None:
     """Find the unique open PR with strong closing evidence for an issue.
 
     This is the metadata-free crash-window recovery path.  A closing keyword
     tied to the configured repository and issue is required; incidental prose,
     bare issue references, and contextual URLs are deliberately ignored.
+
+    ``strict`` is for callers that must fail closed (the #2010 reopen
+    inventory): empty or non-JSON output, a non-list, a malformed entry or a
+    listing that fills the limit raises ``AgentLoopError`` instead of reading
+    as "no matching PR".
     """
     if config.dry_run:
         return None
@@ -878,21 +887,44 @@ def find_open_pr_closing_issue(
             # `gh pr list` follows GitHub pagination up to this explicit limit.
             # The former 100-item cap could silently miss the only candidate.
             "--limit",
-            "100000",
+            str(_OPEN_PR_LISTING_LIMIT),
         ],
         cwd=active_workdir(config),
     )
     raw = result.stdout.strip()
+
+    def unreadable(reason: str) -> AgentLoopError:
+        return AgentLoopError(f"the open pull request listing is {reason}")
+
     if not raw:
+        if strict:
+            raise unreadable("empty")
         return None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
+        if strict:
+            raise unreadable("not valid JSON")
         return None
     if not isinstance(payload, list):
+        if strict:
+            raise unreadable("not a JSON list")
         return None
+    if strict and len(payload) >= _OPEN_PR_LISTING_LIMIT:
+        raise unreadable("possibly truncated")
     matches: list[OpenPrClosingMatch] = []
     for item in payload:
+        if strict and (
+            not isinstance(item, dict)
+            or "number" not in item
+            or "body" not in item
+            or isinstance(item["number"], bool)
+            or not isinstance(item["number"], int)
+            or not isinstance(item["body"], (str, type(None)))
+        ):
+            # Both requested fields must be present: an entry without its
+            # body cannot be checked for closing evidence (#2010).
+            raise unreadable("malformed (an entry lacks an integer number or a text body)")
         if not isinstance(item, dict):
             continue
         body = _optional_str(item.get("body")) or ""

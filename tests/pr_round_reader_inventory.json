@@ -417,17 +417,17 @@
     {
       "module": "decomposition",
       "function": "create_decomposition_child_issues",
-      "call": "find_decompositions_for_parent(issue_comments, parent_issue=parent_issue)",
+      "call": "find_existing_topology_checkpoint(issue_comments, parent_issue=parent_issue, plan_hash=plan_hash, mode=mode)",
       "family": "decomposition",
       "provenance": "decomposition.create_decomposition_child_issues: decomposition reducers select invocation-only protocol_comments from independently acquired issue contexts; execution_policy and plan_execution own live parent/child acquisition before recovery or dispatch. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
       "occurrence": 1
     },
     {
       "module": "decomposition",
-      "function": "create_decomposition_child_issues",
-      "call": "find_existing_topology_checkpoint(issue_comments, parent_issue=parent_issue, plan_hash=plan_hash, mode=mode)",
+      "function": "discover_parent_child_issues",
+      "call": "find_decompositions_for_parent(issue_comments, parent_issue=parent_issue)",
       "family": "decomposition",
-      "provenance": "decomposition.create_decomposition_child_issues: decomposition reducers select invocation-only protocol_comments from independently acquired issue contexts; execution_policy and plan_execution own live parent/child acquisition before recovery or dispatch. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
+      "provenance": "decomposition.discover_parent_child_issues: decomposition reducers select invocation-only protocol_comments from independently acquired issue contexts; execution_policy and plan_execution own live parent/child acquisition before recovery or dispatch. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary. Shared by topology creation and the #2010 reopen hand-off inventory.",
       "occurrence": 1
     },
     {
@@ -1360,10 +1360,10 @@
     },
     {
       "module": "plan_issue_scope",
-      "function": "latest_scope_boundary",
+      "function": "admitted_scope_boundaries",
       "call": "parse_scope_boundary(raw, comment_index=index, issue_number=issue_number)",
       "family": "plan-scope",
-      "provenance": "plan_issue_scope.latest_scope_boundary: plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
+      "provenance": "plan_issue_scope.admitted_scope_boundaries: plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
       "occurrence": 1
     },
     {
@@ -1404,6 +1404,46 @@
       "call": "parse_scope_boundary(payload, comment_index=0)",
       "family": "plan-scope",
       "provenance": "plan_issue_scope.scope_boundary_payload: plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings. Pure body/record codecs are offline only; live callers must preserve the named acquisition boundary.",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_reopen",
+      "function": "apply_operator_reopen",
+      "call": "latest_scope_boundary(refreshed_comments, refreshed_actor, issue_number=issue_number)",
+      "family": "plan-scope",
+      "provenance": "plan_reopen.apply_operator_reopen: plan_issue_scope reads the comments plan_reopen re-admits through plan_board_state.admitted_issue_comments right after posting the operator-reopen boundary; only the authenticated orchestrator actor's boundary is honoured.",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_reopen",
+      "function": "comment_handoff_reason",
+      "call": "find_decompositions_for_parent(comments, parent_issue=issue_number)",
+      "family": "decomposition",
+      "provenance": "plan_reopen.comment_handoff_reason: plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) in the pre-recovery reopen gate, the issue floor preflight and the plan startup hint; any record found can only refuse a reopen, never grant one.",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_reopen",
+      "function": "comment_handoff_reason",
+      "call": "find_existing_split_materialization(comments, parent_issue=issue_number)",
+      "family": "split",
+      "provenance": "plan_reopen.comment_handoff_reason: plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) in the pre-recovery reopen gate, the issue floor preflight and the plan startup hint; any record found can only refuse a reopen, never grant one.",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_reopen",
+      "function": "comment_handoff_reason",
+      "call": "find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=repo)",
+      "family": "handoff",
+      "provenance": "plan_reopen.comment_handoff_reason: plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) in the pre-recovery reopen gate, the issue floor preflight and the plan startup hint; any record found can only refuse a reopen, never grant one.",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_reopen",
+      "function": "comment_handoff_reason",
+      "call": "find_phase_implementation_handoffs_for_parent(comments, parent_issue=issue_number)",
+      "family": "decomposition",
+      "provenance": "plan_reopen.comment_handoff_reason: plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) in the pre-recovery reopen gate, the issue floor preflight and the plan startup hint; any record found can only refuse a reopen, never grant one.",
       "occurrence": 1
     },
     {
@@ -2350,6 +2390,12 @@
     },
     {
       "module": "decomposition",
+      "function": "discover_parent_child_issues",
+      "classification": "reader",
+      "admission": "decomposition reducers select invocation-only protocol_comments from independently acquired issue contexts; execution_policy and plan_execution own live parent/child acquisition before recovery or dispatch. Shared by topology creation and the #2010 reopen hand-off inventory; child bodies are read only to match phase identities."
+    },
+    {
+      "module": "decomposition",
       "function": "execution_decisions_for_parent",
       "classification": "reader",
       "admission": "decomposition reducers select invocation-only protocol_comments from independently acquired issue contexts; execution_policy and plan_execution own live parent/child acquisition before recovery or dispatch."
@@ -3124,7 +3170,19 @@
     },
     {
       "module": "plan_issue_scope",
+      "function": "admitted_scope_boundaries",
+      "classification": "reader",
+      "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
+    },
+    {
+      "module": "plan_issue_scope",
       "function": "comments_bear_scope_boundary",
+      "classification": "reader",
+      "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
+    },
+    {
+      "module": "plan_issue_scope",
+      "function": "latest_operator_reopen_boundary",
       "classification": "reader",
       "admission": "plan_issue_scope reads invocation-only protocol_comments supplied by plan_first_loop startup and refresh acquisition; scope redaction preserves immutable family bindings."
     },
@@ -3151,6 +3209,36 @@
       "function": "plan_ownership_diagnostic",
       "classification": "presentation",
       "admission": "plan_ownership.plan_ownership_diagnostic reads raw body text for presentation, diagnostics or candidate prose; no round approval, child routing or protocol authorization is selected here."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "_bodies",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "_bodies_by_position",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor); execution decisions and topology checkpoints before the newest admitted operator-reopen boundary feed the existing durable execution-retirement assessment, which still verifies terminal or unrealized history before any record is hidden."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "approved_plan_handoff_reason",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "comment_handoff_reason",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."
+    },
+    {
+      "module": "plan_reopen",
+      "function": "reopen_superseded_execution_hashes",
+      "classification": "reader",
+      "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor); execution decisions and topology checkpoints before the newest admitted operator-reopen boundary feed the existing durable execution-retirement assessment, which still verifies terminal or unrealized history before any record is hidden."
     },
     {
       "module": "plan_round_closure",

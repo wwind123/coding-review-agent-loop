@@ -4608,6 +4608,68 @@ invocation only. Child planning and rendered recovery commands never carry it.
 The next planner record stores the new digest, so a later run without the flag
 does not see the edit again.
 
+#### Reopening an approved plan (#2010)
+
+An approved plan is never reopened implicitly, even after an issue edit. When
+an approved plan can no longer be implemented as written (for example a cost
+guard stopped the coder, and you narrowed the issue), rerun with
+`--reopen-approved-plan`:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first --reopen-approved-plan
+```
+
+Before issue recovery runs, and whether or not a reviewer floor is configured,
+the run checks whether the approved plan was already handed off. Any of these
+counts as a hand-off and refuses the reopen:
+
+- an issue-PR handoff record or a one-shot implementation handoff (any PR
+  state);
+- a decomposition summary, phase implementation handoff, split-stage handoff or
+  split materialization for the issue;
+- an open PR that strongly closes the issue for this plan, or an open closing PR
+  whose plan cannot be resolved;
+- a child issue that already carries the plan's identity, even when the parent
+  summary was never posted.
+
+A refusal names the hand-off, posts nothing and invokes no agent. A GitHub
+lookup failure also refuses (`cannot verify that plan <hash> was not handed
+off`): it is never treated as "not handed off". That includes a child-issue
+search or open pull request listing that fails, returns output that is not a
+JSON list, has a malformed entry, or may be truncated. An execution decision or topology checkpoint whose
+children and PR were never created does not count. When the new plan is
+approved for implementation, its execution decision retires those unrealized
+records, whatever their plan hash and even with no earlier decision, so they
+are never adopted and never block the new topology. This also holds when the
+new planner writes byte-identical plan text.
+
+Otherwise the run floor-checks the plan board at the new scope start, posts one
+orchestrator-authored planning-scope boundary that says the approved plan
+`<hash>` was superseded by operator request, and starts a fresh plan against
+the current issue body. "Round 1 of the new scope" is the first round after the
+boundary: round numbers keep increasing (an approved round 3 plan reopens at
+round 4), and the `--max-rounds` budget restarts there. The earlier approval and
+approving board never carry over, even if the new planner writes byte-identical
+plan text: the new scope needs its own approvals. The issue does not have to be
+edited first.
+
+- With no approved plan in the current scope (no plan, an unapproved plan, or
+  the new scope right after a reopen) the flag logs that it has no effect, and
+  the usual edited-issue behaviour applies. A rerun never posts a second
+  operator-reopen boundary.
+- Under `--dry-run` the issue context is synthetic, so the flag only logs
+  `dry run; --reopen-approved-plan performs no reopen check and posts nothing`.
+- The flag applies to that invocation only. Child planning and rendered
+  recovery commands never carry it, and it cannot be combined with
+  `--plan-resume-keep-on-issue-edit`.
+- Without the flag, when the issue digest changed since approval, the
+  `planning is not reopened` log line names both digests and suggests
+  `--reopen-approved-plan` (or says the plan was already handed off).
+
+The boundary record uses schema version 2 with reason `operator-reopen`.
+Releases before #2010 ignore a version 2 record as malformed and would resume
+the superseded plan, so take care when rolling back after a reopen.
+
 Planning histories written before this release carry an issue digest only on
 `primary-then-panel` scheduler checkpoints. An all-reviewers history from before
 the upgrade has no recorded digest, so an edit to it cannot be detected; the

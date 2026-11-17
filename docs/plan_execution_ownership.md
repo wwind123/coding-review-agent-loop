@@ -63,3 +63,10 @@ dispatch call it without another entry-point claim or telemetry scope. Planning
 continues via the caller's explicit callback. Test patches follow moved recovery
 lookups; dependencies still used by issue/task creation retain both owners.
 Only the deliberately changed dispatch and child-planning body hashes are updated.
+
+## Operator plan reopen (#2010)
+
+`_run_child_planning_cycle` resets the new per-invocation
+`--reopen-approved-plan` flag (logging that the child does not inherit it), and
+`_PLAN_BOARD_CONFIG_FIELDS` restores it after an approved plan's board is
+re-pointed. Only these two deliberately changed body hashes are updated.

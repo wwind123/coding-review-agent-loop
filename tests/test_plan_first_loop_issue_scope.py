@@ -1386,3 +1386,146 @@ def test_m1987_recovery_of_the_dry_run_empty_history_needs_no_admission(tmp_path
     context = get_issue_context(dry, config=config, issue_number=56)
     assert context.comments == ()
     assert _recover_scope_start(tmp_path, dry, context, config=config) == (1, 0)
+
+
+# --- Operator reopen of an approved plan (#2010) ---------------------------------
+
+
+def _m2010_approved_history(tmp_path):
+    runner = _m1390_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert run_issue_loop(
+        runner, issue_number=56, config=_m1390_config(tmp_path), plan_first=True,
+    ) == 0
+    return list(runner.issue_comments)
+
+
+@pytest.mark.parametrize("edited", [True, False])
+def test_m2010_approved_shortcut_hints_at_the_reopen_option_only_on_a_digest_change(
+    tmp_path, edited
+):
+    """`no-flag-unchanged-hint`: the approved shortcut is taken exactly as before."""
+    history = _m2010_approved_history(tmp_path)
+    runner, result, messages = _m1390_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT if edited else None,
+    )
+
+    assert result == 0
+    assert _m1390_boundaries(runner) == []
+    assert _m1103_agent_calls(runner) == []
+    shortcut = [m for m in messages if "planning is not reopened" in m]
+    assert len(shortcut) == 1
+    hint = (
+        f"the issue title/body changed since approval (recorded digest {_m1390_digest()}, "
+        f"current digest {_m1390_digest(**_M1390_EDIT)}) — rerun with --reopen-approved-plan "
+        "to start a fresh planning scope"
+    )
+    assert (hint in shortcut[0]) is edited
+    assert ("--reopen-approved-plan" in shortcut[0]) is edited
+
+
+def test_m2010_approved_shortcut_hint_says_a_handed_off_plan_cannot_be_reopened():
+    """`no-flag-unchanged-hint`: a recorded hand-off changes the hint, not the shortcut."""
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+    from coding_review_agent_loop.plan_reopen import approved_shortcut_reopen_hint
+
+    handoff = SimpleNamespace(body=format_issue_pr_handoff_comment(
+        issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        flow="approved-plan-implementation", plan_hash="a" * 16,
+    ))
+    kwargs = {"issue_number": 56, "repo": "OWNER/REPO", "plan_hash": "a" * 16}
+    hint = approved_shortcut_reopen_hint(
+        (handoff,), recorded_digest="1" * 16, current_digest="2" * 16, **kwargs,
+    )
+    assert "already handed off" in hint and "PR #77" in hint
+    assert "cannot reopen it" in hint
+    assert approved_shortcut_reopen_hint(
+        (handoff,), recorded_digest=None, current_digest="2" * 16, **kwargs,
+    ) == ""
+    assert approved_shortcut_reopen_hint(
+        (), recorded_digest="2" * 16, current_digest="2" * 16, **kwargs,
+    ) == ""
+
+
+def test_m2010_flag_on_an_unapproved_edited_plan_keeps_the_issue_edit_reset(tmp_path):
+    """`flag-without-approved-plan`: today's edit reset applies; no operator-reopen boundary."""
+    import coding_review_agent_loop.plan_reopen as plan_reopen
+
+    history = _m1390_history(tmp_path)
+    runner = _m1390_runner(
+        history, issue_payload=_M1390_EDIT,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    with patch_object_in(
+        (plan_first_loop_module, plan_reopen), "log", wraps=plan_first_loop_module.log,
+    ) as logged:
+        result = run_issue_loop(
+            runner, issue_number=56,
+            config=_m1390_config(tmp_path, max_rounds=5, reopen_approved_plan=True),
+            plan_first=True,
+        )
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+
+    assert result == 0
+    boundaries = _m1390_boundaries(runner)
+    assert len(boundaries) == 1
+    assert "The issue title or body changed since plan round 3" in boundaries[0]["body"]
+    assert "superseded by operator request" not in boundaries[0]["body"]
+    assert any("--reopen-approved-plan has no effect" in m for m in messages)
+    assert any("starting a fresh plan at round 4" in m for m in messages)
+
+
+def test_m2010_identical_plan_in_the_new_scope_needs_new_scope_approval(tmp_path):
+    """`identical-plan-hash`: archived approvals never classify the new scope as approved."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.plan_issue_scope import (
+        latest_scope_boundary,
+        render_scope_boundary,
+        scope_boundary_payload,
+    )
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    history = _m2010_approved_history(tmp_path)
+    config = _m1390_config(tmp_path, max_rounds=5)
+
+    def comments(raw):
+        return tuple(
+            IssueComment(
+                author=_M1390_ACTOR[0], created_at="2026-05-23T00:00:00Z",
+                body=str(c["body"]), author_id=c.get("_rest_author_id", _M1390_ACTOR[1]),
+            )
+            for c in raw
+        )
+
+    before = classify_plan_approval(
+        comments(history), config=config, issue_number=56, trusted_actor=_M1390_ACTOR,
+    )
+    assert before.approved
+    boundary = str(render_scope_boundary(scope_boundary_payload(
+        issue_number=56, previous_issue_digest=_m1390_digest(),
+        current_issue_digest=_m1390_digest(), archived_round_number=1,
+        archived_plan_subject=None, reason="operator-reopen",
+        superseded_plan_hash=before.plan_hash,
+    )))
+    after_boundary = [*history, {"body": boundary, "_rest_author_id": _M1390_ACTOR[1]}]
+    scoped = comments(after_boundary)
+    assert latest_scope_boundary(scoped, _M1390_ACTOR, issue_number=56).scope_start_round == 2
+    after = classify_plan_approval(
+        scoped, config=config, issue_number=56, trusted_actor=_M1390_ACTOR,
+    )
+    assert after.state == "empty-scope" and not after.approved
+    # Replaying the archived round-1 planner record (identical text, identical
+    # hash) does not make it a new-scope candidate either.
+    replay = classify_plan_approval(
+        (*scoped, scoped[0]), config=config, issue_number=56, trusted_actor=_M1390_ACTOR,
+    )
+    assert not replay.approved
+    assert approved_plan_hash(
+        next(r for r in _plan_round_records(SimpleNamespace(issue_comments=history))
+             if r.role == "coder").canonical_plan
+    ) == before.plan_hash

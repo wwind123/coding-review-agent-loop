@@ -339,6 +339,10 @@ class AgentLoopConfig:
     # the issue title/body changed, instead of opening a fresh planning scope.
     # Never inherited by child planning or recovery commands.
     plan_resume_keep_on_issue_edit: bool = False
+    # Per-invocation operator option (#2010): supersede a completely approved
+    # plan that was not handed off and open a fresh planning scope.  Never
+    # inherited by child planning or recovery commands.
+    reopen_approved_plan: bool = False
     plan_narrow_staged: bool = False
     # Advisory triage before an issue run's first agent dispatch (#1434).  It
     # posts a route recommendation and never changes the operator's route.
@@ -2852,6 +2856,7 @@ def config_from_args(
         plan_resume_keep_on_issue_edit=bool(
             getattr(args, "plan_resume_keep_on_issue_edit", False)
         ),
+        reopen_approved_plan=bool(getattr(args, "reopen_approved_plan", False)),
         plan_narrow_staged=bool(getattr(args, "plan_narrow_staged", False)),
         triage=bool(getattr(args, "triage", False)),
         triage_model=getattr(args, "triage_model", None) or "",

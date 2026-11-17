@@ -170,6 +170,7 @@ class PlanVerificationContext:
             plan_review_force_full=False,
             plan_reset_stall_streak=False,
             plan_resume_keep_on_issue_edit=False,
+            reopen_approved_plan=False,
             plan_primary_stall_rounds=(
                 config.plan_primary_stall_rounds if staged else DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
             ),
@@ -1431,15 +1432,40 @@ def enforce_issue_board_floor(
             scope_start_round=scope_start,
         )
         if issue_digest is not None:
-            decision = plan_scope_decision(
-                comments,
-                trusted_actor,
-                issue_digest,
-                bool(getattr(config, "plan_resume_keep_on_issue_edit", False)),
-                plan_approved=classification.approved,
-                issue_number=issue_number,
-                repo=getattr(config, "repo", None),
-            )
+            if (
+                classification.approved
+                and getattr(config, "reopen_approved_plan", False)
+                and not getattr(config, "dry_run", False)
+            ):
+                # The same hand-off inventory and decision the pre-recovery
+                # reopen gate makes (#2010): refuse a handed-off plan with
+                # the same reason, otherwise judge the board at the scope the
+                # gate is about to open.
+                from .plan_reopen import operator_reopen_decision, reopen_refusal_error
+
+                decision = operator_reopen_decision(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    comments=comments,
+                    trusted_actor=trusted_actor,
+                    issue_digest=issue_digest,
+                    classification=classification,
+                )
+                if decision.reopen_refused_reason is not None:
+                    raise reopen_refusal_error(
+                        issue_number, classification.plan_hash, decision.reopen_refused_reason,
+                    )
+            else:
+                decision = plan_scope_decision(
+                    comments,
+                    trusted_actor,
+                    issue_digest,
+                    bool(getattr(config, "plan_resume_keep_on_issue_edit", False)),
+                    plan_approved=classification.approved,
+                    issue_number=issue_number,
+                    repo=getattr(config, "repo", None),
+                )
             if decision.reset_required:
                 # The plan loop is about to open this scope: judge it as the
                 # loop will, before anything is posted.
