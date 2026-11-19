@@ -86,8 +86,15 @@ can clear its evidence there. New findings or a failing machine gate release
 the freeze with one release comment, and an external push breaks it.
 
 Native obligations also admit pre-supplied evidence at the final gate. A
-same-round, same-head requester resolution cites `evidence_requirement_ids` from
-that reviewer's surfaced signed input and attests adequate acceptance for H.
+same-head requester resolution cites `evidence_requirement_ids` from that
+reviewer's surfaced signed input and attests adequate acceptance for H. The gate
+reads this round's reviewer records plus the same-head approvals the round's
+scheduler counted as qualifying (carried through the unchanged-head skip or
+paused as already approved, #2019). A carried record counts only when the gate's
+authenticated read holds an identical record (metadata and body) at its index,
+and the gate evaluates that admitted copy. The requester's newest complete review
+at H governs, so a later blocking or non-resolving review overrides an older
+resolution, and a review at another head never clears.
 The gate uses the live effective signed objects, checks content-bound IDs and
 unambiguous complete 7–40 character head references against current/admitted PR
 head history, and publishes a single evidence-cleared release without a freeze.

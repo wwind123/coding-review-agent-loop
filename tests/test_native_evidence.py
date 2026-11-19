@@ -176,6 +176,86 @@ def test_removed_owner_requires_all_current_reviewers_with_exposure():
     assert kept and not clear
 
 
+def _carried_case(disposition="resolved", citation=("r",), subject=H1, state="approved"):
+    """A round-1 Codex review at ``subject``; the gate runs in round 2 at H1 (#2019)."""
+    items, _ = upsert()
+    req = SimpleNamespace(requirement_id="r", body="Accepted " + H1[:7])
+    vote = ReviewItemDisposition("item-1", "Codex", disposition, evidence_requirement_ids=citation)
+    carried = record(0, subject, dispositions=(vote,), surfaced_reviewer_requirement_ids=("r",), state=state)
+    return items, req, carried
+
+
+def gate(items, records, req, carried=(), board=("Codex", "Gemini")):
+    return provisional_clearances(items, records, [req], head=H1, round_number=2, board=board, carried=carried)
+
+
+def test_carried_same_head_requester_resolution_clears_only_when_carried():
+    items, req, carried = _carried_case()
+    kept, clear = gate(items, [carried], req, carried=(carried,))
+    assert not kept and clear and all(head == H1 for _, head in clear)
+    # Without the scheduler's carry, an earlier-round record never counts.
+    kept, clear = gate(items, [carried], req)
+    assert kept and not clear
+
+
+@pytest.mark.parametrize("case", ["open", "no-citation"])
+def test_carried_review_that_did_not_resolve_keeps_item(case):
+    items, req, carried = _carried_case(
+        disposition="open" if case == "open" else "resolved", citation=("r",) if case == "open" else ())
+    kept, clear = gate(items, [carried], req, carried=(carried,))
+    assert kept and not clear
+
+
+@pytest.mark.parametrize("later_disposition", ["open", None])
+def test_later_same_head_review_by_requester_overrides_carried_resolution(later_disposition):
+    items, req, carried = _carried_case()
+    dispositions = () if later_disposition is None else (
+        ReviewItemDisposition("item-1", "Codex", later_disposition),)
+    later = PostedRoundRecord(index=1, body="Later", metadata=replace(
+        carried.metadata, round_number=2, state="blocking", dispositions=dispositions))
+    kept, clear = gate(items, [carried, later], req, carried=(carried,))
+    assert kept and not clear
+
+
+def test_carried_review_at_another_head_or_citing_another_head_never_clears():
+    items, req, carried = _carried_case(subject=H2)
+    kept, clear = gate(items, [carried], req, carried=(carried,))
+    assert kept and not clear
+    items, _, carried = _carried_case()
+    foreign = SimpleNamespace(requirement_id="r", body="Accepted " + H2[:7])
+    kept, clear = gate(items, [carried, record(1, H2)], foreign, carried=(carried,))
+    assert kept and not clear
+
+
+@pytest.mark.parametrize("mismatch", ["absent", "agent", "round", "subject", "vote", "body"])
+def test_carried_record_must_match_the_admitted_record_at_its_index(mismatch):
+    items, req, carried = _carried_case()
+    m = carried.metadata
+    admitted = {
+        "absent": None,
+        "agent": replace(carried, metadata=replace(m, agent="Gemini")),
+        "round": replace(carried, metadata=replace(m, round_number=0)),
+        "subject": replace(carried, metadata=replace(m, subject=H2)),
+        "vote": replace(carried, metadata=replace(m, dispositions=(
+            ReviewItemDisposition("item-1", "Codex", "open"),))),
+        "body": replace(carried, body="Different body"),
+    }[mismatch]
+    kept, clear = gate(items, [] if admitted is None else [admitted], req, carried=(carried,))
+    assert kept and not clear
+
+
+def test_removed_requester_board_fallback_needs_every_current_reviewer_with_carry():
+    items, req, carried = _carried_case()
+    vote = ReviewItemDisposition("item-1", "Gemini", "resolved", evidence_requirement_ids=("r",))
+    gemini = replace(carried, metadata=replace(carried.metadata, agent="Gemini", dispositions=(vote,)))
+    kept, clear = gate(items, [gemini], req, carried=(gemini,), board=("Gemini", "Claude"))
+    assert kept and not clear
+    claude = PostedRoundRecord(index=1, body="Review", metadata=replace(
+        gemini.metadata, agent="Claude", round_number=2, dispositions=(replace(vote, reviewer="Claude"),)))
+    kept, clear = gate(items, [gemini, claude], req, carried=(gemini,), board=("Gemini", "Claude"))
+    assert not kept and clear
+
+
 def test_literal_placeholder_and_foreign_subjects_are_not_commit_references():
     items, _ = upsert()
     updated, consumed = upsert(items, "Accept screenshot <commit>", number=2)

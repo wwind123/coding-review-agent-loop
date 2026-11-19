@@ -495,3 +495,76 @@ def test_invalid_classification_can_reach_fresh_review(tmp_path, monkeypatch, fa
     else:
         assert any("Previous response not accepted: required judgement field" in cmd[-1]
                    and "requirement_evidence" in cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex")
+
+
+
+def _carried_requester(tmp_path, *, policy="all-reviewers", citation=True, reference=HEAD):
+    """#2019: Codex resolves its evidence item at HEAD while Gemini blocks; the head is unchanged."""
+    from agent_loop_helpers import structured_coder_followup
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
+    config = make_config(tmp_path, pr_review_context_mode="full", pr_review_policy=policy,
+                         reviewer=("codex", "gemini"), max_rounds=5, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not _freeze_records(runner)
+    runner.pr_check_runs_payload = {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]}
+    runner.advance_pr_head_on_coder_followup = False
+    runner.pr_payload["comments"].append(_signed("Screenshot accepted for " + reference, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    vote = {**_resolve(), "evidence_requirement_ids": [rid]} if citation else _resolve()
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[vote]))
+    # Gemini is not the requester: its votes on item-1 never count toward clearance.
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", state="blocking", hr=True,
+        blocking=["Fix the retry bound."], dispositions=[_resolve()]))
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-2"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "The signed acceptance is supplied separately."}])]
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    return runner, config
+
+
+def _codex_calls(runner):
+    return sum(1 for cmd, _ in runner.commands if cmd[:1] == ["codex"])
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+def test_carried_same_head_requester_resolution_clears_without_freeze(tmp_path, capsys, policy):
+    runner, config = _carried_requester(tmp_path, policy=policy)
+    codex_before = _codex_calls(runner)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Round N: Codex resolves at HEAD and Gemini blocks. Round N+1 carries Codex without a turn.
+    assert _codex_calls(runner) == codex_before + 1
+    assert "skipping Codex; it approved unchanged PR head " + HEAD in capsys.readouterr().err
+    assert not _freeze_records(runner)
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert len(cleared) == 1
+    assert cleared[0].metadata.evidence_clearances
+    assert all(head == HEAD for _, head in cleared[0].metadata.evidence_clearances)
+    assert not cleared[0].metadata.prior_items
+    assert not runner.codex_outputs and not runner.gemini_outputs and not runner.claude_outputs
+    # Idempotent: a rerun writes no second release and calls no agent.
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not _freeze_records(runner)
+    assert not any(cmd[0] in {"codex", "gemini", "claude"} for cmd, _ in runner.commands[commands:])
+
+
+@pytest.mark.parametrize("kind", ["no-citation", "foreign-head"])
+def test_carried_requester_without_valid_citation_freezes_and_rerun_stops(tmp_path, kind):
+    runner, config = _carried_requester(tmp_path, citation=kind != "no-citation",
+                                        reference="a" * 40 if kind == "foreign-head" else HEAD)
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    freezes = _freeze_records(runner)
+    assert [i.item_id for i in freezes[-1].metadata.prior_items] == ["item-1"]
+    assert not any(r.metadata.evidence_release.reason == "evidence-cleared" for r in _release_records(runner))
+    # Without new signed input the rerun stops at once with no agent calls.
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_freeze_records(runner)) == len(freezes)
+    assert not any(cmd[0] in {"codex", "gemini", "claude"} for cmd, _ in runner.commands[commands:])
