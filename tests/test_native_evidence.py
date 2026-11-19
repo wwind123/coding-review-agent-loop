@@ -206,14 +206,32 @@ def test_carried_review_that_did_not_resolve_keeps_item(case):
     assert kept and not clear
 
 
-@pytest.mark.parametrize("later_disposition", ["open", None])
-def test_later_same_head_review_by_requester_overrides_carried_resolution(later_disposition):
+@pytest.mark.parametrize("later_round", [2, "intervening"])
+@pytest.mark.parametrize("later_disposition", ["open", "resolved-uncited", None])
+def test_later_same_head_review_by_requester_overrides_carried_resolution(later_disposition, later_round):
+    """A later admitted same-head review overrides, whether from this round or an intervening one."""
     items, req, carried = _carried_case()
-    dispositions = () if later_disposition is None else (
-        ReviewItemDisposition("item-1", "Codex", later_disposition),)
+    dispositions = {"open": (ReviewItemDisposition("item-1", "Codex", "open"),),
+                    "resolved-uncited": (ReviewItemDisposition("item-1", "Codex", "resolved"),),
+                    None: ()}[later_disposition]
     later = PostedRoundRecord(index=1, body="Later", metadata=replace(
         carried.metadata, round_number=2, state="blocking", dispositions=dispositions))
-    kept, clear = gate(items, [carried, later], req, carried=(carried,))
+    gate_round = 3 if later_round == "intervening" else 2
+    kept, clear = provisional_clearances(items, [carried, later], [req], head=H1, round_number=gate_round,
+                                         board=("Codex", "Gemini"), carried=(carried,))
+    assert kept and not clear
+    # Control: without the later review the carried resolution clears in that round.
+    kept, clear = provisional_clearances(items, [carried], [req], head=H1, round_number=gate_round,
+                                         board=("Codex", "Gemini"), carried=(carried,))
+    assert not kept and clear
+
+
+def test_newest_uncarried_historical_resolution_never_authorizes():
+    """An intervening-round resolution the scheduler did not carry cannot clear by itself."""
+    items, req, carried = _carried_case(disposition="open", citation=())
+    resolving = replace(_carried_case()[2], index=1, metadata=replace(_carried_case()[2].metadata, round_number=2))
+    kept, clear = provisional_clearances(items, [carried, resolving], [req], head=H1, round_number=3,
+                                         board=("Codex", "Gemini"), carried=(carried,))
     assert kept and not clear
 
 

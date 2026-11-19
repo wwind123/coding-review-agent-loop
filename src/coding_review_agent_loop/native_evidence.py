@@ -130,30 +130,29 @@ def citation_ids(value):
 def provisional_clearances(items, records, requirements, *, head, round_number, board, carried=()):
     """Use the latest requester attestations at ``head`` and effective live signed objects.
 
-    Sources are this round's admitted reviewer records plus the same-head
-    approvals the round's scheduler counted as carried (unchanged-head skip or
-    selective pause, #2019). A carried record counts only when ``records`` (the
-    gate's admitted read) holds an identical record at its index; the admitted
-    copy is evaluated, never the carried one. Each reviewer's newest candidate
-    governs, so a later same-head review overrides an older resolution.
+    Each reviewer's newest admitted complete review at ``head`` from any round
+    governs, so a later same-head review (even one from an intervening round)
+    overrides an older resolution. That newest review attests only when it is
+    from this round or is a same-head approval the round's scheduler counted as
+    carried (unchanged-head skip or selective pause, #2019). A carried record
+    counts only when ``records`` (the gate's admitted read) holds an identical
+    record at its index; the admitted copy is evaluated, never the carried one.
 
     The existing trust policy owns requirement admission. A resolved citation
     attests adequacy; a SHA mention alone never authorizes acceptance.
     """
     from .review_scope import is_complete_code_review
     admitted = {record.index: record for record in records}
-    candidates = [r for r in records if r.metadata.round_number == round_number]
-    for record in carried:
-        match = admitted.get(record.index)
-        if match is not None and match.metadata == record.metadata and match.body == record.body \
-                and match.metadata.round_number < round_number:
-            candidates.append(match)
-    latest, latest_index = {}, {}
-    for record in candidates:
+    carried_indexes = {r.index for r in carried if (match := admitted.get(r.index)) is not None
+                       and match.metadata == r.metadata and match.body == r.body
+                       and match.metadata.round_number < round_number}
+    newest = {}
+    for record in sorted(records, key=lambda r: r.index):
         m = record.metadata
-        if m.role == "reviewer" and is_complete_code_review(m) and m.subject == head \
-                and record.index >= latest_index.get(m.agent, record.index):
-            latest[m.agent], latest_index[m.agent] = m, record.index
+        if m.role == "reviewer" and is_complete_code_review(m) and m.subject == head:
+            newest[m.agent] = record
+    latest = {agent: record.metadata for agent, record in newest.items()
+              if record.metadata.round_number == round_number or record.index in carried_indexes}
     heads = known_pr_heads(records, head)
     live = {r.requirement_id: r for r in requirements}
     kept, cleared = [], []

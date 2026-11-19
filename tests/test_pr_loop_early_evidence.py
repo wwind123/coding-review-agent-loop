@@ -568,3 +568,56 @@ def test_carried_requester_without_valid_citation_freezes_and_rerun_stops(tmp_pa
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_freeze_records(runner)) == len(freezes)
     assert not any(cmd[0] in {"codex", "gemini", "claude"} for cmd, _ in runner.commands[commands:])
+
+
+def test_primary_then_panel_requester_resolution_clears_after_digest_latch(tmp_path, monkeypatch, capsys):
+    """#2019 under a selective (primary-then-panel) policy with a scoped secondary blocker.
+
+    Any vote on a pending evidence obligation changes the ledger signature after
+    the round's digest checkpoint, so the next round raises the recovery digest
+    latch (pr_loop's machine-obligation digest check) instead of pausing the
+    requester; the requester's same-head approval is then carried, and the gate
+    must still clear it.
+    """
+    from agent_loop_helpers import patch_attr_in, structured_coder_followup
+    from coding_review_agent_loop.review_scheduling import TransitionClassification
+    from pr_loop_test_helpers import _staged_config
+    patch_attr_in(monkeypatch, (support, pr_loop), "_observe_pr_transition",
+        lambda *a, **k: TransitionClassification("narrow", "scoped fix"))
+    runner = FakeRunner(codex_outputs=[_evidence_review()],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_evidence_review(reviewer="Antigravity", evidence=[_EVIDENCE_TEXT])],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
+    config = _staged_config(tmp_path, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_check_runs_payload = {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]}
+    runner.advance_pr_head_on_coder_followup = False
+    runner.pr_payload["comments"].append(_signed("Screenshot accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[_resolve()]))
+    runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True,
+        dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}]))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", state="blocking", hr=True,
+        blocking=[{"text": "Fix the retry bound.", "fix_scope": ["src/worker.py"]}], dispositions=[_resolve()]))
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-2"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "The signed acceptance is supplied separately."}])]
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    agy_before = sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"])
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    err = capsys.readouterr().err
+    assert "scheduler obligation digest changed during recovery" in err
+    assert "skipping Antigravity; it approved unchanged PR head " + HEAD in err
+    # Antigravity resolved once (citation round) and was not invoked again.
+    assert sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"]) == agy_before + 1
+    assert not _freeze_records(runner)
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert len(cleared) == 1 and all(head == HEAD for _, head in cleared[0].metadata.evidence_clearances)
+    assert not cleared[0].metadata.prior_items
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not any(cmd[0] in {"codex", "gemini", "agy", "claude"} for cmd, _ in runner.commands[commands:])
