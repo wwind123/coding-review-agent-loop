@@ -221,3 +221,20 @@ def historical_projection(requirements, records):
         for item in m.prior_items:
             targets[item.item_id] = item
     return project(requirements, latest, tuple(targets.values()))
+
+
+def reviewer_owned_ids(requirements, projected):
+    """Return normalized labels of live signed sources the projection routed away from the coder.
+
+    Option A (#2020): evidence-only and human-only sources are reviewer-owned
+    exact-head evidence and never coder-dispositioned. Mixed sources keep their
+    original identity in the projection and therefore stay coder-owned, as do
+    sources with conflicting or missing classifications.
+    """
+    kept = {str(r.requirement_id).strip().lower() for r in projected or ()}
+    result = []
+    for source in requirements or ():
+        label = str(source.requirement_id).strip().lower()
+        if label and label not in kept and label not in result:
+            result.append(label)
+    return tuple(result)

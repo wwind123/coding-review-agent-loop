@@ -359,3 +359,155 @@ def test_plan_review_alias_not_honored_without_surfaced_set():
 def test_plan_state_alias_is_not_honored():
     with pytest.raises(AgentLoopError, match="requirement_id"):
         validate_structured_plan_state(_plan([_aliased(_HR_ID)]))
+
+
+# --- Reviewer-owned signed requirements are outside coder scope (#2020) ---
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    HumanRequirementDisposition,
+    validate_human_requirements_acknowledgement,
+    validate_structured_human_requirements_acknowledgement,
+)
+
+_CODER_ID = "hr-" + "a" * 64
+_OWNED_ID = "hr-" + "b" * 64
+_UNKNOWN_ID = "hr-" + "c" * 64
+
+
+def _disposition(requirement_id):
+    return HumanRequirementDisposition(requirement_id, "addressed", "Covered.")
+
+
+@pytest.mark.parametrize("surfaced", [(_CODER_ID,), ()])
+def test_disposition_naming_reviewer_owned_id_gets_out_of_scope_message(surfaced):
+    dispositions = [_disposition(item) for item in (*surfaced, _OWNED_ID)]
+    with pytest.raises(AgentLoopError) as error:
+        validate_human_requirement_dispositions(
+            dispositions,
+            surfaced_requirement_ids=surfaced,
+            context="coder_followup.human_requirement_dispositions",
+            reviewer_owned_requirement_ids=(_OWNED_ID.upper().replace("HR-", "hr-"),),
+        )
+    message = str(error.value)
+    assert _OWNED_ID in message
+    assert "outside coder scope" in message
+    assert "reviewer-owned exact-head evidence" in message
+    assert "unknown requirement ID" not in message
+    assert "must be empty when no signed human requirements" not in message
+
+
+def test_truly_unknown_disposition_id_keeps_unknown_message():
+    with pytest.raises(AgentLoopError, match="contains unknown requirement ID") as error:
+        validate_human_requirement_dispositions(
+            [_disposition(_CODER_ID), _disposition(_UNKNOWN_ID)],
+            surfaced_requirement_ids=(_CODER_ID,),
+            context="coder_followup.human_requirement_dispositions",
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+    assert "outside coder scope" not in str(error.value)
+    assert _UNKNOWN_ID in str(error.value)
+
+
+def test_mixed_reviewer_owned_and_unknown_disposition_ids_report_both():
+    with pytest.raises(AgentLoopError) as error:
+        validate_human_requirement_dispositions(
+            [_disposition(_CODER_ID), _disposition(_OWNED_ID), _disposition(_UNKNOWN_ID)],
+            surfaced_requirement_ids=(_CODER_ID,),
+            context="coder_followup.human_requirement_dispositions",
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+    message = str(error.value)
+    assert "outside coder scope" in message
+    assert f"also contains unknown requirement ID(s): {_UNKNOWN_ID}" in message
+    assert message.index(_OWNED_ID) < message.index("also contains unknown")
+
+
+def test_coder_scoped_dispositions_still_validate_with_reviewer_owned_ids():
+    validate_human_requirement_dispositions(
+        [_disposition(_CODER_ID)],
+        surfaced_requirement_ids=(_CODER_ID,),
+        reviewer_owned_requirement_ids=(_OWNED_ID,),
+    )
+    validate_human_requirement_dispositions(
+        [], surfaced_requirement_ids=(), reviewer_owned_requirement_ids=(_OWNED_ID,),
+    )
+
+
+def test_all_reviewer_owned_addressed_ids_get_out_of_scope_message():
+    """Early-return branch: nothing surfaced, no direct-discussion acknowledgement."""
+    with pytest.raises(AgentLoopError) as error:
+        validate_structured_human_requirements_acknowledgement(
+            [_OWNED_ID],
+            dispositions=(),
+            checked_discussion_directly=False,
+            surfaced_requirement_ids=(),
+            requires_direct_discussion_ack=False,
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+    message = str(error.value)
+    assert "outside coder scope" in message
+    assert _OWNED_ID in message
+    assert "no signed human requirements were surfaced" not in message
+    assert "arbitrary labels" not in message
+    assert "unknown" not in message
+
+
+def test_all_reviewer_owned_empty_acknowledgement_validates():
+    validate_structured_human_requirements_acknowledgement(
+        [],
+        dispositions=(),
+        checked_discussion_directly=False,
+        surfaced_requirement_ids=(),
+        requires_direct_discussion_ack=False,
+        reviewer_owned_requirement_ids=(_OWNED_ID,),
+    )
+
+
+def test_early_return_branch_keeps_generic_text_for_non_owned_labels():
+    with pytest.raises(AgentLoopError, match="even though no signed human requirements were surfaced"):
+        validate_structured_human_requirements_acknowledgement(
+            [_UNKNOWN_ID],
+            dispositions=(),
+            checked_discussion_directly=False,
+            surfaced_requirement_ids=(),
+            requires_direct_discussion_ack=False,
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+
+
+def test_partially_surfaced_reviewer_owned_addressed_id_uses_general_branch():
+    with pytest.raises(AgentLoopError) as error:
+        validate_structured_human_requirements_acknowledgement(
+            [_CODER_ID, _OWNED_ID],
+            dispositions=(_disposition(_CODER_ID),),
+            checked_discussion_directly=False,
+            surfaced_requirement_ids=(_CODER_ID,),
+            requires_direct_discussion_ack=False,
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+    message = str(error.value)
+    assert "outside coder scope" in message
+    assert "referenced unknown signed human requirement IDs" not in message
+    with pytest.raises(AgentLoopError, match="referenced unknown signed human requirement IDs"):
+        validate_structured_human_requirements_acknowledgement(
+            [_CODER_ID, _UNKNOWN_ID],
+            dispositions=(_disposition(_CODER_ID),),
+            checked_discussion_directly=False,
+            surfaced_requirement_ids=(_CODER_ID,),
+            requires_direct_discussion_ack=False,
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )
+
+
+def test_legacy_markdown_acknowledgement_forwards_reviewer_owned_ids():
+    text = (
+        "Updated.\n\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n"
+        f"- {_CODER_ID}: done.\n- {_OWNED_ID}: done.\n"
+    )
+    with pytest.raises(AgentLoopError, match="outside coder scope"):
+        validate_human_requirements_acknowledgement(
+            text,
+            surfaced_requirement_ids=(_CODER_ID,),
+            requires_direct_discussion_ack=False,
+            reviewer_owned_requirement_ids=(_OWNED_ID,),
+        )

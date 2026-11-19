@@ -369,3 +369,70 @@ def test_valid_mixed_leftovers_preserved_in_complete_review():
     assert parse_associations([entry]) == (entry,)
     assert parsed.requirement_evidence == (entry,)
     assert entry == before
+
+
+# --- Reviewer-owned routing helper (#2020) ---
+
+from coding_review_agent_loop.requirement_evidence import reviewer_owned_ids  # noqa: E402
+
+CODE_SOURCE = HumanReviewRequirement("PR comment", "maintainer", None, "https://example.test/2", "Fix the retry bound.")
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_reviewer_owned_ids_evidence_only(replay):
+    items, entry, text, parsed = setup_role("evidence-only")
+    reviews = {"Codex": parsed}
+    projected = historical_projection([SOURCE], _records(reviews, items)) if replay else project([SOURCE], reviews, items)
+    assert projected == ()
+    assert reviewer_owned_ids([SOURCE], projected) == (SOURCE.requirement_id.lower(),)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_reviewer_owned_ids_human_only(replay):
+    request = "Operator must accept the policy at this exact head."
+    review = SimpleNamespace(
+        requirement_evidence=({"requirement_id": SOURCE.requirement_id, "role": "human-only",
+            "request": request, "answered_item_ids": [], "leftover_instructions": ""},),
+        exact_head_evidence_requests=(request,))
+    reviews = {"Codex": review}
+    projected = historical_projection([SOURCE], _records(reviews, [])) if replay else project([SOURCE], reviews, [])
+    assert projected == ()
+    assert reviewer_owned_ids([SOURCE], projected) == (SOURCE.requirement_id,)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_reviewer_owned_ids_mixed_and_code_stay_coder_owned(replay):
+    items, entry, text, parsed = setup_role("mixed")
+    parsed = dataclasses.replace(parsed, requirement_evidence=(
+        entry, {"requirement_id": CODE_SOURCE.requirement_id, "role": "code", "request": "",
+                "answered_item_ids": [], "leftover_instructions": ""}))
+    reviews = {"Codex": parsed}
+    sources = [SOURCE, CODE_SOURCE]
+    projected = historical_projection(sources, _records(reviews, items)) if replay else project(sources, reviews, items)
+    assert [r.requirement_id for r in projected] == [SOURCE.requirement_id, CODE_SOURCE.requirement_id]
+    assert reviewer_owned_ids(sources, projected) == ()
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("fault", ["conflict", "unclassified"])
+def test_reviewer_owned_ids_conflict_or_unclassified_stay_coder_owned(replay, fault):
+    items, entry, text, parsed = setup_role("evidence-only")
+    if fault == "conflict":
+        items = [*items, dataclasses.replace(items[0], item_id="item-2", reviewer="Gemini")]
+        reviews = {"Codex": parsed, "Gemini": dataclasses.replace(parsed, requirement_evidence=(
+            _association(SOURCE.requirement_id, "code"),))}
+    else:
+        reviews = {"Codex": dataclasses.replace(parsed, requirement_evidence=())}
+    projected = historical_projection([SOURCE], _records(reviews, items)) if replay else project([SOURCE], reviews, items)
+    assert projected == (SOURCE,)
+    assert reviewer_owned_ids([SOURCE], projected) == ()
+
+
+def test_reviewer_owned_ids_mixed_set_lists_only_routed_sources():
+    items, entry, text, parsed = setup_role("evidence-only")
+    parsed = dataclasses.replace(parsed, requirement_evidence=(
+        entry, _association(CODE_SOURCE.requirement_id, "code")))
+    projected = project([SOURCE, CODE_SOURCE], {"Codex": parsed}, items)
+    assert projected == (CODE_SOURCE,)
+    assert reviewer_owned_ids([SOURCE, CODE_SOURCE], projected) == (SOURCE.requirement_id,)
+    assert reviewer_owned_ids([], ()) == ()

@@ -1018,6 +1018,7 @@ def _reconcile_human_requirements_ack_item(
     coder_output: str | None,
     human_requirements,
     source_round: int,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> list[UnresolvedReviewItem]:
     if coder_output is None:
         return list(unresolved_items)
@@ -1049,6 +1050,7 @@ def _reconcile_human_requirements_ack_item(
                 structured_implementation.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 context="issue_implementation.human_requirement_dispositions",
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
             validate_structured_human_requirements_acknowledgement(
                 structured_implementation.human_requirements.addressed_ids,
@@ -1056,6 +1058,7 @@ def _reconcile_human_requirements_ack_item(
                 checked_discussion_directly=structured_implementation.human_requirements.checked_discussion_directly,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1071,6 +1074,7 @@ def _reconcile_human_requirements_ack_item(
                 structured_followup.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 context="coder_followup.human_requirement_dispositions",
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
             validate_structured_human_requirements_acknowledgement(
                 structured_followup.human_requirements.addressed_ids,
@@ -1078,6 +1082,7 @@ def _reconcile_human_requirements_ack_item(
                 checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1102,6 +1107,7 @@ def _reconcile_human_requirements_ack_item(
                 coder_output,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1318,6 +1324,7 @@ def _validate_coder_followup_response(
     resolved_item_ids: Sequence[str] = (),
     excluded_item_ids: Sequence[str] = (),
     test_observations_mode: str = "degrade",
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1353,6 +1360,7 @@ def _validate_coder_followup_response(
             structured_followup.human_requirement_dispositions,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             context="coder_followup.human_requirement_dispositions",
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
         )
         validate_structured_human_requirements_acknowledgement(
             structured_followup.human_requirements.addressed_ids,
@@ -1360,6 +1368,7 @@ def _validate_coder_followup_response(
             checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
         )
         return structured_followup
 

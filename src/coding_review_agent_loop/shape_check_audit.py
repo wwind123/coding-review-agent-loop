@@ -1279,6 +1279,14 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "rather than a claim."
         ),
     ),
+    "_reject_reviewer_owned_labels": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "Fatal sites: no-conservative-reading: dropping a reviewer-owned signed ID the "
+            "coder named would silently hide misrouted signed-requirement work (#2020)."
+        ),
+    ),
     "_require_supported_schema_version": ShapeCheckClassification(
         "fatal",
         frozenset({"kind-or-version-mismatch"}),

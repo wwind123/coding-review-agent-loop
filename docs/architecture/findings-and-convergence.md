@@ -614,6 +614,23 @@ published pending evidence remain available for reviewer agreement or a human de
 cannot authorize acceptance: native requester citations and final live head/source
 reads retain that authority before and after freeze.
 
+Coder-disposition scope (#2020) follows the same projection. A signed source is
+the coder's to dispose exactly when the projection keeps it; every other live
+signed source (evidence-only or human-only) is reviewer-owned and never
+coder-dispositioned. `requirement_evidence.reviewer_owned_ids` derives that set,
+and the PR loop threads it into the coder prompt (a read-only notice that lists
+the bare IDs and says reviewer demands for their dispositions are non-actionable),
+coder follow-up validation, acknowledgement reconciliation, and reviewer guidance
+(a scope line telling reviewers to accept those IDs only through their own
+exact-head evidence path; the approval-marker rule still covers the whole signed
+set). A coder disposition or `addressed_ids` entry naming a reviewer-owned ID gets
+a distinct out-of-scope message, not "unknown requirement ID". The set is seeded each
+round, including the first resumed round, from the single `historical_projection`
+result used for reconciliation, and refreshed after each live projection, so live
+and resumed rounds derive it identically. Conflicting or missing classifications
+keep the source coder-owned. Plan-mode and standalone issue implementation have
+no projection and keep the empty set.
+
 
 ## Decisions
 

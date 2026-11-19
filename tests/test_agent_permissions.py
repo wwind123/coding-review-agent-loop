@@ -2156,3 +2156,52 @@ def test_release_symlink_boundaries(tmp_path):
     assert stat.S_IMODE(nested.stat().st_mode) == 0o700
     assert before == (external.lstat().st_mode, sentinel.lstat().st_mode, sentinel.read_bytes())
     shutil.rmtree(root)
+
+
+@pytest.mark.parametrize("racing_attempts", [0, 3, 10])
+def test_unlistable_root_listing_survives_concurrent_restore(tmp_path, monkeypatch, racing_attempts):
+    """A shared response root re-moded to 0o300 by a concurrent invocation
+    between our chmod and open is retried, not refused (managed CI flake on
+    PR #2024: 'Could not inspect response directory ... Permission denied')."""
+    root = tmp_path / "repo-root"
+    root.mkdir()
+    (root / "seat").mkdir()
+    os.chmod(root, ap.UNLISTABLE_DIR_MODE)
+    real_open = os.open
+    raced = []
+
+    def racing_open(path, flags, *args, **kwargs):
+        if str(path) == str(root) and len(raced) < racing_attempts:
+            raced.append(path)
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(ap.os, "open", racing_open)
+    monkeypatch.setattr(ap.time, "sleep", lambda _seconds: None)
+    try:
+        assert ap._list_unlistable(str(root)) == ["seat"]
+        assert len(raced) == racing_attempts
+        # The 0o300 mode is restored after every attempt, successful or not.
+        assert stat.S_IMODE(os.stat(root).st_mode) == ap.UNLISTABLE_DIR_MODE
+    finally:
+        os.chmod(root, 0o700)
+
+
+def test_unlistable_root_listing_still_fails_on_persistent_denial(tmp_path, monkeypatch):
+    root = tmp_path / "repo-root"
+    root.mkdir()
+    calls = []
+
+    def denied_open(path, flags, *args, **kwargs):
+        calls.append(path)
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(ap.os, "open", denied_open)
+    monkeypatch.setattr(ap.time, "sleep", lambda _seconds: None)
+    try:
+        with pytest.raises(PermissionError):
+            ap._list_unlistable(str(root))
+        assert len(calls) == ap._ROOT_LISTING_ATTEMPTS
+        assert stat.S_IMODE(os.stat(root).st_mode) == ap.UNLISTABLE_DIR_MODE
+    finally:
+        os.chmod(root, 0o700)

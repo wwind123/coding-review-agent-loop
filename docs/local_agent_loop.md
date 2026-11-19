@@ -9264,6 +9264,12 @@ A blocked disposition requires `state: "blocking"`, while not-applicable may
 appear in an approved response. Legacy markdown acknowledgements still list
 every surfaced requirement.
 
+In the PR loop, signed requirements that reviewers classified as evidence-only
+or human-only are reviewer-owned exact-head evidence, not coder work. The coder
+prompt lists them read-only. They never belong in either coder ledger, and
+naming one fails validation with an out-of-scope message. Reviewers accept them
+only through their own exact-head evidence path.
+
 A plan revision uses:
 
 ```json

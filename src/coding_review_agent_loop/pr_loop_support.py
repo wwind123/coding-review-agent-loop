@@ -5919,8 +5919,10 @@ def _record_failed_acknowledgement(
         text=(
             f"Reviewer(s) {', '.join(missing_reviewers)} approved without "
             "acknowledging the signed human requirements. Coder must address the "
-            "human requirements and ensure the reviewer explicitly resolves them "
-            "before approval."
+            "coder-owned signed human requirements surfaced in its prompt; the "
+            "reviewer must explicitly resolve the whole signed set before approval. "
+            "Reviewer-owned (evidence-only/human-only) signed requirements are not "
+            "coder work and need no coder disposition."
         ),
     )
     post_comment(
