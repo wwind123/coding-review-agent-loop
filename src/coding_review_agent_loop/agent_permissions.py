@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -156,6 +157,8 @@ TURN_DIR_PREFIX = "turn-"
 RESPONSE_FILE_NAME = "response.md"
 _ROOT_WARNED: set[str] = set()
 _LISTING_ATTEMPTS = 3
+# Owner-side root listing retries a concurrent 0o300 restore (shared tree).
+_ROOT_LISTING_ATTEMPTS = 25
 
 
 def _current_euid() -> int | None:
@@ -234,19 +237,32 @@ def is_listable_directory(path: Path | str) -> bool:
 
 
 def _list_unlistable(path: str) -> list[str]:
-    """Owner-side listing of a 0o300 directory: briefly 0o700, then restored."""
+    """Owner-side listing of a 0o300 directory: briefly 0o700, then restored.
+
+    Read permission is checked only when the directory is opened, so the
+    listing goes through a descriptor opened inside the short 0o700 window.
+    Concurrent invocations (or parallel test workers) sharing the response
+    tree may restore 0o300 between our chmod and open; that race is retried
+    with a short backoff instead of failing the launch after a few tries.
+    """
     last: OSError | None = None
-    for _attempt in range(_LISTING_ATTEMPTS):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    for attempt in range(_ROOT_LISTING_ATTEMPTS):
         try:
             os.chmod(path, 0o700)
             try:
-                return os.listdir(path)
+                fd = os.open(path, flags)
             finally:
                 os.chmod(path, UNLISTABLE_DIR_MODE)
+            try:
+                return os.listdir(fd)
+            finally:
+                os.close(fd)
         except PermissionError as exc:
             # A concurrent invocation restored 0o300 between our chmod and
-            # listdir; retry the owner-side listing.
+            # open; back off briefly and retry the owner-side listing.
             last = exc
+            time.sleep(min(0.001 * (attempt + 1), 0.02))
     assert last is not None
     raise last
 
