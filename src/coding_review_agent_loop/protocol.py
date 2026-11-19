@@ -1548,11 +1548,45 @@ def _reject_legacy_requirement_labels(
         )
 
 
+def _reviewer_owned_label_set(reviewer_owned_requirement_ids: Sequence[str]) -> set[str]:
+    """Normalize the known signed IDs routed outside coder scope (#2020)."""
+    return {str(item).strip().lower() for item in reviewer_owned_requirement_ids or () if str(item).strip()}
+
+
+def _reviewer_owned_out_of_scope_message(context: str, ids: Sequence[str]) -> str:
+    return (
+        f"{context} names signed requirement ID(s) {', '.join(ids)} that are routed to "
+        "reviewer-owned exact-head evidence (evidence-only/human-only) and are outside coder "
+        "scope; omit them from human_requirement_dispositions and human_requirements.addressed_ids. "
+        "A reviewer demand for a coder disposition of these IDs is non-actionable for the coder."
+    )
+
+
+def _reject_reviewer_owned_labels(
+    labels: Sequence[str],
+    *,
+    reviewer_owned_requirement_ids: Sequence[str],
+    context: str,
+) -> None:
+    owned = _reviewer_owned_label_set(reviewer_owned_requirement_ids)
+    if not owned:
+        return
+    normalized = {str(item).strip().lower(): str(item) for item in labels}
+    named = sorted(set(normalized) & owned)
+    if named:
+        message = _reviewer_owned_out_of_scope_message(context, named)
+        rest = sorted(normalized[label] for label in set(normalized) - owned)
+        if rest:
+            message += f" {context} also contains unknown requirement ID(s): {', '.join(rest)}"
+        raise AgentLoopError(message)  # shape-check: fatal:no-conservative-reading
+
+
 def validate_human_requirements_acknowledgement(
     text: str,
     *,
     surfaced_requirement_ids: Sequence[str],
     requires_direct_discussion_ack: bool,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> None:
     parsed = parse_human_requirements_acknowledgement(text)  # shape-check: fatal:no-conservative-reading
     validate_structured_human_requirements_acknowledgement(  # shape-check: fatal:no-conservative-reading
@@ -1565,6 +1599,7 @@ def validate_human_requirements_acknowledgement(
         requires_direct_discussion_ack=requires_direct_discussion_ack,
         marker_present=parsed.marker_present,
         section_present=parsed.section_present,
+        reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
     )
 
 
@@ -1577,9 +1612,15 @@ def validate_structured_human_requirements_acknowledgement(
     requires_direct_discussion_ack: bool,
     marker_present: bool = True,
     section_present: bool = True,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> None:
     if not surfaced_requirement_ids and not requires_direct_discussion_ack:
         if addressed_ids:
+            _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
+                addressed_ids,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+                context="Coder response human_requirements.addressed_ids",
+            )
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 "Coder response listed signed human requirement IDs even though no signed human "
                 "requirements were surfaced. Use `human_requirements.addressed_ids: []`; issue "
@@ -1622,6 +1663,11 @@ def validate_structured_human_requirements_acknowledgement(
     expected_ids = tuple(_normalize_requirement_label(item_id) for item_id in surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
     unknown = sorted(set(normalized_addressed_ids) - set(expected_ids))
     if unknown:
+        _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
+            unknown,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            context="Coder response human_requirements.addressed_ids",
+        )
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             "Coder response referenced unknown signed human requirement IDs: "
             + ", ".join(unknown)
@@ -2806,6 +2852,7 @@ def validate_human_requirement_dispositions(
     *,
     surfaced_requirement_ids: Sequence[str],
     context: str = "human_requirement_dispositions",
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> None:
     expected = tuple(_normalize_requirement_label(item) for item in surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
     actual = [item.requirement_id for item in dispositions]
@@ -2815,6 +2862,13 @@ def validate_human_requirement_dispositions(
         raise AgentLoopError(f"{context} contains duplicate requirement ID(s): {', '.join(duplicates)}")  # shape-check: fatal:no-conservative-reading
     unknown = sorted(set(actual) - set(expected))
     if unknown:
+        # A known signed ID routed to reviewer-owned evidence is not "unknown"
+        # (#2020); name it as outside coder scope, even when nothing is surfaced.
+        _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
+            unknown,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            context=context,
+        )
         raise AgentLoopError(f"{context} contains unknown requirement ID(s): {', '.join(unknown)}")  # shape-check: fatal:no-conservative-reading
     missing = sorted(set(expected) - set(actual))
     if missing:
