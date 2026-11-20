@@ -5786,6 +5786,9 @@ def run_pr_loop(
                         **_pr_review_validators(reviewer_name), usage_context=usage_context, **CLASSIFICATION_INVOKE_OPTIONS))
                 review_state = parsed_review.state
                 if review_output != classification_input: early_published_pr_reviewers.discard(reviewer)
+                if review_output != classification_input and resumed_record is not None and resumed_record.metadata.phase != "publication" and reviewer_name in classification_resume_kinds:
+                    # Persist an admitted settlement's reconciled classification with its finding IDs and acquisition identity (#2035).
+                    _post_pr_reviewer_comment(reviewer_name, parsed_review, review_output=review_output, model_used=review_model_used, identity=resumed_record.metadata, acquisition_outcome=review_acquisition_outcome, acquisition_returncode=review_acquisition_returncode, new_items=tuple(resumed_record.metadata.new_items))
                 classified_review_carriers[reviewer_name] = parsed_review
                 if carried_approval_record is None:
                     round_review_models[reviewer_name] = review_model_used
@@ -5997,7 +6000,7 @@ def run_pr_loop(
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed_review, review_output=review_output,
                                 model_used=review_model_used,
-                                identity=(review_response if resumed_record is None else None),
+                                identity=(review_response if resumed_record is None else resumed_record.metadata),
                                 acquisition_outcome=review_acquisition_outcome,
                                 acquisition_returncode=review_acquisition_returncode,
                                 new_items=tuple(reviewer_new_unresolved_items),
@@ -6029,7 +6032,7 @@ def run_pr_loop(
                         _post_pr_reviewer_comment(
                             reviewer_name, parsed_review, review_output=review_output,
                             model_used=review_model_used,
-                            identity=(review_response if resumed_record is None else None),
+                            identity=(review_response if resumed_record is None else resumed_record.metadata),
                             acquisition_outcome=review_acquisition_outcome,
                             acquisition_returncode=review_acquisition_returncode,
                             new_items=tuple(reviewer_new_unresolved_items),

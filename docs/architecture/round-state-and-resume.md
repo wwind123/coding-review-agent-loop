@@ -775,6 +775,10 @@ records; every continuation on either kind is pinned to the published verdict
 and blocking findings, and a change stops for a human decision before coder
 dispatch. Reconciled rounds, changed requirement sets, legacy identities and
 plan, acquisition or seat-binding mismatches are never admitted (#2035).
+A reclassified restored review posts its settlement with the original review's
+acquisition identity, and an admitted authoritative settlement whose role is
+reconciled posts the new classification with its existing finding IDs, so a
+later rerun restores the reconciled role and still passes acquisition checks.
 Acceptance still depends on current live content-bound citations and exact-head
 requester attestations; terminal publication, partial acceptance and push
 invalidation use the existing evidence release/freeze records.
