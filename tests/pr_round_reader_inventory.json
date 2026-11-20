@@ -479,6 +479,14 @@
       "occurrence": 1
     },
     {
+      "module": "dispute_release",
+      "function": "coder_dispute_times",
+      "call": "_extract_round_metadata_records(comments, flow='pr')",
+      "family": "rounds",
+      "provenance": "dispute_release.coder_dispute_times: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure dispute-time reducer (#2025): pr_loop.run_pr_loop passes the round's admitted observed pr_context.comments once per round; created_at is read from the same admitted comment at the record's original index, and an unpublished invocation re-dispute fails closed.",
+      "occurrence": 1
+    },
+    {
       "module": "execution_policy",
       "function": "_handle_plan_first_split_scope",
       "call": "has_unfiled_split_warning(issue_context.comments, issue_number=issue_number, subject=plan_subject)",

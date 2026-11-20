@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from .errors import (
@@ -16,7 +17,8 @@ from .errors import (
     UnknownPriorItemDispositionError,
     prior_item_disposition_guidance,
 )
-from .github import PullRequestMergeability
+from .github import PullRequestMergeability, _parse_github_timestamp
+from .prompt_context import released_dispute_pointer_lines
 from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
@@ -760,35 +762,94 @@ def _is_disputed_item(item: UnresolvedReviewItem) -> bool:
     return any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)
 
 
-def _raise_if_maintained_disputed_items(
+def _disputed_still_blocking(
     unresolved_items: Sequence[UnresolvedReviewItem],
     *,
     prior_items: Sequence[UnresolvedReviewItem],
-) -> None:
-    """Stop after one reconsideration when a disputed blocker remains active."""
+) -> list[UnresolvedReviewItem]:
     prior_item_ids = {item.item_id for item in prior_items}
-    disputed_still_blocking = [
+    return [
         item
         for item in unresolved_items
         if item.item_id in prior_item_ids
         and item.status in {"blocking", "same-pr"}
         and _is_disputed_item(item)
     ]
+
+
+def released_dispute_requirement_ids(
+    items: Sequence[UnresolvedReviewItem],
+    dispute_times: Mapping[str, datetime.datetime | None],
+    effective_requirements: Sequence[object],
+) -> dict[str, tuple[str, ...]]:
+    """Map each released disputed item to the newer signed requirement IDs (#2025).
+
+    A carried coder dispute is released only when its dispute time is known
+    and at least one requirement in the loop's effective signed-requirement
+    set has a parseable ``created_at`` strictly later than that time. An
+    unknown dispute time, a tie, or an unparseable requirement timestamp
+    never releases anything (fail closed). Release only routes the item back
+    to the coder and reviewers; it never approves or merges.
+    """
+    dated: list[tuple[datetime.datetime, str]] = []
+    for requirement in effective_requirements:
+        created = _parse_github_timestamp(getattr(requirement, "created_at", None))
+        requirement_id = getattr(requirement, "requirement_id", None)
+        if created is None or not isinstance(requirement_id, str) or not requirement_id:
+            continue
+        dated.append((created, requirement_id))
+    released: dict[str, tuple[str, ...]] = {}
+    for item in items:
+        if not _is_disputed_item(item) or item.item_id in released:
+            continue
+        disputed_at = dispute_times.get(item.item_id)
+        if disputed_at is None:
+            continue
+        newer = sorted({requirement_id for created, requirement_id in dated if created > disputed_at})
+        if newer:
+            released[item.item_id] = tuple(newer)
+    return released
+
+
+def _format_dispute_time(value: datetime.datetime | None) -> str:
+    if value is None:
+        return "unknown"
+    return value.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _raise_if_maintained_disputed_items(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    prior_items: Sequence[UnresolvedReviewItem],
+    released_item_ids: Collection[str] = (),
+    dispute_times: Mapping[str, datetime.datetime | None] | None = None,
+) -> None:
+    """Stop after one reconsideration when a disputed blocker remains active.
+
+    Items whose dispute was released by a newer signed requirement are
+    excluded (#2025). The message names only item IDs, dispute times and
+    recovery steps; it never echoes item text or dispute evidence.
+    """
+    released = set(released_item_ids)
+    disputed_still_blocking = [
+        item
+        for item in _disputed_still_blocking(unresolved_items, prior_items=prior_items)
+        if item.item_id not in released
+    ]
     if not disputed_still_blocking:
         return
-    item_summaries = "\n".join(
-        "\n".join(
-            [
-                f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}",
-                *[f"  Update/evidence: {note}" for note in item.notes],
-            ]
-        )
+    times = dispute_times or {}
+    item_lines = "\n".join(
+        f"- [{item.item_id}] disputed at {_format_dispute_time(times.get(item.item_id))}"
         for item in disputed_still_blocking
     )
     raise HumanDecisionRequiredError(
         f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
         "after seeing coder counter-evidence. Human decision required to resolve the "
-        f"disagreement.\n\nDisputed items still unresolved:\n{item_summaries}"
+        f"disagreement.\n\nDisputed items still unresolved:\n{item_lines}\n\n"
+        "Recovery: post a signed human decision, then rerun. The stop releases "
+        "automatically once a signed requirement created after an item's dispute "
+        "time is admitted; an item whose dispute time is unknown stays stopped."
     )
 
 
@@ -1018,6 +1079,7 @@ def _reconcile_human_requirements_ack_item(
     coder_output: str | None,
     human_requirements,
     source_round: int,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> list[UnresolvedReviewItem]:
     if coder_output is None:
         return list(unresolved_items)
@@ -1049,6 +1111,7 @@ def _reconcile_human_requirements_ack_item(
                 structured_implementation.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 context="issue_implementation.human_requirement_dispositions",
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
             validate_structured_human_requirements_acknowledgement(
                 structured_implementation.human_requirements.addressed_ids,
@@ -1056,6 +1119,7 @@ def _reconcile_human_requirements_ack_item(
                 checked_discussion_directly=structured_implementation.human_requirements.checked_discussion_directly,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1071,6 +1135,7 @@ def _reconcile_human_requirements_ack_item(
                 structured_followup.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 context="coder_followup.human_requirement_dispositions",
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
             validate_structured_human_requirements_acknowledgement(
                 structured_followup.human_requirements.addressed_ids,
@@ -1078,6 +1143,7 @@ def _reconcile_human_requirements_ack_item(
                 checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1102,6 +1168,7 @@ def _reconcile_human_requirements_ack_item(
                 coder_output,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             )
         except AgentLoopError as exc:
             return _upsert_human_requirements_ack_item(
@@ -1318,6 +1385,7 @@ def _validate_coder_followup_response(
     resolved_item_ids: Sequence[str] = (),
     excluded_item_ids: Sequence[str] = (),
     test_observations_mode: str = "degrade",
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1353,6 +1421,7 @@ def _validate_coder_followup_response(
             structured_followup.human_requirement_dispositions,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             context="coder_followup.human_requirement_dispositions",
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
         )
         validate_structured_human_requirements_acknowledgement(
             structured_followup.human_requirements.addressed_ids,
@@ -1360,6 +1429,7 @@ def _validate_coder_followup_response(
             checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
         )
         return structured_followup
 
@@ -2121,7 +2191,10 @@ def format_sub_item_lines(item: UnresolvedReviewItem) -> list[str]:
     return lines
 
 
-def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> str:
+def _format_same_pr_unresolved_items(
+    items: Sequence[UnresolvedReviewItem],
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
+) -> str:
     lines: list[str] = []
     for item in select_coder_followup_items(items):
         lines.append(
@@ -2143,11 +2216,15 @@ def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> s
         if item.notes:
             lines.append("Latest reviewer updates:")
             lines.extend(f"- {note}" for note in item.notes)
+        lines.extend(released_dispute_pointer_lines(item.item_id, released_disputes))
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) -> str:
+def _format_unresolved_items_for_coder(
+    items: Sequence[UnresolvedReviewItem],
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
+) -> str:
     lines: list[str] = []
     for item in select_coder_followup_items(items):
         lines.append(
@@ -2177,6 +2254,7 @@ def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) ->
         if item.notes:
             lines.append("Latest reviewer updates:")
             lines.extend(f"- {note}" for note in item.notes)
+        lines.extend(released_dispute_pointer_lines(item.item_id, released_disputes))
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -2206,10 +2284,11 @@ def _format_human_requirements_ack_for_coder(
 
 def format_coder_followup_context(
     unresolved_items: Sequence[UnresolvedReviewItem],
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     """Render classifiable coder work plus dedicated synthetic obligations."""
     sections = [
-        _format_unresolved_items_for_coder(unresolved_items),
+        _format_unresolved_items_for_coder(unresolved_items, released_disputes),
         _format_human_requirements_ack_for_coder(unresolved_items),
     ]
     return "\n\n".join(section for section in sections if section)

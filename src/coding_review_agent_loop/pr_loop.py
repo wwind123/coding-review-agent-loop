@@ -323,6 +323,7 @@ from .round_visibility import (
     visible_peer_names,
 )
 from .legacy_machine_items import consumed_acknowledgement_disposition
+from .dispute_release import carries_dispute, round_dispute_release, stop_for_held_disputes
 from .unresolved_items import (
     ClearedItemProgress,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
@@ -344,7 +345,6 @@ from .unresolved_items import (
     _reconcile_merge_conflict_item,
     _record_prior_item_disposition,
     _reconcile_human_requirements_ack_item,
-    _raise_if_maintained_disputed_items,
     select_coder_followup_items,
     excluded_coder_followup_item_ids,
     _frozen_evidence_obligations,
@@ -565,7 +565,7 @@ from .pr_board_entry import _enforce_pr_board_floor
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
-from .requirement_evidence import historical_projection, classify_review, project, validate_associations
+from .requirement_evidence import historical_projection, classify_review, project, reviewer_owned_ids, validate_associations
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -3279,6 +3279,7 @@ def run_pr_loop(
                 parent_issue_context=parent_issue_context,
             )
             unresolved_items, human_requirements = round_start(post_merge_run, pr_context, unresolved_items, requirements_context.effective_requirements, round_number)
+            dispute_release = round_dispute_release(pr_comments, unresolved_items, requirements_context.effective_requirements, latest_coder=latest_coder_metadata)
             if qualification_checkpoint is not None and qualification_checkpoint.valid:
                 checkpoint_plan = (
                     approved_plan_context.plan_hash
@@ -3335,11 +3336,12 @@ def run_pr_loop(
                     current_resume, head_review_recovery_post_required=False
                 )
                 current_resume = resumed_round
+            # One historical projection seeds reconciliation and this round's reviewer-owned set (#2020).
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
-                human_requirements=historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments)),
-                source_round=round_number,
+                human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments))),
+                source_round=round_number, reviewer_owned_requirement_ids=(reviewer_owned_requirement_ids := reviewer_owned_ids(human_requirements, resumed_coder_requirements)),
             )
             # A CI obligation is bound to the head that failed.  Only a
             # strictly different live head may become a qualification
@@ -5315,7 +5317,7 @@ def run_pr_loop(
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
-                                human_requirements=human_requirements,
+                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, released_disputes=dispute_release.released,
                                 unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, agent_display_name(reviewer)),
                                 compact_context=(
                                     use_compact_pr_context
@@ -5694,7 +5696,7 @@ def run_pr_loop(
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
-                                human_requirements=human_requirements,
+                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, released_disputes=dispute_release.released,
                                 unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
                                 compact_context=reviewer_compact_context,
                                 compact_prior=(
@@ -6246,7 +6248,7 @@ def run_pr_loop(
                     f"{pr_metadata.head_sha} by its requesting reviewer(s): "
                     + ", ".join(identity for identity, _head in round_evidence_clearances),
                 )
-            coder_requirements = project(human_requirements, classified_review_carriers, prior_unresolved_items)
+            reviewer_owned_requirement_ids = reviewer_owned_ids(human_requirements, coder_requirements := project(human_requirements, classified_review_carriers, prior_unresolved_items))
             if human_requirements and any(
                 item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
                 for item in unresolved_items
@@ -6573,27 +6575,12 @@ def run_pr_loop(
                     evidence_revalidation_required = True
 
             if must_fix_items:
-                try:
-                    _raise_if_maintained_disputed_items(
-                        must_fix_items,
-                        prior_items=prior_unresolved_items,
-                    )
-                except HumanDecisionRequiredError as exc:
-                    post_pr_comment(
-                        runner,
-                        config=config,
-                        pr_number=pr_number,
-                        body=(
-                            "## Human decision required\n\n"
-                            f"{exc}\n\n"
-                            "Post a PR comment that states the decision and required action, "
-                            "and end it with the standalone signature `-- Human Reviewer`. "
-                            "Then rerun this PR; no coder, CI, qualification, or merge was "
-                            "started from this decision boundary.\n\n"
-                            "-- coding-review-agent-loop"
-                        ),
-                    )
-                    raise
+                # Released disputes (#2025) skip this stop; the notice is best-effort.
+                stop_for_held_disputes(
+                    must_fix_items, prior_items=prior_unresolved_items, release=dispute_release,
+                    post_notice=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body),
+                    log_failure=lambda message: log(config, f"Round {round_number}: {message}"),
+                )
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:
@@ -9031,7 +9018,7 @@ def run_pr_loop(
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
                 ]
                 coder_followup_items = select_coder_followup_items(other_items)
-                combined_review = summary_context + format_coder_followup_context(other_items)
+                combined_review = summary_context + format_coder_followup_context(other_items, dispute_release.released)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     coder_requirements
                 )
@@ -9057,7 +9044,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                     base_branch=resolved_base_branch,
                     head_sha=resolved_head_sha,
                     merge_state_detail=merge_state_detail,
@@ -9072,7 +9059,7 @@ def run_pr_loop(
                 # the validator and repair pass on the exact same visible
                 # classifiable item set as the same-PR prompt.
                 coder_followup_items = select_coder_followup_items(same_pr_items)
-                combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items)
+                combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items, dispute_release.released)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     coder_requirements
                 )
@@ -9083,7 +9070,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
@@ -9097,7 +9084,7 @@ def run_pr_loop(
             else:
                 # Prompt and validator share the selected work (#1389).
                 coder_followup_items = select_coder_followup_items(unresolved_items)
-                combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
+                combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items, dispute_release.released)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     coder_requirements
                 )
@@ -9108,7 +9095,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
@@ -9291,13 +9278,13 @@ def run_pr_loop(
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
                     architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
+                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
                         resolved_item_ids=resolved_ids,
                         excluded_item_ids=excluded_ids,
-                        human_requirements=coder_requirements,
+                        human_requirements=coder_requirements, reviewer_owned_requirement_ids=owned_ids,
                         # New follow-ups require the v1 architecture contract.
                         required_architecture_impact_contract=1,
                         delivered_risk_test_matrix=(
@@ -9403,7 +9390,7 @@ def run_pr_loop(
                     unresolved_items,
                     coder_output=coder_output,
                     human_requirements=coder_requirements,
-                    source_round=round_number,
+                    source_round=round_number, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                 )
                 updated_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number,
                     origin=diagnostic_origin(managed_ci),
@@ -9859,6 +9846,9 @@ def run_pr_loop(
             prefetched_pr_context = (
                 get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
                 if any(item.converted_row_id for item in latest_coder_metadata.prior_items)
+                # A carried dispute's release reads requirements and dispute
+                # times from one fresh admitted snapshot per round (#2025).
+                or carries_dispute(unresolved_items)
                 else updated_pr_context
             )
 

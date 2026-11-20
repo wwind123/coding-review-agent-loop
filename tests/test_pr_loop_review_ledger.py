@@ -1110,7 +1110,11 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
     ) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
+    # The decision boundary names only item IDs and dispute times (#2025).
+    assert "I checked and the pricing is still wrong." not in str(excinfo.value)
+    assert "Official docs confirm" not in str(excinfo.value)
+    # The next round refetches admitted history, so the coder record's time is known.
+    assert re.search(r"\[item-1\] disputed at 2026-05-23T00:00:\d\dZ", str(excinfo.value))
     release_command = [
         "gh",
         "api",
@@ -1130,7 +1134,8 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
     assert comment_command[:4] == ["gh", "pr", "comment", "77"]
     assert "--body-file" in comment_command
     assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
-    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
+    assert "I checked and the pricing is still wrong." not in human_decision_comment
+    assert "gemini-3.5-flash pricing constant" not in human_decision_comment
     assert "-- Human Reviewer" in human_decision_comment
     comment_index = commands.index(comment_command)
     assert comment_index < release_index

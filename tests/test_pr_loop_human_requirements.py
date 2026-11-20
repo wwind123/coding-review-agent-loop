@@ -1335,3 +1335,196 @@ def test_mixed_wording_difference_dispatches_merged_requirement(tmp_path, mode):
     codex_line = block.index("- Codex: Fix retries.")
     gemini_line = block.index("- Gemini: Repair retries.")
     assert codex_line < gemini_line
+
+
+# --- Evidence-only signed requirements are reviewer-owned (#2020, #2299 shape) ---
+
+_REVIEWER_OWNED_NOTICE = "Reviewer-owned signed requirements (read-only):"
+_REVIEWER_SCOPE_LINE = "Coder disposition scope:"
+
+
+def _evidence_only_cited_round(tmp_path, mode, *, accepted=True):
+    """One evidence-only signed source whose requester demands a coder disposition."""
+    from pr_loop_test_helpers import _classified_review, _association, _resolve
+    from test_pr_loop_early_evidence import deferred, acceptance, HEAD
+
+    runner, config = deferred(tmp_path, mode=mode)
+    runner.advance_pr_head_on_coder_followup = False
+    rid = acceptance(runner, "Accepted for " + HEAD + "; manifest verified.")
+    entry = _association(rid, "evidence-only", answers=["item-1"])
+    evidence_vote = ({**_resolve(), "evidence_requirement_ids": [rid]} if accepted else
+        {"item_id": "item-1", "disposition": "blocking", "note": "Acceptance remains pending."})
+    demand = f"The coder must record a human_requirement_disposition for signed requirement {rid}."
+    runner.codex_outputs[-1] = _classified_review([entry], state="blocking", blocking=[demand],
+        dispositions=[evidence_vote])
+    return runner, config, rid, entry, evidence_vote
+
+
+def _non_actionable_followup():
+    return structured_coder_followup(
+        disputed_items=["item-2"],
+        dispute_evidence={"item-2": "Reviewer-owned evidence-only signed requirement; non-actionable for the coder."},
+        human_requirement_dispositions=[],
+    )
+
+
+def _ack_item_ever_recorded(runner):
+    from pr_loop_test_helpers import _pr_records
+    return any(item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
+               for record in _pr_records(runner)
+               for item in (*record.metadata.prior_items, *record.metadata.new_items))
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_evidence_only_requirement_cited_by_reviewer_validates_without_repair(tmp_path, mode, capsys):
+    from pr_loop_test_helpers import _classified_review, _resolve, _release_records
+
+    runner, config, rid, entry, evidence_vote = _evidence_only_cited_round(tmp_path, mode)
+    runner.claude_outputs = [_non_actionable_followup()]
+    runner.codex_outputs.append(_classified_review([entry], hr=True,
+        dispositions=[evidence_vote, _resolve("item-2", "Reviewer-owned; evidence accepted directly.")]))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    # Exactly one coder turn: the follow-up validated on its first attempt.
+    assert len(prompts) == 1
+    assert "repair" not in capsys.readouterr().err.lower()
+    assert f"Requirement {rid}:" not in prompts[0]
+    notice = prompts[0].split(_REVIEWER_OWNED_NOTICE, 1)[1].split("\n", 1)[0]
+    assert f"`{rid}`" in notice
+    assert "non-actionable" in notice
+    assert not _ack_item_ever_recorded(runner)
+    # The resumed second reviewer round lists the evidence-only ID as reviewer-owned.
+    review_prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex"]
+    assert f"`{rid}`" in review_prompts[-1].split(_REVIEWER_SCOPE_LINE, 1)[1].split("\n", 1)[0]
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in review_prompts[-1]
+    assert not runner.codex_outputs and not runner.claude_outputs
+    assert _release_records(runner) is not None
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_evidence_only_classification_alone_is_not_acceptance(tmp_path, mode):
+    """Routing never grants acceptance: pending evidence freezes, no coder disposition is needed."""
+    from pr_loop_test_helpers import _classified_review, _release_records, _freeze_records
+
+    runner, config, rid, entry, evidence_vote = _evidence_only_cited_round(tmp_path, mode, accepted=False)
+    runner.claude_outputs = [_non_actionable_followup()]
+    runner.codex_outputs.append(_classified_review([entry], hr=True, state="blocking",
+        dispositions=[evidence_vote, {"item_id": "item-2", "disposition": "resolved"}]))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3))
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"]
+    assert len(prompts) == 1
+    assert not _ack_item_ever_recorded(runner)
+    assert not any(r.metadata.evidence_release.reason == "evidence-cleared" for r in _release_records(runner))
+    assert [i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items] == ["item-1"]
+
+
+def test_coder_naming_evidence_only_id_gets_out_of_scope_message(tmp_path):
+    from coding_review_agent_loop.errors import AgentInvocationError
+
+    runner, config, rid, entry, evidence_vote = _evidence_only_cited_round(tmp_path, "full")
+    runner.claude_outputs = [
+        structured_coder_followup(disputed_items=["item-2"], dispute_evidence={"item-2": "Recorded."},
+            human_requirement_ids=[rid], human_requirement_dispositions=[{
+                "requirement_id": rid, "disposition": "addressed", "evidence": "Acknowledged."}]),
+    ]
+    with pytest.raises(AgentInvocationError) as error:
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3))
+    message = str(error.value)
+    assert "coder_followup.human_requirement_dispositions names signed requirement ID(s)" in message
+    assert rid in message and "outside coder scope" in message
+    assert "unknown requirement ID" not in message
+
+
+@pytest.mark.parametrize("mode", ["compact", "full"])
+def test_resumed_round_reuses_historical_projection_for_reviewer_owned_ids(tmp_path, mode, monkeypatch):
+    """A rerun seeds reconciliation and the first reviewer prompt from one historical projection."""
+    from pr_loop_test_helpers import _classified_review, _resolve
+    from coding_review_agent_loop import requirement_evidence
+
+    runner, config, rid, entry, evidence_vote = _evidence_only_cited_round(tmp_path, mode)
+    runner.claude_outputs = [_non_actionable_followup()]
+    # Stop after the coder turn (the next reviewer output is exhausted) so the
+    # next invocation resumes from the recorded GitHub round state.
+    from coding_review_agent_loop.errors import AgentInvocationError
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3))
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "claude"]) == 1
+    calls = []
+    seeded = []
+    real_projection = pr_loop.historical_projection
+    real_owned = pr_loop.reviewer_owned_ids
+
+    def recording_projection(requirements, records):
+        result = real_projection(requirements, records)
+        calls.append(result)
+        return result
+
+    def recording_owned(requirements, projected):
+        result = real_owned(requirements, projected)
+        seeded.append((projected, result))
+        return result
+
+    monkeypatch.setattr(pr_loop, "historical_projection", recording_projection)
+    monkeypatch.setattr(pr_loop, "reviewer_owned_ids", recording_owned)
+    before = len(runner.commands)
+    runner.codex_outputs = [_classified_review([entry], hr=True,
+        dispositions=[evidence_vote, _resolve("item-2", "Reviewer-owned; evidence accepted directly.")])]
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
+    review_prompts = [cmd[-1] for cmd, _ in runner.commands[before:] if cmd[0] == "codex"]
+    assert review_prompts
+    scope = review_prompts[0].split(_REVIEWER_SCOPE_LINE, 1)[1].split("\n", 1)[0]
+    assert f"`{rid}`" in scope
+    # The first reviewer-owned set derives from the very projection object
+    # used for reconciliation, never a recomputation with different inputs.
+    assert calls and seeded[0][0] is calls[0]
+    assert seeded[0][1] == (rid,)
+    assert requirement_evidence.reviewer_owned_ids(
+        _parse_pr_human_requirements(runner.pr_payload), calls[0]) == (rid,)
+    assert not _ack_item_ever_recorded(runner)
+    assert not [cmd for cmd, _ in runner.commands[before:] if cmd[0] == "claude"]
+
+
+def test_review_guidance_scope_line_only_when_reviewer_owned_ids_exist():
+    from coding_review_agent_loop import prompt_support
+    requirement = HumanReviewRequirement("PR comment", "maintainer", None, "https://example.test/1", "Accept it.")
+    baseline = prompt_support._human_requirements_review_guidance([requirement])
+    assert prompt_support._human_requirements_review_guidance(
+        [requirement], reviewer_owned_requirement_ids=()) == baseline
+    assert _REVIEWER_SCOPE_LINE not in baseline
+    owned = prompt_support._human_requirements_review_guidance(
+        [requirement], reviewer_owned_requirement_ids=(requirement.requirement_id,))
+    assert _REVIEWER_SCOPE_LINE in owned
+    assert f"`{requirement.requirement_id}`" in owned
+    assert "exact_head_evidence_requests" in owned and "evidence_requirement_ids" in owned
+    # The approval-marker rule is not weakened.
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in owned
+    assert "If any signed human requirement in this set is unresolved, return blocking." in owned
+    assert owned.replace(prompt_support._reviewer_owned_review_scope_line((requirement.requirement_id,)), "") == baseline
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_review_prompt_builders_thread_reviewer_owned_ids(tmp_path, compact):
+    from coding_review_agent_loop.prompts import build_review_prompt
+    requirement = HumanReviewRequirement("PR comment", "maintainer", None, "https://example.test/1", "Accept it.")
+    config = make_config(tmp_path)
+    kwargs = dict(reviewer=config.reviewers[0] if hasattr(config, "reviewers") else "codex",
+                  human_requirements=[requirement], compact_context=compact)
+    plain = build_review_prompt(77, 2, config, **kwargs)
+    scoped = build_review_prompt(77, 2, config, reviewer_owned_requirement_ids=(requirement.requirement_id,), **kwargs)
+    assert _REVIEWER_SCOPE_LINE not in plain
+    assert f"`{requirement.requirement_id}`" in scoped.split(_REVIEWER_SCOPE_LINE, 1)[1].split("\n", 1)[0]
+
+
+def test_coder_followup_guidance_notice_only_when_reviewer_owned_ids_exist():
+    from coding_review_agent_loop import prompt_support
+    owned_id = "hr-" + "b" * 64
+    context = prompt_support.render_coder_human_requirements_prompt_context(())
+    baseline = prompt_support._coder_human_requirements_guidance(context, response_kind="coder_followup")
+    assert _REVIEWER_OWNED_NOTICE not in baseline
+    with_notice = prompt_support._coder_human_requirements_guidance(
+        context, response_kind="coder_followup", reviewer_owned_requirement_ids=(owned_id,))
+    assert with_notice.startswith(baseline.rstrip("\n"))
+    assert f"`{owned_id}`" in with_notice
+    assert "No signed human requirements were surfaced." in with_notice
+    assert context.surfaced_requirement_ids == ()

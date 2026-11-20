@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -25,6 +25,33 @@ claims. Duplicates are checked first; unknown IDs and excluded disputes still fa
 This does not clear evidence, resolve findings or change future publication eligibility.
 Reviewer prose can name records omitted from the rendered item list, so prompt
 filtering alone cannot enforce this boundary.
+
+Disputed items and their release (#2025). A coder dispute that the reviewer
+keeps `blocking` or `same-pr` after one reconsideration stops the PR loop with
+`HumanDecisionRequiredError` before any coder, CI, qualification or merge.
+`dispute_release.py` observes, once per round after `round_start` and from the
+freshly read PR history, whether a human has answered. While the carried
+ledger holds a disputed item, the next round refetches the admitted PR context
+instead of reusing the pre-publication snapshot, so requirements and dispute
+times come from one fresh observation. The dispute time is the
+`created_at` of the newest admitted coder follow-up round record that lists the
+item in `disputed_items`. A dispute is released when the loop's existing
+effective signed-requirement set contains a requirement whose `created_at` is
+strictly later; no new authority path is added. An unknown dispute time (no
+admitted record lists the item, or this invocation's newer coder publication
+is not yet in the observed snapshot), a tie, or an unparseable requirement
+timestamp never releases. Any newer requirement releases every older dispute:
+release only routes the item back to the coder and reviewers, never approves or
+merges, and a later re-dispute re-arms the stop because its newer record moves
+the dispute time. Nothing about a release is persisted or cached. Coder,
+same-PR, merge-conflict and reviewer prompts carry one pointer line per
+released item naming the newer `hr-` IDs; requirement text stays only in the
+signed-requirements section. Because a released item no longer triggers the
+stop, a conflicting PR reaches merge-conflict routing; a held dispute still
+stops first. The stop notice lists only item IDs, dispute times and recovery
+steps, never item text or dispute evidence, and is posted best-effort: a
+posting failure is logged and the original `HumanDecisionRequiredError` is
+raised.
 
 Validation and repair share the same required IDs and optional allowance with
 ledger-proven exclusions removed, including an explicitly empty required set.
@@ -622,6 +649,23 @@ that separates exact-head evidence answers from code requirements. The signed so
 published pending evidence remain available for reviewer agreement or a human decision. Invalid associations are semantic judgement errors re-asked within validated reviewer turns; replay conservatively retains the complete source. Classification
 cannot authorize acceptance: native requester citations and final live head/source
 reads retain that authority before and after freeze.
+
+Coder-disposition scope (#2020) follows the same projection. A signed source is
+the coder's to dispose exactly when the projection keeps it; every other live
+signed source (evidence-only or human-only) is reviewer-owned and never
+coder-dispositioned. `requirement_evidence.reviewer_owned_ids` derives that set,
+and the PR loop threads it into the coder prompt (a read-only notice that lists
+the bare IDs and says reviewer demands for their dispositions are non-actionable),
+coder follow-up validation, acknowledgement reconciliation, and reviewer guidance
+(a scope line telling reviewers to accept those IDs only through their own
+exact-head evidence path; the approval-marker rule still covers the whole signed
+set). A coder disposition or `addressed_ids` entry naming a reviewer-owned ID gets
+a distinct out-of-scope message, not "unknown requirement ID". The set is seeded each
+round, including the first resumed round, from the single `historical_projection`
+result used for reconciliation, and refreshed after each live projection, so live
+and resumed rounds derive it identically. Conflicting or missing classifications
+keep the source coder-owned. Plan-mode and standalone issue implementation have
+no projection and keep the empty set.
 
 
 ## Decisions

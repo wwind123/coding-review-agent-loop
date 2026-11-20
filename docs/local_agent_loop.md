@@ -3279,7 +3279,16 @@ incorrect claim or a verified plan conflict, with decision-bearing evidence for
 the latter. They must fix ordinary defects and evidence-backed defects, and may
 not park a verified plan conflict in `remaining_items`. The existing behavior
 re-reviews a disputed item once and terminates visibly for human resolution if
-the reviewer maintains it as blocking. When canonical plan text is omitted for
+the reviewer maintains it as blocking. The stop notice lists only the item IDs,
+their dispute times and the recovery steps. To answer it, post a signed
+`-- Human Reviewer` decision on the PR and rerun. The rerun releases every
+carried dispute whose time is earlier than a signed requirement's creation
+time, so the item goes back to the coder (with a pointer line naming the newer
+`hr-` IDs) and to the reviewers, and a PR that has fallen behind its base can
+reach merge-conflict routing again. Release never approves or merges. If the
+coder disputes the item again, the newer dispute re-arms the stop until a
+still newer signed decision exists. A dispute whose time cannot be read from
+the coder's round record stays stopped. When canonical plan text is omitted for
 provider budget, the source locator must be fetched and verified before a plan
 decision is enforced or challenged; if that fails, no approved decision is
 enforceable or disputable, but ordinary defects remain reviewable. Unavailable,
@@ -9263,6 +9272,12 @@ disposition is `addressed`; omit `blocked` and `not-applicable` requirements.
 A blocked disposition requires `state: "blocking"`, while not-applicable may
 appear in an approved response. Legacy markdown acknowledgements still list
 every surfaced requirement.
+
+In the PR loop, signed requirements that reviewers classified as evidence-only
+or human-only are reviewer-owned exact-head evidence, not coder work. The coder
+prompt lists them read-only. They never belong in either coder ledger, and
+naming one fails validation with an out-of-scope message. Reviewers accept them
+only through their own exact-head evidence path.
 
 A plan revision uses:
 

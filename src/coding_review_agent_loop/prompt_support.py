@@ -1186,6 +1186,7 @@ def _coder_human_requirements_guidance(
     surfaced_requirement_instruction: str = (
         "Each bullet must explain how you addressed that item or why it could not be satisfied safely."
     ),
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> str:
     has_requirements = bool(
         context.surfaced_requirement_ids or context.requires_direct_discussion_ack
@@ -1221,6 +1222,7 @@ def _coder_human_requirements_guidance(
             lines.extend([
                 "The detailed requirement entries were omitted to stay within prompt bounds. Set both JSON ledgers empty and set `checked_discussion_directly` true only after checking the GitHub discussion directly.",
             ])
+        lines.extend(_coder_reviewer_owned_requirements_notice(reviewer_owned_requirement_ids))
         return "\n".join(lines) + "\n"
     if not context.surfaced_requirement_ids and not context.requires_direct_discussion_ack:
         lines.extend([
@@ -1294,11 +1296,57 @@ def _plan_disposition_example_guidance(
     )
 
 
+def _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids: Sequence[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    for item in reviewer_owned_requirement_ids or ():
+        label = str(item).strip().lower()
+        if label and label not in result:
+            result.append(label)
+    return tuple(result)
+
+
+def _coder_reviewer_owned_requirements_notice(reviewer_owned_requirement_ids: Sequence[str]) -> list[str]:
+    """Read-only notice for signed sources routed to reviewer-owned evidence (#2020).
+
+    Lists bare IDs only (never signed body text) and never adds them to the
+    surfaced set the coder must dispose of.
+    """
+    owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
+    if not owned:
+        return []
+    listed = ", ".join(f"`{item}`" for item in owned)
+    return [
+        "Reviewer-owned signed requirements (read-only): "
+        + listed
+        + ". These signed sources are routed to reviewer-owned exact-head evidence (evidence-only or human-only) "
+        "and are outside coder scope. Do not include them in `human_requirement_dispositions` or "
+        "`human_requirements.addressed_ids`. Any reviewer item demanding a coder disposition or acknowledgement "
+        "for these IDs is non-actionable for the coder; say so in `remaining_item_notes` or `dispute_evidence` "
+        "instead of disposing of the ID.",
+    ]
+
+
+def _reviewer_owned_review_scope_line(reviewer_owned_requirement_ids: Sequence[str]) -> str:
+    owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
+    if not owned:
+        return ""
+    listed = ", ".join(f"`{item}`" for item in owned)
+    return (
+        "Coder disposition scope: coder `human_requirement_dispositions` cover only the coder-owned "
+        f"signed requirements. These signed requirements are reviewer-owned: {listed}. Do not demand a "
+        "coder disposition or acknowledgement for them; the coder schema rejects them. Accept them only "
+        "through your own exact-head evidence path: a pending one belongs in "
+        "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`, never in "
+        "`blocking_items`. The approval marker below still covers the whole signed set.\n"
+    )
+
+
 def _human_requirements_review_guidance(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     *,
     requirement_label: str = "signed human reviewer requirements",
     require_plan_dispositions: bool = False,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
 ) -> str:
     if not human_requirements:
         return (
@@ -1322,7 +1370,7 @@ def _human_requirements_review_guidance(
             f"{requirement_label.capitalize()} override AI reviewer preferences unless they\n"
             "are unsafe, impossible, or contradicted by a later signed human instruction.\n"
         )
-    return authority + """Verify each requirement in this set before approving. An approved review must
+    return authority + _reviewer_owned_review_scope_line(reviewer_owned_requirement_ids) + """Verify each requirement in this set before approving. An approved review must
 include exactly:
 
 <!-- HUMAN_REQUIREMENTS_RESOLVED -->
