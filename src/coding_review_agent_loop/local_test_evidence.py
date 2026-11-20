@@ -3392,12 +3392,16 @@ def capture_tracked_tree_snapshot(
         if registration is not None:
             for link_b, target_b in sorted(registration.links.items()):
                 if not _cv.link_intact(canonical_root, link_b, target_b):
-                    raise AgentLoopError("registered worktree link was removed or retargeted")
+                    raise AgentLoopError(
+                        f"registered worktree link was removed or retargeted: {os.fsdecode(link_b)}"
+                    )
                 link_names.add(os.fsdecode(link_b))
             # Validate every private environment before exempting it (#1652).
             for name_b, (_env_digest, identity) in sorted(registration.private.items()):
                 if not _cv.private_path_intact(canonical_root, name_b, identity):
-                    raise AgentLoopError("registered private environment was removed or replaced")
+                    raise AgentLoopError(
+                        f"registered private environment was removed or replaced: {os.fsdecode(name_b)}"
+                    )
                 private_names.add(os.fsdecode(name_b))
         top = _run_git(canonical_root, ("rev-parse", "--show-toplevel"), timeout=timeout_seconds, cancel=cancel)
         git_root = Path(top.decode("utf-8", errors="strict").strip()).resolve(strict=True)
@@ -4610,6 +4614,18 @@ class TestBrokerServer:
                             _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
                             return
                         validated = rebuilt
+                    # Issue #2036: a replaced worktree link is refused before
+                    # anything is reserved or launched; nothing is poisoned.
+                    from . import checkout_verification as _cv
+
+                    replaced = _cv.replaced_worktree_link(self.root)
+                    if replaced is not None:
+                        sender.send(
+                            _legacy_refusal_frame(_cv.replaced_worktree_link_refusal(*replaced)),
+                            grace=terminal, cancellable=False,
+                        )
+                        _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
+                        return
                     nonce = str(validated["nonce"])
                     digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
                     with self._journal_lock:

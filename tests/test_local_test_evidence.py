@@ -8170,3 +8170,109 @@ def test_malformed_reference_and_row_types_are_dropped_not_raised_1995(field, ba
     canonical = evidence_module.canonicalize_bounded_evidence(encoded, strict=True)
     assert decode_bounded_evidence(canonical) is not None
     assert bounded_evidence_for_round(payload)
+
+
+# --- issue #2036: replaced worktree link refused before launch -----------------
+
+
+def _registered_link_worktree(tmp_path):
+    from coding_review_agent_loop import checkout_verification as cv
+
+    root = tmp_path / "run"
+    root.mkdir()
+    store = tmp_path / "store" / "node_modules"
+    store.mkdir(parents=True)
+    (root / "node_modules").symlink_to(store)
+    cv.register_worktree_links(root, {"node_modules": str(store)})
+    return cv, root
+
+
+@pytest.mark.parametrize("replacement", ["directory", "retargeted", "removed"])
+def test_broker_refuses_a_replaced_worktree_link_before_launch_2036(tmp_path, replacement):
+    """Row link-replaced-refusal: named refusal, nothing launched, nothing recorded or poisoned."""
+    cv, root = _registered_link_worktree(tmp_path)
+    marker = tmp_path / "ran"
+    link = root / "node_modules"
+    link.unlink()
+    if replacement == "directory":
+        link.mkdir()
+    elif replacement == "retargeted":
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        link.symlink_to(other)
+    server = BrokerServer(root=root, turn_id="turn-2036-replaced").start()
+    try:
+        argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w')")
+        frame = _raw_broker_request(server, _signed_broker_request(server, root, "e1" * 16, argv))
+        assert frame["type"] == "result" and frame["outcome"] == "cancelled"
+        assert frame["receipt_id"] == "" and frame["inner_exec"] == "not-attempted"
+        assert frame["suite_start"] == "not-started"
+        assert frame["diagnostic"] == (
+            "agent-loop: worktree link `node_modules` was replaced, moved or retargeted; it is "
+            "shared operator infrastructure. Restore it or report the problem; nothing was run "
+            "(not evidence)"
+        )
+        assert not marker.exists() and server.journal == ()
+        assert server._requests == {} and server._receipts == {}
+        assert not cv.has_poisoned_entry(root)
+    finally:
+        server.stop()
+        cv.reset_checkout_baselines()
+
+
+def test_broker_runs_normally_with_an_intact_worktree_link_2036(tmp_path):
+    """Row link-replaced-refusal: an intact link is not refused."""
+    cv, root = _registered_link_worktree(tmp_path)
+    marker = tmp_path / "ran"
+    server = BrokerServer(root=root, turn_id="turn-2036-intact").start()
+    try:
+        argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w')")
+        frame = _raw_broker_request(server, _signed_broker_request(server, root, "e2" * 16, argv))
+        assert frame["type"] == "result" and frame["outcome"] == "passed"
+        assert marker.exists()
+        assert not cv.has_poisoned_entry(root)
+    finally:
+        server.stop()
+        cv.reset_checkout_baselines()
+
+
+def test_replaced_worktree_link_precheck_is_fail_open_and_names_private_paths_2036(tmp_path, monkeypatch):
+    cv, root = _registered_link_worktree(tmp_path)
+    try:
+        assert cv.replaced_worktree_link(root) is None
+        assert cv.replaced_worktree_link(tmp_path / "unregistered") is None
+
+        def broken(*_args, **_kwargs):
+            raise evidence_module.AgentLoopError("registered worktree root was redirected or replaced")
+
+        monkeypatch.setattr(cv, "lookup_worktree_links", broken)
+        assert cv.replaced_worktree_link(root) is None
+    finally:
+        cv.reset_checkout_baselines()
+    assert "private dependency environment `node_modules` was removed or replaced" in (
+        cv.replaced_worktree_link_refusal("node_modules", "private")
+    )
+
+
+def test_cli_prints_the_replaced_link_refusal_and_never_runs_locally_2036(tmp_path, monkeypatch, capsys):
+    import coding_review_agent_loop.cli as cli_module
+
+    cv, root = _registered_link_worktree(tmp_path)
+    (root / "node_modules").unlink()
+    (root / "node_modules").mkdir()
+    server = BrokerServer(root=root, turn_id="turn-2036-cli").start()
+    local = []
+    monkeypatch.setattr(cli_module, "run_foreground_test", lambda *a, **k: local.append(a))
+    for name, value in server.environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", server.turn_id)
+    monkeypatch.chdir(root)
+    try:
+        code = cli_module.main(["run-tests", "--timeout-seconds", "40", "--", sys.executable, "-c", "pass"])
+    finally:
+        server.stop()
+        cv.reset_checkout_baselines()
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "agent-loop: no test ran (cancelled): agent-loop: worktree link `node_modules` was replaced" in err
+    assert local == [] and server.journal == ()

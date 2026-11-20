@@ -936,16 +936,16 @@ def test_env_prefix_without_command_or_with_unrecognized_target_is_unknown(tmp_p
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["node", "--test", "tests/test_history.mjs"],
-        ["node", "--test"],
-        ["nodejs", "--test", "tests"],
-        ["node", "--experimental-vm-modules", "--test", "tests/a.mjs"],
-        ["node", "--test-reporter=spec", "--test", "tests/a.mjs"],
-    ],
-)
+_NODE_ACCEPTED_ARGV = [
+    ["node", "--test", "tests/test_history.mjs"],
+    ["node", "--test"],
+    ["nodejs", "--test", "tests"],
+    ["node", "--experimental-vm-modules", "--test", "tests/a.mjs"],
+    ["node", "--test-reporter=spec", "--test", "tests/a.mjs"],
+]
+
+
+@pytest.mark.parametrize("argv", _NODE_ACCEPTED_ARGV)
 def test_node_test_runner_is_a_recognized_inner_launcher(tmp_path, argv):
     # Issue #1009: ``node --test`` must be probeable so its runs can be cited.
     fake_bin = tmp_path / "bin"
@@ -961,36 +961,36 @@ def test_node_test_runner_is_a_recognized_inner_launcher(tmp_path, argv):
     )
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["node", "scripts/build.mjs", "--test"],
-        ["node", "scripts/build.mjs"],
-        ["node", "--", "--test"],
-        ["node"],
-        ["npx", "--test"],
-        ["node", "--test", "--version"],
-        ["node", "--test", "-v"],
-        ["node", "--test", "--help"],
-        ["node", "--test", "-h"],
-        ["node", "--test", "--v8-options"],
-        ["node", "--test", "--check", "tests/a.mjs"],
-        ["node", "--test", "--eval=process.exit(0)"],
-        ["node", "--test", "-e", "process.exit(0)"],
-        ["node", "--test", "--run", "noop"],
-        ["node", "--test", "--experimental-sea-config=sea.json"],
-        ["node", "--test", "tests/a.mjs", "--version"],
-        ["node", "--test-reporter", "spec", "--test", "tests/a.mjs"],
-        ["node", "--test", "--test-reporter="],
-        ["node", "--test", "--import=data:text/javascript,process.exit(0)", "tests/a.mjs"],
-        ["node", "--test", "--require=./exit.cjs", "tests/a.mjs"],
-        ["node", "--test", "--loader=./loader.mjs", "tests/a.mjs"],
-        ["node", "--test", "--experimental-loader=./loader.mjs", "tests/a.mjs"],
-        ["node", "--test", "--test-global-setup=./setup.mjs", "tests/a.mjs"],
-        ["node", "--test", "--env-file=.env", "tests/a.mjs"],
-        ["node", "--test", "--test-reporter=./reporter.mjs", "tests/a.mjs"],
-    ],
-)
+_NODE_REJECTED_ARGV = [
+    ["node", "scripts/build.mjs", "--test"],
+    ["node", "scripts/build.mjs"],
+    ["node", "--", "--test"],
+    ["node"],
+    ["npx", "--test"],
+    ["node", "--test", "--version"],
+    ["node", "--test", "-v"],
+    ["node", "--test", "--help"],
+    ["node", "--test", "-h"],
+    ["node", "--test", "--v8-options"],
+    ["node", "--test", "--check", "tests/a.mjs"],
+    ["node", "--test", "--eval=process.exit(0)"],
+    ["node", "--test", "-e", "process.exit(0)"],
+    ["node", "--test", "--run", "noop"],
+    ["node", "--test", "--experimental-sea-config=sea.json"],
+    ["node", "--test", "tests/a.mjs", "--version"],
+    ["node", "--test-reporter", "spec", "--test", "tests/a.mjs"],
+    ["node", "--test", "--test-reporter="],
+    ["node", "--test", "--import=data:text/javascript,process.exit(0)", "tests/a.mjs"],
+    ["node", "--test", "--require=./exit.cjs", "tests/a.mjs"],
+    ["node", "--test", "--loader=./loader.mjs", "tests/a.mjs"],
+    ["node", "--test", "--experimental-loader=./loader.mjs", "tests/a.mjs"],
+    ["node", "--test", "--test-global-setup=./setup.mjs", "tests/a.mjs"],
+    ["node", "--test", "--env-file=.env", "tests/a.mjs"],
+    ["node", "--test", "--test-reporter=./reporter.mjs", "tests/a.mjs"],
+]
+
+
+@pytest.mark.parametrize("argv", _NODE_REJECTED_ARGV)
 def test_node_without_builtin_test_runner_stays_unrecognized(tmp_path, monkeypatch, argv, no_ambient_invocation):
     calls = []
     monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
@@ -1110,15 +1110,15 @@ def _fake_playwright(root):
 _PW = "node_modules/.bin/playwright"
 
 
-@pytest.mark.parametrize(
-    "tail",
-    [
-        ["test"],
-        ["test", "--project=chromium"],
-        ["test", "tests/e2e/cost.spec.ts", "--reporter=line", "--workers=1"],
-        ["test", "--reporter=list,json", "--headed", "--grep=cost"],
-    ],
-)
+_PW_ACCEPTED_TAILS = [
+    ["test"],
+    ["test", "--project=chromium"],
+    ["test", "tests/e2e/cost.spec.ts", "--reporter=line", "--workers=1"],
+    ["test", "--reporter=list,json", "--headed", "--grep=cost"],
+]
+
+
+@pytest.mark.parametrize("tail", _PW_ACCEPTED_TAILS)
 def test_playwright_test_is_a_recognized_inner_launcher(tmp_path, no_ambient_invocation, tail):
     launcher = _fake_playwright(tmp_path)
     environment = {"PATH": str(launcher.parent)}
@@ -1129,39 +1129,39 @@ def test_playwright_test_is_a_recognized_inner_launcher(tmp_path, no_ambient_inv
     )
 
 
-@pytest.mark.parametrize(
-    "tail",
-    [
-        ["test", "--project=chromium", "--list"],
-        ["--list"],
-        ["--version"],
-        ["--help"],
-        ["test", "--help"],
-        ["test", "-h"],
-        ["test", "--version"],
-        [],
-        ["show-report"],
-        ["install"],
-        ["tests", "test"],
-        ["test", "--config=./evil.config.ts"],
-        ["test", "-c", "x"],
-        ["test", "--tsconfig=x"],
-        ["test", "--global-setup=./exit.js"],
-        ["test", "--reporter=./reporter.js"],
-        ["test", "--reporter=list,./r.js"],
-        ["test", "--reporter="],
-        ["test", "--project", "chromium"],
-        ["test", "--pass-with-no-tests"],
-        ["test", "--only-changed"],
-        ["test", "--last-failed"],
-        ["test", "--shard=1/1"],
-        ["test", "--shard=1/1", "--grep=nomatch"],
-        ["test", "--ui"],
-        ["test", "--debug"],
-        ["test", "--", "x"],
-        ["test", "-x"],
-    ],
-)
+_PW_REJECTED_TAILS = [
+    ["test", "--project=chromium", "--list"],
+    ["--list"],
+    ["--version"],
+    ["--help"],
+    ["test", "--help"],
+    ["test", "-h"],
+    ["test", "--version"],
+    [],
+    ["show-report"],
+    ["install"],
+    ["tests", "test"],
+    ["test", "--config=./evil.config.ts"],
+    ["test", "-c", "x"],
+    ["test", "--tsconfig=x"],
+    ["test", "--global-setup=./exit.js"],
+    ["test", "--reporter=./reporter.js"],
+    ["test", "--reporter=list,./r.js"],
+    ["test", "--reporter="],
+    ["test", "--project", "chromium"],
+    ["test", "--pass-with-no-tests"],
+    ["test", "--only-changed"],
+    ["test", "--last-failed"],
+    ["test", "--shard=1/1"],
+    ["test", "--shard=1/1", "--grep=nomatch"],
+    ["test", "--ui"],
+    ["test", "--debug"],
+    ["test", "--", "x"],
+    ["test", "-x"],
+]
+
+
+@pytest.mark.parametrize("tail", _PW_REJECTED_TAILS)
 def test_playwright_unsafe_forms_stay_unrecognized(tmp_path, monkeypatch, no_ambient_invocation, tail):
     _fake_playwright(tmp_path)
     calls = []
@@ -1200,20 +1200,20 @@ def test_npx_playwright_without_local_binary_stays_unknown(tmp_path, monkeypatch
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["npx", "-y", "playwright", "test"],
-        ["npx", "--yes", "playwright", "test"],
-        ["npx", "-p", "x", "playwright", "test"],
-        ["npx", "--package", "x", "playwright", "test"],
-        ["npx", "-c", "playwright test"],
-        ["npx", "playwright@1.50", "test"],
-        ["npx", "--", "playwright", "test"],
-        ["npx", "playwright", "test", "--list"],
-        ["npx", "playwright", "test", "--config=x.js"],
-    ],
-)
+_NPX_PW_REJECTED_ARGV = [
+    ["npx", "-y", "playwright", "test"],
+    ["npx", "--yes", "playwright", "test"],
+    ["npx", "-p", "x", "playwright", "test"],
+    ["npx", "--package", "x", "playwright", "test"],
+    ["npx", "-c", "playwright test"],
+    ["npx", "playwright@1.50", "test"],
+    ["npx", "--", "playwright", "test"],
+    ["npx", "playwright", "test", "--list"],
+    ["npx", "playwright", "test", "--config=x.js"],
+]
+
+
+@pytest.mark.parametrize("argv", _NPX_PW_REJECTED_ARGV)
 def test_npx_playwright_unsafe_forms_stay_unrecognized(tmp_path, no_ambient_invocation, argv):
     _fake_playwright(tmp_path)
     assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
@@ -8513,3 +8513,180 @@ def test_rerun_of_a_fixture_failure_replays_under_the_recorded_fixture_1999(tmp_
     assert replayed.fixture.identity == original.fixture.identity == ("fixture.py", replayed.fixture.digest)
     assert replayed.normalized_command == original.normalized_command
     assert replayed.restart_command_digest == original.restart_command_digest
+
+
+# --- issue #2036: specific explanation for argument-rejected launchers --------
+
+_FILTERED_PW_TAIL = [
+    "test", "f.spec", "--project=x", "-g", "pat", "--repeat-each=200", "--workers=6", "--retries=0",
+]
+
+
+def _explain(argv, tmp_path, **environment):
+    return runtime.explain_uncitable_launcher(
+        argv, cwd=tmp_path, environment={"PATH": str(tmp_path / "node_modules" / ".bin"), **environment}
+    )
+
+
+def _recognized(argv, tmp_path, **environment):
+    return runtime.recognized_inner_probe(
+        argv, cwd=tmp_path, environment={"PATH": str(tmp_path / "node_modules" / ".bin"), **environment}
+    ) is not None
+
+
+@pytest.mark.parametrize("form", ["bare", "local-bin", "npx", "npx-no-install"])
+def test_explainer_names_the_short_grep_alias_2036(tmp_path, no_ambient_invocation, form):
+    _fake_playwright(tmp_path)
+    head = {
+        "bare": ["playwright"], "local-bin": [_PW], "npx": ["npx", "playwright"],
+        "npx-no-install": ["npx", "--no-install", "playwright"],
+    }[form]
+    argv = [*head, *_FILTERED_PW_TAIL]
+    assert not _recognized(argv, tmp_path)
+    reason = _explain(argv, tmp_path)
+    assert reason.startswith("`playwright test` is a citable runner, but `-g` is a short alias")
+    assert "`--grep=pat`" in reason
+    assert "unrecognized test launcher" not in reason
+
+
+def test_explainer_names_the_rejected_argument_appended_to_a_package_script_2036(
+    tmp_path, no_ambient_invocation
+):
+    """Row npm-appended-args-notice."""
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"s": "playwright test"})
+    argv = ["npm", "run", "s", "--", "f.spec", "-g", "pat"]
+    assert not _recognized(argv, tmp_path)
+    assert _recognized(["npm", "run", "s"], tmp_path)
+    reason = _explain(argv, tmp_path)
+    assert "an argument appended to `npm run s` is rejected: `-g` is a short alias" in reason
+    assert "`--grep=pat`" in reason
+    assert "Cite the unfiltered `npm run s` run instead and report this run in tests_run" in reason
+    assert "unrecognized" not in reason
+
+
+def test_explainer_names_a_rejected_package_script_body_2036(tmp_path, no_ambient_invocation):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"s": "playwright test --list"})
+    reason = _explain(["npm", "run", "s"], tmp_path)
+    assert "the body of `npm run s` is rejected: `--list` can exit 0 without running a test" in reason
+
+
+@pytest.mark.parametrize(
+    "tail, expected",
+    [
+        (["test", "--config=/tmp/scratch/playwright.config.mjs"], "`--config` loads code into the runner"),
+        (["test", "-c", "x"], "`-c` loads code into the runner"),
+        (["test", "--reporter=./r.js"], "`--reporter` loads code into the runner"),
+        (["test", "--grep", "pat"], "`--grep` is given its value as a separate argument; spell it `--grep=pat`"),
+        (["test", "-j", "4"], "spell it `--workers=4`"),
+        (["test", "-x"], "spell it `--max-failures=1`"),
+        (["test", "--list"], "`--list` can exit 0 without running a test"),
+        (["test", "--shard=1/2"], "`--shard` can exit 0 without running a test"),
+        (["test", "--", "x"], "the `--` separator is not accepted"),
+        (["test", "--bogus"], "`--bogus` is not on the citable `playwright test` option allow-list"),
+        (["test", "--grep="], "`--grep=` has an empty value"),
+        (["show-report"], "its first argument must be the `test` subcommand"),
+    ],
+)
+def test_explainer_categorizes_playwright_rejections_2036(tmp_path, no_ambient_invocation, tail, expected):
+    _fake_playwright(tmp_path)
+    reason = _explain([_PW, *tail], tmp_path)
+    assert expected in reason
+    assert "unrecognized" not in reason
+
+
+def test_explainer_says_a_scratch_config_is_never_citable_2036(tmp_path, no_ambient_invocation):
+    _fake_playwright(tmp_path)
+    reason = _explain(["npx", "playwright", "test", "--config=/tmp/elsewhere/pw.config.mjs"], tmp_path)
+    assert "never citable, including a config file outside the checkout" in reason
+
+
+def test_explainer_names_a_missing_local_playwright_binary_2036(tmp_path, no_ambient_invocation):
+    reason = _explain(["npx", "playwright", "test"], tmp_path)
+    assert reason.startswith("`npx playwright test` is a citable runner, but `node_modules/.bin/playwright`")
+    assert "never allowed to resolve or download" in reason
+
+
+@pytest.mark.parametrize("name", ["NODE_OPTIONS", "PW_TEST_REPORTER"])
+def test_explainer_names_a_code_loading_environment_variable_2036(tmp_path, no_ambient_invocation, name):
+    _fake_playwright(tmp_path)
+    reason = _explain([_PW, "test"], tmp_path, **{name: "x"})
+    assert f"{name} is set" in reason
+
+
+@pytest.mark.parametrize("hook", ["pres", "posts"])
+def test_explainer_names_a_package_pre_or_post_script_2036(tmp_path, no_ambient_invocation, hook):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"s": "playwright test", hook: "echo"})
+    reason = _explain(["npm", "run", "s"], tmp_path)
+    assert reason.startswith("`npm run s` is a citable runner, but package.json also defines")
+    assert f"`{hook}`" in reason
+
+
+def test_explainer_names_a_node_test_rejection_2036(tmp_path, no_ambient_invocation):
+    reason = _explain(["node", "--test", "--import=./x.mjs", "tests/a.mjs"], tmp_path)
+    assert reason.startswith("`node --test` is a citable runner, but `--import`")
+    reason = _explain(["node", "--test-reporter", "spec", "--test"], tmp_path)
+    assert "spell it `--test-reporter=spec`" in reason
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["make", "test"],
+        ["npx", "--test"],
+        ["npx", "jest"],
+        [sys.executable, "scripts/x.py"],
+        ["npm", "run", "missing"],
+        ["npm", "run", "s"],  # malformed package.json
+    ],
+)
+def test_explainer_returns_none_for_unknown_or_unresolvable_commands_2036(
+    tmp_path, no_ambient_invocation, argv
+):
+    (tmp_path / "package.json").write_text("{not json", encoding="utf-8")
+    assert _explain(argv, tmp_path) is None
+    assert not _recognized(argv, tmp_path)
+
+
+def _parity_cases():
+    cases = [(["playwright", *tail], True) for tail in _PW_ACCEPTED_TAILS]
+    cases += [([_PW, *tail], False) for tail in _PW_REJECTED_TAILS]
+    cases += [(list(argv), None) for argv in _NPX_PW_REJECTED_ARGV]
+    cases += [(list(argv), True) for argv in _NODE_ACCEPTED_ARGV]
+    # ``npx --test`` is an unknown head, so it gets no family-specific reason.
+    cases += [(list(argv), None if argv[0] == "npx" else False) for argv in _NODE_REJECTED_ARGV]
+    cases += [
+        (["npx", "playwright", *_FILTERED_PW_TAIL], False),
+        (["playwright", "test", "f.spec", "--grep=pat", "--repeat-each=200", "--workers=6"], True),
+        (["npx", "playwright", "test", "--project=x", "--grep=pat", "--retries=0"], True),
+        (["npm", "run", "pw"], True),
+        (["npm", "run", "pw", "--", "f.spec", "--grep=pat"], True),
+        (["npm", "run", "pw", "--", "f.spec", "-g", "pat"], False),
+        (["npm", "run", "listing"], False),
+    ]
+    return cases
+
+
+@pytest.mark.parametrize("argv, accepted", _parity_cases())
+def test_explainer_and_recognizer_agree_within_supported_families_2036(
+    tmp_path, no_ambient_invocation, argv, accepted
+):
+    """Row recognizer-parity: None exactly when the recognizer accepts."""
+    _fake_playwright(tmp_path)
+    for name in ("node", "nodejs"):
+        launcher = tmp_path / "node_modules" / ".bin" / name
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
+    _write_package(tmp_path, {"pw": "playwright test", "listing": "playwright test --list"})
+    recognized = _recognized(argv, tmp_path)
+    if accepted is not None:
+        assert recognized is accepted  # the accepted set is unchanged
+    explanation = _explain(argv, tmp_path)
+    if recognized:
+        assert explanation is None
+    elif accepted is False:
+        assert explanation is not None and "unrecognized" not in explanation
+    if explanation is not None:
+        assert not recognized

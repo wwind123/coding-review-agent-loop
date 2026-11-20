@@ -386,6 +386,47 @@ def link_intact(root: Path, link: bytes | str, target: bytes | str) -> bool:
     return descriptor == ("symlink", os.fsencode(target))
 
 
+def replaced_worktree_link(root: Path) -> tuple[str, str] | None:
+    """``(name, kind)`` of the first registered entry of ``root`` that is no longer intact (#2036).
+
+    ``kind`` is ``"link"`` for a shared --worktree-link and ``"private"`` for a
+    rebuilt private environment.  This is an advisory pre-check for
+    ``agent-loop run-tests``: a lookup error returns None so the request falls
+    through to the snapshot and checkout guard, which still cover it.  It
+    never poisons the checkout.
+    """
+    try:
+        requested = Path(os.path.abspath(os.fspath(root)))
+        canonical = requested.resolve(strict=True)
+        registration = lookup_worktree_links(requested, canonical)
+        if registration is None:
+            return None
+        for link, target in sorted(registration.links.items()):
+            if not link_intact(canonical, link, target):
+                return os.fsdecode(link), "link"
+        for name, (_digest, identity) in sorted(registration.private.items()):
+            if not private_path_intact(canonical, name, identity):
+                return os.fsdecode(name), "private"
+    except (OSError, AgentLoopError):
+        return None
+    return None
+
+
+def replaced_worktree_link_refusal(name: str, kind: str) -> str:
+    """The run-tests refusal text naming a replaced link (#2036)."""
+    if kind == "private":
+        return (
+            f"agent-loop: private dependency environment `{name}` was removed or replaced; "
+            "agent-loop builds it from the committed --worktree-setup-key files. Restore it or "
+            "report the problem; nothing was run (not evidence)"
+        )
+    return (
+        f"agent-loop: worktree link `{name}` was replaced, moved or retargeted; it is shared "
+        "operator infrastructure. Restore it or report the problem; nothing was run (not "
+        "evidence)"
+    )
+
+
 def _deferred_paths(path: Path) -> tuple[str, ...]:
     registration = link_registration(path)
     return registration.deferred if registration is not None else ()

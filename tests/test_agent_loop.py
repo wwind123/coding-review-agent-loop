@@ -5608,6 +5608,60 @@ def test_run_tests_prints_the_not_citable_notice_for_an_unrecognized_launcher(tm
     assert recorded == ["timing"]
 
 
+_PW_FILTERED_ARGS = [
+    "test", "f.spec", "--project=p", "-g", "pat", "--repeat-each=200", "--workers=6", "--retries=0",
+]
+
+
+def _local_playwright(tmp_path):
+    binary = tmp_path / "node_modules" / ".bin" / "playwright"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return binary
+
+
+@pytest.mark.parametrize("reason", ["unrecognized-launcher", None], ids=["persisted-reason", "older-broker"])
+@pytest.mark.parametrize("form", ["npx", "bare", "npm-appended"])
+def test_run_tests_notice_names_the_rejected_playwright_argument_2036(
+    tmp_path, monkeypatch, capsys, reason, form
+):
+    """Rows pw-short-alias-notice / legacy-broker-no-reason (issue #2036)."""
+    _local_playwright(tmp_path)
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    monkeypatch.delenv("PW_TEST_REPORTER", raising=False)
+    if form == "npx":
+        inner = ["npx", "playwright", *_PW_FILTERED_ARGS]
+    elif form == "bare":
+        inner = [str(tmp_path / "node_modules" / ".bin" / "playwright"), *_PW_FILTERED_ARGS]
+    else:
+        (tmp_path / "package.json").write_text('{"scripts": {"s": "playwright test"}}')
+        inner = ["npm", "run", "s", "--", "f.spec", "-g", "pat", "--repeat-each=200"]
+    code, err, recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, inner, suite_start_reason=reason
+    )
+    assert code == 0
+    assert "unrecognized test launcher" not in err
+    assert "`playwright test` is a citable runner, but" in err
+    assert "`-g` is a short alias" in err and "`--grep=pat`" in err
+    assert "suite_start=unknown" in err and "you may still report it in tests_run" in err
+    if form == "npm-appended":
+        assert "an argument appended to `npm run s` is rejected" in err
+        assert "Cite the unfiltered `npm run s` run instead" in err
+    assert err.count("not citable evidence") == 1
+    assert recorded == ["timing"]  # advisory only: no launcher health, same exit code
+
+
+def test_run_tests_notice_keeps_the_generic_text_for_a_malformed_package_json_2036(
+    tmp_path, monkeypatch, capsys
+):
+    """Row legacy-broker-no-reason: a malformed package.json never crashes the notice."""
+    (tmp_path / "package.json").write_text("{not json")
+    code, err, _recorded = _run_tests_notice(tmp_path, monkeypatch, capsys, ["npm", "run", "s"])
+    assert code == 0
+    assert _UNRECOGNIZED_NOTICE in err
+
+
 def test_run_tests_prints_no_notice_for_a_verified_pytest_receipt(tmp_path, monkeypatch, capsys):
     """Row notice-absent-verified."""
     code, err, recorded = _run_tests_notice(

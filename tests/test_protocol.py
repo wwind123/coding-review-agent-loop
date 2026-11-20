@@ -8193,7 +8193,7 @@ def test_unknown_test_observations_mode_is_rejected_1626():
 @pytest.mark.parametrize(
     "reason, expected, absent",
     [
-        ("unrecognized-launcher", "the test launcher is not recognized", "bootstrap probe"),
+        ("unrecognized-launcher", "is not on the citable allow-list (the run-tests receipt line names the rejected argument)", "bootstrap probe"),
         ("probe-unavailable", "its bootstrap probe could not verify it", "not recognized"),
         (None, "an unrecognized or unverified test launcher", "bootstrap probe"),
     ],

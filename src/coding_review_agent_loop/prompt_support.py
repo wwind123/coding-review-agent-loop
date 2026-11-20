@@ -1101,6 +1101,7 @@ def _coder_workdir_guidance(
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
         f"{_pr_local_environment_guidance(config, workdir) if implementation else ''}"
+        f"{_worktree_link_guidance(config, workdir) if implementation else ''}"
         f"{_sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
     )
 
@@ -1118,12 +1119,42 @@ def _pr_local_environment_guidance(config: AgentLoopConfig, workdir: Path) -> st
         "file, commit it and keep tracked files committed; agent-loop rebuilds "
         f"{links} from the committed keys after the turn. Installs during the turn only affect "
         "this worktree, and test evidence from before the rebuild does not count for the rebuilt "
-        "environment. Do not delete or replace those paths yourself.\n"
+        "environment. Do not delete, replace, move or copy over those paths yourself.\n"
     )
     note = take_rebuild_note(workdir)
     if note:
         text += f"Note: {note}\n"
     return text
+
+
+def _worktree_link_guidance(config: AgentLoopConfig, workdir: Path) -> str:
+    """Name the coder checkout's shared ``--worktree-link`` paths as off limits (#2036).
+
+    The names come only from this checkout's own link registration, never from
+    ``config.worktree_links`` alone: the configured links stay set whenever any
+    role uses a default worktree, while an explicit coder directory has no
+    links.  Under --worktree-setup-pr-local the configured links are already
+    named by the private-environment note, so they are left out here.
+    """
+    from .checkout_verification import registered_links
+
+    names = [os.fsdecode(name) for name in registered_links(workdir)]
+    if getattr(config, "worktree_setup_pr_local", False):
+        covered = set(config.worktree_links)
+        names = [name for name in names if name not in covered]
+    if not names:
+        return ""
+    links = ", ".join(f"`{name}`" for name in names)
+    return (
+        f"Shared worktree links: {links} in this checkout "
+        f"{'is a link' if len(names) == 1 else 'are links'} (--worktree-link) to the operator's "
+        "dependency store, shared across runs. They are shared operator infrastructure: do not "
+        "replace, move, copy over or delete them, not even to make a test receipt citable. "
+        "`agent-loop run-tests` refuses to run while one is replaced, and the run's checkout "
+        "guard treats a changed link as an untrustworthy checkout. If a dependency seems to "
+        "block citable evidence, report that in tests_run or the PR instead of changing the "
+        "link.\n"
+    )
 
 
 def _sandboxed_permission_guidance(

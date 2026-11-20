@@ -2547,8 +2547,9 @@ SUITE_START_UNVERIFIED_DIAGNOSTIC = (
 
 
 SUITE_START_UNRECOGNIZED_DIAGNOSTIC = (
-    "Suite start was never verified (suite_start=unknown): the test launcher is not "
-    "recognized, so this receipt cannot be cited. Citable runners: "
+    "Suite start was never verified (suite_start=unknown): the launcher or one of its "
+    "arguments is not on the citable allow-list (the run-tests receipt line names the "
+    "rejected argument), so this receipt cannot be cited. Citable runners: "
     f"{CITABLE_TEST_RUNNERS_SUMMARY}. Wrap the check in a pytest test to make it citable."
 )
 SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC = (
