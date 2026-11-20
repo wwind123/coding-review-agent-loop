@@ -102,6 +102,17 @@ def _isolated_agy_settings_path(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_agy_capability_probe(monkeypatch):
+    """Never probe a host agy; structured output is off unless a test opts in (#2029)."""
+    from coding_review_agent_loop.agents import antigravity_structured
+
+    antigravity_structured.reset_structured_output_capability_cache()
+    monkeypatch.setattr(antigravity_structured, "_probe_agy_help", lambda runner, config: None)
+    yield
+    antigravity_structured.reset_structured_output_capability_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_agy_log_dir(monkeypatch, tmp_path_factory):
     """Never list or read the host's real agy CLI log directory (#1604)."""
     from coding_review_agent_loop.agents import antigravity

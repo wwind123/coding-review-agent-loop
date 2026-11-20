@@ -48,6 +48,18 @@ from .base import (
     read_public_response_file,
     with_public_response_file_instruction,
 )
+from .antigravity_structured import (
+    AgyEnvelope,
+    SCHEMA_FILE_NAME,
+    envelope_provider_error,
+    STRUCTURED_KIND_FOOTERS,
+    antigravity_structured_output_supported,
+    oversized_prompt_directive,
+    parse_agy_json_envelope,
+    render_structured_output_text,
+    structured_output_signature,
+    write_structured_output_schema,
+)
 from .replacement import classify_provider_executable_replacement_interruption
 from ..worktree_hints import dependency_hint_environment
 from ..errors import AgentLoopError, AgentSettingsLockWaitTimeout, CheckoutVerificationError
@@ -387,6 +399,10 @@ def quota_memory_for_current_run() -> AntigravityQuotaGroupMemory:
     return memory
 
 
+# Format failures on one model before the turn moves to the next chain model.
+FORMAT_FAILURE_FALLBACK_THRESHOLD = 2
+
+
 @dataclass
 class AntigravityAttemptState:
     """Shared retry-before-fallback policy for normal Antigravity invocations."""
@@ -402,6 +418,8 @@ class AntigravityAttemptState:
     config: "AgentLoopConfig | None" = None
     models_tried: list[str] = field(default_factory=list)
     last_frame: str = ""
+    # Per-model count of turns with no recoverable structured payload (#2029).
+    format_failures: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.groups:
@@ -451,9 +469,28 @@ class AntigravityAttemptState:
         self.model_index = first
         return "ok"
 
-    def next_after_failure(self, *, retryable: bool, provider_capacity: bool) -> str:
-        """Return retry, fallback, or stop; retries are chain-wide."""
+    def next_after_failure(
+        self, *, retryable: bool, provider_capacity: bool, format_failure: bool = False
+    ) -> str:
+        """Return retry, fallback, format-fallback, or stop; retries are chain-wide.
+
+        A format failure (no recoverable structured payload, repair refused)
+        moves to the next eligible model once the current model reaches
+        ``FORMAT_FAILURE_FALLBACK_THRESHOLD`` such failures, or at once when
+        no retries remain, without consuming chain-wide retries (#2029).  On
+        the last eligible model the ordinary retry/stop policy applies, so the
+        seat becomes unavailable only when the chain is exhausted.
+        """
         self.attempts += 1
+        if format_failure:
+            model = self.models[self.model_index]
+            count = self.format_failures.get(model, 0) + 1
+            self.format_failures[model] = count
+            if count >= FORMAT_FAILURE_FALLBACK_THRESHOLD or not self.retries_remaining:
+                later = self._first_eligible(self.model_index + 1)
+                if later is not None:
+                    self.model_index = later
+                    return "format-fallback"
         if retryable and self.retries_remaining:
             self.retries_remaining -= 1
             return "retry"
@@ -1026,9 +1063,13 @@ _REVIEWER_SETTINGS_INJECTION = {
         ]
     },
 }
-_OVERSIZED_PROMPT_DIRECTIVE = (
-    "Follow the complete task included in the Agent Loop Task section of GEMINI.md."
-)
+
+
+def _oversized_prompt_directive(response_path: Path, structured: bool) -> str:
+    """Name the required output channel and forbid a chat answer (#2029)."""
+    return oversized_prompt_directive(response_path, structured=structured)
+
+
 _REPAIR_SETTINGS_INJECTION = {
     "toolPermission": "strict",
     "permissions": {"allow": []},
@@ -1173,15 +1214,24 @@ def _antigravity_log_dir() -> Path:
 
 
 def is_silent_antigravity_attempt(
-    result: CommandResult, response_file_text: str | None
+    result: CommandResult, response_file_text: str | None, *, json_mode: bool = False
 ) -> bool:
     """True when agy exited without a response file and printed nothing useful.
 
-    A timeout (returncode None) is never silent: it stays a timeout.
+    A timeout (returncode None) is never silent: it stays a timeout.  In JSON
+    output mode an envelope with no prose, no structured output and no error
+    text is silent too, so the agy-log lookup still runs (#2029).
     """
     if result.returncode is None or response_file_text is not None:
         return False
-    for raw_line in strip_ansi(result.stdout or "").replace("\r", "\n").splitlines():
+    stdout = result.stdout or ""
+    if json_mode:
+        envelope = parse_agy_json_envelope(stdout)
+        if envelope is not None:
+            if not envelope.is_empty:
+                return False
+            stdout = envelope.remainder
+    for raw_line in strip_ansi(stdout).replace("\r", "\n").splitlines():
         line = raw_line.strip()
         if line and not _AGY_SILENT_WARNING_RE.match(line):
             return False
@@ -1311,6 +1361,8 @@ def _silent_attempt_log_evidence(
     result: CommandResult,
     response_file_text: str | None,
     lookup: AntigravityLogLookup | Exception | None,
+    *,
+    json_mode: bool = False,
 ) -> tuple[Path | None, AntigravityLogQuotaEvidence | None]:
     """Read this silent attempt's agy log from a lookup taken under the lock.
 
@@ -1318,7 +1370,7 @@ def _silent_attempt_log_evidence(
     the exception the lookup raised. Never raises.
     """
     try:
-        if not is_silent_antigravity_attempt(result, response_file_text):
+        if not is_silent_antigravity_attempt(result, response_file_text, json_mode=json_mode):
             return None, None
         if result.observation is None:
             log(config, "Antigravity printed no output; no agy log lookup (no spawn observation)")
@@ -1349,6 +1401,53 @@ def _strip_public_response_marker(raw: str) -> tuple[str, AgentTextSource]:
     if PUBLIC_RESPONSE_MARKER not in raw:
         return raw, "stdout"
     return raw.rsplit(PUBLIC_RESPONSE_MARKER, 1)[1].lstrip("\n"), "stdout_marker"
+
+
+def _select_structured_turn_text(
+    config: AgentLoopConfig,
+    stdout: str,
+    response_file_text: str | None,
+    *,
+    kind: str,
+    signature: str,
+) -> tuple[str, AgentTextSource, str | None]:
+    """(text, text_source, provider error) for a JSON-mode turn (#2029).
+
+    Precedence: a SUCCESS envelope whose ``structured_output`` renders, then a
+    non-empty response file, then the public-response marker in the
+    envelope's prose (or raw stdout when no envelope parsed).  A non-empty
+    response file does not prove a usable contract, so a renderable payload
+    wins over it; the file stays on the result for audit only.
+
+    A non-SUCCESS envelope is an operational failure reported by agy, not
+    model prose: its decoded error comes back separately as the provider
+    error, so classification can read it as the terminal provider frame in
+    every failure phase (narration in ``response`` can never displace it).
+    """
+    envelope: AgyEnvelope | None = parse_agy_json_envelope(stdout)
+    if envelope is not None and envelope.succeeded and envelope.structured_output is not None:
+        rendered = render_structured_output_text(envelope.structured_output, kind, signature)
+        if rendered is not None:
+            if response_file_text is not None:
+                log(
+                    config,
+                    "Antigravity returned both structured_output and a response file; "
+                    "using structured_output (the file is kept for audit only)",
+                )
+            return rendered, "structured_output", None
+        log(config, "Antigravity structured_output was not renderable; falling back")
+    provider_error = (
+        envelope_provider_error(envelope)
+        if envelope is not None and not envelope.succeeded
+        else None
+    )
+    if response_file_text is not None:
+        return response_file_text, "response_file", provider_error
+    if envelope is not None:
+        text, source = _strip_public_response_marker(envelope.response)
+        return text, source, provider_error
+    text, source = _strip_public_response_marker(stdout)
+    return text, source, provider_error
 
 
 def _parse_model_catalog(raw: str) -> set[str]:
@@ -1461,6 +1560,17 @@ class AntigravityBackend:
                 role=role,
             )
         oversized_prompt = len(prompt_text.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
+        # Schema-constrained output (#2029): only for a normal role whose turn
+        # the validated-agent entry point marked eligible, and only when the
+        # installed agy advertises the flags.
+        structured_kind = config.antigravity_structured_kind
+        if (
+            isolated_role
+            or structured_kind not in STRUCTURED_KIND_FOOTERS
+            or not antigravity_structured_output_supported(runner, config)
+        ):
+            structured_kind = None
+        schema_path: Path | None = None
         args = [
             config.antigravity_cmd,
             "--model",
@@ -1476,8 +1586,18 @@ class AntigravityBackend:
         # is None and turns are single-shot; honor it if a caller ever supplies one.
         if session_id:
             args += ["--conversation", session_id]
+        if structured_kind is not None:
+            # The schema sits beside the private response file, outside the
+            # checkout, and is removed after the turn.
+            schema_path = write_structured_output_schema(response_path.parent, structured_kind)
+            args += ["--output-format", "json", "--json-schema", str(schema_path)]
         # The prompt is the value of --print (must be last), not a positional.
-        args += ["--print", _OVERSIZED_PROMPT_DIRECTIVE if oversized_prompt else prompt_text]
+        args += [
+            "--print",
+            _oversized_prompt_directive(response_path, structured_kind is not None)
+            if oversized_prompt
+            else prompt_text,
+        ]
         log_path = log_path_override or agent_log_path(
             config, "antigravity", run_id=run_id, label=label, attempt_suffix=attempt_suffix
         )
@@ -1680,7 +1800,9 @@ class AntigravityBackend:
                         role != _SEMANTIC_DEDUPE_ROLE
                         and agy_log_inventory is not None
                         and result.observation is not None
-                        and is_silent_antigravity_attempt(result, None)
+                        and is_silent_antigravity_attempt(
+                            result, None, json_mode=structured_kind is not None
+                        )
                     ):
                         try:
                             spawn = result.observation.spawn_wall_time
@@ -1745,6 +1867,8 @@ class AntigravityBackend:
                     log(config, f"{seat_label} could not remove its shared agy settings lock holder record: {exc}")
             fcntl.flock(settings_lock, fcntl.LOCK_UN)
             settings_lock.close()
+            if schema_path is not None:
+                schema_path.unlink(missing_ok=True)
         log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
         # Prefer the public response file the prompt asks the agent to write; else
@@ -1757,7 +1881,16 @@ class AntigravityBackend:
         if role == _SEMANTIC_DEDUPE_ROLE:
             response_path.unlink(missing_ok=True)
             response_file_text = None
-        if response_file_text is not None:
+        provider_error_text: str | None = None
+        if structured_kind is not None:
+            message_text, text_source, provider_error_text = _select_structured_turn_text(
+                config,
+                result.stdout,
+                response_file_text,
+                kind=structured_kind,
+                signature=structured_output_signature(config, model),
+            )
+        elif response_file_text is not None:
             message_text, text_source = response_file_text, "response_file"
         else:
             message_text, text_source = _strip_public_response_marker(result.stdout)
@@ -1765,11 +1898,16 @@ class AntigravityBackend:
         agy_log_evidence: AntigravityLogQuotaEvidence | None = None
         if role != _SEMANTIC_DEDUPE_ROLE:
             agy_log_path, agy_log_evidence = _silent_attempt_log_evidence(
-                config, result, response_file_text, agy_log_lookup
+                config,
+                result,
+                response_file_text,
+                agy_log_lookup,
+                json_mode=structured_kind is not None,
             )
         return AgentResult(
             text=message_text,
             raw_output=result.stdout,
+            provider_error_text=provider_error_text,
             text_source=text_source,
             response_file_text=response_file_text,
             response_file_path=response_path,

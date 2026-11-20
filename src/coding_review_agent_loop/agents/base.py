@@ -21,7 +21,10 @@ if TYPE_CHECKING:
     from ..review_images_transport import ImageInputs, ImageDeliveryProof
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
-AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
+# ``structured_output`` is an agent-authored payload from agy's schema channel
+# (#2029); like ``response_file`` it was not scraped from stdout.
+AgentTextSource = Literal["response_file", "structured_output", "stdout_marker", "stdout"]
+AGENT_AUTHORED_TEXT_SOURCES = frozenset({"response_file", "structured_output"})
 
 # Keep prompts below Linux's per-argument exec limit; longer prompts are sent
 # through stdin or backend-specific task context instead. Claude and Codex
@@ -90,6 +93,10 @@ class AgentResult:
     # and its RESOURCE_EXHAUSTED 429 executor line when one was found.
     antigravity_log_path: Path | None = None
     antigravity_log_quota_evidence: AntigravityLogQuotaEvidence | None = None
+    # Antigravity JSON mode only (#2029): the decoded error of a non-SUCCESS
+    # agy envelope. A provider diagnostic, never model prose: failure
+    # classification reads it as the terminal frame in every phase.
+    provider_error_text: str | None = None
 
     image_delivery_proof: ImageDeliveryProof | None = None
 

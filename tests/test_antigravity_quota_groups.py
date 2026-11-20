@@ -1203,3 +1203,197 @@ def test_non_silent_turn_does_not_list_agy_logs(tmp_path, _isolated_agy_log_dir,
     assert error is None and response.model_used == GEM1
     assert models == [GEM1] and repairs == []
     assert calls == []
+
+
+# --- format-failure fallback and JSON-mode classification (#2029) -------------
+
+NARRATION = "I reviewed the PR as markdown in chat; it looks fine overall."
+MODEL_A = "Gemini 4 Hydrogen (Medium)"
+MODEL_B = "Gemini 3.8 Flash (High)"
+
+
+def _state(models, retries):
+    return agy.AntigravityAttemptState(tuple(models), retries)
+
+
+def test_two_format_failures_on_a_move_to_b_without_consuming_retries():
+    state = _state((MODEL_A, MODEL_B), 2)
+    assert state.next_after_failure(retryable=True, provider_capacity=False, format_failure=True) == "retry"
+    assert state.retries_remaining == 1
+    assert state.next_after_failure(retryable=True, provider_capacity=False, format_failure=True) == "format-fallback"
+    assert state.models[state.model_index] == MODEL_B
+    assert state.retries_remaining == 1  # the fallback consumed no chain-wide retry
+    assert state.format_failures == {MODEL_A: 2}
+
+
+def test_one_format_failure_with_no_retries_left_moves_to_b():
+    state = _state((MODEL_A, MODEL_B), 0)
+    assert state.next_after_failure(retryable=True, provider_capacity=False, format_failure=True) == "format-fallback"
+    assert state.models[state.model_index] == MODEL_B
+
+
+def test_format_failures_on_the_last_model_retry_then_stop():
+    state = _state((MODEL_A,), 1)
+    assert state.next_after_failure(retryable=True, provider_capacity=False, format_failure=True) == "retry"
+    assert state.next_after_failure(retryable=True, provider_capacity=False, format_failure=True) == "stop"
+    assert state.model_index == 0
+
+
+def test_capacity_and_plain_failures_ignore_format_counts():
+    state = _state((MODEL_A, MODEL_B), 0)
+    assert state.next_after_failure(retryable=True, provider_capacity=True) == "fallback"
+    assert state.format_failures == {}
+    other = _state((MODEL_A, MODEL_B), 0)
+    assert other.next_after_failure(retryable=False, provider_capacity=False) == "stop"
+    assert other.model_index == 0
+
+
+def _review_turn(tmp_path, outputs, *, models, agent_max_retries=1, runner=None):
+    runner = runner or FakeRunner(antigravity_outputs=list(outputs))
+    config = make_config(
+        tmp_path, antigravity_models=tuple(models), agent_max_retries=agent_max_retries,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[object] = []
+
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    try:
+        with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)), \
+                patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+            response = validated_agent._run_validated_agent(
+                runner, agent="antigravity", config=config, prompt="Review this PR.",
+                marker_description="structured pr_review",
+                validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+                use_repair=True, repair_expected_kind="pr_review", role="reviewer",
+            )
+        error = None
+    except (AgentInvocationError, QuotaResetExceededError) as exc:
+        response, error = None, exc
+    cmds = [c for c, _cwd in runner.commands if c[:1] == ["agy"]]
+    models_run = [c[c.index("--model") + 1] for c in cmds if "--model" in c]
+    return response, error, models_run, logs, repairs
+
+
+def test_repeated_narration_on_a_falls_back_to_b_and_accepts_its_review(tmp_path):
+    valid = structured_pr_review(reviewer=f"Google Antigravity: {MODEL_B}")
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, logs, repairs = _review_turn(
+            tmp_path, [(NARRATION, 0), (NARRATION, 0), (valid, 0)], models=(MODEL_A, MODEL_B),
+        )
+    assert error is None
+    assert response.model_used == MODEL_B
+    assert response.marker_value.state == "approved"
+    assert models == [MODEL_A, MODEL_A, MODEL_B]
+    assert repairs == []  # the substance gate refused repair before any backend call
+    assert (
+        f"Antigravity: {MODEL_A} produced no recoverable structured payload 2 times; "
+        f"falling back to {MODEL_B}"
+    ) in logs
+
+
+def test_single_narration_with_no_retries_falls_back_at_once(tmp_path):
+    valid = structured_pr_review(reviewer=f"Google Antigravity: {MODEL_B}")
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, _logs, _repairs = _review_turn(
+            tmp_path, [(NARRATION, 0), (valid, 0)], models=(MODEL_A, MODEL_B), agent_max_retries=0,
+        )
+    assert error is None and response.model_used == MODEL_B
+    assert models == [MODEL_A, MODEL_B]
+
+
+@pytest.mark.parametrize(
+    "models,outputs,expected_models",
+    [
+        ((MODEL_A,), [(NARRATION, 0)] * 6, [MODEL_A, MODEL_A]),
+        ((MODEL_A, MODEL_B), [(NARRATION, 0)] * 6, [MODEL_A, MODEL_A, MODEL_B]),
+    ],
+    ids=["single-model", "chain-exhausted"],
+)
+def test_seat_is_unavailable_only_when_the_chain_is_exhausted(tmp_path, models, outputs, expected_models):
+    with workdir_claims.workdir_claim_scope():
+        response, error, models_run, logs, repairs = _review_turn(
+            tmp_path, outputs, models=models,
+        )
+    assert response is None
+    assert isinstance(error, AgentInvocationError)
+    assert error.failure_category == "agent-unavailable"
+    assert "review_substance_integrity" in str(error)
+    assert models_run == expected_models
+    # Bounded by max_attempts (len(models) + retries + 2), and no synthesized verdict.
+    assert len(models_run) <= len(models) + 1 + 2
+    assert repairs == []
+
+
+def _structured_on(monkeypatch):
+    from coding_review_agent_loop.agents import antigravity_structured
+
+    antigravity_structured.reset_structured_output_capability_cache()
+    monkeypatch.setattr(
+        antigravity_structured, "_probe_agy_help",
+        lambda runner, config: "--output-format string\n--json-schema string\n",
+    )
+
+
+def _json_envelope(prefix="agy starting", **fields):
+    import json as json_module
+
+    return f"{prefix}\r\n" + json_module.dumps(fields) + "\r\n"
+
+
+_MULTILINE_NARRATION = (
+    "## Review\n\nI looked at the diff carefully.\nThe parser change reads well.\n"
+    "The tests cover the new branch.\nI would approve this change."
+)
+
+
+@pytest.mark.parametrize("returncode", [1, 0], ids=["nonzero-exit", "zero-exit"])
+@pytest.mark.parametrize("response", ["", _MULTILINE_NARRATION], ids=["empty", "multiline-narration"])
+def test_json_mode_quota_frame_is_classified_and_falls_back_by_quota(
+    tmp_path, monkeypatch, returncode, response
+):
+    """The decoded 429 frame stays terminal for classification in every phase (#2029)."""
+    import json as json_module
+
+    _structured_on(monkeypatch)
+    failure = _json_envelope(status="ERROR", response=response, error=LIVE_SAMPLE)
+    valid_payload = json_module.JSONDecoder().raw_decode(structured_pr_review())[0]
+    success = _json_envelope(status="SUCCESS", response="prose", structured_output=valid_payload)
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, logs, repairs = _review_turn(
+            tmp_path, [(failure, returncode), (success, 0)], models=(GEM1, OPUS),
+        )
+        assert _gemini_marked()
+    assert error is None and response.model_used == OPUS
+    assert models == [GEM1, OPUS]
+    assert repairs == []
+    assert any("skipping quota group gemini" in line for line in logs)
+    assert not any("no recoverable structured payload" in line for line in logs)
+
+
+def test_json_mode_silent_envelope_still_reads_the_agy_log(tmp_path, monkeypatch, _isolated_agy_log_dir):
+    import json as json_module
+
+    _structured_on(monkeypatch)
+    # Only agy's known no-output warning surrounds an empty envelope.
+    silent = _json_envelope(AGY_SILENT_WARNING, status="ERROR", response="")
+    valid_payload = json_module.JSONDecoder().raw_decode(structured_pr_review())[0]
+    success = _json_envelope(status="SUCCESS", response="", structured_output=valid_payload)
+    runner = AgyLogRunner(
+        antigravity_outputs=[(silent, 0), (success, 0)], log_dir=_isolated_agy_log_dir,
+        agy_logs=[AGY_429_LOG, None],
+    )
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, logs, repairs = _review_turn(
+            tmp_path, [], models=(GEM1, OPUS), runner=runner,
+        )
+        assert _gemini_marked()
+    assert error is None and response.model_used == OPUS
+    assert models == [GEM1, OPUS]
+    assert repairs == []
+    assert any("treating as quota exhaustion" in line for line in logs)
+    assert not any("no recoverable structured payload" in line for line in logs)

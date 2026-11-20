@@ -2272,3 +2272,112 @@ def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind,
     assert "Reported PR (unverified)" not in message
     assert stop.value.failure_category == "deterministic"
     assert runner.issue_comments == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Unauthorized: invalid api key provided.",
+        "Quota exceeded: billing credits are exhausted.",
+    ],
+    ids=["auth", "billing"],
+)
+def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, output):
+    """#2029: a refused repair on a named auth/billing failure keeps its stop."""
+    from coding_review_agent_loop.protocol import parse_pr_review
+
+    runner = FakeRunner(antigravity_outputs=[(output, 0)] * 4)
+    config = make_config(
+        tmp_path,
+        antigravity_models=("Model A", "Model B"),
+        agent_max_retries=2,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[object] = []
+
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+            patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+        with pytest.raises(AgentInvocationError) as excinfo:
+            _run_validated_agent(
+                runner,
+                agent="antigravity",
+                config=config,
+                prompt="Review this PR.",
+                marker_description="structured pr_review",
+                validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+                use_repair=True,
+                repair_expected_kind="pr_review",
+                role="reviewer",
+            )
+
+    models = [c[c.index("--model") + 1] for c, _ in runner.commands if c[:1] == ["agy"]]
+    assert models == ["Model A"]
+    assert excinfo.value.failure_category == "non-retryable"
+    assert repairs == []
+    assert not any("falling back to" in line for line in logs)
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["zero-exit", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "error",
+    ["Unauthorized: invalid api key provided.", "Quota exceeded: billing credits are exhausted."],
+    ids=["auth", "billing"],
+)
+def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
+    tmp_path, monkeypatch, returncode, error
+):
+    """#2029: a non-SUCCESS agy envelope's auth/billing error survives narration."""
+    from coding_review_agent_loop.agents import antigravity_structured
+    from coding_review_agent_loop.protocol import parse_pr_review
+
+    antigravity_structured.reset_structured_output_capability_cache()
+    monkeypatch.setattr(
+        antigravity_structured, "_probe_agy_help",
+        lambda runner, config: "--output-format string\n--json-schema string\n",
+    )
+    envelope = "agy starting\r\n" + json.dumps({
+        "status": "ERROR",
+        "response": "## Review\n\nI reviewed the change and it looks fine to me overall.",
+        "error": error,
+    }) + "\r\n"
+    runner = FakeRunner(antigravity_outputs=[(envelope, returncode)] * 4)
+    config = make_config(
+        tmp_path,
+        antigravity_models=("Model A", "Model B"),
+        agent_max_retries=2,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[object] = []
+
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+            patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+        with pytest.raises(AgentInvocationError) as excinfo:
+            _run_validated_agent(
+                runner,
+                agent="antigravity",
+                config=config,
+                prompt="Review this PR.",
+                marker_description="structured pr_review",
+                validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+                use_repair=True,
+                repair_expected_kind="pr_review",
+                role="reviewer",
+            )
+
+    cmds = [c for c, _ in runner.commands if c[:1] == ["agy"]]
+    assert all("--json-schema" in cmd for cmd in cmds)
+    assert [c[c.index("--model") + 1] for c in cmds] == ["Model A"]
+    assert excinfo.value.failure_category == "non-retryable"
+    assert repairs == []
+    assert not any("falling back to" in line for line in logs)
+    assert not any("no recoverable structured payload" in line for line in logs)

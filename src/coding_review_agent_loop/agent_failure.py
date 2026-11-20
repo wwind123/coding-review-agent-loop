@@ -1568,14 +1568,24 @@ def _agent_failure_classification(
     *,
     phase: str,
 ) -> tuple[str, ProviderFailureVerdict | None]:
-    """Choose the classification text and, for Codex, the provider verdict (#1269)."""
+    """Choose the classification text and, for Codex, the provider verdict (#1269).
+
+    A typed provider error (a non-SUCCESS agy envelope, #2029) is appended
+    last in every phase, so it stays the terminal provider frame however
+    much model prose precedes it.
+    """
+    provider_error = getattr(result, "provider_error_text", None)
     if phase in {"command", "empty"}:
         if result.provider == "codex":
             verdict = classify_codex_failure(result.raw_output or "")
             if verdict is not None:
                 return verdict.text, verdict
-        return result.raw_output or result.text, None
-    return result.text, None
+        base = result.raw_output or result.text
+    else:
+        base = result.text
+    if provider_error:
+        return f"{base}\n{provider_error}" if base else provider_error, None
+    return base, None
 
 
 def _agent_failure_classification_text(

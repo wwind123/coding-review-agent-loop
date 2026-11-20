@@ -22,7 +22,7 @@ from .agents.antigravity import AntigravityBackend
 from .agents.format_repair import run_cli_repair
 from .agent_executable import pinned_agent_environment
 from .coder_ci_guard import coder_ci_guard_environment
-from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
+from .agents.base import AGENT_AUTHORED_TEXT_SOURCES, STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
 from .config import (
     ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES,
@@ -1842,7 +1842,7 @@ def _is_transient_model_access_failure(result: object | None, output: str) -> bo
     A response-file artifact or a structured JSON response is model-authored
     content and is never classified as transient, whatever text it quotes.
     """
-    if result is None or getattr(result, "text_source", None) == "response_file":
+    if result is None or getattr(result, "text_source", None) in AGENT_AUTHORED_TEXT_SOURCES:
         return False
     if _looks_like_structured_response(output):
         return False
@@ -2062,7 +2062,7 @@ def execute_repair(
                     config.repair_backend == "antigravity"
                     and outcome in {"nonzero_exit", "timeout"}
                     and result is not None
-                    and result.text_source == "response_file"
+                    and result.text_source in AGENT_AUTHORED_TEXT_SOURCES
                 )
             ):
                 try:

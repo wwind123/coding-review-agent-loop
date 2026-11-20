@@ -509,7 +509,21 @@ def build_parser() -> argparse.ArgumentParser:
             "--antigravity-models",
             nargs="+",
             default=None,
-            help="Ordered Antigravity fallback chain after provider capacity retries. Mutually exclusive with --antigravity-model.",
+            help=(
+                "Ordered Antigravity fallback chain. A turn moves to the next model after "
+                "provider capacity retries, or after repeated responses with no recoverable "
+                "structured payload. Mutually exclusive with --antigravity-model."
+            ),
+        )
+        subparser.add_argument(
+            "--antigravity-structured-output",
+            choices=("auto", "off"),
+            default="auto",
+            help=(
+                "Use agy --output-format json --json-schema for eligible structured turns "
+                "when the installed agy supports it (default: auto). 'off' keeps the "
+                "legacy response-file channel."
+            ),
         )
         subparser.add_argument(
             "--antigravity-quota-signatures",
