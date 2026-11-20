@@ -73,9 +73,6 @@ DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
 # for discoverability/symmetry with DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES.
 DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
     "Gemini 3.8 Flash (High)",
-    "Gemini 3.7 Flash (High)",
-    "Gemini 3.6 Flash (High)",
-    "Gemini 3.1 Pro (High)",
     # Served on a quota separate from Gemini's, so it only runs when the Gemini
     # group cannot serve (#1236). Two reviewers may then share one model.
     "Claude Opus 5.5 (Medium)",
@@ -105,7 +102,8 @@ DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_REPAIR_MODELS: tuple[str, ...] = (
     "Gemini 3.8 Flash (Medium)",
-    "Gemini 3.7 Flash (Medium)",
+    # Served on Antigravity's separate quota, so it is a real fallback (#2023).
+    "Claude Opus 5.5 (Medium)",
 )
 # agy reports a transient model-access failure on its provider channel (stdout,
 # with no response artifact) with this text.  Matched case-insensitively; the

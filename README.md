@@ -1520,7 +1520,6 @@ snapshot with bounded, spillable excerpts.
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
 
 The default Antigravity model chain is `Gemini 3.8 Flash (High)`, then
-`Gemini 3.7 Flash (High)`, then `Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)`, then
 `Claude Opus 5.5 (Medium)` (served on a separate quota) for eligible capacity
 failures. A quota-exhausted provider is skipped as a whole quota group, so a
 Gemini exhaustion goes straight to Opus; see
@@ -1535,7 +1534,7 @@ structured turns use agy's schema-constrained output. Disable it with
 
 Malformed structured responses get a format-repair pass. By default it uses
 Antigravity with the repair chain `Gemini 3.8 Flash (Medium)`, then
-`Gemini 3.7 Flash (Medium)`, followed by the Antigravity chain above. Use
+`Claude Opus 5.5 (Medium)`, followed by the Antigravity chain above. Use
 `--repair-backend` and repeatable `--repair-model` to change it. The default
 requires the `agy` CLI even when no role uses Antigravity; on a host without it,
 pass `--repair-backend codex --repair-model MODEL` (or `claude`). Models that

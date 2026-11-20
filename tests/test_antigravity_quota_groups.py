@@ -88,6 +88,15 @@ JSON_4H = (
 HIGH_TRAFFIC = "Error: high traffic, try again in a minute"
 OPUS = "Claude Opus 5.5 (Medium)"
 GEM1 = "Gemini 3.8 Flash (High)"
+# Test-local multi-Gemini chain for walk-mechanics tests that need several
+# entries in the gemini quota group. It is a fixture, not a production default.
+GEM2 = "Gemini Sibling B (High)"
+MULTI_GEMINI_CHAIN = (GEM1, GEM2, "Gemini Sibling C (High)", "Gemini Sibling D (High)", OPUS)
+REMOVED_DEFAULT_MODELS = (
+    "Gemini 3.7 Flash (High)",
+    "Gemini 3.6 Flash (High)",
+    "Gemini 3.1 Pro (High)",
+)
 
 
 class FakeClock:
@@ -129,8 +138,12 @@ def _turn(tmp_path, outputs, *, agent_max_retries=1, runner=None, **overrides):
 # --- config / groups -------------------------------------------------------
 
 def test_default_chain_has_opus_last():
-    assert len(DEFAULT_ANTIGRAVITY_MODELS) == 5
+    assert DEFAULT_ANTIGRAVITY_MODELS == (GEM1, OPUS)
     assert DEFAULT_ANTIGRAVITY_MODELS[-1] == OPUS
+
+
+def test_default_chain_quota_groups_are_gemini_then_claude():
+    assert [agy.antigravity_quota_group(m) for m in DEFAULT_ANTIGRAVITY_MODELS] == ["gemini", "claude"]
 
 
 def test_group_derivation_and_override():
@@ -171,7 +184,9 @@ def test_cli_override_must_name_a_chain_model(tmp_path):
 
 
 def test_override_only_on_fallback_entry_survives_singleton(tmp_path):
-    config = make_config(tmp_path, antigravity_quota_groups=((OPUS, "x"),))
+    config = make_config(
+        tmp_path, antigravity_models=MULTI_GEMINI_CHAIN, antigravity_quota_groups=((OPUS, "x"),)
+    )
     state = agy.AntigravityAttemptState.from_config(config, 1)
     assert state.groups == ("gemini",) * 4 + ("x",)
     narrowed = state.singleton_config(config)
@@ -189,6 +204,30 @@ def test_quota_on_first_link_skips_gemini_group_without_sleep(tmp_path):
     assert any("capacity failure after" in line for line in logs)
     assert any("skipping quota group gemini" in line for line in logs)
     assert response.model_used == OPUS
+
+
+def test_default_chain_quota_exhaustion_jumps_straight_to_opus(tmp_path):
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, sleeps, _l = _turn(tmp_path, [_fail(QUOTA_4H), ("ok review", 0)])
+    assert error is None and response.text == "ok review"
+    assert response.model_used == OPUS
+    assert models == [GEM1, OPUS]  # no retry of the exhausted model
+    assert sleeps == []
+    assert not set(models) & set(REMOVED_DEFAULT_MODELS)
+
+
+def test_default_chain_transient_failures_end_at_opus_with_ordinary_error(tmp_path):
+    with workdir_claims.workdir_claim_scope():
+        runner = FakeRunner(antigravity_outputs=[_fail(HIGH_TRAFFIC)] * 3)
+        _r, error, models, _s, _l = _turn(tmp_path, [], agent_max_retries=1, runner=runner)
+        assert runner.antigravity_outputs == []  # every queued failure was consumed
+        memory = agy.quota_memory_for_current_run()
+        assert all(memory.entry(g) is None for g in ("gemini", "claude"))
+    assert models == [GEM1, GEM1, OPUS]
+    assert type(error) is AgentInvocationError
+    assert not isinstance(error, QuotaResetExceededError)
+    assert not str(error).startswith("Antigravity unavailable")
+    assert not set(models) & set(REMOVED_DEFAULT_MODELS)
 
 
 def test_quota_exhaustion_does_not_consume_retry_budget(tmp_path):
@@ -283,21 +322,29 @@ def test_transient_walk_to_opus_then_exhaustion_jumps_back_to_gemini(tmp_path):
         tmp_path,
         [_fail(HIGH_TRAFFIC)] * 4 + [_fail(QUOTA_4H), _fail(HIGH_TRAFFIC), _fail(HIGH_TRAFFIC)],
         agent_max_retries=0,
+        antigravity_models=MULTI_GEMINI_CHAIN,
     )
-    assert models[:5] == list(DEFAULT_ANTIGRAVITY_MODELS)
+    assert models[:5] == list(MULTI_GEMINI_CHAIN)
     assert models[5] == GEM1  # Claude group exhausted; jump back, no raise
     assert not isinstance(error, QuotaResetExceededError)
 
 
-def test_unverified_transcript_reset_at_end_of_chain_does_not_raise_quota_reset(tmp_path):
+@pytest.mark.parametrize("chain", [MULTI_GEMINI_CHAIN, DEFAULT_ANTIGRAVITY_MODELS], ids=["multi-gemini", "default"])
+def test_unverified_transcript_reset_at_end_of_chain_does_not_raise_quota_reset(tmp_path, chain):
     noise = "reviewing: the quota note says try again in 4h\nmore transcript\n"
-    outputs = [_fail(HIGH_TRAFFIC)] * 5 + [_fail(noise + HIGH_TRAFFIC)]
+    # One retry is spent on the first entry, then the walk reaches Opus, which
+    # fails last with the transcript noise. Queue exactly one output per call.
+    expected_models = [GEM1, GEM1, *chain[1:]]
+    outputs = [_fail(HIGH_TRAFFIC)] * (len(expected_models) - 1) + [_fail(noise + HIGH_TRAFFIC)]
+    runner = FakeRunner(antigravity_outputs=list(outputs))
     with workdir_claims.workdir_claim_scope():
-        _r, error, models, _s, _l = _turn(tmp_path, outputs, agent_max_retries=1)
+        _r, error, models, _s, _l = _turn(
+            tmp_path, outputs, agent_max_retries=1, runner=runner, antigravity_models=chain
+        )
         memory = agy.quota_memory_for_current_run()
         assert all(memory.entry(g) is None for g in ("gemini", "claude"))
-    # one retry is spent on Gemini 3.8, then the walk reaches Opus, which fails last
-    assert models == [GEM1, GEM1, *DEFAULT_ANTIGRAVITY_MODELS[1:]]
+    assert models == expected_models
+    assert runner.antigravity_outputs == []  # the end-of-chain noise output was consumed
     assert type(error) is AgentInvocationError
     assert not str(error).startswith("Antigravity unavailable")
 
@@ -310,10 +357,11 @@ def test_sparse_newline_head_header_never_becomes_exhaustion(tmp_path):
     assert capacity.is_capacity and capacity.frame == ""
     with workdir_claims.workdir_claim_scope():
         _r, error, models, sleeps, _l = _turn(
-            tmp_path, [_fail(text), ("ok", 0)], agent_max_retries=0
+            tmp_path, [_fail(text), ("ok", 0)], agent_max_retries=0,
+            antigravity_models=MULTI_GEMINI_CHAIN,
         )
         assert error is None
-        assert models == [GEM1, "Gemini 3.7 Flash (High)"]  # transient sibling fallback, no skip
+        assert models == [GEM1, GEM2]  # transient sibling fallback, no skip
         assert agy.quota_memory_for_current_run().entry("gemini") is None
 
 
@@ -321,7 +369,9 @@ def test_shared_limit_message_names_the_actual_last_failure(tmp_path):
     claude_frame = "Error: quota exceeded (claude frame)"
     gemini_frame = "Error: quota exceeded (gemini frame)"
     outputs = [_fail(HIGH_TRAFFIC)] * 4 + [_fail(claude_frame), _fail(gemini_frame)]
-    _r, error, models, _s, _l = _turn(tmp_path, outputs, agent_max_retries=0)
+    _r, error, models, _s, _l = _turn(
+        tmp_path, outputs, agent_max_retries=0, antigravity_models=MULTI_GEMINI_CHAIN
+    )
     assert models[-2:] == [OPUS, GEM1]
     assert type(error) is AgentInvocationError
     assert "gemini frame" in str(error) and "claude frame" not in str(error)
@@ -430,8 +480,11 @@ def test_multiple_overrides_and_out_of_chain_repair_model(tmp_path, monkeypatch)
     agy = sys.modules[repair_module.AntigravityBackend.__module__]
 
     monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
-    overrides = ((GEM1, "g1"), ("Gemini 3.7 Flash (High)", "g1"), (OPUS, "g2"))
-    config = make_config(tmp_path, antigravity_quota_groups=overrides, repair_models=("Out Of Chain Model",))
+    overrides = ((GEM1, "g1"), (GEM2, "g1"), (OPUS, "g2"))
+    config = make_config(
+        tmp_path, antigravity_models=MULTI_GEMINI_CHAIN, antigravity_quota_groups=overrides,
+        repair_models=("Out Of Chain Model",),
+    )
     state = agy.AntigravityAttemptState.from_config(config, 1)
     assert state.groups == ("g1", "g1", "gemini", "gemini", "g2")
     captured = []

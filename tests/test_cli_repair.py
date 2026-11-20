@@ -139,6 +139,19 @@ def test_cli_repair_requires_explicit_model(tmp_path, backend):
         make_config(tmp_path, repair_backend=backend)
 
 
+def test_codex_repair_flag_without_model_rejected_and_single_model_verbatim(tmp_path):
+    base = [
+        "issue", "1", "--repo", "OWNER/REPO",
+        "--codex-dir", str(tmp_path / "codex"),
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+        "--repair-backend", "codex",
+    ]
+    with pytest.raises(AgentLoopError, match="explicit --repair-model"):
+        config_from_args(build_parser().parse_args(base), FakeRunner())
+    config = config_from_args(build_parser().parse_args([*base, "--repair-model", "M"]), FakeRunner())
+    assert config.repair_models == ("M",)
+
+
 @pytest.mark.parametrize("backend,effort", [("codex", "max"), ("claude", "minimal"), ("antigravity", "high")])
 def test_cli_repair_invalid_effort(tmp_path, backend, effort):
     with pytest.raises(AgentLoopError, match="--repair-reasoning-effort"):
@@ -179,14 +192,20 @@ def test_default_repair_and_antigravity_chains_use_current_flash_generation(tmp_
         DEFAULT_REPAIR_MODELS,
     )
 
-    assert DEFAULT_REPAIR_MODELS == ("Gemini 3.8 Flash (Medium)", "Gemini 3.7 Flash (Medium)")
+    assert DEFAULT_REPAIR_MODELS == ("Gemini 3.8 Flash (Medium)", "Claude Opus 5.5 (Medium)")
     assert DEFAULT_ANTIGRAVITY_MODELS == (
         "Gemini 3.8 Flash (High)",
-        "Gemini 3.7 Flash (High)",
-        "Gemini 3.6 Flash (High)",
-        "Gemini 3.1 Pro (High)",
         "Claude Opus 5.5 (Medium)",
     )
+    removed = {
+        "Gemini 3.7 Flash (High)",
+        "Gemini 3.7 Flash (Medium)",
+        "Gemini 3.6 Flash (High)",
+        "Gemini 3.1 Pro (High)",
+    }
+    for model in (*DEFAULT_ANTIGRAVITY_MODELS, *DEFAULT_REPAIR_MODELS):
+        assert model not in removed
+        assert "Gemini 4 Hydrogen" not in model
     args = build_parser().parse_args([
         "issue", "1", "--repo", "OWNER/REPO",
         "--subprocess-log-dir", str(tmp_path / "logs"),
@@ -198,5 +217,5 @@ def test_default_repair_and_antigravity_chains_use_current_flash_generation(tmp_
     with pytest.raises(SystemExit):
         build_parser().parse_args(["issue", "--help"])
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "Gemini 3.8 Flash (Medium) -> Gemini 3.7 Flash (Medium)" in help_text
+    assert "Gemini 3.8 Flash (Medium) -> Claude Opus 5.5 (Medium)" in help_text
     assert "only; required" not in help_text
