@@ -7253,6 +7253,95 @@ def test_pr_local_environment_note_only_with_the_flag_and_after_a_rebuild(tmp_pa
     assert guidance not in _coder_workdir_guidance(on, implementation=False)
 
 
+_SHARED_LINK_GUIDANCE = "They are shared operator infrastructure: do not replace, move, copy over or delete them"
+_PR_LOCAL_GUIDANCE = "private dependency environment that agent-loop builds"
+
+
+def _link_guidance_case(tmp_path, *, register=True, **overrides):
+    """A coder (claude) workdir with an optionally registered ``node_modules`` link (#2036)."""
+    from dataclasses import replace as _replace
+
+    from agent_loop_helpers import make_config
+
+    from coding_review_agent_loop import checkout_verification as cv
+
+    config = _replace(make_config(tmp_path), **overrides)
+    workdir = config.claude_dir.resolve()
+    store = tmp_path / "store" / "node_modules"
+    store.mkdir(parents=True)
+    if register:
+        (workdir / "node_modules").symlink_to(store)
+        cv.register_worktree_links(workdir, {"node_modules": str(store)})
+    return cv, config, workdir
+
+
+def test_coder_prompt_names_registered_worktree_links_as_off_limits_2036(tmp_path):
+    """Row prompt-links-present-absent (a), (d): registered links, coder only."""
+    from coding_review_agent_loop.prompt_support import _coder_workdir_guidance
+
+    cv, config, _workdir = _link_guidance_case(tmp_path, worktree_links=("node_modules",))
+    try:
+        coder = _coder_workdir_guidance(config)
+        assert "Shared worktree links: `node_modules` in this checkout is a link (--worktree-link)" in coder
+        assert _SHARED_LINK_GUIDANCE in coder
+        assert "If a dependency seems to block citable evidence, report that" in coder
+        assert _PR_LOCAL_GUIDANCE not in coder
+        prompt = build_issue_implementation_prompt(56, "Implement.", config)
+        assert prompt.count(_SHARED_LINK_GUIDANCE) == 1
+        # Reviewer prompts never carry it.
+        assert _SHARED_LINK_GUIDANCE not in _coder_workdir_guidance(config, implementation=False)
+    finally:
+        cv.reset_checkout_baselines()
+
+
+@pytest.mark.parametrize("configured", [(), ("node_modules",)], ids=["no-links", "mixed-mode"])
+def test_coder_prompt_has_no_link_guidance_for_an_unregistered_checkout_2036(tmp_path, configured):
+    """Row prompt-links-present-absent (b), (c): no registration, even with configured links."""
+    from coding_review_agent_loop.prompt_support import _coder_workdir_guidance
+
+    cv, config, _workdir = _link_guidance_case(tmp_path, register=False, worktree_links=configured)
+    try:
+        guidance = _coder_workdir_guidance(config)
+        assert _SHARED_LINK_GUIDANCE not in guidance and "Shared worktree links" not in guidance
+        assert "`node_modules`" not in guidance
+    finally:
+        cv.reset_checkout_baselines()
+
+
+@pytest.mark.parametrize("rebuilt", [False, True], ids=["pre-rebuild", "post-rebuild"])
+def test_pr_local_coder_prompt_names_each_link_once_without_the_shared_paragraph_2036(tmp_path, rebuilt):
+    """Row prompt-links-present-absent (e), (f): the pr-local paragraph alone, with move/copy wording."""
+    from coding_review_agent_loop.prompt_support import (
+        _coder_workdir_guidance,
+        _pr_local_environment_guidance,
+    )
+
+    cv, config, workdir = _link_guidance_case(
+        tmp_path, worktree_links=("node_modules",), worktree_setup_pr_local=True,
+        worktree_setup="npm ci", worktree_setup_keys=("package-lock.json",),
+    )
+    try:
+        if rebuilt:
+            (workdir / "node_modules").unlink()
+            (workdir / "node_modules").mkdir()
+            info = (workdir / "node_modules").lstat()
+            cv.mark_private(workdir, {b"node_modules": (info.st_dev, info.st_ino)}, "digest")
+            assert cv.private_paths(workdir)
+        else:
+            assert not cv.private_paths(workdir)
+        guidance = _coder_workdir_guidance(config)
+        assert _PR_LOCAL_GUIDANCE in guidance
+        assert "Do not delete, replace, move or copy over those paths yourself." in guidance
+        # Only the pr-local paragraph names the link; no second paragraph lists it again.
+        pr_local = _pr_local_environment_guidance(config, workdir)
+        assert pr_local and pr_local in guidance
+        assert guidance.count("`node_modules`") == pr_local.count("`node_modules`")
+        assert _SHARED_LINK_GUIDANCE not in guidance and "Shared worktree links" not in guidance
+        assert "shared operator infrastructure" not in guidance
+    finally:
+        cv.reset_checkout_baselines()
+
+
 @pytest.mark.parametrize("source", ["local", "remote"])
 @pytest.mark.parametrize("outcome", ["valid terminal response", "failed before producing a valid public response"])
 def test_salvage_wrapper_is_outcome_neutral(tmp_path, source, outcome):

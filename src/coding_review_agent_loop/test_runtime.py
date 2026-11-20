@@ -3144,6 +3144,40 @@ _NODE_TEST_RUNNER_VALUE_OPTIONS = frozenset({
 _NODE_BUILTIN_TEST_REPORTERS = frozenset({"spec", "tap", "dot", "junit", "lcov"})
 
 
+def _first_rejected_node_argument(arguments: Sequence[str]) -> tuple[str, str] | None:
+    """``(argument, category)`` of the first ``node`` argument the allow-list rejects.
+
+    ``None`` exactly when :func:`_is_node_test_runner` accepts (issue #2036):
+    the recognizer is this walk, so the explainer can never disagree with it.
+    """
+    selected = False
+    positional_seen = False
+    for argument in arguments:
+        if argument == "--":
+            return argument, "separator"
+        if not argument.startswith("-"):
+            positional_seen = True
+            continue
+        if argument == "--test":
+            if positional_seen:
+                return argument, "test-after-positional"
+            selected = True
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS:
+                return argument, "unknown-option"
+            if not value:
+                return argument, "empty-value"
+            if name == "--test-reporter" and value not in _NODE_BUILTIN_TEST_REPORTERS:
+                return argument, "code-loading"
+        elif argument not in _NODE_TEST_RUNNER_FLAGS:
+            return argument, (
+                "separate-value" if argument in _NODE_TEST_RUNNER_VALUE_OPTIONS else "unknown-option"
+            )
+    return None if selected else ("", "missing-test")
+
+
 def _is_node_test_runner(arguments: Sequence[str]) -> bool:
     """Return whether ``node`` argv provably runs the built-in test runner.
 
@@ -3152,28 +3186,7 @@ def _is_node_test_runner(arguments: Sequence[str]) -> bool:
     the allow-list so no print-and-exit option can turn a zero exit into
     citable evidence that ran no tests.
     """
-    selected = False
-    positional_seen = False
-    for argument in arguments:
-        if argument == "--":
-            return False
-        if not argument.startswith("-"):
-            positional_seen = True
-            continue
-        if argument == "--test":
-            if positional_seen:
-                return False
-            selected = True
-            continue
-        name, has_value, value = argument.partition("=")
-        if has_value:
-            if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS or not value:
-                return False
-            if name == "--test-reporter" and value not in _NODE_BUILTIN_TEST_REPORTERS:
-                return False
-        elif argument not in _NODE_TEST_RUNNER_FLAGS:
-            return False
-    return selected
+    return _first_rejected_node_argument(arguments) is None
 
 
 # Playwright ``test`` options accepted by the recognizer.  Allow-list only:
@@ -3214,6 +3227,59 @@ _PLAYWRIGHT_BUILTIN_REPORTERS = frozenset({
 })
 
 
+# Explanation-only classification of rejected Playwright options (issue
+# #2036).  None of these sets is consulted for acceptance.
+_PLAYWRIGHT_SHORT_ALIASES = {"-g": "--grep", "-gv": "--grep-invert", "-j": "--workers"}
+_PLAYWRIGHT_SHORT_FLAG_ALIASES = {"-x": "--max-failures=1"}
+_PLAYWRIGHT_CODE_LOADING_OPTIONS = frozenset({
+    "--config", "-c", "--tsconfig", "--global-setup", "--global-teardown", "--reporter",
+})
+_PLAYWRIGHT_ZERO_TEST_OPTIONS = frozenset({
+    "--list", "--pass-with-no-tests", "--only-changed", "--last-failed", "--shard",
+    "--ui", "--ui-host", "--ui-port", "--debug", "--help", "-h", "--version", "-V",
+})
+
+
+def _first_rejected_playwright_argument(arguments: Sequence[str]) -> tuple[str, str] | None:
+    """``(argument, category)`` of the first ``playwright`` argument the allow-list rejects.
+
+    ``None`` exactly when :func:`_is_playwright_test_runner` accepts (issue
+    #2036); the category only selects explanation wording.
+    """
+    if not arguments or arguments[0] != "test":
+        return (arguments[0] if arguments else ""), "missing-test"
+    for argument in arguments[1:]:
+        if argument == "--":
+            return argument, "separator"
+        if not argument.startswith("-"):
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _PLAYWRIGHT_TEST_VALUE_OPTIONS:
+                return argument, _playwright_rejection_category(name)
+            if not value:
+                return argument, "empty-value"
+            if name == "--reporter" and not all(
+                entry in _PLAYWRIGHT_BUILTIN_REPORTERS for entry in value.split(",")
+            ):
+                return argument, "code-loading"
+        elif argument not in _PLAYWRIGHT_TEST_FLAGS:
+            if argument in _PLAYWRIGHT_TEST_VALUE_OPTIONS:
+                return argument, "separate-value"
+            return argument, _playwright_rejection_category(argument)
+    return None
+
+
+def _playwright_rejection_category(name: str) -> str:
+    if name in _PLAYWRIGHT_SHORT_ALIASES or name in _PLAYWRIGHT_SHORT_FLAG_ALIASES:
+        return "short-alias"
+    if name in _PLAYWRIGHT_CODE_LOADING_OPTIONS:
+        return "code-loading"
+    if name in _PLAYWRIGHT_ZERO_TEST_OPTIONS:
+        return "zero-test"
+    return "unknown-option"
+
+
 def _is_playwright_test_runner(arguments: Sequence[str]) -> bool:
     """Return whether ``playwright`` argv provably runs the test subcommand.
 
@@ -3221,24 +3287,7 @@ def _is_playwright_test_runner(arguments: Sequence[str]) -> bool:
     allow-list, so no enumerate/print-and-exit or code-loading option can turn
     a zero exit into citable evidence.
     """
-    if not arguments or arguments[0] != "test":
-        return False
-    for argument in arguments[1:]:
-        if argument == "--":
-            return False
-        if not argument.startswith("-"):
-            continue
-        name, has_value, value = argument.partition("=")
-        if has_value:
-            if name not in _PLAYWRIGHT_TEST_VALUE_OPTIONS or not value:
-                return False
-            if name == "--reporter" and not all(
-                entry in _PLAYWRIGHT_BUILTIN_REPORTERS for entry in value.split(",")
-            ):
-                return False
-        elif argument not in _PLAYWRIGHT_TEST_FLAGS:
-            return False
-    return True
+    return _first_rejected_playwright_argument(arguments) is None
 
 
 def _recognized_inner_probe_tokens(
@@ -3288,8 +3337,234 @@ CITABLE_TEST_RUNNERS_SUMMARY = (
     "`pytest` or `py.test`, `<python> -m pytest`, `node --test <file>` (or `nodejs`, "
     "with an empty NODE_OPTIONS), `playwright test` (including the local "
     "`npx playwright test`), and `npm`/`pnpm`/`yarn run <script>` whose package.json "
-    "body is a single such command with no pre/post scripts"
+    "body is a single such command with no pre/post scripts. For `node --test` and "
+    "`playwright test` every option must be on the runner's allow-list, with value options "
+    "in `--name=value` form (for example `--grep=<pattern>`, not `-g <pattern>`); "
+    "`--config` and other code-loading options are never citable"
 )
+
+
+# Issue #2036: what to do instead, shared by every argument-rejection reason.
+_REPORT_IN_TESTS_RUN = "report this run in tests_run"
+
+
+def _option_value_after(arguments: Sequence[str], argument: str) -> str | None:
+    """The detached value that follows ``argument``, when it looks like one."""
+    try:
+        index = list(arguments).index(argument)
+    except ValueError:
+        return None
+    if index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+        return arguments[index + 1]
+    return None
+
+
+def _playwright_rejection_text(argument: str, category: str, arguments: Sequence[str]) -> str:
+    name, has_value, value = argument.partition("=")
+    if category == "missing-test":
+        return "its first argument must be the `test` subcommand; run `playwright test ...`"
+    if category == "separator":
+        return (
+            "the `--` separator is not accepted after `playwright test`; pass test files and "
+            "`--name=value` options directly"
+        )
+    if category == "short-alias":
+        if name in _PLAYWRIGHT_SHORT_FLAG_ALIASES:
+            return (
+                f"`{argument}` is a short alias, which the citable allow-list does not accept; "
+                f"spell it `{_PLAYWRIGHT_SHORT_FLAG_ALIASES[name]}`"
+            )
+        long_name = _PLAYWRIGHT_SHORT_ALIASES[name]
+        detached = value if has_value and value else _option_value_after(arguments, argument)
+        spelled = f"{long_name}={detached if detached is not None else '<value>'}"
+        return (
+            f"`{name}` is a short alias, which the citable allow-list does not accept; "
+            f"spell it `{spelled}` (value options are citable only in `--name=value` form)"
+        )
+    if category == "separate-value":
+        detached = _option_value_after(arguments, argument)
+        spelled = f"{argument}={detached if detached is not None else '<value>'}"
+        return (
+            f"`{argument}` is given its value as a separate argument; spell it `{spelled}` "
+            "(value options are citable only in `--name=value` form, so a detached value can "
+            "never hide another option)"
+        )
+    if category == "empty-value":
+        return f"`{argument}` has an empty value; give it a value or drop it"
+    if category == "code-loading":
+        return (
+            f"`{name}` loads code into the runner (a config file, tsconfig, global setup or "
+            "custom reporter module), so it is never citable, including a config file outside "
+            "the checkout; use the checkout's own default configuration and "
+            f"{_REPORT_IN_TESTS_RUN}"
+        )
+    if category == "zero-test":
+        return (
+            f"`{name}` can exit 0 without running a test (an enumerate, zero-test, interactive "
+            f"or print-and-exit option), so it is never citable; drop it"
+        )
+    return (
+        f"`{name}` is not on the citable `playwright test` option allow-list; drop it or use an "
+        "allow-listed option"
+    )
+
+
+def _node_rejection_text(argument: str, category: str, arguments: Sequence[str]) -> str:
+    name = argument.partition("=")[0]
+    if category == "missing-test":
+        return "`--test` is missing; run `node --test <file>`"
+    if category == "separator":
+        return "the `--` separator is not accepted; pass test files directly"
+    if category == "test-after-positional":
+        return "`--test` must come before the first test file or script argument"
+    if category == "separate-value":
+        detached = _option_value_after(arguments, argument)
+        spelled = f"{argument}={detached if detached is not None else '<value>'}"
+        return (
+            f"`{argument}` is given its value as a separate argument; spell it `{spelled}` "
+            "(value options are citable only in `--name=value` form)"
+        )
+    if category == "empty-value":
+        return f"`{argument}` has an empty value; give it a value or drop it"
+    if category == "code-loading":
+        return (
+            f"`{argument}` names a custom reporter module, which loads code into the runner, so "
+            "it is never citable; use a built-in reporter (spec, tap, dot, junit or lcov)"
+        )
+    return (
+        f"`{name}` is not on the citable `node --test` option allow-list; drop it or use an "
+        "allow-listed option"
+    )
+
+
+def _explain_direct_launcher(
+    tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
+) -> tuple[str, str] | None:
+    """``(family, reason)`` for a rejected direct launcher, or None (accepted or unknown)."""
+    split = _split_env_prefix(tokens, environment=environment)
+    if split is None:
+        return None
+    assignments, target, _env_path = split
+    values = {**environment, **assignments} if assignments else environment
+    if target and Path(target[0]).name == "npx":
+        rewritten = _npx_local_playwright_target(target, cwd=cwd)
+        if rewritten is None:
+            index = 1
+            while index < len(target) and target[index] in _NPX_PLAYWRIGHT_SAFE_OPTIONS:
+                index += 1
+            if index < len(target) and target[index] == "playwright":
+                return "`npx playwright test`", (
+                    "`node_modules/.bin/playwright` is not a regular file in this checkout, and "
+                    "npx is never allowed to resolve or download a package; restore the "
+                    "checkout's dependencies or report the problem"
+                )
+            return None
+        target = rewritten
+    if not target:
+        return None
+    head = Path(target[0]).name
+    node_options = values.get("NODE_OPTIONS", "").strip()
+    if head in {"node", "nodejs"}:
+        rejected = _first_rejected_node_argument(target[1:])
+        if rejected is not None:
+            return "`node --test`", _node_rejection_text(*rejected, target[1:])
+        if node_options:
+            return "`node --test`", (
+                "NODE_OPTIONS is set, which can preload code into the runner; run it with an "
+                "empty NODE_OPTIONS"
+            )
+        return None
+    if head == "playwright":
+        rejected = _first_rejected_playwright_argument(target[1:])
+        if rejected is not None:
+            return "`playwright test`", _playwright_rejection_text(*rejected, target[1:])
+        for name in ("NODE_OPTIONS", "PW_TEST_REPORTER"):
+            if values.get(name, "").strip():
+                return "`playwright test`", (
+                    f"{name} is set, which can load code into the runner; run it with an "
+                    f"empty {name}"
+                )
+        return None
+    return None
+
+
+def _explain_unresolved_package_script(
+    tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
+) -> tuple[str, str] | None:
+    """Name a known package-script refusal; None for an unreadable or missing script."""
+    split = _split_env_prefix(tokens, environment=environment)
+    if split is None:
+        return None
+    parsed = _package_script_request(split[1])
+    if parsed is None:
+        return None
+    manager, name, _appended = parsed
+    scripts = _read_package_scripts(cwd)
+    if scripts is None or not isinstance(scripts.get(name), str):
+        return None
+    family = f"`{manager} run {name}`"
+    for hook in (f"pre{name}", f"post{name}"):
+        if hook in scripts:
+            return family, (
+                f"package.json also defines `{hook}`, which would run code outside the "
+                "resolved command; run the underlying test command directly or remove the hook"
+            )
+    if any(char in _PACKAGE_BODY_FORBIDDEN_CHARS for char in str(scripts[name])):
+        return family, (
+            "its package.json body contains shell syntax (operators, substitutions, globs or "
+            "redirections), so it is not a single test command; make the script body one "
+            "plain test command"
+        )
+    return None
+
+
+def explain_uncitable_launcher(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> str | None:
+    """Why a citable launcher family's receipt was refused for its arguments (issue #2036).
+
+    Static and side-effect free: reads only ``<cwd>/package.json`` and stats
+    the local Playwright binary; spawns nothing.  Returns ``None`` for an
+    accepted command and for an unknown or unresolvable command (the caller
+    keeps the generic unrecognized-launcher text).  Advisory only: it never
+    influences classification, citability, exit code or launcher health.
+    """
+    try:
+        values: Mapping[str, str] = environment if environment is not None else os.environ
+        tokens = tuple(str(item) for item in argv)
+        resolution = resolve_package_script(tokens, cwd=cwd, environment=values)
+        if resolution is None:
+            explained = _explain_unresolved_package_script(tokens, cwd=cwd, environment=values)
+        elif isinstance(resolution, PackageScriptResolution):
+            if _recognized_inner_probe_with_environment(
+                resolution.executed_argv, cwd=cwd, environment=values
+            ) is not None:
+                return None
+            explained = _explain_direct_launcher(
+                resolution.executed_argv, cwd=cwd, environment=values
+            )
+            if explained is None:
+                return None
+            script = f"`{resolution.manager} run {resolution.script_name}`"
+            appended = resolution.appended_args
+            body_only = resolution.executed_argv[: len(resolution.executed_argv) - len(appended)]
+            if appended and _recognized_inner_probe_with_environment(
+                body_only, cwd=cwd, environment=values
+            ) is not None:
+                explained = (explained[0], (
+                    f"an argument appended to {script} is rejected: {explained[1]}. Cite the "
+                    f"unfiltered {script} run instead and {_REPORT_IN_TESTS_RUN}"
+                ))
+            else:
+                explained = (explained[0], f"the body of {script} is rejected: {explained[1]}")
+        else:
+            explained = _explain_direct_launcher(tokens, cwd=cwd, environment=values)
+    except Exception:  # noqa: BLE001 - advisory text only; never fail run-tests
+        return None
+    if explained is None:
+        return None
+    family, reason = explained
+    return f"{family} is a citable runner, but {reason}"
 
 
 PROBE_DEADLINE_DIAGNOSTIC = "inner probe truncated at the request deadline"

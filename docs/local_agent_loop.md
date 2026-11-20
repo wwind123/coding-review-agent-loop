@@ -1998,6 +1998,16 @@ fallback. Every no-test refusal (`overlap-rejected`, `worker-budget-busy`,
 again after the receipt line as `agent-loop: no test ran (<outcome>):
 <reason>`; a lock held by another request of the same broker is named with
 its command, phase and age.
+In a per-run worktree with `--worktree-link` paths, the broker checks every
+registered link (and every private environment rebuilt under
+`--worktree-setup-pr-local`) before it reserves or launches anything (#2036).
+A replaced, moved, retargeted or removed link is refused with
+`` agent-loop: no test ran (cancelled): agent-loop: worktree link `<name>` was replaced, moved or retargeted; it is shared operator infrastructure. Restore it or report the problem; nothing was run (not evidence) ``.
+The pre-check never poisons the checkout and does not change the checkout
+guard; a lookup error falls through to the existing snapshot and guard.
+Coder prompts for such a checkout name its registered links as shared
+operator infrastructure that must not be replaced, moved, copied over or
+deleted.
 A receipt whose inner command started but whose suite start was never verified
 (`suite_start=unknown`) can never be cited, so `run-tests` says so right after
 the receipt line (#1659). The broker persists why the suite start stayed
@@ -2007,6 +2017,24 @@ It never changes admission, citability or a disqualifier. For a launcher the
 inner-probe recognizer does not accept (for example `python scripts/x.py`,
 reason `unrecognized-launcher`) it prints
 `agent-loop: this receipt is not citable evidence: unrecognized test launcher, so suite start was not verified (suite_start=unknown). Citable runners: <runners>. Wrap the check in a pytest test to make it citable; you may still report it in tests_run.`
+When the launcher family is citable but one of its arguments or its context is
+rejected (#2036), the notice names the cause instead of calling the launcher
+unrecognized, for example
+`` agent-loop: this receipt is not citable evidence: `playwright test` is a citable runner, but `-g` is a short alias, which the citable allow-list does not accept; spell it `--grep=pat` (value options are citable only in `--name=value` form). Suite start was not verified (suite_start=unknown); you may still report it in tests_run. ``
+The static explainer covers `playwright test` (including `npx` and a local
+`node_modules/.bin/playwright`), `node --test` and package scripts that
+resolve to them. It names short aliases and detached values (`-g pat`,
+`--grep pat`, `-j 4`, `-x`) with their citable `--name=value` spelling,
+code-loading options (`--config`/`-c`, including a scratch config outside the
+checkout, `--tsconfig`, custom reporters: never citable), zero-test and
+interactive options, the `--` separator, unknown options, a non-empty
+`NODE_OPTIONS`/`PW_TEST_REPORTER`, a missing local Playwright binary for
+`npx playwright`, and a package script with a `pre`/`post` hook or shell
+syntax. A rejected argument appended with `npm run <script> -- ...` is named as
+appended, with the advice to cite the unfiltered `npm run <script>` run and
+report the filtered run in tests_run. Unknown or unresolvable commands keep
+the generic text above. The explainer is advisory only: the allow-list, the
+persisted reason and citability are unchanged.
 For a recognized launcher whose bootstrap probe could not verify it (reason
 `probe-unavailable`, for example unavailable probe containment) it prints
 `agent-loop: this receipt is not citable evidence: the test launcher is recognized, but its bootstrap probe could not verify it in this run, so suite start was not verified (suite_start=unknown). Rerunning the same command may make it citable; you may still report it in tests_run.`

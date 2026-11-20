@@ -2420,6 +2420,22 @@ def _uncitable_receipt_unrecognized_message() -> str:
     )
 
 
+def _uncitable_launcher_message(raw_inner: Sequence[str]) -> str:
+    """The specific argument-rejection notice, else the generic unrecognized text (#2036)."""
+    try:
+        from .test_runtime import explain_uncitable_launcher
+
+        explanation = explain_uncitable_launcher(list(raw_inner), cwd=Path.cwd(), environment=os.environ)
+    except Exception:  # advisory only; never fail run-tests
+        explanation = None
+    if not explanation:
+        return _uncitable_receipt_unrecognized_message()
+    return (
+        f"agent-loop: this receipt is not citable evidence: {explanation}. Suite start was not "
+        "verified (suite_start=unknown); you may still report it in tests_run."
+    )
+
+
 def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
     """Say next to the receipt line when it can never be cited (#1659).
 
@@ -2446,7 +2462,7 @@ def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
 
     reason = coerce_suite_start_reason(getattr(result, "suite_start_reason", None), "unknown")
     if reason == SUITE_START_REASON_UNRECOGNIZED:
-        print(_uncitable_receipt_unrecognized_message(), file=sys.stderr, flush=True)
+        print(_uncitable_launcher_message(raw_inner), file=sys.stderr, flush=True)
         return
     if reason == SUITE_START_REASON_PROBE_UNAVAILABLE:
         print(UNCITABLE_RECEIPT_PROBE_UNAVAILABLE_MESSAGE, file=sys.stderr, flush=True)
@@ -2456,7 +2472,7 @@ def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
         probe = recognized_inner_probe(list(raw_inner), cwd=Path.cwd(), environment=os.environ)
     except Exception:  # advisory only; a malformed package.json must not fail run-tests
         probe = ()
-    message = UNCITABLE_RECEIPT_GENERIC_MESSAGE if probe is not None else _uncitable_receipt_unrecognized_message()
+    message = UNCITABLE_RECEIPT_GENERIC_MESSAGE if probe is not None else _uncitable_launcher_message(raw_inner)
     print(message, file=sys.stderr, flush=True)
 
 

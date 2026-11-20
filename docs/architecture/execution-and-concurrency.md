@@ -12,7 +12,7 @@ Concurrent default-dir invocations on one repository are supported.
 Each run with an omitted `--<agent>-dir` gets its own detached `git worktree`
 under `<scratch>/OWNER-REPO/<agent>/runs/<run-token>`, backed by one shared
 clone per repo/agent (the *store*, `<scratch>/OWNER-REPO/<agent>/repo`) that
-owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path such as `.venv` from the shared store into each per-run worktree. The path must exist in the store (otherwise the run fails, naming the shared clone and suggesting `--worktree-setup` or creating the path there) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash (`/.venv`, `/node_modules`) in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
+owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path such as `.venv` from the shared store into each per-run worktree. The path must exist in the store and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash (`/.venv`, `/node_modules`) in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. Parallel
 reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.
@@ -208,7 +208,9 @@ client (including `--fixture` runs) prints that advisory, or the remedy selected
 after a launch failure or a pre-collection failure. The variable is excluded
 from evidence environment identity, and nothing reads it for classification,
 outcome, evidence or exit code. A replaced-link refusal names the link source
-in the shared clone. When an issue run stops (a checkout refusal or a terminal
+in the shared clone. Before reservation or launch the broker refuses, naming
+it, a registered link or private environment that is not intact (fail-open,
+never poisons). Coder prompts name the checkout's own links as off limits (#2036). When an issue run stops (a checkout refusal or a terminal
 no-PR result) while the implementing coder's per-run worktree is poisoned and its branch
 has a remote-tracking ref, the stop's message gains a `managed-pr --head`
 resume and the manual worktree-removal command; the exception type, exit code
