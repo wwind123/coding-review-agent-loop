@@ -5666,3 +5666,193 @@ def test_excluded_future_1868_filtered_repair_allowance_instructs_removal(requir
     assert "Optional coder follow-up item IDs" not in prompt
     assert "Remove" in prompt and "`dispute_evidence`" in prompt
     assert "- `item-2`" not in prompt
+
+
+# --- #2026: configured repair and the tool-owned acknowledgement record ---
+
+import contextlib  # noqa: E402
+
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID as _ACK_2026,
+    _reconcile_human_requirements_ack_item as _reconcile_2026,
+    _validate_coder_followup_response as _validate_followup_2026,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    UnresolvedReviewItem as _Item2026,
+    parse_structured_pr_review as _parse_review_2026,
+)
+from coding_review_agent_loop.github import HumanReviewRequirement as _Req2026  # noqa: E402
+from coding_review_agent_loop.repair_preservation import validate_repair_preservation  # noqa: E402
+
+_ITEMS_2026 = (_Item2026(item_id="item-1", reviewer="Codex", source_round=1, text="Fix.", status="blocking"),)
+_REQ_2026 = (
+    _Req2026(
+        source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Use the absolute URL.",
+    ),
+)
+
+
+def _ack_lines_2026(caplog):
+    return [r.getMessage() for r in caplog.records if "acknowledgement record" in r.getMessage()]
+
+
+def _broken_followup_2026(**kwargs):
+    """A follow-up whose only defect is an empty summary (an unrelated format error)."""
+    text = structured_coder_followup(**kwargs)
+    payload = json.loads(text[: text.index("}\n") + 1])
+    payload["summary"] = ""
+    return json.dumps(payload) + text[text.index("}\n") + 1:]
+
+
+@contextlib.contextmanager
+def _configured_repair_2026(output):
+    """Route repair through the real configured chain (execute_repair).
+
+    The conftest stub replaces the legacy ``attempt_repair`` hook; restoring
+    the original binding sends repair to ``execute_repair``, whose model call
+    is the patched subprocess.
+    """
+    with patch.object(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR), patch(
+        "coding_review_agent_loop.repair.subprocess.run",
+        return_value=MagicMock(returncode=0, stdout=output, stderr=""),
+    ) as run:
+        yield run
+
+
+def _repair_config_2026(tmp_path, **kwargs):
+    return make_config(tmp_path, repair_backend="gemini", repair_models=("gemini-flash",), **kwargs)
+
+
+def _run_followup_2026(runner, tmp_path, *, requirements=(), retries=0):
+    return _run_validated_agent(
+        runner, agent="claude", config=_repair_config_2026(tmp_path, agent_max_retries=retries),
+        prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        validate=lambda text: _validate_followup_2026(
+            text, unresolved_items=_ITEMS_2026, human_requirements=requirements,
+            architecture_status_mode="legacy",
+        ),
+        use_repair=True, repair_expected_kind="coder_followup",
+        repair_unresolved_item_ids=("item-1",),
+    )
+
+
+def test_configured_repair_adding_ack_placement_is_rejected_then_accepted_logs_once(tmp_path, caplog):
+    caplog.set_level("WARNING")
+    source = _broken_followup_2026(addressed_items=["item-1", _ACK_2026])
+    added = structured_coder_followup(addressed_items=["item-1", _ACK_2026], remaining_items=[_ACK_2026])
+    kept = structured_coder_followup(addressed_items=["item-1", _ACK_2026], summary="Second candidate.")
+    runner = FakeRunner(claude_outputs=[source])
+    outputs = [MagicMock(returncode=0, stdout=text, stderr="") for text in (added, kept)]
+    with _configured_repair_2026(None) as run:
+        run.side_effect = outputs
+        response = _run_validated_agent(
+            runner, agent="claude",
+            config=make_config(tmp_path, repair_backend="gemini", repair_models=("m1", "m2"),
+                               agent_max_retries=0),
+            prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_followup_2026(
+                text, unresolved_items=_ITEMS_2026, human_requirements=(),
+                architecture_status_mode="legacy",
+            ),
+            use_repair=True, repair_expected_kind="coder_followup",
+            repair_unresolved_item_ids=("item-1",),
+        )
+    assert run.call_count == 2
+    assert "Second candidate." in response.text
+    assert response.marker_value.addressed_items == ("item-1",)
+    lines = _ack_lines_2026(caplog)
+    assert len(lines) == 1 and "counted as the coder's acknowledgement" in lines[0]
+
+
+def test_configured_repair_rejects_added_ack_placement_with_no_acceptance(tmp_path, caplog):
+    caplog.set_level("WARNING")
+    added = structured_coder_followup(addressed_items=["item-1", _ACK_2026])
+    runner = FakeRunner(claude_outputs=[_broken_followup_2026(addressed_items=["item-1"])])
+    with _configured_repair_2026(added):
+        with pytest.raises(AgentLoopError):
+            _run_followup_2026(runner, tmp_path)
+    assert _ack_lines_2026(caplog) == []
+
+
+def test_configured_repair_removing_remaining_ack_placement_keeps_ledger(tmp_path):
+    rid = _REQ_2026[0].requirement_id
+    signed = {"human_requirement_ids": [rid], "addressed_items": ["item-1"]}
+    original = _broken_followup_2026(remaining_items=[_ACK_2026], **signed)
+    repaired = structured_coder_followup(**signed)
+    runner = FakeRunner(claude_outputs=[original])
+    with _configured_repair_2026(repaired):
+        response = _run_followup_2026(runner, tmp_path, requirements=_REQ_2026)
+    assert response.text.startswith(repaired.split("\n")[0][:30])
+    pending = (_Item2026(item_id=_ACK_2026, reviewer="Orchestrator", source_round=1, text="Ack.", status="blocking"),)
+    fixed_original = structured_coder_followup(remaining_items=[_ACK_2026], **signed)
+    for output in (response.text, fixed_original):
+        assert _reconcile_2026(
+            pending, coder_output=output, human_requirements=_REQ_2026, source_round=2,
+        ) == []
+
+
+@pytest.mark.parametrize("bad_kind", [False, ["coder_followup"], {"k": "coder_followup"}])
+@pytest.mark.parametrize("ack_kept", [False, True], ids=["added", "kept"])
+def test_configured_repair_rejects_non_string_kind(tmp_path, bad_kind, ack_kept):
+    source_items = ["item-1", _ACK_2026] if ack_kept else ["item-1"]
+    target = json.loads(structured_coder_followup(addressed_items=["item-1", _ACK_2026]).split("\n")[0])
+    target["kind"] = bad_kind
+    repaired = json.dumps(target) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    with pytest.raises(AgentLoopError, match="repaired output must use a string kind"):
+        validate_repair_preservation(_broken_followup_2026(addressed_items=source_items), repaired,
+                                     unresolved_item_ids=("item-1",))
+    runner = FakeRunner(claude_outputs=[_broken_followup_2026(addressed_items=source_items)])
+    with _configured_repair_2026(repaired):
+        with pytest.raises(AgentLoopError):
+            _run_followup_2026(runner, tmp_path)
+
+
+@pytest.mark.parametrize("bad_kind", [["pr_review"], {"k": "pr_review"}])
+def test_configured_review_repair_with_non_string_kind_cannot_drop_blocker(bad_kind):
+    source = malformed_pr_review_source(state="blocking", blocking_items=["Close the pool."])
+    payload = json.loads(source[: source.index("}\n") + 1])
+    payload["human_requirement_dispositions"] = []
+    source = json.dumps(payload) + source[source.index("}\n") + 1:]
+    target = json.loads(structured_pr_review(state="approved").split("\n")[0])
+    target.update(kind=bad_kind, human_requirement_dispositions=[])
+    with pytest.raises(AgentLoopError, match="repaired output must use a string kind"):
+        validate_repair_preservation(
+            source, json.dumps(target) + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        )
+
+
+def _with_dispositions_2026(text):
+    split = text.index("}\n") + 1
+    payload = json.loads(text[:split])
+    payload["human_requirement_dispositions"] = [
+        {"requirement_id": "hr-" + "d" * 64, "disposition": "addressed", "evidence": "Done."}
+    ]
+    return json.dumps(payload) + text[split:]
+
+
+def test_configured_reviewer_repair_carrying_dispositions_field_is_accepted(tmp_path):
+    original = _with_dispositions_2026(
+        malformed_pr_review_source(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini")
+    )
+    repaired = _with_dispositions_2026(
+        structured_pr_review(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini")
+    )
+    runner = FakeRunner(gemini_outputs=[original])
+    with _configured_repair_2026(repaired) as repair:
+        response = _run_validated_agent(
+            runner, agent="gemini",
+            config=_repair_config_2026(tmp_path, reviewer="gemini", agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _parse_review_2026(text, reviewer="Google Gemini").state,
+            use_repair=True, repair_expected_kind="pr_review",
+        )
+    assert repair.called
+    parsed = _parse_review_2026(response.text, reviewer="Google Gemini")
+    without = _parse_review_2026(
+        structured_pr_review(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini"),
+        reviewer="Google Gemini",
+    )
+    assert parsed.dropped_human_requirement_dispositions is True
+    assert parsed.blocking_items == without.blocking_items
+    assert parsed.dispositions == without.dispositions

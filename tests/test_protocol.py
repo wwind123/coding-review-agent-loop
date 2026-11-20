@@ -5,6 +5,7 @@ structured response parsing and validation, and related protocol functions.
 """
 
 from coding_review_agent_loop import protocol_risk as _risk_owner
+import dataclasses
 import json
 
 import pytest
@@ -8344,3 +8345,155 @@ def test_2009_prior_item_guidance_names_carried_ids_and_same_round_rule():
     assert "Only these carried prior IDs may take a disposition: item-8." in text
     empty = prior_item_disposition_guidance(("item-1",), (), "prior_item_dispositions")
     assert "No prior items are carried, so prior_item_dispositions must be empty." in empty
+
+
+# --- #2026: tool-owned ack record from the coder, coder-only field from a reviewer ---
+
+_ACK = HUMAN_REQUIREMENTS_ACK_ITEM_ID
+_ACK_REAL_ITEMS = tuple(
+    UnresolvedReviewItem(item_id=item_id, reviewer="Codex", source_round=1, text="Fix it.", status="blocking")
+    for item_id in ("item-1", "item-2", "item-3")
+)
+
+
+def _ack_followup(**overrides):
+    return _coder_followup(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides,buckets",
+    [
+        ({"addressed_items": ["item-1", _ACK]}, ("addressed_items",)),
+        ({"remaining_items": ["item-2", _ACK]}, ("remaining_items",)),
+        ({"disputed_items": ["item-3", _ACK]}, ("disputed_items",)),
+        ({"addressed_items": ["item-1", _ACK, _ACK]}, ("addressed_items",)),
+        (
+            {"addressed_items": ["item-1", _ACK], "remaining_items": ["item-2", _ACK]},
+            ("addressed_items", "remaining_items"),
+        ),
+        ({"addressed_items": ["item-1", f"  {_ACK} "]}, ("addressed_items",)),
+        (
+            {"addressed_items": ["item-1", _ACK], "addressed_item_notes": {_ACK: ""}},
+            ("addressed_items",),
+        ),
+        (
+            {"remaining_items": ["item-2", _ACK], "remaining_item_notes": {f" {_ACK}": 7}},
+            ("remaining_items",),
+        ),
+        (
+            {"disputed_items": ["item-3", _ACK], "dispute_evidence": {"item-3": "evidence", _ACK: ""}},
+            ("disputed_items",),
+        ),
+    ],
+    ids=[
+        "addressed", "remaining", "disputed-no-evidence", "repeated", "across-buckets",
+        "padded", "empty-note", "non-string-note", "empty-evidence",
+    ],
+)
+def test_coder_ack_item_placement_is_stripped_and_accepted(overrides, buckets, caplog):
+    text = _ack_followup(**overrides)
+    caplog.set_level("WARNING")
+    for parsed in (
+        validate_structured_coder_followup(text),
+        _validate_coder_followup_response(
+            text, unresolved_items=_ACK_REAL_ITEMS, human_requirements=(),
+            architecture_status_mode="legacy",
+        ),
+    ):
+        assert parsed.dropped_ack_item_buckets == buckets
+        assert parsed.ack_item_addressed is ("addressed_items" in buckets)
+        for ids in (parsed.addressed_items, parsed.remaining_items, parsed.disputed_items):
+            assert _ACK not in ids
+        for mapping in (parsed.addressed_item_notes, parsed.remaining_item_notes, parsed.dispute_evidence):
+            assert _ACK not in mapping
+        assert parsed.addressed_items == ("item-1",)
+        assert parsed.remaining_items == ("item-2",)
+        assert parsed.disputed_items == ("item-3",)
+    assert not [r for r in caplog.records if "acknowledgement record" in r.getMessage()]
+
+
+def test_coder_ack_parent_sub_item_is_skipped_without_shifting_indices():
+    parsed = validate_structured_coder_followup(
+        _ack_followup(
+            remaining_items=["item-2", _ACK],
+            addressed_sub_items=[f"{_ACK}.s1", "item-9.s1", "item-2.s1"],
+        ),
+        expected_sub_item_ids={"item-2": ("item-2.s1",)},
+    )
+    assert parsed.addressed_sub_items == ("item-2.s1",)
+    assert [r.element_path for r in parsed.sub_item_claim_degradations] == [
+        "coder_followup.addressed_sub_items[1]"
+    ]
+
+
+def test_coder_without_ack_item_records_no_bucket():
+    parsed = validate_structured_coder_followup(_ack_followup())
+    assert parsed.dropped_ack_item_buckets == () and not parsed.ack_item_addressed
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"addressed_items": ["item-1", _ACK, "item-999"]}, r"unknown unresolved reviewer item IDs: item-999$"),
+        ({"addressed_items": [_ACK]}, "item-1"),
+        ({"addressed_items": ["item-1", "item-1", _ACK]}, "more than once: item-1"),
+        ({"disputed_items": ["item-3", _ACK], "dispute_evidence": {}}, "Missing evidence for: item-3"),
+        ({"addressed_items": ["item-1", _ACK], "addressed_item_notes": ["not", "a", "dict"]}, "addressed_item_notes"),
+        ({"addressed_items": ["item-1", _ACK], "addressed_item_notes": {"item-1": ""}}, "addressed_item_notes"),
+        ({"addressed_items": ["item-1", "item-merge-conflict"]}, "item-merge-conflict"),
+        ({"addressed_items": ["item-1", _ACK + "s"]}, _ACK + "s"),
+    ],
+    ids=[
+        "unknown", "missing-required", "duplicate-real", "real-dispute-no-evidence",
+        "note-map-not-dict", "real-empty-note", "merge-conflict-not-stripped", "near-miss",
+    ],
+)
+def test_coder_other_validation_stays_fatal_alongside_ack_item(overrides, match):
+    with pytest.raises(AgentLoopError, match=match) as error:
+        _validate_coder_followup_response(
+            _ack_followup(**overrides), unresolved_items=_ACK_REAL_ITEMS, human_requirements=(),
+            architecture_status_mode="legacy",
+        )
+    if "item-999" in str(overrides):
+        assert _ACK not in str(error.value)
+
+
+def _review_with(**extra):
+    payload = {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": "blocking",
+        "summary": "Found a defect.",
+        "blocking_items": ["Close the pool."],
+        "same_pr_followups": [],
+        "future_followups": ["Later."],
+        "prior_item_dispositions": [{"item_id": "item-1", "disposition": "resolved"}],
+    }
+    payload.update(extra)
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [{"requirement_id": "hr-" + "a" * 64, "disposition": "addressed", "evidence": "x"}],
+        "not-an-array",
+        [{"nonsense": True}],
+    ],
+    ids=["well-formed", "string", "malformed-row"],
+)
+def test_pr_review_drops_coder_only_dispositions_field(value, caplog):
+    caplog.set_level("WARNING")
+    baseline = parse_structured_pr_review(_review_with(), reviewer="Codex")
+    assert not caplog.records and baseline.dropped_human_requirement_dispositions is False
+    parsed = parse_structured_pr_review(
+        _review_with(human_requirement_dispositions=value), reviewer="Codex"
+    )
+    assert parsed.dropped_human_requirement_dispositions is True
+    assert dataclasses.replace(parsed, dropped_human_requirement_dispositions=False) == baseline
+    assert parsed.blocking_items == baseline.blocking_items
+    assert parsed.dispositions == baseline.dispositions
+    drops = [r.getMessage() for r in caplog.records]
+    assert drops == [
+        "pr_review: dropped coder-only field `human_requirement_dispositions` before validation"
+    ]

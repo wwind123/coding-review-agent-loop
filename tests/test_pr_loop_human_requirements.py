@@ -1528,3 +1528,84 @@ def test_coder_followup_guidance_notice_only_when_reviewer_owned_ids_exist():
     assert f"`{owned_id}`" in with_notice
     assert "No signed human requirements were surfaced." in with_notice
     assert context.surfaced_requirement_ids == ()
+
+
+# --- #2026: a coder listing the tool-owned ack record never decides the ledger ---
+
+_ACK_PLACEMENTS_2026 = {
+    "addressed": {"addressed_items": [ACK_ID]},
+    "remaining": {"remaining_items": [ACK_ID]},
+    "disputed": {"disputed_items": [ACK_ID]},
+    "addressed-and-remaining": {"addressed_items": [ACK_ID], "remaining_items": [ACK_ID]},
+    "none": {},
+}
+
+
+@pytest.mark.parametrize("placement", list(_ACK_PLACEMENTS_2026))
+def test_live_coder_ack_placement_ledger_is_placement_independent(tmp_path, monkeypatch, caplog, placement):
+    caplog.set_level("WARNING")
+    _exhaust_ack_repair(monkeypatch)
+    requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
+    coder_output = structured_coder_followup(
+        human_requirement_ids=[requirement_id], **_ACK_PLACEMENTS_2026[placement]
+    )
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(),
+        codex_outputs=[_code_requirement_review(), _code_requirement_review(), _code_requirement_review(human_requirements_resolved=True)],
+        claude_outputs=[coder_output] * 2,
+    )
+    after_coder = []
+    real = pr_loop._reconcile_human_requirements_ack_item
+
+    def reconcile(items, **kwargs):
+        result = real(items, **kwargs)
+        if kwargs.get("coder_output") == coder_output:
+            after_coder.append((
+                any(i.item_id == ACK_ID for i in items),
+                [i.item_id for i in result],
+            ))
+        return result
+
+    monkeypatch.setattr(pr_loop, "_reconcile_human_requirements_ack_item", reconcile)
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3)) == 0
+    # Asserted at coder reconciliation, before any reviewer-board clearance:
+    # a pending record clears and none is created, for every placement.
+    assert after_coder and any(pending for pending, _ in after_coder)
+    assert all(ACK_ID not in result for _pending, result in after_coder)
+    lines = [r.getMessage() for r in caplog.records if "acknowledgement record" in r.getMessage()]
+    if placement == "none":
+        assert lines == []
+    else:
+        assert lines and all(
+            ("counted as the coder's acknowledgement" in line) is placement.startswith("addressed")
+            for line in lines
+        )
+    assert not any("unknown unresolved reviewer item IDs" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("placement", ["remaining", "none"])
+def test_reconcile_without_pending_ack_creates_none_for_any_placement(placement):
+    requirement = _parse_pr_human_requirements(ack_pr_payload())[0]
+    output = structured_coder_followup(
+        human_requirement_ids=[requirement.requirement_id], **_ACK_PLACEMENTS_2026[placement]
+    )
+    assert _reconcile_human_requirements_ack_item(
+        (), coder_output=output, human_requirements=(requirement,), source_round=2
+    ) == []
+
+
+def test_invalid_signed_fields_with_ack_placement_fail_like_without_it():
+    requirement = _parse_pr_human_requirements(ack_pr_payload())[0]
+    errors = []
+    for extra in ([ACK_ID], []):
+        output = structured_coder_followup(
+            addressed_items=extra, human_requirement_ids=[], human_requirement_dispositions=[]
+        )
+        with pytest.raises(AgentLoopError) as error:
+            pr_loop._validate_coder_followup_response(
+                output, unresolved_items=(), human_requirements=(requirement,),
+                architecture_status_mode="legacy",
+            )
+        errors.append(str(error.value))
+    assert errors[0] == errors[1]
+    assert "unknown unresolved reviewer item IDs" not in errors[0]

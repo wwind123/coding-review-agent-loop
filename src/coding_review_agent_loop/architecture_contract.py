@@ -46,6 +46,7 @@ from .protocol import (
 )
 from .protocol_common import (
     ParseDegradation,
+    _logger,
 )
 from .repair_preservation import (
     canonicalize_architecture_near_miss_text,
@@ -596,8 +597,33 @@ def _accepted_validated_response(
     candidate: _AcceptedCandidate, **fields: object
 ) -> ValidatedAgentResponse:
     """The only constructor of an accepted response; text comes from the boundary."""
+    _log_accepted_ack_item_strip(candidate.marker_value)
     return ValidatedAgentResponse(
         text=candidate.text, marker_value=candidate.marker_value, **fields
+    )
+
+
+def _log_accepted_ack_item_strip(marker_value: object) -> None:
+    """Log one line when an accepted coder follow-up named the ack record (#2026).
+
+    Logged only here, at acceptance, so an addressed placement is credited
+    only once the signed acknowledgement fields have been validated.
+    """
+    payload = _carrier_payload(marker_value)
+    if not isinstance(payload, StructuredCoderFollowup):
+        return
+    buckets = payload.dropped_ack_item_buckets
+    if not buckets:
+        return
+    outcome = (
+        "counted as the coder's acknowledgement"
+        if payload.ack_item_addressed
+        else "dropped; acknowledgement decided by the signed fields"
+    )
+    _logger.warning(
+        "coder_followup: stripped tool-owned acknowledgement record from %s; %s",
+        ", ".join(buckets),
+        outcome,
     )
 
 

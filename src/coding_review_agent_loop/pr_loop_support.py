@@ -1680,7 +1680,8 @@ def _finalization_obligation_predicate(
     if kind == "human-requirements-acknowledgement":
         return (
             "signed human requirements have not been validly acknowledged; "
-            "a response acknowledging them is required"
+            "acknowledge them through the `human_requirements` and "
+            "`human_requirement_dispositions` fields, not by listing this record as an item"
         )
     if kind == "merge-conflict":
         head = (

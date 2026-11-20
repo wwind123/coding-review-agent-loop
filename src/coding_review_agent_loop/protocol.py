@@ -30,6 +30,7 @@ from .protocol_common import (
     ANY_HEADING_RE,
     BULLET_RE,
     HTML_COMMENT_RE,
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_HEADING_RE,
     HUMAN_REQUIREMENTS_RESOLVED_RE,
@@ -416,6 +417,8 @@ class ParsedReview:
     requirement_evidence: tuple[dict, ...] = ()
     sub_item_degradations: tuple["ParseDegradation", ...] = ()
     post_merge_obligations: tuple[ObligationRequest, ...] = ()
+    # Parser-derived: a coder-only top-level field was dropped (#2026).
+    dropped_human_requirement_dispositions: bool = False
 
 
 @dataclass(frozen=True)
@@ -916,6 +919,13 @@ class StructuredCoderFollowup:
     # history proves were already resolved, dropped by validation (#1388).
     dropped_resolved_addressed_items: tuple[str, ...] = ()
     dropped_excluded_items: tuple[str, ...] = ()
+    # Parser-derived, never parsed from a key: the item-list buckets that named
+    # the tool-owned acknowledgement record, which was stripped (#2026).
+    dropped_ack_item_buckets: tuple[str, ...] = ()
+
+    @property
+    def ack_item_addressed(self) -> bool:
+        return "addressed_items" in self.dropped_ack_item_buckets
 
 
 @dataclass(frozen=True)
@@ -3318,6 +3328,12 @@ def _dedupe_pr_review_items(
     return ApprovedFollowups(same_pr=same_pr, future=future)
 
 
+HUMAN_REQUIREMENT_DISPOSITIONS_FIELD = "human_requirement_dispositions"
+PR_REVIEW_DISPOSITIONS_DROP_MESSAGE = (
+    "pr_review: dropped coder-only field `human_requirement_dispositions` before validation"
+)
+
+
 def parse_structured_pr_review(
     text: str, *, reviewer: str, architecture_status_mode: str = "strict"
 ) -> ParsedReview | None:
@@ -3328,6 +3344,11 @@ def parse_structured_pr_review(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "pr_review":
         raise AgentLoopError("Structured response kind mismatch: expected `pr_review`.")  # shape-check: fatal:unparseable-envelope
+    dropped_dispositions = HUMAN_REQUIREMENT_DISPOSITIONS_FIELD in payload
+    if dropped_dispositions:
+        # A coder-only field a reviewer copied from shared context (#2026).
+        payload = {k: v for k, v in payload.items() if k != HUMAN_REQUIREMENT_DISPOSITIONS_FIELD}
+        _logger.warning(PR_REVIEW_DISPOSITIONS_DROP_MESSAGE)
     _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
         payload,
         context="pr_review",
@@ -3410,7 +3431,8 @@ def parse_structured_pr_review(
     associations = parse_associations(payload.get("requirement_evidence", []))
     return dataclasses.replace(parsed, requirement_evidence=associations, exact_head_evidence_requests=evidence_requests,
                                screenshot_requests=typed, screenshot_coverage_acceptances=votes,
-                               post_merge_obligations=obligations)
+                               post_merge_obligations=obligations,
+                               dropped_human_requirement_dispositions=dropped_dispositions)
 
 
 def _expect_evidence_request_list(
@@ -3705,20 +3727,35 @@ def validate_structured_coder_followup(
         payload.get("disputed_items", []),
         context="coder_followup.disputed_items",
     )
+    # The acknowledgement record is tool-owned: strip any placement of it
+    # before every list, note, evidence and duplicate check (#2026).
+    buckets = (
+        ("addressed_items", addressed_items),
+        ("remaining_items", remaining_items),
+        ("disputed_items", disputed_items),
+    )
+    dropped_ack_item_buckets = tuple(
+        name for name, ids in buckets if HUMAN_REQUIREMENTS_ACK_ITEM_ID in ids
+    )
+    if dropped_ack_item_buckets:
+        addressed_items, remaining_items, disputed_items = (
+            tuple(item_id for item_id in ids if item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID)
+            for _name, ids in buckets
+        )
     addressed_item_notes = _expect_item_note_map(  # shape-check: fatal:no-conservative-reading
-        payload.get("addressed_item_notes", {}),
+        _without_ack_item_key(payload.get("addressed_item_notes", {})),
         context="coder_followup.addressed_item_notes",
         allowed_item_ids=set(addressed_items),
         allowed_context="coder_followup.addressed_items",
     )
     remaining_item_notes = _expect_item_note_map(  # shape-check: fatal:no-conservative-reading
-        payload.get("remaining_item_notes", {}),
+        _without_ack_item_key(payload.get("remaining_item_notes", {})),
         context="coder_followup.remaining_item_notes",
         allowed_item_ids=set(remaining_items),
         allowed_context="coder_followup.remaining_items",
     )
     dispute_evidence = _expect_item_note_map(  # shape-check: fatal:no-conservative-reading
-        payload.get("dispute_evidence", {}),
+        _without_ack_item_key(payload.get("dispute_evidence", {})),
         context="coder_followup.dispute_evidence",
         allowed_item_ids=set(disputed_items),
         allowed_context="coder_followup.disputed_items",
@@ -3740,6 +3777,7 @@ def validate_structured_coder_followup(
         payload.get("addressed_sub_items", []),
         remaining_items=remaining_items,
         expected_sub_item_ids=expected_sub_item_ids,
+        skip_parent_ids=frozenset({HUMAN_REQUIREMENTS_ACK_ITEM_ID}),
     )
     state = _expect_state(payload["state"], context="coder_followup.state")  # shape-check: fatal:no-conservative-reading
     if state == "approved" and any(
@@ -3781,7 +3819,22 @@ def validate_structured_coder_followup(
         architecture_impact_degradations=architecture_impact_degradations,
         addressed_sub_items=sub_item_claims,
         sub_item_claim_degradations=sub_item_claim_degradations,
+        dropped_ack_item_buckets=dropped_ack_item_buckets,
     )
+
+
+def _without_ack_item_key(value: object) -> object:
+    """Drop an acknowledgement-keyed entry, unvalidated, from a dict (#2026).
+
+    Non-dict containers pass through so container validation still applies.
+    """
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: entry
+        for key, entry in value.items()
+        if not (isinstance(key, str) and key.strip() == HUMAN_REQUIREMENTS_ACK_ITEM_ID)
+    }
 
 
 def sub_item_parent_id(sub_item_id: str) -> str:
@@ -3794,8 +3847,13 @@ def _degradable_sub_item_claims(
     *,
     remaining_items: Sequence[str],
     expected_sub_item_ids: Mapping[str, Sequence[str]] | None,
+    skip_parent_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ...], tuple[ParseDegradation, ...]]:
-    """Read advisory coder sub-item claims; every defect drops the claim (#958)."""
+    """Read advisory coder sub-item claims; every defect drops the claim (#958).
+
+    Entries whose parent is in ``skip_parent_ids`` are skipped in place, so
+    other entries keep their submitted indices (#2026).
+    """
     context = "coder_followup.addressed_sub_items"
     if not isinstance(value, list):
         return (), (
@@ -3816,7 +3874,7 @@ def _degradable_sub_item_claims(
         else:
             entry = entry.strip()
             parent = sub_item_parent_id(entry)
-            if entry in claims:
+            if parent in skip_parent_ids or entry in claims:
                 continue
             if parent not in remaining:
                 rule = "addressed_sub_items-parent-not-in-remaining_items"

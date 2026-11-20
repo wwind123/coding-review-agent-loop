@@ -3101,3 +3101,101 @@ def test_nonmixed_normalization_does_not_authorize_finding_changes(change):
         target["blocking_items"][0] = "Replace the storage backend"
     with pytest.raises(AgentLoopError):
         check(source, target)
+
+
+# --- #2026: ack-record placements and the coder-only dispositions field ---
+
+ACK = "item-human-requirements-acknowledgement"
+_ACK_ADD_ERROR = "repair cannot add a human-requirements acknowledgement record placement"
+
+
+def _coder(**fields):
+    return {"kind": "coder_followup", "addressed_items": ["item-1"], "remaining_items": [], **fields}
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        (_coder(), _coder(addressed_items=["item-1", ACK])),
+        (_coder(remaining_items=[ACK]), _coder(addressed_items=["item-1", ACK])),
+        (_coder(), _coder(remaining_items=[f"  {ACK} "])),
+        ({"addressed_items": [], "remaining_items": []}, _coder(disputed_items=[ACK])),
+    ],
+    ids=["added", "moved-into-addressed", "padded", "kindless-empty-source"],
+)
+def test_repair_cannot_add_ack_placement(source, target):
+    with pytest.raises(AgentLoopError, match=_ACK_ADD_ERROR):
+        check(source, target)
+
+
+def test_repair_cannot_add_ack_placement_over_unrecoverable_source():
+    with pytest.raises(AgentLoopError, match=_ACK_ADD_ERROR):
+        validate_repair_preservation("not json at all", json.dumps(_coder(addressed_items=[ACK])))
+
+
+def test_repair_keeps_recovered_kindless_ack_placement():
+    check({"addressed_items": ["item-1", ACK], "remaining_items": []}, _coder(addressed_items=["item-1", ACK]))
+
+
+def test_repair_may_remove_disputed_ack_placement_without_allowlist():
+    source = _coder(
+        disputed_items=["item-2", ACK],
+        dispute_evidence={"item-2": "Proved by test_x.", ACK: "Signed fields carry it."},
+        addressed_item_notes={"item-1": "Fixed in foo.", ACK: "Acknowledged."},
+    )
+    target = _coder(
+        disputed_items=["item-2"],
+        dispute_evidence={"item-2": "Proved by test_x."},
+        addressed_item_notes={"item-1": "Fixed in foo."},
+    )
+    check(source, target)
+    with pytest.raises(AgentLoopError, match="disputed_items"):
+        check(source, {**target, "disputed_items": []})
+    with pytest.raises(AgentLoopError, match="dispute_evidence"):
+        check(source, {**target, "dispute_evidence": {}})
+
+
+@pytest.mark.parametrize("bad_kind", [False, ["coder_followup"], {"k": "coder_followup"}, 3])
+@pytest.mark.parametrize("ack_in_target", [False, True])
+def test_repair_rejects_non_string_target_kind(bad_kind, ack_in_target):
+    source = _coder(addressed_items=["item-1", ACK])
+    target = {**source, "kind": bad_kind}
+    if not ack_in_target:
+        target["addressed_items"] = ["item-1"]
+    with pytest.raises(AgentLoopError, match="repaired output must use a string kind"):
+        check(source, target)
+
+
+@pytest.mark.parametrize("bad_kind", [["pr_review"], {"kind": "pr_review"}])
+def test_review_repair_with_non_string_kind_cannot_drop_blocker(bad_kind):
+    source = {"kind": "pr_review", "state": "blocking", "blocking_items": ["Close the pool."],
+              "human_requirement_dispositions": []}
+    target = {**source, "kind": bad_kind, "state": "approved", "blocking_items": []}
+    with pytest.raises(AgentLoopError, match="repaired output must use a string kind"):
+        check(source, target)
+
+
+_ROW = {"requirement_id": "hr-" + "b" * 64, "disposition": "addressed", "evidence": "Implemented in foo."}
+
+
+@pytest.mark.parametrize(
+    "target_value",
+    [[_ROW], [{"requirement_id": "hr-" + "c" * 64, "disposition": "blocked"}], "altered", None],
+    ids=["kept", "altered-rows", "altered-type", "dropped"],
+)
+def test_pr_review_repair_ignores_coder_only_dispositions_field(target_value):
+    source = {"kind": "pr_review", "state": "blocking", "summary": "Defect.",
+              "blocking_items": ["Close the pool."], "human_requirement_dispositions": [_ROW]}
+    target = {k: v for k, v in source.items() if k != "human_requirement_dispositions"}
+    if target_value is not None:
+        target["human_requirement_dispositions"] = target_value
+    check(source, target)
+    # Other preservation rules still apply.
+    with pytest.raises(AgentLoopError):
+        check(source, {**target, "blocking_items": []})
+
+
+def test_coder_dispositions_preservation_still_fails_on_lost_row():
+    source = _coder(human_requirement_dispositions=[_ROW])
+    with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
+        check(source, _coder(human_requirement_dispositions=[]))

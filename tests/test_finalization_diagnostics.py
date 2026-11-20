@@ -286,7 +286,11 @@ def _pred(item, current=HEAD):
 
 
 def test_kind_specific_predicates_are_exact_in_every_lifecycle():
-    ack = "signed human requirements have not been validly acknowledged; a response acknowledging them is required"
+    ack = (
+        "signed human requirements have not been validly acknowledged; "
+        "acknowledge them through the `human_requirements` and "
+        "`human_requirement_dispositions` fields, not by listing this record as an item"
+    )
     for lifecycle in ("repair_required", *CANDIDATE_LIFECYCLES):
         cand = None if lifecycle == "repair_required" else HEAD
         assert _pred(machine("human-requirements-acknowledgement", lifecycle, candidate=cand)) == ack
