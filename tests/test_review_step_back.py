@@ -1757,6 +1757,19 @@ def test_stall_disposition_reasons_are_distinct_and_deferrals_before_the_crossin
     assert _disposition(_state(deferrals=(5,))).kind == DISPOSITION_DEFER_PENDING
 
 
+def test_stall_disposition_names_a_non_one_shot_candidate_instead_of_no_crossing():
+    """#2025: a staged candidate is never a growth crossing; say so, not "no signal"."""
+    staged = _disposition(_state(), crossing_round=None, candidate_strategy="staged")
+    assert staged.kind == DISPOSITION_NOT_APPLICABLE
+    assert "staged plan" in staged.reason and "one-shot" in staged.reason
+    assert "crosses no plan-growth signal" not in staged.reason
+    for strategy in ("one-shot", None):
+        result = _disposition(_state(), crossing_round=None, candidate_strategy=strategy)
+        assert result.reason == "the current candidate crosses no plan-growth signal"
+    # A real crossing is unaffected by the strategy hint.
+    assert _disposition(_state(), candidate_strategy="staged").kind == DISPOSITION_DEFER_PENDING
+
+
 def test_streak_before_ignores_reviews_at_or_after_the_round():
     state = _state(rounds=(3, 4, 5))
     assert state.streak_since(3) == 3

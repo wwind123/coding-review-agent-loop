@@ -1152,8 +1152,13 @@ def plan_stall_step_back_disposition(
     growth_gate_enforced: bool,
     step_back_rounds: int,
     escalation_rounds: int,
+    candidate_strategy: str | None = None,
 ) -> StallStepBackDisposition:
     """Fixed-precedence decision the round-start stall stop consults.
+
+    ``candidate_strategy`` is the current candidate's execution strategy; it
+    only refines the not-applicable reason, because growth crossings count
+    one-shot candidates alone (#2025).
 
     Eligibility is judged from rounds before ``round_number`` so the answer does
     not change when that round's own primary review is posted.  The stall streak
@@ -1181,6 +1186,12 @@ def plan_stall_step_back_disposition(
     if not growth_gate_enforced:
         return StallStepBackDisposition(na, "plan-growth gate is off")
     if crossing_round is None:
+        if candidate_strategy is not None and candidate_strategy != "one-shot":
+            return StallStepBackDisposition(
+                na,
+                f"the current candidate is a {candidate_strategy} plan; plan step-back "
+                "applies only to a one-shot candidate that crosses a plan-growth signal",
+            )
         return StallStepBackDisposition(
             na, "the current candidate crosses no plan-growth signal"
         )
