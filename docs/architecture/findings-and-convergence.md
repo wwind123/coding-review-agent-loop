@@ -98,6 +98,14 @@ resolved dispositions do not. The fresh reviewer acknowledgement gate still
 runs before qualification: an approving reviewer missing acknowledgement triggers
 repair and exhaustion re-creates the dedicated blocker even after valid coder
 clearance. Unrelated findings and machine gates retain their own lifecycle.
+A coder that lists the tool-owned acknowledgement record in its addressed,
+remaining or disputed items has it stripped by the coder follow-up parser, with
+one accepted-response log line; the listing never clears or blocks the
+obligation, which stays decided by the signed acknowledgement fields, and a
+format repair may not add such a listing. A `pr_review` carrying the coder-only
+`human_requirement_dispositions` field has it dropped (and logged) by
+`parse_structured_pr_review` before the exact-key check, and pr_review repair
+preservation ignores it; other unknown fields remain fatal (#2026).
 
 Human-only exact-head evidence is a separate channel from findings.
 Reviewers list it in `exact_head_evidence_requests`, and the ledger records it

@@ -23,6 +23,7 @@ from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol_common import (
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ParseDegradation,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     parse_human_requirements_acknowledgement,
@@ -52,7 +53,6 @@ from .protocol import (
     _normalized_review_item_text,
 )
 
-HUMAN_REQUIREMENTS_ACK_ITEM_ID = "item-human-requirements-acknowledgement"
 MERGE_CONFLICT_ITEM_ID = "item-merge-conflict"
 CODER_DISPUTE_NOTE_PREFIX = "Coder disputes this item"
 MANAGED_CI_OBLIGATION_KIND = "managed-exact-head-ci"

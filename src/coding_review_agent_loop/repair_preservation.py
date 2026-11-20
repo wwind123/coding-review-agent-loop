@@ -21,6 +21,7 @@ from .protocol_risk import (
     _test_observation_item_defect,
 )
 from .protocol_common import (
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ParseDegradation,
     _extract_json_object_prefix,
     _normalize_requirement_label,
@@ -1117,6 +1118,53 @@ def _validate_test_observations_shape_repair(
     require(_contains_fragments(combined, fragments), "test_observations")
 
 
+_ACK_PLACEMENT_BUCKETS = ("addressed_items", "remaining_items", "disputed_items")
+
+
+def _is_ack_item_id(value: object) -> bool:
+    return isinstance(value, str) and value.strip() == HUMAN_REQUIREMENTS_ACK_ITEM_ID
+
+
+def _ack_placements(payload: object) -> set[str]:
+    """Bucket names whose list names the tool-owned acknowledgement record."""
+    if not isinstance(payload, dict):
+        return set()
+    return {
+        bucket
+        for bucket in _ACK_PLACEMENT_BUCKETS
+        if isinstance(payload.get(bucket), list)
+        and any(_is_ack_item_id(entry) for entry in payload[bucket])
+    }
+
+
+def _require_string_target_kind(target: dict | None) -> None:
+    """A repaired output may not use a present, non-string kind (#2026).
+
+    Rejecting it keeps every kind-keyed grounding and preservation check
+    reachable; live parsers' tolerance of such kinds is unchanged.
+    """
+    if isinstance(target, dict) and target.get("kind") is not None and not isinstance(
+        target["kind"], str
+    ):
+        raise AgentLoopError(
+            "Repair content preservation failed for kind: repaired output must use a string kind"
+        )
+
+
+def _require_no_added_ack_placement(source: dict | None, target: dict | None) -> None:
+    """A repair may not add an ack-record placement the coder did not make (#2026)."""
+    if not isinstance(target, dict) or target.get("kind") not in (None, "coder_followup"):
+        return
+    if not any(bucket in target for bucket in _ACK_PLACEMENT_BUCKETS):
+        return
+    added = sorted(_ack_placements(target) - _ack_placements(source))
+    if added:
+        raise AgentLoopError(
+            f"Repair content preservation failed for {added[0]}: repair cannot add a "
+            "human-requirements acknowledgement record placement the coder did not make"
+        )
+
+
 def validate_repair_preservation(
     raw: str,
     repaired: str,
@@ -1137,6 +1185,8 @@ def validate_repair_preservation(
     Do not heuristically parse broken JSON or interpret prose as item ledgers.
     """
     source, target = _payload(raw), _payload(repaired)
+    _require_string_target_kind(target)
+    _require_no_added_ack_placement(source, target)
     from .post_merge_obligations import preserve_fields as preserve_post_merge
     if source is None and "post_merge_obligations" in raw:
         raise AgentLoopError("Post-merge classification source cannot be extracted for repair")
@@ -1550,6 +1600,8 @@ def validate_repair_preservation(
             if not isinstance(notes, dict):
                 continue
             for item_id, note in notes.items():
+                if _is_ack_item_id(item_id):
+                    continue
                 if allowed_item_ids is not None and item_id not in allowed_item_ids:
                     continue
                 if not isinstance(note, str) or not _fragments(note):
@@ -1569,6 +1621,8 @@ def validate_repair_preservation(
             target_disputed_items = target.get("disputed_items", [])
             require(isinstance(target_disputed_items, list), "disputed_items")
             for item_id in disputed_items:
+                if _is_ack_item_id(item_id):
+                    continue
                 if allowed_item_ids is not None and item_id not in allowed_item_ids:
                     continue
                 require(item_id in target_disputed_items, "disputed_items")
@@ -1578,6 +1632,8 @@ def validate_repair_preservation(
             target_evidence = target.get("dispute_evidence", {})
             require(isinstance(target_evidence, dict), "dispute_evidence")
             for item_id, evidence in dispute_evidence.items():
+                if _is_ack_item_id(item_id):
+                    continue
                 if allowed_item_ids is not None and item_id not in allowed_item_ids:
                     continue
                 if not isinstance(evidence, str) or not _fragments(evidence):
@@ -1590,14 +1646,14 @@ def validate_repair_preservation(
 
     # A format repair must not adjudicate surfaced signed requirements. Preserve
     # their already-valid disposition/evidence while allowing the authoritative
-    # context validator to remove fabricated rows. PR reviews prohibit this
-    # field entirely, so no source row is authoritative for that kind.
+    # context validator to remove fabricated rows. The pr_review parser drops
+    # this coder-only field, so a pr_review repair ignores it entirely (#2026).
     dispositions = source.get("human_requirement_dispositions")
-    if isinstance(dispositions, list):
+    if isinstance(dispositions, list) and "pr_review" not in (
+        source["kind"], target.get("kind")
+    ):
         requirement_context = surfaced_requirement_ids
-        if source["kind"] == "pr_review":
-            requirement_context = ()
-        elif source["kind"] == "plan_review":
+        if source["kind"] == "plan_review":
             requirement_context = reviewer_requirement_ids
         allowed_requirement_ids = None
         if requirement_context is not None:

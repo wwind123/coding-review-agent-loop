@@ -1388,3 +1388,17 @@ def test_excluded_future_1868_real_repair_removes_claims_and_preserves_reports(t
     assert response.marker_value.addressed_items == (("item-1",) if required else ())
     assert response.marker_value.remaining_items == response.marker_value.disputed_items == ()
     assert response.marker_value.tests_run == tuple(base["tests_run"])
+
+
+@pytest.mark.parametrize("with_dropped_field", [False, True], ids=["alone", "beside-dropped-field"])
+def test_pr_review_other_unknown_fields_stay_fatal_2026(with_dropped_field):
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    rendered = structured_pr_review(state="approved")
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    payload["foo"] = 1
+    if with_dropped_field:
+        payload["human_requirement_dispositions"] = []
+    with pytest.raises(AgentLoopError, match=r"pr_review has unknown field\(s\): foo$"):
+        parse_structured_pr_review(json.dumps(payload) + rendered[split:], reviewer="Codex")

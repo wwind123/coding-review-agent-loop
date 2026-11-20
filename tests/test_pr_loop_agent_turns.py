@@ -1784,3 +1784,49 @@ def test_stale_sync_failure_reaches_cli_and_preserves_healthy_peer(
     else:
         assert not any(cmd[:1] == ["gemini"] for cmd, _ in runner.commands)
         assert not any("**Review verdict:** Approved" in body for body in runner.comments)
+
+
+# --- #2026: a reviewer's coder-only dispositions field is dropped by the parser ---
+
+def _review_with_dispositions_2026(text):
+    split = text.index("}\n") + 1
+    payload = json.loads(text[:split])
+    payload["human_requirement_dispositions"] = [
+        {"requirement_id": "hr-" + "e" * 64, "disposition": "addressed", "evidence": "Copied from a note."}
+    ]
+    return json.dumps(payload) + text[split:]
+
+
+def test_live_review_carrying_dispositions_field_is_published(tmp_path, caplog):
+    from agent_loop_helpers import structured_coder_followup, structured_pr_review
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    caplog.set_level("WARNING")
+    blocking = structured_pr_review(state="blocking", blocking_items=["Add the regression case."])
+    approving = structured_pr_review(
+        state="approved",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Added."}],
+    )
+    runner = FakeRunner(
+        codex_outputs=[_review_with_dispositions_2026(blocking), _review_with_dispositions_2026(approving)],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    lines = [r.getMessage() for r in caplog.records if "human_requirement_dispositions" in r.getMessage()]
+    assert lines and set(lines) == {
+        "pr_review: dropped coder-only field `human_requirement_dispositions` before validation"
+    }
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+    )
+    reviewer_dispositions = [
+        [(d.item_id, d.disposition) for d in r.metadata.dispositions]
+        for r in records if r.metadata.role == "reviewer"
+    ]
+    assert [("item-1", "resolved")] in reviewer_dispositions
+    published = parse_pr_review(_review_with_dispositions_2026(approving), reviewer="OpenAI Codex")
+    baseline = parse_pr_review(approving, reviewer="OpenAI Codex")
+    assert published.dispositions == baseline.dispositions

@@ -405,3 +405,91 @@ def test_nested_pr_phase_carries_pr_number_without_a_second_window(tmp_path):
     assert runner.telemetry_attribution is None
     kinds = [r["record"] for r in load_records(telemetry_log_path())]
     assert kinds == ["run-start", "run-end"]
+
+
+# --- #2026: one coder acknowledgement-strip line per accepted follow-up ---
+
+from coding_review_agent_loop.errors import NonRepairableEvidenceRejection as _ack_NonRepairable  # noqa: E402
+from coding_review_agent_loop.protocol import UnresolvedReviewItem as _AckItem  # noqa: E402
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID as _ACK,
+    _validate_coder_followup_response as _ack_validate_followup,
+)
+from agent_loop_helpers import structured_coder_followup as _ack_followup  # noqa: E402
+
+_ACK_ITEMS = (_AckItem(item_id="item-1", reviewer="Codex", source_round=1, text="Fix.", status="blocking"),)
+
+
+def _ack_validators(reject_first=None):
+    calls = {"n": 0}
+
+    def factory(mode, observations_mode):
+        def validate(text):
+            parsed = _ack_validate_followup(
+                text, unresolved_items=_ACK_ITEMS, human_requirements=(),
+                architecture_status_mode=mode, test_observations_mode=observations_mode,
+            )
+            calls["n"] += 1
+            if reject_first is not None and reject_first(text):
+                raise _ack_NonRepairable("report outside the assigned checkout", reason="report-workdir")
+            return parsed
+        return validate
+
+    return architecture_contract._architecture_and_test_observation_mode_validators(factory)
+
+
+def _ack_lines(caplog):
+    return [r.getMessage() for r in caplog.records if "acknowledgement record" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "placement,credited",
+    [
+        ({"addressed_items": ["item-1", _ACK]}, True),
+        ({"addressed_items": ["item-1"], "remaining_items": [_ACK]}, False),
+        ({"addressed_items": ["item-1"], "disputed_items": [_ACK]}, False),
+        ({"addressed_items": ["item-1", _ACK], "remaining_items": [_ACK]}, True),
+    ],
+    ids=["addressed", "remaining", "disputed", "multi-bucket"],
+)
+def test_accepted_coder_followup_logs_one_ack_strip_line(tmp_path, caplog, placement, credited):
+    caplog.set_level("WARNING")
+    runner = _FakeRunner(claude_outputs=[_ack_followup(**placement)])
+    response = validated_agent_module._run_validated_agent(
+        runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+        prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        **_ack_validators(), require_architecture_impact_contract=True,
+    )
+    assert _ACK not in response.marker_value.addressed_items
+    lines = _ack_lines(caplog)
+    assert len(lines) == 1
+    assert ("counted as the coder's acknowledgement" in lines[0]) is credited
+
+
+def test_strict_reparse_still_logs_one_ack_strip_line(tmp_path, caplog):
+    caplog.set_level("WARNING")
+    text = _deg_with(_ack_followup(addressed_items=["item-1", _ACK]), _DEG_CORROBORATED)
+    runner = _FakeRunner(claude_outputs=[text])
+    response = validated_agent_module._run_validated_agent(
+        runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+        prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        **_ack_validators(), require_architecture_impact_contract=True,
+    )
+    assert [r.outcome for r in response.marker_value.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    assert len(_ack_lines(caplog)) == 1
+
+
+def test_workdir_guard_rejected_candidate_logs_no_ack_strip_line(tmp_path, caplog):
+    caplog.set_level("WARNING")
+    rejected = _ack_followup(addressed_items=["item-1", _ACK], summary="Outside checkout.")
+    runner = _FakeRunner(claude_outputs=[rejected])
+    with pytest.raises(AgentLoopError):
+        validated_agent_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            **_ack_validators(reject_first=lambda text: "Outside checkout." in text),
+            require_architecture_impact_contract=True,
+        )
+    assert _ack_lines(caplog) == []
