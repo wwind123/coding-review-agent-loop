@@ -259,6 +259,17 @@ def parse_agy_json_envelope(stdout: str) -> AgyEnvelope | None:
         return None
 
 
+def envelope_provider_error(envelope: AgyEnvelope) -> str:
+    """The decoded operational error of a non-SUCCESS envelope (#2029).
+
+    The envelope's own error text when present, else a status line, so a
+    failed agy turn is never mistaken for a model format failure.
+    """
+    if envelope.error_text.strip():
+        return envelope.error_text.strip()
+    return f"agy reported status {envelope.status or 'unknown'} with no error text"
+
+
 def structured_output_signature(config: "AgentLoopConfig", model: str) -> str:
     """The Antigravity signature label, seat-labelled when a seat is active."""
     base = f"Google Antigravity: {model}"

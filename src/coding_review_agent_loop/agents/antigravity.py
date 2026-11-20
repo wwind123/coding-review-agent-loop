@@ -51,6 +51,7 @@ from .base import (
 from .antigravity_structured import (
     AgyEnvelope,
     SCHEMA_FILE_NAME,
+    envelope_provider_error,
     STRUCTURED_KIND_FOOTERS,
     antigravity_structured_output_supported,
     oversized_prompt_directive,
@@ -1409,19 +1410,21 @@ def _select_structured_turn_text(
     *,
     kind: str,
     signature: str,
-) -> tuple[str, AgentTextSource, str]:
-    """(text, text_source, classification raw output) for a JSON-mode turn (#2029).
+) -> tuple[str, AgentTextSource, str | None]:
+    """(text, text_source, provider error) for a JSON-mode turn (#2029).
 
     Precedence: a SUCCESS envelope whose ``structured_output`` renders, then a
     non-empty response file, then the public-response marker in the
     envelope's prose (or raw stdout when no envelope parsed).  A non-empty
     response file does not prove a usable contract, so a renderable payload
-    wins over it; the file stays on the result for audit only.  For a
-    non-SUCCESS envelope the decoded error and prose are appended to the raw
-    stdout so quota, capacity and auth classifiers still see provider lines.
+    wins over it; the file stays on the result for audit only.
+
+    A non-SUCCESS envelope is an operational failure reported by agy, not
+    model prose: its decoded error comes back separately as the provider
+    error, so classification can read it as the terminal provider frame in
+    every failure phase (narration in ``response`` can never displace it).
     """
     envelope: AgyEnvelope | None = parse_agy_json_envelope(stdout)
-    raw_output = stdout
     if envelope is not None and envelope.succeeded and envelope.structured_output is not None:
         rendered = render_structured_output_text(envelope.structured_output, kind, signature)
         if rendered is not None:
@@ -1431,21 +1434,20 @@ def _select_structured_turn_text(
                     "Antigravity returned both structured_output and a response file; "
                     "using structured_output (the file is kept for audit only)",
                 )
-            return rendered, "structured_output", raw_output
+            return rendered, "structured_output", None
         log(config, "Antigravity structured_output was not renderable; falling back")
-    if envelope is not None and not envelope.succeeded:
-        decoded = "\n".join(
-            part for part in (envelope.error_text, envelope.response) if part.strip()
-        )
-        if decoded:
-            raw_output = f"{stdout}\n{decoded}"
+    provider_error = (
+        envelope_provider_error(envelope)
+        if envelope is not None and not envelope.succeeded
+        else None
+    )
     if response_file_text is not None:
-        return response_file_text, "response_file", raw_output
+        return response_file_text, "response_file", provider_error
     if envelope is not None:
         text, source = _strip_public_response_marker(envelope.response)
-        return text, source, raw_output
+        return text, source, provider_error
     text, source = _strip_public_response_marker(stdout)
-    return text, source, raw_output
+    return text, source, provider_error
 
 
 def _parse_model_catalog(raw: str) -> set[str]:
@@ -1879,9 +1881,9 @@ class AntigravityBackend:
         if role == _SEMANTIC_DEDUPE_ROLE:
             response_path.unlink(missing_ok=True)
             response_file_text = None
-        raw_output = result.stdout
+        provider_error_text: str | None = None
         if structured_kind is not None:
-            message_text, text_source, raw_output = _select_structured_turn_text(
+            message_text, text_source, provider_error_text = _select_structured_turn_text(
                 config,
                 result.stdout,
                 response_file_text,
@@ -1904,7 +1906,8 @@ class AntigravityBackend:
             )
         return AgentResult(
             text=message_text,
-            raw_output=raw_output,
+            raw_output=result.stdout,
+            provider_error_text=provider_error_text,
             text_source=text_source,
             response_file_text=response_file_text,
             response_file_path=response_path,

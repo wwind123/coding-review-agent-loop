@@ -1345,16 +1345,27 @@ def _json_envelope(prefix="agy starting", **fields):
     return f"{prefix}\r\n" + json_module.dumps(fields) + "\r\n"
 
 
-def test_json_mode_quota_frame_is_classified_and_falls_back_by_quota(tmp_path, monkeypatch):
+_MULTILINE_NARRATION = (
+    "## Review\n\nI looked at the diff carefully.\nThe parser change reads well.\n"
+    "The tests cover the new branch.\nI would approve this change."
+)
+
+
+@pytest.mark.parametrize("returncode", [1, 0], ids=["nonzero-exit", "zero-exit"])
+@pytest.mark.parametrize("response", ["", _MULTILINE_NARRATION], ids=["empty", "multiline-narration"])
+def test_json_mode_quota_frame_is_classified_and_falls_back_by_quota(
+    tmp_path, monkeypatch, returncode, response
+):
+    """The decoded 429 frame stays terminal for classification in every phase (#2029)."""
     import json as json_module
 
     _structured_on(monkeypatch)
-    failure = _json_envelope(status="ERROR", response="", error=LIVE_SAMPLE)
+    failure = _json_envelope(status="ERROR", response=response, error=LIVE_SAMPLE)
     valid_payload = json_module.JSONDecoder().raw_decode(structured_pr_review())[0]
     success = _json_envelope(status="SUCCESS", response="prose", structured_output=valid_payload)
     with workdir_claims.workdir_claim_scope():
         response, error, models, logs, repairs = _review_turn(
-            tmp_path, [(failure, 1), (success, 0)], models=(GEM1, OPUS),
+            tmp_path, [(failure, returncode), (success, 0)], models=(GEM1, OPUS),
         )
         assert _gemini_marked()
     assert error is None and response.model_used == OPUS

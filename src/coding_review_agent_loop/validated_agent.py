@@ -1132,6 +1132,18 @@ def _test_turn_receipts(acquisition: AgentResult | None) -> tuple[dict[str, str]
     return tuple(receipts)
 
 
+class _ProviderEnvelopeFailure(Exception):
+    """Internal control flow: a non-SUCCESS agy envelope whose fallback failed validation (#2029).
+
+    Deliberately not an AgentLoopError, so the format-failure handling below
+    never sees it.
+    """
+
+    def __init__(self, validation_error: AgentLoopError) -> None:
+        self.validation_error = validation_error
+        super().__init__(str(validation_error))
+
+
 def _run_validated_agent(*args, **kwargs):
     """Run one validated agent turn, then remove its per-turn response directories.
 
@@ -2239,13 +2251,59 @@ def _run_validated_agent_in_scope(
                 unavailable = parse_agent_unavailable(text)
                 if unavailable is not None:
                     raise _AgentUnavailableResponse(unavailable)
-                marker_value = validate(text)
+                try:
+                    marker_value = validate(text)
+                except AgentLoopError as validation_exc:
+                    if result.provider_error_text and not isinstance(
+                        validation_exc, _ArchitectureImpactContractUnsatisfied
+                    ):
+                        # agy itself reported a failed turn and the fallback
+                        # content did not validate (#2029): an operational
+                        # provider failure, never a model format failure.
+                        raise _ProviderEnvelopeFailure(validation_exc) from validation_exc
+                    raise
                 if response_file_pre_status == "leading-public-response-marker-recovered":
                     log(
                         config,
                         f"{agent_name}: response file contained stdout filtering marker and "
                         "validated after stripping it",
                     )
+            except _ProviderEnvelopeFailure as exc:
+                # Classify like a failed command: the typed provider error is
+                # the terminal frame, so auth/billing stay non-retryable and
+                # quota/capacity reach the quota path. No repair and no
+                # format-failure transition for an operational failure.
+                last_error = (
+                    f"Antigravity reported a failed turn ({result.provider_error_text}); "
+                    f"fallback response rejected: {exc.validation_error}"
+                )[:2000]
+                classification_text, _provider_verdict = _agent_failure_classification(
+                    result, phase="command"
+                )
+                last_classification_text = classification_text
+                should_retry = _is_transient_agent_output(classification_text)
+                last_failure_category = _failure_category(classification_text)
+                # A non-SUCCESS envelope is a failed invocation even at exit 0.
+                capacity = classify_antigravity_capacity(
+                    classification_text,
+                    returncode=result.returncode or 1,
+                    empty_response=False,
+                    signatures=config.antigravity_quota_signatures,
+                )
+                provider_capacity = bool(capacity and capacity.is_capacity)
+                if provider_capacity:
+                    should_retry = True
+                    last_failure_category = "transient"
+                elif capacity.auth_failure:
+                    should_retry = False
+                    last_failure_category = "non-retryable"
+                if usage_record is not None:
+                    usage_record.validation_status = "invalid"
+                log(
+                    config,
+                    f"{agent_name}: agy reported a failed turn and the fallback response did "
+                    f"not validate ({last_failure_category})",
+                )
             except _AgentUnavailableResponse as exc:
                 unavailable = exc.unavailable
                 last_error = (

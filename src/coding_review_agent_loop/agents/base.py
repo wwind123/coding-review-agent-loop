@@ -93,6 +93,10 @@ class AgentResult:
     # and its RESOURCE_EXHAUSTED 429 executor line when one was found.
     antigravity_log_path: Path | None = None
     antigravity_log_quota_evidence: AntigravityLogQuotaEvidence | None = None
+    # Antigravity JSON mode only (#2029): the decoded error of a non-SUCCESS
+    # agy envelope. A provider diagnostic, never model prose: failure
+    # classification reads it as the terminal frame in every phase.
+    provider_error_text: str | None = None
 
     image_delivery_proof: ImageDeliveryProof | None = None
 

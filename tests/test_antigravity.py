@@ -2883,3 +2883,30 @@ def test_oversized_directive_names_the_output_channel(tmp_path, monkeypatch, str
     assert "Do not answer in chat" in directive
     assert ("structured result" in directive) is structured
     assert len(directive.encode("utf-8")) < 2_000
+
+
+@pytest.mark.parametrize(
+    "envelope,expected",
+    [
+        (_agy_envelope(None, status="ERROR", error="RESOURCE_EXHAUSTED (code 429)"), "RESOURCE_EXHAUSTED (code 429)"),
+        (_agy_envelope(None, status="ERROR"), "agy reported status ERROR with no error text"),
+        (_agy_envelope(_payload(structured_pr_review())), None),
+        (_agy_envelope(None), None),
+    ],
+    ids=["error-text", "status-only", "success-structured", "success-no-structured"],
+)
+def test_non_success_envelope_error_is_a_typed_provider_diagnostic(tmp_path, monkeypatch, envelope, expected):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.agent_failure import _agent_failure_classification_text
+
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(antigravity_outputs=[(envelope, 0)])
+    config = _structured_config(tmp_path)
+
+    result = AntigravityBackend().run(runner, config, "Review this PR.", run_id="r", role="reviewer")
+
+    assert result.provider_error_text == expected
+    assert result.raw_output == envelope  # raw stdout kept verbatim for audit
+    if expected is not None:
+        for phase in ("command", "empty", "validation"):
+            assert _agent_failure_classification_text(result, phase=phase).endswith(expected)
