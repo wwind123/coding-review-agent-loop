@@ -113,6 +113,7 @@ from .agent_failure import (
     _is_transient_public_response,
     _is_retryable_marker_near_miss,
     _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION,
+    _JUDGEMENT_FIELD_CLASSIFICATION,
     _failure_category,
     _response_file_structured_status,
     _neutralize_untrusted_markers,
@@ -1211,6 +1212,7 @@ def _run_validated_agent_in_scope(
     test_observations_fallback_strict_revalidate: Callable[[str], object] | None = None,
     reask_on_prior_disposition_omission: bool = False,
     reask_on_missing_judgement_field: bool = False,
+    reviewer_judgement_turn: bool = False,
     reask_on_evidence_rejection: bool = False,
     architecture_document_paths: Callable[[], frozenset[str] | None] | None = None,
 ) -> ValidatedAgentResponse:
@@ -3004,7 +3006,11 @@ def _run_validated_agent_in_scope(
                         should_retry = False
                         last_failure_category = "deterministic"
                     elif (
-                        repair_expected_kind in {"plan_review", "pr_review"}
+                        # A reviewer turn without a repair kind (signed-source
+                        # classification, #2035) opts in explicitly, so it keeps
+                        # its own backend output channel while an exhausted
+                        # judgement re-ask still takes this deterministic path.
+                        (repair_expected_kind in {"plan_review", "pr_review"} or reviewer_judgement_turn)
                         and isinstance(exc, MissingJudgementFieldError)
                     ):
                         # Reformatting cannot supply the reviewer's decision (#1185).
@@ -3020,6 +3026,7 @@ def _run_validated_agent_in_scope(
                             f"{exc.field_path} (allowed: {allowed}); a repair pass cannot "
                             "supply the reviewer's decision)"
                         )
+                        last_classification_text = _JUDGEMENT_FIELD_CLASSIFICATION
                         last_failure_category = "deterministic"
                     elif (
                         use_repair

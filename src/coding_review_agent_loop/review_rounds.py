@@ -1023,12 +1023,19 @@ def _replay_unavailable_cause(
     *,
     own_posted: bool = False,
     loaded_unreplayable: bool = False,
+    own_posted_reason: str = "",
 ) -> str:
-    """Why this reviewer's withheld outcome cannot be replayed (#1142)."""
+    """Why this reviewer's withheld outcome cannot be replayed (#1142).
+
+    ``own_posted_reason`` names the failing resume predicate for a posted review
+    that a classification-only resume could not admit either (#2035).
+    """
     if own_posted:
+        because = f" (resume rejected it because {own_posted_reason})" if own_posted_reason else ""
         return (
             f"{reviewer_name}'s own review for this round is already posted but no longer "
-            "accepted, so it needs a fresh turn and its withheld outcome cannot be replayed."
+            f"accepted{because}, so it needs a fresh turn and its withheld outcome cannot be "
+            "replayed."
         )
     if loaded_unreplayable:
         return f"{reviewer_name}'s spooled outcome no longer validates against this run."
@@ -1156,6 +1163,7 @@ def _refuse_partial_round_before_sequential_turns(
     already_posted: Sequence[AgentName] = (),
     recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
+    posted_rejection_reasons: Mapping[str, str] | None = None,
 ) -> None:
     """Stop before any sequential turn when one of them would face a public peer.
 
@@ -1172,7 +1180,8 @@ def _refuse_partial_round_before_sequential_turns(
                 surface=spool.surface, number=spool.number, round_number=spool.round_number,
                 reviewer_name=agent_display_name(reviewer), public_peers=peers,
                 cause=_replay_unavailable_cause(
-                    spool, agent_display_name(reviewer), own_posted=reviewer in already_posted
+                    spool, agent_display_name(reviewer), own_posted=reviewer in already_posted,
+                    own_posted_reason=(posted_rejection_reasons or {}).get(agent_display_name(reviewer), ""),
                 ) if not unresolved_conversion_boundary else "",
                 recovery=recovery,
                 unresolved_conversion_boundary=unresolved_conversion_boundary,
@@ -1191,6 +1200,7 @@ def _same_round_replay_or_invoke(
     already_posted: bool = False,
     recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
+    posted_rejection_reasons: Mapping[str, str] | None = None,
 ) -> ValidatedAgentResponse:
     """Sequential-mode seam: never invoke a reviewer against public same-round peers.
 
@@ -1219,6 +1229,7 @@ def _same_round_replay_or_invoke(
         cause=_replay_unavailable_cause(
             spool, reviewer_name, own_posted=already_posted,
             loaded_unreplayable=fields is not None,
+            own_posted_reason=(posted_rejection_reasons or {}).get(reviewer_name, ""),
         ) if not unresolved_conversion_boundary else "",
         recovery=recovery,
         unresolved_conversion_boundary=unresolved_conversion_boundary,
@@ -1244,6 +1255,7 @@ def _launch_reviewer_turns(
     prepare_fallback: Callable[[AgentName], None] | None = None,
     recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
+    posted_rejection_reasons: Mapping[str, str] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -1341,6 +1353,8 @@ def _launch_reviewer_turns(
                         spool, agent_display_name(reviewer),
                         own_posted=reviewer in already_posted,
                         loaded_unreplayable=reviewer in replay_fallbacks,
+                        own_posted_reason=(posted_rejection_reasons or {}).get(
+                            agent_display_name(reviewer), ""),
                     ) if not unresolved_conversion_boundary else "",
                     recovery=recovery,
                     unresolved_conversion_boundary=unresolved_conversion_boundary,

@@ -1,5 +1,5 @@
 """Reviewer-owned signed-source routing; classification never grants acceptance."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .errors import AgentLoopError, MissingJudgementFieldError
 from .github import HumanReviewRequirement
@@ -16,6 +16,29 @@ def normalize_empty_text(entry):
             and isinstance(result["leftover_instructions"], str)):
         result["leftover_instructions"] = ""
     return result
+
+
+_HUMAN_ONLY_RULE = "human-only must name its exact emitted evidence request in request"
+_NON_HUMAN_REQUEST_RULE = "only human-only names a request; code, evidence-only and mixed use request \"\""
+_ANSWER_RULES = {
+    "mixed": ("mixed requires at least one answered_item_id; if no prior evidence item of yours "
+              "is answered, use code or human-only"),
+    "evidence-only": ("evidence-only requires at least one answered_item_id; if no prior evidence "
+                      "item of yours is answered, use code or human-only"),
+    "code": "code uses answered_item_ids []; use evidence-only or mixed to answer your prior evidence items",
+    "human-only": ("human-only uses answered_item_ids []; use evidence-only or mixed to answer "
+                   "your prior evidence items"),
+}
+_LEFTOVER_RULE = ("mixed requires explicit leftover_instructions; if nothing is left for the coder, "
+                  "use evidence-only")
+
+
+def _inconsistent(index, entry, rule):
+    """A role/field consistency violation, routed to the reviewer judgement re-ask."""
+    rid = " ".join(str(entry["requirement_id"]).split())[:120]
+    message = f"requirement_evidence[{index}] (requirement_id {rid}, role {entry['role']}): {rule}."
+    return MissingJudgementFieldError(message, field_path="requirement_evidence",
+                                      allowed_values=(rule,), observed_preview=message)
 
 
 def parse_associations(value):
@@ -39,12 +62,17 @@ def parse_associations(value):
         if not isinstance(answers, list) or any(not isinstance(i, str) or not i for i in answers) or len(set(answers)) != len(answers):
             raise AgentLoopError("requirement_evidence answers must be distinct item IDs")
         role = entry["role"]
-        if not entry["requirement_id"] or (role == "human-only") != bool(entry["request"].strip()):
+        if not entry["requirement_id"]:
             raise AgentLoopError("Human-only requirements must link an evidence request")
+        # Role/field consistency is the reviewer's judgement (#2035): it takes
+        # the bounded judgement re-ask, never format repair or a fatal stop.
+        if (role == "human-only") != bool(entry["request"].strip()):
+            raise _inconsistent(index, entry, _HUMAN_ONLY_RULE if role == "human-only"
+                                else _NON_HUMAN_REQUEST_RULE)
         if (role in {"mixed", "evidence-only"}) != bool(answers):
-            raise AgentLoopError("Evidence responses must identify answered items")
+            raise _inconsistent(index, entry, _ANSWER_RULES[role])
         if (role == "mixed") != bool(entry["leftover_instructions"].strip()):
-            raise AgentLoopError("Only mixed sources require explicit leftover instructions")
+            raise _inconsistent(index, entry, _LEFTOVER_RULE)
         if any(e["requirement_id"] == entry["requirement_id"] for e in result):
             raise AgentLoopError("Repeated requirement_evidence source")
         result.append(dict(entry))
@@ -159,8 +187,34 @@ def _role_conflict_message(conflicts, previous_entries, reviewer_name):
             "no coder was dispatched.")
 
 
-def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke, previous=None):
-    """Settle unacknowledged source routing with one bounded semantic continuation."""
+# The signed-source classification continuation's validated-turn options. A
+# consistency violation is re-asked once; an exhausted re-ask takes the typed
+# judgement-failure path (#2035). No repair kind is set, so the turn keeps its
+# backend output channel and never enters format repair.
+CLASSIFICATION_INVOKE_OPTIONS = {
+    "marker_description": "structured PR review classification",
+    "role": "reviewer",
+    "operation_description": "Signed-source classification",
+    "reask_on_missing_judgement_field": True,
+    "reviewer_judgement_turn": True,
+}
+
+
+def _pinned_signature(review):
+    """The published verdict and findings a restored review must keep (#2035)."""
+    return (review.state, tuple(" ".join(str(item.text).split()) for item in review.blocking_items))
+
+
+def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke, previous=None,
+                    force_continuation=False, pinned_review=None):
+    """Settle unacknowledged source routing with one bounded semantic continuation.
+
+    ``force_continuation`` runs the continuation even when no existing trigger
+    fires (a published review whose classification never completed).
+    ``pinned_review`` applies to every continuation that runs: a review restored
+    from a published record may change only its classification once its peers
+    are public, so a changed verdict or finding stops for a human decision.
+    """
     from .protocol import human_requirements_resolved
     classified = {e["requirement_id"] for e in parsed.requirement_evidence}
     missing = {r.requirement_id for r in requirements} - classified
@@ -172,7 +226,7 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
             p["requirement_id"] == e["requirement_id"] and p["role"] != e["role"]
             for _, p in previous_entries)]
 
-    if conflicts_with_previous(parsed) or (requirements and missing
+    if (force_continuation and requirements) or conflicts_with_previous(parsed) or (requirements and missing
             and (parsed.requirement_evidence or not human_requirements_resolved(text))):
         import json
         from .errors import HumanDecisionRequiredError
@@ -189,8 +243,22 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
             "This is a real semantic reviewer turn; do not invent instructions. Agreement is decided by role; "
             "leftover wording need not match other reviewers.\nSigned sources: "
             + json.dumps(sources) + "\nPrior classifications to reconcile: " + json.dumps(prior) + "\nPrior items: " + repr(items) + "\nPrevious review:\n" + text)
+        if pinned_review is not None:
+            prompt += ("\nThis review is already published and its peers are public: its verdict "
+                "(state) and blocking_items are final and must be returned unchanged. Supply only "
+                "requirement_evidence (and any linked exact-head evidence request)"
+                + (", reconciling your role with the prior classifications above." if prior else "."))
         response = invoke(prompt)
         parsed, text = response.marker_value, response.text
+        if pinned_review is not None:
+            if _pinned_signature(parsed) != _pinned_signature(pinned_review):
+                raise HumanDecisionRequiredError(
+                    f"{reviewer_name}'s review was restored from its published record, and its "
+                    "signed-source classification continuation changed the published verdict or "
+                    "findings. A restored review cannot change its verdict or findings after its "
+                    "peers are public; no coder was dispatched.")
+            parsed = replace(pinned_review, requirement_evidence=parsed.requirement_evidence,
+                             exact_head_evidence_requests=parsed.exact_head_evidence_requests)
         if {r.requirement_id for r in requirements} - {e["requirement_id"] for e in parsed.requirement_evidence}:
             raise HumanDecisionRequiredError("Signed-source classification remained absent; no coder was dispatched for human evidence.")
         conflicts = conflicts_with_previous(parsed)

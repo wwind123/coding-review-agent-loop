@@ -4110,7 +4110,9 @@ Execution model:
     directory looked under), the spool holds no outcome for that reviewer, the
     reviewer's spool file exists but is unreadable or foreign, the spooled
     outcome no longer validates, or the reviewer's own posted review was
-    rejected and needs a fresh turn. It never offers a rerun from another host.
+    rejected and needs a fresh turn; for a rejected own review it names the
+    failing check (a changed signed requirement set, a reconciled round, or an
+    approved-plan, acquisition or seat-binding change). It never offers a rerun from another host.
     It then lists, by comment id and URL, the comments to delete so the whole
     round runs again independently: the round's peer reviewer verdicts of any
     scheduler phase (including a rejected own record), the round's reconciling
@@ -4131,6 +4133,16 @@ Execution model:
     round now treats a scheduler-prelaunch summary as a pre-reconciliation
     checkpoint, as planning rounds already do. A reset operation that deletes
     the comments for you is out of scope.
+  - A posted review whose only gap is the signed-source classification step
+    (#2035) is not refused. Classification runs after the round's reviews are
+    published, so a run that stopped there (for example, a reviewer's
+    classification exhausted its one judgement re-ask) leaves every independent
+    verdict public. When the round is unreconciled and the surfaced signed
+    requirement set is unchanged, a rerun resumes that review and redoes only
+    its classification. The published verdict and blocking findings are kept,
+    and a classification answer that changes them stops for a human decision
+    before any coder runs. Nothing needs deleting and no `--managed-ci-fresh`
+    is required.
   - This refusal covers only a round that was interrupted before its
     reconciliation. A PR round whose reconciliation is posted is closed
     (#1553): when a rerun needs a fresh reviewer turn there (for example, a

@@ -395,7 +395,7 @@ from .response_validation import (
     _surfaced_reviewer_requirement_ids,
     _reviewer_requirement_identity_ids,
     _reviewer_requirement_coverage_matches,
-    _resumed_pr_reviewer_matches_requirements,
+    _resumed_pr_reviewer_matches_requirements, admit_classification_resumes,
     _drop_repeated_carried_future_followups,
     _validate_followup_workdir_report,
 )
@@ -565,7 +565,7 @@ from .pr_board_entry import _enforce_pr_board_floor
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
-from .requirement_evidence import historical_projection, classify_review, project, reviewer_owned_ids, validate_associations
+from .requirement_evidence import CLASSIFICATION_INVOKE_OPTIONS, historical_projection, classify_review, project, reviewer_owned_ids, validate_associations
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -3810,6 +3810,7 @@ def run_pr_loop(
                 )
                 and (seat_binding is None or record.metadata.seat_binding == seat_binding)
             }
+            classification_resume_kinds, posted_rejection_reasons = admit_classification_resumes(completed_by_name, resumed_by_name, human_requirements, approved_plan_context, reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None, seat_binding=seat_binding, items=prior_unresolved_items, round_number=round_number, head_sha=current_pr_subject, reconciled=current_resume is not None and current_resume.reconciliation_record is not None)
             # Staged-policy panel evidence (#840).  Derived from comment-ordered
             # history before any resume, approval, or scheduling decision uses
             # reviewer records, so premature secondary work cannot count.
@@ -5255,7 +5256,7 @@ def run_pr_loop(
                         if agent_display_name(reviewer) in completed_by_name
                     ),
                     recovery=_pr_round_recovery,
-                    unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
+                    unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
                 )
             if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
@@ -5480,7 +5481,7 @@ def run_pr_loop(
                             public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             retry_bound=_pr_retry_bound,
-                            unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
+                            unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
                             max_workers=None if config.review_parallel else 1,
                             # A spooled reviewer skipped the pre-review sync
                             # above; sync it if its replay falls back to a turn.
@@ -5680,7 +5681,7 @@ def run_pr_loop(
                             recovery=_pr_round_recovery,
                             validators=sequential_pr_validators,
                             unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
-                            already_posted=reviewer_name in completed_by_name,
+                            already_posted=reviewer_name in completed_by_name, posted_rejection_reasons=posted_rejection_reasons,
                             invoke=lambda: _run_validated_agent(
                             runner,
                             agent=reviewer,
@@ -5780,12 +5781,14 @@ def run_pr_loop(
                 classification_input = review_output
                 parsed_review, review_output = classify_review(parsed_review, review_output,
                     requirements=human_requirements, items=prior_unresolved_items, reviewer_name=reviewer_name, previous=classified_review_carriers,
-                    invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config,
-                        prompt=prompt, marker_description="structured PR review classification",
-                        **_pr_review_validators(reviewer_name), usage_context=usage_context,
-                        role="reviewer", operation_description="Signed-source classification", reask_on_missing_judgement_field=True))
+                    **({"pinned_review": parsed_review, "force_continuation": classification_resume_kinds[reviewer_name] == "pending"} if resumed_record is not None and reviewer_name in classification_resume_kinds else {}),
+                    invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config, prompt=prompt,
+                        **_pr_review_validators(reviewer_name), usage_context=usage_context, **CLASSIFICATION_INVOKE_OPTIONS))
                 review_state = parsed_review.state
                 if review_output != classification_input: early_published_pr_reviewers.discard(reviewer)
+                if review_output != classification_input and resumed_record is not None and resumed_record.metadata.phase != "publication" and reviewer_name in classification_resume_kinds:
+                    # Persist an admitted settlement's reconciled classification with its finding IDs and acquisition identity (#2035).
+                    _post_pr_reviewer_comment(reviewer_name, parsed_review, review_output=review_output, model_used=review_model_used, identity=resumed_record.metadata, acquisition_outcome=review_acquisition_outcome, acquisition_returncode=review_acquisition_returncode, new_items=tuple(resumed_record.metadata.new_items))
                 classified_review_carriers[reviewer_name] = parsed_review
                 if carried_approval_record is None:
                     round_review_models[reviewer_name] = review_model_used
@@ -5997,7 +6000,7 @@ def run_pr_loop(
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed_review, review_output=review_output,
                                 model_used=review_model_used,
-                                identity=(review_response if resumed_record is None else None),
+                                identity=(review_response if resumed_record is None else resumed_record.metadata),
                                 acquisition_outcome=review_acquisition_outcome,
                                 acquisition_returncode=review_acquisition_returncode,
                                 new_items=tuple(reviewer_new_unresolved_items),
@@ -6029,7 +6032,7 @@ def run_pr_loop(
                         _post_pr_reviewer_comment(
                             reviewer_name, parsed_review, review_output=review_output,
                             model_used=review_model_used,
-                            identity=(review_response if resumed_record is None else None),
+                            identity=(review_response if resumed_record is None else resumed_record.metadata),
                             acquisition_outcome=review_acquisition_outcome,
                             acquisition_returncode=review_acquisition_returncode,
                             new_items=tuple(reviewer_new_unresolved_items),

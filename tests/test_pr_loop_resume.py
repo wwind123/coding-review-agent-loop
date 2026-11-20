@@ -1710,3 +1710,621 @@ def test_non_open_entry_stops_before_branch_observation(tmp_path, state, deleted
     assert not runner.comments
     assert not any("/git/ref/heads/" in " ".join(cmd) for cmd, _ in runner.commands)
     assert not any(cmd[:1] in (["claude"], ["codex"]) for cmd, _ in runner.commands)
+
+
+# --- #2035: classification-only resume after a published round -------------
+
+_CLASSIFY = "Continue the PR review with semantic signed-source classification"
+
+
+def _classification_failed_round(tmp_path, *, codex_state="approved", codex_blocking=(), signed=("Fix the retry bound.",)):
+    """Run A: every review is published, then Codex's classification exhausts its re-ask."""
+    from pr_loop_test_helpers import _association, _classified_review, _evidence_review, _signed
+    runner = FakeRunner()
+    for index, body in enumerate(signed, start=1):
+        runner.pr_payload["comments"].append(_signed(body, index))
+    rids = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    published = _evidence_review(state=codex_state, blocking=list(codex_blocking))
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.") for rid in rids],
+                             state=codex_state, blocking=list(codex_blocking))
+    runner.codex_outputs = [published, bad, bad]
+    runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in rids],
+                                                reviewer="Google Gemini", hr=True)]
+    with pytest.raises(AgentLoopError, match="repair skipped because the reviewer did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    return runner, config, rids
+
+
+def _agent_prompts(runner, agent):
+    return [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == [agent]]
+
+
+def _no_deletes(runner):
+    return not any(cmd[:2] == ["gh", "api"] and "DELETE" in cmd for cmd, _ in runner.commands)
+
+
+def test_2035_rerun_redoes_only_the_missing_classification(tmp_path):
+    from pr_loop_test_helpers import _association, _classified_review, _pr_records
+    runner, config, rids = _classification_failed_round(tmp_path)
+    before = len(runner.commands)
+    publications = [r for r in _pr_records(runner) if r.metadata.phase == "publication"]
+    assert {r.metadata.agent for r in publications} == {"Codex", "Gemini"}
+    runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in rids], hr=True)]
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    rerun = runner.commands[before:]
+    codex = [cmd[-1] for cmd, _ in rerun if cmd[:1] == ["codex"]]
+    assert len(codex) == 1 and _CLASSIFY in codex[0]
+    assert "already published" in codex[0]
+    assert not any(cmd[:1] == ["gemini"] for cmd, _ in rerun)
+    assert not runner.codex_outputs
+    assert _no_deletes(runner)
+    records = _pr_records(runner)
+    # Publications are kept, never duplicated; Codex's classified settlement follows.
+    assert [r.metadata.agent for r in records if r.metadata.phase == "publication"].count("Codex") == 1
+    settlement = [r for r in records if r.metadata.agent == "Codex" and r.metadata.role == "reviewer"][-1]
+    assert settlement.metadata.phase != "publication"
+    assert settlement.metadata.state == "approved"
+    assert [e["role"] for e in settlement.metadata.requirement_evidence] == ["code"]
+
+
+@pytest.mark.parametrize("change", ["approved", "items"])
+def test_2035_classification_redo_cannot_change_published_verdict(tmp_path, change):
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from pr_loop_test_helpers import _association, _classified_review
+    runner, config, rids = _classification_failed_round(
+        tmp_path, codex_state="blocking", codex_blocking=("Fix the retry bound.",))
+    entries = [_association(rid, "code") for rid in rids]
+    runner.codex_outputs = [
+        _classified_review(entries, hr=True) if change == "approved"
+        else _classified_review(entries, hr=True, state="blocking", blocking=["A brand new finding."])
+    ]
+    with pytest.raises(HumanDecisionRequiredError, match="Codex's review was restored"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)
+    assert _no_deletes(runner)
+
+
+def test_2035_diagnosis_unacknowledged_publication_is_the_rejecting_predicate(tmp_path, monkeypatch):
+    """Pin Run B: without the classification admission the rerun hits the deletion refusal."""
+    from coding_review_agent_loop.protocol import human_requirements_resolved
+    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
+    from pr_loop_test_helpers import _association, _classified_review, _pr_records
+    runner, config, rids = _classification_failed_round(tmp_path)
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    codex = [r for r in _pr_records(runner) if r.metadata.agent == "Codex"][-1]
+    assert codex.metadata.phase == "publication"
+    assert not human_requirements_resolved(codex.body)
+    assert response_validation._resumed_pr_reviewer_identity_matches(codex)
+    assert not response_validation._resumed_pr_reviewer_matches_requirements(codex, requirements)
+    assert response_validation.classification_resume_kind(codex, requirements) == "pending"
+    monkeypatch.setattr(response_validation, "classification_resume_kind", lambda *a, **k: None)
+    runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in rids], hr=True)]
+    with pytest.raises(PartialReviewRoundError, match="Delete these"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert runner.codex_outputs
+
+
+@pytest.mark.parametrize("policy", [None, "selective-intermediate"])
+def test_2035_repeated_classification_failure_keeps_classified_peer_resumable(tmp_path, policy):
+    from pr_loop_test_helpers import _association, _classified_review, _evidence_review, _signed, _pr_records
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 1))
+    (rid,) = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    extra = {"pr_review_policy": policy} if policy else {}
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, **extra)
+    bad = lambda **kw: _classified_review([_association(rid, "mixed", leftover="Fix retries.")], **kw)
+    code = lambda **kw: _classified_review([_association(rid, "code")], **kw)
+    # Run A: both publish without classification; Codex's classification fails.
+    runner.codex_outputs = [_evidence_review(), bad(), bad()]
+    runner.gemini_outputs = [_evidence_review(reviewer="Google Gemini")]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    # Rerun 1: Codex classifies (no acknowledgement); Gemini's classification fails.
+    runner.codex_outputs = [code()]
+    runner.gemini_outputs = [bad(reviewer="Google Gemini"), bad(reviewer="Google Gemini")]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    codex_settlement = [r for r in _pr_records(runner) if r.metadata.agent == "Codex"][-1]
+    assert codex_settlement.metadata.phase != "publication"
+    assert response_validation.classification_resume_kind(
+        codex_settlement, _parse_pr_human_requirements(runner.pr_payload)) == "complete"
+    publication = [r for r in _pr_records(runner) if r.metadata.agent == "Codex" and r.metadata.phase == "publication"][-1]
+    # The settlement keeps the independent review's acquisition identity, so
+    # scheduler/seat acquisition checks still admit it on a later rerun.
+    for field in ("provider", "configured_model", "configured_effort", "effort_source",
+                  "observed_model", "observed_effort", "acquisition_outcome"):
+        assert getattr(codex_settlement.metadata, field) == getattr(publication.metadata, field), field
+    assert codex_settlement.metadata.provider == "codex"
+    contract = {"Codex": (publication.metadata.configured_model, publication.metadata.configured_effort,
+                          publication.metadata.provider)}
+    assert response_validation.classification_resume_kind(
+        codex_settlement, _parse_pr_human_requirements(runner.pr_payload), None, contract) == "complete"
+    # Rerun 2: Codex resumes as complete with no turn; only Gemini is redone.
+    before = len(runner.commands)
+    before_records = len(_pr_records(runner))
+    runner.gemini_outputs = [code(reviewer="Google Gemini", hr=True)]
+    # Codex never acknowledged the source, so after the round settles the loop
+    # records the failed-acknowledgement boundary and dispatches the coder,
+    # whose empty script ends the run; any earlier stop fails the asserts below.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    rerun = runner.commands[before:]
+    agents = [(cmd[0], cmd[-1]) for cmd, _ in rerun if cmd[:1] in (["codex"], ["gemini"], ["claude"])]
+    assert [name for name, _ in agents] == ["gemini", "claude"]
+    assert _CLASSIFY in agents[0][1]
+    assert not runner.gemini_outputs
+    assert _no_deletes(runner)
+    new_records = _pr_records(runner)[before_records:]
+    gemini_settlement = [r for r in new_records if r.metadata.agent == "Gemini" and r.metadata.role == "reviewer"]
+    assert len(gemini_settlement) == 1 and gemini_settlement[0].metadata.phase != "publication"
+    assert [e["role"] for e in gemini_settlement[0].metadata.requirement_evidence] == ["code"]
+    assert not [r for r in new_records if r.metadata.agent == "Codex"]
+    phases = [(r.metadata.phase, r.metadata.round_number) for r in new_records if r.metadata.role == "summary"]
+    assert ("reconciliation", 1) in phases
+    assert ("acknowledgement-repair-failed", 1) in phases
+    assert ("coder-dispatch", 2) in phases
+    # The resumed Codex record never gains an acknowledgement it did not give.
+    from coding_review_agent_loop.protocol import human_requirements_resolved
+    assert not any(human_requirements_resolved(r.body) for r in _pr_records(runner) if r.metadata.agent == "Codex")
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_2035_complete_reviewer_peer_conflict_continuation_is_pinned(tmp_path, keep):
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from pr_loop_test_helpers import (_association, _classified_review, _evidence_review, _signed,
+                                      _EVIDENCE_TEXT, _pr_records)
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy.", 1))
+    (rid,) = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.")])
+    gemini_args = dict(reviewer="Google Gemini", state="blocking", blocking=["Gemini finding."],
+                       evidence=[_EVIDENCE_TEXT])
+    # Gemini's unacknowledged publication already carries complete associations.
+    runner.codex_outputs = [_evidence_review(), bad, bad]
+    runner.gemini_outputs = [_classified_review(
+        [_association(rid, "human-only", request=_EVIDENCE_TEXT)], **gemini_args)]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    gemini_record = [r for r in _pr_records(runner) if r.metadata.agent == "Gemini"][-1]
+    assert response_validation.classification_resume_kind(
+        gemini_record, _parse_pr_human_requirements(runner.pr_payload)) == "complete"
+    before = len(runner.commands)
+    runner.codex_outputs = [_classified_review([_association(rid, "code")], hr=True)]
+    reconciled = (_classified_review([_association(rid, "code")], hr=True, **gemini_args) if keep
+                  else _classified_review([_association(rid, "code")], hr=True, reviewer="Google Gemini"))
+    runner.gemini_outputs = [reconciled]
+    if keep:
+        try:
+            run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            assert "restored" not in str(exc) and "partially published" not in str(exc)
+        settlement = [r for r in _pr_records(runner) if r.metadata.agent == "Gemini"][-1]
+        assert settlement.metadata.state == "blocking"
+        assert [e["role"] for e in settlement.metadata.requirement_evidence] == ["code"]
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match="Gemini's review was restored"):
+            run_pr_loop(runner, pr_number=77, config=config)
+        claude = [cmd for cmd, _ in runner.commands[before:] if cmd[:1] == ["claude"]]
+        assert not claude
+    gemini = [cmd[-1] for cmd, _ in runner.commands[before:] if cmd[:1] == ["gemini"]]
+    assert len(gemini) == 1 and _CLASSIFY in gemini[0] and "reconciling your role" in gemini[0]
+    assert _no_deletes(runner)
+
+
+def test_2035_closed_round_admits_no_classification_resume(tmp_path, monkeypatch):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace as NS
+    from pr_loop_test_helpers import _association, _classified_review, _signed, _pr_records
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 1))
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    (rid,) = [r.requirement_id for r in requirements]
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    # Codex's publication carries complete associations but no acknowledgement.
+    runner.codex_outputs = [_classified_review([_association(rid, "code")])]
+    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini", hr=True)]
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    # Interrupt right after round 1's reconciliation: the round is closed.
+    comments = runner.pr_payload["comments"]
+    cut = next(i for i, c in enumerate(comments)
+               if (recs := _extract_round_metadata_records([NS(body=c["body"])], flow="pr"))
+               and recs[0].metadata.phase == "reconciliation")
+    del comments[cut + 1:]
+    codex = [r for r in _pr_records(runner) if r.metadata.agent == "Codex"][-1]
+    assert response_validation.classification_resume_kind(codex, requirements) == "complete"
+    kinds, reasons = response_validation.admit_classification_resumes(
+        {"Codex": codex}, {}, requirements, None, None, seat_binding=None, items=(),
+        round_number=1, head_sha=codex.metadata.subject, reconciled=True)
+    assert kinds == {} and reasons == {"Codex": "the round is already reconciled"}
+    before_records = len(_pr_records(runner))
+    before = len(runner.commands)
+    runner.codex_outputs = [_classified_review([_association(rid, "code")], hr=True)] * 3
+    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini", hr=True)] * 3
+    calls = []
+    real_admit = pr_loop.admit_classification_resumes
+    def spy(*args, **kwargs):
+        result = real_admit(*args, **kwargs)
+        calls.append((kwargs["round_number"], kwargs["reconciled"], dict(result[0])))
+        return result
+    monkeypatch.setattr(pr_loop, "admit_classification_resumes", spy)
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError:
+        pass
+    round_one = [call for call in calls if call[0] == 1]
+    assert round_one and all(reconciled and kinds == {} for _, reconciled, kinds in round_one)
+    rerun_prompts = [cmd[-1] for cmd, _ in runner.commands[before:] if cmd[:1] in (["codex"], ["gemini"])]
+    assert not any(_CLASSIFY in prompt for prompt in rerun_prompts)
+    new_round_one_reviews = [r for r in _pr_records(runner)[before_records:]
+                             if r.metadata.role == "reviewer" and r.metadata.round_number == 1]
+    assert new_round_one_reviews == []
+    assert _no_deletes(runner)
+
+
+def _plan_context(plan_hash):
+    return SimpleNamespace(plan_hash=plan_hash, plan_subject="subject-" + plan_hash)
+
+
+@pytest.mark.parametrize("mismatch", ["plan", "acquisition", "seat", "legacy", "round", "head"])
+def test_2035_other_mismatch_is_never_admitted_and_names_its_cause(tmp_path, mismatch):
+    from pr_loop_test_helpers import _pr_records
+    runner, config, rids = _classification_failed_round(tmp_path)
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    codex = [r for r in _pr_records(runner) if r.metadata.agent == "Codex"][-1]
+    assert response_validation.classification_resume_kind(codex, requirements) == "pending"
+    plan = acquisition = seat = None
+    round_number, head = 1, codex.metadata.subject
+    expected = None
+    if mismatch == "plan":
+        plan, expected = _plan_context("other"), "the approved plan changed since publication"
+    elif mismatch == "acquisition":
+        acquisition = {"Codex": ("some-other-model", "high")}
+        expected = "the reviewer acquisition contract no longer matches"
+    elif mismatch == "seat":
+        seat, expected = {"seat": "different"}, "the reviewer seat binding changed"
+    elif mismatch == "legacy":
+        codex = dataclasses.replace(codex, metadata=dataclasses.replace(
+            codex.metadata, surfaced_reviewer_requirement_ids=("1",)))
+        expected = "its signed requirement coverage uses legacy identities"
+    elif mismatch == "round":
+        round_number = 2
+    else:
+        head = "f" * 40
+    if mismatch != "seat":  # the seat binding is checked by the admitting caller
+        assert response_validation.classification_resume_kind(
+            codex, requirements, plan, acquisition, round_number=round_number, head_sha=head) is None
+    resumed = {}
+    kinds, reasons = response_validation.admit_classification_resumes(
+        {"Codex": codex}, resumed, requirements, plan, acquisition, seat_binding=seat, items=(),
+        round_number=round_number, head_sha=head, reconciled=False)
+    assert kinds == {} and resumed == {}
+    if expected is not None:
+        assert reasons["Codex"] == expected
+
+
+def test_2035_refusal_cause_names_the_rejecting_reason(tmp_path):
+    from coding_review_agent_loop import review_rounds
+    spool = SimpleNamespace()
+    cause = review_rounds._replay_unavailable_cause(
+        spool, "Codex", own_posted=True, own_posted_reason="the approved plan changed since publication")
+    assert "already posted but no longer accepted (resume rejected it because the approved plan changed" in cause
+
+
+def _round_two_classification_failure(tmp_path, *, policy=None):
+    """#2310 shape: round 1 blocks, the coder runs, then round 2's reviews are all
+    published (one blocking without acknowledgement) and a classification fails."""
+    from pr_loop_test_helpers import _association, _classified_review, _evidence_review, _signed
+    runner = FakeRunner()
+    runner.advance_pr_head_on_coder_followup = True
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 1))
+    (rid,) = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    code = [_association(rid, "code")]
+    extra = {"pr_review_policy": policy} if policy else {}
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, max_rounds=3, **extra)
+    keep = [{"item_id": "item-1", "disposition": "blocking", "note": "Still unbounded."}]
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.")],
+                             state="blocking", blocking=["Bound the retries."], dispositions=keep)
+    runner.codex_outputs = [
+        _classified_review(code, hr=True, state="blocking", blocking=["Bound the retries."]),
+        _evidence_review(state="blocking", blocking=["Bound the retries."], dispositions=keep),
+        bad, bad,
+    ]
+    runner.gemini_outputs = [
+        _classified_review(code, hr=True, reviewer="Google Gemini"),
+        _classified_review(code, hr=True, reviewer="Google Gemini",
+                           dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+    ]
+    runner.claude_outputs = [structured_coder_followup(
+        addressed_items=["item-1"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "Retry bound added."}])]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.codex_outputs and not runner.gemini_outputs and not runner.claude_outputs
+    return runner, config, rid
+
+
+@pytest.mark.parametrize("policy", [None, "selective-intermediate"])
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
+def test_2035_round_two_rerun_preserves_records_and_redoes_only_classification(tmp_path, monkeypatch, parallel, policy):
+    from pr_loop_test_helpers import _association, _classified_review, _pr_records
+    from coding_review_agent_loop.protocol import human_requirements_resolved
+    runner, config, rid = _round_two_classification_failure(tmp_path, policy=policy)
+    before_comments = [c["body"] for c in runner.pr_payload["comments"]]
+    before_records = _pr_records(runner)
+    codex_published = [r for r in before_records if r.metadata.agent == "Codex" and r.metadata.round_number == 2]
+    assert [r.metadata.phase for r in codex_published] == ["publication"]
+    assert codex_published[0].metadata.state == "blocking"
+    assert not human_requirements_resolved(codex_published[0].body)
+    round_two_summaries = sorted(r.metadata.phase for r in before_records
+                                 if r.metadata.role == "summary" and r.metadata.round_number == 2)
+    sequential_guard = []
+    real_guard = pr_loop._refuse_partial_round_before_sequential_turns
+    def guard_spy(**kwargs):
+        sequential_guard.append(kwargs)
+        return real_guard(**kwargs)
+    monkeypatch.setattr(pr_loop, "_refuse_partial_round_before_sequential_turns", guard_spy)
+    keep = [{"item_id": "item-1", "disposition": "blocking", "note": "Still unbounded."}]
+    runner.codex_outputs = [_classified_review([_association(rid, "code")], hr=True, state="blocking",
+                                               blocking=["Bound the retries."], dispositions=keep)]
+    before = len(runner.commands)
+    rerun_config = dataclasses.replace(config, review_parallel=parallel)
+    # The settled blocking round dispatches the coder, whose script is empty:
+    # reaching it proves the round finished without any deletion request.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=rerun_config)
+    agents = [(cmd[0], cmd[-1]) for cmd, _ in runner.commands[before:] if cmd[:1] in (["codex"], ["gemini"], ["claude"])]
+    assert [name for name, _ in agents] == ["codex", "claude"]
+    assert _CLASSIFY in agents[0][1] and "already published" in agents[0][1]
+    assert bool(sequential_guard) is (not parallel)
+    after_comments = [c["body"] for c in runner.pr_payload["comments"]]
+    # Every existing record, including the coder-dispatch record and scheduler
+    # checkpoints, is kept verbatim: nothing deleted, edited or reordered.
+    assert after_comments[:len(before_comments)] == before_comments
+    assert _no_deletes(runner)
+    new_records = _pr_records(runner)[len(before_records):]
+    # Only the per-invocation scheduler audit may be re-posted for round 2; the
+    # coder-dispatch record and any other existing checkpoint never are.
+    reposted = [r.metadata.phase for r in new_records if r.metadata.round_number == 2
+                and r.metadata.phase in round_two_summaries and r.metadata.phase != "reconciliation"]
+    assert reposted in ([], ["scheduler-prelaunch"])
+    assert "coder-dispatch" not in reposted
+    assert not [r for r in new_records if r.metadata.round_number == 2 and r.metadata.phase == "publication"]
+    settlement = [r for r in new_records if r.metadata.agent == "Codex" and r.metadata.round_number == 2]
+    assert len(settlement) == 1 and settlement[0].metadata.state == "blocking"
+    assert [e["role"] for e in settlement[0].metadata.requirement_evidence] == ["code"]
+    assert [(i.text) for i in settlement[0].metadata.new_items] == ["Bound the retries."]
+    # Round 2 settled: the next coder dispatch is recorded for round 3 (parallel
+    # rounds also post their round 2 reconciliation checkpoint first).
+    assert [r for r in new_records if r.metadata.round_number == 3 and r.metadata.phase == "coder-dispatch"]
+    if parallel:
+        assert [r for r in new_records if r.metadata.round_number == 2 and r.metadata.phase == "reconciliation"]
+    # Gemini's published approval survives as its round 2 verdict.
+    gemini = [r for r in _pr_records(runner) if r.metadata.agent == "Gemini" and r.metadata.round_number == 2]
+    assert [r.metadata.state for r in gemini] == ["approved"]
+
+
+def _keep_through_last_reviewer_record(runner, agent, *, drop_agent):
+    """Simulate an interruption right after ``agent``'s latest reviewer record and the
+    loss of ``drop_agent``'s settlements, leaving that peer classification-pending."""
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace as NS
+
+    def meta(comment):
+        records = _extract_round_metadata_records([NS(body=comment["body"])], flow="pr")
+        return records[0].metadata if records else None
+
+    comments = runner.pr_payload["comments"]
+    last = max(i for i, c in enumerate(comments)
+               if (m := meta(c)) is not None and m.role == "reviewer" and m.agent == agent)
+    del comments[last + 1:]
+    comments[:] = [c for c in comments
+                   if not ((m := meta(c)) is not None and m.role == "reviewer" and m.agent == drop_agent
+                           and m.phase != "publication")]
+
+
+def test_2035_complete_authoritative_settlement_persists_reconciled_role(tmp_path):
+    """A classification-complete authoritative settlement whose pinned conflict
+    continuation reconciles its role posts the new classification, so a later
+    rerun restores the reconciled role, not the stale one (#2035)."""
+    from pr_loop_test_helpers import (_association, _classified_review, _evidence_review, _signed,
+                                      _EVIDENCE_TEXT, _pr_records)
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy.", 1))
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    (rid,) = [r.requirement_id for r in requirements]
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    bad = lambda **kw: _classified_review([_association(rid, "mixed", leftover="Fix retries.")], **kw)
+    codex_args = dict(state="blocking", blocking=["Codex finding."])
+    gemini_args = dict(reviewer="Google Gemini", state="blocking", blocking=["Gemini finding."])
+    code = lambda **kw: _classified_review([_association(rid, "code")], **kw)
+    human = lambda **kw: _classified_review([_association(rid, "human-only", request=_EVIDENCE_TEXT)],
+                                            evidence=[_EVIDENCE_TEXT], **kw)
+    # Run A: both publish without classification; Codex's classification fails.
+    runner.codex_outputs = [_evidence_review(**codex_args), bad(**codex_args), bad(**codex_args)]
+    runner.gemini_outputs = [_evidence_review(**gemini_args)]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    # Rerun 1: both classify code without acknowledgement and settle.
+    runner.codex_outputs = [code(**codex_args)]
+    runner.gemini_outputs = [code(**gemini_args)]
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    _keep_through_last_reviewer_record(runner, "Gemini", drop_agent="Codex")
+    gemini_settlement = [r for r in _pr_records(runner) if r.metadata.agent == "Gemini"][-1]
+    assert gemini_settlement.metadata.phase != "publication"
+    assert response_validation.classification_resume_kind(gemini_settlement, requirements) == "complete"
+    settled_items = [(i.item_id, i.text) for i in gemini_settlement.metadata.new_items]
+    assert settled_items
+    # Rerun 2: Codex now classifies human-only; Gemini's complete authoritative
+    # settlement meets the conflict and reconciles to human-only, keeping its verdict.
+    before_records = len(_pr_records(runner))
+    before = len(runner.commands)
+    runner.codex_outputs = [human(**codex_args)]
+    runner.gemini_outputs = [human(**gemini_args)]
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError:
+        pass  # the human-only evidence or the empty coder script stops the run
+    agents = [(cmd[0], cmd[-1]) for cmd, _ in runner.commands[before:] if cmd[:1] in (["codex"], ["gemini"])]
+    assert [name for name, _ in agents] == ["codex", "gemini"]
+    assert "reconciling your role" in agents[1][1]
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    reconciled = [r for r in _pr_records(runner)[before_records:]
+                  if r.metadata.agent == "Gemini" and r.metadata.role == "reviewer"]
+    assert len(reconciled) == 1
+    reconciled = reconciled[0].metadata
+    assert reconciled.phase != "publication" and reconciled.state == "blocking"
+    assert [e["role"] for e in reconciled.requirement_evidence] == ["human-only"]
+    # Existing finding IDs are kept, not re-minted, and acquisition identity survives.
+    assert [(i.item_id, i.text) for i in reconciled.new_items] == settled_items
+    for field in ("provider", "configured_model", "configured_effort", "acquisition_outcome"):
+        assert getattr(reconciled, field) == getattr(gemini_settlement.metadata, field), field
+    # A peer failure leaves Codex pending again; the next rerun restores Gemini's
+    # reconciled role, so no further Gemini continuation is needed.
+    _keep_through_last_reviewer_record(runner, "Gemini", drop_agent="Codex")
+    before = len(runner.commands)
+    runner.codex_outputs = [human(**codex_args)]
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError as exc:
+        assert "classification remained conflicting" not in str(exc)
+        assert "scripted agent output exhausted" not in str(exc) or not any(
+            cmd[:1] == ["gemini"] for cmd, _ in runner.commands[before:])
+    assert not any(cmd[:1] == ["gemini"] for cmd, _ in runner.commands[before:])
+    assert not runner.codex_outputs
+    assert _no_deletes(runner)
+
+
+def _managed_checkpoint_round(tmp_path):
+    """A managed-CI qualifying checkpoint for the head, then a signed requirement
+    that invalidates its requirement identity and forces the round's reviews."""
+    from coding_review_agent_loop.qualification_checkpoint import QualificationCheckpoint
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _signed
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+                         managed_ci=True, auto_merge=True, max_rounds=1)
+    acquisition = {
+        name: (inv.configured_model, inv.resolved_effort, provider)
+        for name, provider in (("Codex", "codex"), ("Gemini", "gemini"))
+        for inv in [pr_loop.resolve_invocation(config, provider=provider, role="reviewer")]
+    }
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed on the previous head.", status="blocking",
+        source_status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
+        failed_head_sha="old-head", candidate_head_sha=head,
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci", obligation_identity=item.obligation_identity,
+        lifecycle="qualifying", failed_head_sha="old-head", candidate_head_sha=head,
+        base_branch="main",
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(acquisition),
+        approval_digest=pr_loop_support._qualification_digest(("Codex", "Gemini")),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))),
+        qualification_attempt_id="123/1", allowed_rounds=1,
+    )
+    checkpoint_comment = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=head,
+            prior_items=(item,), state="blocking", phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint, architecture_contract_version=1,
+        ),
+    )
+    runner = FakeRunner(pr_payload={"comments": [
+        {"author": {"login": "coding-review-agent-loop"}, "body": checkpoint_comment}]})
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 1))
+    return runner, config, checkpoint_comment
+
+
+def _run_managed_checkpoint_scenario(tmp_path, monkeypatch, *, interrupted):
+    from coding_review_agent_loop.managed_ci_types import ManagedCiContract, ManagedCiOutcome
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _association, _classified_review, _evidence_review
+    runner, config, checkpoint_comment = _managed_checkpoint_round(tmp_path)
+    (rid,) = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    contract = ManagedCiContract(protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha=head)
+    calls = SimpleNamespace(dispatches=[], waited=[], merges=[])
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: calls.dispatches.append(k))
+    def wait(*a, **k):
+        calls.waited.append((k["contract"].attached_run_id, k["contract"].run_attempt))
+        return ManagedCiOutcome(status="passed", head_sha=head)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: calls.merges.append(k))
+    done = [{"item_id": "item-1", "disposition": "resolved"}]
+    good = _classified_review([_association(rid, "code")], hr=True, dispositions=done)
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.")], dispositions=done)
+    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini",
+                                                hr=True, dispositions=done)]
+    if not interrupted:
+        runner.codex_outputs = [_evidence_review(dispositions=done), good]
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        return runner, calls, checkpoint_comment, 0
+    runner.codex_outputs = [_evidence_review(dispositions=done), bad, bad]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert calls.waited == [] and calls.merges == []
+    before = len(runner.commands)
+    runner.codex_outputs = [good]
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    return runner, calls, checkpoint_comment, before
+
+
+def _checkpoint_sequence(runner):
+    from pr_loop_test_helpers import _pr_records
+    return [(r.metadata.qualification_checkpoint.lifecycle,
+             r.metadata.qualification_checkpoint.qualification_attempt_id,
+             r.metadata.qualification_checkpoint.requirements_digest)
+            for r in _pr_records(runner) if r.metadata.phase == "qualification-checkpoint"]
+
+
+@pytest.mark.usefixtures("private_response_tempdir")
+def test_2035_managed_qualification_checkpoint_survives_classification_resume(tmp_path, monkeypatch):
+    """resume-classification-only with a real managed-CI qualification checkpoint:
+    the rerun redoes only the classification, keeps the checkpoint, reattaches the
+    same qualification attempt (no fresh managed-CI authorization) and records
+    exactly the checkpoint sequence an uninterrupted round records."""
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _pr_records
+    (tmp_path / "control").mkdir()
+    (tmp_path / "rerun").mkdir()
+    control, control_calls, _, _ = _run_managed_checkpoint_scenario(
+        tmp_path / "control", monkeypatch, interrupted=False)
+    runner, calls, checkpoint_comment, before = _run_managed_checkpoint_scenario(
+        tmp_path / "rerun", monkeypatch, interrupted=True)
+    agents = [(cmd[0], cmd[-1]) for cmd, _ in runner.commands[before:] if cmd[:1] in (["codex"], ["gemini"])]
+    assert [name for name, _ in agents] == ["codex"] and _CLASSIFY in agents[0][1]
+    # The original qualification checkpoint stays verbatim and first.
+    assert runner.pr_payload["comments"][0]["body"] == checkpoint_comment
+    assert _no_deletes(runner)
+    # The existing attempt is reattached: no fresh dispatch, so no fresh
+    # managed-CI authorization is needed, and the exact head merges.
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert calls.dispatches == [] and calls.waited == [(123, 1)]
+    assert calls.merges == [{"expected_head_sha": head}]
+    assert (control_calls.dispatches, control_calls.waited) == (calls.dispatches, calls.waited)
+    # Same checkpoint records as an uninterrupted round: nothing duplicated.
+    assert _checkpoint_sequence(runner) == _checkpoint_sequence(control)
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    current = pr_loop_support._qualification_digest(tuple(r.requirement_id for r in requirements))
+    assert _checkpoint_sequence(runner)[-1] == ("qualifying", "123/1", current)
+    # Published reviews are kept; only Codex's classified settlement is new.
+    reviewers = [(r.metadata.agent, r.metadata.phase, r.metadata.state)
+                 for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    # Parallel publications post in completion order; the settlement follows them.
+    assert sorted(reviewers[:2]) == [("Codex", "publication", "approved"), ("Gemini", "publication", "approved")]
+    assert reviewers[2:] == [("Codex", "authoritative", "approved")]

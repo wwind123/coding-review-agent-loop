@@ -178,6 +178,10 @@ not reconciliation or approval. Parallel-review peer visibility and partial-roun
 recovery use the same latest same-head, same-round boundary in the history being
 read: earlier publications are historical context, and neither they nor the
 boundary are deletion targets. Publications after the boundary remain peers.
+A posted review that resume rejects keeps the deletion-only refusal, but the
+refusal names the failing predicate (changed signed requirement set, reconciled
+round, approved-plan, acquisition or seat-binding change), except where the
+classification-only resume below admits it (#2035).
 It reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
 round and history-wide numbering into a fresh review on the new head without
@@ -753,6 +757,28 @@ role, requester-owned request or answered item IDs, and explicit mixed-source
 leftover instructions. Resume restores associations alongside the requester's
 own evidence requests, then projects only against current admitted signed sources
 and owned native items. Invalid associations and cross-round classification conflicts retain the full source without preventing a fresh review on resume. Missing legacy metadata never consumes an instruction.
+Role/field consistency violations in a live response (a human-only source
+without its request, mixed or evidence-only without answered items, a request
+or answers on another role, mixed without leftover instructions) are reviewer
+judgements: they take the bounded judgement re-ask and, when it is exhausted,
+the deterministic reviewer-judgement failure, never format repair. Shape errors
+stay fatal (#2035).
+Signed-source classification runs after the round's reviews are published. In
+an unreconciled round whose surfaced signed requirement identities exactly equal
+the current set, a same-round, same-head review that the ordinary resume
+predicate rejects is admitted as classification-pending when it is a
+publication record whose associations do not cover every current source, and as
+classification-complete when its validated associations already cover them (any
+phase, so a settlement written by an earlier successful classification stays
+resumable). Only the classification continuation reruns, forced for pending
+records; every continuation on either kind is pinned to the published verdict
+and blocking findings, and a change stops for a human decision before coder
+dispatch. Reconciled rounds, changed requirement sets, legacy identities and
+plan, acquisition or seat-binding mismatches are never admitted (#2035).
+A reclassified restored review posts its settlement with the original review's
+acquisition identity, and an admitted authoritative settlement whose role is
+reconciled posts the new classification with its existing finding IDs, so a
+later rerun restores the reconciled role and still passes acquisition checks.
 Acceptance still depends on current live content-bound citations and exact-head
 requester attestations; terminal publication, partial acceptance and push
 invalidation use the existing evidence release/freeze records.

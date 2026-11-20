@@ -956,18 +956,19 @@ def test_resumed_acknowledged_pr_review_is_rebuilt_from_round_metadata(
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
-def test_resumed_unacknowledged_pr_review_is_reinvoked_not_repaired_from_a_stale_source(
+def test_resumed_unacknowledged_classified_pr_review_resumes_from_round_metadata(
     tmp_path, monkeypatch, parallel
 ):
-    # In the PR flow a same-head review resumes only when its record already
-    # carries the acknowledgement (_resumed_pr_reviewer_matches_requirements),
-    # so an unacknowledged posted review is re-run instead of resumed. The
-    # acknowledgement repair then sees the fresh accepted carrier, which keeps
-    # the null assessment and its record.
+    # The unacknowledged posted review already classifies every signed source,
+    # so in an open round with an unchanged requirement set it resumes as
+    # classification-complete (#2035) instead of re-running the reviewer.  The
+    # resumed carrier, and any acknowledgement-repair carrier, keep the null
+    # assessment and its record from round metadata, never a stale source.
     run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=False, parallel=parallel)
-    assert run.reinvoked == 1
-    assert run.resumed == []
-    assert run.carriers
+    assert run.reinvoked == 0
+    ((impact, records),) = run.resumed
+    assert impact is None
+    assert [r.outcome for r in records] == ["degraded-to-undetermined"]
     for carrier in run.carriers:
         assert carrier.architecture_impact is None
         assert [r.outcome for r in carrier.architecture_impact_degradations] == [

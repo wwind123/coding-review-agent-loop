@@ -495,6 +495,13 @@ _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION = (
 )
 
 
+# Classification text for a reviewer judgement field still missing after the
+# bounded re-ask (#1185, #2035): a reviewer decision, not a schema miss.
+_JUDGEMENT_FIELD_CLASSIFICATION = (
+    "structured response omitted a reviewer judgement after the bounded re-ask"
+)
+
+
 def _is_structured_schema_rejection(classification_text: str) -> bool:
     """True when a recognized structured envelope failed schema validation (#957).
 
@@ -1118,6 +1125,11 @@ def _failure_suggestion(
             return "Suggestion: clean up the dirty working tree or workdir, then re-run."
         return f"Suggestion: check that {agent_name} is installed and authenticated, then re-run."
     if category == "deterministic":
+        if classification_text == _JUDGEMENT_FIELD_CLASSIFICATION:
+            return (
+                "Suggestion: re-run the same command — the reviewer's next turn decides "
+                "the judgement field again. If the same judgement keeps failing, inspect the log above."
+            )
         if _is_structured_schema_rejection(classification_text):
             return (
                 "Suggestion: re-run the same command — the agent's structured response "
@@ -1206,6 +1218,12 @@ def _format_invalid_agent_response_error(
             " Failure category: semantic-evidence-rejection (a risk-matrix claim selected a "
             "test observation that cannot carry authority; repair was skipped because "
             "reformatting cannot change it)."
+        )
+    elif category == "deterministic" and classification_text == _JUDGEMENT_FIELD_CLASSIFICATION:
+        category_hint = (
+            " Failure category: reviewer-judgement (the reviewer did not supply a valid "
+            "judgement field after one re-ask; repair was skipped because reformatting "
+            "cannot supply the reviewer's decision, and a rerun asks the reviewer again)."
         )
     elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
         category_hint = (
