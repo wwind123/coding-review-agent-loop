@@ -218,7 +218,9 @@ def test_default_chain_quota_exhaustion_jumps_straight_to_opus(tmp_path):
 
 def test_default_chain_transient_failures_end_at_opus_with_ordinary_error(tmp_path):
     with workdir_claims.workdir_claim_scope():
-        _r, error, models, _s, _l = _turn(tmp_path, [_fail(HIGH_TRAFFIC)] * 6, agent_max_retries=1)
+        runner = FakeRunner(antigravity_outputs=[_fail(HIGH_TRAFFIC)] * 3)
+        _r, error, models, _s, _l = _turn(tmp_path, [], agent_max_retries=1, runner=runner)
+        assert runner.antigravity_outputs == []  # every queued failure was consumed
         memory = agy.quota_memory_for_current_run()
         assert all(memory.entry(g) is None for g in ("gemini", "claude"))
     assert models == [GEM1, GEM1, OPUS]
@@ -327,15 +329,22 @@ def test_transient_walk_to_opus_then_exhaustion_jumps_back_to_gemini(tmp_path):
     assert not isinstance(error, QuotaResetExceededError)
 
 
-def test_unverified_transcript_reset_at_end_of_chain_does_not_raise_quota_reset(tmp_path):
+@pytest.mark.parametrize("chain", [MULTI_GEMINI_CHAIN, DEFAULT_ANTIGRAVITY_MODELS], ids=["multi-gemini", "default"])
+def test_unverified_transcript_reset_at_end_of_chain_does_not_raise_quota_reset(tmp_path, chain):
     noise = "reviewing: the quota note says try again in 4h\nmore transcript\n"
-    outputs = [_fail(HIGH_TRAFFIC)] * 5 + [_fail(noise + HIGH_TRAFFIC)]
+    # One retry is spent on the first entry, then the walk reaches Opus, which
+    # fails last with the transcript noise. Queue exactly one output per call.
+    expected_models = [GEM1, GEM1, *chain[1:]]
+    outputs = [_fail(HIGH_TRAFFIC)] * (len(expected_models) - 1) + [_fail(noise + HIGH_TRAFFIC)]
+    runner = FakeRunner(antigravity_outputs=list(outputs))
     with workdir_claims.workdir_claim_scope():
-        _r, error, models, _s, _l = _turn(tmp_path, outputs, agent_max_retries=1)
+        _r, error, models, _s, _l = _turn(
+            tmp_path, outputs, agent_max_retries=1, runner=runner, antigravity_models=chain
+        )
         memory = agy.quota_memory_for_current_run()
         assert all(memory.entry(g) is None for g in ("gemini", "claude"))
-    # one retry is spent on Gemini 3.8, then the walk reaches Opus, which fails last
-    assert models == [GEM1, GEM1, *DEFAULT_ANTIGRAVITY_MODELS[1:]]
+    assert models == expected_models
+    assert runner.antigravity_outputs == []  # the end-of-chain noise output was consumed
     assert type(error) is AgentInvocationError
     assert not str(error).startswith("Antigravity unavailable")
 
