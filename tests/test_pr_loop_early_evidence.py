@@ -495,3 +495,229 @@ def test_invalid_classification_can_reach_fresh_review(tmp_path, monkeypatch, fa
     else:
         assert any("Previous response not accepted: required judgement field" in cmd[-1]
                    and "requirement_evidence" in cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex")
+
+
+
+def _carried_requester(tmp_path, *, policy="all-reviewers", citation=True, reference=HEAD):
+    """#2019: Codex resolves its evidence item at HEAD while Gemini blocks; the head is unchanged."""
+    from agent_loop_helpers import structured_coder_followup
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
+    config = make_config(tmp_path, pr_review_context_mode="full", pr_review_policy=policy,
+                         reviewer=("codex", "gemini"), max_rounds=5, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not _freeze_records(runner)
+    runner.pr_check_runs_payload = {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]}
+    runner.advance_pr_head_on_coder_followup = False
+    runner.pr_payload["comments"].append(_signed("Screenshot accepted for " + reference, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    vote = {**_resolve(), "evidence_requirement_ids": [rid]} if citation else _resolve()
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[vote]))
+    # Gemini is not the requester: its votes on item-1 never count toward clearance.
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", state="blocking", hr=True,
+        blocking=["Fix the retry bound."], dispositions=[_resolve()]))
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-2"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "The signed acceptance is supplied separately."}])]
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    return runner, config
+
+
+def _codex_calls(runner):
+    return sum(1 for cmd, _ in runner.commands if cmd[:1] == ["codex"])
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+def test_carried_same_head_requester_resolution_clears_without_freeze(tmp_path, capsys, policy):
+    runner, config = _carried_requester(tmp_path, policy=policy)
+    codex_before = _codex_calls(runner)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Round N: Codex resolves at HEAD and Gemini blocks. Round N+1 carries Codex without a turn.
+    assert _codex_calls(runner) == codex_before + 1
+    assert "skipping Codex; it approved unchanged PR head " + HEAD in capsys.readouterr().err
+    assert not _freeze_records(runner)
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert len(cleared) == 1
+    assert cleared[0].metadata.evidence_clearances
+    assert all(head == HEAD for _, head in cleared[0].metadata.evidence_clearances)
+    assert not cleared[0].metadata.prior_items
+    assert not runner.codex_outputs and not runner.gemini_outputs and not runner.claude_outputs
+    # Idempotent: a rerun writes no second release and calls no agent.
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not _freeze_records(runner)
+    assert not any(cmd[0] in {"codex", "gemini", "claude"} for cmd, _ in runner.commands[commands:])
+
+
+@pytest.mark.parametrize("kind", ["no-citation", "foreign-head"])
+def test_carried_requester_without_valid_citation_freezes_and_rerun_stops(tmp_path, kind):
+    runner, config = _carried_requester(tmp_path, citation=kind != "no-citation",
+                                        reference="a" * 40 if kind == "foreign-head" else HEAD)
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    freezes = _freeze_records(runner)
+    assert [i.item_id for i in freezes[-1].metadata.prior_items] == ["item-1"]
+    assert not any(r.metadata.evidence_release.reason == "evidence-cleared" for r in _release_records(runner))
+    # Without new signed input the rerun stops at once with no agent calls.
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_freeze_records(runner)) == len(freezes)
+    assert not any(cmd[0] in {"codex", "gemini", "claude"} for cmd, _ in runner.commands[commands:])
+
+
+def test_primary_then_panel_requester_resolution_clears_after_digest_latch(tmp_path, monkeypatch, capsys):
+    """#2019 under a selective (primary-then-panel) policy with a scoped secondary blocker.
+
+    Here the evidence item is created in a round that no coder checkpoint
+    follows, so the next round's recovery digest check (pr_loop's
+    machine-obligation digest check) sees a changed ledger and latches the full
+    board; the requester's same-head approval is then carried through the
+    unchanged-head skip, and the gate must still clear it. The selective-pause
+    branch is covered by test_selective_paused_requester_resolution_clears_without_freeze.
+    """
+    from agent_loop_helpers import patch_attr_in, structured_coder_followup
+    from coding_review_agent_loop.review_scheduling import TransitionClassification
+    from pr_loop_test_helpers import _staged_config
+    patch_attr_in(monkeypatch, (support, pr_loop), "_observe_pr_transition",
+        lambda *a, **k: TransitionClassification("narrow", "scoped fix"))
+    runner = FakeRunner(codex_outputs=[_evidence_review()],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_evidence_review(reviewer="Antigravity", evidence=[_EVIDENCE_TEXT])],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
+    config = _staged_config(tmp_path, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_check_runs_payload = {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]}
+    runner.advance_pr_head_on_coder_followup = False
+    runner.pr_payload["comments"].append(_signed("Screenshot accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[_resolve()]))
+    runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True,
+        dispositions=[{**_resolve(), "evidence_requirement_ids": [rid]}]))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", state="blocking", hr=True,
+        blocking=[{"text": "Fix the retry bound.", "fix_scope": ["src/worker.py"]}], dispositions=[_resolve()]))
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-2"], human_requirement_ids=[rid],
+        human_requirement_dispositions=[{"requirement_id": rid, "disposition": "addressed",
+                                         "evidence": "The signed acceptance is supplied separately."}])]
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", hr=True, dispositions=[_resolve(), _resolve("item-2")]))
+    agy_before = sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"])
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    err = capsys.readouterr().err
+    assert "scheduler obligation digest changed during recovery" in err
+    assert "skipping Antigravity; it approved unchanged PR head " + HEAD in err
+    # Antigravity resolved once (citation round) and was not invoked again.
+    assert sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"]) == agy_before + 1
+    assert not _freeze_records(runner)
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert len(cleared) == 1 and all(head == HEAD for _, head in cleared[0].metadata.evidence_clearances)
+    assert not cleared[0].metadata.prior_items
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not any(cmd[0] in {"codex", "gemini", "agy", "claude"} for cmd, _ in runner.commands[commands:])
+
+
+def _restart_after_coder_checkpoint(runner):
+    """Interrupt the process at its first PR write after a coder checkpoint.
+
+    Within one invocation the next round reuses a PR snapshot that predates the
+    coder publication (pr_loop's post-coder ``prefetched_pr_context``), so the
+    recovery digest check cannot see the checkpoint and latches the full board.
+    A restarted process reads the checkpoint, which is the consistent scheduler
+    state the selective pause needs.
+    """
+    real_run, armed = runner.run, [False]
+
+    def run(args, **kwargs):
+        comment = list(args)[:3] == ["gh", "pr", "comment"]
+        if comment and armed[0]:
+            armed[0] = False
+            raise KeyboardInterrupt("simulated restart after the coder checkpoint")
+        result = real_run(args, **kwargs)
+        if comment:
+            armed[0] = _pr_records(runner)[-1].metadata.role == "coder"
+        return result
+    runner.run = run
+
+
+def test_selective_paused_requester_resolution_clears_without_freeze(tmp_path, monkeypatch, capsys):
+    """#2019 paused-selective-approval-clears: the requester is paused, not carried.
+
+    The evidence item and the scoped code work are established together before
+    the first coder checkpoint, and the signed acceptance exists before any
+    coder turn, so every later round starts from a consistent digest and the
+    primary-then-panel remediation narrows to the finding owner. Antigravity
+    resolves its evidence item with a citation in round 3 while Gemini still
+    blocks; round 4 pauses Antigravity at the early selective continue, and the
+    gate must count that scheduler-counted same-head approval.
+    """
+    from agent_loop_helpers import patch_attr_in, structured_coder_followup
+    from coding_review_agent_loop.review_scheduling import TransitionClassification
+    from pr_loop_test_helpers import _staged_config
+    patch_attr_in(monkeypatch, (support, pr_loop), "_observe_pr_transition",
+        lambda *a, **k: TransitionClassification("narrow", "scoped fix"))
+    runner = FakeRunner(codex_outputs=[_evidence_review(hr=True)],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini", state="blocking", hr=True,
+            blocking=[{"text": "Fix the retry bound.", "fix_scope": ["src/worker.py"]}])],
+        antigravity_outputs=[_evidence_review(reviewer="Antigravity", state="blocking", hr=True,
+            evidence=[_EVIDENCE_TEXT], blocking=[{"text": "Log the retry count.", "fix_scope": ["src/log.py"]}])],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]})
+    runner.advance_pr_head_on_coder_followup = False
+    runner.pr_payload["comments"].append(_signed("Screenshot accepted for " + HEAD, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[-1].requirement_id
+    _restart_after_coder_checkpoint(runner)
+    signed = dict(human_requirement_ids=[rid], human_requirement_dispositions=[
+        {"requirement_id": rid, "disposition": "addressed", "evidence": "The signed acceptance is supplied separately."}])
+    config = _staged_config(tmp_path, quiet=False)
+    # Rounds 1-2: Codex (primary) approves; Gemini and Antigravity block on
+    # scoped code work and Antigravity requests evidence (item-3).
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-1", "item-2"], **signed)]
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config)
+    evidence = [i for i in _pr_records(runner)[-1].metadata.prior_items if i.obligation_kind == "human-exact-head-evidence"]
+    assert [(i.item_id, i.reviewer) for i in evidence] == [("item-3", "Antigravity")]
+    # Round 3: the owners recheck; Antigravity resolves item-3 citing the signed
+    # acceptance and approves, while Gemini still blocks item-1.
+    runner.simulate_new_process()
+    runner.claude_outputs = [structured_coder_followup(addressed_items=["item-1"], **signed)]
+    runner.codex_outputs.append(_evidence_review(hr=True, dispositions=[_resolve("item-1"), _resolve("item-2"), _resolve("item-3")]))
+    runner.gemini_outputs += [
+        _evidence_review(reviewer="Google Gemini", state="blocking", hr=True, dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Still unbounded."}, _resolve("item-2"), _resolve("item-3")]),
+        _evidence_review(reviewer="Google Gemini", hr=True, dispositions=[_resolve("item-1"), _resolve("item-2"), _resolve("item-3")])]
+    runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True, dispositions=[
+        _resolve("item-1"), _resolve("item-2"), {**_resolve("item-3"), "evidence_requirement_ids": [rid]}]))
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.antigravity_outputs
+    # Round 4: a consistent checkpoint narrows to Gemini and pauses Antigravity.
+    runner.simulate_new_process()
+    agy_calls = sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"])
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    err = capsys.readouterr().err
+    assert "Round 4: pausing Antigravity; its prior approval is historical for this candidate" in err
+    assert "skipping Antigravity" not in err
+    assert "scheduler obligation digest changed" not in err
+    assert sum(1 for cmd, _ in runner.commands if cmd[:1] == ["agy"]) == agy_calls
+    assert not runner.gemini_outputs and not runner.claude_outputs
+    assert not _freeze_records(runner)
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert len(cleared) == 1
+    assert [identity for identity, _ in cleared[0].metadata.evidence_clearances] == [evidence[0].obligation_identity]
+    assert all(head == HEAD for _, head in cleared[0].metadata.evidence_clearances)
+    assert not cleared[0].metadata.prior_items
+    # Idempotent: a rerun writes no second release and calls no agent.
+    commands = len(runner.commands)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]) == 1
+    assert not _freeze_records(runner)
+    assert not any(cmd[0] in {"codex", "gemini", "agy", "claude"} for cmd, _ in runner.commands[commands:])

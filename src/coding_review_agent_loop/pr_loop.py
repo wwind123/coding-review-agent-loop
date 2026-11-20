@@ -2303,10 +2303,12 @@ def run_pr_loop(
             )
 
         live_evidence_requirements = []
+        unchanged_head_approvals = {}
 
         def evidence_freeze_gate(*args, round_number: int, **kwargs):
             kwargs["live_requirements"] = live_evidence_requirements
             kwargs["configured_reviewers"] = tuple(agent_display_name(r) for r in configured_reviewers)
+            kwargs["carried_reviews"] = tuple(unchanged_head_approvals.values())
             try:
                 return _evidence_freeze_gate(*args, round_number=round_number, **kwargs)
             except HumanDecisionRequiredError as exc:

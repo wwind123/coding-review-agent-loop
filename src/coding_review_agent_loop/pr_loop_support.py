@@ -2206,6 +2206,7 @@ def _evidence_freeze_gate(
     in_process_audits: Sequence[EvidenceConversionAudit] = (),
     live_requirements: Sequence = (),
     configured_reviewers: Sequence[str] = (),
+    carried_reviews: Sequence[PostedRoundRecord] = (),
 ) -> _EvidenceGateOutcome:
     """Final revalidation and, when evidence is pending, the single freeze write.
 
@@ -2256,7 +2257,7 @@ def _evidence_freeze_gate(
     items[:] = consolidate_ledger(items, known_pr_heads(records, head_sha))
     kept, early_clearances = provisional_clearances(
         items, records, live_requirements,
-        head=head_sha, round_number=round_number, board=configured_reviewers)
+        head=head_sha, round_number=round_number, board=configured_reviewers, carried=carried_reviews)
     clearances = tuple(dict.fromkeys((*clearances, *early_clearances)))
     if early_clearances:
         items[:] = kept

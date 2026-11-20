@@ -127,18 +127,32 @@ def citation_ids(value):
     return tuple(value)
 
 
-def provisional_clearances(items, records, requirements, *, head, round_number, board):
-    """Use this round's latest requester attestations and effective live signed objects.
+def provisional_clearances(items, records, requirements, *, head, round_number, board, carried=()):
+    """Use the latest requester attestations at ``head`` and effective live signed objects.
+
+    Each reviewer's newest admitted complete review at ``head`` from any round
+    governs, so a later same-head review (even one from an intervening round)
+    overrides an older resolution. That newest review attests only when it is
+    from this round or is a same-head approval the round's scheduler counted as
+    carried (unchanged-head skip or selective pause, #2019). A carried record
+    counts only when ``records`` (the gate's admitted read) holds an identical
+    record at its index; the admitted copy is evaluated, never the carried one.
 
     The existing trust policy owns requirement admission. A resolved citation
     attests adequacy; a SHA mention alone never authorizes acceptance.
     """
     from .review_scope import is_complete_code_review
-    latest = {}
-    for record in records:
+    admitted = {record.index: record for record in records}
+    carried_indexes = {r.index for r in carried if (match := admitted.get(r.index)) is not None
+                       and match.metadata == r.metadata and match.body == r.body
+                       and match.metadata.round_number < round_number}
+    newest = {}
+    for record in sorted(records, key=lambda r: r.index):
         m = record.metadata
-        if m.role == "reviewer" and is_complete_code_review(m) and m.subject == head and m.round_number == round_number:
-            latest[m.agent] = m
+        if m.role == "reviewer" and is_complete_code_review(m) and m.subject == head:
+            newest[m.agent] = record
+    latest = {agent: record.metadata for agent, record in newest.items()
+              if record.metadata.round_number == round_number or record.index in carried_indexes}
     heads = known_pr_heads(records, head)
     live = {r.requirement_id: r for r in requirements}
     kept, cleared = [], []
