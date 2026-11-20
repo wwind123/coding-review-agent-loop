@@ -299,3 +299,42 @@ def test_ack_failure_recovery_retains_boundary_and_earlier_pass(shift, later_pub
     assert not _listed(recovery) & history.ids(range(boundary + 1))
     if later_publication:
         assert recovery.verified, recovery.reason
+
+
+# --- #2035: a changed signed requirement set still refuses, naming the change ---
+
+
+@pytest.mark.parametrize("change", ["added", "edited", "withdrawn"])
+def test_2035_changed_requirement_set_refuses_with_named_cause(tmp_path, change):
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.github import _parse_pr_human_requirements
+    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
+    from pr_loop_test_helpers import _association, _classified_review, _signed
+    from test_pr_loop_resume import _classification_failed_round, _no_deletes
+
+    signed = ("Fix the retry bound.", "Also log retries.") if change == "withdrawn" else ("Fix the retry bound.",)
+    runner, config, rids = _classification_failed_round(tmp_path, signed=signed)
+    comments = runner.pr_payload["comments"]
+    signed_indexes = [i for i, c in enumerate(comments) if c["body"].endswith("-- Human Reviewer")]
+    if change == "added":
+        comments.append(_signed("Add a retry metric.", 9))
+    elif change == "edited":
+        comments[signed_indexes[0]] = {**comments[signed_indexes[0]],
+                                       "body": "Fix the retry bound to 5.\n\n-- Human Reviewer"}
+    else:
+        del comments[signed_indexes[-1]]
+    current = {r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)}
+    assert current != set(rids)
+    before = len(runner.commands)
+    runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)], hr=True)]
+    with pytest.raises(PartialReviewRoundError) as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(error.value)
+    assert "Codex's own review for this round is already posted but no longer accepted" in message
+    assert "the signed requirement set changed since publication" in message
+    expected_word = {"added": "added", "edited": "added", "withdrawn": "withdrawn"}[change]
+    assert expected_word in message.split("signed requirement set changed since publication", 1)[1]
+    # No fresh turn beside public peers, and no classification continuation.
+    assert not any(cmd[:1] in (["codex"], ["gemini"]) for cmd, _ in runner.commands[before:])
+    assert runner.codex_outputs
+    assert _no_deletes(runner)

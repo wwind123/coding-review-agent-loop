@@ -2381,3 +2381,75 @@ def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
     assert repairs == []
     assert not any("falling back to" in line for line in logs)
     assert not any("no recoverable structured payload" in line for line in logs)
+
+
+# --- #2035: signed-source classification consistency is a bounded re-ask ---
+
+from coding_review_agent_loop.requirement_evidence import CLASSIFICATION_INVOKE_OPTIONS
+from coding_review_agent_loop.architecture_contract import _architecture_mode_validators
+
+_JUDGEMENT_HEADING = "## Previous response not accepted: required judgement field"
+_SOURCE_ID = "hr-" + "a" * 64
+
+
+def _classification_review(role, *, answers=(), leftover="", summary="Reviewed."):
+    from pr_loop_test_helpers import _association, _classified_review
+    return _classified_review(
+        [_association(_SOURCE_ID, role, answers=answers, leftover=leftover)], summary=summary)
+
+
+def _run_production_classification(runner, config):
+    """Exactly the kwargs pr_loop's classification invoke passes (no extra test kwargs)."""
+    validators = _architecture_mode_validators(
+        lambda mode: lambda text: _validate_review_response(
+            text, reviewer="OpenAI Codex", unresolved_items=(), current_round_items=(),
+            architecture_status_mode=mode,
+        )
+    )
+    return _run_validated_agent(runner, agent="codex", config=config, prompt="CLASSIFY PROMPT",
+                                **validators, usage_context=None, **CLASSIFICATION_INVOKE_OPTIONS)
+
+
+def _codex_commands(runner):
+    return ["\n".join(cmd) for cmd, _ in runner.commands if cmd[:1] == ["codex"]]
+
+
+def test_classification_mixed_without_answers_is_reasked_then_accepted(tmp_path):
+    bad = _classification_review("mixed", leftover="Fix retries.", summary="BAD")
+    good = _classification_review("code", summary="GOOD")
+    runner = FakeRunner(codex_outputs=[bad, good])
+    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
+    repairs: list[str] = []
+    def fake_repair(raw, **kwargs):
+        repairs.append(raw)
+        return None, None, []
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
+        response = _run_production_classification(runner, config)
+    assert response.marker_value.requirement_evidence[0]["role"] == "code"
+    commands = _codex_commands(runner)
+    assert len(commands) == 2
+    assert _JUDGEMENT_HEADING not in commands[0]
+    assert _JUDGEMENT_HEADING in commands[1]
+    assert "requirement_evidence[0]" in commands[1]
+    assert _SOURCE_ID in commands[1]
+    assert "mixed requires at least one answered_item_id" in commands[1]
+    assert repairs == []
+
+
+def test_classification_reask_exhausted_takes_judgement_failure_path(tmp_path):
+    bad = _classification_review("mixed", leftover="Fix retries.", summary="BAD")
+    runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
+    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
+    repairs: list[str] = []
+    def fake_repair(raw, **kwargs):
+        repairs.append(raw)
+        return None, None, []
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
+        with pytest.raises(AgentLoopError) as info:
+            _run_production_classification(runner, config)
+    message = str(info.value)
+    assert "repair skipped because the reviewer did not supply requirement_evidence" in message
+    assert "schema-validation" not in message
+    assert getattr(info.value, "failure_category", None) == "deterministic"
+    assert len(_codex_commands(runner)) == 2
+    assert repairs == []

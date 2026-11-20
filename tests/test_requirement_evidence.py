@@ -284,8 +284,8 @@ def test_identity_is_not_normalized(value):
 
 @pytest.mark.parametrize("value", ["", "  ", [], None])
 @pytest.mark.parametrize("role,field,message", [
-    ("human-only", "request", "Human-only requirements"),
-    ("mixed", "leftover_instructions", "Only mixed sources")])
+    ("human-only", "request", "human-only must name its exact emitted evidence request"),
+    ("mixed", "leftover_instructions", "mixed requires explicit leftover_instructions")])
 def test_normalized_empty_text_retains_required_content(role, field, message, value):
     entry = _association("source", role, answers=["item-1"] if role == "mixed" else [])
     entry[field] = value
@@ -436,3 +436,145 @@ def test_reviewer_owned_ids_mixed_set_lists_only_routed_sources():
     assert projected == (CODE_SOURCE,)
     assert reviewer_owned_ids([SOURCE, CODE_SOURCE], projected) == (SOURCE.requirement_id,)
     assert reviewer_owned_ids([], ()) == ()
+
+
+# --- #2035: role/field consistency is a reviewer judgement, shape stays fatal ---
+
+from coding_review_agent_loop.errors import MissingJudgementFieldError
+from coding_review_agent_loop.requirement_evidence import decode_associations
+
+
+@pytest.mark.parametrize("role,request_text,answers,leftover,rule", [
+    ("mixed", "", [], "Fix retries.",
+     "mixed requires at least one answered_item_id; if no prior evidence item of yours is answered, use code or human-only"),
+    ("evidence-only", "", [], "", "evidence-only requires at least one answered_item_id"),
+    ("code", "", ["item-1"], "", "code uses answered_item_ids []"),
+    ("human-only", "", [], "", "human-only must name its exact emitted evidence request"),
+    ("code", "Run the suite", [], "", "only human-only names a request"),
+    ("mixed", "", ["item-1"], "", "mixed requires explicit leftover_instructions"),
+])
+def test_consistency_rules_raise_typed_judgement_error(role, request_text, answers, leftover, rule):
+    valid = _association("hr-first", "code")
+    entry = _association("hr-second", role, request=request_text, answers=answers, leftover=leftover)
+    with pytest.raises(MissingJudgementFieldError) as error:
+        parse_associations([valid, entry])
+    exc = error.value
+    assert exc.field_path == "requirement_evidence"
+    message = str(exc)
+    assert "requirement_evidence[1]" in message
+    assert "hr-second" in message
+    assert rule in message
+    assert exc.allowed_values and rule in exc.allowed_values[0]
+    assert exc.observed_preview == message
+    # Through the structured PR review parser the error keeps its type.
+    with pytest.raises(MissingJudgementFieldError):
+        parse_structured_pr_review(_classified_review([valid, entry]), reviewer="Codex",
+                                   architecture_status_mode="legacy")
+
+
+def test_consistency_rule_order_reports_first_violation():
+    # human-only without request also has answers: the request rule still wins.
+    entry = _association("hr-x", "human-only", answers=["item-1"])
+    with pytest.raises(MissingJudgementFieldError, match="human-only must name"):
+        parse_associations([entry])
+
+
+@pytest.mark.parametrize("value", [
+    "not-an-array",
+    [{"requirement_id": "hr-x", "role": "code"}],
+    [_association("hr-x", "unknown")],
+    [{**_association("hr-x", "code"), "request": 3}],
+    [{**_association("hr-x", "code"), "answered_item_ids": "item-1"}],
+    [_association("hr-x", "evidence-only", answers=["item-1", "item-1"])],
+    [_association("", "code")],
+    [_association("hr-x", "code"), _association("hr-x", "code")],
+])
+def test_shape_errors_stay_plain_agent_loop_error(value):
+    with pytest.raises(AgentLoopError) as error:
+        parse_associations(value)
+    assert not isinstance(error.value, MissingJudgementFieldError)
+    with pytest.raises(ValueError):
+        decode_associations({"requirement_evidence": value})
+
+
+def test_decode_associations_maps_consistency_errors_to_value_error():
+    with pytest.raises(ValueError, match="mixed requires at least one answered_item_id"):
+        decode_associations({"requirement_evidence": [_association("hr-x", "mixed", leftover="x")]})
+
+
+def _pinned_blocking(parsed):
+    from coding_review_agent_loop.protocol import ApprovedFollowup as ReviewItem
+    return dataclasses.replace(parsed, state="blocking",
+                               blocking_items=(ReviewItem(reviewer="Codex", text="Fix the retry bug."),))
+
+
+def test_force_continuation_with_pin_keeps_published_verdict():
+    items, entry, text, parsed = setup_role()
+    published = _pinned_blocking(dataclasses.replace(parsed, requirement_evidence=()))
+    classified = dataclasses.replace(published, summary="other words", requirement_evidence=(entry,))
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(marker_value=classified, text="classified text")
+    result, result_text = classify_review(published, _evidence_review(hr=True),
+        requirements=[SOURCE], items=items, reviewer_name="Codex", invoke=invoke,
+        force_continuation=True, pinned_review=published)
+    assert len(calls) == 1
+    assert "already published" in calls[0]
+    assert result.state == "blocking"
+    assert result.blocking_items == published.blocking_items
+    assert result.summary == published.summary
+    assert result.requirement_evidence == (entry,)
+    assert result_text == "classified text"
+
+
+@pytest.mark.parametrize("change", ["approved", "items"])
+def test_pinned_continuation_cannot_change_verdict_or_findings(change):
+    from coding_review_agent_loop.protocol import ApprovedFollowup as ReviewItem
+    items, entry, text, parsed = setup_role()
+    published = _pinned_blocking(dataclasses.replace(parsed, requirement_evidence=()))
+    changed = (dataclasses.replace(published, state="approved", blocking_items=(), requirement_evidence=(entry,))
+               if change == "approved" else
+               dataclasses.replace(published, blocking_items=(ReviewItem(reviewer="Codex", text="New finding."),),
+                                   requirement_evidence=(entry,)))
+    with pytest.raises(HumanDecisionRequiredError, match="Codex's review was restored") as error:
+        classify_review(published, text, requirements=[SOURCE], items=items, reviewer_name="Codex",
+            invoke=lambda prompt: SimpleNamespace(marker_value=changed, text=text),
+            force_continuation=True, pinned_review=published)
+    assert "no coder was dispatched" in str(error.value)
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_pinned_conflict_continuation(keep):
+    items, entry, text, parsed = setup_role("evidence-only")
+    published = _pinned_blocking(parsed)
+    previous = {"Gemini": dataclasses.replace(parsed, requirement_evidence=(_association(SOURCE.requirement_id, "code"),))}
+    reconciled = dataclasses.replace(published, requirement_evidence=(_association(SOURCE.requirement_id, "code"),))
+    if not keep:
+        reconciled = dataclasses.replace(reconciled, state="approved", blocking_items=())
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(marker_value=reconciled, text=text)
+    run = lambda: classify_review(published, text, requirements=[SOURCE], items=items, reviewer_name="Codex",
+                                  invoke=invoke, previous=previous, pinned_review=published)
+    if keep:
+        result, _ = run()
+        assert result.state == "blocking"
+        assert result.requirement_evidence[0]["role"] == "code"
+    else:
+        with pytest.raises(HumanDecisionRequiredError, match="restored from its published record"):
+            run()
+    assert len(calls) == 1
+    assert "reconciling your role" in calls[0]
+
+
+def test_pinned_complete_associations_without_conflict_get_no_continuation():
+    items, entry, text, parsed = setup_role()
+    published = _pinned_blocking(parsed)
+    def invoke(prompt):
+        raise AssertionError("no continuation expected")
+    result, result_text = classify_review(published, text, requirements=[SOURCE], items=items,
+        reviewer_name="Codex", invoke=invoke, pinned_review=published)
+    assert result is published
+    assert result_text == text
