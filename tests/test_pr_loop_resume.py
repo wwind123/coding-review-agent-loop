@@ -2199,3 +2199,132 @@ def test_2035_complete_authoritative_settlement_persists_reconciled_role(tmp_pat
     assert not any(cmd[:1] == ["gemini"] for cmd, _ in runner.commands[before:])
     assert not runner.codex_outputs
     assert _no_deletes(runner)
+
+
+def _managed_checkpoint_round(tmp_path):
+    """A managed-CI qualifying checkpoint for the head, then a signed requirement
+    that invalidates its requirement identity and forces the round's reviews."""
+    from coding_review_agent_loop.qualification_checkpoint import QualificationCheckpoint
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _signed
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+                         managed_ci=True, auto_merge=True, max_rounds=1)
+    acquisition = {
+        name: (inv.configured_model, inv.resolved_effort, provider)
+        for name, provider in (("Codex", "codex"), ("Gemini", "gemini"))
+        for inv in [pr_loop.resolve_invocation(config, provider=provider, role="reviewer")]
+    }
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed on the previous head.", status="blocking",
+        source_status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
+        failed_head_sha="old-head", candidate_head_sha=head,
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci", obligation_identity=item.obligation_identity,
+        lifecycle="qualifying", failed_head_sha="old-head", candidate_head_sha=head,
+        base_branch="main",
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(acquisition),
+        approval_digest=pr_loop_support._qualification_digest(("Codex", "Gemini")),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))),
+        qualification_attempt_id="123/1", allowed_rounds=1,
+    )
+    checkpoint_comment = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=head,
+            prior_items=(item,), state="blocking", phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint, architecture_contract_version=1,
+        ),
+    )
+    runner = FakeRunner(pr_payload={"comments": [
+        {"author": {"login": "coding-review-agent-loop"}, "body": checkpoint_comment}]})
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 1))
+    return runner, config, checkpoint_comment
+
+
+def _run_managed_checkpoint_scenario(tmp_path, monkeypatch, *, interrupted):
+    from coding_review_agent_loop.managed_ci_types import ManagedCiContract, ManagedCiOutcome
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _association, _classified_review, _evidence_review
+    runner, config, checkpoint_comment = _managed_checkpoint_round(tmp_path)
+    (rid,) = [r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)]
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    contract = ManagedCiContract(protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha=head)
+    calls = SimpleNamespace(dispatches=[], waited=[], merges=[])
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: calls.dispatches.append(k))
+    def wait(*a, **k):
+        calls.waited.append((k["contract"].attached_run_id, k["contract"].run_attempt))
+        return ManagedCiOutcome(status="passed", head_sha=head)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: calls.merges.append(k))
+    done = [{"item_id": "item-1", "disposition": "resolved"}]
+    good = _classified_review([_association(rid, "code")], hr=True, dispositions=done)
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.")], dispositions=done)
+    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini",
+                                                hr=True, dispositions=done)]
+    if not interrupted:
+        runner.codex_outputs = [_evidence_review(dispositions=done), good]
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        return runner, calls, checkpoint_comment, 0
+    runner.codex_outputs = [_evidence_review(dispositions=done), bad, bad]
+    with pytest.raises(AgentLoopError, match="did not supply requirement_evidence"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert calls.waited == [] and calls.merges == []
+    before = len(runner.commands)
+    runner.codex_outputs = [good]
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    return runner, calls, checkpoint_comment, before
+
+
+def _checkpoint_sequence(runner):
+    from pr_loop_test_helpers import _pr_records
+    return [(r.metadata.qualification_checkpoint.lifecycle,
+             r.metadata.qualification_checkpoint.qualification_attempt_id,
+             r.metadata.qualification_checkpoint.requirements_digest)
+            for r in _pr_records(runner) if r.metadata.phase == "qualification-checkpoint"]
+
+
+@pytest.mark.usefixtures("private_response_tempdir")
+def test_2035_managed_qualification_checkpoint_survives_classification_resume(tmp_path, monkeypatch):
+    """resume-classification-only with a real managed-CI qualification checkpoint:
+    the rerun redoes only the classification, keeps the checkpoint, reattaches the
+    same qualification attempt (no fresh managed-CI authorization) and records
+    exactly the checkpoint sequence an uninterrupted round records."""
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from pr_loop_test_helpers import _pr_records
+    (tmp_path / "control").mkdir()
+    (tmp_path / "rerun").mkdir()
+    control, control_calls, _, _ = _run_managed_checkpoint_scenario(
+        tmp_path / "control", monkeypatch, interrupted=False)
+    runner, calls, checkpoint_comment, before = _run_managed_checkpoint_scenario(
+        tmp_path / "rerun", monkeypatch, interrupted=True)
+    agents = [(cmd[0], cmd[-1]) for cmd, _ in runner.commands[before:] if cmd[:1] in (["codex"], ["gemini"])]
+    assert [name for name, _ in agents] == ["codex"] and _CLASSIFY in agents[0][1]
+    # The original qualification checkpoint stays verbatim and first.
+    assert runner.pr_payload["comments"][0]["body"] == checkpoint_comment
+    assert _no_deletes(runner)
+    # The existing attempt is reattached: no fresh dispatch, so no fresh
+    # managed-CI authorization is needed, and the exact head merges.
+    head = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert calls.dispatches == [] and calls.waited == [(123, 1)]
+    assert calls.merges == [{"expected_head_sha": head}]
+    assert (control_calls.dispatches, control_calls.waited) == (calls.dispatches, calls.waited)
+    # Same checkpoint records as an uninterrupted round: nothing duplicated.
+    assert _checkpoint_sequence(runner) == _checkpoint_sequence(control)
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    current = pr_loop_support._qualification_digest(tuple(r.requirement_id for r in requirements))
+    assert _checkpoint_sequence(runner)[-1] == ("qualifying", "123/1", current)
+    # Published reviews are kept; only Codex's classified settlement is new.
+    reviewers = [(r.metadata.agent, r.metadata.phase, r.metadata.state)
+                 for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    # Parallel publications post in completion order; the settlement follows them.
+    assert sorted(reviewers[:2]) == [("Codex", "publication", "approved"), ("Gemini", "publication", "approved")]
+    assert reviewers[2:] == [("Codex", "authoritative", "approved")]
