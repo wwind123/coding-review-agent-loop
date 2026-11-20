@@ -27,6 +27,7 @@ from .github import _parse_github_timestamp
 from .protocol import StructuredCoderFollowup, UnresolvedReviewItem
 from .round_metadata import PostedRoundMetadata, rebuild_resumed_coder_carrier
 from .unresolved_items import (
+    _is_disputed_item,
     _raise_if_maintained_disputed_items,
     released_dispute_requirement_ids,
 )
@@ -38,6 +39,16 @@ class DisputeRelease:
 
     dispute_times: Mapping[str, datetime.datetime | None] = field(default_factory=dict)
     released: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def carries_dispute(items: Sequence[UnresolvedReviewItem]) -> bool:
+    """True when a carried item has a coder dispute note.
+
+    The next round then acquires a fresh admitted PR snapshot instead of the
+    pre-publication one, so the coder's own dispute record and any signed
+    answer posted since are both observed (#2025).
+    """
+    return any(_is_disputed_item(item) for item in items)
 
 
 def _carrier_disputes(metadata: object) -> tuple[str, ...]:

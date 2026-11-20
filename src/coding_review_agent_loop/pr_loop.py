@@ -323,7 +323,7 @@ from .round_visibility import (
     visible_peer_names,
 )
 from .legacy_machine_items import consumed_acknowledgement_disposition
-from .dispute_release import round_dispute_release, stop_for_held_disputes
+from .dispute_release import carries_dispute, round_dispute_release, stop_for_held_disputes
 from .unresolved_items import (
     ClearedItemProgress,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
@@ -9844,6 +9844,9 @@ def run_pr_loop(
             prefetched_pr_context = (
                 get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
                 if any(item.converted_row_id for item in latest_coder_metadata.prior_items)
+                # A carried dispute's release reads requirements and dispute
+                # times from one fresh admitted snapshot per round (#2025).
+                or carries_dispute(unresolved_items)
                 else updated_pr_context
             )
 

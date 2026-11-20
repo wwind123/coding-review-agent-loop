@@ -30,7 +30,10 @@ Disputed items and their release (#2025). A coder dispute that the reviewer
 keeps `blocking` or `same-pr` after one reconsideration stops the PR loop with
 `HumanDecisionRequiredError` before any coder, CI, qualification or merge.
 `dispute_release.py` observes, once per round after `round_start` and from the
-freshly read PR history, whether a human has answered. The dispute time is the
+freshly read PR history, whether a human has answered. While the carried
+ledger holds a disputed item, the next round refetches the admitted PR context
+instead of reusing the pre-publication snapshot, so requirements and dispute
+times come from one fresh observation. The dispute time is the
 `created_at` of the newest admitted coder follow-up round record that lists the
 item in `disputed_items`. A dispute is released when the loop's existing
 effective signed-requirement set contains a requirement whose `created_at` is

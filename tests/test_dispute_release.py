@@ -515,3 +515,50 @@ def test_review_prompt_carries_pointer_beside_the_released_item(tmp_path, compac
     # The pointer sits inside item-1's entry, after its updates.
     entry = released.split("- [item-1]", 1)[1]
     assert entry.index(REVIEWER_NOTE) < entry.index(pointer)
+
+
+def test_signed_answer_between_consecutive_rounds_releases_within_one_invocation(tmp_path):
+    """Row fresh-per-round: the next round of the same run sees the coder's
+    dispute record and a signed answer posted after it."""
+    human = {
+        "author": {"login": "maintainer"},
+        "createdAt": "2026-05-24T00:00:00Z",
+        "url": "https://github.com/OWNER/REPO/pull/77#issuecomment-2026",
+        "body": f"{HUMAN_TEXT}\n\n-- Human Reviewer",
+    }
+    requirements = _parse_pr_human_requirements({"comments": [human], "reviews": []})
+    hr_ids = [requirement.requirement_id for requirement in requirements]
+    runner = FakeRunner(
+        claude_outputs=[
+            _dispute_output(),
+            structured_coder_followup(addressed_items=["item-1"], summary="Applied the decision.",
+                                      human_requirement_ids=hr_ids),
+        ],
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Pricing constant is wrong.",
+                                 blocking_items=[ITEM_TEXT]),
+            _still_blocking(requirements=requirements),
+            _approve(requirements),
+        ],
+    )
+    original_run = runner.run
+
+    def post_answer_after_dispute(args, *, cwd, **kwargs):
+        result = original_run(args, cwd=cwd, **kwargs)
+        command = [str(arg) for arg in args]
+        if command[:3] == ["gh", "pr", "comment"] and _coder_records(runner) and human not in runner.pr_payload["comments"]:
+            runner.pr_payload["comments"].append(human)
+        return result
+
+    runner.run = post_answer_after_dispute
+
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path)) == 0
+
+    (coder_record,) = [c for c in _coder_records(runner) if "Disputing item-1" in c["body"]]
+    assert coder_record["createdAt"] < human["createdAt"]
+    coder_prompts = [cmd[-1] for cmd in _coder_calls(runner)]
+    assert len(coder_prompts) == 2
+    (pointer,) = _pointer_lines(coder_prompts[1])
+    assert hr_ids[0] in pointer
+    assert coder_prompts[1].count(HUMAN_TEXT) == 1
+    assert _pointer_lines([cmd[-1] for cmd in _reviewer_calls(runner)][1])
