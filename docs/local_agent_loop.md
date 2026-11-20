@@ -1125,12 +1125,12 @@ unavailable reread can never remove an established evidence barrier. A reviewer-
 change never reassigns a converted obligation's stored owners; the clearance
 rule above already falls back to the whole current board.
 
-Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)` → `Claude Opus 5.5 (Medium)`; see [Quota groups and fallback](#quota-groups-and-fallback)). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
+Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.8 Flash (High)` → `Claude Opus 5.5 (Medium)`; see [Quota groups and fallback](#quota-groups-and-fallback)). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 
 ### Quota groups and fallback
 
-The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)` → `Claude Opus 5.5 (Medium)`. The four Gemini entries share one quota; the Claude entry is served on a separate one, so it is reached only when Gemini cannot serve.
+The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Claude Opus 5.5 (Medium)`. The Gemini entry uses the Gemini quota; the Claude entry is served on a separate one, so it is reached only when Gemini cannot serve.
 
 - **Groups.** Each chain entry belongs to a quota group derived from its name: names starting with `Gemini` form the `gemini` group, names starting with `Claude` the `claude` group, and any other name is its own group. `--antigravity-quota-group MODEL=GROUP` (repeatable) overrides the derivation; `MODEL` must be in the configured chain. Groups are a **skipping heuristic, not a guarantee of independent quota**: agy can fail every model for an account-wide limit.
 - **Exhaustion is read from the provider's own error frame only** (the `Error:` line plus its indented continuation lines, a JSON error object, or agy's `AGY_ERROR:` line), taken from the raw output, never from transcript text. Capacity-only wording (`high traffic`, `capacity exhausted`), short resets (300 s or less), bare `429` and auth/billing failures are never exhaustion.
@@ -9510,7 +9510,7 @@ For structured plan reviews, plan revisions, PR reviews, and coder follow-ups,
 a present but malformed structured response may get a repair pass before the
 local failure is raised. By default the repair pass calls Antigravity through
 the existing PTY backend with the default repair chain `Gemini 3.8 Flash (Medium)` →
-`Gemini 3.7 Flash (Medium)`; explicit repair models replace that chain and are
+`Claude Opus 5.5 (Medium)`; explicit repair models replace that chain and are
 followed by the configured coder/reviewer chain. Models missing from `agy models`
 are skipped. When `agy` reports a transient `model-access validation errors`
 failure on its own output channel (stdout with no response artifact and no

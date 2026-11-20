@@ -5007,8 +5007,12 @@ def test_fresh_matrix_guard_stays_strict_for_unnormalized_bare_string():
         )
 
 
-def test_execute_repair_default_antigravity_chain_ends_with_opus(tmp_path, monkeypatch):
-    """The repair chain is the union of repair and chain models; Opus is now last (#1236)."""
+def test_execute_repair_default_chain_is_repair_then_deduplicated_antigravity_chain(tmp_path, monkeypatch):
+    """The repair chain is the union of repair and chain models (#1236).
+
+    With the #2023 defaults, Opus appears in both chains, so it is tried second
+    and the de-duplicated Antigravity chain adds only Gemini 3.8 Flash (High).
+    """
     from coding_review_agent_loop.agents import antigravity as agy_mod
     from coding_review_agent_loop.config import DEFAULT_REPAIR_MODELS
 
@@ -5025,13 +5029,11 @@ def test_execute_repair_default_antigravity_chain_ends_with_opus(tmp_path, monke
         expected_kind="pr_review",
     )
     tried = list(dict.fromkeys(attempt.model for attempt in attempts))
+    assert DEFAULT_REPAIR_MODELS == ("Gemini 3.8 Flash (Medium)", "Claude Opus 5.5 (Medium)")
     assert tried == [
-        *DEFAULT_REPAIR_MODELS,
-        "Gemini 3.8 Flash (High)",
-        "Gemini 3.7 Flash (High)",
-        "Gemini 3.6 Flash (High)",
-        "Gemini 3.1 Pro (High)",
+        "Gemini 3.8 Flash (Medium)",
         "Claude Opus 5.5 (Medium)",
+        "Gemini 3.8 Flash (High)",
     ]
     assert agy_mod._run_memories == memory_before  # repair never touches quota memory
 

@@ -973,13 +973,34 @@ def test_failed_managed_activation_state_report_is_documented():
     assert "reports only the measured current state" in doc
 
 
-def test_antigravity_quota_group_docs_describe_five_model_chain():
-    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
+def test_antigravity_quota_group_docs_describe_default_chain():
+    import re
+
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS, DEFAULT_REPAIR_MODELS
 
     guide = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
     assert "### Quota groups and fallback" in guide
     for model in DEFAULT_ANTIGRAVITY_MODELS:
         assert f"`{model}`" in guide
+        assert f"`{model}`" in readme
+    for model in DEFAULT_REPAIR_MODELS:
+        assert f"`{model}`" in guide
+        assert f"`{model}`" in readme
+    removed = ("Gemini 3.7 Flash", "Gemini 3.6 Flash", "Gemini 3.1 Pro")
+    chain_sentences = [
+        sentence
+        for text in (guide, readme)
+        for sentence in re.split(r"(?<=[.;])\s", " ".join(text.split()))
+        if "default Antigravity chain" in sentence
+        or "default Antigravity model chain" in sentence
+        or "default chain `" in sentence
+        or "repair chain `" in sentence
+    ]
+    assert len(chain_sentences) >= 4
+    for sentence in chain_sentences:
+        for name in removed:
+            assert name not in sentence, sentence
     for expected in (
         "skipping heuristic, not a guarantee of independent quota",
         "Claude Sonnet 5.5 (Medium)",
