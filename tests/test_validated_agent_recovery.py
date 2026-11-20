@@ -2272,3 +2272,51 @@ def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind,
     assert "Reported PR (unverified)" not in message
     assert stop.value.failure_category == "deterministic"
     assert runner.issue_comments == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Unauthorized: invalid api key provided.",
+        "Quota exceeded: billing credits are exhausted.",
+    ],
+    ids=["auth", "billing"],
+)
+def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, output):
+    """#2029: a refused repair on a named auth/billing failure keeps its stop."""
+    from coding_review_agent_loop.protocol import parse_pr_review
+
+    runner = FakeRunner(antigravity_outputs=[(output, 0)] * 4)
+    config = make_config(
+        tmp_path,
+        antigravity_models=("Model A", "Model B"),
+        agent_max_retries=2,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[object] = []
+
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+            patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+        with pytest.raises(AgentInvocationError) as excinfo:
+            _run_validated_agent(
+                runner,
+                agent="antigravity",
+                config=config,
+                prompt="Review this PR.",
+                marker_description="structured pr_review",
+                validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+                use_repair=True,
+                repair_expected_kind="pr_review",
+                role="reviewer",
+            )
+
+    models = [c[c.index("--model") + 1] for c, _ in runner.commands if c[:1] == ["agy"]]
+    assert models == ["Model A"]
+    assert excinfo.value.failure_category == "non-retryable"
+    assert repairs == []
+    assert not any("falling back to" in line for line in logs)

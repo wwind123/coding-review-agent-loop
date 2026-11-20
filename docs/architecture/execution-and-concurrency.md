@@ -513,20 +513,15 @@ both callers enforce as non-retryable with no fallback, unless a typed runner
 retry decision applies; dirty checkouts stay non-retryable; billing wording is
 exempt only when agy's credits-balance error is correlated with a terminal
 retryable `429 RESOURCE_EXHAUSTED` frame, which then cools its group down like
-any other exhaustion. agy can also end a quota-exhausted turn silently (no
-response file; stdout empty or only agy's `run ended with no output and no
-recorded error` warning). `AntigravityBackend.run` then reads agy's own CLI
-log (`~/.gemini/antigravity-cli/log/cli-<stamp>.log`). Newness is proven by a
-directory inventory taken under the shared settings lock, which serializes
-agent-loop agy turns host-wide, just before spawn: only a name absent from it
-qualifies. The name-stamp and mtime windows around the attempt then only
-narrow among new regular files, and exactly one candidate must remain. An
-error-severity executor `RESOURCE_EXHAUSTED` `429` line in that log becomes
-typed `AntigravityLogQuotaEvidence` on `AgentResult`. `validated_agent.py`
-routes it, before the nonzero-exit, empty-response and format/repair branches,
-into the same quota path as a printed frame (reason `agy-log`), unless a typed
-runner retry decision applies. Any lookup failure leaves no evidence and keeps
-the earlier behavior. `AntigravityAttemptState`
+any other exhaustion. For a silent agy turn (no response file; stdout empty
+or only agy's no-output warning) `AntigravityBackend.run` reads the one agy CLI
+log this attempt created, proven new by an inventory taken under the host-wide
+settings lock before spawn and narrowed by name-stamp and mtime windows. Its
+executor `RESOURCE_EXHAUSTED` `429` line becomes typed
+`AntigravityLogQuotaEvidence`, which `validated_agent.py` routes into the quota
+path (reason `agy-log`) before the exit, empty and format branches, unless a
+typed runner retry decision applies; lookup failure keeps the earlier behavior.
+`AntigravityAttemptState`
 is the policy used by `validated_agent.py`:
 transient failures retry then fall back to a later eligible entry; a verified
 exhaustion skips the whole group with no retry or sleep and makes at most one
@@ -534,6 +529,13 @@ cross-group jump per turn; a second verified exhaustion is a shared-limit stop;
 and an all-groups-cooling state stops before invoking. Only when every group
 carries a parsed long reset is `QuotaResetExceededError` raised. Memory is not
 persisted across processes.
+
+**Antigravity structured output (#2029).** `agents/antigravity_structured.py`
+adds agy's `--json-schema` channel for eligible kinds when a cached probe
+allows. A renderable `SUCCESS` `structured_output` outranks the response file
+and stdout marker; validators stay authoritative. Repeated no-payload reviewer
+turns give a retry-free `format-fallback` to the next model. See the
+[CLI guide](../local_agent_loop.md#structured-output).
 
 **Quota reset wait.** `--wait-for-quota-reset DURATION` (off by default) turns
 a parsed long-reset stop into a bounded wait. `quota_wait.py` owns a

@@ -396,6 +396,14 @@ class AgentLoopConfig:
     antigravity_quota_cooldown_seconds: int = DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS
     # Explicit (model, group) overrides of the derived quota group (#1236).
     antigravity_quota_groups: tuple[tuple[str, str], ...] = ()
+    # agy schema-constrained output for eligible structured turns (#2029):
+    # ``auto`` uses it when the installed agy advertises the flags, ``off``
+    # keeps the legacy response-file channel.
+    antigravity_structured_output: str = "auto"
+    # Invocation-scoped: the structured kind the current Antigravity turn may
+    # request through agy's schema flags, set only by the validated-agent
+    # entry point for an eligible turn (#2029). None disables schema mode.
+    antigravity_structured_kind: str | None = None
     # Opt-in bound (seconds) for waiting out a parsed quota reset (#1601);
     # None keeps the immediate QuotaResetExceededError stop.
     wait_for_quota_reset_seconds: int | None = None
@@ -681,6 +689,8 @@ class AgentLoopConfig:
             object.__setattr__(self, "antigravity_models", DEFAULT_ANTIGRAVITY_MODELS)
         if any(not m.strip() for m in self.antigravity_models):
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
+        if self.antigravity_structured_output not in {"auto", "off"}:
+            raise AgentLoopError("--antigravity-structured-output must be auto or off.")
         if self.antigravity_print_timeout_seconds <= 0:
             raise AgentLoopError("--antigravity-print-timeout-seconds must be greater than zero.")
         cooldown = self.antigravity_quota_cooldown_seconds
@@ -2653,6 +2663,7 @@ def config_from_args(
             DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
         ),
         antigravity_quota_groups=quota_group_overrides,
+        antigravity_structured_output=getattr(args, "antigravity_structured_output", None) or "auto",
         wait_for_quota_reset_seconds=parse_quota_wait_duration(
             getattr(args, "wait_for_quota_reset", None)
         ),

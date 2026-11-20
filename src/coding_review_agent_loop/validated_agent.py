@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .agents.base import AgentName, AgentResult, response_turn_scope
 from .agents.antigravity import AntigravityAttemptState
+from .agents.antigravity_structured import antigravity_structured_kind_for_turn
 from .agents.registry import agent_display_name, agent_signature, run_agent_result
 from .config import AgentLoopConfig
 from .errors import (
@@ -1433,6 +1434,18 @@ def _run_validated_agent_in_scope(
         if backend_agent == "antigravity"
         else None
     )
+    # agy schema-constrained output applies only to an eligible turn (#2029);
+    # it rides on the per-attempt config so other backends stay untouched.
+    antigravity_structured_kind = (
+        antigravity_structured_kind_for_turn(
+            repair_expected_kind,
+            surfaced_requirement_ids=repair_surfaced_requirement_ids,
+            reviewer_requirement_ids=repair_reviewer_requirement_ids,
+            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+        )
+        if antigravity_attempts is not None
+        else None
+    )
     # Each fallback retains an initial attempt; retry allowance is shared. The
     # provider-specific replacement replay gets one explicit extra slot.
     max_attempts = (
@@ -1639,7 +1652,10 @@ def _run_validated_agent_in_scope(
                 raise _antigravity_stop_error(last_classification_text, shared_limit=False)
         attempt_started_at = time.monotonic()
         attempt_config = (
-            antigravity_attempts.singleton_config(config)
+            dataclasses_replace(
+                antigravity_attempts.singleton_config(config),
+                antigravity_structured_kind=antigravity_structured_kind,
+            )
             if antigravity_attempts is not None
             else config
         )
@@ -1752,12 +1768,21 @@ def _run_validated_agent_in_scope(
         # repair callback for the current response. Repair itself may replace
         # runner.latest_test_turn_id, but it cannot replace this snapshot.
         validation_acquisition = result
+        audit_result = result
+        if result.text_source == "structured_output":
+            # agy's structured_output won (#2029): the rendered payload is this
+            # invocation's authoritative artifact. A response file the model
+            # also wrote is audit-only, so artifact salvage, response-file
+            # status and structured-candidate recovery see the rendered
+            # payload and never override or reclassify it. ``last_result``
+            # below keeps the original file for diagnostics.
+            result = dataclasses_replace(result, response_file_text=result.text)
         # The bounded deadline belongs only to the interrupted invocation and
         # its dedicated replay. A later ordinary retry has its normal budget.
         if is_executable_replacement_replay or is_quota_replay:
             executable_replacement_replay_pending = False
             next_timeout_seconds = timeout_seconds
-        last_result = result
+        last_result = audit_result
         # A typed planning-validation candidate is valid only for the final
         # deterministic failure of this invocation. A later timeout, provider,
         # marker-safety, or containment failure must clear it.
@@ -2025,6 +2050,9 @@ def _run_validated_agent_in_scope(
                 )
                 continue
         should_retry = False
+        # Set only when the reviewer's turn carried no recoverable structured
+        # payload and repair was refused for it (#2029).
+        format_failure = False
         # Codex structured verdicts read the reset from the authoritative error
         # only (#1281); None falls back to the whole classification text.
         reset_evidence_text: str | None = None
@@ -3147,6 +3175,7 @@ def _run_validated_agent_in_scope(
                                 # its repair says nothing about availability, and a
                                 # rerun cannot fix an auth or billing failure.
                                 should_retry = True
+                                format_failure = True
                                 last_failure_category = "agent-unavailable"
                                 last_classification_text = (
                                     "reviewer response carried no recoverable review substance; "
@@ -3360,9 +3389,16 @@ def _run_validated_agent_in_scope(
                     _wait_for_quota_reset(reservation)
                     pending_quota_replay = last_dispatch
                     continue
+            format_failed_model = (
+                antigravity_attempts.models[antigravity_attempts.model_index]
+                if antigravity_attempts is not None
+                else None
+            )
             transition = (
                 antigravity_attempts.next_after_failure(
-                    retryable=should_retry, provider_capacity=provider_capacity
+                    retryable=should_retry,
+                    provider_capacity=provider_capacity,
+                    format_failure=format_failure,
                 )
                 if antigravity_attempts is not None
                 else ("retry" if ordinary_retries_used < config.agent_max_retries else "stop")
@@ -3394,6 +3430,15 @@ def _run_validated_agent_in_scope(
                     # gets the ordinary bounded relaunch (#1226).
                     stability_wait(target_exec_command, deadline=None)
                 runner.run(("sleep", str(delay)), cwd=active_workdir(config))
+                continue
+            if transition == "format-fallback":
+                failures = antigravity_attempts.format_failures.get(format_failed_model, 0)
+                log(
+                    config,
+                    f"{agent_name}: {format_failed_model} produced no recoverable structured "
+                    f"payload {failures} time{'s' if failures != 1 else ''}; falling back to "
+                    f"{antigravity_attempts.models[antigravity_attempts.model_index]}",
+                )
                 continue
             if transition == "fallback":
                 log(

@@ -21,7 +21,10 @@ if TYPE_CHECKING:
     from ..review_images_transport import ImageInputs, ImageDeliveryProof
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
-AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
+# ``structured_output`` is an agent-authored payload from agy's schema channel
+# (#2029); like ``response_file`` it was not scraped from stdout.
+AgentTextSource = Literal["response_file", "structured_output", "stdout_marker", "stdout"]
+AGENT_AUTHORED_TEXT_SOURCES = frozenset({"response_file", "structured_output"})
 
 # Keep prompts below Linux's per-argument exec limit; longer prompts are sent
 # through stdin or backend-specific task context instead. Claude and Codex
