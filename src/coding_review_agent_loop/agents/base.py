@@ -97,6 +97,10 @@ class AgentResult:
     # agy envelope. A provider diagnostic, never model prose: failure
     # classification reads it as the terminal frame in every phase.
     provider_error_text: str | None = None
+    # Antigravity JSON mode only (#2039): a provider-owned diagnostic line
+    # showing agy rejected agent-loop's request schema (INVALID_ARGUMENT
+    # naming the schema).  Never derived from model prose.
+    antigravity_structured_request_rejection: str | None = None
 
     image_delivery_proof: ImageDeliveryProof | None = None
 
