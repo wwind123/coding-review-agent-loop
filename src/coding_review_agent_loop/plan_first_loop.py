@@ -603,6 +603,11 @@ def _run_plan_first_loop_body(
             growth_gate_enforced=plan_growth_gate_enforced(config),
             step_back_rounds=config.plan_step_back_rounds,
             escalation_rounds=config.plan_step_back_escalation_rounds,
+            candidate_strategy=(
+                plan_strategy(current_plan_sidecar.canonical_json)
+                if current_plan_sidecar is not None
+                else None
+            ),
         )
 
     if inherited_matrix_binding is not None:

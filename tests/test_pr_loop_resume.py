@@ -1525,11 +1525,12 @@ from acknowledgement_helpers import (
 
 def _capture_ack_blockers(monkeypatch):
     captured = []
-    real = pr_loop._raise_if_maintained_disputed_items
+    import coding_review_agent_loop.dispute_release as dispute_release
+    real = dispute_release._raise_if_maintained_disputed_items
     def capture(items, **kwargs):
         captured.append(tuple(items))
         return real(items, **kwargs)
-    monkeypatch.setattr(pr_loop, "_raise_if_maintained_disputed_items", capture)
+    monkeypatch.setattr(dispute_release, "_raise_if_maintained_disputed_items", capture)
     return captured
 
 

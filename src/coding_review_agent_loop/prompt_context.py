@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace as dataclass_replace
 from textwrap import indent
 from typing import TYPE_CHECKING
@@ -308,7 +308,35 @@ def _human_requirements_block(
     )
 
 
-def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewItem] | None) -> str:
+def released_dispute_pointer(item_id: str, requirement_ids: Sequence[str]) -> str:
+    """One pointer line for a coder dispute released by newer signed requirements (#2025).
+
+    Only requirement IDs are named here; the requirement text stays in the
+    signed human requirements section.
+    """
+    named = ", ".join(requirement_ids)
+    return (
+        f"Dispute on {item_id} is released by newer signed requirement(s) {named}; "
+        "see the signed human requirements section. Reconsider the item against them."
+    )
+
+
+def released_dispute_pointer_lines(
+    item_id: str,
+    released_disputes: Mapping[str, Sequence[str]] | None,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    requirement_ids = (released_disputes or {}).get(item_id)
+    if not requirement_ids:
+        return []
+    return [prefix + released_dispute_pointer(item_id, requirement_ids)]
+
+
+def _format_unresolved_review_items(
+    unresolved_items: Sequence[UnresolvedReviewItem] | None,
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
+) -> str:
     # Converted findings and cleared row tombstones (#1325) are retained only
     # for provenance; they are nobody's open work and need no disposition.
     unresolved_items = [item for item in unresolved_items or () if not item.is_inert_ledger_record]
@@ -365,6 +393,9 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         if updates:
             details.append("  Updates/evidence:")
             details.extend(f"  - {note}" for note in updates)
+        details.extend(
+            released_dispute_pointer_lines(item.item_id, released_disputes, prefix="  ")
+        )
         lines.extend(
             [
                 f"- [{item.item_id}] {item.status} from {item.reviewer} in round {item.source_round}",

@@ -2756,6 +2756,7 @@ def _compact_pr_review_stable_prefix(
     architecture_context: str = "",
     managed_human_block: str | None = None,
     managed_plan_block: str | None = None,
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     reviewer_group = prompt_support.format_agent_list(reviewers(config))
     coder_name = agent_display_name(config.coder)
@@ -2872,7 +2873,7 @@ adds a merge migration.
             declared_out_of_scope_block(parent_issue_context, issue_context),
             managed_human_block if managed_human_block is not None else _human_requirements_block(human_requirements),
             _canonical_pr_review_ledger_rules(),
-            _format_unresolved_review_items(non_future_items)
+            _format_unresolved_review_items(non_future_items, released_disputes)
             or "Prior unresolved review items from earlier rounds\n\n(none)\n",
             _compact_prior_ledger_block(compact_prior),
         )
@@ -2899,6 +2900,7 @@ def _build_compact_pr_review_prompt(
     parent_issue_context: IssueContext | None,
     coder_followup_context: str = "",
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2944,6 +2946,7 @@ def _build_compact_pr_review_prompt(
         architecture_context=managed_architecture_block,
         managed_human_block=managed_human_block,
         managed_plan_block=managed_plan_block,
+        released_disputes=released_disputes,
     )
     head_sha = (compact_tail.head_sha if compact_tail else None) or pr_metadata.head_sha or "(unknown)"
     volatile_round = (compact_tail.round_number if compact_tail else None) or round_number
@@ -3372,6 +3375,7 @@ def build_review_prompt(
     sweep_context: str = "",
     evidence_scope: Mapping[str, object] | None = None,
     screenshot_context: str = "",
+    released_disputes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     coder_followup_context += screenshot_context
     from .capture_acceptance import evidence_prompt
@@ -3417,6 +3421,7 @@ def build_review_prompt(
             approved_plan_max_chars=approved_plan_max_chars,
             parent_issue_context=parent_issue_context,
             coder_followup_context=sanitize_historical_text(coder_followup_context),
+            released_disputes=released_disputes,
         )
         return compact_prompt
     title = neutralize_untrusted_github_text(metadata.title, fallback="(unknown)")
@@ -3428,7 +3433,7 @@ def build_review_prompt(
     human_requirements_guidance = prompt_support._human_requirements_review_guidance(
         human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids
     )
-    unresolved_items_block = _format_unresolved_review_items(unresolved_items)
+    unresolved_items_block = _format_unresolved_review_items(unresolved_items, released_disputes)
     if unresolved_items:
         unresolved_items_guidance = _build_unresolved_items_guidance()
     else:
