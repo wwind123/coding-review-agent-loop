@@ -52,12 +52,14 @@ from .antigravity_structured import (
     AgyEnvelope,
     SCHEMA_FILE_NAME,
     envelope_provider_error,
+    envelope_request_rejection,
     STRUCTURED_KIND_FOOTERS,
     antigravity_structured_output_supported,
     oversized_prompt_directive,
     parse_agy_json_envelope,
     render_structured_output_text,
     structured_output_signature,
+    structured_request_rejection_line,
     write_structured_output_schema,
 )
 from .replacement import classify_provider_executable_replacement_interruption
@@ -1319,8 +1321,8 @@ def find_antigravity_attempt_log(
     return AntigravityLogLookup(candidates[0], "matched")
 
 
-def antigravity_log_quota_line(path: Path) -> str | None:
-    """First error-severity executor RESOURCE_EXHAUSTED 429 line in an agy log."""
+def _read_agy_log_tail(path: Path) -> str | None:
+    """The bounded tail of a regular agy log file (no symlinks), else None."""
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
     except OSError:
@@ -1343,7 +1345,10 @@ def antigravity_log_quota_line(path: Path) -> str | None:
         return None
     finally:
         os.close(fd)
-    text = b"".join(chunks).decode("utf-8", errors="replace")
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _agy_log_quota_line_in(text: str) -> str | None:
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if (
@@ -1356,6 +1361,12 @@ def antigravity_log_quota_line(path: Path) -> str | None:
     return None
 
 
+def antigravity_log_quota_line(path: Path) -> str | None:
+    """First error-severity executor RESOURCE_EXHAUSTED 429 line in an agy log."""
+    text = _read_agy_log_tail(path)
+    return None if text is None else _agy_log_quota_line_in(text)
+
+
 def _silent_attempt_log_evidence(
     config: AgentLoopConfig,
     result: CommandResult,
@@ -1363,38 +1374,85 @@ def _silent_attempt_log_evidence(
     lookup: AntigravityLogLookup | Exception | None,
     *,
     json_mode: bool = False,
-) -> tuple[Path | None, AntigravityLogQuotaEvidence | None]:
+) -> tuple[Path | None, AntigravityLogQuotaEvidence | None, str | None]:
     """Read this silent attempt's agy log from a lookup taken under the lock.
+
+    Returns (log path, quota evidence, request-schema rejection line).  The
+    rejection line (#2039) is read only in JSON mode, from the same bounded
+    read, and only when the log carries no quota line (quota wins).
 
     ``lookup`` is None when no lookup was taken (no pre-spawn inventory), or
     the exception the lookup raised. Never raises.
     """
     try:
         if not is_silent_antigravity_attempt(result, response_file_text, json_mode=json_mode):
-            return None, None
+            return None, None, None
         if result.observation is None:
             log(config, "Antigravity printed no output; no agy log lookup (no spawn observation)")
-            return None, None
+            return None, None, None
         if isinstance(lookup, Exception):
             log(config, f"Antigravity agy log lookup failed: {lookup}")
-            return None, None
+            return None, None, None
         if lookup is None:
             lookup = AntigravityLogLookup(None, "no pre-spawn inventory")
         if lookup.log_path is None:
             log(config, f"Antigravity printed no output; no new matching agy log ({lookup.reason})")
-            return None, None
-        line = antigravity_log_quota_line(lookup.log_path)
+            return None, None, None
+        text = _read_agy_log_tail(lookup.log_path)
+        line = None if text is None else _agy_log_quota_line_in(text)
         if line is None:
+            rejection = (
+                structured_request_rejection_line(text) if json_mode and text is not None else None
+            )
             log(
                 config,
                 f"Antigravity printed no output; agy log {lookup.log_path.name} has no "
-                "RESOURCE_EXHAUSTED 429 line",
+                "RESOURCE_EXHAUSTED 429 line"
+                + ("; it shows a request-schema INVALID_ARGUMENT rejection" if rejection else ""),
             )
-            return lookup.log_path, None
-        return lookup.log_path, AntigravityLogQuotaEvidence(lookup.log_path, line)
+            return lookup.log_path, None, rejection
+        return lookup.log_path, AntigravityLogQuotaEvidence(lookup.log_path, line), None
     except Exception as exc:  # noqa: BLE001 - the lookup must never fail the turn
         log(config, f"Antigravity agy log lookup failed: {exc}")
-        return None, None
+        return None, None, None
+
+
+def structured_request_rejection_evidence(
+    result: CommandResult,
+    response_file_text: str | None,
+    text_source: AgentTextSource,
+    log_rejection: str | None,
+) -> str | None:
+    """Provider-owned evidence that agy rejected the request schema (#2039).
+
+    Call only for a structured attempt.  Nothing counts when the attempt
+    produced a renderable ``structured_output`` or a response file, or timed
+    out.  Sources, in order: a non-SUCCESS envelope's error/status; stdout
+    outside any parsed envelope; raw stdout of a nonzero exit with no
+    envelope; this silent attempt's own agy log.  A SUCCESS envelope's
+    ``response`` prose is never read.  Never raises.
+    """
+    try:
+        if (
+            result.returncode is None
+            or response_file_text is not None
+            or text_source == "structured_output"
+        ):
+            return None
+        envelope = parse_agy_json_envelope(result.stdout or "")
+        if envelope is not None:
+            line = envelope_request_rejection(envelope)
+            if line is None:
+                line = structured_request_rejection_line(envelope.remainder)
+            if line is not None:
+                return line
+        elif result.returncode != 0:
+            line = structured_request_rejection_line(result.stdout or "")
+            if line is not None:
+                return line
+        return log_rejection
+    except Exception:  # noqa: BLE001 - detection never fails the turn
+        return None
 
 
 def _strip_public_response_marker(raw: str) -> tuple[str, AgentTextSource]:
@@ -1896,14 +1954,22 @@ class AntigravityBackend:
             message_text, text_source = _strip_public_response_marker(result.stdout)
         agy_log_path: Path | None = None
         agy_log_evidence: AntigravityLogQuotaEvidence | None = None
+        agy_log_rejection: str | None = None
         if role != _SEMANTIC_DEDUPE_ROLE:
-            agy_log_path, agy_log_evidence = _silent_attempt_log_evidence(
+            agy_log_path, agy_log_evidence, agy_log_rejection = _silent_attempt_log_evidence(
                 config,
                 result,
                 response_file_text,
                 agy_log_lookup,
                 json_mode=structured_kind is not None,
             )
+        request_rejection = (
+            structured_request_rejection_evidence(
+                result, response_file_text, text_source, agy_log_rejection
+            )
+            if structured_kind is not None and agy_log_evidence is None
+            else None
+        )
         return AgentResult(
             text=message_text,
             raw_output=result.stdout,
@@ -1930,6 +1996,7 @@ class AntigravityBackend:
             ),
             antigravity_log_path=agy_log_path,
             antigravity_log_quota_evidence=agy_log_evidence,
+            antigravity_structured_request_rejection=request_rejection,
         )
 
     @staticmethod

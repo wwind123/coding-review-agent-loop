@@ -172,14 +172,18 @@ def reset_structured_output_capability_cache() -> None:
 def structured_output_schema(kind: str) -> dict[str, object]:
     """A loose JSON Schema for ``kind`` that also admits ``agent_unavailable``.
 
-    Only basic constructs are used so agy accepts it.  ``state`` is optional
-    here because an agent_unavailable payload has none; the role validators
-    still require it.
+    Only constructs Gemini function declarations accept are used (#2039):
+    ``enum`` appears only on string-typed values and every enum value is a
+    non-empty string.  An integer enum is rejected by the provider with
+    INVALID_ARGUMENT, so ``schema_version`` is a plain integer here and the
+    protocol validators keep enforcing ``schema_version == 1``.  ``state`` is
+    optional because an agent_unavailable payload has none; the role
+    validators still require it.
     """
     return {
         "type": "object",
         "properties": {
-            "schema_version": {"type": "integer", "enum": [1]},
+            "schema_version": {"type": "integer"},
             "kind": {"type": "string", "enum": [kind, AGENT_UNAVAILABLE_KIND]},
             "state": {"type": "string", "enum": ["approved", "blocking"]},
         },
@@ -202,6 +206,8 @@ class AgyEnvelope:
     error_text: str
     # The normalized stdout with the envelope's own JSON text removed.
     remainder: str = ""
+    # Whether the envelope carries a top-level ``json_schema`` key (#2039).
+    has_json_schema: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -254,6 +260,7 @@ def parse_agy_json_envelope(stdout: str) -> AgyEnvelope | None:
             structured_output=found.get("structured_output"),
             error_text=_error_text(found),
             remainder=text[: span[0]] + text[span[1] :],
+            has_json_schema=found.get("json_schema") is not None,
         )
     except Exception:  # noqa: BLE001 - a malformed envelope is a missing channel
         return None
@@ -268,6 +275,61 @@ def envelope_provider_error(envelope: AgyEnvelope) -> str:
     if envelope.error_text.strip():
         return envelope.error_text.strip()
     return f"agy reported status {envelope.status or 'unknown'} with no error text"
+
+
+# --- Provider rejection of the request schema (#2039) ------------------------
+#
+# A schema construct the provider refuses fails the request before the model
+# runs.  These detectors read provider-owned diagnostics only (a non-SUCCESS
+# envelope's error/status, stdout outside the envelope, agy's own CLI log);
+# model ``response`` prose is never evidence.
+_INVALID_ARGUMENT_TOKEN = "INVALID_ARGUMENT"
+_SCHEMA_REFERENCE_TOKENS = (
+    "function_declarations",
+    "parameters.properties",
+    "json_schema",
+    "response_schema",
+    "responseschema",
+)
+_REJECTION_LINE_LIMIT = 2000
+
+
+def structured_request_rejection_line(text: str | None) -> str | None:
+    """The first line naming INVALID_ARGUMENT and the request schema, else None."""
+    if not text:
+        return None
+    try:
+        cleaned = strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n")
+    except Exception:  # noqa: BLE001 - detection never fails a turn
+        return None
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if _INVALID_ARGUMENT_TOKEN not in line:
+            continue
+        lowered = line.lower()
+        if any(token in lowered for token in _SCHEMA_REFERENCE_TOKENS):
+            return line[:_REJECTION_LINE_LIMIT]
+    return None
+
+
+def envelope_request_rejection(envelope: AgyEnvelope | None) -> str | None:
+    """Schema-rejection evidence from a non-SUCCESS envelope, else None.
+
+    Reads the decoded error text and status only; ``response`` is never read.
+    """
+    if envelope is None or envelope.succeeded:
+        return None
+    line = structured_request_rejection_line(envelope.error_text)
+    if line is not None:
+        return line
+    status = (envelope.status or "").upper()
+    if status == _INVALID_ARGUMENT_TOKEN and (
+        envelope.has_json_schema or "json_schema" in envelope.error_text.lower()
+    ):
+        detail = envelope.error_text.strip().splitlines()[0].strip() if envelope.error_text.strip() else ""
+        summary = f"{_INVALID_ARGUMENT_TOKEN}: agy rejected the request json_schema"
+        return (f"{summary} ({detail})" if detail else summary)[:_REJECTION_LINE_LIMIT]
+    return None
 
 
 def structured_output_signature(config: "AgentLoopConfig", model: str) -> str:

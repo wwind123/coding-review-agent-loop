@@ -2910,3 +2910,374 @@ def test_non_success_envelope_error_is_a_typed_provider_diagnostic(tmp_path, mon
     if expected is not None:
         for phase in ("command", "empty", "validation"):
             assert _agent_failure_classification_text(result, phase=phase).endswith(expected)
+
+
+# --- Gemini-compatible schema and request-rejection replay (#2039) -----------
+
+_SCHEMA_REJECTION = (
+    "error: INVALID_ARGUMENT (code 400): * GenerateContentRequest.tools[14]."
+    "function_declarations[0].parameters.properties[schema_version].enum[0]: cannot be empty"
+)
+
+
+def _walk_schema_nodes(node, path="$"):
+    if isinstance(node, dict):
+        yield path, node
+        for key, value in node.items():
+            yield from _walk_schema_nodes(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _walk_schema_nodes(value, f"{path}[{index}]")
+
+
+from coding_review_agent_loop.agents.antigravity_structured import (  # noqa: E402
+    STRUCTURED_KIND_FOOTERS as _STRUCTURED_KIND_FOOTERS,
+)
+
+
+@pytest.mark.parametrize("kind", sorted(_STRUCTURED_KIND_FOOTERS))
+def test_structured_schema_uses_only_gemini_compatible_enums(tmp_path, kind):
+    from coding_review_agent_loop.agents.antigravity_structured import (
+        structured_output_schema,
+        write_structured_output_schema,
+    )
+
+    written = json.loads(write_structured_output_schema(tmp_path, kind).read_text(encoding="utf-8"))
+    for schema in (structured_output_schema(kind), written):
+        enum_nodes = 0
+        for path, node in _walk_schema_nodes(schema):
+            if "enum" not in node:
+                continue
+            enum_nodes += 1
+            assert node.get("type") == "string", f"{path}: enum on a non-string type"
+            assert node["enum"], f"{path}: empty enum"
+            for value in node["enum"]:
+                assert isinstance(value, str) and value.strip(), f"{path}: bad enum value {value!r}"
+        assert schema["properties"]["schema_version"] == {"type": "integer"}
+        assert schema["properties"]["kind"]["enum"] == [kind, "agent_unavailable"]
+        assert schema["properties"]["state"]["enum"] == ["approved", "blocking"]
+        assert schema["required"] == ["schema_version", "kind"]
+        assert enum_nodes == 2
+
+
+def test_validated_turn_rejects_structured_output_with_wrong_schema_version(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    structured = _payload(structured_pr_review())
+    structured["schema_version"] = 2
+    runner = FakeRunner(antigravity_outputs=[(_agy_envelope(structured), 0)])
+    config = make_config(tmp_path, antigravity_model="Gemini 4 Hydrogen (Medium)", agent_max_retries=0)
+
+    with pytest.raises(AgentInvocationError) as excinfo:
+        _run_validated_agent(
+            runner,
+            agent="antigravity",
+            config=config,
+            prompt="Review this PR.",
+            marker_description="structured pr_review",
+            validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+            repair_expected_kind="pr_review",
+            role="reviewer",
+        )
+    assert "schema_version" in str(excinfo.value)
+    cmds = [c for c, _ in runner.commands if c[:1] == ["agy"]]
+    assert len(cmds) == 1 and "--json-schema" in cmds[0]
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (_SCHEMA_REJECTION, _SCHEMA_REJECTION),
+        ("\x1b[31m" + _SCHEMA_REJECTION + "\x1b[0m\r\n", _SCHEMA_REJECTION),
+        ("INVALID_ARGUMENT: bad responseSchema field", "INVALID_ARGUMENT: bad responseSchema field"),
+        ("error: INVALID_ARGUMENT (code 400): prompt is too long", None),
+        ("error: RESOURCE_EXHAUSTED (code 429): function_declarations quota", None),
+        ("", None),
+        (None, None),
+    ],
+    ids=["issue-error", "ansi", "response-schema", "no-schema-reference", "resource-exhausted", "empty", "none"],
+)
+def test_structured_request_rejection_line_detector(text, expected):
+    from coding_review_agent_loop.agents.antigravity_structured import structured_request_rejection_line
+
+    assert structured_request_rejection_line(text) == expected
+
+
+def test_envelope_request_rejection_reads_provider_fields_only():
+    from coding_review_agent_loop.agents.antigravity_structured import (
+        envelope_request_rejection,
+        parse_agy_json_envelope,
+    )
+
+    status_only = parse_agy_json_envelope(
+        _agy_envelope(status="INVALID_ARGUMENT", response="", error="request failed", json_schema={"type": "object"})
+    )
+    assert "INVALID_ARGUMENT" in envelope_request_rejection(status_only)
+    in_error = parse_agy_json_envelope(_agy_envelope(status="ERROR", response="", error=_SCHEMA_REJECTION))
+    assert envelope_request_rejection(in_error) == _SCHEMA_REJECTION
+    # A SUCCESS envelope's prose quoting the exact error is never evidence.
+    prose = parse_agy_json_envelope(_agy_envelope(response=_SCHEMA_REJECTION))
+    assert envelope_request_rejection(prose) is None
+    # Non-SUCCESS prose is never read either.
+    failed_prose = parse_agy_json_envelope(_agy_envelope(status="ERROR", response=_SCHEMA_REJECTION))
+    assert envelope_request_rejection(failed_prose) is None
+    bare = parse_agy_json_envelope(
+        _agy_envelope(status="INVALID_ARGUMENT", response="", error="INVALID_ARGUMENT: prompt too long")
+    )
+    assert envelope_request_rejection(bare) is None
+    exhausted = parse_agy_json_envelope(
+        _agy_envelope(status="RESOURCE_EXHAUSTED", response="", error="quota", json_schema={})
+    )
+    assert envelope_request_rejection(exhausted) is None
+
+
+_REJECTION_OUTPUTS = {
+    "envelope-error": (_agy_envelope(status="ERROR", response="", error=_SCHEMA_REJECTION), 3),
+    "envelope-status": (
+        _agy_envelope(status="INVALID_ARGUMENT", response="", error="bad request", json_schema={"type": "object"}),
+        3,
+    ),
+    "stdout-remainder": (_SCHEMA_REJECTION + "\n" + _agy_envelope(status="ERROR", response=""), 3),
+    "raw-stdout": (_SCHEMA_REJECTION + "\n", 3),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REJECTION_OUTPUTS))
+def test_backend_reports_request_rejection_from_provider_output(tmp_path, monkeypatch, case):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(antigravity_outputs=[_REJECTION_OUTPUTS[case]])
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+    assert result.antigravity_structured_request_rejection
+    assert "INVALID_ARGUMENT" in result.antigravity_structured_request_rejection
+
+
+def test_backend_never_reads_success_prose_or_unstructured_output(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(antigravity_outputs=[(_agy_envelope(response=_SCHEMA_REJECTION), 0)])
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+    assert result.antigravity_structured_request_rejection is None
+    # The same text on a turn with no structured kind is no evidence.
+    runner = FakeRunner(antigravity_outputs=[(_SCHEMA_REJECTION, 3)])
+    config = _structured_config(tmp_path, kind=None)
+    result = AntigravityBackend().run(runner, config, "Review.", run_id="r", role="reviewer")
+    assert result.antigravity_structured_request_rejection is None
+    # A zero-exit attempt with no envelope is not provider evidence.
+    runner = FakeRunner(antigravity_outputs=[(_SCHEMA_REJECTION, 0)])
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+    assert result.antigravity_structured_request_rejection is None
+
+
+_AGY_REJECTION_LOG = (
+    AGY_LOG_STARTUP_LINES
+    + "E1120 04:36:08.700000 12345 executor.go:88] agent executor error: " + _SCHEMA_REJECTION + "\n"
+)
+
+
+def test_backend_reads_rejection_from_the_silent_attempts_own_agy_log(tmp_path, monkeypatch, _isolated_agy_log_dir):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    # An earlier attempt's log with the same line is never this attempt's evidence.
+    stale = _isolated_agy_log_dir / agy_log_name(_time.time() - 1)
+    stale.write_text(_AGY_REJECTION_LOG, encoding="utf-8")
+    runner = AgyLogRunner(
+        antigravity_outputs=[("", 3), ("", 3)],
+        log_dir=_isolated_agy_log_dir,
+        agy_logs=[_AGY_REJECTION_LOG, AGY_LOG_STARTUP_LINES],
+    )
+    config = _structured_config(tmp_path)
+    first = AntigravityBackend().run(runner, config, "Review.", run_id="r", role="reviewer")
+    assert first.antigravity_log_path == runner.written_agy_logs[0]
+    assert first.antigravity_log_quota_evidence is None
+    assert _SCHEMA_REJECTION in first.antigravity_structured_request_rejection
+    second = AntigravityBackend().run(runner, config, "Review.", run_id="r", role="reviewer")
+    assert second.antigravity_log_path == runner.written_agy_logs[1]
+    assert second.antigravity_structured_request_rejection is None
+
+
+def test_backend_quota_line_wins_over_rejection_in_agy_log(tmp_path, monkeypatch, _isolated_agy_log_dir):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    runner = AgyLogRunner(
+        antigravity_outputs=[("", 3)],
+        log_dir=_isolated_agy_log_dir,
+        agy_logs=[_AGY_REJECTION_LOG + AGY_LOG_429_LINE + "\n"],
+    )
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+    assert result.antigravity_log_quota_evidence is not None
+    assert result.antigravity_structured_request_rejection is None
+
+
+def _run_structured_review_turn(runner, config, logs, repairs, *, expected_kind="pr_review"):
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair), \
+            patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
+        return _run_validated_agent(
+            runner,
+            agent="antigravity",
+            config=config,
+            prompt="Review this PR.",
+            marker_description="structured pr_review",
+            validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+            use_repair=True,
+            repair_expected_kind=expected_kind,
+            role="reviewer",
+        )
+
+
+def _agy_cmds(runner):
+    return [c for c, _ in runner.commands if c[:1] == ["agy"]]
+
+
+_REPLAY_WARNING = "retrying this turn once with structured output off"
+
+
+@pytest.mark.parametrize("case", sorted(_REJECTION_OUTPUTS))
+def test_validated_turn_replays_once_without_schema_after_request_rejection(tmp_path, monkeypatch, case):
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(
+        antigravity_outputs=[_REJECTION_OUTPUTS[case], ("Done; see the response file.", 0)],
+        public_response_outputs=[{"text": ""}, structured_pr_review(summary="From the replay.")],
+    )
+    # No retry budget and a single model: the replay must be the dedicated slot.
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    response = _run_structured_review_turn(runner, config, logs, repairs)
+
+    cmds = _agy_cmds(runner)
+    assert len(cmds) == 2
+    assert "--json-schema" in cmds[0] and "--output-format" in cmds[0]
+    assert "--json-schema" not in cmds[1] and "--output-format" not in cmds[1]
+    assert cmds[0][cmds[0].index("--model") + 1] == cmds[1][cmds[1].index("--model") + 1]
+    # Same prompt (each attempt has its own response path), not a corrective re-prompt.
+    assert re.sub(r"turn-[0-9a-f]+", "turn-X", cmds[0][-1]) == re.sub(r"turn-[0-9a-f]+", "turn-X", cmds[1][-1])
+    assert repairs == []
+    assert sum(_REPLAY_WARNING in line for line in logs) == 1
+    assert any(line.startswith("WARNING:") and _REPLAY_WARNING in line for line in logs)
+    assert not any("falling back to" in line for line in logs)
+    assert response.marker_value.state == "approved"
+    assert "From the replay." in response.text
+
+
+def test_validated_turn_replays_after_silent_exit_with_rejection_in_agy_log(
+    tmp_path, monkeypatch, _isolated_agy_log_dir
+):
+    _enable_agy_structured_output(monkeypatch)
+    runner = AgyLogRunner(
+        antigravity_outputs=[("", 3), ("Done.", 0)],
+        public_response_outputs=[{"text": ""}, structured_pr_review(summary="After silent rejection.")],
+        log_dir=_isolated_agy_log_dir,
+        agy_logs=[_AGY_REJECTION_LOG, None],
+    )
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    response = _run_structured_review_turn(runner, config, logs, repairs)
+
+    cmds = _agy_cmds(runner)
+    assert len(cmds) == 2
+    assert "--json-schema" in cmds[0] and "--json-schema" not in cmds[1]
+    assert repairs == []
+    assert sum(_REPLAY_WARNING in line for line in logs) == 1
+    assert "After silent rejection." in response.text
+
+
+def test_failed_replay_is_classified_normally_without_a_second_fallback(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(
+        antigravity_outputs=[
+            _REJECTION_OUTPUTS["raw-stdout"],
+            ("agy crashed: unexpected internal error", 3),
+            ("should never run", 0),
+        ],
+    )
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    with pytest.raises(AgentInvocationError) as excinfo:
+        _run_structured_review_turn(runner, config, logs, repairs)
+
+    cmds = _agy_cmds(runner)
+    assert len(cmds) == 2
+    assert "--json-schema" not in cmds[1]
+    assert sum(_REPLAY_WARNING in line for line in logs) == 1
+    assert "exited with 3" in str(excinfo.value)
+
+
+def test_replay_failing_with_the_same_rejection_does_not_loop(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(
+        antigravity_outputs=[_REJECTION_OUTPUTS["raw-stdout"]] * 3,
+    )
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+
+    with pytest.raises(AgentInvocationError):
+        _run_structured_review_turn(runner, config, logs, [])
+
+    assert len(_agy_cmds(runner)) == 2
+    assert sum(_REPLAY_WARNING in line for line in logs) == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["unstructured-turn", "no-schema-reference"],
+)
+def test_no_replay_outside_the_structured_schema_rejection_gate(tmp_path, monkeypatch, case):
+    _enable_agy_structured_output(monkeypatch)
+    output = (
+        (_SCHEMA_REJECTION, 3)
+        if case == "unstructured-turn"
+        else ("error: INVALID_ARGUMENT (code 400): prompt is too long", 3)
+    )
+    runner = FakeRunner(antigravity_outputs=[output, ("should never run", 0)])
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+
+    with pytest.raises(AgentInvocationError):
+        _run_structured_review_turn(
+            runner, config, logs, [],
+            expected_kind="discuss_review" if case == "unstructured-turn" else "pr_review",
+        )
+
+    assert len(_agy_cmds(runner)) == 1
+    assert not any(_REPLAY_WARNING in line for line in logs)
+
+
+def test_success_envelope_prose_quoting_the_rejection_gets_no_replay(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    runner = FakeRunner(
+        antigravity_outputs=[
+            (_agy_envelope(response=f"Reviewing #2039: {_SCHEMA_REJECTION}"), 0),
+            (_agy_envelope(_payload(structured_pr_review(summary="Second attempt."))), 0),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        antigravity_model="Gemini 3.8 Flash (High)",
+        agent_max_retries=1,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    try:
+        _run_structured_review_turn(runner, config, logs, repairs)
+    except AgentInvocationError:
+        pass
+
+    cmds = _agy_cmds(runner)
+    assert not any(_REPLAY_WARNING in line for line in logs)
+    # Any later attempt keeps the schema flags: no free schema-off attempt.
+    assert all("--json-schema" in cmd for cmd in cmds)

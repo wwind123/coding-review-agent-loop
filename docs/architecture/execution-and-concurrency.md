@@ -12,7 +12,7 @@ Concurrent default-dir invocations on one repository are supported.
 Each run with an omitted `--<agent>-dir` gets its own detached `git worktree`
 under `<scratch>/OWNER-REPO/<agent>/runs/<run-token>`, backed by one shared
 clone per repo/agent (the *store*, `<scratch>/OWNER-REPO/<agent>/repo`) that
-owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming the shared clone and suggesting `--worktree-setup` or creating the path there) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash, for example `/.venv` or `/node_modules` in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
+owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path such as `.venv` from the shared store into each per-run worktree. The path must exist in the store (otherwise the run fails, naming the shared clone and suggesting `--worktree-setup` or creating the path there) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash (`/.venv`, `/node_modules`) in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
 reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.
@@ -503,11 +503,10 @@ finite monotonic expiries: the parsed reset, or a bounded
 logical run: it is keyed by the `workdir_claims` owner's `run_id`, created on
 first use, dropped by a run finalizer when the outermost scope ends, shared by
 nested loops, and reached from reviewer threads because `review_rounds.py` and
-`discuss_loop.py` submit with `contextvars.copy_context()`. With no owner
-(direct library use) the memory is local to one attempt
+`discuss_loop.py` submit with `contextvars.copy_context()`. With no owner the memory is local to one attempt
 state. Exhaustion is classified in `transient.py` only from the matched
-provider error frame, extracted from raw unstripped lines (never the whole
-transcript), with capacity wording taking precedence. Auth (auth words or a
+provider error frame in raw unstripped lines (never the whole
+transcript); capacity wording takes precedence. Auth (auth words or a
 numeric 401/403 in a terminal frame) returns a typed `auth_failure` verdict that
 both callers enforce as non-retryable with no fallback, unless a typed runner
 retry decision applies; dirty checkouts stay non-retryable; billing wording is
@@ -520,9 +519,8 @@ settings lock before spawn and narrowed by name-stamp and mtime windows. Its
 executor `RESOURCE_EXHAUSTED` `429` line becomes typed
 `AntigravityLogQuotaEvidence`, which `validated_agent.py` routes into the quota
 path (reason `agy-log`) before the exit, empty and format branches, unless a
-typed runner retry decision applies; lookup failure keeps the earlier behavior.
-`AntigravityAttemptState`
-is the policy used by `validated_agent.py`:
+typed runner retry decision applies; a failed lookup changes nothing.
+`AntigravityAttemptState` is the `validated_agent.py` policy:
 transient failures retry then fall back to a later eligible entry; a verified
 exhaustion skips the whole group with no retry or sleep and makes at most one
 cross-group jump per turn; a second verified exhaustion is a shared-limit stop;
@@ -530,11 +528,13 @@ and an all-groups-cooling state stops before invoking. Only when every group
 carries a parsed long reset is `QuotaResetExceededError` raised. Memory is not
 persisted across processes.
 
-**Antigravity structured output (#2029).** `agents/antigravity_structured.py`
-adds agy's `--json-schema` channel for eligible kinds when a cached probe
-allows. A renderable `SUCCESS` `structured_output` outranks the response file
-and stdout marker; validators stay authoritative. Repeated no-payload reviewer
-turns give a retry-free `format-fallback` to the next model. See the
+**Antigravity structured output (#2029, #2039).**
+`agents/antigravity_structured.py` adds agy's `--json-schema` channel (string
+enums only) for eligible kinds after a cached probe. A renderable
+`structured_output` wins; validators stay authoritative. No-payload turns get
+a retry-free `format-fallback`. A schema-naming INVALID_ARGUMENT in provider
+diagnostics (not model prose) replays the dispatch once per turn without schema
+flags: no retry, format failure or repair. See the
 [CLI guide](../local_agent_loop.md#structured-output).
 
 **Quota reset wait.** `--wait-for-quota-reset DURATION` (off by default) turns

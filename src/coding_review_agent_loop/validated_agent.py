@@ -1471,6 +1471,10 @@ def _run_validated_agent_in_scope(
     if reask_on_evidence_rejection:
         # One dedicated slot that never consumes agent_max_retries (#1240).
         max_attempts += 1
+    if antigravity_structured_kind is not None:
+        # One dedicated structured-off replay after agy rejects agent-loop's
+        # request schema (#2039); never consumes agent_max_retries.
+        max_attempts += 1
     if require_risk_test_matrix_contract:
         # One dedicated planner replay for a fresh matrix integrity refusal;
         # never consumes agent_max_retries or Antigravity fallback state.
@@ -1524,6 +1528,10 @@ def _run_validated_agent_in_scope(
     next_timeout_seconds = timeout_seconds
     marker_safety_repair_attempted = False
     settings_lock_retry_used = False
+    # One structured-off replay per turn after a request-schema rejection
+    # (#2039); the replayed dispatch is set only by that branch.
+    structured_request_fallback_used = False
+    pending_structured_off_replay: _QuotaReplay | None = None
     # A field-naming diagnostic for the next attempt's prompt, set only by an
     # unsatisfied architecture-impact contract and consumed by one attempt.
     pending_contract_reprompt: str | None = None
@@ -1687,6 +1695,14 @@ def _run_validated_agent_in_scope(
                 invocation_kwargs["attempt_suffix"] = f"quota-wait-{quota_replays_used}"
             pending_quota_replay = None
             pending_contract_reprompt = None
+        elif pending_structured_off_replay is not None:
+            # The exact dispatch agy rejected for its schema, re-sent without
+            # schema flags (#2039): not a corrective re-prompt.
+            attempt_prompt = pending_structured_off_replay.prompt
+            attempt_session_id = pending_structured_off_replay.session_id
+            next_timeout_seconds = pending_structured_off_replay.timeout_seconds
+            invocation_kwargs = dict(pending_structured_off_replay.invocation_kwargs)
+            pending_structured_off_replay = None
         else:
             if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = (
@@ -2061,6 +2077,34 @@ def _run_validated_agent_in_scope(
                     f"{agent_name}: {result.self_update_reason}; replaying once after executable stability",
                 )
                 continue
+        if (
+            backend_agent == "antigravity"
+            and antigravity_attempts is not None
+            and antigravity_structured_kind is not None
+            and not structured_request_fallback_used
+            and result.antigravity_structured_request_rejection is not None
+            and result.antigravity_log_quota_evidence is None
+            and result.returncode is not None
+            and artifact_unavailable is None
+            and not target_exec_retryable
+            and last_dispatch is not None
+        ):
+            # agy refused agent-loop's own request schema before the model ran
+            # (#2039). Replay the same dispatch once with structured output off
+            # for the rest of this turn: no retry budget, no format-failure
+            # count, no model-chain advance and no repair.
+            structured_request_fallback_used = True
+            antigravity_structured_kind = None
+            pending_structured_off_replay = last_dispatch
+            last_error = "Antigravity rejected agent-loop's structured-output request"
+            last_classification_text = result.antigravity_structured_request_rejection
+            log(
+                config,
+                f"WARNING: {agent_name}: Antigravity rejected agent-loop's structured-output "
+                f"request ({result.antigravity_structured_request_rejection[:600]}); retrying "
+                "this turn once with structured output off",
+            )
+            continue
         should_retry = False
         # Set only when the reviewer's turn carried no recoverable structured
         # payload and repair was refused for it (#2029).
