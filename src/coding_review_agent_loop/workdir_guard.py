@@ -625,6 +625,9 @@ class _Clause:
     # shell -c script, and whether the text has a subshell or substitution.
     shell_depth: int = 0
     in_subshell: bool = False
+    # A ``sh -c`` launcher (or one of its wrappers) that is not a PATH name or
+    # system toolchain program: the script's measurements are never plain.
+    launcher_untrusted: bool = False
 
 
 def _posix_tokens(text: str) -> list[str]:
@@ -794,6 +797,11 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
             in_subshell=inner.in_subshell or clause.in_subshell,
         )
         expanded.extend(_expand_shell_clause(inner, depth + 1))
+    launcher_untrusted = clause.launcher_untrusted or not _launch_is_plain(
+        clause.tokens, *_program_position_indices(clause.tokens)
+    )
+    if launcher_untrusted:
+        expanded[1:] = [replace(inner, launcher_untrusted=True) for inner in expanded[1:]]
     return expanded
 
 
@@ -1746,17 +1754,16 @@ _MEASUREMENT_SAFE_WRAPPERS = frozenset({
 })
 
 
-def _measurement_launch_is_plain(
-    tokens: Sequence[str], positions: set[int], head: int, log: _PathLog
-) -> bool:
-    """Whether a measurement clause runs the real program on its own operands.
+def _launch_is_plain(tokens: Sequence[str], positions: set[int], head: int | None) -> bool:
+    """Whether a clause runs its head program directly, from PATH or the toolchain.
 
-    Every program position (wrappers and the head) must be a bare name found
-    on an unmodified ``PATH`` or an executable in a system toolchain
-    directory, so neither an outside nor a checkout-located program can hide
-    behind a measurement basename (#2052).
+    Every program position (wrappers and the head) must be a bare name or an
+    executable in a system toolchain directory, and every prefix wrapper must
+    neither supply operands nor move the working directory, so neither an
+    outside nor a checkout-located program can hide behind a measurement
+    basename (#2052).
     """
-    if log.path_modified:
+    if head is None:
         return False
     env_options_closed = False
     for index in range(head):
@@ -1891,7 +1898,11 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             # A fallback-tokenized clause is never classified by the grammar.
             log.ambiguous_target = True
             return
-        if not _measurement_launch_is_plain(tokens, positions, head, log):
+        if (
+            log.path_modified
+            or clause.launcher_untrusted
+            or not _launch_is_plain(tokens, positions, head)
+        ):
             # Operand-supplying wrappers, PATH changes and path-named
             # programs make the clause ambiguous on its own (#2052); its
             # operands are still located below so outside ones are recorded.
@@ -1973,11 +1984,18 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         ):
             continue
         cleaned = _strip_wrap(token)
-        if not cleaned or cleaned.isdigit():
+        if not cleaned:
             continue
         after_unknown_option = previous.startswith("-") and not (
             _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
         )
+        if cleaned.isdigit() and after_unknown_option and (
+            cwd is None or not (cwd / cleaned).exists()
+        ):
+            # A number after an unknown option is taken as its value only when
+            # no such path exists to be a test target (#2052); otherwise it is
+            # an operand like any other.
+            continue
         if after_unknown_option:
             kind = locate(cleaned)
             if kind == "outside":
@@ -2028,16 +2046,17 @@ def _validate_command_contents(
     clauses = _clauses_for_entry(command, origin)
     # A preflight (pwd/git status) can precede a managed test command. Apply
     # the exact wrapper contract per clause, not just to the whole report.
+    # Clauses are classified in execution order so a managed command sees the
+    # working directory an earlier ``cd`` clause established (#2052).
     ordinary_clauses: list[_Clause] = []
     for clause in clauses:
-        if not _validate_managed_command(
+        if _validate_managed_command(
             shlex.join(clause.tokens), assigned=assigned,
             origin="structured" if clause.mode in {"structured", "code"} else "response",
             path_violations=path_violations, display_partition=display_partition,
         ):
-            ordinary_clauses.append(clause)
-
-    for clause in ordinary_clauses:
+            continue
+        ordinary_clauses.append(clause)
         for raw_path, role in _path_roles(clause, display_partition=display_partition):
             _check_path_role(
                 raw_path,

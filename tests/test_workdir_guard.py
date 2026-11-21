@@ -2132,3 +2132,63 @@ def test_plain_measurement_launch_and_outside_runner_stay_context_2052(measure_l
     assert workdir_guard.command_targets_outside_workdir(
         command, assigned_workdir=measure_layout.checkout
     )
+
+
+@pytest.mark.parametrize("command", [
+    # item-5: a managed clause resolves against the cwd an earlier cd set.
+    "cd {checkout}/sub && agent-loop run-tests -- pytest ../tests",
+    "cd {checkout}/sub && {wrap} -- du -sk ..",
+    # item-6: a numeric positional names a real checkout path.
+    "pytest ../sibling/tests 123",
+    "pytest ../sibling/tests --reruns 123",
+])
+def test_inside_target_is_never_lost_2052(measure_layout, command):
+    """Generalization: every operand is classified, in execution order."""
+    (measure_layout.checkout / "sub").mkdir()
+    (measure_layout.checkout / "123").mkdir()
+    (measure_layout.parent / "sibling" / "tests").mkdir()
+    command = _measure_fmt(command, measure_layout)
+    log = workdir_guard._command_path_violations(command, assigned_workdir=measure_layout.checkout)
+    assert log.inside_target
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    partition = None
+    try:
+        partition = _partition(measure_layout, [command])
+    except workdir_guard.ReportWorkdirRefusal:
+        return
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "cd {outside} && agent-loop run-tests -- pytest t.py",
+    # A number with no matching path after an unknown option is its value.
+    "pytest {outside}/t.py --reruns 2",
+])
+def test_outside_order_and_option_values_stay_context_2052(measure_layout, command):
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", [
+    # item-7: an untrusted sh -c launcher taints the script's measurements.
+    "{outside}/bin/bash -c 'du -sk {outside}'",
+    "../sibling/bash -c 'du -sk {outside}'",
+    "xargs sh -c 'du -sk {outside}'",
+    "bash -c '{outside}/bin/sh -c \"du -sk {outside}\"'",
+])
+def test_untrusted_shell_launcher_taints_measurement_2052(measure_layout, command):
+    _assert_refused(measure_layout, _measure_fmt(command, measure_layout))
+
+
+@pytest.mark.parametrize("command", ["bash -c 'du -sk {outside}'", "/bin/sh -c 'du -sk {outside}'"])
+def test_plain_shell_launcher_measurement_is_context_2052(measure_layout, command):
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )

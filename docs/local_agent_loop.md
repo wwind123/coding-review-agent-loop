@@ -6468,7 +6468,7 @@ or after a `PATH` change, uses a `find` executor or reference-file predicate
 runners alike, an operand the shell would expand counts as outside only when
 every expansion provably lies outside: a variable, substitution or brace is
 ambiguous, and so is a glob whose literal parent contains the checkout and
-could match it (`../*/tests`), or whose current matches reach it. A refused
+could match it (`../*/tests`), or whose current matches reach it. Clauses are classified in execution order, so a managed `run-tests` clause resolves against the directory an earlier `cd` set; a number is an operand unless it follows an unknown option and names no existing path; and a measurement inside `sh -c` is plain only when the shell launcher itself is. A refused
 `tests_run` entry earns the coder's single semantic-evidence re-ask: the
 re-ask quotes the refusal and asks for a corrected `tests_run`, and a second
 refusal stops the turn. A managed-broker run whose
