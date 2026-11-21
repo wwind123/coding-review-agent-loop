@@ -4148,11 +4148,13 @@ Execution model:
     failing check (a changed signed requirement set, a reconciled round, or an
     approved-plan, acquisition or seat-binding change). It never offers a rerun from another host.
     One case does not refuse (#2054): when every published review of the
-    round, on a board of two or more reviewers, was rejected only because signed sources were added
+    round was rejected only because signed sources were added
     since it was posted, and each review proves it was never edited (its frozen spool
     carrier still matches the public comments, or GitHub's edit history shows
     no edit), resume posts a signed-input supersession record and opens the
-    next round instead. The superseded reviews stay as history, never count
+    next round instead (on a one-reviewer board only when the review's spool
+    carrier is still on this host; otherwise its fresh same-round turn runs).
+    The superseded reviews stay as history, never count
     toward approval and are never listed for deletion; a reviewer's pending
     exact-head evidence request is carried into the new round so a signed
     answer can clear it; the new round uses one

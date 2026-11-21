@@ -216,10 +216,6 @@ def supersede_for_signed_growth(
         or getattr(current_resume, "round_number", None) != round_number
         or getattr(current_resume, "reconciliation_record", None) is not None
         or getattr(current_resume, "evidence_boundary", None) is not None
-        # A one-reviewer board has no same-round peer, so today's fresh turn
-        # already applies.  On a larger board even a single public review is a
-        # peer for every reviewer still to launch, so the refusal would fire.
-        or len(configured_reviewer_names) < 2
         # At least one published review must be rejected for growth.
         or not completed_by_name
         or set(completed_by_name) & set(resumed_by_name)
@@ -241,6 +237,16 @@ def supersede_for_signed_growth(
         states[name] = state
         if name not in completed_by_name and state[0] not in _UNPUBLISHED_STATES:
             return current_resume
+    # A one-reviewer board has no same-round peer: without a retained carrier
+    # today's fresh same-round turn already works (and keeps the reviewer's
+    # own durable evidence requests in its round).  A retained carrier cannot
+    # be resumed against the grown signed set, so that case rolls over too.
+    # On a larger board even one public review is a peer for every reviewer
+    # still to launch, so today's path would refuse.
+    if len(configured_reviewer_names) < 2 and not any(
+        states.get(name, ("absent", None))[0] == "carrier" for name in completed_by_name
+    ):
+        return current_resume
     ids_by_name: dict[str, tuple[int, ...]] = {}
     for name, record in completed_by_name.items():
         ids = review_comment_ids(comments, record)

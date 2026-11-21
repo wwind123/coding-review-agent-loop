@@ -184,9 +184,7 @@ round, approved-plan, acquisition or seat-binding change), except where the
 classification-only resume below admits it (#2035), or where the signed set
 only grew (#2054).
 
-When every published review of an unreconciled same-head round on a board of
-at least two reviewers (one public review is already a peer for every reviewer
-still to launch; a one-reviewer board keeps today's fresh same-round turn) is
+When every published review of an unreconciled same-head round is
 rejected only because the signed requirement set grew
 since publication (a strict digest superset,
 with the same round, head, seat binding, approved plan and acquisition
@@ -206,7 +204,11 @@ record carries the ledger resume rebuilt for round N (its input ledger plus the
 durable evidence requests resume already restores for reviews invalidated by
 new input, so a signed answer can clear them, #1922), the superseded reviewers
 (agent, anchor comment ID, integrity route), the old and new surfaced IDs and
-the item-number high-water mark. A malformed payload never closes a round. On
+the item-number high-water mark. On a board of two or more reviewers one
+public review is already a peer for every reviewer still to launch. A
+one-reviewer board rolls over only when its published review's carrier is
+still spooled, because that carrier cannot be resumed against the grown set;
+without a carrier its fresh same-round turn already applies. A malformed payload never closes a round. On
 resume the record closes round N like a reconciliation with no completed
 reviews, so an interrupted rerun rolls over without a second record. Reviewer
 records it supersedes are inert for resume, panel evidence and scheduler

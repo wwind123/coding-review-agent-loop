@@ -806,3 +806,67 @@ def test_managed_ci_rollover_workflow_keeps_authorization_and_correlates_new_rec
     # The checkpoint, round-1 reviews and every other earlier comment are retained.
     assert [c["body"] for c in runner.pr_payload["comments"][:len(kept)]] == kept
     assert by_id and _no_deletes(runner)
+
+
+def _single_reviewer_publication(tmp_path, monkeypatch, *, carrier):
+    """Run A on a one-reviewer board: Codex publishes, then its classification
+    continuation fails, leaving the round unreconciled."""
+    from pr_loop_test_helpers import _evidence_review
+    runner = FakeRunner()
+    if carrier:
+        runner.authenticated_actor = _ACTOR
+        runner.serve_rest_issue_comments = True
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy run.", 1))
+    (rid,) = _rids(runner)
+    config = make_config(tmp_path, reviewer=("codex",), review_parallel=True)
+    bad = _classified_review([_association(rid, "mixed", leftover="Fix retries.")])
+    runner.codex_outputs = [_evidence_review(), bad, bad]
+    with monkeypatch.context() as patch:
+        if carrier:
+            patch.setattr(ReviewRoundSpool, "remove", lambda self, name: None)
+            patch.setattr(ReviewRoundSpool, "discard", lambda self: None)
+        with pytest.raises(AgentLoopError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert [r.metadata.agent for r in _pr_records(runner) if r.metadata.role == "reviewer"] == ["Codex"]
+    return runner, config
+
+
+def test_single_reviewer_board_with_retained_carrier_rolls_over(tmp_path, monkeypatch):
+    """Review item-4: with one configured reviewer and its complete carrier still
+    spooled, the same-round resume cannot revalidate against the grown set; pure
+    growth must roll over instead of stopping for partial-round recovery."""
+    runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=True)
+    spool = _round_spool(tmp_path, config)
+    assert spool.publication_state("Codex")[0] == "carrier"
+    carrier_before = spool.publication_state("Codex")
+    _follow_hint(runner)
+    rids = _rids(runner)
+    runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True)]
+    before = len(_agent_commands(runner))
+    kept = [c["body"] for c in runner.pr_payload["comments"]]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    (record,) = _supersessions(runner)
+    assert record.metadata.signed_input_supersession["superseded"] == [
+        {"agent": "Codex", "comment_id": record.metadata.signed_input_supersession["superseded"][0]["comment_id"],
+         "route": "carrier"}]
+    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
+    assert [r.metadata.agent for r in round_two] == ["Codex"]
+    assert _agent_commands(runner)[before:] == ["codex"]
+    assert [c["body"] for c in runner.pr_payload["comments"][:len(kept)]] == kept
+    assert spool.publication_state("Codex") == carrier_before
+    assert _no_deletes(runner)
+    assert not any("Delete these" in c or "partial-round recovery" in c for c in runner.comments)
+
+
+def test_single_reviewer_board_without_carrier_keeps_same_round_turn(tmp_path, monkeypatch):
+    """Control for item-4: with no retained carrier the one-reviewer fresh turn in
+    the same round still works, so no supersession record is posted."""
+    runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=False)
+    _follow_hint(runner)
+    rids = _rids(runner)
+    runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True)]
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not _supersessions(runner)
+    assert [r.metadata.round_number for r in _pr_records(runner) if r.metadata.role == "reviewer"] == [1, 1]
