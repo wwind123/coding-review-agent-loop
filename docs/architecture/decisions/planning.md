@@ -43,3 +43,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-21: A refused `tests_run` display-partition entry gets its own `tests-run-workdir` reason and a `tests_run`-specific re-ask inside the shared single allowance, because the citation-only wording left the coder resubmitting the same entry; a non-eligible evidence rejection logs its first refusing term (#2052).
 
 - 2026-11-21: Context classification requires every shell expansion of an operand to lie provably outside, and a measurement clause must launch a PATH-named or toolchain-directory program without operand-supplying wrappers, so a clause-local invalid program cannot be masked by another clause's outside target (#2052).
+
+- 2026-11-21: Outside-only classification trusts only shell-literal tokens (no `$`, backtick or leading `~` anywhere in a clause) and applies `path::name` selector syntax only to pytest, replacing per-case expansion patches with one rule (#2052).

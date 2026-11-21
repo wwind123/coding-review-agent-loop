@@ -2281,3 +2281,55 @@ def test_literal_selectors_and_values_stay_context_2052(measure_layout, command)
     assert workdir_guard.command_targets_outside_workdir(
         command, assigned_workdir=measure_layout.checkout
     )
+
+
+@pytest.mark.parametrize("command", [
+    # item-14: an unquoted variable in a skipped option or predicate value may add operands.
+    "du --exclude=$EXCLUDES -sk {outside}",
+    "du --exclude $EXCLUDES -sk {outside}",
+    "head -n $COUNT {outside}/f",
+    "find {outside} -name $PATTERN",
+    "find {outside} -maxdepth $DEPTH",
+    # item-11/13 restated under the same rule: any expansion anywhere in the clause.
+    "pytest {outside}/t.py -k $EXPR",
+    "du -sk {outside} `true`",
+    # item-15: selector syntax belongs to pytest only.
+    "sha256sum ../sibling/file::part",
+    "md5sum ../sibling/file::part",
+    # item-16: quoted home syntax is a literal checkout directory to the shell.
+    "du -sk '~/data'",
+    "du -sk '$HOME/data'",
+    "cd '~' && du -sk .",
+])
+def test_only_shell_literal_tokens_prove_an_outside_location_2052(measure_layout, command):
+    """Generalization (step-back): expansion syntax anywhere, and program-specific
+    selector syntax for non-pytest programs, can never prove a location."""
+    (measure_layout.checkout / "README.md").write_text("", encoding="utf-8")
+    (measure_layout.checkout / "~" / "data").mkdir(parents=True)
+    (measure_layout.parent / "sibling" / "file::part").symlink_to(
+        measure_layout.checkout / "README.md"
+    )
+    command = _measure_fmt(command, measure_layout)
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    try:
+        partition = _partition(measure_layout, [command])
+    except workdir_guard.ReportWorkdirRefusal:
+        return
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "pytest ../sibling/test_a.py::test_case[1]",
+    "python -m pytest ../sibling/test_a.py::test_case",
+    "PYTHONPATH=$PWD pytest {outside}/t.py",
+    "du --exclude='*.pyc' -sk {outside}",
+])
+def test_literal_pytest_selectors_and_assignments_stay_context_2052(measure_layout, command):
+    (measure_layout.parent / "sibling" / "test_a.py").write_text("", encoding="utf-8")
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )

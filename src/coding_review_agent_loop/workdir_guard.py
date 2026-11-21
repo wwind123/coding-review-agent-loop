@@ -1804,14 +1804,43 @@ def _launch_is_plain(tokens: Sequence[str], positions: set[int], head: int | Non
     return True
 
 
+def _is_shell_literal(token: str) -> bool:
+    """Whether a lexed token means to the shell exactly what it reads as.
+
+    The lexer drops quotes, so expansion syntax that survives lexing may or
+    may not have been expanded: ``$`` and backticks may add words, run
+    commands, or name any directory, and a leading ``~`` may be a home path
+    or a quoted literal directory.  Such a token never proves a location
+    anywhere in a clause -- operand, option value, ``find`` predicate value
+    or selector suffix (#2052).  An assignment value is not word-split, so
+    only a substitution there runs anything.
+    """
+    if VAR_ASSIGNMENT_RE.match(token):
+        value = token.split("=", 1)[1]
+        return "$(" not in value and "`" not in value
+    return "$" not in token and "`" not in token and not token.startswith("~")
+
+
+_SELECTOR_RUNNERS = frozenset({"pytest", "py.test"})
+
+
+def _runs_pytest(tokens: Sequence[str], head: int) -> bool:
+    """Whether a clause runs pytest, whose operands may be node selectors."""
+    if _program_basename(tokens[head]) in _SELECTOR_RUNNERS:
+        return True
+    return any(
+        _program_basename(token) in _SELECTOR_RUNNERS and tokens[index - 1] in {"-m", "run"}
+        for index, token in enumerate(tokens[head + 1 :], start=head + 1)
+    )
+
+
 def _literal_directory(raw: str) -> Path | None:
     """A working-directory target, or ``None`` when the shell would expand it.
 
     ``cd /work/$NAME`` or ``cd /work/*`` may land anywhere, including the
     checkout, so such a target leaves the directory unknown (#2052).
     """
-    remainder = raw[len("$HOME/"):] if raw.startswith("$HOME/") else raw
-    if set(remainder) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS):
+    if not _is_shell_literal(raw) or set(raw) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS):
         return None
     return _normalize_reported_path(raw)
 
@@ -1867,9 +1896,8 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if any(token.startswith("PATH=") for token in tokens):
         # A later bare program name may now resolve anywhere.
         log.path_modified = True
-    if any("$(" in token or "`" in token for token in tokens):
-        # A command substitution runs a command of its own wherever it sits,
-        # including inside a skipped option or predicate value (#2052).
+    if not all(_is_shell_literal(token) for token in tokens):
+        # Only what the shell takes literally can prove a location (#2052).
         log.ambiguous_target = True
     positions, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
@@ -1891,10 +1919,13 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         return
 
     cwd: Path | None = None if log.cwd_unknown else (log.cwd_path or assigned)
+    # Only pytest gives ``path::name`` selector meaning; any other program
+    # sees the whole token as a filename (#2052).
+    selector_runner = _runs_pytest(tokens, head)
 
     def locate(operand: str, *, measurement: bool = False) -> OperandLocation:
         kind, note = _operand_location(
-            operand, cwd, assigned, selector=not measurement
+            operand, cwd, assigned, selector=not measurement and selector_runner
         )
         if note is not None and not _is_path_shaped(operand):
             # The role pass already records (or, for an eligible scratch
