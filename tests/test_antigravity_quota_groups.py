@@ -1410,12 +1410,9 @@ def test_json_mode_quota_frame_is_classified_and_falls_back_by_quota(
     tmp_path, monkeypatch, returncode, response
 ):
     """The decoded 429 frame stays terminal for classification in every phase (#2029)."""
-    import json as json_module
-
     _structured_on(monkeypatch)
     failure = _json_envelope(status="ERROR", response=response, error=LIVE_SAMPLE)
-    valid_payload = json_module.JSONDecoder().raw_decode(structured_pr_review())[0]
-    success = _json_envelope(status="SUCCESS", response="prose", structured_output=valid_payload)
+    success = _json_envelope(status="SUCCESS", response="prose\n" + structured_pr_review())
     with workdir_claims.workdir_claim_scope():
         response, error, models, logs, repairs = _review_turn(
             tmp_path, [(failure, returncode), (success, 0)], models=(GEM1, OPUS),
@@ -1429,13 +1426,10 @@ def test_json_mode_quota_frame_is_classified_and_falls_back_by_quota(
 
 
 def test_json_mode_silent_envelope_still_reads_the_agy_log(tmp_path, monkeypatch, _isolated_agy_log_dir):
-    import json as json_module
-
     _structured_on(monkeypatch)
     # Only agy's known no-output warning surrounds an empty envelope.
     silent = _json_envelope(AGY_SILENT_WARNING, status="ERROR", response="")
-    valid_payload = json_module.JSONDecoder().raw_decode(structured_pr_review())[0]
-    success = _json_envelope(status="SUCCESS", response="", structured_output=valid_payload)
+    success = _json_envelope(status="SUCCESS", response=structured_pr_review())
     runner = AgyLogRunner(
         antigravity_outputs=[(silent, 0), (success, 0)], log_dir=_isolated_agy_log_dir,
         agy_logs=[AGY_429_LOG, None],

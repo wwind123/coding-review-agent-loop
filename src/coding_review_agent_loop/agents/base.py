@@ -21,8 +21,10 @@ if TYPE_CHECKING:
     from ..review_images_transport import ImageInputs, ImageDeliveryProof
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
-# ``structured_output`` is an agent-authored payload from agy's schema channel
-# (#2029); like ``response_file`` it was not scraped from stdout.
+# ``structured_output`` is an agent-authored payload rendered in code from the
+# agy JSON envelope (#2029, #2049): the single JSON object recovered from the
+# envelope's ``response`` text, never agy's own ``structured_output`` field.
+# Like ``response_file`` it was not scraped from stdout.
 AgentTextSource = Literal["response_file", "structured_output", "stdout_marker", "stdout"]
 AGENT_AUTHORED_TEXT_SOURCES = frozenset({"response_file", "structured_output"})
 
@@ -101,6 +103,12 @@ class AgentResult:
     # showing agy rejected agent-loop's request schema (INVALID_ARGUMENT
     # naming the schema).  Never derived from model prose.
     antigravity_structured_request_rejection: str | None = None
+    # Antigravity JSON mode only (#2049): a tool-authored diagnostic set when
+    # the envelope's ``response`` held more than one candidate JSON object, an
+    # object of another kind, or a footer contradicting the payload.  Built
+    # only from a fixed reason code and a count, never from model text; the
+    # validated turn records it as a format failure with no repair.
+    antigravity_structured_ambiguity: str | None = None
 
     image_delivery_proof: ImageDeliveryProof | None = None
 

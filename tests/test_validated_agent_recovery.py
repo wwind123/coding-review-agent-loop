@@ -2375,7 +2375,7 @@ def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
             )
 
     cmds = [c for c, _ in runner.commands if c[:1] == ["agy"]]
-    assert all("--json-schema" in cmd for cmd in cmds)
+    assert all("--output-format" in cmd and "--json-schema" not in cmd for cmd in cmds)
     assert [c[c.index("--model") + 1] for c in cmds] == ["Model A"]
     assert excinfo.value.failure_category == "non-retryable"
     assert repairs == []

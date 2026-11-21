@@ -1717,6 +1717,9 @@ def _issue_implementation_instruction(
     )
 
 
+_REVIEW_ENVELOPE_ONLY_KEYS = frozenset({"schema_version", "kind", "state"})
+
+
 def require_recoverable_review_substance(raw: str, *, expected_kind: str) -> None:
     """Refuse reviewer repair when the source carries no review substance.
 
@@ -1745,6 +1748,14 @@ def require_recoverable_review_substance(raw: str, *, expected_kind: str) -> Non
             raise ReviewSubstanceIntegrityError(
                 f"Reviewer repair refused: the source declares kind {kind!r}, not the "
                 f"expected `{expected_kind}`."
+            )
+        if set(payload) <= _REVIEW_ENVELOPE_ONLY_KEYS:
+            # An envelope-only payload (for example agy's key-stripped
+            # structured_output, #2049) carries no summary, finding or
+            # disposition; repair could only invent the review around it.
+            raise ReviewSubstanceIntegrityError(
+                f"Reviewer repair refused: the `{expected_kind}` source carries only "
+                "envelope keys (schema_version, kind, state) and no review substance."
             )
         return
     if not (REVIEW_KIND_UNIQUE_FIELDS[expected_kind] & set(payload)):

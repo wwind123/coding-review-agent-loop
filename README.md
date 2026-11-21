@@ -1527,8 +1527,8 @@ Gemini exhaustion goes straight to Opus; see
 `--antigravity-models`. Antigravity turns are single-shot and its usage totals
 are estimated because `agy` does not expose token counts. A model that
 repeatedly answers in chat prose with no recoverable structured payload also
-falls back to the next chain model. When `agy` supports `--json-schema`,
-structured turns use agy's schema-constrained output. Disable it with
+falls back to the next chain model. When `agy` supports `--output-format`,
+structured turns read the single JSON answer from agy's JSON envelope. Disable it with
 `--antigravity-structured-output off`; see
 [Structured output](docs/local_agent_loop.md#structured-output).
 
