@@ -1681,7 +1681,7 @@ OperandLocation = Literal["inside", "outside", "ambiguous"]
 
 
 def _operand_location(
-    raw: str, cwd: Path | None, assigned: Path
+    raw: str, cwd: Path | None, assigned: Path, *, selector: bool = False
 ) -> tuple[OperandLocation, str | None]:
     """Where a reported operand can lie, and an outside location to record.
 
@@ -1698,9 +1698,14 @@ def _operand_location(
         return path == assigned or _is_inside(path, assigned)
 
     text = raw
-    if "::" in text and text.split("::", 1)[0]:
-        # A test-node selector (``path::name[param]``) runs its file part.
-        text = text.split("::", 1)[0]
+    if selector and "::" in text and text.split("::", 1)[0]:
+        # A test runner's node selector (``path::name[param]``) runs its file
+        # part; a measurement keeps the whole filename (#2052).
+        text, _, suffix = text.partition("::")
+        if "$" in suffix or "`" in suffix:
+            # The shell may split the suffix into further operands.
+            _, note = _operand_location(text, cwd, assigned)
+            return "ambiguous", note
     if text.startswith("$HOME/"):
         text = str(Path.home()) + text[len("$HOME"):]
     elif text == "~" or text.startswith("~/"):
@@ -1862,6 +1867,10 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if any(token.startswith("PATH=") for token in tokens):
         # A later bare program name may now resolve anywhere.
         log.path_modified = True
+    if any("$(" in token or "`" in token for token in tokens):
+        # A command substitution runs a command of its own wherever it sits,
+        # including inside a skipped option or predicate value (#2052).
+        log.ambiguous_target = True
     positions, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
@@ -1883,8 +1892,10 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
 
     cwd: Path | None = None if log.cwd_unknown else (log.cwd_path or assigned)
 
-    def locate(operand: str) -> OperandLocation:
-        kind, note = _operand_location(operand, cwd, assigned)
+    def locate(operand: str, *, measurement: bool = False) -> OperandLocation:
+        kind, note = _operand_location(
+            operand, cwd, assigned, selector=not measurement
+        )
         if note is not None and not _is_path_shaped(operand):
             # The role pass already records (or, for an eligible scratch
             # option value, deliberately exempts) absolute and home paths.
@@ -1899,7 +1910,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             if kind == "outside":
                 log.note_outside(str(cwd))
         else:
-            kind = locate(operand)
+            kind = locate(operand, measurement=measurement)
         if kind == "ambiguous":
             log.ambiguous_target = True
         elif kind == "inside":

@@ -2236,3 +2236,48 @@ def test_literal_selector_and_trusted_launch_stay_context_2052(measure_layout, c
     assert workdir_guard.command_targets_outside_workdir(
         command, assigned_workdir=measure_layout.checkout
     )
+
+
+@pytest.mark.parametrize("command", [
+    # item-11: an expanding selector suffix may add operands.
+    "pytest ../sibling/test_a.py::$NODE",
+    "pytest ../sibling/test_a.py::`echo t`",
+    # item-12: a measurement keeps the whole colon-bearing filename.
+    "cat ../sibling/file::part",
+    "wc -l {parent}/sibling/file::part",
+    # item-13: a command substitution runs wherever it sits.
+    'du --exclude="$(pytest tests)" -sk {outside}',
+    'du --exclude "$(pytest tests)" -sk {outside}',
+    'find {outside} -name "$(pytest tests)"',
+    'head -n "$(pytest tests)" {outside}/f',
+    'pytest {outside}/t.py -k "$(pytest tests)"',
+])
+def test_selector_and_substitution_never_hide_checkout_work_2052(measure_layout, command):
+    """Generalization: an expansion anywhere in a clause, and a filename's full text, decide location."""
+    (measure_layout.checkout / "README.md").write_text("", encoding="utf-8")
+    sibling = measure_layout.parent / "sibling"
+    (sibling / "test_a.py").write_text("", encoding="utf-8")
+    (sibling / "file::part").symlink_to(measure_layout.checkout / "README.md")
+    command = _measure_fmt(command, measure_layout)
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    try:
+        partition = _partition(measure_layout, [command])
+    except workdir_guard.ReportWorkdirRefusal:
+        return
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "pytest ../sibling/test_a.py::test_case[1-2]",
+    "cat {outside}/x::y",
+    "du --exclude='*.pyc' -sk {outside}",
+])
+def test_literal_selectors_and_values_stay_context_2052(measure_layout, command):
+    (measure_layout.parent / "sibling" / "test_a.py").write_text("", encoding="utf-8")
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
