@@ -1800,7 +1800,8 @@ def _run_validated_agent_in_scope(
         validation_acquisition = result
         audit_result = result
         if result.text_source == "structured_output":
-            # agy's structured_output won (#2029): the rendered payload is this
+            # The payload recovered from the agy envelope won (#2029, #2049):
+            # the rendered payload is this
             # invocation's authoritative artifact. A response file the model
             # also wrote is audit-only, so artifact salvage, response-file
             # status and structured-candidate recovery see the rendered
@@ -2248,6 +2249,27 @@ def _run_validated_agent_in_scope(
                 # but yields to typed runner retry decisions (#1226, #1598).
                 should_retry = False
                 last_failure_category = "non-retryable"
+        elif (
+            backend_agent == "antigravity"
+            and antigravity_structured_kind is not None
+            and result.antigravity_structured_ambiguity is not None
+        ):
+            # The agy envelope's response held several candidate JSON objects,
+            # an object of another kind, or a contradicting footer (#2049).
+            # That is a pure format failure: classify from the tool-authored
+            # diagnostic only (never raw output or rejected payload prose, so
+            # no quota/auth/capacity path), skip repair, and let the #2029
+            # per-model format accounting decide retry or format-fallback.
+            diagnostic = result.antigravity_structured_ambiguity
+            last_error = diagnostic
+            classification_text = diagnostic
+            last_classification_text = diagnostic
+            last_failure_category = "agent-unavailable"
+            should_retry = True
+            format_failure = True
+            if usage_record is not None:
+                usage_record.validation_status = "invalid"
+            log(config, f"{agent_name}: {diagnostic}; no repair (format failure)")
         elif not text.strip():
             last_error = "agent response was empty"
             classification_text, provider_verdict = _agent_failure_classification(

@@ -2422,27 +2422,43 @@ def _payload(text):
     return json.JSONDecoder().raw_decode(text.lstrip())[0]
 
 
-def _agy_envelope(structured=None, *, status="SUCCESS", response=_NARRATED_PROSE, **extra):
+_DECLARED_KEYS = ("schema_version", "kind", "state")
+
+
+def _agy_envelope(payload=None, *, status="SUCCESS", response=_NARRATED_PROSE, **extra):
+    """An agy envelope; ``payload`` is the model's full answer object.
+
+    Like agy 1.5.12 (#2049), the payload is carried in ``response`` as one
+    fenced JSON block after the narration, while ``structured_output`` holds
+    only the keys the old request schema declared.
+    """
     envelope = {"status": status, "response": response, **extra}
-    if structured is not None:
-        envelope["structured_output"] = structured
+    if payload is not None:
+        envelope["response"] = f"{response}\n\n```json\n{json.dumps(payload, indent=2)}\n```\n"
+        envelope.setdefault(
+            "structured_output", {key: payload[key] for key in _DECLARED_KEYS if key in payload}
+        )
     # PTY start-up chrome and CRLF line endings around the envelope.
     return "\x1b[2mStarting agy 1.5.12\x1b[0m\r\n" + json.dumps(envelope) + "\r\n"
 
 
-class _SchemaCapturingRunner(FakeRunner):
-    """Captures each agy argv and the schema file content while agy runs."""
+class _ResponseDirCapturingRunner(FakeRunner):
+    """Records the private response directory's contents while agy runs."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.schemas: list[dict | None] = []
+        self.response_dir_listings: list[list[str] | None] = []
 
     def run_with_log(self, args, *, cwd, **kwargs):
-        if list(args[:1]) == ["agy"] and "--json-schema" in args:
-            path = Path(args[args.index("--json-schema") + 1])
-            self.schemas.append(json.loads(path.read_text(encoding="utf-8")))
-        elif list(args[:1]) == ["agy"]:
-            self.schemas.append(None)
+        if list(args[:1]) == ["agy"]:
+            prompt = args[-1]
+            match = re.search(r"(/\S*?/response\.md)", prompt)
+            listing: list[str] | None = None
+            if match is not None:
+                directory = Path(match.group(1)).parent
+                if directory.exists():
+                    listing = sorted(path.name for path in directory.iterdir())
+            self.response_dir_listings.append(listing)
         return super().run_with_log(args, cwd=cwd, **kwargs)
 
 
@@ -2474,29 +2490,40 @@ def _structured_config(tmp_path, kind="pr_review", **overrides):
     ],
     ids=["pr_review", "plan_review"],
 )
-def test_structured_output_is_used_when_the_model_narrates(tmp_path, monkeypatch, kind, payload_text, parse):
+def test_stripped_structured_output_never_displaces_the_response_payload(
+    tmp_path, monkeypatch, kind, payload_text, parse
+):
+    """#2049: structured_output holds only declared keys; response holds the payload."""
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
 
     _enable_agy_structured_output(monkeypatch)
     structured = _payload(payload_text)
-    runner = _SchemaCapturingRunner(antigravity_outputs=[(_agy_envelope(structured), 0)])
+    stdout = _agy_envelope(structured)
+    stripped = json.loads(stdout.split("\r\n")[1])["structured_output"]
+    assert set(stripped) == set(_DECLARED_KEYS)  # the live agy 1.5.12 shape
+    runner = _ResponseDirCapturingRunner(antigravity_outputs=[(stdout, 0)])
     config = _structured_config(tmp_path, kind)
 
     result = AntigravityBackend().run(runner, config, "Review this PR.", run_id="r", role="reviewer")
 
     cmd = runner.commands[-1][0]
     assert cmd[cmd.index("--output-format") + 1] == "json"
-    assert cmd.index("--json-schema") < cmd.index("--print")
-    schema = runner.schemas[-1]
-    assert schema["properties"]["kind"]["enum"] == [kind, "agent_unavailable"]
-    assert set(schema["required"]) == {"schema_version", "kind"}
-    assert not Path(cmd[cmd.index("--json-schema") + 1]).exists()
+    assert cmd.index("--output-format") < cmd.index("--print")
+    assert "--json-schema" not in cmd
+    assert runner.response_dir_listings[-1] is not None
+    assert not any(name.endswith(".json") for name in runner.response_dir_listings[-1])
+    assert not any(name.endswith(".json") for name in _os.listdir(result.response_file_path.parent))
     assert result.text_source == "structured_output"
     assert result.response_file_text is None
     assert _NARRATED_PROSE not in result.text
     assert result.text.rstrip().endswith("-- Google Antigravity: Gemini 4 Hydrogen (Medium)")
+    assert _payload(result.text) == structured  # the full payload, not the stripped one
+    assert structured["summary"] in result.text
+    for item in structured.get("blocking_items", []):
+        assert item in result.text
     parsed = parse(result.text)
     assert parsed.state == structured["state"]
+    assert parsed.summary == structured["summary"]
 
 
 @pytest.mark.parametrize(
@@ -2550,11 +2577,12 @@ def test_missing_structured_output_falls_back_to_file_then_marker(
     ["# Review\n\nLooks fine, approving.", structured_pr_review(state="blocking", blocking_items=["Other."])],
     ids=["invalid-markdown-file", "valid-but-different-file"],
 )
-def test_structured_output_wins_over_a_non_empty_response_file(tmp_path, monkeypatch, file_text):
+def test_non_empty_response_file_wins_over_the_envelope_payload(tmp_path, monkeypatch, file_text):
+    """#2049: a response file outranks the payload recovered from response prose."""
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
 
     _enable_agy_structured_output(monkeypatch)
-    structured = _payload(structured_pr_review(summary="From structured_output."))
+    structured = _payload(structured_pr_review(summary="From the envelope prose."))
     runner = FakeRunner(
         antigravity_outputs=[(_agy_envelope(structured), 0)],
         public_response_outputs=[file_text],
@@ -2563,24 +2591,20 @@ def test_structured_output_wins_over_a_non_empty_response_file(tmp_path, monkeyp
 
     result = AntigravityBackend().run(runner, config, "Review this PR.", run_id="r", role="reviewer")
 
-    assert result.text_source == "structured_output"
-    assert result.response_file_text == file_text.strip()  # retained for audit
-    assert "From structured_output." in result.text
-    assert file_text.strip() not in result.text  # never merged
-    assert parse_pr_review(result.text, reviewer="Antigravity").state == "approved"
+    assert result.text_source == "response_file"
+    assert result.text == file_text.strip()
+    assert "From the envelope prose." not in result.text  # never merged
+    assert result.antigravity_structured_ambiguity is None
 
 
 @pytest.mark.parametrize("returncode", [0, 1], ids=["zero-exit", "nonzero-exit"])
-def test_validated_turn_accepts_structured_output_over_invalid_file_without_repair(
+def test_validated_turn_accepts_the_recovered_envelope_payload_without_repair(
     tmp_path, monkeypatch, returncode
 ):
     _enable_agy_structured_output(monkeypatch)
     structured = _payload(structured_pr_review(summary="From structured_output."))
     runner = FakeRunner(
         antigravity_outputs=[(_agy_envelope(structured), returncode)],
-        # A valid but different review in the file: neither salvage nor
-        # structured-candidate recovery may prefer it.
-        public_response_outputs=[structured_pr_review(state="blocking", blocking_items=["From file."])],
     )
     config = make_config(tmp_path, antigravity_model="Gemini 4 Hydrogen (Medium)", agent_max_retries=0)
     repairs: list[object] = []
@@ -2605,7 +2629,6 @@ def test_validated_turn_accepts_structured_output_over_invalid_file_without_repa
     assert repairs == []
     assert response.marker_value.state == "approved"
     assert "From structured_output." in response.text
-    assert "From file." not in response.text
     assert len([c for c, _ in runner.commands if c[:1] == ["agy"]]) == 1
 
 
@@ -2696,7 +2719,7 @@ def test_structured_agent_unavailable_keeps_availability_handling(tmp_path, monk
 
 @pytest.mark.parametrize(
     "case",
-    ["old-help", "probe-error", "probe-nonzero", "off", "operator-output-format"],
+    ["old-help", "probe-error", "probe-nonzero", "off", "operator-output-format", "operator-json-schema"],
 )
 def test_capability_gate_keeps_legacy_args(tmp_path, monkeypatch, case):
     from coding_review_agent_loop.agents import antigravity_structured
@@ -2721,8 +2744,12 @@ def test_capability_gate_keeps_legacy_args(tmp_path, monkeypatch, case):
         overrides["antigravity_structured_output"] = "off"
     if case == "operator-output-format":
         overrides["antigravity_args"] = ("--output-format=text",)
+    if case == "operator-json-schema":
+        overrides["antigravity_args"] = ("--json-schema=/tmp/operator-schema.json",)
     config = _structured_config(tmp_path, **overrides)
-    runner = FakeRunner(antigravity_outputs=[("first review", 0), ("second review", 0)])
+    # A recoverable payload in an envelope must not be used on the legacy channel.
+    envelope = _agy_envelope(_payload(structured_pr_review()))
+    runner = FakeRunner(antigravity_outputs=[("first review", 0), (envelope, 0)])
 
     first = AntigravityBackend().run(runner, config, "Review this PR.", run_id="r", role="reviewer")
     second = AntigravityBackend().run(runner, config, "Review this PR.", run_id="r", role="reviewer")
@@ -2732,9 +2759,10 @@ def test_capability_gate_keeps_legacy_args(tmp_path, monkeypatch, case):
             assert "--json-schema" not in cmd
             assert "--output-format" not in cmd
     assert first.text == "first review" and first.text_source == "stdout"
-    assert second.text == "second review"
+    assert second.text == envelope and second.text_source == "stdout"  # no envelope recovery
+    assert second.antigravity_structured_ambiguity is None
     # Probed at most once per command path; never for off/operator overrides.
-    assert len(probes) == (0 if case in {"off", "operator-output-format"} else 1)
+    assert len(probes) == (0 if case in {"off", "operator-output-format", "operator-json-schema"} else 1)
 
 
 def test_capability_probe_runs_once_when_supported(tmp_path, monkeypatch):
@@ -2746,7 +2774,21 @@ def test_capability_probe_runs_once_when_supported(tmp_path, monkeypatch):
     AntigravityBackend().run(runner, config, "Review.", run_id="r", role="reviewer")
     AntigravityBackend().run(runner, config, "Review.", run_id="r", role="reviewer")
     assert probes == ["agy"]
-    assert all("--json-schema" in cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"])
+    agy = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"]]
+    assert agy and all(
+        cmd[cmd.index("--output-format") + 1] == "json" and "--json-schema" not in cmd for cmd in agy
+    )
+
+
+def test_capability_probe_needs_only_output_format():
+    from coding_review_agent_loop.agents.antigravity_structured import (
+        help_text_supports_structured_output,
+    )
+
+    assert help_text_supports_structured_output("Usage: agy\n  --output-format string   text|json\n")
+    assert help_text_supports_structured_output(_AGY_HELP_WITH_SCHEMA)
+    assert not help_text_supports_structured_output("Usage: agy\n  --json-schema string\n")
+    assert not help_text_supports_structured_output("Usage: agy\n  --print string\n")
 
 
 @pytest.mark.parametrize(
@@ -2814,7 +2856,7 @@ def test_validated_turn_threads_eligibility_into_the_agy_argv(
     tmp_path, monkeypatch, expected_kind, turn_kwargs, flags_expected
 ):
     _enable_agy_structured_output(monkeypatch)
-    runner = _SchemaCapturingRunner(antigravity_outputs=[("ok", 0)])
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
     config = make_config(tmp_path, agent_max_retries=0)
 
     _run_validated_agent(
@@ -2829,10 +2871,8 @@ def test_validated_turn_threads_eligibility_into_the_agy_argv(
     )
 
     cmd = [c for c, _ in runner.commands if c[:1] == ["agy"]][-1]
-    assert ("--json-schema" in cmd) is flags_expected
+    assert "--json-schema" not in cmd
     assert ("--output-format" in cmd) is flags_expected
-    if flags_expected:
-        assert runner.schemas[-1]["properties"]["kind"]["enum"] == [expected_kind, "agent_unavailable"]
 
 
 @pytest.mark.parametrize("role", ["repair", "semantic-dedupe"])
@@ -2878,7 +2918,8 @@ def test_oversized_directive_names_the_output_channel(tmp_path, monkeypatch, str
     assert all(prompt not in arg for arg in cmd)
     assert str(result.response_file_path) in directive
     assert "Do not answer in chat" in directive
-    assert ("structured result" in directive) is structured
+    assert ("exactly one JSON object" in directive) is structured
+    assert "schema" not in directive
     assert len(directive.encode("utf-8")) < 2_000
 
 
@@ -2917,46 +2958,6 @@ _SCHEMA_REJECTION = (
 )
 
 
-def _walk_schema_nodes(node, path="$"):
-    if isinstance(node, dict):
-        yield path, node
-        for key, value in node.items():
-            yield from _walk_schema_nodes(value, f"{path}.{key}")
-    elif isinstance(node, list):
-        for index, value in enumerate(node):
-            yield from _walk_schema_nodes(value, f"{path}[{index}]")
-
-
-from coding_review_agent_loop.agents.antigravity_structured import (  # noqa: E402
-    STRUCTURED_KIND_FOOTERS as _STRUCTURED_KIND_FOOTERS,
-)
-
-
-@pytest.mark.parametrize("kind", sorted(_STRUCTURED_KIND_FOOTERS))
-def test_structured_schema_uses_only_gemini_compatible_enums(tmp_path, kind):
-    from coding_review_agent_loop.agents.antigravity_structured import (
-        structured_output_schema,
-        write_structured_output_schema,
-    )
-
-    written = json.loads(write_structured_output_schema(tmp_path, kind).read_text(encoding="utf-8"))
-    for schema in (structured_output_schema(kind), written):
-        enum_nodes = 0
-        for path, node in _walk_schema_nodes(schema):
-            if "enum" not in node:
-                continue
-            enum_nodes += 1
-            assert node.get("type") == "string", f"{path}: enum on a non-string type"
-            assert node["enum"], f"{path}: empty enum"
-            for value in node["enum"]:
-                assert isinstance(value, str) and value.strip(), f"{path}: bad enum value {value!r}"
-        assert schema["properties"]["schema_version"] == {"type": "integer"}
-        assert schema["properties"]["kind"]["enum"] == [kind, "agent_unavailable"]
-        assert schema["properties"]["state"]["enum"] == ["approved", "blocking"]
-        assert schema["required"] == ["schema_version", "kind"]
-        assert enum_nodes == 2
-
-
 def test_validated_turn_rejects_structured_output_with_wrong_schema_version(tmp_path, monkeypatch):
     _enable_agy_structured_output(monkeypatch)
     structured = _payload(structured_pr_review())
@@ -2977,7 +2978,7 @@ def test_validated_turn_rejects_structured_output_with_wrong_schema_version(tmp_
         )
     assert "schema_version" in str(excinfo.value)
     cmds = [c for c, _ in runner.commands if c[:1] == ["agy"]]
-    assert len(cmds) == 1 and "--json-schema" in cmds[0]
+    assert len(cmds) == 1 and "--output-format" in cmds[0] and "--json-schema" not in cmds[0]
 
 
 @pytest.mark.parametrize(
@@ -3152,8 +3153,8 @@ def test_validated_turn_replays_once_without_schema_after_request_rejection(tmp_
 
     cmds = _agy_cmds(runner)
     assert len(cmds) == 2
-    assert "--json-schema" in cmds[0] and "--output-format" in cmds[0]
-    assert "--json-schema" not in cmds[1] and "--output-format" not in cmds[1]
+    assert "--output-format" in cmds[0] and "--json-schema" not in cmds[0]
+    assert "--output-format" not in cmds[1]
     assert cmds[0][cmds[0].index("--model") + 1] == cmds[1][cmds[1].index("--model") + 1]
     # Same prompt (each attempt has its own response path), not a corrective re-prompt.
     assert re.sub(r"turn-[0-9a-f]+", "turn-X", cmds[0][-1]) == re.sub(r"turn-[0-9a-f]+", "turn-X", cmds[1][-1])
@@ -3183,7 +3184,7 @@ def test_validated_turn_replays_after_silent_exit_with_rejection_in_agy_log(
 
     cmds = _agy_cmds(runner)
     assert len(cmds) == 2
-    assert "--json-schema" in cmds[0] and "--json-schema" not in cmds[1]
+    assert "--output-format" in cmds[0] and "--output-format" not in cmds[1]
     assert repairs == []
     assert sum(_REPLAY_WARNING in line for line in logs) == 1
     assert "After silent rejection." in response.text
@@ -3207,7 +3208,7 @@ def test_failed_replay_is_classified_normally_without_a_second_fallback(tmp_path
 
     cmds = _agy_cmds(runner)
     assert len(cmds) == 2
-    assert "--json-schema" not in cmds[1]
+    assert "--output-format" not in cmds[1]
     assert sum(_REPLAY_WARNING in line for line in logs) == 1
     assert "exited with 3" in str(excinfo.value)
 
@@ -3276,5 +3277,308 @@ def test_success_envelope_prose_quoting_the_rejection_gets_no_replay(tmp_path, m
 
     cmds = _agy_cmds(runner)
     assert not any(_REPLAY_WARNING in line for line in logs)
-    # Any later attempt keeps the schema flags: no free schema-off attempt.
-    assert all("--json-schema" in cmd for cmd in cmds)
+    # Any later attempt keeps the JSON flag: no free structured-off attempt.
+    assert all("--output-format" in cmd for cmd in cmds)
+
+
+# --- Envelope response recovery and ambiguity (#2049) -------------------------
+
+_PROSE_NOISE_BEFORE = (
+    "1. I read the diff.\n2 files changed; tests pass: true, flaky: null.\n"
+    "See step [2] and the list [1, 2, 3].\n"
+)
+_PROSE_NOISE_AFTER = "\nDone. Count: 3, ok: true, missing: null, items [2].\n"
+
+
+def _recover(response, kind="pr_review"):
+    from coding_review_agent_loop.agents.antigravity_structured import recover_response_payload
+
+    return recover_response_payload(response, kind)
+
+
+def _fenced(payload):
+    return f"```json\n{json.dumps(payload, indent=2)}\n```"
+
+
+@pytest.mark.parametrize("fenced", [True, False], ids=["fenced", "bare"])
+def test_recovery_counts_one_object_amid_prose_scalars_and_arrays(fenced):
+    from coding_review_agent_loop.agents.antigravity_structured import RecoveredPayload
+
+    payload = _payload(structured_pr_review(state="blocking", blocking_items=["Fix [2] now."]))
+    body = _fenced(payload) if fenced else json.dumps(payload)
+    outcome = _recover(_PROSE_NOISE_BEFORE + body + _PROSE_NOISE_AFTER)
+    assert isinstance(outcome, RecoveredPayload)
+    assert outcome.payload == payload  # never edited
+
+
+def test_recovery_ignores_a_footer_quoted_inside_the_object():
+    from coding_review_agent_loop.agents.antigravity_structured import RecoveredPayload
+
+    payload = _payload(structured_pr_review(
+        summary="The doc example shows <!-- AGENT_STATE: blocking --> as a footer.",
+    ))
+    outcome = _recover("Narration.\n" + _fenced(payload))
+    assert isinstance(outcome, RecoveredPayload) and outcome.payload["state"] == "approved"
+
+
+def test_recovery_accepts_a_matching_footer_and_agent_unavailable():
+    from coding_review_agent_loop.agents.antigravity_structured import RecoveredPayload
+
+    assert isinstance(_recover(structured_pr_review()), RecoveredPayload)
+    unavailable = {"schema_version": 1, "kind": "agent_unavailable", "retryable": True,
+                   "category": "tooling", "summary": "x", "suggested_action": "y"}
+    assert isinstance(_recover(_fenced(unavailable)), RecoveredPayload)
+    assert _recover("No JSON here, just [1, 2] and true.") is None
+    assert _recover("") is None
+    # An undecodable brace is skipped, not counted.
+    assert _recover("A {broken brace and prose.") is None
+
+
+@pytest.mark.parametrize(
+    "response,reason,count",
+    [
+        (
+            _fenced(_payload(structured_pr_review())) + "\n" + _fenced(_payload(structured_pr_review(state="blocking", blocking_items=["x"]))),
+            "multiple-candidates", 2,
+        ),
+        (
+            json.dumps(_payload(structured_pr_review(state="blocking", blocking_items=["Before."])))
+            + f"\n{PUBLIC_RESPONSE_MARKER}\n" + structured_pr_review(summary="After the marker."),
+            "multiple-candidates", 2,
+        ),
+        ("Intro {\"note\": 1}\n" + _fenced(_payload(structured_pr_review())), "multiple-candidates", 2),
+        (_fenced(_payload(structured_plan_review())), "wrong-kind", 1),
+        (_fenced({"schema_version": 1, "state": "approved", "summary": "x"}), "wrong-kind", 1),
+        (_fenced(_payload(structured_pr_review())) + "\n<!-- AGENT_STATE: blocking -->", "footer-state-conflict", 1),
+    ],
+    ids=["two-fences", "across-marker", "stray-object", "other-kind", "no-kind", "footer-conflict"],
+)
+def test_recovery_ambiguity_carries_only_a_reason_code_and_count(response, reason, count):
+    from coding_review_agent_loop.agents.antigravity_structured import AmbiguousPayload
+
+    outcome = _recover(response)
+    assert isinstance(outcome, AmbiguousPayload)
+    assert (outcome.reason, outcome.candidate_count) == (reason, count)
+    assert outcome.diagnostic.startswith(f"Antigravity response carried {count} ")
+    assert reason in outcome.diagnostic and "no payload selected" in outcome.diagnostic
+    for model_text in ("After the marker", "Review complete", "Before."):
+        assert model_text not in outcome.diagnostic
+
+
+def test_backend_recovers_a_fenced_payload_when_no_response_file_exists(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    payload = _payload(structured_plan_review(state="blocking", blocking_plan_issues=["Step 3 is unsafe."]))
+    stdout = _agy_envelope(response=_PROSE_NOISE_BEFORE + _fenced(payload) + _PROSE_NOISE_AFTER)
+    runner = FakeRunner(antigravity_outputs=[(stdout, 0)])
+    config = _structured_config(tmp_path, "plan_review")
+
+    result = AntigravityBackend().run(runner, config, "Review this plan.", run_id="r", role="reviewer")
+
+    assert result.response_file_text is None
+    assert result.text_source == "structured_output"
+    assert result.antigravity_structured_ambiguity is None
+    assert "<!-- AGENT_PLAN_STATE: blocking -->" in result.text
+    assert result.text.rstrip().endswith("-- Google Antigravity: Gemini 4 Hydrogen (Medium)")
+    parsed = parse_plan_review(result.text, reviewer="Antigravity")
+    assert parsed.state == "blocking"
+    assert "Step 3 is unsafe." in result.text
+
+
+def test_backend_blank_state_object_falls_through_to_the_marker_path(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    payload = _payload(structured_pr_review())
+    payload["state"] = "  "
+    response = "Narration.\n" + _fenced(payload)
+    runner = FakeRunner(antigravity_outputs=[(_agy_envelope(response=response), 0)])
+
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+
+    assert result.text_source == "stdout"
+    assert result.text == response  # not rendered, no state invented
+    assert "AGENT_STATE" not in result.text and "Google Antigravity" not in result.text
+    assert result.antigravity_structured_ambiguity is None
+
+
+def test_backend_ambiguous_response_returns_empty_text_and_a_typed_diagnostic(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    response = structured_pr_review(summary="First.") + f"\n{PUBLIC_RESPONSE_MARKER}\n" + structured_pr_review(summary="Second.")
+    stdout = _agy_envelope(response=response)
+    runner = FakeRunner(antigravity_outputs=[(stdout, 0)])
+
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+
+    assert result.text == "" and result.text_source == "stdout"
+    assert result.raw_output == stdout  # kept for audit
+    assert result.antigravity_structured_ambiguity == (
+        "Antigravity response carried 2 candidate JSON objects (multiple-candidates); "
+        "no payload selected"
+    )
+    assert result.provider_error_text is None
+
+
+def test_backend_non_success_envelope_never_recovers_from_prose(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    _enable_agy_structured_output(monkeypatch)
+    payload = _payload(structured_pr_review())
+    stdout = _agy_envelope(payload, status="ERROR", error="RESOURCE_EXHAUSTED (code 429)")
+    runner = FakeRunner(antigravity_outputs=[(stdout, 0)])
+
+    result = AntigravityBackend().run(runner, _structured_config(tmp_path), "Review.", run_id="r", role="reviewer")
+
+    assert result.provider_error_text == "RESOURCE_EXHAUSTED (code 429)"
+    assert result.text_source == "stdout"
+    assert "Google Antigravity" not in result.text  # not rendered in code
+    assert result.antigravity_structured_ambiguity is None
+
+
+def test_validated_turn_accepts_a_single_recovered_object_amid_noise(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    payload = _payload(structured_pr_review(state="blocking", blocking_items=["Fix calc.py:3."]))
+    response = _PROSE_NOISE_BEFORE + json.dumps(payload) + _PROSE_NOISE_AFTER
+    runner = FakeRunner(antigravity_outputs=[(_agy_envelope(response=response), 0)])
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    response_obj = _run_structured_review_turn(runner, config, logs, repairs)
+
+    assert repairs == []
+    assert response_obj.marker_value.state == "blocking"
+    assert "Fix calc.py:3." in response_obj.text
+
+
+_PROVIDER_LIKE = "quota exhausted; RESOURCE_EXHAUSTED (code 429); unauthorized: invalid api key"
+
+
+def _ambiguous_envelope():
+    first = _payload(structured_pr_review(summary=f"First: {_PROVIDER_LIKE}"))
+    second = _payload(structured_pr_review(state="blocking", blocking_items=[_PROVIDER_LIKE]))
+    return _agy_envelope(response=f"{_fenced(first)}\n{_PROVIDER_LIKE}\n{_fenced(second)}")
+
+
+def _spy_classifiers(monkeypatch):
+    from coding_review_agent_loop import validated_agent
+
+    calls: list[str] = []
+    real_capacity = validated_agent.classify_antigravity_capacity
+    real_failure = validated_agent._agent_failure_classification
+
+    def capacity(text, **kwargs):
+        calls.append(f"capacity:{text}")
+        return real_capacity(text, **kwargs)
+
+    def failure(result, **kwargs):
+        calls.append("failure-classification")
+        return real_failure(result, **kwargs)
+
+    monkeypatch.setattr(validated_agent, "classify_antigravity_capacity", capacity)
+    monkeypatch.setattr(validated_agent, "_agent_failure_classification", failure)
+    return calls
+
+
+def test_ambiguity_is_a_trusted_format_failure_that_falls_back_down_the_chain(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    calls = _spy_classifiers(monkeypatch)
+    valid = _agy_envelope(_payload(structured_pr_review(summary="From Model B.")))
+    runner = FakeRunner(
+        antigravity_outputs=[(_ambiguous_envelope(), 0), (_ambiguous_envelope(), 0), (valid, 0)],
+    )
+    config = make_config(
+        tmp_path,
+        antigravity_models=("Model A", "Model B"),
+        agent_max_retries=1,
+        agent_retry_backoff_seconds=0,
+    )
+    logs: list[str] = []
+    repairs: list[int] = []
+
+    response = _run_structured_review_turn(runner, config, logs, repairs)
+
+    models = [c[c.index("--model") + 1] for c in _agy_cmds(runner)]
+    assert models == ["Model A", "Model A", "Model B"]
+    assert repairs == []
+    assert calls == []  # no capacity/quota/auth classification of model text
+    assert any("Model A produced no recoverable structured payload 2 times" in line for line in logs)
+    assert not any("quota" in line.lower() and "skipping" in line.lower() for line in logs)
+    assert not any("agent response was empty" in line for line in logs)
+    assert response.marker_value.state == "approved"
+    assert "From Model B." in response.text
+
+
+def test_ambiguity_classification_text_is_only_the_trusted_diagnostic(tmp_path, monkeypatch):
+    _enable_agy_structured_output(monkeypatch)
+    calls = _spy_classifiers(monkeypatch)
+    runner = FakeRunner(antigravity_outputs=[(_ambiguous_envelope(), 0)])
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[int] = []
+    from coding_review_agent_loop import validated_agent
+
+    captured: list[dict] = []
+    real_diagnostics = validated_agent._failed_run_diagnostics
+
+    def diagnostics(**kwargs):
+        captured.append(kwargs)
+        return real_diagnostics(**kwargs)
+
+    monkeypatch.setattr(validated_agent, "_failed_run_diagnostics", diagnostics)
+
+    with pytest.raises(AgentInvocationError) as excinfo:
+        _run_structured_review_turn(runner, config, logs, repairs)
+
+    diagnostic = (
+        "Antigravity response carried 2 candidate JSON objects (multiple-candidates); "
+        "no payload selected"
+    )
+    assert excinfo.value.failure_category == "agent-unavailable"
+    assert repairs == [] and calls == []
+    assert captured[-1]["classification_text"] == diagnostic
+    assert captured[-1]["failure_reason"] == diagnostic
+    assert len(_agy_cmds(runner)) == 1
+
+
+@pytest.mark.parametrize(
+    "kind,parse",
+    [
+        ("pr_review", lambda text: parse_pr_review(text, reviewer="Antigravity")),
+        ("plan_review", lambda text: parse_plan_review(text, reviewer="Antigravity")),
+    ],
+    ids=["pr_review", "plan_review"],
+)
+def test_bare_approved_envelope_payload_never_yields_an_approval(tmp_path, monkeypatch, kind, parse):
+    """#2049 item 3: {schema_version, kind, state: approved} is no review."""
+    from coding_review_agent_loop import validated_agent
+
+    _enable_agy_structured_output(monkeypatch)
+    bare = {"schema_version": 1, "kind": kind, "state": "approved"}
+    runner = FakeRunner(antigravity_outputs=[(_agy_envelope(response=_fenced(bare)), 0)])
+    config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
+    backend_repairs: list[int] = []
+
+    def record_backend_repair(*_a, **_k):
+        backend_repairs.append(1)
+        return None
+
+    monkeypatch.setattr(validated_agent, "attempt_repair", record_backend_repair)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        _run_validated_agent(
+            runner,
+            agent="antigravity",
+            config=config,
+            prompt="Review.",
+            marker_description=f"structured {kind}",
+            validate=parse,
+            use_repair=True,
+            repair_expected_kind=kind,
+            role="reviewer",
+        )
+    assert backend_repairs == []
+    assert excinfo.value.failure_category == "agent-unavailable"
+    assert "carries only envelope keys" in str(excinfo.value)

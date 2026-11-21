@@ -5858,3 +5858,41 @@ def test_configured_reviewer_repair_carrying_dispositions_field_is_accepted(tmp_
     assert parsed.dropped_human_requirement_dispositions is True
     assert parsed.blocking_items == without.blocking_items
     assert parsed.dispositions == without.dispositions
+
+
+# --- Issue #2049: envelope-only reviewer payloads ------------------------------
+
+
+@pytest.mark.parametrize("expected_kind", ["pr_review", "plan_review"])
+@pytest.mark.parametrize("state", ["approved", "blocking", None])
+@pytest.mark.parametrize("fenced", [False, True], ids=["bare", "fenced"])
+def test_envelope_only_reviewer_payload_is_refused_repair(expected_kind, state, fenced):
+    payload = {"schema_version": 1, "kind": expected_kind}
+    if state is not None:
+        payload["state"] = state
+    body = json.dumps(payload)
+    source = f"```json\n{body}\n```" if fenced else body
+    with pytest.raises(ReviewSubstanceIntegrityError, match="only envelope keys"):
+        require_recoverable_review_substance(source, expected_kind=expected_kind)
+
+
+def test_envelope_only_approval_fails_the_strict_parsers():
+    from coding_review_agent_loop.protocol import parse_plan_review, parse_pr_review
+
+    for kind, footer, parse in (
+        ("pr_review", "AGENT_STATE", parse_pr_review),
+        ("plan_review", "AGENT_PLAN_STATE", parse_plan_review),
+    ):
+        text = (
+            json.dumps({"schema_version": 1, "kind": kind, "state": "approved"})
+            + f"\n\n<!-- {footer}: approved -->\n-- Google Antigravity: Gemini"
+        )
+        with pytest.raises(AgentLoopError):
+            parse(text, reviewer="Antigravity")
+
+
+def test_envelope_plus_one_review_field_is_still_admitted():
+    require_recoverable_review_substance(
+        json.dumps({"schema_version": 1, "kind": "pr_review", "state": "approved", "summary": "LGTM."}),
+        expected_kind="pr_review",
+    )

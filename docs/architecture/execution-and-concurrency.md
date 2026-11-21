@@ -530,13 +530,13 @@ and an all-groups-cooling state stops before invoking. Only when every group
 carries a parsed long reset is `QuotaResetExceededError` raised. Memory is not
 persisted across processes.
 
-**Antigravity structured output (#2029, #2039).**
-`agents/antigravity_structured.py` adds agy's `--json-schema` channel (string
-enums only) for eligible kinds after a cached probe. A renderable
-`structured_output` wins; validators stay authoritative. No-payload turns get
-a retry-free `format-fallback`. A schema-naming INVALID_ARGUMENT in provider
-diagnostics (not model prose) replays the dispatch once per turn without schema
-flags: no retry, format failure or repair. See the
+**Antigravity structured output (#2029, #2039, #2049).**
+`agents/antigravity_structured.py` requests agy's schema-free
+`--output-format json` envelope for eligible kinds. Answer: response file, else
+the one expected-kind object in `response` (footer/signature added in code),
+else the marker; `structured_output` is ignored. Ambiguity (several objects,
+wrong kind, contradicting footer) is a trusted, repair-free format failure
+feeding `format-fallback`. Envelope-only reviews are refused repair. See the
 [CLI guide](../local_agent_loop.md#structured-output).
 
 **Quota reset wait.** `--wait-for-quota-reset DURATION` (off by default) turns

@@ -1,23 +1,27 @@
-"""agy schema-constrained output for structured Antigravity turns (#2029).
+"""agy JSON-envelope output for structured Antigravity turns (#2029, #2049).
 
 Some Gemini models answer in chat markdown even when a turn asks for a JSON
-response file.  agy can constrain the final answer with ``--output-format json
---json-schema <file>``: the CLI then prints a JSON envelope whose
-``structured_output`` field holds a schema-valid object even when the model's
-``response`` prose is narration.
+response file.  agy's ``--output-format json`` wraps the turn in a JSON
+envelope whose ``response`` field holds the model's final answer text.  No
+request schema is sent: agy's ``--json-schema`` channel keeps only the
+properties a schema declares in ``structured_output`` (#2049), so a loose
+schema stripped every review field and a full nested schema is not accepted
+by Gemini function declarations (#2039).
 
 This module holds the pure pieces of that channel:
 
 * a cached capability probe, so an older agy keeps the legacy channel;
 * the eligibility rule for a turn (allowlisted kind, and no content the
   contract requires outside the JSON object, footer and signature);
-* a loose per-kind schema that also admits the shared ``agent_unavailable``
-  alternative;
-* a tolerant envelope parser and a renderer that rebuilds the public text
-  (JSON, footer marker, signature) in code.
+* a tolerant envelope parser;
+* single-object recovery from the envelope's ``response`` text, which is a
+  format failure when the text holds more than one candidate object, an
+  object of another kind, or a footer contradicting the payload;
+* a renderer that rebuilds the public text (JSON, footer marker, signature)
+  in code.
 
-The schema only shapes the payload.  The protocol validators stay
-authoritative for every rendered response.
+``structured_output`` is never the answer source.  The protocol validators
+stay authoritative for every rendered response.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import threading
@@ -52,8 +57,10 @@ STRUCTURED_KIND_FOOTERS: dict[str, str] = {
 }
 AGENT_UNAVAILABLE_KIND = "agent_unavailable"
 _AGENT_UNAVAILABLE_FOOTER = "<!-- AGENT_UNAVAILABLE -->"
+# Operator pass-through of either flag means the operator owns the format.
 STRUCTURED_OUTPUT_FLAGS = ("--output-format", "--json-schema")
-SCHEMA_FILE_NAME = "agy-structured-schema.json"
+# The capability probe needs only the envelope flag: no schema is sent (#2049).
+CAPABILITY_FLAGS = ("--output-format",)
 CAPABILITY_PROBE_TIMEOUT_SECONDS = 20.0
 
 _capability_cache: dict[str, bool] = {}
@@ -67,11 +74,12 @@ def antigravity_structured_kind_for_turn(
     reviewer_requirement_ids: Sequence[str] | None,
     requires_direct_discussion_ack: bool,
 ) -> str | None:
-    """The kind this turn may request through agy's schema flags, else None.
+    """The kind this turn may request through agy's JSON envelope, else None.
 
     A turn whose contract needs content beyond the JSON object, footer and
     signature keeps the response-file channel, because ``structured_output``
-    cannot carry that content and the renderer must never invent it:
+    recovered from the envelope cannot carry that content and the renderer
+    must never invent it:
 
     * surfaced signed requirement IDs (the human-requirements acknowledgement
       marker and section between the JSON and the footer);
@@ -96,7 +104,7 @@ def operator_args_set_output_format(args: Sequence[str]) -> bool:
 
 def help_text_supports_structured_output(help_text: str) -> bool:
     cleaned = strip_ansi(help_text or "")
-    return all(flag in cleaned for flag in STRUCTURED_OUTPUT_FLAGS)
+    return all(flag in cleaned for flag in CAPABILITY_FLAGS)
 
 
 def _probe_agy_help(runner: Runner, config: "AgentLoopConfig") -> str | None:
@@ -134,7 +142,7 @@ def _capability_cache_key(config: "AgentLoopConfig") -> str:
 def antigravity_structured_output_supported(
     runner: Runner, config: "AgentLoopConfig"
 ) -> bool:
-    """Whether agy advertises both schema flags; probed once per command path.
+    """Whether agy advertises ``--output-format``; probed once per command path.
 
     ``off`` mode, operator pass-through format args, and a probe that errors,
     times out or exits nonzero all mean unsupported.  A failed probe is cached
@@ -167,35 +175,6 @@ def antigravity_structured_output_supported(
 def reset_structured_output_capability_cache() -> None:
     with _capability_lock:
         _capability_cache.clear()
-
-
-def structured_output_schema(kind: str) -> dict[str, object]:
-    """A loose JSON Schema for ``kind`` that also admits ``agent_unavailable``.
-
-    Only constructs Gemini function declarations accept are used (#2039):
-    ``enum`` appears only on string-typed values and every enum value is a
-    non-empty string.  An integer enum is rejected by the provider with
-    INVALID_ARGUMENT, so ``schema_version`` is a plain integer here and the
-    protocol validators keep enforcing ``schema_version == 1``.  ``state`` is
-    optional because an agent_unavailable payload has none; the role
-    validators still require it.
-    """
-    return {
-        "type": "object",
-        "properties": {
-            "schema_version": {"type": "integer"},
-            "kind": {"type": "string", "enum": [kind, AGENT_UNAVAILABLE_KIND]},
-            "state": {"type": "string", "enum": ["approved", "blocking"]},
-        },
-        "required": ["schema_version", "kind"],
-        "additionalProperties": True,
-    }
-
-
-def write_structured_output_schema(directory: Path, kind: str) -> Path:
-    path = directory / SCHEMA_FILE_NAME
-    path.write_text(json.dumps(structured_output_schema(kind), indent=2), encoding="utf-8")
-    return path
 
 
 @dataclass(frozen=True)
@@ -332,6 +311,105 @@ def envelope_request_rejection(envelope: AgyEnvelope | None) -> str | None:
     return None
 
 
+# --- Single-object recovery from the envelope ``response`` (#2049) -----------
+
+AMBIGUITY_MULTIPLE_CANDIDATES = "multiple-candidates"
+AMBIGUITY_WRONG_KIND = "wrong-kind"
+AMBIGUITY_FOOTER_STATE_CONFLICT = "footer-state-conflict"
+
+_STATE_FOOTER_RE = re.compile(
+    r"<!--\s*(?:"
+    + "|".join(sorted({re.escape(name) for name in STRUCTURED_KIND_FOOTERS.values()}))
+    + r")\s*:\s*([^\s>]*)\s*-->"
+)
+_AMBIGUITY_DESCRIPTIONS = {
+    AMBIGUITY_MULTIPLE_CANDIDATES: "candidate JSON objects",
+    AMBIGUITY_WRONG_KIND: "JSON object of an unexpected kind",
+    AMBIGUITY_FOOTER_STATE_CONFLICT: "JSON object whose state contradicts a footer outside it",
+}
+
+
+@dataclass(frozen=True)
+class RecoveredPayload:
+    """Exactly one expected-kind (or agent_unavailable) object was found."""
+
+    payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AmbiguousPayload:
+    """The response cannot yield one payload; carries no model text."""
+
+    reason: str
+    candidate_count: int
+
+    @property
+    def diagnostic(self) -> str:
+        """A tool-authored diagnostic built only from the reason and count."""
+        description = _AMBIGUITY_DESCRIPTIONS.get(self.reason, "unusable JSON objects")
+        return (
+            f"Antigravity response carried {self.candidate_count} {description} "
+            f"({self.reason}); no payload selected"
+        )
+
+
+def _top_level_objects(text: str) -> list[tuple[int, int, dict[str, object]]]:
+    """Decoded top-level JSON objects as (start, end, value), in order.
+
+    Only a ``{`` that decodes counts; an object nested inside an earlier
+    candidate is consumed by it.  Scalars and arrays are never candidates.
+    """
+    decoder = json.JSONDecoder()
+    found: list[tuple[int, int, dict[str, object]]] = []
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append((index, end, value))
+            index = text.find("{", end)
+        else:  # pragma: no cover - a value decoded at "{" is always a dict
+            index = text.find("{", index + 1)
+    return found
+
+
+def recover_response_payload(
+    response: str, kind: str
+) -> RecoveredPayload | AmbiguousPayload | None:
+    """Recover the single answer object from an envelope's ``response`` text.
+
+    Candidates are counted over the complete normalized response, before and
+    independent of any public-response marker.  ``None`` means no candidate.
+    Two or more candidates, one candidate of another kind (or without a
+    string kind), or a state footer outside the candidate whose state differs
+    from the payload's are ambiguous.  Fields are never merged, picked or
+    edited.  Never raises.
+    """
+    try:
+        text = strip_ansi(response or "").replace("\r\n", "\n").replace("\r", "\n")
+        candidates = _top_level_objects(text)
+    except Exception:  # noqa: BLE001 - recovery never fails a turn
+        return None
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        return AmbiguousPayload(AMBIGUITY_MULTIPLE_CANDIDATES, len(candidates))
+    start, end, payload = candidates[0]
+    payload_kind = payload.get("kind")
+    if not isinstance(payload_kind, str) or payload_kind not in {kind, AGENT_UNAVAILABLE_KIND}:
+        return AmbiguousPayload(AMBIGUITY_WRONG_KIND, 1)
+    state = payload.get("state")
+    payload_state = state.strip() if isinstance(state, str) else ""
+    outside = text[:start] + "\n" + text[end:]
+    for match in _STATE_FOOTER_RE.finditer(outside):
+        if match.group(1).strip() != payload_state:
+            return AmbiguousPayload(AMBIGUITY_FOOTER_STATE_CONFLICT, 1)
+    return RecoveredPayload(payload)
+
+
 def structured_output_signature(config: "AgentLoopConfig", model: str) -> str:
     """The Antigravity signature label, seat-labelled when a seat is active."""
     base = f"Google Antigravity: {model}"
@@ -342,7 +420,7 @@ def structured_output_signature(config: "AgentLoopConfig", model: str) -> str:
 def render_structured_output_text(
     payload: object, kind: str, signature: str
 ) -> str | None:
-    """Rebuild the public text from a ``structured_output`` payload, else None.
+    """Rebuild the public text from a recovered payload, else None.
 
     A role payload gets its kind's footer carrying the payload's own state;
     an agent_unavailable payload gets the dedicated footer.  The renderer
@@ -367,8 +445,8 @@ def render_structured_output_text(
 def oversized_prompt_directive(response_path: Path, *, structured: bool) -> str:
     """The short ``--print`` value used when the task moves into GEMINI.md."""
     channel = (
-        "Return your answer as the requested structured result (the JSON object the "
-        f"schema describes); if you also write a file, write it to {response_path}."
+        "Return exactly one JSON object as your final answer, as the task describes; "
+        f"if you also write a file, write it to {response_path}."
         if structured
         else f"Write your complete answer to the public response file {response_path}."
     )

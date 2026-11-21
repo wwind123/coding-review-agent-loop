@@ -520,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
             choices=("auto", "off"),
             default="auto",
             help=(
-                "Use agy --output-format json --json-schema for eligible structured turns "
+                "Use agy --output-format json (no request schema) for eligible structured turns "
                 "when the installed agy supports it (default: auto). 'off' keeps the "
                 "legacy response-file channel."
             ),

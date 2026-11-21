@@ -50,7 +50,8 @@ from .base import (
 )
 from .antigravity_structured import (
     AgyEnvelope,
-    SCHEMA_FILE_NAME,
+    AmbiguousPayload,
+    RecoveredPayload,
     envelope_provider_error,
     envelope_request_rejection,
     STRUCTURED_KIND_FOOTERS,
@@ -59,8 +60,8 @@ from .antigravity_structured import (
     parse_agy_json_envelope,
     render_structured_output_text,
     structured_output_signature,
+    recover_response_payload,
     structured_request_rejection_line,
-    write_structured_output_schema,
 )
 from .replacement import classify_provider_executable_replacement_interruption
 from ..worktree_hints import dependency_hint_environment
@@ -1426,7 +1427,7 @@ def structured_request_rejection_evidence(
     """Provider-owned evidence that agy rejected the request schema (#2039).
 
     Call only for a structured attempt.  Nothing counts when the attempt
-    produced a renderable ``structured_output`` or a response file, or timed
+    produced a payload rendered from the envelope (#2049) or a response file, or timed
     out.  Sources, in order: a non-SUCCESS envelope's error/status; stdout
     outside any parsed envelope; raw stdout of a nonzero exit with no
     envelope; this silent attempt's own agy log.  A SUCCESS envelope's
@@ -1468,44 +1469,63 @@ def _select_structured_turn_text(
     *,
     kind: str,
     signature: str,
-) -> tuple[str, AgentTextSource, str | None]:
-    """(text, text_source, provider error) for a JSON-mode turn (#2029).
+) -> tuple[str, AgentTextSource, str | None, str | None]:
+    """(text, text_source, provider error, ambiguity) for a JSON-mode turn.
 
-    Precedence: a SUCCESS envelope whose ``structured_output`` renders, then a
-    non-empty response file, then the public-response marker in the
-    envelope's prose (or raw stdout when no envelope parsed).  A non-empty
-    response file does not prove a usable contract, so a renderable payload
-    wins over it; the file stays on the result for audit only.
+    Precedence (#2029, #2049):
 
-    A non-SUCCESS envelope is an operational failure reported by agy, not
-    model prose: its decoded error comes back separately as the provider
-    error, so classification can read it as the terminal provider frame in
-    every failure phase (narration in ``response`` can never displace it).
+    1. A non-SUCCESS envelope is an operational failure reported by agy, not
+       model prose: its decoded error comes back separately as the provider
+       error, so classification can read it as the terminal provider frame in
+       every failure phase.  The response file, else the marker text of the
+       envelope's prose, is the fallback content; no payload is recovered
+       from a failed envelope's prose.
+    2. A non-empty response file.
+    3. A SUCCESS envelope whose ``response`` holds exactly one expected-kind
+       (or agent_unavailable) JSON object: rendered in code with the footer
+       carrying the payload's own state and the signature.
+    4. An ambiguous ``response`` (several candidate objects, a wrong kind,
+       or a contradicting footer): empty text plus a tool-authored diagnostic
+       the validated turn records as a format failure.
+    5. Otherwise the public-response marker in the envelope's prose (or raw
+       stdout when no envelope parsed).
+
+    agy's ``structured_output`` field is never the answer source: it holds
+    only declared schema keys, so it could displace the model's full payload.
     """
     envelope: AgyEnvelope | None = parse_agy_json_envelope(stdout)
-    if envelope is not None and envelope.succeeded and envelope.structured_output is not None:
-        rendered = render_structured_output_text(envelope.structured_output, kind, signature)
-        if rendered is not None:
-            if response_file_text is not None:
-                log(
-                    config,
-                    "Antigravity returned both structured_output and a response file; "
-                    "using structured_output (the file is kept for audit only)",
-                )
-            return rendered, "structured_output", None
-        log(config, "Antigravity structured_output was not renderable; falling back")
-    provider_error = (
-        envelope_provider_error(envelope)
-        if envelope is not None and not envelope.succeeded
-        else None
-    )
-    if response_file_text is not None:
-        return response_file_text, "response_file", provider_error
-    if envelope is not None:
+    if envelope is not None and not envelope.succeeded:
+        provider_error = envelope_provider_error(envelope)
+        if response_file_text is not None:
+            return response_file_text, "response_file", provider_error, None
         text, source = _strip_public_response_marker(envelope.response)
-        return text, source, provider_error
-    text, source = _strip_public_response_marker(stdout)
-    return text, source, provider_error
+        return text, source, provider_error, None
+    if envelope is not None and envelope.structured_output is not None:
+        log(
+            config,
+            "Antigravity envelope carried structured_output; ignored (never the answer source)",
+        )
+    if response_file_text is not None:
+        return response_file_text, "response_file", None, None
+    if envelope is None:
+        text, source = _strip_public_response_marker(stdout)
+        return text, source, None, None
+    recovery = recover_response_payload(envelope.response, kind)
+    if isinstance(recovery, AmbiguousPayload):
+        diagnostic = recovery.diagnostic
+        log(config, f"{diagnostic}; recording a format failure")
+        return "", "stdout", None, diagnostic
+    if isinstance(recovery, RecoveredPayload):
+        rendered = render_structured_output_text(recovery.payload, kind, signature)
+        if rendered is not None:
+            return rendered, "structured_output", None, None
+        log(
+            config,
+            "Antigravity response object could not be rendered (missing state); "
+            "falling back to the marker text",
+        )
+    text, source = _strip_public_response_marker(envelope.response)
+    return text, source, None, None
 
 
 def _parse_model_catalog(raw: str) -> set[str]:
@@ -1628,7 +1648,6 @@ class AntigravityBackend:
             or not antigravity_structured_output_supported(runner, config)
         ):
             structured_kind = None
-        schema_path: Path | None = None
         args = [
             config.antigravity_cmd,
             "--model",
@@ -1645,10 +1664,9 @@ class AntigravityBackend:
         if session_id:
             args += ["--conversation", session_id]
         if structured_kind is not None:
-            # The schema sits beside the private response file, outside the
-            # checkout, and is removed after the turn.
-            schema_path = write_structured_output_schema(response_path.parent, structured_kind)
-            args += ["--output-format", "json", "--json-schema", str(schema_path)]
+            # JSON envelope only: no request schema, because agy's
+            # structured_output keeps only declared schema keys (#2049).
+            args += ["--output-format", "json"]
         # The prompt is the value of --print (must be last), not a positional.
         args += [
             "--print",
@@ -1925,8 +1943,6 @@ class AntigravityBackend:
                     log(config, f"{seat_label} could not remove its shared agy settings lock holder record: {exc}")
             fcntl.flock(settings_lock, fcntl.LOCK_UN)
             settings_lock.close()
-            if schema_path is not None:
-                schema_path.unlink(missing_ok=True)
         log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
         # Prefer the public response file the prompt asks the agent to write; else
@@ -1940,8 +1956,14 @@ class AntigravityBackend:
             response_path.unlink(missing_ok=True)
             response_file_text = None
         provider_error_text: str | None = None
+        structured_ambiguity: str | None = None
         if structured_kind is not None:
-            message_text, text_source, provider_error_text = _select_structured_turn_text(
+            (
+                message_text,
+                text_source,
+                provider_error_text,
+                structured_ambiguity,
+            ) = _select_structured_turn_text(
                 config,
                 result.stdout,
                 response_file_text,
@@ -1997,6 +2019,7 @@ class AntigravityBackend:
             antigravity_log_path=agy_log_path,
             antigravity_log_quota_evidence=agy_log_evidence,
             antigravity_structured_request_rejection=request_rejection,
+            antigravity_structured_ambiguity=structured_ambiguity,
         )
 
     @staticmethod
