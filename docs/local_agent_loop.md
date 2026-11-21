@@ -6461,8 +6461,14 @@ against the tracked working directory, so `du -sk ../sibling` is outside and
 when it mixes inside and outside operands, uses an option its closed grammar
 does not list or one that reads a file list (`--files0-from`, `du -X`,
 `file -f`), names an unexpanded operand such as `"$DIR"`, runs a program
-located outside the checkout, uses a `find` executor or reference-file
-predicate (`-exec`, `-delete`, `-newer`), or cannot be parsed. A refused
+named by a path other than a system toolchain directory (`../x/bin/du`,
+`/outside/bin/du`), is launched through `xargs`, `sudo`, `env` with options,
+or after a `PATH` change, uses a `find` executor or reference-file predicate
+(`-exec`, `-delete`, `-newer`), or cannot be parsed. For measurements and test
+runners alike, an operand the shell would expand counts as outside only when
+every expansion provably lies outside: a variable, substitution or brace is
+ambiguous, and so is a glob whose literal parent contains the checkout and
+could match it (`../*/tests`), or whose current matches reach it. A refused
 `tests_run` entry earns the coder's single semantic-evidence re-ask: the
 re-ask quotes the refusal and asks for a corrected `tests_run`, and a second
 refusal stops the turn. A managed-broker run whose

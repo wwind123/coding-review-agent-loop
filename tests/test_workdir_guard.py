@@ -2054,3 +2054,81 @@ def test_runner_relative_operand_resolves_against_tracked_cwd_2052(measure_layou
     )
     # An outside location after an unknown option is never a target.
     _assert_refused(measure_layout, "pytest --unknown-option ../sibling")
+
+
+@pytest.mark.parametrize("command", [
+    # item-1: shell expansion that may reach the checkout is never outside-only.
+    "pytest ../*/tests",
+    "bash -c 'pytest ../*/tests'",
+    "pytest ../$CHECKOUT_NAME/tests",
+    "pytest ../{{sibling,checkout}}/tests",
+    "pytest {parent}/*/tests",
+    "pytest ../sibling/*/../../checkout/tests",
+    "du -sk ../*",
+    "du -sk ../c*/tests",
+    "cd {parent} && du -sk *",
+])
+def test_shell_expansion_reaching_the_checkout_is_refused_2052(measure_layout, command):
+    """Generalization: every expanding operand is outside only if all expansions are."""
+    _assert_refused(measure_layout, _measure_fmt(command, measure_layout))
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk ../sib*",
+    "du -sk {outside}/*",
+    "pytest {outside}/*.py",
+    "ls {outside}/[a-z]*",
+])
+def test_shell_expansion_provably_outside_is_context_2052(measure_layout, command):
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+def test_glob_match_symlinked_into_checkout_is_refused_2052(measure_layout):
+    (measure_layout.outside / "link").symlink_to(measure_layout.checkout)
+    _assert_refused(measure_layout, _measure_fmt("du -sk {outside}/*", measure_layout))
+
+
+@pytest.mark.parametrize("command", ["pytest tests/*.py", "pytest 'tests/test_a.py::t[1]'"])
+def test_in_checkout_globs_stay_in_checkout_2052(measure_layout, command):
+    assert _partition(measure_layout, [command]).in_checkout == (command,)
+
+
+@pytest.mark.parametrize("command", [
+    # item-2: a relative path-named program, outside or inside.
+    "../sibling/bin/du -sk {outside}",
+    "./du -sk {outside}",
+    # item-3: operand-supplying or directory-moving launch wrappers.
+    "printf tests | xargs du -sk {outside}",
+    "xargs du -sk {outside} < list",
+    "sudo du -sk {outside}",
+    "env -C {checkout} du -sk {outside}",
+    "PATH={outside}/bin du -sk {outside}",
+    "export PATH={outside}/bin; du -sk {outside}",
+    # item-4: an outside measurement program next to an outside test target.
+    "{outside}/bin/du -sk {outside} && pytest {outside}/test_a.py",
+    "pytest {outside}/test_a.py && {outside}/bin/du -sk {outside}",
+    "{outside}/bin/timeout 5 du -sk {outside}",
+])
+def test_measurement_launch_must_be_plain_2052(measure_layout, command):
+    """Every program position of a measurement clause is a PATH name or toolchain path."""
+    _assert_refused(measure_layout, _measure_fmt(command, measure_layout))
+
+
+@pytest.mark.parametrize("command", [
+    "/usr/bin/du -sk {outside}",
+    "timeout 10 du -sk {outside}",
+    "env LC_ALL=C du -sk {outside}",
+    "nice -n 5 du -sk {outside}",
+    # Existing permitted runner behaviour: an outside interpreter on outside targets.
+    "{outside}/venv/bin/pytest {outside}/test_a.py",
+])
+def test_plain_measurement_launch_and_outside_runner_stay_context_2052(measure_layout, command):
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )

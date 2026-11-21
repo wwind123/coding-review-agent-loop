@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import ipaddress
 import re
 import shlex
+from itertools import islice
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Sequence
@@ -1420,6 +1423,8 @@ class _PathLog(list):
         self.unresolved_inputs: list[str] = []
         # The entry needed the whitespace fallback because shell lexing failed.
         self.parse_failed = False
+        # ``PATH`` was reassigned, so a bare program name may resolve anywhere.
+        self.path_modified = False
 
     def note_outside(self, location: str) -> None:
         """Record an outside location once, however the command spelled it."""
@@ -1656,6 +1661,132 @@ def _is_unexpanded(token: str) -> bool:
     return "$" in remainder
 
 
+# Shell expansion the guard cannot evaluate: it may produce any text,
+# including ``/`` and ``..``.  Glob characters only match names within one
+# directory, so a glob's literal parent directory bounds its matches.
+_UNKNOWN_EXPANSION_CHARS = frozenset("$`{")
+_GLOB_CHARS = frozenset("*?[")
+_GLOB_MATCH_LIMIT = 256
+OperandLocation = Literal["inside", "outside", "ambiguous"]
+
+
+def _operand_location(
+    raw: str, cwd: Path | None, assigned: Path
+) -> tuple[OperandLocation, str | None]:
+    """Where a reported operand can lie, and an outside location to record.
+
+    A literal operand is canonicalised against ``cwd``.  An operand the shell
+    would expand is outside only when every possible expansion is provably
+    outside (#2052): an unknown expansion (``$X``, a substitution, a brace)
+    or a ``..`` after a glob is ambiguous, and so is a glob whose literal
+    parent is an ancestor of the checkout (``../*/tests`` from the checkout)
+    or whose current matches reach it.  The second value is the outside
+    location to record as a violation, if any.
+    """
+
+    def inside(path: Path) -> bool:
+        return path == assigned or _is_inside(path, assigned)
+
+    text = raw
+    if text.startswith("$HOME/"):
+        text = str(Path.home()) + text[len("$HOME"):]
+    elif text == "~" or text.startswith("~/"):
+        text = str(Path.home()) + text[1:]
+    if text.startswith("/"):
+        path, offset = Path(text), 0
+    elif cwd is None:
+        return "ambiguous", None
+    else:
+        path, offset = cwd / text, len(cwd.parts)
+    parts = path.parts
+    first = next(
+        (
+            index for index in range(offset, len(parts))
+            if set(parts[index]) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS)
+        ),
+        None,
+    )
+    try:
+        if first is None:
+            resolved = _canonical(path)
+            return ("inside", None) if inside(resolved) else ("outside", str(resolved))
+        prefix = _canonical(Path(*parts[:first]))
+        note = None if inside(prefix) else str(prefix)
+        remainder = parts[first:]
+        if ".." in remainder or any(set(part) & _UNKNOWN_EXPANSION_CHARS for part in remainder):
+            return "ambiguous", note
+        if inside(prefix):
+            return "inside", None
+        if _is_inside(assigned, prefix):
+            # The glob's parent contains the checkout: a match may be the
+            # checkout, an ancestor of it, or a path inside it, unless some
+            # component cannot match the checkout's own path below the parent.
+            below = assigned.relative_to(prefix).parts
+            if all(
+                fnmatch.fnmatchcase(name, pattern)
+                for name, pattern in zip(below, remainder)
+            ):
+                return "ambiguous", note
+        pattern = str(prefix.joinpath(*remainder))
+        matches = list(islice(glob.iglob(pattern), _GLOB_MATCH_LIMIT + 1))
+        if len(matches) > _GLOB_MATCH_LIMIT or any(
+            inside(_canonical(Path(match))) for match in matches
+        ):
+            return "ambiguous", note
+        return "outside", pattern
+    except (OSError, RuntimeError, ValueError):
+        return "ambiguous", None
+
+
+# Prefix wrappers that neither supply operands nor move the working
+# directory; ``xargs`` (operands from stdin) and ``sudo`` are excluded, and
+# ``env`` is accepted only without options (``env -C``/``-S``).
+_MEASUREMENT_SAFE_WRAPPERS = frozenset({
+    "env", "nohup", "nice", "time", "timeout", "stdbuf", "command",
+})
+
+
+def _measurement_launch_is_plain(
+    tokens: Sequence[str], positions: set[int], head: int, log: _PathLog
+) -> bool:
+    """Whether a measurement clause runs the real program on its own operands.
+
+    Every program position (wrappers and the head) must be a bare name found
+    on an unmodified ``PATH`` or an executable in a system toolchain
+    directory, so neither an outside nor a checkout-located program can hide
+    behind a measurement basename (#2052).
+    """
+    if log.path_modified:
+        return False
+    env_options_closed = False
+    for index in range(head):
+        token = tokens[index]
+        if index in positions:
+            if _program_basename(token) not in _MEASUREMENT_SAFE_WRAPPERS:
+                return False
+            env_options_closed = _program_basename(token) == "env"
+            continue
+        if VAR_ASSIGNMENT_RE.match(token):
+            if token.split("=", 1)[0] in INTERPRETER_VALUE_ENV_VARS:
+                return False
+            continue
+        if env_options_closed and token.startswith("-"):
+            return False
+    for index in positions:
+        program = _strip_wrap(tokens[index])
+        if "/" not in program and "\\" not in program:
+            continue
+        if not _is_path_shaped(program):
+            return False
+        try:
+            located = _canonical(Path(_normalize_reported_path(program) or program))
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if str(located.parent) not in _EXACT_TOOLCHAIN_DIRS:
+            return False
+    return True
+
+
 def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
     """Note whether a clause's test targets lie inside and/or outside the checkout.
 
@@ -1704,7 +1835,10 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if log.cwd_depth > clause.shell_depth:
         # The shell -c script that moved the directory has exited.
         forget_cwd()
-    _, head = _program_position_indices(tokens)
+    if any(token.startswith("PATH=") for token in tokens):
+        # A later bare program name may now resolve anywhere.
+        log.path_modified = True
+    positions, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
@@ -1725,28 +1859,31 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
 
     cwd: Path | None = None if log.cwd_unknown else (log.cwd_path or assigned)
 
-    def resolve(operand: str | None) -> Path | None:
-        if cwd is None:
-            return None
-        if operand is None:
-            return cwd
-        try:
-            return _canonical(cwd / operand)
-        except (OSError, RuntimeError, ValueError):
-            return None
+    def locate(operand: str) -> OperandLocation:
+        kind, note = _operand_location(operand, cwd, assigned)
+        if note is not None and not _is_path_shaped(operand):
+            # The role pass already records (or, for an eligible scratch
+            # option value, deliberately exempts) absolute and home paths.
+            log.note_outside(note)
+        return kind
 
     def record_relative(operand: str | None, *, measurement: bool = False) -> None:
-        resolved = resolve(operand)
-        if resolved is None:
-            log.ambiguous_target = True
-        elif inside(resolved):
-            log.inside_target = True
+        if operand is None:
+            kind: OperandLocation = (
+                "ambiguous" if cwd is None else "inside" if inside(cwd) else "outside"
+            )
+            if kind == "outside":
+                log.note_outside(str(cwd))
         else:
-            log.note_outside(str(resolved))
-            if measurement:
-                log.measured_outside = True
-            else:
-                log.outside_target = True
+            kind = locate(operand)
+        if kind == "ambiguous":
+            log.ambiguous_target = True
+        elif kind == "inside":
+            log.inside_target = True
+        elif measurement:
+            log.measured_outside = True
+        else:
+            log.outside_target = True
 
     grammar = _MEASUREMENT_GRAMMARS.get(head_name)
     if grammar is not None:
@@ -1754,6 +1891,11 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             # A fallback-tokenized clause is never classified by the grammar.
             log.ambiguous_target = True
             return
+        if not _measurement_launch_is_plain(tokens, positions, head, log):
+            # Operand-supplying wrappers, PATH changes and path-named
+            # programs make the clause ambiguous on its own (#2052); its
+            # operands are still located below so outside ones are recorded.
+            log.ambiguous_target = True
         for token in tokens[head + 1 :]:
             # The role pass skips ``--option=/path`` values; an outside one
             # (``--files0-from=/x/list``) is still an outside location.
@@ -1778,18 +1920,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
                 log.ambiguous_target = True
                 continue
             cleaned = _strip_wrap(raw)
-            if not cleaned:
-                continue
-            if _is_path_shaped(cleaned):
-                path = _normalize_reported_path(cleaned)
-                if path is None:
-                    log.ambiguous_target = True
-                elif inside(path):
-                    log.inside_target = True
-                else:
-                    log.note_outside(cleaned)
-                    log.measured_outside = True
-            else:
+            if cleaned:
                 record_relative(cleaned, measurement=True)
         return
     if head_name in _NON_TEST_HEADS:
@@ -1823,13 +1954,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             if not cleaned:
                 continue
             saw_positional = True
-            if _is_path_shaped(cleaned):
-                if outside(cleaned):
-                    log.outside_target = True
-                else:
-                    log.inside_target = True
-            else:
-                record_relative(cleaned)
+            record_relative(cleaned)
             continue
         if index == forwarding:
             continue
@@ -1853,23 +1978,16 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         after_unknown_option = previous.startswith("-") and not (
             _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
         )
-        if _is_path_shaped(cleaned):
-            is_outside = outside(cleaned)
-            if after_unknown_option and is_outside:
-                # Possibly an option value; an inside path still counts.
-                continue
-            saw_positional = True
-            if is_outside:
-                log.outside_target = True
-            else:
-                log.inside_target = True
-            continue
         if after_unknown_option:
-            resolved = resolve(cleaned)
-            if resolved is not None and not inside(resolved):
-                # The same rule for a relative outside location: possibly an
-                # option value, so it is a violation but never a target.
-                log.note_outside(str(resolved))
+            kind = locate(cleaned)
+            if kind == "outside":
+                # Possibly an option value: an outside location is a
+                # violation but never a target; an inside path still counts.
+                continue
+            if kind == "ambiguous":
+                # Possibly an option value, possibly an operand that reaches
+                # the checkout: never context, and the implicit cwd remains.
+                log.ambiguous_target = True
                 continue
         saw_positional = True
         record_relative(cleaned)

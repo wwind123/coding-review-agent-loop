@@ -41,3 +41,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).
 
 - 2026-11-21: A refused `tests_run` display-partition entry gets its own `tests-run-workdir` reason and a `tests_run`-specific re-ask inside the shared single allowance, because the citation-only wording left the coder resubmitting the same entry; a non-eligible evidence rejection logs its first refusing term (#2052).
+
+- 2026-11-21: Context classification requires every shell expansion of an operand to lie provably outside, and a measurement clause must launch a PATH-named or toolchain-directory program without operand-supplying wrappers, so a clause-local invalid program cannot be masked by another clause's outside target (#2052).
