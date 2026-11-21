@@ -239,6 +239,72 @@ def test_superseded_reviews_are_inert_for_approval_panel_and_resume(tmp_path, mo
         response_validation._resumed_pr_reviewer_matches_requirements(r, requirements) for r in approved)
 
 
+def test_single_published_review_on_two_reviewer_board_rolls_over(tmp_path, monkeypatch):
+    """Only Codex published before the stop; Gemini never began.  Gemini's turn
+    would sit beside Codex's public review, so today's path refuses; pure growth
+    must roll over instead (#2054 review item-1)."""
+    runner, config = _conflict_stop(tmp_path, monkeypatch)
+    gemini = next(r for r in _pr_records(runner) if r.metadata.agent == "Gemini")
+    del runner.pr_payload["comments"][gemini.index]
+    assert [r.metadata.agent for r in _pr_records(runner) if r.metadata.role == "reviewer"] == ["Codex"]
+    _follow_hint(runner)
+    _queue_fresh_round(runner)
+    before = len(_agent_commands(runner))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    (record,) = _supersessions(runner)
+    assert [e["agent"] for e in record.metadata.signed_input_supersession["superseded"]] == ["Codex"]
+    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
+    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
+    assert sorted(_agent_commands(runner)[before:]) == ["codex", "gemini"]
+    assert _no_deletes(runner)
+    assert not any("Delete these" in c for c in runner.comments)
+
+
+def test_withdrawn_source_after_boundary_never_revives_superseded_approval(tmp_path, monkeypatch):
+    """Review item-2: after the closing record, withdrawing the added source makes the
+    old approvals cover the live set again; they must still never carry."""
+    from coding_review_agent_loop.code_approval import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.github import _parse_pr_human_requirements as parse
+    runner, config = _conflict_stop(tmp_path, monkeypatch)
+    _follow_hint(runner)
+    _interrupt_after_supersession(runner, config, monkeypatch)
+    added = next(i for i, c in enumerate(runner.pr_payload["comments"])
+                 if "keep the policy check code-actionable" in c["body"])
+    del runner.pr_payload["comments"][added]
+    requirements = parse(runner.pr_payload)
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
+    codex = next(r for r in _pr_records(runner) if r.metadata.agent == "Codex" and r.metadata.role == "reviewer")
+    assert codex.metadata.state == "approved"
+    # The old approval covers the live set again ...
+    assert response_validation._resumed_pr_reviewer_matches_requirements(codex, requirements)
+    # ... but the approval reader still excludes it as superseded history.
+    carried = _latest_pr_approved_reviews_for_head(
+        comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config),
+        human_requirements=requirements)
+    assert carried == {}
+    # Control: without the closing record the same approval would carry.
+    unclosed = [c for c in comments if "superseded by new signed input" not in c.body]
+    assert "Codex" in _latest_pr_approved_reviews_for_head(
+        unclosed, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config),
+        human_requirements=requirements)
+    # The resumed run opens round 2 with fresh turns for both reviewers.
+    rid = requirements[0].requirement_id
+    runner.codex_outputs = [_classified_review([_association(rid, "code")], hr=True,
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Withdrawn request."}])]
+    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini", hr=True,
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}])]
+    before = len(_agent_commands(runner))
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError:
+        pass
+    assert sorted(_agent_commands(runner)[before:])[:2] == ["codex", "gemini"]
+    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
+    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
+
+
 # --- interrupt-after-boundary -----------------------------------------------
 
 
@@ -437,8 +503,10 @@ def test_unit_mixed_rejection_reasons_keep_the_refusal(tmp_path, monkeypatch):
     assert call(rebound, seat_binding=seat) is resume and posted == []
     # A blocked route (recovery, conflict, evidence or conversion pass) never rolls over.
     assert call(records, blocked=True) is resume and posted == []
-    # A lone rejected review has no public peer: today's fresh turn applies.
-    assert call({"Codex": records["Codex"]}) is resume and posted == []
+    # No published review at all: nothing was rejected, so nothing rolls over.
+    assert call({}) is resume and posted == []
+    # A one-reviewer board has no same-round peer: today's fresh turn applies.
+    assert call({"Codex": records["Codex"]}, configured_reviewer_names=["Codex"]) is resume and posted == []
     # A reviewer not rejected at all (resumed) keeps the ordinary path.
     assert call(records, resumed_by_name={"Codex": records["Codex"]}) is resume and posted == []
 
@@ -634,3 +702,107 @@ def test_managed_ci_authorization_survives_rollover_and_correlates_next_round(tm
     assert continued.authorization_kind == "continuity"
     assert audit is not None and audit[0] == continued.authorization_comment_id
     assert any(c.get("id") == initial.authorization_comment_id for c in runner.intent_comments)
+
+
+class _ContinuityCaptured(Exception):
+    pass
+
+
+def test_managed_ci_rollover_workflow_keeps_authorization_and_correlates_new_records(tmp_path, monkeypatch):
+    """Review item-3: a managed issue-created run takes the conflict stop, the
+    operator adds a signed source, and the resume rolls over, blocks in round 2 and
+    pushes a coder fix.  The original authorization handoff is reused (no fresh
+    grant), the real continuity correlation binds only the newly generated
+    round-2 block and round-3 coder records, and nothing is deleted."""
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from coding_review_agent_loop.managed_ci_types import ManagedCiContract
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from agent_loop_helpers import structured_coder_followup
+
+    actor_login, actor_id = _ACTOR
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha=HEAD, branch="agent-loop/managed-56",
+        trusted_actor_login=actor_login, trusted_actor_id=actor_id,
+        protection_mode="voluntary", override_nonce="root",
+        authorization_kind="creation", authorization_comment_id=17,
+    )
+    fresh, correlated, published = [], [], []
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci",
+                        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True))
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume",
+                        lambda *a, **k: fresh.append(k) or (_ for _ in ()).throw(AssertionError("fresh grant")))
+    real_find = pr_loop.find_actor_round_metadata_comment_ids
+
+    def find(*args, **kwargs):
+        result = real_find(*args, **kwargs)
+        correlated.append((kwargs, result))
+        return result
+
+    def publish(*_args, **kwargs):
+        published.append(kwargs)
+        raise _ContinuityCaptured
+
+    monkeypatch.setattr(pr_loop, "find_actor_round_metadata_comment_ids", find)
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
+
+    runner = FakeRunner(pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": HEAD,
+                                    "baseRefName": "main", "body": "Fixes #56"})
+    runner.authenticated_actor = _ACTOR
+    # An existing qualification record for the head: rollover must keep it.
+    checkpoint = _attach_round_metadata("Qualification was dispatched.", PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=HEAD, prior_items=(),
+        state="blocking", phase="qualification-checkpoint", architecture_contract_version=1))
+    runner.pr_payload["comments"].append({"author": {"login": actor_login}, "createdAt": "2026-05-23T00:00:00Z",
+                                          "body": checkpoint})
+    runner.pr_payload["comments"].append(_signed("A human must accept the policy run.", 1))
+    (rid,) = _rids(runner)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, managed_ci=True,
+                         managed_ci_trusted_actor=actor_login, allow_unprotected_managed_ci=True, max_rounds=4)
+    run = lambda: run_pr_loop(runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+                              managed_ci_issue_number=56)
+    runner.codex_outputs = [_classified_review(
+        [_association(rid, "human-only", request=_EVIDENCE_TEXT)], hr=True, evidence=[_EVIDENCE_TEXT])] * 2
+    runner.gemini_outputs = [_classified_review(
+        [_association(rid, "code")], reviewer="Google Gemini", hr=True,
+        state="blocking", blocking=["Fix the policy check."])] * 2
+    with pytest.raises(HumanDecisionRequiredError, match="remained conflicting"):
+        run()
+    _follow_hint(runner)
+    old, new = _rids(runner)
+    answer = {"item_id": "item-1", "disposition": "resolved", "note": "Accepted.", "evidence_requirement_ids": [new]}
+    runner.codex_outputs = [_classified_review(
+        [_association(old, "code"), _association(new, "code")], hr=True, dispositions=[answer],
+        state="blocking", blocking=["Bound the policy retries."])]
+    runner.gemini_outputs = [_classified_review(
+        [_association(old, "code"), _association(new, "code")], reviewer="Google Gemini", hr=True,
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}])]
+    runner.claude_outputs = [structured_coder_followup(
+        addressed_items=["item-1"], human_requirement_ids=[old, new],
+        human_requirement_dispositions=[{"requirement_id": r, "disposition": "addressed", "evidence": "Done."}
+                                        for r in (old, new)])]
+    kept = [c["body"] for c in runner.pr_payload["comments"]]
+
+    with pytest.raises(_ContinuityCaptured):
+        run()
+
+    assert fresh == []
+    (record,) = _supersessions(runner)
+    ((kwargs, ids),) = correlated
+    assert kwargs["round_number"] == 2 and kwargs["predecessor_head"] == HEAD
+    assert kwargs["after_comment_id"] == 17  # the original authorization, not a fresh one
+    by_id = {_cid(c): c for c in runner.pr_payload["comments"]}
+    records = {r.index: r for r in _pr_records(runner)}
+    index_of = {_cid(c): i for i, c in enumerate(runner.pr_payload["comments"])}
+    bound = [records[index_of[i]].metadata for i in ids]
+    assert [(m.role, m.agent, m.round_number, m.state) for m in bound] == [
+        ("reviewer", "Codex", 2, "blocking"), ("coder", "Claude", 3, None)]
+    assert all(index_of[i] > record.index for i in ids)
+    assert published and published[0]["round_comment_ids"] == ids
+    assert published[0]["handoff"] is handoff
+    # The checkpoint, round-1 reviews and every other earlier comment are retained.
+    assert [c["body"] for c in runner.pr_payload["comments"][:len(kept)]] == kept
+    assert by_id and _no_deletes(runner)

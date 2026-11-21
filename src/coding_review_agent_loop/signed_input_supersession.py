@@ -216,9 +216,12 @@ def supersede_for_signed_growth(
         or getattr(current_resume, "round_number", None) != round_number
         or getattr(current_resume, "reconciliation_record", None) is not None
         or getattr(current_resume, "evidence_boundary", None) is not None
-        # A lone rejected review has no public same-round peer, so today's
-        # fresh same-round turn already applies; only peers force a refusal.
-        or len(completed_by_name) < 2
+        # A one-reviewer board has no same-round peer, so today's fresh turn
+        # already applies.  On a larger board even a single public review is a
+        # peer for every reviewer still to launch, so the refusal would fire.
+        or len(configured_reviewer_names) < 2
+        # At least one published review must be rejected for growth.
+        or not completed_by_name
         or set(completed_by_name) & set(resumed_by_name)
         or set(completed_by_name) - set(rejection_reasons)
     ):

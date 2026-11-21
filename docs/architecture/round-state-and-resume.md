@@ -184,9 +184,10 @@ round, approved-plan, acquisition or seat-binding change), except where the
 classification-only resume below admits it (#2035), or where the signed set
 only grew (#2054).
 
-When every review of an unreconciled same-head round (at least two, so each
-has a public same-round peer; a lone rejected review keeps today's fresh
-same-round turn) is rejected only because the signed requirement set grew
+When every published review of an unreconciled same-head round on a board of
+at least two reviewers (one public review is already a peer for every reviewer
+still to launch; a one-reviewer board keeps today's fresh same-round turn) is
+rejected only because the signed requirement set grew
 since publication (a strict digest superset,
 with the same round, head, seat binding, approved plan and acquisition
 identity), and every such review proves its publication unedited, resume posts

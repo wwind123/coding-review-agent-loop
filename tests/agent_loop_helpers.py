@@ -1489,6 +1489,26 @@ class FakeRunner(Runner):
                         "merge_base_commit": {"sha": tip if self.compare_status == "behind" else "d" * 40 if self.compare_status == "diverged" else head}}
                 return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
 
+        paginated_comments = (
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=100", cmd[3])
+            if cmd[:3] == ["gh", "api", "--paginate"] and len(cmd) == 4
+            else None
+        )
+        if paginated_comments is not None and paginated_comments.group(1) == str(self.pr_payload.get("number", 77)):
+            # Managed-CI continuity (#2054 tests) reads the PR's REST comment
+            # history as one flat paginated array; serve the same REST shape.
+            rows, page = [], 1
+            while True:
+                result = self._run_locked(["gh", "api", f"{cmd[3]}&page={page}"], cwd=cwd, check=check,
+                                          input_text=input_text)
+                if result.returncode != 0:
+                    return result
+                batch = json.loads(result.stdout or "[]")
+                rows.extend(batch)
+                if len(batch) < 100:
+                    return CommandResult(cmd, cwd_path, json_dumps(rows), "", 0)
+                page += 1
+
         rest_comments = (
             re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)(?:&since=[^&]+)?", cmd[2])
             if cmd[:2] == ["gh", "api"] and len(cmd) > 2
