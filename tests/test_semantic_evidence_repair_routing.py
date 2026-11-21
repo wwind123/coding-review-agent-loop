@@ -837,9 +837,9 @@ def test_legacy_hook_candidate_citing_unverified_suite_start_is_accepted_1659(tm
 
 
 @pytest.mark.parametrize('order', [
-    ('report-workdir', 'non-passing-selector'),
-    ('launch-integrity', 'report-workdir'),
-    ('report-workdir', 'report-workdir'),
+    ('tests-run-workdir', 'non-passing-selector'),
+    ('launch-integrity', 'tests-run-workdir'),
+    ('tests-run-workdir', 'tests-run-workdir'),
 ])
 @pytest.mark.parametrize('repair_surfaced', [False, True])
 def test_followup_guard_shared_allowance(tmp_path, monkeypatch, real_repair, order, repair_surfaced):
@@ -854,7 +854,8 @@ def test_followup_guard_shared_allowance(tmp_path, monkeypatch, real_repair, ord
         def validate(text):
             parsed = validate_structured_coder_followup(text)
             reason = order[min(invoke.call_count, 2) - 1]
-            if reason == 'report-workdir':
+            if reason == 'tests-run-workdir':
+                # The real display partition refuses this mixed entry (#2052).
                 parsed = __import__('dataclasses').replace(
                     parsed, tests_run=('pytest tests/test_api.py /outside/test_api.py',),
                 )
@@ -1002,3 +1003,201 @@ def test_forwarded_output_does_not_spend_evidence_correction(tmp_path, monkeypat
     assert invoke.call_count == 1
     assert accepted.marker_value.tests_run == (command,)
     assert not accepted.marker_value.out_of_checkout_tests_run
+
+
+# --- #2052: a refused tests_run entry gets its own reason and re-ask prompt ---
+
+_MIXED_TESTS_RUN = "pytest tests/test_api.py /outside/test_api.py"
+
+
+def _followup_validator(config):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    def validate(text):
+        return response_validation._validate_followup_workdir_report(
+            validate_structured_coder_followup(text), config=config,
+        )
+
+    return validate
+
+
+def _run_followup(tmp_path, monkeypatch, results, *, repair_surfaced=False, config=None):
+    """Drive one real coder follow-up acquisition; return (response, error, invoke, logged)."""
+    config = config or make_config(tmp_path, agent_max_retries=0, **_codex_repair())
+    logged: list[str] = []
+    monkeypatch.setattr(validated_agent_module, "log", lambda _config, text, *a, **k: logged.append(str(text)))
+    response = error = None
+    with patch_object_in(
+        (validated_agent_module, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        try:
+            response = _run_validated_agent(
+                FakeRunner(), agent="claude", config=config, prompt="Address PR feedback.",
+                marker_description="structured coder_followup result",
+                validate=_followup_validator(config), role="coder", use_repair=True,
+                repair_expected_kind="coder_followup", reask_on_evidence_rejection=True,
+            )
+        except AgentInvocationError as exc:
+            error = exc
+    return response, error, invoke, logged
+
+
+@pytest.mark.parametrize("repair_surfaced", [False, True])
+def test_tests_run_workdir_refusal_reasks_with_tests_run_prompt_2052(
+    tmp_path, monkeypatch, real_repair, repair_surfaced
+):
+    """`tests-run-reask-recovers`: one re-ask carrying the refusal; a corrected report completes."""
+    from agent_loop_helpers import structured_coder_followup
+
+    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
+    first = bad.replace("Rejected report.", "") if repair_surfaced else bad
+    corrected = structured_coder_followup(
+        summary="Corrected report.", tests_run=["pytest tests/test_api.py"],
+    )
+    calls = _cli_repair(monkeypatch, [(bad, 0)]) if repair_surfaced else []
+    response, error, invoke, logged = _run_followup(
+        tmp_path, monkeypatch,
+        [_result(first, session_id="acquired"), _result(corrected)],
+        repair_surfaced=repair_surfaced,
+    )
+    assert error is None
+    assert invoke.call_count == 2
+    assert len(calls) == (1 if repair_surfaced else 0)
+    second = invoke.call_args_list[1].kwargs
+    assert second["session_id"] == "acquired"
+    assert second["prompt"].startswith("Address PR feedback.\n\n")
+    assert "Previous response not accepted: tests_run report" in second["prompt"]
+    assert "may also test the checkout itself" in second["prompt"]
+    assert "/outside/test_api.py" in second["prompt"]
+    assert "not citable" not in second["prompt"]
+    assert response.marker_value.summary == "Corrected report."
+    assert response.marker_value.tests_run == ("pytest tests/test_api.py",)
+    assert any("re-asking the coder once to correct its tests_run report" in line for line in logged)
+
+
+@pytest.mark.parametrize("repair_surfaced", [False, True])
+def test_second_tests_run_refusal_stops_and_names_budget_used_2052(
+    tmp_path, monkeypatch, real_repair, repair_surfaced
+):
+    """`reask-budget-exhausted` + `reask-ineligibility-diagnosed`: no second re-ask; the log names the term."""
+    from agent_loop_helpers import structured_coder_followup
+
+    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
+    masked = bad.replace("Rejected report.", "")
+    first = masked if repair_surfaced else bad
+    calls = _cli_repair(monkeypatch, [(bad, 0), (bad, 0)]) if repair_surfaced else []
+    response, error, invoke, logged = _run_followup(
+        tmp_path, monkeypatch,
+        [_result(first, session_id="acquired"), _result(first)],
+        repair_surfaced=repair_surfaced,
+    )
+    assert response is None
+    assert error is not None and "semantic-evidence-rejection" in str(error)
+    assert invoke.call_count == 2
+    assert len(calls) == (2 if repair_surfaced else 0)
+    assert any("no coder re-ask (budget-used)" in line for line in logged)
+
+
+def test_issue_wrapped_du_measurement_is_accepted_without_reask_2052(tmp_path, monkeypatch, no_repair):
+    """`measure-wrapped-outside`: the issue's exact hand-off is accepted on the first attempt."""
+    from agent_loop_helpers import structured_coder_followup
+    import coding_review_agent_loop.workdir_guard as guard
+
+    outside = tmp_path / "scratch-elsewhere" / "issue-2347.J1RhjT" / "xdist"
+    du = (
+        '"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --timeout-seconds 30 -- '
+        f"du -sk {outside}"
+    )
+    text = structured_coder_followup(
+        summary="Measured.", tests_run=[du, "pytest tests/test_api.py"],
+    )
+    response, error, invoke, logged = _run_followup(tmp_path, monkeypatch, [_result(text)])
+    assert error is None
+    assert invoke.call_count == 1
+    assert response.marker_value.tests_run == ("pytest tests/test_api.py",)
+    assert response.marker_value.out_of_checkout_tests_run == (du,)
+    assert not any("re-asking" in line for line in logged)
+    config = make_config(tmp_path)
+    assert guard.command_targets_outside_workdir(du, assigned_workdir=config.claude_dir)
+    assert not guard.command_is_admissible_evidence(du, assigned_workdir=config.claude_dir)
+
+
+def test_workdir_refusal_reasons_and_prompts_stay_separate_2052(tmp_path):
+    """`citation-reask-unchanged`: receipt citations keep report-workdir and the citation prompt."""
+    from coding_review_agent_loop.architecture_contract import _evidence_rejection_reask_prompt
+    from coding_review_agent_loop.errors import CITATION_REASKABLE_REASONS
+    from agent_loop_helpers import structured_coder_followup
+
+    config = make_config(tmp_path)
+    validate = _followup_validator(config)
+    with pytest.raises(NonRepairableEvidenceRejection) as partition:
+        validate(structured_coder_followup(tests_run=[_MIXED_TESTS_RUN]))
+    assert partition.value.reason == "tests-run-workdir"
+
+    raw = structured_coder_followup(tests_run=[])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["test_observations"] = [{
+        "command": "pytest /outside/test_api.py", "receipt_id": "outside", "claim": "current-result",
+    }]
+    with pytest.raises(NonRepairableEvidenceRejection) as citation:
+        validate(json.dumps(payload) + raw[end:])
+    assert citation.value.reason == "report-workdir"
+
+    citation_prompt = _evidence_rejection_reask_prompt("P", str(citation.value), reason="report-workdir")
+    assert "Previous response not accepted: test evidence" in citation_prompt
+    assert "not citable" in citation_prompt
+    assert "tests_run report" not in citation_prompt
+    assert _evidence_rejection_reask_prompt("P", "detail") == _evidence_rejection_reask_prompt(
+        "P", "detail", reason="non-passing-selector"
+    )
+    tests_run_prompt = _evidence_rejection_reask_prompt(
+        "P", str(partition.value), reason="tests-run-workdir"
+    )
+    assert "Previous response not accepted: tests_run report" in tests_run_prompt
+    assert "not citable" not in tests_run_prompt
+    # Only the tests_run workdir reason was added to the re-askable set.
+    assert CITATION_REASKABLE_REASONS == frozenset({
+        "non-passing-selector", "launch-integrity", "report-workdir", "tests-run-workdir",
+    })
+
+
+def test_evidence_reask_refusal_names_the_first_refusing_term_2052():
+    """`reask-ineligibility-diagnosed`: every eligibility term is named, in order."""
+    from coding_review_agent_loop.validated_agent import (
+        _evidence_reask_eligible,
+        _evidence_reask_refusal,
+    )
+
+    rejection = NonRepairableEvidenceRejection("x", reason="tests-run-workdir")
+    base = dict(opted_in=True, already_used=False)
+    assert _evidence_reask_refusal(rejection, **base) is None
+    assert _evidence_reask_refusal(rejection, opted_in=False, already_used=True) == "not-opted-in"
+    assert _evidence_reask_refusal(rejection, opted_in=True, already_used=True) == "budget-used"
+    assert _evidence_reask_refusal(
+        NonRepairableEvidenceRejection("x"), **base
+    ) == "reason-not-reaskable"
+    assert _evidence_reask_refusal(
+        rejection, **base, public_text_is_transient=True, marker_safety_failure=True,
+    ) == "transient-public-text"
+    assert _evidence_reask_refusal(rejection, **base, marker_safety_failure=True) == "marker-safety"
+    assert _evidence_reask_refusal(
+        rejection, **base, response_failure_is_unsupported=True
+    ) == "unsupported-failure"
+    # Eligibility itself is unchanged.
+    assert _evidence_reask_eligible(rejection, **base, blocked=False)
+    assert not _evidence_reask_eligible(rejection, **base, blocked=True)
+
+
+def test_transient_public_text_blocks_tests_run_reask_and_is_logged_2052(tmp_path, monkeypatch, no_repair):
+    """`reask-ineligibility-diagnosed`: a transient capture blocks the re-ask and is named."""
+    from types import SimpleNamespace
+    from agent_loop_helpers import structured_coder_followup
+
+    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
+    result = AgentResult(text=bad, returncode=0, session_id="acquired")
+    object.__setattr__(result, "command_result", SimpleNamespace(capture_diagnostics=("lost",)))
+    response, error, invoke, logged = _run_followup(tmp_path, monkeypatch, [result, result])
+    assert response is None
+    assert error is not None
+    assert not any("re-asking the coder once" in line for line in logged)
+    assert any("no coder re-ask (transient-public-text)" in line for line in logged)

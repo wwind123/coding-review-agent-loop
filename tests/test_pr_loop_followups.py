@@ -2283,7 +2283,13 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
     prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ['codex']]
     assert len(prompts) == (1 if mode == 'display' else 2)
     if mode != 'display':
-        assert 'Previous response not accepted: test evidence' in prompts[1]
+        # #2052: a refused tests_run entry gets the tests_run re-ask; a
+        # refused receipt citation keeps the citation wording.
+        heading = (
+            'Previous response not accepted: test evidence' if mode == 'citation'
+            else 'Previous response not accepted: tests_run report'
+        )
+        assert heading in prompts[1]
         assert 'Add coverage.' in prompts[1]
     if mode == 'citation':
         assert 'without hiding failing observations' in prompts[1]

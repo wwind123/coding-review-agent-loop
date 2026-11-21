@@ -39,3 +39,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Historical child retirement admits each complete child observation before handoff lineage validation and endpoint enumeration; human trust cannot authorize loop-published handoffs (#1965).
 
 - 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).
+
+- 2026-11-21: A refused `tests_run` display-partition entry gets its own `tests-run-workdir` reason and a `tests_run`-specific re-ask inside the shared single allowance, because the citation-only wording left the coder resubmitting the same entry; a non-eligible evidence rejection logs its first refusing term (#2052).

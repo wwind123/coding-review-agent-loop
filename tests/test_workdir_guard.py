@@ -1877,3 +1877,180 @@ def test_exported_launcher_reports_validate_inner_targets(tmp_path, launcher):
     validate_test_commands_within_workdir([prefix + "tests/test_example.py"], assigned_workdir=tmp_path)
     with pytest.raises(AgentLoopError):
         validate_test_commands_within_workdir([prefix + "/outside/foreign/test_example.py"], assigned_workdir=tmp_path)
+
+
+# --- #2052: read-only measurement commands on outside paths are context ---
+
+
+@pytest.fixture
+def measure_layout(tmp_path, monkeypatch):
+    """An assigned checkout at <parent>/checkout, a sibling, and an unrelated outside dir."""
+    monkeypatch.setattr(workdir_guard, "scratch_root", lambda: tmp_path / "no-scratch-root")
+    parent = tmp_path / "parent"
+    checkout = parent / "checkout"
+    (checkout / "tests").mkdir(parents=True)
+    (parent / "sibling").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    return SimpleNamespace(parent=parent, checkout=checkout, outside=outside)
+
+
+def _measure_fmt(command, layout):
+    return command.format(
+        outside=layout.outside, parent=layout.parent, checkout=layout.checkout,
+        wrap='"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests',
+    )
+
+
+def _partition(layout, commands):
+    return workdir_guard.partition_reported_tests_by_workdir(
+        commands, assigned_workdir=layout.checkout,
+    )
+
+
+def _assert_refused(layout, command, match="outside the assigned checkout"):
+    with pytest.raises(workdir_guard.ReportWorkdirRefusal, match=match):
+        _partition(layout, [command])
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", [
+    # measure-bare-outside / measure-wrapped-outside
+    "du -sk {outside}",
+    "{wrap} --timeout-seconds 30 -- du -sk {outside}",
+    # measure-other-heads
+    "ls -la {outside}",
+    "wc -l {outside}/f",
+    "stat {outside}",
+    "find {outside} -name '*.py' -type f",
+    # tracked outside cwd and relative outside operand
+    "cd {outside} && du -sk .",
+    "cd {outside} && du -sk",
+    "du -sk ../sibling",
+    "du --max-depth=1 -h {outside}",
+    "head -n 5 {outside}/f",
+])
+def test_outside_only_measurement_is_context_2052(measure_layout, command):
+    """`measure-bare-outside`, `measure-wrapped-outside`, `measure-other-heads`."""
+    command = _measure_fmt(command, measure_layout)
+    partition = _partition(measure_layout, [command, "pytest tests/test_a.py"])
+    assert partition.in_checkout == ("pytest tests/test_a.py",)
+    assert partition.out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    # Context is never evidence.
+    assert not workdir_guard.command_is_admissible_evidence(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+def test_relative_outside_operand_is_recorded_as_violation_2052(measure_layout):
+    """`measure-relative-outside-operand`: the resolved location reaches the violation list."""
+    log = workdir_guard._command_path_violations(
+        "du -sk ../sibling", assigned_workdir=measure_layout.checkout
+    )
+    assert str((measure_layout.parent / "sibling").resolve()) in log
+    assert log.measured_outside and not log.inside_target
+    _assert_refused(measure_layout, "du -sk ../sibling tests")
+
+
+@pytest.mark.parametrize("command", [
+    # mixed-still-refused
+    "pytest tests/test_a.py {outside}/test_a.py",
+    "du -sk {outside} tests/",
+    "pytest -c {outside}/pytest.ini tests",
+    "pytest tests && du -sk {outside}",
+    # measure-mixed-relative-operands
+    "du -sk {outside} tests",
+    "du -sk {outside} ./tests",
+    "wc -l {outside}/f README.md",
+    "ls {outside} tests",
+    # measure-outside-cwd-mixed / runner-outside-cwd-relative
+    "cd {parent} && du -sk {outside} checkout/tests",
+    "cd {parent} && pytest {outside}/t.py checkout/tests",
+    # measure-other-heads: executors and file-referencing predicates
+    "find {outside} -exec pytest {{}} +",
+    "find {outside} -newer README.md",
+    "find {outside} -delete",
+    # measure-indirect-input
+    "du --files0-from {outside}/list",
+    "wc --files0-from={outside}/list",
+    "du -X {outside}/ex {outside}",
+    "file -f {outside}/list",
+    "du -sk --bogus {outside}",
+    # untrusted-program-or-cwd
+    "{outside}/bin/du -sk {outside}",
+    "pushd {outside}; popd; du -sk .",
+    # ls/cat left _NON_TEST_HEADS: an inside listing now makes a run mixed.
+    "ls tests && pytest {outside}/t.py",
+])
+def test_mixed_or_unrecognised_measurement_is_refused_2052(measure_layout, command):
+    """`mixed-still-refused` and the measurement refusal rows."""
+    _assert_refused(measure_layout, _measure_fmt(command, measure_layout))
+
+
+def test_mixed_refusal_keeps_separate_commands_guidance_2052(measure_layout):
+    command = _measure_fmt("pytest tests/test_a.py {outside}/test_a.py", measure_layout)
+    with pytest.raises(workdir_guard.ReportWorkdirRefusal) as excinfo:
+        _partition(measure_layout, [command])
+    message = str(excinfo.value)
+    assert "may also test the checkout itself" in message
+    assert "as separate commands" in message
+    assert "a measurement of an outside directory" in message
+
+
+@pytest.mark.parametrize("command", ['du -sk "$DIR"', "du -sk `pwd`"])
+def test_unexpanded_measurement_operand_is_refused_2052(measure_layout, command):
+    """`measure-unexpanded-operand`: refused with no path violation, naming the operand."""
+    log = workdir_guard._command_path_violations(command, assigned_workdir=measure_layout.checkout)
+    assert list(log) == []
+    assert log.unresolved_inputs
+    with pytest.raises(workdir_guard.ReportWorkdirRefusal, match="cannot be proved") as excinfo:
+        _partition(measure_layout, [command])
+    assert log.unresolved_inputs[0] in str(excinfo.value)
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", ["du -sk", "du -sk tests", "ls tests", "cat README.md"])
+def test_in_checkout_measurement_is_kept_2052(measure_layout, command):
+    partition = _partition(measure_layout, [command])
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk '{outside}",
+    "{wrap} -- du -sk '{outside}",
+])
+def test_malformed_measurement_is_never_context_2052(measure_layout, command):
+    """`measure-malformed-quote`: refused as unparseable; never outside-only."""
+    _assert_refused(measure_layout, _measure_fmt(command, measure_layout), match="could not be parsed")
+
+
+def test_malformed_entry_without_outside_path_keeps_todays_handling_2052(measure_layout):
+    command = "pytest tests/test_a.py -k 'broken"
+    assert _partition(measure_layout, [command]).in_checkout == (command,)
+
+
+def test_runner_relative_operand_resolves_against_tracked_cwd_2052(measure_layout):
+    """`runner-outside-cwd-relative`: an in-checkout target is never context."""
+    command = _measure_fmt("cd {parent} && pytest checkout/tests", measure_layout)
+    log = workdir_guard._command_path_violations(command, assigned_workdir=measure_layout.checkout)
+    assert log.inside_target and not log.outside_target
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    # A relative test operand escaping the checkout is outside, not in-checkout evidence.
+    assert workdir_guard.command_targets_outside_workdir(
+        "pytest ../sibling/tests", assigned_workdir=measure_layout.checkout
+    )
+    assert not workdir_guard.command_is_admissible_evidence(
+        "pytest ../sibling/tests", assigned_workdir=measure_layout.checkout
+    )
+    # An outside location after an unknown option is never a target.
+    _assert_refused(measure_layout, "pytest --unknown-option ../sibling")

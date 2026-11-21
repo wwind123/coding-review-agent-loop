@@ -624,16 +624,32 @@ class _Clause:
     in_subshell: bool = False
 
 
+def _posix_tokens(text: str) -> list[str]:
+    """Shell-lex ``text``; raises ``ValueError`` for malformed quoting."""
+    # ``shlex.split`` only separates operators surrounded by whitespace.
+    # A shell does not impose that restriction, so use punctuation-aware
+    # lexing to keep adjacent commands from hiding in an argument token.
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def _lexes_cleanly(text: str) -> bool:
+    """Whether :func:`_tokenize` can lex ``text`` without its fallback (#2052)."""
+    try:
+        _posix_tokens(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _tokenize(text: str) -> list[str]:
     try:
-        # ``shlex.split`` only separates operators surrounded by whitespace.
-        # A shell does not impose that restriction, so use punctuation-aware
-        # lexing to keep adjacent commands from hiding in an argument token.
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
+        return _posix_tokens(text)
     except ValueError:
+        # The fallback is observable: _validate_command_contents marks a
+        # display-partition entry it applied to as parse-failed (#2052).
         return text.split()
 
 
@@ -1394,6 +1410,21 @@ class _PathLog(list):
         self.ambiguous_target = False
         # An interpreter or executable outside the checkout was named.
         self.program_outside = False
+        # The tracked working directory; ``None`` means the assigned checkout
+        # until a resolvable move, and is cleared whenever cwd_unknown is set.
+        self.cwd_path: Path | None = None
+        # A read-only measurement (du, ls, ...) named only outside operands.
+        self.measured_outside = False
+        # Measurement operands whose location cannot be proved, such as an
+        # unexpanded variable or command substitution (#2052).
+        self.unresolved_inputs: list[str] = []
+        # The entry needed the whitespace fallback because shell lexing failed.
+        self.parse_failed = False
+
+    def note_outside(self, location: str) -> None:
+        """Record an outside location once, however the command spelled it."""
+        if location not in self:
+            self.append(location)
 
 
 # Options whose following operand is a value (config file, plugin, expression,
@@ -1423,11 +1454,206 @@ _CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
 # Clause heads that never run tests themselves.  A shell's own clause is here
 # because its -c script is expanded into separate clauses.
 _NON_TEST_HEADS = frozenset({
-    "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
+    "pwd", "echo", "printf", "true", "false", "export", "set",
     "source", ".", "mkdir", "rm", "cp", "mv", "which", "git", "grep",
     "egrep", "fgrep",
     "sh", "bash", "zsh",
 })
+
+
+# Read-only inspection programs whose whole command line the guard can parse
+# (#2052).  A clause headed by one of these is a *measurement*: it tests
+# nothing, so an entry whose every measurement operand lies outside the
+# checkout is out-of-checkout context instead of an ambiguous test run.  The
+# grammar is closed: an option it does not list, or one that reads its file
+# list from another file, makes the clause ambiguous, which keeps the entry
+# from ever becoming context.
+@dataclass(frozen=True)
+class _MeasurementGrammar:
+    short_booleans: str = ""
+    long_booleans: frozenset[str] = frozenset()
+    # Value-taking options: short letters, and long names (separate or ``=``).
+    short_values: str = ""
+    long_values: frozenset[str] = frozenset()
+    # Long options whose value is optional and only given in ``=`` form.
+    optional_long_values: frozenset[str] = frozenset()
+    # Options naming a control file that may itself list checkout files.
+    indirect: frozenset[str] = frozenset()
+    # ``head -5`` style numeric counts.
+    numeric_count: bool = False
+
+
+_MEASUREMENT_GRAMMARS: dict[str, _MeasurementGrammar] = {
+    "du": _MeasurementGrammar(
+        short_booleans="abchkmsxlLHPDS0",
+        long_booleans=frozenset({
+            "--all", "--apparent-size", "--bytes", "--total", "--dereference-args",
+            "--human-readable", "--si", "--count-links", "--dereference",
+            "--no-dereference", "--separate-dirs", "--summarize", "--one-file-system",
+            "--null", "--inodes",
+        }),
+        short_values="dBt",
+        long_values=frozenset({
+            "--max-depth", "--block-size", "--threshold", "--exclude", "--time-style",
+        }),
+        indirect=frozenset({"--files0-from", "-X", "--exclude-from"}),
+    ),
+    "ls": _MeasurementGrammar(
+        short_booleans="aAlhdR1trSFinogGpQUXvs",
+        long_booleans=frozenset({
+            "--all", "--almost-all", "--human-readable", "--directory", "--recursive",
+            "--classify", "--inode", "--numeric-uid-gid", "--reverse", "--size",
+            "--color",
+        }),
+        short_values="Iw",
+        long_values=frozenset({"--ignore", "--width", "--sort", "--time-style"}),
+        optional_long_values=frozenset({"--color"}),
+    ),
+    "wc": _MeasurementGrammar(
+        short_booleans="cmlLw",
+        long_booleans=frozenset({
+            "--bytes", "--chars", "--lines", "--max-line-length", "--words",
+        }),
+        indirect=frozenset({"--files0-from"}),
+    ),
+    "stat": _MeasurementGrammar(
+        short_booleans="Lft",
+        long_booleans=frozenset({"--dereference", "--file-system", "--terse"}),
+        short_values="c",
+        long_values=frozenset({"--format", "--printf"}),
+    ),
+    "file": _MeasurementGrammar(
+        short_booleans="biLhzks",
+        long_booleans=frozenset({
+            "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
+            "--no-dereference", "--uncompress", "--keep-going", "--special-files",
+        }),
+        indirect=frozenset({"-f", "--files-from", "-m", "--magic-file"}),
+    ),
+    "head": _MeasurementGrammar(
+        short_booleans="qv",
+        long_booleans=frozenset({"--quiet", "--silent", "--verbose"}),
+        short_values="nc",
+        long_values=frozenset({"--lines", "--bytes"}),
+        numeric_count=True,
+    ),
+    "tail": _MeasurementGrammar(
+        short_booleans="qv",
+        long_booleans=frozenset({"--quiet", "--silent", "--verbose"}),
+        short_values="nc",
+        long_values=frozenset({"--lines", "--bytes"}),
+        numeric_count=True,
+    ),
+    "cat": _MeasurementGrammar(
+        short_booleans="AbeEnstTuv",
+        long_booleans=frozenset({
+            "--show-all", "--number-nonblank", "--number", "--squeeze-blank",
+            "--show-ends", "--show-tabs", "--show-nonprinting",
+        }),
+    ),
+    # ``find`` has its own expression grammar; see _find_operands.
+    "find": _MeasurementGrammar(),
+}
+# find predicates that take one value (a pattern, number or format), never a
+# file the predicate reads.
+_FIND_VALUE_PREDICATES = frozenset({
+    "-name", "-iname", "-path", "-ipath", "-regex", "-type", "-maxdepth",
+    "-mindepth", "-size", "-mtime", "-mmin", "-perm", "-user", "-group", "-printf",
+})
+_FIND_PLAIN_TOKENS = frozenset({
+    "-print", "-print0", "-prune", "-empty", "-ls", "-o", "-a", "-or", "-and",
+    "-not", "(", ")", "!",
+})
+
+
+def _find_operands(tokens: Sequence[str], start: int) -> list[str] | None:
+    """find's starting points, or ``None`` when its expression is not read-only.
+
+    Executors (``-exec``, ``-ok``, ``-delete``, ...), output files
+    (``-fprint``), and predicates naming a reference file (``-newer``,
+    ``-samefile``, ...) all fall outside the closed grammar.
+    """
+    index = start
+    while index < len(tokens) and tokens[index] in {"-H", "-L", "-P"}:
+        index += 1
+    starts: list[str] = []
+    while index < len(tokens) and not tokens[index].startswith(("-", "(", ")", "!")):
+        starts.append(tokens[index])
+        index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _FIND_VALUE_PREDICATES:
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+        elif token in _FIND_PLAIN_TOKENS:
+            index += 1
+        else:
+            return None
+    return starts
+
+
+def _measurement_operands(
+    tokens: Sequence[str], start: int, grammar: _MeasurementGrammar
+) -> list[str] | None:
+    """File operands of a measurement clause, or ``None`` if not fully recognised."""
+    operands: list[str] = []
+    index = start
+    terminated = False
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if terminated:
+            operands.append(token)
+            continue
+        if token == "--":
+            terminated = True
+            continue
+        if token == "-":
+            # Standard input names no file.
+            continue
+        if token.startswith("--"):
+            name, equals, _ = token.partition("=")
+            if name in grammar.indirect:
+                return None
+            if name in grammar.long_values:
+                if not equals:
+                    if index >= len(tokens):
+                        return None
+                    index += 1
+                continue
+            if name in grammar.optional_long_values or (
+                not equals and name in grammar.long_booleans
+            ):
+                continue
+            return None
+        if token.startswith("-"):
+            body = token[1:]
+            if grammar.numeric_count and body.isdigit():
+                continue
+            for position, letter in enumerate(body):
+                if f"-{letter}" in grammar.indirect:
+                    return None
+                if letter in grammar.short_values:
+                    if position + 1 == len(body):
+                        # The value is the next token, never an operand.
+                        if index >= len(tokens):
+                            return None
+                        index += 1
+                    break
+                if letter not in grammar.short_booleans:
+                    return None
+            continue
+        operands.append(token)
+    return operands
+
+
+def _is_unexpanded(token: str) -> bool:
+    """Whether a token still holds shell expansion the guard cannot resolve."""
+    if "`" in token:
+        return True
+    remainder = token[len("$HOME/"):] if token.startswith("$HOME/") else token
+    return "$" in remainder
 
 
 def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
@@ -1435,16 +1661,24 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
 
     This is fail-safe: a run counts as out-of-checkout context only with
     positive evidence that everything it tested lies elsewhere.  Every
-    positional operand that does not resolve outside -- relative paths, bare
-    words such as ``tests``, node IDs such as ``test_a.py::t`` -- is an inside
-    target, resolved against the current directory.  That is the confined
-    in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
-    working-directory option (``-C``, ``--chdir``, ...) moved it; ``--rootdir``
-    does not.  A test clause with no positional operand tests its current
-    directory.  An outside path after a value-taking or unknown option is not
-    a target, so an unrecognized report or config path can never turn an
-    in-checkout run into context; an inside path there still counts, and
-    every token after ``--`` is an operand.
+    positional operand that is not absolute is resolved against the tracked
+    working directory -- relative paths, bare words such as ``tests``, node
+    IDs such as ``test_a.py::t`` -- and classified by where it lands, so
+    ``../other`` from the checkout is an outside location and
+    ``checkout/tests`` from its parent is an inside one (#2052).  Every
+    outside location reaches the violation list.  The directory is the
+    confined in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
+    working-directory option (``-C``, ``--chdir``, ...) moved it;
+    ``--rootdir`` does not.  A test clause with no positional operand tests
+    its current directory.  An outside location after a value-taking or
+    unknown option is not a target, so an unrecognized report or config path
+    can never turn an in-checkout run into context; an inside path there
+    still counts, and every token after ``--`` is an operand.
+
+    A clause headed by a read-only measurement program (``du``, ``ls``, ...)
+    is classified through its closed grammar instead: its file operands set
+    ``measured_outside`` or ``inside_target``, and anything the grammar does
+    not recognise is ambiguous.
 
     The directory is tracked only through resolvable absolute moves outside
     any subshell.  After ``popd``, ``cd -``, a relative or unresolvable
@@ -1453,35 +1687,114 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     is ambiguous, which keeps the run authoritative.
     """
 
+    def inside(path: Path) -> bool:
+        return path == assigned or _is_inside(path, assigned)
+
     def outside(raw: str) -> bool | None:
         path = _normalize_reported_path(raw)
         if path is None:
             return None
-        return not (path == assigned or _is_inside(path, assigned))
+        return not inside(path)
+
+    def forget_cwd() -> None:
+        log.cwd_unknown = True
+        log.cwd_path = None
 
     tokens = clause.tokens
     if log.cwd_depth > clause.shell_depth:
         # The shell -c script that moved the directory has exited.
-        log.cwd_unknown = True
+        forget_cwd()
     _, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
     forwarding = _npm_forwarding_separator(tokens, head)
     if head_name in {"cd", "pushd", "popd"}:
-        moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
-        if moved is None or clause.in_subshell or head_name == "popd":
+        target = (
+            _normalize_reported_path(tokens[head + 1]) if head + 1 < len(tokens) else None
+        )
+        if target is None or clause.in_subshell or head_name == "popd":
             # Only one resolvable move outside any subshell is tracked; a
             # restore or unresolvable target leaves the directory unknown.
-            log.cwd_unknown = True
+            forget_cwd()
         else:
-            log.cwd_outside = moved
+            log.cwd_outside = not inside(target)
+            log.cwd_path = target
             log.cwd_depth = max(log.cwd_depth, clause.shell_depth)
+        return
+
+    cwd: Path | None = None if log.cwd_unknown else (log.cwd_path or assigned)
+
+    def resolve(operand: str | None) -> Path | None:
+        if cwd is None:
+            return None
+        if operand is None:
+            return cwd
+        try:
+            return _canonical(cwd / operand)
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def record_relative(operand: str | None, *, measurement: bool = False) -> None:
+        resolved = resolve(operand)
+        if resolved is None:
+            log.ambiguous_target = True
+        elif inside(resolved):
+            log.inside_target = True
+        else:
+            log.note_outside(str(resolved))
+            if measurement:
+                log.measured_outside = True
+            else:
+                log.outside_target = True
+
+    grammar = _MEASUREMENT_GRAMMARS.get(head_name)
+    if grammar is not None:
+        if log.parse_failed:
+            # A fallback-tokenized clause is never classified by the grammar.
+            log.ambiguous_target = True
+            return
+        for token in tokens[head + 1 :]:
+            # The role pass skips ``--option=/path`` values; an outside one
+            # (``--files0-from=/x/list``) is still an outside location.
+            value = token.partition("=")[2] if token.startswith("--") else ""
+            if _is_path_shaped(value):
+                path = _normalize_reported_path(value)
+                if path is not None and not inside(path):
+                    log.note_outside(value)
+        operands = (
+            _find_operands(tokens, head + 1)
+            if head_name == "find"
+            else _measurement_operands(tokens, head + 1, grammar)
+        )
+        if operands is None:
+            log.ambiguous_target = True
+            return
+        if not operands:
+            record_relative(None, measurement=True)
+        for raw in operands:
+            if _is_unexpanded(raw):
+                log.unresolved_inputs.append(raw)
+                log.ambiguous_target = True
+                continue
+            cleaned = _strip_wrap(raw)
+            if not cleaned:
+                continue
+            if _is_path_shaped(cleaned):
+                path = _normalize_reported_path(cleaned)
+                if path is None:
+                    log.ambiguous_target = True
+                elif inside(path):
+                    log.inside_target = True
+                else:
+                    log.note_outside(cleaned)
+                    log.measured_outside = True
+            else:
+                record_relative(cleaned, measurement=True)
         return
     if head_name in _NON_TEST_HEADS:
         return
 
-    cwd_outside: bool | None = None if log.cwd_unknown else log.cwd_outside
     index = head + 1
     while index < len(tokens):
         token = tokens[index]
@@ -1491,21 +1804,13 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         if token == "--":
             break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
-            cwd_outside = outside(tokens[index + 1])
+            cwd = _normalize_reported_path(tokens[index + 1])
             index += 2
             continue
         for prefix in _CWD_FLAG_PREFIXES:
             if token.startswith(prefix):
-                cwd_outside = outside(token[len(prefix) :])
+                cwd = _normalize_reported_path(token[len(prefix) :])
         index += 1
-
-    def record_relative() -> None:
-        if cwd_outside is None:
-            log.ambiguous_target = True
-        elif cwd_outside:
-            log.outside_target = True
-        else:
-            log.inside_target = True
 
     saw_positional = False
     terminated = False
@@ -1524,7 +1829,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
                 else:
                     log.inside_target = True
             else:
-                record_relative()
+                record_relative(cleaned)
             continue
         if index == forwarding:
             continue
@@ -1559,10 +1864,17 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             else:
                 log.inside_target = True
             continue
+        if after_unknown_option:
+            resolved = resolve(cleaned)
+            if resolved is not None and not inside(resolved):
+                # The same rule for a relative outside location: possibly an
+                # option value, so it is a violation but never a target.
+                log.note_outside(str(resolved))
+                continue
         saw_positional = True
-        record_relative()
+        record_relative(cleaned)
     if not saw_positional:
-        record_relative()
+        record_relative(None)
 
 
 def _validate_command_contents(
@@ -1581,6 +1893,19 @@ def _validate_command_contents(
             "validated against the assigned Unix checkout: "
             f"{raw_windows!r} in command {command!r}. Assigned checkout: {assigned}"
         )
+
+    if isinstance(path_violations, _PathLog) and not _lexes_cleanly(command):
+        # Malformed quoting falls back to whitespace tokens, which can hide a
+        # quoted outside path from the role pass.  Such an entry is never
+        # context, and one naming an outside path is refused (#2052).
+        path_violations.parse_failed = True
+        for token in command.split():
+            if not any(quote in token for quote in "'\""):
+                continue
+            cleaned = token.strip("'\"`;&|()")
+            path = _normalize_reported_path(cleaned) if _is_path_shaped(cleaned) else None
+            if path is not None and not (path == assigned or _is_inside(path, assigned)):
+                path_violations.note_outside(cleaned)
 
     clauses = _clauses_for_entry(command, origin)
     # A preflight (pwd/git status) can precede a managed test command. Apply
@@ -1649,7 +1974,11 @@ def _validate_managed_command(
         managed = parse_managed_test_command(
             tokens, allow_command_name_launcher=True
         )
-    except (ValueError, TestRuntimeConfigurationError):
+    except ValueError:
+        if isinstance(path_violations, _PathLog):
+            path_violations.parse_failed = True
+        managed = None
+    except TestRuntimeConfigurationError:
         managed = None
     if managed is not None:
         # Leading assignments are command syntax even when extracted from a
@@ -1747,9 +2076,13 @@ def _partition_reported_tests_by_workdir(
     this way.  A command that names an outside path but may also test the
     checkout -- mixed operands, an outside config or ignore path, a directory
     the guard cannot track -- is ambiguous and refused with guidance to run
-    the two separately.  Live remote targets, unvalidatable Windows paths, and
-    malformed shell text still fail closed, as do receipt citations, which
-    keep using the strict validator.
+    the two separately.  A read-only measurement (``du``, ``ls``, ``wc``,
+    ``stat``, ``find`` without executors, ...) whose every operand lies
+    outside is context too (#2052); one with an unexpanded operand, an
+    unparseable entry naming an outside path, and an indirect-input or
+    unrecognised option are refused.  Live remote targets, unvalidatable
+    Windows paths, and malformed shell text still fail closed, as do receipt
+    citations, which keep using the strict validator.
     """
     if not tests_run:
         return ReportedTestsPartition(in_checkout=None if tests_run is None else ())
@@ -1762,20 +2095,43 @@ def _partition_reported_tests_by_workdir(
             command, assigned=assigned, origin="structured", path_violations=violations,
             display_partition=True,
         )
-        if not violations:
+        if not violations and not violations.unresolved_inputs:
             kept.append(command)
         elif _tests_only_outside(violations):
             context.append(command)
         else:
-            message = (
-                "Coder reported a test command that names a path outside the "
-                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
-                "but may also test the checkout itself, in command "
-                f"{command!r}. Report in-checkout tests and any baseline run "
-                "outside the checkout as separate commands; a baseline command "
-                "must name only outside test targets. Assigned checkout: "
-                f"{assigned}"
-            )
+            named = ", ".join(repr(p) for p in violations)
+            if violations.parse_failed:
+                message = (
+                    "Coder reported a test command that could not be parsed "
+                    "(unbalanced quoting) and names a path outside the assigned "
+                    f"checkout ({named}), in command {command!r}. Report each "
+                    "command with balanced quotes, and report in-checkout tests "
+                    "and any run outside the checkout as separate commands. "
+                    f"Assigned checkout: {assigned}"
+                )
+            elif violations.unresolved_inputs:
+                unresolved = ", ".join(repr(p) for p in violations.unresolved_inputs)
+                message = (
+                    "Coder reported a command whose operand location cannot be "
+                    f"proved ({unresolved}: an unexpanded variable or command "
+                    f"substitution), in command {command!r}. Name literal paths, "
+                    "and report in-checkout tests and any run outside the "
+                    "checkout as separate commands. Assigned checkout: "
+                    f"{assigned}"
+                )
+            else:
+                message = (
+                    "Coder reported a test command that names a path outside the "
+                    f"assigned checkout ({named}) "
+                    "but may also test the checkout itself, in command "
+                    f"{command!r}. Report in-checkout tests and any baseline run "
+                    "outside the checkout as separate commands; a baseline command "
+                    "must name only outside test targets, and a measurement of an "
+                    "outside directory (for example du or ls) must be its own "
+                    "entry naming only outside paths. Assigned checkout: "
+                    f"{assigned}"
+                )
             if violations.program_outside and dependency_hint:
                 from .worktree_hints import with_remedy
 
@@ -1870,12 +2226,19 @@ def command_targets_outside_workdir(
 
 
 def _tests_only_outside(log: "_PathLog") -> bool:
-    """Whether a validated command names outside paths and tests nothing else."""
+    """Whether a validated command names outside paths and tests nothing else.
+
+    A read-only measurement of outside paths qualifies too (#2052), unless
+    its program itself lies outside the checkout.  Unresolved operands and
+    unparseable entries never do.
+    """
     return (
         bool(log)
-        and log.outside_target
         and not log.inside_target
         and not log.ambiguous_target
+        and not log.unresolved_inputs
+        and not log.parse_failed
+        and (log.outside_target or (log.measured_outside and not log.program_outside))
     )
 
 

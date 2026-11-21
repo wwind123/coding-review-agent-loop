@@ -24,7 +24,7 @@ from .architecture_context import (
 from .config import AgentLoopConfig
 from .decomposition import PlanDecomposition
 from .pr_round_errors import PrRoundHistoryError
-from .errors import AgentInvocationError, AgentLoopError
+from .errors import TESTS_RUN_WORKDIR_REASON, AgentInvocationError, AgentLoopError
 from .github import PullRequestMetadata, post_issue_comment
 from .logging import log
 from .protocol_risk import (
@@ -821,9 +821,26 @@ def _missing_judgement_field_reask_prompt(
 _EVIDENCE_REASK_MAX_CHARS = EVIDENCE_REASK_MAX_CHARS
 
 
-def _evidence_rejection_reask_prompt(prompt: str, detail: str) -> str:
-    """Append one bounded, marker-free section quoting a rejected test citation."""
+def _evidence_rejection_reask_prompt(
+    prompt: str, detail: str, *, reason: str | None = None
+) -> str:
+    """Append one bounded, marker-free section quoting the rejected evidence.
+
+    A refused ``tests_run`` entry (#2052) asks the coder to correct that report;
+    every other re-askable reason keeps the citation wording (#1240).
+    """
     quoted = render_evidence_rejection_detail(detail)
+    if reason == TESTS_RUN_WORKDIR_REASON:
+        return (
+            f"{prompt}\n\n## Previous response not accepted: tests_run report\n\n"
+            f"A `tests_run` entry in your structured result was refused: {quoted}\n\n"
+            "Resubmit your full structured result with a corrected `tests_run`. List "
+            "in-checkout test commands and any command run outside the assigned "
+            "checkout (a baseline run or a measurement of an outside directory) as "
+            "separate `tests_run` entries, each naming literal paths. Remove entries "
+            "that are neither. Leave valid `test_observations` as they are. If you "
+            "cannot comply, return a blocking result instead.\n"
+        )
     return (
         f"{prompt}\n\n## Previous response not accepted: test evidence\n\n"
         f"The test observation you selected is not citable: {quoted}\n\n"

@@ -21,6 +21,7 @@ from .errors import (
     AgentLoopError,
     ReportWorkdirRefusal,
     NonRepairableEvidenceRejection,
+    TESTS_RUN_WORKDIR_REASON,
     IssueImplementationConflictError,
     SemanticPatchPayloadRejection,
     SemanticPatchUnknownPriorItemDispositionError,
@@ -1572,16 +1573,23 @@ def _validate_followup_workdir_report(
     """Compose structured report guards inside every validated candidate path."""
     if not isinstance(parsed, (StructuredCoderFollowup, StructuredIssueImplementation)):
         return parsed
+    # The two guards keep separate reasons so the single coder re-ask can say
+    # which part of the report to correct (#2052).
     try:
         partitioned = _degrade_out_of_checkout_tests(parsed, config=config)
+    except ReportWorkdirRefusal as exc:
+        raise NonRepairableEvidenceRejection(
+            str(exc), reason=TESTS_RUN_WORKDIR_REASON
+        ) from exc
+    try:
         validate_test_observation_citations_within_workdir(
             partitioned.test_observations,
             assigned_workdir=active_workdir(config),
             dependency_hint=dependency_remedy(config, active_workdir(config)),
         )
-        return partitioned
     except ReportWorkdirRefusal as exc:
         raise NonRepairableEvidenceRejection(str(exc), reason="report-workdir") from exc
+    return partitioned
 
 
 def _degrade_out_of_checkout_tests(

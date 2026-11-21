@@ -6450,7 +6450,22 @@ nothing but outside targets is context. An entry that names an outside path
 but may also test the checkout -- mixed operands, an outside config or ignore
 path, or a working directory the guard cannot track -- is refused with a
 message telling the coder to report the in-checkout run and the baseline as
-separate commands. A managed-broker run whose
+separate commands. A read-only inspection command (`du`, `ls`, `wc`, `stat`,
+`file`, `head`, `tail`, `cat`, or `find` with only name/type/size-style
+predicates), bare or wrapped in `agent-loop run-tests --`, tests nothing: when
+the guard recognises its whole command line and every file operand lies outside
+the checkout, it is out-of-checkout context too, for example
+`du -sk /tmp/coding-review-agent-loop/scratch/<dir>` (#2052). Operands resolve
+against the tracked working directory, so `du -sk ../sibling` is outside and
+`cd <parent> && du -sk checkout/tests` is inside. Such a command stays refused
+when it mixes inside and outside operands, uses an option its closed grammar
+does not list or one that reads a file list (`--files0-from`, `du -X`,
+`file -f`), names an unexpanded operand such as `"$DIR"`, runs a program
+located outside the checkout, uses a `find` executor or reference-file
+predicate (`-exec`, `-delete`, `-newer`), or cannot be parsed. A refused
+`tests_run` entry earns the coder's single semantic-evidence re-ask: the
+re-ask quotes the refusal and asks for a corrected `tests_run`, and a second
+refusal stops the turn. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
 evidence, so it can never back a verified row. On the failure side the
