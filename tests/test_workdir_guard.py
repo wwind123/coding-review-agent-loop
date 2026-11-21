@@ -2192,3 +2192,47 @@ def test_plain_shell_launcher_measurement_is_context_2052(measure_layout, comman
     assert workdir_guard.command_targets_outside_workdir(
         command, assigned_workdir=measure_layout.checkout
     )
+
+
+@pytest.mark.parametrize("command", [
+    # item-8: an untrusted shell launcher still taints a run-tests-wrapped measurement.
+    "{outside}/bin/bash -c 'agent-loop run-tests -- du -sk {outside}'",
+    "../sibling/bash -c 'agent-loop run-tests -- du -sk {outside}'",
+    # item-9: a node selector runs its file part, here a symlink into the checkout.
+    "pytest ../sibling/test_alias.py::test_case",
+    "pytest {parent}/sibling/test_alias.py::test_case[1]",
+    # item-10: an expanding cd or -C target leaves the directory unknown.
+    "cd {parent}/$NAME && du -sk .",
+    "cd {parent}/* && du -sk .",
+    "cd {parent}/c{{heckout,x}} && du -sk",
+])
+def test_inherited_launch_selector_and_expanding_cwd_are_never_context_2052(
+    measure_layout, command
+):
+    """Generalization: every fact a classification relies on must be literal and inherited."""
+    (measure_layout.checkout / "tests" / "test_a.py").write_text("", encoding="utf-8")
+    (measure_layout.parent / "sibling" / "test_alias.py").symlink_to(
+        measure_layout.checkout / "tests" / "test_a.py"
+    )
+    command = _measure_fmt(command, measure_layout)
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    try:
+        partition = _partition(measure_layout, [command])
+    except workdir_guard.ReportWorkdirRefusal:
+        return
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "bash -c 'agent-loop run-tests -- du -sk {outside}'",
+    "pytest {outside}/t.py::test_x[1]",
+    "cd {outside} && du -sk .",
+])
+def test_literal_selector_and_trusted_launch_stay_context_2052(measure_layout, command):
+    command = _measure_fmt(command, measure_layout)
+    assert _partition(measure_layout, [command]).out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )

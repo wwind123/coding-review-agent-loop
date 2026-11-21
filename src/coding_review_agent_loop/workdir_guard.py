@@ -1433,6 +1433,8 @@ class _PathLog(list):
         self.parse_failed = False
         # ``PATH`` was reassigned, so a bare program name may resolve anywhere.
         self.path_modified = False
+        # Nesting depth of managed commands launched by an untrusted sh -c.
+        self.inherited_untrusted = 0
 
     def note_outside(self, location: str) -> None:
         """Record an outside location once, however the command spelled it."""
@@ -1696,6 +1698,9 @@ def _operand_location(
         return path == assigned or _is_inside(path, assigned)
 
     text = raw
+    if "::" in text and text.split("::", 1)[0]:
+        # A test-node selector (``path::name[param]``) runs its file part.
+        text = text.split("::", 1)[0]
     if text.startswith("$HOME/"):
         text = str(Path.home()) + text[len("$HOME"):]
     elif text == "~" or text.startswith("~/"):
@@ -1794,6 +1799,18 @@ def _launch_is_plain(tokens: Sequence[str], positions: set[int], head: int | Non
     return True
 
 
+def _literal_directory(raw: str) -> Path | None:
+    """A working-directory target, or ``None`` when the shell would expand it.
+
+    ``cd /work/$NAME`` or ``cd /work/*`` may land anywhere, including the
+    checkout, so such a target leaves the directory unknown (#2052).
+    """
+    remainder = raw[len("$HOME/"):] if raw.startswith("$HOME/") else raw
+    if set(remainder) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS):
+        return None
+    return _normalize_reported_path(raw)
+
+
 def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
     """Note whether a clause's test targets lie inside and/or outside the checkout.
 
@@ -1852,7 +1869,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     forwarding = _npm_forwarding_separator(tokens, head)
     if head_name in {"cd", "pushd", "popd"}:
         target = (
-            _normalize_reported_path(tokens[head + 1]) if head + 1 < len(tokens) else None
+            _literal_directory(tokens[head + 1]) if head + 1 < len(tokens) else None
         )
         if target is None or clause.in_subshell or head_name == "popd":
             # Only one resolvable move outside any subshell is tracked; a
@@ -1901,6 +1918,7 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         if (
             log.path_modified
             or clause.launcher_untrusted
+            or log.inherited_untrusted
             or not _launch_is_plain(tokens, positions, head)
         ):
             # Operand-supplying wrappers, PATH changes and path-named
@@ -1946,12 +1964,12 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         if token == "--":
             break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
-            cwd = _normalize_reported_path(tokens[index + 1])
+            cwd = _literal_directory(tokens[index + 1])
             index += 2
             continue
         for prefix in _CWD_FLAG_PREFIXES:
             if token.startswith(prefix):
-                cwd = _normalize_reported_path(token[len(prefix) :])
+                cwd = _literal_directory(token[len(prefix) :])
         index += 1
 
     saw_positional = False
@@ -2050,11 +2068,21 @@ def _validate_command_contents(
     # working directory an earlier ``cd`` clause established (#2052).
     ordinary_clauses: list[_Clause] = []
     for clause in clauses:
-        if _validate_managed_command(
-            shlex.join(clause.tokens), assigned=assigned,
-            origin="structured" if clause.mode in {"structured", "code"} else "response",
-            path_violations=path_violations, display_partition=display_partition,
-        ):
+        inherit = isinstance(path_violations, _PathLog) and clause.launcher_untrusted
+        if inherit:
+            # The managed inner argv is re-parsed into fresh clauses; an
+            # untrusted sh -c launcher above it still taints them (#2052).
+            path_violations.inherited_untrusted += 1
+        try:
+            managed = _validate_managed_command(
+                shlex.join(clause.tokens), assigned=assigned,
+                origin="structured" if clause.mode in {"structured", "code"} else "response",
+                path_violations=path_violations, display_partition=display_partition,
+            )
+        finally:
+            if inherit:
+                path_violations.inherited_untrusted -= 1
+        if managed:
             continue
         ordinary_clauses.append(clause)
         for raw_path, role in _path_roles(clause, display_partition=display_partition):
