@@ -182,9 +182,10 @@ def _role_conflict_message(conflicts, previous_entries, reviewer_name):
         details.append(f"{rid}: " + ", ".join(f"{name}: {role}" for name, role in sorted(roles)))
     return ("Signed-source classification remained conflicting; retained signed sources and pending evidence "
             "require reviewer agreement or a human decision before coder dispatch. Reviewer roles per source: "
-            + "; ".join(details) + ". Post a follow-up signed comment that separates exact-head evidence "
-            "answers from code requirements, or have reviewers converge on one role on rerun; "
-            "no coder was dispatched.")
+            + "; ".join(details) + ". Post a new follow-up signed comment (do not edit the existing "
+            "signed comment) that separates exact-head evidence answers from code requirements; the next "
+            "resume opens a fresh review round against the added source. Or have reviewers converge on "
+            "one role on rerun; no coder was dispatched.")
 
 
 # The signed-source classification continuation's validated-turn options. A

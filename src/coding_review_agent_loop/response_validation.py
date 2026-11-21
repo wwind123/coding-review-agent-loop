@@ -1306,6 +1306,51 @@ def posted_review_rejection_reason(
     return "it no longer matches this run's review contract"
 
 
+def signed_input_growth_rejection(
+    record: PostedRoundRecord,
+    human_requirements: Sequence[HumanReviewRequirement],
+    approved_plan_context: ApprovedPlanContext | None = None,
+    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
+    *,
+    seat_binding: object = None,
+    round_number: int,
+    head_sha: str,
+    reconciled: bool,
+) -> bool:
+    """Whether resume rejected this posted review only because the signed set grew (#2054).
+
+    True only for a complete code review of this round and head, in an
+    unreconciled round, whose seat binding and non-classification identity
+    (plan, acquisition, evidence consistency) still match, and whose persisted
+    digest IDs are a strict subset of the live set.  A withdrawn or edited
+    source (a persisted ID missing from the live set), legacy labels or any
+    other failing predicate keep the partial-round refusal.  Metadata alone
+    never proves the published body is unedited; callers also apply the
+    publication-integrity gate.
+    """
+    from .review_scope import is_complete_code_review
+
+    metadata = record.metadata
+    if reconciled or not human_requirements:
+        return False
+    if metadata.round_number != round_number or metadata.subject != head_sha:
+        return False
+    if not is_complete_code_review(metadata):
+        return False
+    if seat_binding is not None and metadata.seat_binding != seat_binding:
+        return False
+    if _resumed_pr_reviewer_identity_rejection(
+        record, approved_plan_context, reviewer_acquisition_contract
+    ) is not None:
+        return False
+    persisted = [str(item) for item in metadata.surfaced_reviewer_requirement_ids]
+    # An empty persisted set (published before any signed source) is growth too.
+    if any(not re.fullmatch(r"hr-[0-9a-f]{64}", item) for item in persisted):
+        return False
+    live = set(_reviewer_requirement_identity_ids(human_requirements))
+    return set(persisted) < live
+
+
 def _validate_plan_revision_response(
     text: str,
     *,

@@ -4194,6 +4194,8 @@ def run_pr_loop(
                     human_requirements=human_requirements,
                 )
 
+            from .signed_input_supersession import supersede_for_signed_growth  # #2054: close round N on pure signed growth
+            current_resume = supersede_for_signed_growth(runner, config=config, pr_number=pr_number, comments=pr_comments, current_resume=current_resume, round_number=round_number, allowed_rounds=allowed_rounds, head_sha=current_pr_subject, human_requirements=human_requirements, approved_plan_context=approved_plan_context, acquisition_contract=reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None, seat_binding=seat_binding, prior_items=prior_unresolved_items, configured_reviewer_names=[agent_display_name(r) for r in configured_reviewers], completed_by_name=completed_by_name, resumed_by_name=resumed_by_name, rejection_reasons=posted_rejection_reasons, spool=pr_round_spool, bound_metadata=bound_pr_metadata, post_comment=post_pr_comment, unresolved_items=unresolved_items, blocked=bool(skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None or conversion_pass or prepanel_unqualified_reviews))
             # A reconciled round is closed (#1553): it never receives another
             # scheduling or reviewer record.  Recovery, qualification,
             # evidence, conflict, evidence-pass and conversion resumes keep

@@ -3693,6 +3693,24 @@
       "admission": "scope_declarations.extract_declared_out_of_scope reads raw body text for presentation, diagnostics or candidate prose; no round approval, child routing or protocol authorization is selected here."
     },
     {
+      "module": "signed_input_supersession",
+      "function": "edit_history_proves_unedited",
+      "classification": "reader",
+      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
+    },
+    {
+      "module": "signed_input_supersession",
+      "function": "read_pr_comment_edit_states",
+      "classification": "acquisition",
+      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
+    },
+    {
+      "module": "signed_input_supersession",
+      "function": "review_comment_ids",
+      "classification": "reader",
+      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
+    },
+    {
       "module": "split_materialization",
       "function": "_adopt_from_found",
       "classification": "reader",

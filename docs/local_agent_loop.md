@@ -967,8 +967,14 @@ signed source plus every reviewer's `leftover_instructions`, each attributed to
 its reviewer; accepting human evidence is never coder work. Reviewers agree on a
 source by role, so different leftover wording is not a conflict. If reviewers
 still disagree on the role after one continuation, the run stops, names each
-reviewer's role, and asks for a follow-up signed comment that separates
-exact-head evidence answers from code requirements. Classification alone cannot clear evidence. The requester
+reviewer's role, and asks for a new follow-up signed comment that separates
+exact-head evidence answers from code requirements. Post a new comment rather
+than editing the existing signed comment: an edit changes that source's digest
+(a withdrawal plus an addition), which resume still refuses. Adding a signed
+source only grows the signed set, so the next resume posts a signed-input
+supersession record that closes the round and opens a fresh review round
+against the added source, with no comment to delete (see the partial-round
+recovery notes). Classification alone cannot clear evidence. The requester
 must also attest adequacy through live signed citations and exact-head binding,
 before or after a freeze. Missing classification triggers one real reviewer
 continuation when evidence is involved; absent or conflicting classification
@@ -4141,6 +4147,18 @@ Execution model:
     rejected and needs a fresh turn; for a rejected own review it names the
     failing check (a changed signed requirement set, a reconciled round, or an
     approved-plan, acquisition or seat-binding change). It never offers a rerun from another host.
+    One case does not refuse (#2054): when every published review of the
+    round (at least two) was rejected only because signed sources were added
+    since it was posted, and each review proves it was never edited (its frozen spool
+    carrier still matches the public comments, or GitHub's edit history shows
+    no edit), resume posts a signed-input supersession record and opens the
+    next round instead. The superseded reviews stay as history, never count
+    toward approval and are never listed for deletion; a reviewer's pending
+    exact-head evidence request is carried into the new round so a signed
+    answer can clear it; the new round uses one
+    round of `--max-rounds`, and with none left the ordinary round-limit stop
+    applies. An edited or withdrawn signed source, an edited review, an
+    unreadable edit history or any other cause keeps the refusal below.
     It then lists, by comment id and URL, the comments to delete so the whole
     round runs again independently: the round's peer reviewer verdicts of any
     scheduler phase (including a rejected own record), the round's reconciling

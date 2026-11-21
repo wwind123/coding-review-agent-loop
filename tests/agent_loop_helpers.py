@@ -1544,6 +1544,29 @@ class FakeRunner(Runner):
                 cmd, cwd_path, json_dumps(self._issue_payload_for(number)), "", 0
             )
 
+        if cmd[:3] == ["gh", "api", "graphql"] and any(
+            "SignedInputEditHistory" in part for part in cmd[3:]
+        ):
+            # PR comment edit history (#2054).  A comment may set
+            # ``_edit_history`` to a node override, or ``None`` for an
+            # unreadable history; the default is a never-edited comment.
+            self.edit_history_calls = getattr(self, "edit_history_calls", 0) + 1
+            number = self.pr_payload.get("number", 77)
+            comments = self.pr_payload.get("comments", [])
+            self._ensure_fixture_comment_ids(comments, number)
+            nodes = []
+            for comment in comments:
+                node = {"databaseId": comment.get("id", comment.get("databaseId")),
+                        "lastEditedAt": None, "includesCreatedEdit": False,
+                        "userContentEdits": {"totalCount": 0, "nodes": []}}
+                if "_edit_history" in comment:
+                    override = comment["_edit_history"]
+                    node = {"databaseId": node["databaseId"]} if override is None else {**node, **override}
+                nodes.append(node)
+            payload = {"data": {"repository": {"pullRequest": {"comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}}
+            return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
+
         if cmd[:3] == ["gh", "api", "graphql"]:
             self.pr_commit_calls += 1
             if self.pr_commit_query_failures:

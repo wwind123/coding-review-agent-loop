@@ -73,6 +73,7 @@ from .review_scheduling import FORCE_FULL_SOURCES
 
 from .evidence_stall import stall_snapshot_is_consistent
 from .evidence_conversion import EvidenceConversionAudit, decode_capture_classification
+from .signed_input_record import decode_supersession_payload
 
 
 # Preserve the historical diagnostic logger while changing code ownership.
@@ -380,6 +381,9 @@ class PostedRoundMetadata:
     # The conversion audit on an ``evidence-conversion`` summary record; an
     # invalid audit decodes as None and is treated as unconverted.
     evidence_conversion: "EvidenceConversionAudit | None" = None
+    # The signed-input supersession payload (#2054) on a
+    # ``signed-input-supersession`` summary; malformed decodes as None.
+    signed_input_supersession: Mapping[str, object] | None = None
     # The review snapshot of the conversion round, which posts no coder
     # follow-up record; ``review_round`` equals the record's own round.
     conversion_stall_snapshot: Mapping[str, object] | None = None
@@ -2464,6 +2468,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         )
     if metadata.evidence_conversion is not None:
         payload["evidence_conversion"] = metadata.evidence_conversion.to_payload()
+    if metadata.signed_input_supersession is not None:
+        payload["signed_input_supersession"] = dict(metadata.signed_input_supersession)
     if metadata.conversion_stall_snapshot is not None:
         payload["conversion_stall_snapshot"] = dict(metadata.conversion_stall_snapshot)
     if metadata.conversion_review_round is not None:
@@ -3097,6 +3103,12 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
             **_decode_conversion_fields(payload),
+            signed_input_supersession=(
+                decode_supersession_payload(
+                    payload["signed_input_supersession"],
+                    round_number=payload.get("round_number"), subject=payload.get("subject"),
+                ) if "signed_input_supersession" in payload else None
+            ),
             **decode_review_scope(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
             plan_issue_digest=_decode_plan_issue_digest(payload),
