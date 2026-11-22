@@ -373,16 +373,12 @@ from .architecture_contract import (
     _architecture_mode_validators,
     _architecture_document_paths_hook,
     _resumed_review_architecture,
-    _acknowledgement_repair_forbids_assessment,
-    _pin_acknowledgement_repair,
 )
 from .validated_agent import (
     _new_usage_context,
     _begin_run_telemetry,
     _end_run_telemetry,
     _persist_usage_summary,
-    _run_structured_repair,
-    _log_repair_attempts,
     _run_validated_agent,
 )
 from .risk_coverage_map import (
@@ -6608,101 +6604,14 @@ def run_pr_loop(
                         for reviewer_name, review_output in approved_review_outputs:
                             if human_requirements_resolved(review_output):
                                 continue
+                            # No repair backend reformats the acknowledgement any
+                            # more (#2066): the missing marker is re-injected as a
+                            # blocking item and the reviewer is asked again.
                             log(
                                 config,
                                 f"Round {round_number}: {reviewer_name} approved without "
-                                "HUMAN_REQUIREMENTS_RESOLVED; attempting repair",
+                                "HUMAN_REQUIREMENTS_RESOLVED",
                             )
-                            repaired_text, repaired_validated, repair_attempts = _run_structured_repair(
-                                review_output,
-                                runner=runner,
-                                config=config,
-                                usage_context=usage_context,
-                                validate=lambda candidate, reviewer_name=reviewer_name: _validate_review_response(
-                                    candidate,
-                                    reviewer=reviewer_name,
-                                    unresolved_items=prior_unresolved_items,
-                                    optional_item_ids=compact_hidden_future_ids,
-                                    current_round_items=round_new_unresolved_items, architecture_status_mode="strict",
-                                    approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
-                                ),
-                                repair_kwargs={
-                                    "expected_kind": "pr_review",
-                                    "reviewer_requirement_ids": hr_ids,
-                                    "allowed_prior_item_ids": tuple(
-                                        item.item_id for item in prior_unresolved_items
-                                    ),
-                                    "evidence_row_id_universe": approved_matrix_row_ids(approved_plan_context) or (),
-                                },
-                                forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
-                                    review_output
-                                ),
-                            )
-                            repaired_validated = _pin_acknowledgement_repair(
-                                accepted_review_carriers.get(reviewer_name),
-                                repaired_validated,
-                                config=config,
-                                reviewer_name=reviewer_name,
-                            )
-                            _log_repair_attempts(
-                                config, f"Round {round_number}: {reviewer_name}", repair_attempts
-                            )
-                            if repaired_validated is not None:
-                                repaired_parsed = repaired_validated
-                                if repaired_parsed.summary.strip():
-                                    reviewer_summaries[reviewer_name] = _reviewer_summary_context(
-                                        reviewer_name,
-                                        repaired_parsed.summary,
-                                        round_number=round_number,
-                                        head_sha=current_pr_subject,
-                                    )
-                                if (
-                                    repaired_parsed.state == "approved"
-                                    and human_requirements_resolved(repaired_text)
-                                ):
-                                    log(
-                                        config,
-                                        f"Round {round_number}: repair recovered "
-                                        f"HUMAN_REQUIREMENTS_RESOLVED for {reviewer_name}",
-                                    )
-                                    continue
-                                if repaired_parsed.state == "blocking":
-                                    log(
-                                        config,
-                                        f"Round {round_number}: repair returned blocking for "
-                                        f"{reviewer_name}; treating as reviewer blocking",
-                                    )
-                                    for item in repaired_parsed.blocking_items:
-                                        new_item = _next_unresolved_item(
-                                            item_number=next_unresolved_item_number,
-                                            reviewer=item.reviewer,
-                                            source_round=round_number,
-                                            text=item.text,
-                                            status="blocking",
-                                            sub_items=item.sub_items,
-                                            evidence_row_ids=item.evidence_row_ids,
-                                        )
-                                        round_new_unresolved_items.append(new_item)
-                                        unresolved_items.append(new_item)
-                                        next_unresolved_item_number += 1
-                                    for item in repaired_parsed.followups.same_pr:
-                                        new_item = _next_unresolved_item(
-                                            item_number=next_unresolved_item_number,
-                                            reviewer=item.reviewer,
-                                            source_round=round_number,
-                                            text=item.text,
-                                            status="same-pr",
-                                            sub_items=item.sub_items,
-                                        )
-                                        round_new_unresolved_items.append(new_item)
-                                        unresolved_items.append(new_item)
-                                        next_unresolved_item_number += 1
-                                    all_approved = False
-                                    must_fix_items = [
-                                        item for item in unresolved_items
-                                        if item.status in {"blocking", "same-pr"}
-                                    ]
-                                    continue
                             still_missing.append(reviewer_name)
                         if still_missing:
                             log(

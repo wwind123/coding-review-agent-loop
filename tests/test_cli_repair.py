@@ -133,89 +133,124 @@ def test_cli_repair_failures_fail_closed(tmp_path, backend, response, outcome):
     assert attempts[0].outcome == outcome
 
 
-@pytest.mark.parametrize("backend", ["codex", "claude"])
-def test_cli_repair_requires_explicit_model(tmp_path, backend):
-    with pytest.raises(AgentLoopError, match="explicit --repair-model"):
-        make_config(tmp_path, repair_backend=backend)
+# --- #2066: --repair-* and --containment-repair-* are deprecated no-ops ---------
 
 
-def test_codex_repair_flag_without_model_rejected_and_single_model_verbatim(tmp_path):
-    base = [
+def _issue_args(tmp_path, *extra):
+    return build_parser().parse_args([
         "issue", "1", "--repo", "OWNER/REPO",
-        "--codex-dir", str(tmp_path / "codex"),
+        "--codex-dir", str(tmp_path / "codex"), "--claude-dir", str(tmp_path / "claude"),
         "--subprocess-log-dir", str(tmp_path / "logs"),
-        "--repair-backend", "codex",
-    ]
-    with pytest.raises(AgentLoopError, match="explicit --repair-model"):
-        config_from_args(build_parser().parse_args(base), FakeRunner())
-    config = config_from_args(build_parser().parse_args([*base, "--repair-model", "M"]), FakeRunner())
-    assert config.repair_models == ("M",)
+        *extra,
+    ])
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+def test_repair_backend_without_model_is_a_noop_with_a_deprecation_notice(tmp_path, capsys, backend):
+    config = config_from_args(_issue_args(tmp_path, "--repair-backend", backend), FakeRunner())
+    notice = capsys.readouterr().err
+    assert "deprecated no-op flag(s) ignored: --repair-backend" in notice
+    assert notice.count("deprecated no-op") == 1
+    # The no-op value never reaches the config: no repair backend exists.
+    assert config.repair_backend == "antigravity"
 
 
 @pytest.mark.parametrize("backend,effort", [("codex", "max"), ("claude", "minimal"), ("antigravity", "high")])
-def test_cli_repair_invalid_effort(tmp_path, backend, effort):
-    with pytest.raises(AgentLoopError, match="--repair-reasoning-effort"):
-        make_config(tmp_path, repair_backend=backend, repair_models=("repair-model",), repair_reasoning_effort=effort)
+def test_former_repair_validation_never_fails_a_run(tmp_path, capsys, backend, effort):
+    config_from_args(_issue_args(
+        tmp_path, "--repair-backend", backend, "--repair-model", " ",
+        "--repair-reasoning-effort", effort, "--repair-timeout-seconds", "-5",
+    ), FakeRunner())
+    notice = capsys.readouterr().err
+    for flag in ("--repair-backend", "--repair-model", "--repair-reasoning-effort", "--repair-timeout-seconds"):
+        assert flag in notice
+    # Library-built configs never validate the retired fields either.
+    make_config(tmp_path, repair_backend=backend, repair_reasoning_effort=effort, repair_timeout_seconds=0)
 
 
-@pytest.mark.parametrize("mode,number", [("pr", "1"), ("issue", "2")])
-def test_parser_accepts_cli_repair_settings(mode, number):
+def test_no_notice_without_repair_flags(tmp_path, capsys):
+    config_from_args(_issue_args(tmp_path), FakeRunner())
+    assert "deprecated" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode,number", [("pr", "1"), ("issue", "2"), ("discuss", "3")])
+def test_parser_still_accepts_deprecated_repair_settings(mode, number):
     args = build_parser().parse_args([
         mode, number, "--repair-backend", "codex", "--repair-model", "first",
         "--repair-model", "second", "--repair-reasoning-effort", "high",
+        "--repair-timeout-seconds", "180",
+        "--containment-repair-memory-max", "not-a-size",
     ])
     assert args.repair_backend == "codex"
     assert args.repair_model == ["first", "second"]
-    assert args.repair_reasoning_effort == "high"
 
 
-@pytest.mark.parametrize("backend", ["codex", "claude"])
-@pytest.mark.parametrize("mode", ["issue", "pr", "discuss"])
-def test_repair_options_reach_config(tmp_path, backend, mode):
-    args = build_parser().parse_args([
-        mode, "1", "--repo", "OWNER/REPO",
-        "--codex-dir", str(tmp_path / "codex"), "--claude-dir", str(tmp_path / "claude"),
-        "--subprocess-log-dir", str(tmp_path / "logs"),
-        "--repair-backend", backend, "--repair-model", "first", "--repair-model", "second",
-        "--repair-reasoning-effort", "high", "--repair-timeout-seconds", "180",
-    ])
-    config = config_from_args(args, FakeRunner())
-    assert config.repair_backend == backend
-    assert config.repair_models == ("first", "second")
-    assert config.repair_reasoning_effort == "high"
-    assert config.repair_timeout_seconds == 180
+def test_repair_backend_never_requires_the_agy_cli(tmp_path, monkeypatch):
+    import shutil
+
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda command: None if command == "agy" else real_which(command) or f"/usr/bin/{command}")
+    runner = FakeRunner()
+    args = _issue_args(tmp_path, "--repair-backend", "antigravity")
+    args.dry_run = False
+    config_from_args(args, runner)
 
 
-def test_default_repair_and_antigravity_chains_use_current_flash_generation(tmp_path, capsys):
-    from coding_review_agent_loop.config import (
-        DEFAULT_ANTIGRAVITY_MODELS,
-        DEFAULT_REPAIR_MODELS,
+@pytest.mark.parametrize("repair_values", [
+    {"containment_repair_memory_max": "not-a-size"},
+    {"containment_repair_memory_high": "900M", "containment_repair_memory_max": "100M"},
+    {"containment_repair_tasks_max": "-3"},
+])
+def test_invalid_containment_repair_overrides_are_discarded(tmp_path, repair_values):
+    from coding_review_agent_loop.containment import policy_from_values
+
+    values = {
+        "containment_coder_memory_max": "200M",
+        "containment_reviewer_tasks_max": "321",
+        **repair_values,
+    }
+    policy = policy_from_values(values)
+    roles = dict(policy.roles)
+    assert roles["coder"].memory_max == 200_000_000
+    assert roles["reviewer"].tasks_max == 321
+    default_roles = dict(policy_from_values({}).roles)
+    assert roles["repair"] == default_roles["repair"]
+    # The config and the runner build the same policy, so neither rejects it.
+    config = make_config(tmp_path, **values)
+    assert dict(config.containment_policy.roles)["coder"].memory_max == 200_000_000
+
+
+def test_invalid_containment_repair_flag_reaches_neither_config_nor_runner(tmp_path, capsys):
+    from types import SimpleNamespace
+
+    args = _issue_args(
+        tmp_path, "--containment-repair-memory-max", "not-a-size",
+        "--containment-repair-memory-high", "1T",
+        "--containment-coder-memory-max", "300M",
     )
+    config = config_from_args(args, FakeRunner())
+    assert "--containment-repair-memory-max" in capsys.readouterr().err
+    assert dict(config.containment_policy.roles)["coder"].memory_max == 300_000_000
+    # Runner setup parses the same values and never rejects them either.
+    runner = FakeRunner()
+    runner.configure_from_config(SimpleNamespace(**vars(args)))
+    assert dict(runner.containment_policy.roles)["coder"].memory_max == 300_000_000
 
-    assert DEFAULT_REPAIR_MODELS == ("Gemini 3.8 Flash (Medium)", "Claude Opus 5.5 (Medium)")
+
+def test_default_antigravity_chain_uses_current_flash_generation(tmp_path):
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
+
     assert DEFAULT_ANTIGRAVITY_MODELS == (
         "Gemini 3.8 Flash (High)",
         "Claude Opus 5.5 (Medium)",
     )
-    removed = {
-        "Gemini 3.7 Flash (High)",
-        "Gemini 3.7 Flash (Medium)",
-        "Gemini 3.6 Flash (High)",
-        "Gemini 3.1 Pro (High)",
-    }
-    for model in (*DEFAULT_ANTIGRAVITY_MODELS, *DEFAULT_REPAIR_MODELS):
-        assert model not in removed
-        assert "Gemini 4 Hydrogen" not in model
-    args = build_parser().parse_args([
-        "issue", "1", "--repo", "OWNER/REPO",
-        "--subprocess-log-dir", str(tmp_path / "logs"),
-    ])
-    config = config_from_args(args, FakeRunner())
-    assert config.repair_backend == "antigravity"
-    assert config.repair_models == DEFAULT_REPAIR_MODELS
+    config = config_from_args(_issue_args(tmp_path), FakeRunner())
     assert config.antigravity_models == DEFAULT_ANTIGRAVITY_MODELS
+
+
+def test_repair_flag_help_says_deprecated_noop(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["issue", "--help"])
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "Gemini 3.8 Flash (Medium) -> Claude Opus 5.5 (Medium)" in help_text
-    assert "only; required" not in help_text
+    assert "--repair-backend REPAIR_BACKEND Deprecated no-op." in help_text
+    assert "--containment-repair-memory-max CONTAINMENT_REPAIR_MEMORY_MAX Deprecated no-op" in help_text

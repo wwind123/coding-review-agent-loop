@@ -166,7 +166,7 @@ def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, 
     assert reask["session_id"] == "s-first"
     assert replay["prompt"] == reask["prompt"]
     assert replay["session_id"] == reask["session_id"]
-    assert reask["attempt_suffix"] == "evidence-reask"
+    assert reask["attempt_suffix"] == "reask1"
     assert replay["attempt_suffix"] == "quota-wait-1"
     assert sum(slept) == 7260
 

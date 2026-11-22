@@ -548,8 +548,8 @@ def test_validated_agent_retries_an_expired_settings_lock_wait_once_in_place(
     repairs: list[object] = []
     monkeypatch.setattr(validated_agent, "log", lambda _c, message: logs.append(message))
     monkeypatch.setattr(
-        validated_agent, "execute_repair",
-        lambda *args, **kwargs: repairs.append(args) or (None, None, []),
+        validated_agent, "execute_repair", raising=False,  # retired seam (#2066)
+        value=lambda *args, **kwargs: repairs.append(args) or (None, None, []),
     )
     with workdir_claims.workdir_claim_scope():
         response = validated_agent._run_validated_agent(
@@ -574,8 +574,8 @@ def test_validated_agent_second_settings_lock_expiry_raises_transient(tmp_path, 
     config = make_config(tmp_path, reviewer=(seat,), reviewer_seats=(seat,), agent_max_retries=3)
     repairs: list[object] = []
     monkeypatch.setattr(
-        validated_agent, "execute_repair",
-        lambda *args, **kwargs: repairs.append(args) or (None, None, []),
+        validated_agent, "execute_repair", raising=False,  # retired seam (#2066)
+        value=lambda *args, **kwargs: repairs.append(args) or (None, None, []),
     )
     with workdir_claims.workdir_claim_scope():
         with pytest.raises(AgentInvocationError) as caught:
@@ -812,26 +812,29 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
         for command, _cwd in runner.commands
         if command[:1] == ["claude"]
     ]
-    assert len(planner_prompts) == 2
-    assert "Trusted orchestration correction record" in planner_prompts[1]
-    assert "Failed validation attempt: 1" in planner_prompts[1]
-    assert "Exact bounded validator diagnostic" in planner_prompts[1]
-    assert planner_prompts[1].count(
+    # The first invocation's turn and its two same-agent re-asks (#2066),
+    # then the resumed planner turn.
+    assert len(planner_prompts) == 4
+    resumed = planner_prompts[-1]
+    assert "Trusted orchestration correction record" in resumed
+    assert "Failed validation attempt: 1" in resumed
+    assert "Exact bounded validator diagnostic" in resumed
+    assert resumed.count(
         "plan_state must include architecture_impact for this fresh contract turn."
     ) == 1
     # The re-prompt names the field and its accepted values (#925).
-    assert "`changed` or `unchanged`" in planner_prompts[1]
-    assert "AGENT_PLAN_VALIDATION_DIAGNOSTIC" not in planner_prompts[1]
-    assert "2026-09-17T05:31:00Z" not in planner_prompts[1]
+    assert "`changed` or `unchanged`" in resumed
+    assert "AGENT_PLAN_VALIDATION_DIAGNOSTIC" not in resumed
+    assert "2026-09-17T05:31:00Z" not in resumed
     assert len(runner.verified_round_bodies) == 2
 
 
-def test_unsatisfied_plan_repair_is_deterministic_and_the_rerun_is_accepted(tmp_path):
-    """An uncorroborated near miss plus a repairable defect (#925).
+def test_unsatisfied_plan_reask_is_deterministic_and_the_rerun_is_accepted(tmp_path):
+    """An uncorroborated near miss plus a structural defect (#925, #2066).
 
-    Repair fixes the envelope but may not supply the assessment, so the repair
-    outcome is a deterministic contract refusal; the planner re-prompt names
-    the field and the next planner turn is accepted.
+    The planner's re-ask fixes the envelope but omits the assessment, so the
+    final outcome is a deterministic contract refusal; the resumed planner
+    prompt names the field and the next planner turn is accepted.
     """
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
     payload["architecture_impact"] = {"status": "modified", "rationale": "Something changed."}
@@ -846,31 +849,30 @@ def test_unsatisfied_plan_repair_is_deterministic_and_the_rerun_is_accepted(tmp_
     )
     runner = _PlanDiagnosticParallelRunner(
         diagnostic_body=None,
-        claude_outputs=[invalid_candidate],
+        claude_outputs=[invalid_candidate, repaired_candidate],
         codex_outputs=[],
         gemini_outputs=[],
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch.object(validated_agent, "attempt_repair", lambda raw, cmd, **kw: repaired_candidate):
-        with pytest.raises(AgentInvocationError) as error:
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert error.value.failure_category == "deterministic"
     exhaustion = error.value.plan_validation_exhaustion
     assert exhaustion is not None and exhaustion.candidate_text == repaired_candidate
-    assert [r.outcome for r in error.value.preserved_unsatisfied_response.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
+    # The retained candidate is the planner's own latest response, which
+    # omitted the assessment and so carries no near-miss record.
+    assert error.value.preserved_unsatisfied_response.architecture_impact_degradations == ()
     assert len(runner.verified_round_bodies) == 1
 
     runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
     runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     planner_prompts = [command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]]
-    assert len(planner_prompts) == 2
-    assert "plan_state must include architecture_impact" in planner_prompts[1]
-    assert "`changed` or `unchanged`" in planner_prompts[1]
+    assert len(planner_prompts) == 4
+    assert "plan_state must include architecture_impact" in planner_prompts[-1]
+    assert "`changed` or `unchanged`" in planner_prompts[-1]
 
 
 @pytest.mark.parametrize("context_mode", ["compact", "full"])
@@ -932,7 +934,8 @@ def test_plan_parallel_revision_validation_exhaustion_survives_resume(
     planner_prompts = [
         command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
     ]
-    assert len(planner_prompts) == 3
+    # Initial plan, the rejected revision and its two re-asks, the resume.
+    assert len(planner_prompts) == 5
     assert "Trusted orchestration correction record" in planner_prompts[-1]
     assert "Add the missing verification step." in planner_prompts[-1]
     assert len([command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]]) == 2
@@ -2505,37 +2508,29 @@ def test_pr_loop_parallel_rejects_shared_reviewer_workdirs_with_workdirs_ready_h
 # Repair/retry isolation
 # ---------------------------------------------------------------------------
 
-def test_plan_first_parallel_repair_isolated_between_reviewers(tmp_path):
-    # A repairable source must carry the reviewer's own verdict; narration alone
-    # is refused before any repair backend call (#871).
-    malformed_codex = malformed_plan_review_source(summary="Codex approves after repair.")
-    repaired_codex = structured_plan_review(summary="Codex approves after repair.")
+def test_plan_first_parallel_reask_isolated_between_reviewers(tmp_path):
+    # A malformed parallel review is re-asked to its own reviewer only (#2066);
+    # the other reviewer's turn is untouched.
+    malformed_codex = malformed_plan_review_source(summary="Codex approves after re-ask.")
+    corrected_codex = structured_plan_review(summary="Codex approves after re-ask.")
     gemini_ok = structured_plan_review(summary="Gemini approves the plan.", reviewer="Google Gemini")
-
-    lock = threading.Lock()
-    repair_calls = []
-
-    def fake_attempt_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
-        with lock:
-            repair_calls.append(raw)
-        if raw == malformed_codex:
-            return repaired_codex
-        return None
 
     runner = FakeRunner(
         claude_outputs=[_initial_plan()],
-        codex_outputs=[malformed_codex],
+        codex_outputs=[malformed_codex, corrected_codex],
         gemini_outputs=[gemini_ok],
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
     )
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    assert len(repair_calls) == 1
-    assert any("Codex approves after repair." in comment for comment in runner.comments)
+    codex_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    gemini_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(codex_prompts) == 2 and "re-ask 1 of 2" in codex_prompts[1]
+    assert len(gemini_prompts) == 1 and "re-ask" not in gemini_prompts[0]
+    assert any("Codex approves after re-ask." in comment for comment in runner.comments)
     assert any("Gemini approves the plan." in comment for comment in runner.comments)
 
 

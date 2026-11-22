@@ -1406,7 +1406,8 @@ def test_initial_report_correction_exhaustion_precedes_authentication(tmp_path, 
     assert "semantic-evidence-rejection" in str(error.value)
     assert "confirmed open" not in str(error.value)
     assert "agent-loop pr 77" not in str(error.value)
-    assert len(_claude_commands(h)) == 2
+    # The primary turn and both same-agent re-asks (#2066).
+    assert len(_claude_commands(h)) == 3
     assert not authenticated
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in h.runner.commands)
     assert not h.all_comments()

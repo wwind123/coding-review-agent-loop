@@ -1163,8 +1163,8 @@ The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Claude Opus 5.5 
 - **On exhaustion** the whole group is skipped: there are no same-model retries, no sleeps and no sibling walk. The turn jumps once to the first entry of another group. A second verified exhaustion in the same turn is treated as a shared limit and stops the turn; further groups are not tried.
 - **Run-scoped memory.** An exhausted group is remembered for the logical run (shared by nested loops and reviewer threads, dropped when the run ends) until its parsed reset, or, with no parsed reset, for `--antigravity-quota-cooldown-seconds` (default 600, max 3600). Later turns skip a cooling group and re-probe it afterwards; each transition is logged once. Nothing is latched for the rest of the run. Memory is not persisted across processes, so a rerun rediscovers exhaustion once.
 - **Early stop.** When every group in the chain is cooling down, the turn stops without invoking agy: `Antigravity unavailable on all models`, naming the last frame, the models tried and when groups become eligible again. `QuotaResetExceededError` is raised only when every group has a parsed long reset; unverified text never stops an Antigravity turn. With `--wait-for-quota-reset`, that verified stop (including the shared-limit stop) waits for the earliest group reset instead when every reset is within DURATION (see [Waiting for a quota reset](#waiting-for-a-quota-reset)). Transient capacity failures (`high traffic`) still retry the same model, then fall back. Each capacity failure logs its attempt duration.
-- **Repair chain.** The format-repair chain is the union of the repair models and the antigravity chain, so it now ends with `Claude Opus 5.5 (Medium)`. Repair neither reads nor marks quota memory.
-- **Format fallback.** A model that answers in chat prose instead of the required structured response, so that repair is refused because there is no recoverable review payload, also moves the turn along the chain. After two such failures on one model, or one failure when no retries remain, the turn moves to the next eligible model without using a retry and logs `<agent>: <model> produced no recoverable structured payload N times; falling back to <next>`. The seat is marked agent-unavailable only when the last model in the chain fails too. Auth, billing and other provider-definitive failures never trigger this fallback.
+- **Re-asks.** A rejected response is re-asked on the model that produced it; same-agent re-asks never advance the chain and neither read nor mark quota memory (#2066).
+- **Format fallback.** A model that still answers in chat prose instead of the required structured response after its two same-agent re-asks, with no recoverable review payload, also moves the turn along the chain. After two such failures on one model, or one failure when no retries remain, the turn moves to the next eligible model without using a retry and logs `<agent>: <model> produced no recoverable structured payload N times; falling back to <next>`. The seat is marked agent-unavailable only when the last model in the chain fails too. Auth, billing and other provider-definitive failures never trigger this fallback.
 - **Independence trade-off.** With the default board (Codex, Claude Code on `claude-opus-5-5`, Antigravity), an Opus fallback means two reviewers run the same model in different harnesses and may share blind spots. The round reconciliation summary and log then state, for example, `note: Claude and Antigravity both reviewed with Claude Opus 5.5` (only for reviews made in that round). To keep models distinct, pass your own chain, for example `--antigravity-models "Gemini 3.8 Flash (High)" "Gemini 3.1 Pro (High)" "Claude Sonnet 5.5 (Medium)"`. Refusing same-model panels is an operator policy choice and is not enforced.
 
 ### Structured output
@@ -1357,13 +1357,11 @@ as before.
 
 An omitted or undetermined required assessment leaves the contract
 unsatisfied. The turn is refused with a message naming `architecture_impact`
-and its accepted values. It is retried within `--agent-max-retries`, and the
-retried prompt repeats that message. No repair call is spent on it, including
-when it arrives as a response-file artifact or from completion recovery. When
-the retries run out, the refused response is kept for the operator. The repair
-pass cannot add an assessment that the agent did not supply, and a repair that
-only adds a signed-requirement acknowledgement cannot change an accepted
-assessment. Each degradation is listed under **Parse degradations** in the
+and its accepted values and re-asked to the same agent (at most twice), whose
+prompt repeats that message, including when it arrives as a response-file
+artifact or from completion recovery. When the re-asks run out, the refused
+response is kept for the operator. No other model ever adds an assessment the
+agent did not supply. Each degradation is listed under **Parse degradations** in the
 round summary. A decomposition reports its degradations in a separate
 parent-issue comment, whether it was accepted or refused. Its topology
 checkpoint is unchanged. A semantic plan patch that replaces
@@ -2988,16 +2986,12 @@ A wrongly shaped `test_observations` field is fixed before anything is dropped
   round summary shows one `citations-decoded-from-string` line ahead of any
   drop records.
 - In a fresh follow-up or implementation, a value that is still not an array
-  (prose, an object, a number), or more than eight malformed citations, goes
-  to the structured format repair first. The repair prompt lists this turn's
-  run-tests receipts and asks for an array of `{command, receipt_id, claim}`
-  citations, with the prose moved into `summary` or an item note. A repair
-  that deletes the prose or a valid citation, or still returns a non-array,
-  is not accepted.
-- If repair fails or is unavailable, a non-array value falls back to the
-  single field drop, recorded with the rule `test_observations is not a JSON
-  array; format repair was attempted and did not produce one; no citation is
-  kept`. No agent retry is spent. More than eight malformed citations still
+  (prose, an object, a number), or more than eight malformed citations, is
+  re-asked to the same coder first, with the validator message.
+- If the re-asks still return a non-array value, it falls back to the single
+  field drop, recorded with the historical rule `test_observations is not a
+  JSON array; format repair was attempted and did not produce one; no citation
+  is kept`. No agent retry is spent. More than eight malformed citations still
   reject the response.
 - Resumed runs and other re-parses of responses that were already posted keep
   the earlier drop record and never become fatal.
@@ -10435,52 +10429,40 @@ is automatically injected on a default rerun: the printed patch path is the only
 recovery route. Artifact persistence does not imply automatic discovery or access
 from another machine. Inspect the summary and patch before manually reusing work.
 
-If strict structured-response validation fails, the log may show a repair pass:
-`schema validation failed ... attempting repair pass`, followed by either
-`repair pass recovered malformed response` or `repair pass produced invalid
-output`. A recovered response is still revalidated before posting; a failed
-repair leaves the run in local failure just like any other protocol error.
+If strict structured-response validation fails, the response goes back to the
+same agent (#2066). The log shows `<agent>: response rejected (<validator
+message>); re-asking the same agent (1/2; resuming session)`. The re-ask uses
+the same agent, the model that produced the response (an Antigravity chain is
+not advanced) and the response's own session when there is one; otherwise it
+resends the full original prompt. The prompt adds a bounded, marker-free copy
+of the validator message and asks for the complete corrected response only.
+A turn gets at most two re-asks. They spend neither `--agent-max-retries` nor
+the Antigravity model fallback, and transient, provider, quota, timeout and
+unsupported-model failures keep their own retry paths. When both re-asks fail,
+the turn fails as before, with the message prefixed by `response rejected after
+2 same-agent re-asks; last validator message:`.
 
-Use `--repair-backend`, repeatable `--repair-model`, and
-`--repair-timeout-seconds` to configure this path. The Antigravity default
-requires `agy` even when no role uses Antigravity; a host without it should pass
-`--repair-backend codex --repair-model MODEL` (or `claude`). For Antigravity, the repair chain is the explicit
-prefix followed by `antigravity_models`, with duplicates removed. It queries `agy
-models` once through the same PTY-safe runner as `agy --print`, rejects stale names
-with available-choice guidance, and attempts candidates directly when discovery is
-unavailable. `--repair-backend gemini` retains the legacy CLI for
-enterprise/API-key/Vertex authentication; personal OAuth may require an
-interactive authorization and is not the default. Normal diagnostics include
-backend, model, return code, a sanitized bounded combined-PTY diagnostic, log
-path, and whether another configured model will run. Usage summaries record
-prompt/output usage (provider-reported when available, otherwise estimated), repair outcome, and validation status for
-every attempt, including failed attempts, so repair consumes visible quota.
+A re-asked coder is told not to modify, commit or push the checkout, and the
+checkout head is read before and after the re-ask. A moved head ends the turn
+with an error naming both heads and the re-asked response is never accepted;
+the PR loop then records the pushed head as it does for any rejected
+follow-up that pushed. When the rejection says a cited test observation is not
+citable (a non-passing selector, missing launch integrity or an outside-checkout
+receipt command), the re-ask instead asks the coder to rerun the covering test
+through the test wrapper and cite the new observation; commits and pushes stay
+forbidden. Only that kind of re-ask can bring new run-tests receipts into the
+turn; every other re-ask keeps the receipts of the turn that ran the tests.
 
-Codex and Claude can also repair responses, independently of the original agent:
+Purely mechanical fixes never call a model: envelope trimming (fences,
+reversed footer and signature), lone-string risk-matrix list fields, the
+semantic-patch `rationale` alias and stripping unknown prior-item dispositions
+proven to be resolved history.
 
-```bash
---repair-backend codex --repair-model gpt-5.6-luna --repair-reasoning-effort medium
-```
-
-Or select `--repair-backend claude --repair-model claude-sonnet-5`.
-Both require an explicit model; repeat `--repair-model` for a same-backend fallback
-chain. They do not append reviewer models or query Antigravity's catalog.
-`--repair-reasoning-effort` defaults independently to `medium`, accepts the selected
-provider's effort values, and is only valid with these two backends. It does not
-inherit coder/reviewer effort. The configured `--codex-cmd` or `--claude-cmd` selects
-the executable, but ordinary agent arguments and dangerous permission flags are
-not forwarded. Selecting a repair backend does not change coder/reviewer models.
-
-Each attempt uses stdin, a fresh temporary directory, and no resumed session.
-Codex runs ephemeral with user config/rules ignored, a read-only sandbox, and
-shell/web search/subagents disabled. Claude runs safe mode with tools and MCP
-disabled and no session persistence. These paths require CLIs supporting those
-flags; unsupported flags fail the attempt rather than weakening its restrictions.
-CLI authentication remains available. Each attempt is bounded by
-`--repair-timeout-seconds` (default 120). Nonzero exits and timeouts are not accepted
-for Codex/Claude repairs. All successful output still passes schema validation and
-the same content-preservation guard; repairs cannot drop findings or plan steps
-just to make validation pass. The default backend remains Antigravity.
+`--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
+`--repair-timeout-seconds` and `--containment-repair-*` are deprecated no-ops
+kept for one release. They still parse, print one `deprecated no-op flag(s)
+ignored` notice on stderr, are never validated and no longer require the `agy`
+CLI. They will be removed in a later release.
 
 Long reset or quota responses can exit early with guidance to rerun after the
 reset or switch keys/models. Narrower transient stream, tool-call, network

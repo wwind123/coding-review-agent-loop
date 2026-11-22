@@ -2434,36 +2434,6 @@ def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path
     assert WEAK_SUMMARY not in _published(runner)
 
 
-def test_m979_patch_envelope_defect_still_routes_to_repair(tmp_path, monkeypatch):
-    """#979: an envelope-only defect is exactly what patch repair may fix."""
-    fresh = _m976_full_plan_state()
-    corrected = _m976_patch(fresh, summary="Repaired revision.")
-    missing_footer = corrected.split("\n<!--", 1)[0]
-    repair_calls = []
-
-    def envelope_repair(raw, *, validate, repair_kwargs, **kwargs):
-        repair_calls.append((raw, repair_kwargs["expected_kind"]))
-        return corrected, validate(corrected), []
-
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", envelope_repair)
-    runner = _ChildPlanningRunner(
-        claude_outputs=[fresh, missing_footer],
-        codex_outputs=[
-            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
-            structured_plan_review(
-                state="approved",
-                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-    )
-    assert issue_loop.run_issue_loop(
-        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
-    ) == 0
-    assert repair_calls == [(missing_footer, "plan_revision_patch")]
-    assert len(_agent_prompts(runner, "claude")) == 2
-    assert "Repaired revision." in _published(runner)
-
-
 def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     """No rejection class both invokes patch repair and is guaranteed to fail preservation."""
     fresh = _m976_full_plan_state()
@@ -5040,7 +5010,7 @@ def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
 
 _M1377_ACTOR = ("agent", 7)
 # The #936 world forbids repair; the requirement-acknowledgement path needs it.
-_M1377_REAL_REPAIR = validated_agent._run_structured_repair
+_M1377_REAL_REPAIR = None  # the acknowledgement repair was retired (#2066)
 _M1377_PARENT_RULE = HumanReviewRequirement(
     source_type="Issue body", author="maintainer", created_at="2026-05-17T08:00:00Z",
     url="https://github.com/OWNER/REPO/issues/55", body="Preserve the parent audit trail.",

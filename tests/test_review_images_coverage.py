@@ -622,32 +622,6 @@ def test_signed_input_during_acquisition_refreshes_board_before_single_release(v
     assert set(response.metadata.surfaced_reviewer_requirement_ids) <= set(releases[0].metadata.evidence_release.signed_requirement_ids_surfaced)
 
 
-@pytest.mark.parametrize('kind', ['pr_review', 'screenshot-coverage'])
-@pytest.mark.parametrize('change', ['drop', 'alter', 'wrong-kind'])
-def test_production_repair_boundary_cannot_rewrite_coverage_authority(tmp_path, monkeypatch, attachment, kind, change):
-    report = attachment()
-    scope = scope_for(report)
-    if kind == 'pr_review':
-        raw = typed_review()
-        source, _ = json.JSONDecoder().raw_decode(raw)
-        target = copy.deepcopy(source)
-        if change == 'drop': target.pop('screenshot_requests')
-        elif change == 'alter': target['screenshot_requests'][0]['description'] = 'Other view'
-        else: source['kind'] = 'unsupported'
-        validate = lambda text: parse_pr_review(text, reviewer='seat')
-    else:
-        source = dict(version=1, kind=coverage.KIND, decisions=[dict(request_id='mobile', accepted=False, image_ids=[])])
-        target = copy.deepcopy(source)
-        if change == 'drop': target['decisions'] = []
-        elif change == 'alter': target['decisions'][0].update(accepted=True, image_ids=['main'])
-        else: source['kind'] = 'unsupported'
-        validate = lambda text: coverage.decisions(json.loads(text), scope, report)
-    monkeypatch.setattr(validated_agent, 'attempt_repair', lambda *a, **k: json.dumps(target))
-    output, parsed, attempts = validated_agent._run_structured_repair(json.dumps(source), runner=None,
-        config=make_config(tmp_path), usage_context=None, validate=validate, repair_kwargs={'expected_kind': kind})
-    assert parsed is None
-
-
 def test_dedicated_response_requires_original_artifact(tmp_path, monkeypatch, attachment):
     report = attachment()
     value = dict(version=1, kind=coverage.KIND, decisions=[dict(request_id='mobile', accepted=True, image_ids=['main'])])

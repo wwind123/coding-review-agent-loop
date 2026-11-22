@@ -812,7 +812,6 @@ def test_readme_sandboxed_example_passes_sandboxed_validation(tmp_path):
     config = config_from_args(args, FakeRunner())
     config = type(config)(**{**config.__dict__, "plan_execution_mode": args.plan_execution_mode})
     assert config.agent_permissions == "sandboxed"
-    assert config.repair_backend == "claude" and config.repair_models == ("MODEL",)
     assert config.semantic_followup_backend == "claude"
     agent_permissions.validate_sandboxed_selections(config)
     agent_permissions.validate_sandboxed_flow(config, command=args.command, plan_first=args.plan_first)
@@ -825,7 +824,7 @@ def test_readme_sandboxed_step_documents_requirements_and_limits():
     )[0]
     for phrase in (
         "--no-semantic-followup-dedupe",
-        "default repair backend\n(`antigravity`)",
+        "No repair backend runs any more",
         "Install agent-loop outside the agent checkouts",
         "`git` and `gh` found first on `PATH` must also live outside every\n  checkout",
         "`TMPDIR` must resolve outside every checkout",
@@ -976,7 +975,7 @@ def test_failed_managed_activation_state_report_is_documented():
 def test_antigravity_quota_group_docs_describe_default_chain():
     import re
 
-    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS, DEFAULT_REPAIR_MODELS
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
 
     guide = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
@@ -984,9 +983,8 @@ def test_antigravity_quota_group_docs_describe_default_chain():
     for model in DEFAULT_ANTIGRAVITY_MODELS:
         assert f"`{model}`" in guide
         assert f"`{model}`" in readme
-    for model in DEFAULT_REPAIR_MODELS:
-        assert f"`{model}`" in guide
-        assert f"`{model}`" in readme
+    # No repair chain exists any more (#2066): the retired repair models are
+    # not documented as a chain.
     removed = ("Gemini 3.7 Flash", "Gemini 3.6 Flash", "Gemini 3.1 Pro")
     chain_sentences = [
         sentence

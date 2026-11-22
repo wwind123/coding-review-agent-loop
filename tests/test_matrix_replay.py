@@ -1,4 +1,4 @@
-"""Fresh risk-matrix integrity replay and string-list normalization (#1229)."""
+"""Risk-matrix string-list normalization and the shared same-agent re-ask (#1229, #2066)."""
 
 import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
@@ -171,7 +171,7 @@ def test_bare_strings_are_normalized_without_repair_or_replay(tmp_path, kind):
 
 
 @pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
-def test_unrecoverable_matrix_replays_once_with_quoted_error(tmp_path, kind):
+def test_unrecoverable_matrix_is_reasked_with_quoted_error(tmp_path, kind):
     make = _state if kind == "plan_state" else _revision
     runner = _runner("codex", [make(_row(forbidden_side_effects="")), make()])
     response, error, logs, spy, _ = _run(runner, _config(tmp_path, "codex", 0), kind)
@@ -179,9 +179,9 @@ def test_unrecoverable_matrix_replays_once_with_quoted_error(tmp_path, kind):
     cmds = _cmds(runner, "codex")
     assert len(cmds) == 2
     first, second = ("\n".join(c) for c in cmds)
-    assert HEADING not in first
-    assert HEADING in second and "forbidden_side_effects" in second
-    assert any("retrying planner turn once" in m for m in logs)
+    assert "re-ask" not in first
+    assert "re-ask 1 of 2" in second and "forbidden_side_effects" in second
+    assert any("re-asking the same agent (1/2" in m for m in logs)
 
 
 def test_remaining_defect_after_normalization_is_quoted_and_persisted(tmp_path):
@@ -191,13 +191,14 @@ def test_remaining_defect_after_normalization_is_quoted_and_persisted(tmp_path):
     response, error, logs, _spy, exhaustions = _run(runner, _config(tmp_path, "codex", 1))
     assert response is None and error is not None
     cmds = _cmds(runner, "codex")
-    assert len(cmds) == 2
+    # The primary turn and both shared re-asks; no ordinary retry follows.
+    assert len(cmds) == 3
     replay_prompt = "\n".join(cmds[1])
-    assert HEADING in replay_prompt and "related_scope_item_ids" in replay_prompt
+    assert "re-ask 1 of 2" in replay_prompt and "related_scope_item_ids" in replay_prompt
     assert "forbidden_side_effects must be a JSON array" not in replay_prompt
     assert any("normalized risk test matrix string field(s)" in m for m in logs)
-    assert error.failure_category == "fresh-contract-integrity"
-    assert "one automatic planner replay" in str(error)
+    assert error.failure_category == "deterministic"
+    assert "response rejected after 2 same-agent re-asks" in str(error)
     expected = _state(_row(forbidden_side_effects=["Replay slip"], related_scope_item_ids=""))
     exhaustion = error.plan_validation_exhaustion
     assert exhaustion is not None and len(exhaustions) == 1
@@ -236,24 +237,11 @@ def test_execution_integrity_refusal_keeps_ordinary_budget(tmp_path):
     bad = json.dumps(payload) + PLAN_FOOTER
     runner = _runner("codex", [bad, bad, bad])
     response, error, _l, _s, _e = _run(runner, _config(tmp_path, "codex", 1))
-    assert response is None and error.failure_category == "fresh-contract-integrity"
-    assert len(_cmds(runner, "codex")) == 2
-    assert "one automatic planner replay" not in str(error)
-
-
-def test_repair_guard_logs_its_own_normalization(tmp_path):
-    logs: list[str] = []
-    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
-        _, _, attempts = validated_agent_module._run_structured_repair(
-            _state(_row(forbidden_side_effects="Slip", related_scope_item_ids="")),
-            runner=FakeRunner(),
-            config=_config(tmp_path, "codex", 0),
-            usage_context=None,
-            validate=_validate_state,
-            repair_kwargs={"expected_kind": "plan_state", "require_risk_test_matrix_contract": True},
-        )
-    assert attempts and attempts[-1].outcome == "fresh_contract_integrity"
-    assert any("normalized risk test matrix string field(s)" in m and "forbidden_side_effects" in m for m in logs)
+    # A missing execution recommendation shares the two re-asks; it never
+    # spends the ordinary retry budget on the same defect.
+    assert response is None and error.failure_category == "deterministic"
+    assert len(_cmds(runner, "codex")) == 3
+    assert "execution_recommendation" in str(error)
 
 
 def _order(runner, binary):
@@ -294,17 +282,17 @@ def test_replay_takes_no_transition_or_delay_with_zero_budget(tmp_path):
     assert _models(_cmds(runner, "antigravity")) == ["ModelA", "ModelA"]
 
 
-def test_replay_transitions_are_not_taken_for_the_dedicated_replay(tmp_path):
+def test_reasks_take_no_transition_or_delay(tmp_path):
     state_cls, transitions, spy = _spy_transitions()
     bad = _state(_row(forbidden_side_effects=""))
     runner = _runner("antigravity", [bad, "Error: server is overloaded, try again later", _state()])
     with patch.object(state_cls, "next_after_failure", spy):
         response, error, _logs, _spy, _ = _run_noskip(runner, _config(tmp_path, "antigravity", 1))
     assert error is None and response is not None
-    # Only the later ordinary failure takes a transition, with its full allowance.
-    assert transitions == [1]
-    # No delay between the refusal and the replay; exactly one before the ordinary retry.
-    assert _order(runner, "agy") == ["agent", "agent", "sleep", "agent"]
+    # Both validation failures are same-agent re-asks: no Antigravity
+    # transition, no backoff delay and no model fallback (#2066).
+    assert transitions == []
+    assert _order(runner, "agy") == ["agent", "agent", "agent"]
     assert _models(_cmds(runner, "antigravity")) == ["ModelA"] * 3
 
 
@@ -333,8 +321,8 @@ def test_mixed_contract_failure_after_matrix_replay_reports_the_real_contract(tm
     exec_bad = json.dumps(payload) + PLAN_FOOTER
     runner = _runner("codex", [_state(_row(forbidden_side_effects="")), exec_bad])
     response, error, _logs, _spy, exhaustions = _run(runner, _config(tmp_path, "codex", 0))
-    assert response is None and error.failure_category == "fresh-contract-integrity"
-    assert len(_cmds(runner, "codex")) == 2
+    assert response is None and error.failure_category == "deterministic"
+    assert len(_cmds(runner, "codex")) == 3
     text = str(error)
     assert "also failed the fresh risk-test-matrix contract" not in text
     assert "execution_recommendation" in text

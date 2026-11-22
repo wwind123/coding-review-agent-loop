@@ -1,10 +1,12 @@
-"""Semantic evidence rejections never route to structured repair (#990).
+"""Semantic evidence rejections and the same-agent re-ask rule (#990, #1240, #2066).
 
 Selecting an in-catalog broker handle without authoritative launch integrity
-is an authority decision, not a formatting defect. Repair cannot satisfy it,
-so it must be skipped (together with its model fallback chain), and the
-terminal failure must name the validation rejection rather than a repair
-timeout. Envelope-shaped defects on the same kind still route to repair.
+is an authority decision, not a formatting defect.  No repair model ever
+reshapes it: the coder is re-asked through the shared two-re-ask budget.  A
+non-citable observation (non-passing-selector, launch-integrity,
+report-workdir) earns a fresh-evidence re-ask whose dispatch becomes the
+active evidence acquisition; every other cause is a resend-only re-ask that
+inherits the active acquisition unchanged.
 """
 
 import coding_review_agent_loop.issue_recovery as issue_recovery
@@ -106,51 +108,6 @@ def _forbid_repair(*args, **kwargs):
     pytest.fail("a semantic evidence rejection must not invoke structured repair")
 
 
-@pytest.mark.parametrize(
-    "response_text",
-    [
-        pytest.param(_implementation_with_claim(), id="raw-response"),
-        # An envelope defect masks the authority defect until normalization.
-        pytest.param(_implementation_with_claim() + "\ntrailing prose", id="envelope-masked"),
-    ],
-)
-def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
-    tmp_path, monkeypatch, response_text
-):
-    catalog = [_observation(suite_start="not-started")]
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
-    result = AgentResult(text=response_text, returncode=0)
-    logged: list[str] = []
-    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop, issue_recovery, plan_execution,), "log", lambda config, text, *a, **k: logged.append(str(text)))
-
-    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
-        with pytest.raises(AgentInvocationError) as excinfo:
-            _run(tmp_path, response_text, _validator(catalog))
-
-    # The rejection is final for this output: no coder retry either.
-    assert invoke.call_count == 1
-    error = excinfo.value
-    assert error.failure_category == "deterministic"
-    message = str(error)
-    assert "launch-integrity" in message
-    assert _SELECTOR in message
-    assert "Failure category: semantic-evidence-rejection" in message
-    assert "Failure category: timeout" not in message
-    # The richer diagnosis reaches last_error: condition, redacted command, time.
-    from coding_review_agent_loop.local_test_evidence import redact_test_command
-
-    rendered = redact_test_command(_SECRET_COMMAND)[0]
-    assert "suite_start=not-started" in message
-    assert rendered in message
-    assert _TIMESTAMP in message
-    assert "s3cr3t-value" not in message
-    rejected_line = next(line for line in logged if "semantic evidence rejected" in line)
-    assert "suite_start=not-started" in rejected_line
-    assert rendered in rejected_line
-    assert _TIMESTAMP in rejected_line
-    assert "s3cr3t-value" not in rejected_line
-
-
 def test_non_admissible_selector_also_skips_repair(tmp_path, monkeypatch):
     catalog = [_observation(outcome="failed")]
     patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
@@ -160,33 +117,6 @@ def test_non_admissible_selector_also_skips_repair(tmp_path, monkeypatch):
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result):
         with pytest.raises(AgentInvocationError, match="not an admissible passing observation"):
             _run(tmp_path, text, _validator(catalog))
-
-
-def test_envelope_defect_with_authoritative_selector_still_routes_to_repair(
-    tmp_path, monkeypatch
-):
-    catalog = [_observation()]
-    validate = _validator(catalog)
-    # A blank summary is a schema defect normalization cannot fix.
-    malformed = _implementation_with_claim(summary="")
-    repaired = _implementation_with_claim(summary="Implemented the change.")
-    with pytest.raises(Exception):
-        validate(malformed)
-    repair_calls = []
-
-    def repair(raw, *, validate, **kwargs):
-        repair_calls.append(raw)
-        return repaired, validate(repaired), []
-
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", repair)
-    result = AgentResult(text=malformed, returncode=0)
-
-    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result):
-        response = _run(tmp_path, malformed, validate)
-
-    assert len(repair_calls) == 1
-    assert response.text == repaired
-    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
 
 
 # --- #1240: one bounded coder re-ask for a non-citable selected observation ---
@@ -279,22 +209,6 @@ def test_reask_session_selection(tmp_path, no_repair, caller, first, expected):
     assert invoke.call_args_list[1].kwargs["session_id"] == expected
 
 
-def test_reask_exhausted_stops_with_existing_classification(tmp_path, no_repair):
-    bad = [_observation(suite_start="not-started")]
-    response, error, invoke = _reask(tmp_path, [_result(), _result(), _result()], [bad])
-    assert response is None
-    assert invoke.call_count == 2
-    assert "Failure category: semantic-evidence-rejection" in str(error)
-    assert error.failure_category == "deterministic"
-
-
-def test_collision_is_never_reasked(tmp_path, no_repair):
-    catalog = [_observation(), _observation()]
-    response, error, invoke = _reask(tmp_path, [_result(), _result()], [catalog])
-    assert invoke.call_count == 1
-    assert "Failure category: semantic-evidence-rejection" in str(error)
-
-
 def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
     masked = _implementation_with_claim() + "\ntrailing prose"
     bad = [_observation(suite_start="not-started")]
@@ -303,15 +217,6 @@ def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
     )
     assert error is None
     assert invoke.call_count == 2
-
-
-def test_without_flag_single_attempt_unchanged(tmp_path, no_repair):
-    bad = [_observation(suite_start="not-started")]
-    result = _result()
-    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
-        with pytest.raises(AgentInvocationError):
-            _run(tmp_path, result.text, _validator(bad))
-    assert invoke.call_count == 1
 
 
 def test_protocol_rejection_reasons():
@@ -421,6 +326,107 @@ def test_reask_cannot_cite_the_rejected_turns_observation(tmp_path, no_repair):
     assert claims[0].dropped_execution_refs == ("turn1:obs-1",)
 
 
+def _drop_summary(text):
+    body, footer = text.split("\n<!--", 1)
+    payload = json.loads(body)
+    payload.pop("summary")
+    return json.dumps(payload) + "\n<!--" + footer
+
+
+def test_fresh_evidence_reask_uses_the_rerun_prompt_and_binds_its_own_acquisition(tmp_path):
+    """`evidence-rejection-reask`."""
+    first = _turn_result(
+        _claim_text("turn1:obs-1"), "t1",
+        [_obs_for("turn1:obs-1", "t1", suite_start="not-started")], "coder-session",
+    )
+    second = _turn_result(
+        _claim_text("turn2:obs-1"), "t2", [_obs_for("turn2:obs-1", "t2")], "coder-session"
+    )
+    response, error, invoke = _run_real(tmp_path, [first, second])
+    assert error is None
+    # One unit of the shared budget; no separate evidence slot.
+    assert invoke.call_count == 2
+    reask = invoke.call_args_list[1].kwargs
+    assert reask["session_id"] == "coder-session"
+    assert "Previous response not accepted: test evidence" in reask["prompt"]
+    assert "Rerun the test command that covers this change" in reask["prompt"]
+    assert "You may rerun the covering test through the test wrapper" in reask["prompt"]
+    assert "do not run tests" not in reask["prompt"]
+    assert "Do not edit files, commit, push" in reask["prompt"]
+    # The new receipt from the re-ask dispatch is accepted and the accepted
+    # metadata names that dispatch's acquisition.
+    claims = response.marker_value.risk_test_matrix_claims.claims
+    assert claims[0].execution_refs == ("turn2:obs-1",)
+    assert response.acquisition_test_turn_id == "t2"
+
+
+@pytest.mark.parametrize("second_reask_cites", ["turn2:obs-1", "turn3:obs-1"])
+def test_resend_only_reask_after_fresh_evidence_keeps_the_fresh_catalog(tmp_path, second_reask_cites):
+    """`evidence-then-resend-reask`."""
+    first = _turn_result(
+        _claim_text("turn1:obs-1"), "t1",
+        [_obs_for("turn1:obs-1", "t1", suite_start="not-started")], "coder-session",
+    )
+    # Re-ask 1 reruns the test and cites the new receipt but omits a field.
+    second = _turn_result(
+        _drop_summary(_claim_text("turn2:obs-1")), "t2",
+        [_obs_for("turn2:obs-1", "t2")], "coder-session",
+    )
+    # Re-ask 2 (resend-only) corrects only that field.  Its own dispatch
+    # produced a receipt that must never be admitted.
+    third = _turn_result(
+        _claim_text(second_reask_cites), "t3", [_obs_for("turn3:obs-1", "t3")], "coder-session"
+    )
+    response, error, invoke = _run_real(tmp_path, [first, second, third])
+    assert error is None
+    assert invoke.call_count == 3
+    resend_prompt = invoke.call_args_list[2].kwargs["prompt"]
+    assert "re-ask 2 of 2" in resend_prompt
+    assert "Do not modify, commit or push anything" in resend_prompt
+    assert response.acquisition_test_turn_id == "t2"
+    assert response.acquisition_test_observations == (_obs_for("turn2:obs-1", "t2"),)
+    claims = response.marker_value.risk_test_matrix_claims.claims
+    if second_reask_cites == "turn2:obs-1":
+        # Re-ask 1's receipt survives the resend-only correction.
+        assert claims[0].execution_refs == ("turn2:obs-1",)
+    else:
+        # Catalogs are never merged: re-ask 2's own receipt is not admitted.
+        assert claims[0].execution_refs == ()
+        assert claims[0].dropped_execution_refs == ("turn3:obs-1",)
+
+
+def test_evidence_rejection_after_the_reask_budget_stops_with_semantic_classification(tmp_path):
+    results = [
+        _turn_result(
+            _claim_text(f"turn{index}:obs-1"), f"t{index}",
+            [_obs_for(f"turn{index}:obs-1", f"t{index}", suite_start="not-started")], "s",
+        )
+        for index in (1, 2, 3, 4)
+    ]
+    response, error, invoke = _run_real(tmp_path, results)
+    assert response is None
+    assert invoke.call_count == 3
+    message = str(error)
+    assert error.failure_category == "deterministic"
+    assert "response rejected after 2 same-agent re-asks" in message
+    assert "launch-integrity" in message
+    assert "Failure category: semantic-evidence-rejection" in message
+
+
+def test_catalog_collision_is_a_resend_only_reask_with_the_primary_catalog(tmp_path):
+    colliding = [_obs_for("turn1:obs-1", "t1"), _obs_for("turn1:obs-1", "t1")]
+    first = _turn_result(_claim_text("turn1:obs-1"), "t1", colliding, "s")
+    corrected = _turn_result(structured_issue_implementation(), "t2", [_obs_for("turn2:obs-1", "t2")], "s")
+    response, error, invoke = _run_real(tmp_path, [first, corrected])
+    assert error is None
+    assert invoke.call_count == 2
+    prompt = invoke.call_args_list[1].kwargs["prompt"]
+    assert "catalog-collision" in prompt or "collid" in prompt.lower()
+    assert "Do not modify, commit or push anything" in prompt
+    # The resend-only dispatch's catalog is never the active acquisition.
+    assert response.acquisition_test_turn_id == "t1"
+
+
 def test_approved_plan_call_site_enables_reask():
     import inspect
 
@@ -512,179 +518,8 @@ def _assert_semantic_stop(error):
     return message
 
 
-@pytest.mark.parametrize(
-    "chain",
-    [
-        pytest.param([(_REJECTED_CANDIDATE, 0)], id="first-model"),
-        pytest.param([(_MASKED, 0), (_REJECTED_CANDIDATE, 0)], id="after-invalid"),
-        pytest.param([("", None), (_REJECTED_CANDIDATE, 0)], id="after-timeout"),
-    ],
-)
-def test_repair_surfaced_collision_stops_with_semantic_classification(
-    tmp_path, monkeypatch, real_repair, chain
-):
-    calls = _cli_repair(monkeypatch, chain)
-    collision = [_observation(), _observation()]
-    response, error, invoke, logged = _run_masked(
-        tmp_path, [collision], [_result(_MASKED)] * 3, **_codex_repair()
-    )
-    assert response is None
-    # No coder retry, and the chain ran exactly the scripted models.
-    assert invoke.call_count == 1
-    assert calls == ["model-a", "model-b"][: len(chain)]
-    message = _assert_semantic_stop(error)
-    assert _SELECTOR in message
-    # Earlier attempts reach the operator log, never the final reason.
-    assert "invalid_output" not in message
-    assert any("outcome=semantic_evidence_rejection" in line for line in logged)
-    assert any("repair chain stopped" in line for line in logged)
-
-
-def test_all_invalid_repair_chain_keeps_repair_invocation_failure_text(
-    tmp_path, monkeypatch, real_repair
-):
-    _cli_repair(monkeypatch, [(_MASKED, 0), (_MASKED, 0)])
-    response, error, invoke, _ = _run_masked(
-        tmp_path, [[_observation()]], [_result(_MASKED)] * 2, retries=0, **_codex_repair()
-    )
-    assert response is None
-    message = str(error)
-    assert "repair invocation failure" in message
-    assert "semantic-evidence-rejection" not in message
-
-
-def test_antigravity_timeout_repair_candidate_reports_semantic_rejection(
-    tmp_path, monkeypatch, real_repair
-):
-    from coding_review_agent_loop.agents import antigravity as agy_mod
-
-    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
-    runner = FakeRunner(
-        antigravity_catalog_outputs=[("Available models:\nModelA\nModelB\n", 0)],
-        antigravity_outputs=[("", None), ("", None)],
-        public_response_outputs=[{"text": _REJECTED_CANDIDATE}],
-    )
-    config = make_config(
-        tmp_path, agent_max_retries=1, repair_models=("ModelA",), antigravity_models=("ModelB",)
-    )
-    collision = [_observation(), _observation()]
-    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=_result(_MASKED)
-    ) as invoke:
-        with pytest.raises(AgentInvocationError) as excinfo:
-            _run_validated_agent(
-                runner,
-                agent="claude",
-                config=config,
-                prompt="Implement the issue.",
-                marker_description="structured issue_implementation result",
-                validate=_sequenced_validator([collision], invoke),
-                role="coder",
-                use_repair=True,
-                repair_expected_kind="issue_implementation",
-            )
-    assert invoke.call_count == 1
-    _assert_semantic_stop(excinfo.value)
-    repairs = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"] and "models" not in cmd]
-    assert len(repairs) == 1
-
-
-def test_repair_surfaced_reaskable_rejection_reasks_coder_once_on_primary_session(
-    tmp_path, monkeypatch, real_repair
-):
-    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
-    bad = [_observation(suite_start="not-started")]
-    response, error, invoke, logged = _run_masked(
-        tmp_path,
-        [bad, [_observation()]],
-        [_result(_MASKED, session_id="primary"), _result()],
-        reask=True,
-        retries=0,
-        **_codex_repair(),
-    )
-    assert error is None
-    assert calls == ["model-a"]
-    assert invoke.call_count == 2
-    second = invoke.call_args_list[1].kwargs
-    assert second["session_id"] == "primary"
-    assert "Previous response not accepted: test evidence" in second["prompt"]
-    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
-    assert any("re-asking the coder once" in line for line in logged)
-
-
-def test_repair_surfaced_rejection_after_consumed_reask_stops(tmp_path, monkeypatch, real_repair):
-    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0), (_REJECTED_CANDIDATE, 0)])
-    bad = [_observation(suite_start="not-started")]
-    response, error, invoke, _ = _run_masked(
-        tmp_path,
-        [bad],
-        [_result(_MASKED), _result(_MASKED), _result(_MASKED)],
-        reask=True,
-        retries=1,
-        **_codex_repair(),
-    )
-    assert response is None
-    # One primary turn plus the single re-ask; agent_max_retries is unspent.
-    assert invoke.call_count == 2
-    assert calls == ["model-a", "model-a"]
-    _assert_semantic_stop(error)
-
-
-def test_repair_surfaced_collision_is_never_reasked(tmp_path, monkeypatch, real_repair):
-    _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
-    collision = [_observation(), _observation()]
-    response, error, invoke, _ = _run_masked(
-        tmp_path, [collision], [_result(_MASKED), _result()], reask=True, **_codex_repair()
-    )
-    assert invoke.call_count == 1
-    _assert_semantic_stop(error)
-
-
 def _legacy_hook(candidate):
     return lambda raw, cmd, **kwargs: candidate
-
-
-def test_legacy_hook_candidate_rejection_is_terminal_semantic_attempt(tmp_path, monkeypatch):
-    from coding_review_agent_loop.validated_agent import _run_structured_repair
-
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
-    repaired, marker, attempts = _run_structured_repair(
-        _MASKED,
-        runner=FakeRunner(),
-        config=make_config(tmp_path),
-        usage_context=None,
-        validate=_validator([_observation(outcome="failed")]),
-        repair_kwargs={"expected_kind": "issue_implementation"},
-    )
-    assert (repaired, marker) == (None, None)
-    assert [a.outcome for a in attempts] == ["semantic_evidence_rejection"]
-    assert attempts[0].evidence_rejection.reason == "non-passing-selector"
-    assert attempts[0].fallback_planned is False
-
-
-def test_legacy_hook_non_evidence_failure_stays_invalid_output(tmp_path, monkeypatch):
-    from coding_review_agent_loop.validated_agent import _run_structured_repair
-
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_MASKED))
-    repaired, marker, attempts = _run_structured_repair(
-        _MASKED,
-        runner=FakeRunner(),
-        config=make_config(tmp_path),
-        usage_context=None,
-        validate=_validator([_observation()]),
-        repair_kwargs={"expected_kind": "issue_implementation"},
-    )
-    assert repaired == _MASKED
-    assert marker is None
-    assert [a.outcome for a in attempts] == ["invalid_output"]
-    assert attempts[0].evidence_rejection is None
-
-
-def test_legacy_hook_rejection_routes_through_validated_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
-    collision = [_observation(), _observation()]
-    response, error, invoke, _ = _run_masked(tmp_path, [collision], [_result(_MASKED)] * 3)
-    assert invoke.call_count == 1
-    _assert_semantic_stop(error)
 
 
 def test_legacy_hook_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
@@ -804,191 +639,6 @@ def test_implementation_reask_budget_is_intact_for_a_later_real_rejection_1659(t
     assert "Previous response not accepted: test evidence" in invoke.call_args_list[1].kwargs["prompt"]
 
 
-def test_repair_candidate_citing_unverified_suite_start_is_accepted_1659(tmp_path, monkeypatch, real_repair):
-    """`impl-and-repair-cite-unverified-suite`: the repair chain does not stop as a rejection."""
-    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
-    response, error, invoke, logged = _run_masked(
-        tmp_path, [_unverified_suite_catalog()], [_result(_MASKED), _result()],
-        reask=True, retries=0, **_codex_repair(),
-    )
-    assert error is None
-    assert calls == ["model-a"]
-    assert invoke.call_count == 1
-    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
-    assert not any("semantic_evidence_rejection" in line for line in logged)
-    assert not any("re-asking the coder once" in line for line in logged)
-
-
-def test_legacy_hook_candidate_citing_unverified_suite_start_is_accepted_1659(tmp_path, monkeypatch):
-    from coding_review_agent_loop.validated_agent import _run_structured_repair
-
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
-    repaired, marker, attempts = _run_structured_repair(
-        _MASKED,
-        runner=FakeRunner(),
-        config=make_config(tmp_path),
-        usage_context=None,
-        validate=_validator(_unverified_suite_catalog()),
-        repair_kwargs={"expected_kind": "issue_implementation"},
-    )
-    assert repaired == _REJECTED_CANDIDATE
-    assert marker is not None
-    assert all(attempt.outcome != "semantic_evidence_rejection" for attempt in attempts)
-
-
-@pytest.mark.parametrize('order', [
-    ('tests-run-workdir', 'non-passing-selector'),
-    ('launch-integrity', 'tests-run-workdir'),
-    ('tests-run-workdir', 'tests-run-workdir'),
-])
-@pytest.mark.parametrize('repair_surfaced', [False, True])
-def test_followup_guard_shared_allowance(tmp_path, monkeypatch, real_repair, order, repair_surfaced):
-    """#1738: real acquisition and repair routing share one reason-agnostic budget."""
-    from coding_review_agent_loop.protocol import validate_structured_coder_followup
-    from agent_loop_helpers import structured_coder_followup
-    valid = structured_coder_followup(summary='Rejected report.')
-    masked = valid.replace('Rejected report.', '')
-    calls = _cli_repair(monkeypatch, [(valid, 0)]) if repair_surfaced else []
-    results = [_result(masked if repair_surfaced else valid, session_id='acquired'), _result(valid)]
-    with patch_object_in((validated_agent_module, response_validation), 'run_agent_result', side_effect=results) as invoke:
-        def validate(text):
-            parsed = validate_structured_coder_followup(text)
-            reason = order[min(invoke.call_count, 2) - 1]
-            if reason == 'tests-run-workdir':
-                # The real display partition refuses this mixed entry (#2052).
-                parsed = __import__('dataclasses').replace(
-                    parsed, tests_run=('pytest tests/test_api.py /outside/test_api.py',),
-                )
-                return response_validation._validate_followup_workdir_report(parsed, config=config)
-            raise NonRepairableEvidenceRejection('Selected observation refused.', reason=reason)
-        config = make_config(tmp_path, agent_max_retries=0, **_codex_repair())
-        with pytest.raises(AgentInvocationError, match='semantic-evidence-rejection'):
-            _run_validated_agent(
-                FakeRunner(), agent='claude', config=config, prompt='Address PR feedback.',
-                marker_description='structured coder_followup result', validate=validate,
-                role='coder', use_repair=True, repair_expected_kind='coder_followup',
-                reask_on_evidence_rejection=True,
-            )
-    assert invoke.call_count == 2
-    assert invoke.call_args_list[1].kwargs['session_id'] == 'acquired'
-    assert invoke.call_args_list[1].kwargs['prompt'].startswith('Address PR feedback.')
-    assert len(calls) == (1 if repair_surfaced else 0)
-
-
-def test_repair_surfaced_scratch_citation_reasks_with_fresh_catalog(tmp_path, monkeypatch, real_repair):
-    from coding_review_agent_loop.protocol import validate_structured_coder_followup
-    from agent_loop_helpers import structured_coder_followup
-    import coding_review_agent_loop.workdir_guard as guard
-    root = tmp_path / 'coding-review-agent-loop'
-    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
-    audit = f'python scripts/dependency_audit.py evaluate --input {root}/scratch/1837/audit.json'
-    raw = structured_coder_followup(summary='Audit reported.', tests_run=[audit])
-    payload, end = json.JSONDecoder().raw_decode(raw)
-    payload['test_observations'] = [{'command': audit, 'receipt_id': 'audit', 'claim': 'current-result'}]
-    candidate = json.dumps(payload) + raw[end:]
-    masked = candidate.replace('Audit reported.', '')
-    corrected = structured_coder_followup(summary='Replacement evidence.')
-    repair_calls = _cli_repair(monkeypatch, [(candidate, 0)])
-    runner = FakeRunner()
-    config = make_config(tmp_path, agent_max_retries=0, **_codex_repair())
-    first, second = object(), object()
-    results = [
-        _turn_result(masked, 'rejected', [first], session_id='coder-session'),
-        _turn_result(corrected, 'accepted', [second], session_id='coder-session'),
-    ]
-    seen = []
-    def validate(text):
-        seen.append(response_validation._current_test_turn_observations(runner))
-        return response_validation._validate_followup_workdir_report(
-            validate_structured_coder_followup(text), config=config,
-        )
-    with patch_object_in((validated_agent_module, response_validation), 'run_agent_result', side_effect=results) as invoke:
-        response = _run_validated_agent(
-            runner, agent='claude', config=config, prompt='Address PR feedback.',
-            marker_description='structured coder_followup result', validate=validate,
-            role='coder', use_repair=True, repair_expected_kind='coder_followup',
-            reask_on_evidence_rejection=True,
-        )
-    assert invoke.call_count == 2 and len(repair_calls) == 1
-    assert 'without hiding failing observations' in invoke.call_args_list[1].kwargs['prompt']
-    assert invoke.call_args_list[1].kwargs['session_id'] == 'coder-session'
-    assert all(catalog == (first,) for catalog in seen[:-1])
-    assert seen[-1] == (second,)
-    assert response.acquisition_test_observations == (second,)
-    assert not response.marker_value.test_observations
-
-
-@pytest.mark.parametrize("already_spent", [False, True])
-@pytest.mark.parametrize("fallback_source", ["original", "repaired"])
-@pytest.mark.parametrize("refusal", ["partition", "citation"])
-def test_fallback_workdir_refusal_shares_semantic_allowance(
-    tmp_path, monkeypatch, real_repair, already_spent, fallback_source, refusal,
-):
-    """#1738: fallback candidates cannot swallow or reset semantic refusals."""
-    from agent_loop_helpers import structured_coder_followup
-    from coding_review_agent_loop.protocol import validate_structured_coder_followup
-
-    config = make_config(tmp_path, agent_max_retries=0, **_codex_repair(repair_models=("model-a",)))
-    command = "pytest tests/test_api.py /outside/test_api.py"
-    raw = structured_coder_followup(summary="Rejected fallback claim.", tests_run=[command])
-    payload, end = json.JSONDecoder().raw_decode(raw)
-    payload["test_observations"] = {}
-    if refusal == "citation":
-        payload["tests_run"] = []
-    candidate = json.dumps(payload) + raw[end:]
-    source = candidate if fallback_source == "original" else candidate.replace("Rejected fallback claim.", "")
-    corrected = structured_coder_followup(summary="Accepted replacement claim.")
-    repair_calls = _cli_repair(monkeypatch, [(candidate, 0)])
-    runner = FakeRunner()
-    first, second, third = object(), object(), object()
-    results = []
-    if already_spent:
-        results.append(_turn_result(raw, "initial", [first], session_id="coder-session"))
-    results += [
-        _turn_result(source, "fallback", [second], session_id="coder-session"),
-        _turn_result(corrected, "replacement", [third], session_id="coder-session"),
-    ]
-    fallback_seen = []
-
-    def factory(architecture_mode, observations_mode):
-        def validate(text):
-            parsed = validate_structured_coder_followup(
-                text, architecture_status_mode=architecture_mode,
-                test_observations_mode=observations_mode,
-            )
-            if observations_mode == "degrade-after-repair":
-                fallback_seen.append(response_validation._current_test_turn_observations(runner))
-                if refusal == "citation":
-                    # Isolate the common routing rule for all typed semantic refusals.
-                    raise NonRepairableEvidenceRejection("Citation workdir refused.", reason="report-workdir")
-            return response_validation._validate_followup_workdir_report(parsed, config=config)
-        return validate
-
-    validators = architecture_contract._architecture_and_test_observation_mode_validators(factory)
-    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=results) as invoke:
-        def run():
-            return _run_validated_agent(
-                runner, agent="claude", config=config, prompt="Address PR feedback.",
-                marker_description="structured coder_followup result", role="coder",
-                use_repair=True, repair_expected_kind="coder_followup",
-                reask_on_evidence_rejection=True, **validators,
-            )
-        if already_spent:
-            with pytest.raises(AgentInvocationError, match="semantic-evidence-rejection"):
-                run()
-        else:
-            response = run()
-            assert response.marker_value.summary == "Accepted replacement claim."
-            assert "Rejected fallback claim." not in response.text
-            assert response.acquisition_test_observations == (third,)
-    assert invoke.call_count == 2
-    assert invoke.call_args_list[1].kwargs["session_id"] == "coder-session"
-    assert invoke.call_args_list[1].kwargs["prompt"].startswith("Address PR feedback.")
-    assert fallback_seen == [(second,)]
-    assert repair_calls == ["model-a"]
-
-
-
 def test_forwarded_output_does_not_spend_evidence_correction(tmp_path, monkeypatch):
     command = "agent-loop run-tests --timeout-seconds 60 -- npm run capture -- --output /outside/artifacts"
     text = structured_issue_implementation(pr_number=None, tests_run=[command], summary="Capture failed; implementation blocked.")
@@ -1040,62 +690,6 @@ def _run_followup(tmp_path, monkeypatch, results, *, repair_surfaced=False, conf
         except AgentInvocationError as exc:
             error = exc
     return response, error, invoke, logged
-
-
-@pytest.mark.parametrize("repair_surfaced", [False, True])
-def test_tests_run_workdir_refusal_reasks_with_tests_run_prompt_2052(
-    tmp_path, monkeypatch, real_repair, repair_surfaced
-):
-    """`tests-run-reask-recovers`: one re-ask carrying the refusal; a corrected report completes."""
-    from agent_loop_helpers import structured_coder_followup
-
-    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
-    first = bad.replace("Rejected report.", "") if repair_surfaced else bad
-    corrected = structured_coder_followup(
-        summary="Corrected report.", tests_run=["pytest tests/test_api.py"],
-    )
-    calls = _cli_repair(monkeypatch, [(bad, 0)]) if repair_surfaced else []
-    response, error, invoke, logged = _run_followup(
-        tmp_path, monkeypatch,
-        [_result(first, session_id="acquired"), _result(corrected)],
-        repair_surfaced=repair_surfaced,
-    )
-    assert error is None
-    assert invoke.call_count == 2
-    assert len(calls) == (1 if repair_surfaced else 0)
-    second = invoke.call_args_list[1].kwargs
-    assert second["session_id"] == "acquired"
-    assert second["prompt"].startswith("Address PR feedback.\n\n")
-    assert "Previous response not accepted: tests_run report" in second["prompt"]
-    assert "may also test the checkout itself" in second["prompt"]
-    assert "/outside/test_api.py" in second["prompt"]
-    assert "not citable" not in second["prompt"]
-    assert response.marker_value.summary == "Corrected report."
-    assert response.marker_value.tests_run == ("pytest tests/test_api.py",)
-    assert any("re-asking the coder once to correct its tests_run report" in line for line in logged)
-
-
-@pytest.mark.parametrize("repair_surfaced", [False, True])
-def test_second_tests_run_refusal_stops_and_names_budget_used_2052(
-    tmp_path, monkeypatch, real_repair, repair_surfaced
-):
-    """`reask-budget-exhausted` + `reask-ineligibility-diagnosed`: no second re-ask; the log names the term."""
-    from agent_loop_helpers import structured_coder_followup
-
-    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
-    masked = bad.replace("Rejected report.", "")
-    first = masked if repair_surfaced else bad
-    calls = _cli_repair(monkeypatch, [(bad, 0), (bad, 0)]) if repair_surfaced else []
-    response, error, invoke, logged = _run_followup(
-        tmp_path, monkeypatch,
-        [_result(first, session_id="acquired"), _result(first)],
-        repair_surfaced=repair_surfaced,
-    )
-    assert response is None
-    assert error is not None and "semantic-evidence-rejection" in str(error)
-    assert invoke.call_count == 2
-    assert len(calls) == (2 if repair_surfaced else 0)
-    assert any("no coder re-ask (budget-used)" in line for line in logged)
 
 
 def test_issue_wrapped_du_measurement_is_accepted_without_reask_2052(tmp_path, monkeypatch, no_repair):
@@ -1159,48 +753,6 @@ def test_workdir_refusal_reasons_and_prompts_stay_separate_2052(tmp_path):
     assert CITATION_REASKABLE_REASONS == frozenset({
         "non-passing-selector", "launch-integrity", "report-workdir", "tests-run-workdir",
     })
-
-
-def test_evidence_reask_refusal_names_the_first_refusing_term_2052():
-    """`reask-ineligibility-diagnosed`: every eligibility term is named, in order."""
-    from coding_review_agent_loop.validated_agent import (
-        _evidence_reask_eligible,
-        _evidence_reask_refusal,
-    )
-
-    rejection = NonRepairableEvidenceRejection("x", reason="tests-run-workdir")
-    base = dict(opted_in=True, already_used=False)
-    assert _evidence_reask_refusal(rejection, **base) is None
-    assert _evidence_reask_refusal(rejection, opted_in=False, already_used=True) == "not-opted-in"
-    assert _evidence_reask_refusal(rejection, opted_in=True, already_used=True) == "budget-used"
-    assert _evidence_reask_refusal(
-        NonRepairableEvidenceRejection("x"), **base
-    ) == "reason-not-reaskable"
-    assert _evidence_reask_refusal(
-        rejection, **base, public_text_is_transient=True, marker_safety_failure=True,
-    ) == "transient-public-text"
-    assert _evidence_reask_refusal(rejection, **base, marker_safety_failure=True) == "marker-safety"
-    assert _evidence_reask_refusal(
-        rejection, **base, response_failure_is_unsupported=True
-    ) == "unsupported-failure"
-    # Eligibility itself is unchanged.
-    assert _evidence_reask_eligible(rejection, **base, blocked=False)
-    assert not _evidence_reask_eligible(rejection, **base, blocked=True)
-
-
-def test_transient_public_text_blocks_tests_run_reask_and_is_logged_2052(tmp_path, monkeypatch, no_repair):
-    """`reask-ineligibility-diagnosed`: a transient capture blocks the re-ask and is named."""
-    from types import SimpleNamespace
-    from agent_loop_helpers import structured_coder_followup
-
-    bad = structured_coder_followup(summary="Rejected report.", tests_run=[_MIXED_TESTS_RUN])
-    result = AgentResult(text=bad, returncode=0, session_id="acquired")
-    object.__setattr__(result, "command_result", SimpleNamespace(capture_diagnostics=("lost",)))
-    response, error, invoke, logged = _run_followup(tmp_path, monkeypatch, [result, result])
-    assert response is None
-    assert error is not None
-    assert not any("re-asking the coder once" in line for line in logged)
-    assert any("no coder re-ask (transient-public-text)" in line for line in logged)
 
 
 @pytest.mark.parametrize("entry", [

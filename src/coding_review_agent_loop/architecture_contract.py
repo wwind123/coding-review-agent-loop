@@ -48,7 +48,7 @@ from .protocol_common import (
     ParseDegradation,
     _logger,
 )
-from .repair_preservation import (
+from .response_normalization import (
     canonicalize_architecture_near_miss_text,
     recover_payload,
 )

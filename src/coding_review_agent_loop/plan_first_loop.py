@@ -222,12 +222,8 @@ from .architecture_contract import (
     _architecture_metadata_fields,
     _architecture_mode_validators,
     _resumed_review_architecture,
-    _acknowledgement_repair_forbids_assessment,
-    _pin_acknowledgement_repair,
 )
 from .validated_agent import (
-    _run_structured_repair,
-    _log_repair_attempts,
     _run_validated_agent,
 )
 from .response_validation import (
@@ -3686,160 +3682,14 @@ def _run_plan_first_loop_body(
                 for reviewer_name, review_output in approved_review_outputs:
                     if human_requirements_resolved(review_output):
                         continue
+                    # No repair backend reformats the acknowledgement any
+                    # more (#2066): the missing marker is re-injected as a
+                    # blocking plan item and the reviewer is asked again.
                     log(
                         config,
                         f"Planning round {round_number}: {reviewer_name} approved without "
-                        "HUMAN_REQUIREMENTS_RESOLVED; attempting repair",
+                        "HUMAN_REQUIREMENTS_RESOLVED",
                     )
-                    repaired_text, repaired_validated, repair_attempts = _run_structured_repair(
-                        review_output,
-                        runner=runner,
-                        config=config,
-                        usage_context=usage_context,
-                        validate=lambda candidate, reviewer_name=reviewer_name: _validate_plan_review_response(
-                            candidate,
-                            reviewer=reviewer_name,
-                            unresolved_items=prior_unresolved_items,
-                            current_round_items=round_new_unresolved_items,
-                            surfaced_requirement_ids=hr_ids, architecture_status_mode="strict",
-                        ),
-                        repair_kwargs={
-                            "expected_kind": "plan_review",
-                            "reviewer_requirement_ids": hr_ids,
-                            "allowed_prior_item_ids": tuple(
-                                item.item_id for item in prior_unresolved_items
-                            ),
-                        },
-                        forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
-                            review_output
-                        ),
-                    )
-                    # The repair was an agent turn after the round-outcome read:
-                    # re-read and re-validate the board history before its result
-                    # is published, and keep that read for the approval
-                    # boundary's requirement refresh (#1377).
-                    round_outcome_issue_context = get_issue_context(
-                        runner, config=config, issue_number=issue_number
-                    )
-                    revalidate_plan_lineage(
-                        round_outcome_issue_context.comments,
-                        round_number=round_number,
-                        boundary="after an acknowledgement repair",
-                    )
-                    repaired_validated = _pin_acknowledgement_repair(
-                        accepted_review_carriers.get(reviewer_name),
-                        repaired_validated,
-                        config=config,
-                        reviewer_name=reviewer_name,
-                    )
-                    _log_repair_attempts(
-                        config, f"Planning round {round_number}: {reviewer_name}", repair_attempts
-                    )
-                    if repaired_validated is not None:
-                        repaired_parsed = repaired_validated
-                        if (
-                            repaired_parsed.state == "approved"
-                            and human_requirements_resolved(repaired_text)
-                        ):
-                            log(
-                                config,
-                                f"Planning round {round_number}: repair recovered "
-                                f"HUMAN_REQUIREMENTS_RESOLVED for {reviewer_name}",
-                            )
-                            repaired_plan_approvals[reviewer_name] = repaired_text
-                            # Persisted wherever approvals carry requirement-
-                            # binding evidence (#1377): staged carries, and the
-                            # all-reviewers evidence of generation-1 plans.
-                            if staged_planning or current_plan_key.complete:
-                                # The record posted before the repair stores no
-                                # surfaced requirement IDs, because the original
-                                # text carried no acknowledgement.  Without an
-                                # amended record the next round would reject this
-                                # approval as unacknowledged and re-invoke the
-                                # reviewer instead of advancing the phase, so the
-                                # repaired result is persisted here; a later
-                                # record for the same reviewer supersedes the
-                                # earlier one (#905).
-                                log(
-                                    config,
-                                    f"Planning round {round_number}: persisting the repaired "
-                                    f"{reviewer_name} plan approval for the exact-plan carry",
-                                )
-                                _post_plan_reviewer_comment(
-                                    reviewer_name,
-                                    repaired_parsed,
-                                    review_output=repaired_text,
-                                    # The repair re-renders a completed review;
-                                    # keep the model that produced it (#1363).
-                                    model_used=round_review_models.get(reviewer_name),
-                                )
-                            continue
-                        if repaired_parsed.state == "blocking":
-                            log(
-                                config,
-                                f"Planning round {round_number}: repair returned blocking for "
-                                f"{reviewer_name}; treating as reviewer blocking",
-                            )
-                            blocking_reviews.append((reviewer_name, repaired_text))
-                            for item in repaired_parsed.items.blocking:
-                                new_item = _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer=item.reviewer,
-                                    source_round=round_number,
-                                    text=item.text,
-                                    status="blocking",
-                                    **_plan_review_item_tags(item, prior_unresolved_items),
-                                )
-                                round_new_unresolved_items.append(new_item)
-                                unresolved_items = [*unresolved_items, new_item]
-                                next_unresolved_item_number += 1
-                            for item in repaired_parsed.items.same_plan:
-                                new_item = _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer=item.reviewer,
-                                    source_round=round_number,
-                                    text=item.text,
-                                    status="same-plan",
-                                    **_plan_review_item_tags(item, prior_unresolved_items),
-                                )
-                                round_new_unresolved_items.append(new_item)
-                                unresolved_items = [*unresolved_items, new_item]
-                                next_unresolved_item_number += 1
-                            # The record posted before the repair still says
-                            # approved; supersede it with the repaired blocking
-                            # outcome and every item this reviewer minted in the
-                            # round, so durable sweep, step-back and export
-                            # derivations see the block (#1505).
-                            repaired_reviewer_items = tuple(
-                                item for item in round_new_unresolved_items
-                                if item.reviewer == reviewer_name
-                            )
-                            _post_plan_reviewer_comment(
-                                reviewer_name,
-                                repaired_parsed,
-                                review_output=repaired_text,
-                                model_used=round_review_models.get(reviewer_name),
-                                new_items=repaired_reviewer_items,
-                            )
-                            if plan_baseline_records is not None:
-                                repaired_counts = plan_round_provenance_counts(
-                                    repaired_reviewer_items, reviewer=reviewer_name
-                                )
-                                log(
-                                    config,
-                                    f"Planning round {round_number}: {reviewer_name} repaired "
-                                    "blocking outcome new mandatory finding provenance: "
-                                    f"pre_existing={repaired_counts['pre_existing']} "
-                                    f"revision_introduced={repaired_counts['revision_introduced']} "
-                                    f"untagged={repaired_counts['untagged']} "
-                                    f"repeats={repaired_counts['repeats']}",
-                                )
-                            all_approved = False
-                            must_fix_items = [
-                                item for item in unresolved_items
-                                if item.status in {"blocking", "same-plan"}
-                            ]
-                            continue
                     still_missing.append(reviewer_name)
                 if still_missing:
                     log(

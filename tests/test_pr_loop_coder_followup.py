@@ -1,6 +1,7 @@
 """PR-loop tests for pr_loop: coder follow-up handling (#1542)."""
 
 import dataclasses
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -665,9 +666,10 @@ def _approving_review_1292():
 def _rejected_push_runner_1292(*, coder_outputs=(_LIVE_TARGET_FOLLOWUP,), reviews=None, **kwargs):
     return FakeRunner(
         claude_outputs=list(reviews or [_blocking_review_1292(), _approving_review_1292()]),
-        # A terminal report refusal now exhausts one semantic correction first.
+        # A terminal report refusal now exhausts the two same-agent re-asks
+        # first (#2066): three acquisitions per refused dispatch.
         codex_outputs=[value for output in coder_outputs for value in (
-            (output, output) if 'https://live.example' in output else (output,)
+            (output, output, output) if 'https://live.example' in output else (output,)
         )],
         authenticated_actor=_ACTOR_1292,
         **kwargs,
@@ -739,7 +741,7 @@ def test_post_push_unknown_id_and_citation_post_a_degraded_record_and_review_run
     assert _records_1292(runner, "coder-followup-rejected") == []
     reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
     assert reviews and reviews[-1].state == "approved"
-    assert len(_coder_prompts_1292(runner)) == 1  # no second coder turn
+    assert len(_coder_prompts_1292(runner)) == 3  # the primary turn and its two same-agent re-asks (#2066)
 
 
 def test_post_push_outside_checkout_tests_run_is_dropped_and_review_runs(tmp_path):
@@ -777,7 +779,7 @@ def test_post_push_unparseable_response_posts_a_git_synthesized_record_and_revie
     assert _records_1292(runner, "coder-followup-rejected") == []
     reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
     assert reviews and reviews[-1].state == "approved"
-    assert len(_coder_prompts_1292(runner)) == 1
+    assert len(_coder_prompts_1292(runner)) == 3  # the primary turn and its two same-agent re-asks (#2066)
 
 
 def test_unchanged_head_rejection_posts_no_coder_record_and_surfaces_the_error(tmp_path):
@@ -986,7 +988,7 @@ def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
         run_pr_loop(runner, pr_number=77, config=config)
     assert "consecutive" in str(raised.value)
-    assert len(_coder_prompts_1292(runner)) == 4  # two acquisitions per refused dispatch
+    assert len(_coder_prompts_1292(runner)) == 6  # three acquisitions per refused dispatch
 
 
 _A_1292, _B_1292, _C_1292 = "a" * 40, "b" * 40, "c" * 40
@@ -1223,7 +1225,8 @@ def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_pat
     assert [r.dispatch_attempt for r in _records_1292(runner, "coder-followup-rejected")][-1] == 2
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head"):
         run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_coder_prompts_1292(runner)) == 2
+    # One recovery dispatch: the primary turn and its two same-agent re-asks.
+    assert len(_coder_prompts_1292(runner)) == 3
 
 
 def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_recovery_coder(tmp_path):
@@ -1382,7 +1385,7 @@ def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruptio
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as limit:
         run_pr_loop(runner, pr_number=77, config=config)
     assert "consecutive" in str(limit.value)
-    assert len(_coder_prompts_1292(runner)) == 4  # the limit stops a third dispatch
+    assert len(_coder_prompts_1292(runner)) == 6  # the limit stops a third dispatch (three acquisitions each)
 
     flagged = make_config(tmp_path, coder="codex", reviewer="claude", review_unrecorded_head=True)
     runner.claude_outputs.clear()  # interrupt right after the handoff: no reviewer output
@@ -1394,7 +1397,7 @@ def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruptio
     runner.claude_outputs.append(_approving_review_1292())
     assert run_pr_loop(runner, pr_number=77, config=config) == 0  # no flag needed
     assert len(_records_1292(runner, "head-review-recovery")) == 1  # resumed from the handoff
-    assert len(_coder_prompts_1292(runner)) == 4  # no further coder dispatch
+    assert len(_coder_prompts_1292(runner)) == 6  # no further coder dispatch
 
 
 def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path):
@@ -1612,14 +1615,13 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
             ),
         ],
         claude_outputs=[
-            structured_coder_followup(
-                summary="Fixed CI.", addressed_items=["item-1"],
-                tests_run=["pytest tests/test_foo.py https://live.example"],
-            ),
-            structured_coder_followup(
-                summary="Fixed CI.", addressed_items=["item-1"],
-                tests_run=["pytest tests/test_foo.py https://live.example"],
-            ),
+            # The refused report and its two same-agent re-asks (#2066).
+            *[
+                structured_coder_followup(
+                    summary="Fixed CI.", addressed_items=["item-1"],
+                    tests_run=["pytest tests/test_foo.py https://live.example"],
+                )
+            ] * 3,
             structured_coder_followup(summary="Fixed CI in checkout.", addressed_items=["item-1"]),
         ],
         authenticated_actor=_ACTOR_1292,
@@ -1671,7 +1673,7 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
     ]
     assert reviews  # the following reviewer round published for the recovered head
     assert "managed-exact-head-ci" in str(refused.value)  # refused: no second extension
-    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 3  # correction plus recovery acquisitions
+    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 4  # the refused dispatch (three acquisitions) plus the recovery
     assert len(_records_1292(runner, "coder-dispatch")) == 2  # no second extension was granted
 
 
@@ -2331,69 +2333,6 @@ def _reviews_run_1626(runner):
     return len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]])
 
 
-def test_evidence_only_followup_repaired_and_cited_gets_one_review_round_1626(tmp_path, monkeypatch, capsys):
-    """Matrix row `evidence-only-1738` (repair succeeds).
-
-    The prior follow-up already left 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged; the next one reruns the
-    command, gets a compatible pass, and writes prose.  Repair (which repoints
-    the runner's latest test turn) returns a cited array, live reconciliation
-    supersedes the failure with the coder turn's pass, and the grant lets the
-    reviewer see it instead of stopping.
-    """
-    prose = _followup_1626(_PROSE_1626)
-    repaired = _followup_1626(
-        [_citation_1626("pass-2")], summary=f"Re-ran the evidence command. {_PROSE_1626}"
-    )
-    outcome, runner, launches = _run_evidence_loop_1626(
-        tmp_path, monkeypatch,
-        coder_outputs=[_followup_1626(), prose],
-        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
-        reviews=_evidence_reviews_1626(1),
-        repair_output=repaired,
-    )
-    assert outcome == 0, outcome
-    assert len(launches) == 1 and "## test_observations repair:" in launches[0]
-    assert '"receipt_id": "pass-2"' in launches[0]
-    assert runner.latest_test_turn_id == "repair-turn-1"
-    # Review three ran on the unchanged head because of the grant.
-    assert _reviews_run_1626(runner) == 3
-    live = runner.last_reconciled_local_test_evidence
-    failure = next(row for row in live.observations if row.receipt_id == "fail-1")
-    assert failure.superseded_by == "pass-2"
-    assert "authoritative cited evidence progress; granting one review round" in capsys.readouterr().err
-
-
-def test_evidence_only_followup_with_failed_repair_stops_and_names_the_drop_1626(tmp_path, monkeypatch):
-    """Matrix rows `evidence-only-1738` (repair fails) and `degrade-after-failed-repair`.
-
-    The same compatible pass supersedes the failure in live reconciliation,
-    but the citations were dropped, so no grant: the stop fires and names
-    the non-array test_observations and the true uncited count, taken from
-    the coder acquisition's catalog rather than the repointed runner.
-    """
-    outcome, runner, launches = _run_evidence_loop_1626(
-        tmp_path, monkeypatch,
-        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626)],
-        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
-        reviews=_evidence_reviews_1626(1, final=None),
-        repair_output=None,
-    )
-    assert isinstance(outcome, AgentLoopError), outcome
-    message = str(outcome)
-    assert "unchanged in 2 consecutive follow-up rounds" in message
-    assert (
-        "The coder's test_observations were not a JSON array (format repair attempted: yes); "
-        "1 run-tests receipt(s) from that turn went uncited, so the blocker may be a tool "
-        "format problem rather than a code defect."
-    ) in message
-    assert message.index("not a JSON array") < message.index("human review required.") + 200
-    assert len(launches) == 1
-    assert runner.latest_test_turn_id == "repair-turn-1"
-    live = runner.last_reconciled_local_test_evidence
-    assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by == "pass-2"
-    assert _reviews_run_1626(runner) == 2
-
-
 def test_uncited_supersession_or_no_supersession_still_stops_1626(tmp_path, monkeypatch):
     """Matrix rows `unchanged-head-no-progress` and `stop-message-unchanged`."""
     # (a) Supersession by this turn's pass, but no surviving citation cites it.
@@ -2426,23 +2365,6 @@ def test_uncited_supersession_or_no_supersession_still_stops_1626(tmp_path, monk
     assert "unsuperseded failure receipts" in message
     assert "not a JSON array" not in message
     assert _reviews_run_1626(runner) == 2
-
-
-def test_grant_is_bounded_to_one_round_per_head_1626(tmp_path, monkeypatch):
-    """Matrix row `unchanged-head-second-grant` (loop level)."""
-    repaired = _followup_1626(
-        [_citation_1626("pass-2")], summary=f"Re-ran the evidence command. {_PROSE_1626}"
-    )
-    outcome, runner, _launches = _run_evidence_loop_1626(
-        tmp_path, monkeypatch,
-        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626), _followup_1626([_citation_1626("pass-3")])],
-        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})], [("pass-3", "passed", {"PATH": "/usr/bin"})]],
-        reviews=_evidence_reviews_1626(2, final=None),
-        repair_output=repaired,
-    )
-    assert isinstance(outcome, AgentLoopError), outcome
-    assert "unchanged in 3 consecutive follow-up rounds" in str(outcome)
-    assert _reviews_run_1626(runner) == 3
 
 
 def test_unchanged_head_tracker_grants_once_per_head_1626():
@@ -2494,31 +2416,6 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
     assert _reviews_run_1626(runner) == 2
 
 
-def test_uncited_count_survives_bounding_and_runner_repointing_1626(tmp_path, monkeypatch):
-    """Matrix row `stop-count-unbounded`."""
-    # Retained failures crowd this turn's passes out of the bounded evidence.
-    monkeypatch.setattr(_evidence_module_1626, "MAX_ROUND_OBSERVATIONS", 1)
-    outcome, runner, launches = _run_evidence_loop_1626(
-        tmp_path, monkeypatch,
-        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626)],
-        turn_receipts=[(), [
-            ("pass-a", "passed", {"PATH": "/opt/a"}),
-            ("pass-b", "passed", {"PATH": "/opt/b"}),
-            ("pass-c", "passed", {"PATH": "/opt/c"}),
-        ]],
-        reviews=_evidence_reviews_1626(1, final=None),
-        repair_output=None,
-    )
-    assert isinstance(outcome, AgentLoopError), outcome
-    assert "3 run-tests receipt(s) from that turn went uncited" in str(outcome)
-    assert len(launches) == 1 and runner.latest_test_turn_id == "repair-turn-1"
-    assert runner.current_test_turn_observations() == ()
-    bounded = _evidence_module_1626.decode_bounded_evidence(
-        runner.render_local_test_evidence(current_head="6367c48dd193d56ea7b0baad25b19455e529f5ee")
-    )
-    assert [row.receipt_id for row in bounded.observations] == ["fail-1"]
-
-
 def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
     """Matrix row `stop-message-unchanged` (message unit)."""
     from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
@@ -2540,7 +2437,7 @@ def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
     with_drop = unchanged_head_stop_message(
         **base, citation_diagnosis=FollowupCitationDiagnosis(True, False, 2)
     )
-    assert "(format repair attempted: no); 2 run-tests receipt(s)" in with_drop
+    assert "(same-agent re-asks attempted: no); 2 run-tests receipt(s)" in with_drop
     assert with_drop.endswith(" ROUTE")
 
 
@@ -3033,7 +2930,7 @@ def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monke
 
 
 @pytest.mark.parametrize("dispatch", ["ordinary", "same-pr", "conflict"])
-@pytest.mark.parametrize("repair_future", [False, True])
+@pytest.mark.parametrize("repair_future", [False])
 def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatch, dispatch, repair_future):
     from pr_loop_test_helpers import _evidence_review, _EVIDENCE_TEXT, _pr_records
     from coding_review_agent_loop.round_metadata import (
@@ -3550,3 +3447,156 @@ def test_discarded_fix_summary_never_reaches_the_next_coder_prompt_2086(tmp_path
     assert "DISCARDED-NOTE-2086" not in prompts[1]
     (first,) = [r for r in _records_1292(runner) if r.role == "coder"][:1]
     assert first.coder_record_source == "synthesized"
+
+
+# --- #2066: the same-agent re-ask rule through the real PR follow-up caller ---
+
+
+def _drop_summary_2066(text):
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload["summary"] = "   "
+    return json.dumps(payload) + text[end:]
+
+
+def _run_evidence_reask_loop_2066(tmp_path, monkeypatch, *, coder_outputs, turn_receipts, carried_rounds=0):
+    runner = _EvidenceRunner1626(
+        turn_receipts=turn_receipts, tmp_path=tmp_path,
+        codex_outputs=_evidence_reviews_1626(carried_rounds), claude_outputs=coder_outputs,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4)
+    derived = []
+    real_render = pr_loop.render_followup_local_test_evidence
+
+    def spy_render(runner_arg, response, *args, **kwargs):
+        # What pr_loop's evidence derivation receives for the accepted turn.
+        derived.append(SimpleNamespace(
+            turn_id=response.acquisition_test_turn_id,
+            catalog=tuple(row.receipt_id for row in response.acquisition_test_observations),
+            cited=tuple(c.receipt_id for c in response.marker_value.test_observations),
+        ))
+        return real_render(runner_arg, response, *args, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "render_followup_local_test_evidence", spy_render)
+    try:
+        outcome = run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError as exc:
+        outcome = exc
+    prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    return outcome, runner, prompts, derived
+
+
+def test_resend_only_coder_reask_keeps_primary_citations_through_pr_loop_derivation_2066(tmp_path, monkeypatch):
+    """`coder-reask-frozen-acquisition` (pr_loop integration)."""
+    cited = _followup_1626([_citation_1626("pass-2")])
+    outcome, runner, prompts, derived = _run_evidence_reask_loop_2066(
+        tmp_path, monkeypatch,
+        coder_outputs=[_drop_summary_2066(cited), cited],
+        # The primary turn ran the test; the resend-only re-ask dispatch
+        # captures a receipt of its own that must never be admitted.
+        turn_receipts=[
+            [("pass-2", "passed", {"PATH": "/usr/bin"})],
+            [("reask-pass", "passed", {"PATH": "/usr/bin"})],
+        ],
+    )
+    assert outcome == 0, outcome
+    assert len(prompts) == 2
+    assert "Do not modify, commit or push anything" in prompts[1]
+    # pr_loop's derivation reads the primary acquisition: the citation
+    # survives the resend-only correction and the re-ask's receipt is absent.
+    (first_round,) = [entry for entry in derived if entry.cited]
+    assert first_round.turn_id == "coder-turn-1"
+    assert first_round.catalog == ("pass-2",)
+    assert first_round.cited == ("pass-2",)
+
+
+def _outside_citation_2066(receipt_id):
+    return {"command": "python3 -m pytest /outside/tests/test_x.py -q -n 0", "receipt_id": receipt_id, "claim": "current-result"}
+
+
+def test_fresh_evidence_reask_admits_the_reask_receipt_through_pr_loop_derivation_2066(tmp_path, monkeypatch):
+    """`evidence-rejection-reask` (pr_loop integration)."""
+    outcome, runner, prompts, derived = _run_evidence_reask_loop_2066(
+        tmp_path, monkeypatch,
+        coder_outputs=[
+            _followup_1626([_outside_citation_2066("outside-1")]),
+            _followup_1626([_citation_1626("pass-2")]),
+        ],
+        turn_receipts=[
+            [("outside-1", "passed", {"PATH": "/usr/bin"})],
+            [("pass-2", "passed", {"PATH": "/usr/bin"})],
+        ],
+    )
+    assert outcome == 0, outcome
+    assert len(prompts) == 2, prompts
+    assert "Rerun the test command that covers this change" in prompts[1]
+    assert "You may rerun the covering test through the test wrapper" in prompts[1]
+    # The fresh-evidence dispatch became the active acquisition, so its new
+    # receipt reaches pr_loop's derivation.
+    (first_round,) = [entry for entry in derived if entry.cited]
+    assert first_round.turn_id == "coder-turn-2"
+    assert first_round.catalog == ("pass-2",)
+    assert first_round.cited == ("pass-2",)
+
+
+def test_resend_only_reask_after_fresh_evidence_keeps_the_fresh_receipt_2066(tmp_path, monkeypatch):
+    """`evidence-then-resend-reask` (pr_loop integration)."""
+    fresh = _followup_1626([_citation_1626("pass-2")])
+    outcome, runner, prompts, derived = _run_evidence_reask_loop_2066(
+        tmp_path, monkeypatch,
+        coder_outputs=[
+            _followup_1626([_outside_citation_2066("outside-1")]),
+            _drop_summary_2066(fresh),
+            fresh,
+        ],
+        turn_receipts=[
+            [("outside-1", "passed", {"PATH": "/usr/bin"})],
+            [("pass-2", "passed", {"PATH": "/usr/bin"})],
+            [("reask-2-pass", "passed", {"PATH": "/usr/bin"})],
+        ],
+    )
+    assert outcome == 0, outcome
+    assert len(prompts) == 3
+    assert "Rerun the test command that covers this change" in prompts[1]
+    assert "Do not modify, commit or push anything" in prompts[2]
+    # Re-ask 1's receipt survives re-ask 2's resend-only correction; re-ask 2's
+    # own receipt is never admitted and the catalogs are never merged.
+    (first_round,) = [entry for entry in derived if entry.cited]
+    assert first_round.turn_id == "coder-turn-2"
+    assert first_round.catalog == ("pass-2",)
+    assert first_round.cited == ("pass-2",)
+
+
+def test_coder_reask_that_moves_the_head_takes_the_post_push_record_path_2066(tmp_path, monkeypatch):
+    """`coder-reask-head-moved` (pr_loop integration with the #2086 record path)."""
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[_unknown_id_and_citation_followup(), _VALID_FOLLOWUP],
+        advance_pr_head_on_coder_followup=False,
+    )
+    original_head = runner.pr_payload["headRefOid"]
+    served = runner._next_agent_output
+
+    def push_during_reask(outputs, **kwargs):
+        output = served(outputs, **kwargs)
+        if outputs is runner.codex_outputs and runner._serving_reask:
+            moved = hashlib.sha1(b"pushed-during-reask").hexdigest()
+            runner.pr_payload["headRefOid"] = moved
+            runner._move_head(moved, cwd=runner._last_agent_cwd)
+        return output
+
+    monkeypatch.setattr(runner, "_next_agent_output", push_during_reask)
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != original_head
+    prompts = _coder_prompts_1292(runner)
+    # The re-asked response is not accepted and no second re-ask runs.
+    assert len(prompts) == 2
+    assert "Do not modify, commit or push anything" in prompts[1]
+    # pr_loop's post-push path records the moved head from the rejected
+    # primary candidate and the review runs on it.
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source in {"degraded", "synthesized"}
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
+    assert reviews and reviews[-1].state == "approved"

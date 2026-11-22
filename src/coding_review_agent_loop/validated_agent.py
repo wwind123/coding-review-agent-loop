@@ -1,4 +1,4 @@
-"""Run telemetry, structured repair, completion recovery and the validated agent turn.
+"""Run telemetry, same-agent re-asks, completion recovery and the validated agent turn.
 
 Extracted from ``orchestrator.py`` as a pure move (#1181, #1192); the
 orchestrator re-exports every name defined here.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 
@@ -25,12 +25,10 @@ from .errors import (
     AgentLoopError,
     AgentSettingsLockWaitTimeout,
     DeterministicPlanValidationExhaustion,
-    FreshContractIntegrityError,
     PreservedUnsatisfiedResponse,
     NonRepairableEvidenceRejection,
     QuotaResetExceededError,
     RejectedCandidate,
-    ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
     MissingJudgementFieldError,
     MissingPriorItemDispositionError,
@@ -60,28 +58,19 @@ from .protocol import (
 from .protocol_common import (
     ParseDegradation,
 )
-from .repair import (
-    CandidateDecision,
-    RepairAttemptResult,
+from .response_normalization import (
     attempt_envelope_normalization,
     attempt_risk_test_matrix_string_list_normalization,
     attempt_semantic_patch_disposition_normalization,
-    attempt_repair,
-    execute_repair,
+    recover_payload,
+    review_substance_missing,
     strip_unknown_prior_item_dispositions,
     unknown_dispositions_are_resolved_history,
-    require_recoverable_fresh_execution_contract,
-    require_recoverable_fresh_risk_test_matrix_contract,
-    require_recoverable_review_substance,
 )
-from .repair_preservation import (
-    normalize_architecture_impact_near_miss,
-    candidate_retains_source_test_observations,
-    recover_payload,
-    require_recoverable_semantic_patch,
-    source_has_test_observations_shape_defect,
-    require_repair_architecture_impact_absent,
-    validate_repair_preservation,
+from .response_reask import (
+    MAX_SAME_AGENT_REASKS,
+    build_reask_prompt,
+    sanitize_validator_message,
 )
 from .runner import Runner
 from .salvage import SalvageContext
@@ -94,6 +83,7 @@ from .transient import (
 from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .worker_telemetry import append_record, run_record, telemetry_log_path
 from .workdirs import active_workdir
+from .workdir_guard import GitProbeResult, read_workdir_head
 from .comment_rendering import render_agent_unavailable_comment
 from . import quota_wait
 from .round_metadata import (
@@ -132,7 +122,6 @@ from .agent_failure import (
     _agent_failure_classification_text,
 )
 from .architecture_contract import (
-    _carrier_payload,
     _unwrap_architecture_result,
     _architecture_contract_diagnostic,
     _attach_architecture_degradations,
@@ -146,7 +135,6 @@ from .architecture_contract import (
     _architecture_document_path_rejection,
     _architecture_document_path_retry_prompt,
     _reported_canonical_document_path,
-    _fresh_matrix_contract_retry_prompt,
     _evidence_rejection_reask_prompt,
     _prior_disposition_omission_reask_prompt,
     _missing_judgement_field_reask_prompt,
@@ -241,354 +229,75 @@ def _persist_usage_summary(config: AgentLoopConfig, usage_context: RunUsageConte
     )
 
 
-_ORIGINAL_ATTEMPT_REPAIR = attempt_repair
+# A NonRepairableEvidenceRejection whose old observations are no longer
+# citable: the coder re-ask may rerun the covering test, and its dispatch
+# becomes the active evidence acquisition (#1240, #2066).  A refused
+# ``tests_run`` entry is a resend-only correction.
+_FRESH_EVIDENCE_REASONS = CITATION_REASKABLE_REASONS - {TESTS_RUN_WORKDIR_REASON}
+_CODER_EXPECTED_KINDS = frozenset({"coder_followup", "issue_implementation"})
+REASK_TERMINAL_PREFIX = "response rejected after {count} same-agent re-ask{plural}"
 
 
-def _run_structured_repair(
-    raw: str,
+@dataclass(frozen=True)
+class _PendingReask:
+    """One scheduled same-agent re-ask (#2066)."""
+
+    number: int
+    prompt: str
+    session_id: str | None
+    fresh_evidence: bool
+    # The coder checkout head read before the re-ask; None for other roles.
+    head_before: str | None
+
+
+def _read_reask_head(runner: Runner, config: AgentLoopConfig) -> GitProbeResult:
+    """Read the assigned checkout head for the coder re-ask guard."""
+    return read_workdir_head(runner, active_workdir(config), tolerate_exceptions=True)
+
+
+def _reask_hint_prompt(
+    prompt: str,
+    exc: AgentLoopError,
     *,
-    runner: Runner,
-    config: AgentLoopConfig,
-    usage_context: RunUsageContext | None,
-    validate: Callable[[str], object],
-    repair_kwargs: dict[str, object],
-    require_architecture_impact_contract: bool = False,
-    degrade_architecture_impact: bool = False,
-    forbid_architecture_impact: bool = False,
-    parse_response: Callable[[str], object] | None = None,
-    contract_refusal: Callable[[object, str, tuple[ParseDegradation, ...]], str | None] | None = None,
-) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
-    """Run configured repair, retaining compatibility with patched legacy test hooks.
+    contract_unsatisfied: bool,
+    document_path_rejection: tuple[str, frozenset[str]] | None,
+) -> str:
+    """The original prompt plus the typed hint section for ``exc``, if it has one.
 
-    Every new parameter is an optional control keyword, never a repair-prompt
-    keyword, and defaults to today's behavior.  For an invocation that enabled
-    degradation, a near miss is normalized in the raw payload before the
-    repair prompt is built; its record travels out of band.  Each candidate is
-    parsed with the non-refusing ``parse_response``, checked by preservation
-    (including the absence pin), given the merged records, and only then
-    offered to ``contract_refusal`` -- all before it can be accepted (#925).
+    Missing carried-item IDs, a missing judgement field with its allowed
+    values, the evidence rejection reason and the architecture contract field
+    keep their bounded, marker-free sections; the generic re-ask appendix is
+    added by :func:`build_reask_prompt`.
     """
-    if parse_response is None:
-        parse_response = validate
-    if repair_kwargs.get("expected_kind") == "plan_revision_patch":
-        try:
-            require_recoverable_semantic_patch(raw)
-        except AgentLoopError as exc:
-            return None, None, [
-                RepairAttemptResult(
-                    backend="none",
-                    model="semantic-patch-integrity",
-                    prompt="",
-                    output=raw,
-                    returncode=None,
-                    outcome="semantic_patch_integrity",
-                    diagnostic=str(exc),
-                    log_path=None,
-                    fallback_planned=False,
-                )
-            ]
-    review_expected_kind = repair_kwargs.get("expected_kind")
-    if review_expected_kind in {"plan_review", "pr_review"}:
-        try:
-            require_recoverable_review_substance(raw, expected_kind=review_expected_kind)
-        except ReviewSubstanceIntegrityError as exc:
-            # No configuration may bypass this: a reviewer turn with no review
-            # substance has no verdict for repair to recover.
-            return None, None, [
-                RepairAttemptResult(
-                    backend="none",
-                    model="review-substance-integrity",
-                    prompt="",
-                    output=raw,
-                    returncode=None,
-                    outcome="review_substance_integrity",
-                    diagnostic=str(exc),
-                    log_path=None,
-                    fallback_planned=False,
-                )
-            ]
-    if repair_kwargs.get("require_execution_strategy_contract"):
-        expected_kind = repair_kwargs.get("expected_kind")
-        if isinstance(expected_kind, str):
-            try:
-                require_recoverable_fresh_execution_contract(raw, expected_kind=expected_kind)
-            except FreshContractIntegrityError as exc:
-                return None, None, [
-                    RepairAttemptResult(
-                        backend="none",
-                        model="fresh-contract-integrity",
-                        prompt="",
-                        output=raw,
-                        returncode=None,
-                        outcome="fresh_contract_integrity",
-                        diagnostic=str(exc),
-                        log_path=None,
-                        fallback_planned=False,
-                        integrity_contract="execution_recommendation",
-                    )
-                ]
-    if repair_kwargs.get("require_risk_test_matrix_contract"):
-        expected_kind = repair_kwargs.get("expected_kind")
-        if isinstance(expected_kind, str):
-            matrix_normalized = attempt_risk_test_matrix_string_list_normalization(
-                raw, expected_kind=expected_kind
-            )
-            if matrix_normalized is not None:
-                raw = matrix_normalized[0]
-                log(
-                    config,
-                    "repair guard: normalized risk test matrix string field(s) "
-                    f"to one-element list(s): {', '.join(matrix_normalized[1])}",
-                )
-            try:
-                require_recoverable_fresh_risk_test_matrix_contract(
-                    raw, expected_kind=expected_kind
-                )
-            except FreshContractIntegrityError as exc:
-                return None, None, [
-                    RepairAttemptResult(
-                        backend="none",
-                        model="fresh-matrix-contract-integrity",
-                        prompt="",
-                        output=raw,
-                        returncode=None,
-                        outcome="fresh_contract_integrity",
-                        diagnostic=str(exc),
-                        log_path=None,
-                        fallback_planned=False,
-                        integrity_contract="risk_test_matrix",
-                    )
-                ]
-    degradation_records: tuple[ParseDegradation, ...] = ()
-    forbid = forbid_architecture_impact
-    if degrade_architecture_impact:
-        near_miss = normalize_architecture_impact_near_miss(
-            raw,
-            required_contract=require_architecture_impact_contract,
-            expected_kind=(
-                repair_kwargs.get("expected_kind")
-                if isinstance(repair_kwargs.get("expected_kind"), str) else None
-            ),
+    if contract_unsatisfied:
+        if document_path_rejection is not None:
+            return _architecture_document_path_retry_prompt(prompt, *document_path_rejection)
+        return _architecture_contract_retry_prompt(prompt, str(exc))
+    if isinstance(exc, MissingJudgementFieldError):
+        return _missing_judgement_field_reask_prompt(
+            prompt, exc.field_path, exc.allowed_values, exc.observed_preview
         )
-        raw = near_miss.raw
-        degradation_records = (near_miss.record,) if near_miss.record is not None else ()
-        forbid = forbid or near_miss.forbid_architecture_impact
-
-    def candidate_refusal(output: str, parsed: object) -> CandidateDecision:
-        # Merge, never replace: source records first, then any record the
-        # candidate's own degradable parse produced.
-        record_bearing = _attach_architecture_degradations(parsed, degradation_records)
-        payload = _carrier_payload(record_bearing)
-        records = tuple(payload.architecture_impact_degradations) if payload is not None else ()
-        refusal = (
-            contract_refusal(record_bearing, output, records)
-            if contract_refusal is not None else None
-        )
-        return CandidateDecision(parsed=record_bearing, refusal=refusal)
-
-    if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
-        try:
-            repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
-        except TypeError as exc:
-            # Keep older test/integration hooks callable while the reviewer-ID
-            # context is rolled out. The real repair API accepts this keyword.
-            if not any(
-                name in str(exc)
-                for name in (
-                    "reviewer_requirement_ids",
-                    "require_execution_strategy_contract",
-                    "require_risk_test_matrix_contract",
-                    "reject_unsolicited_risk_test_matrix_contract",
-                    "evidence_row_id_universe",
-                    "optional_item_ids",
-                    "test_observations_shape_defect",
-                    "test_turn_receipts",
-                )
-            ):
-                raise
-            legacy_kwargs = dict(repair_kwargs)
-            legacy_kwargs.pop("test_observations_shape_defect", None)
-            legacy_kwargs.pop("test_turn_receipts", None)
-            legacy_kwargs.pop("optional_item_ids", None)
-            legacy_kwargs.pop("reviewer_requirement_ids", None)
-            legacy_kwargs.pop("require_execution_strategy_contract", None)
-            legacy_kwargs.pop("require_risk_test_matrix_contract", None)
-            legacy_kwargs.pop("reject_unsolicited_risk_test_matrix_contract", None)
-            legacy_kwargs.pop("evidence_row_id_universe", None)
-            repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
-        if repaired is None:
-            return None, None, []
-        try:
-            parsed = parse_response(repaired)
-            if repair_kwargs.get("expected_kind") in {
-                "plan_revision_patch", "plan_review", "pr_review", "screenshot-coverage",
-            }:
-                validate_repair_preservation(
-                    raw,
-                    repaired,
-                    allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
-                    evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
-                    forbid_architecture_impact=forbid,
-                )
-            elif repair_kwargs.get("test_observations_shape_defect"):
-                # The scoped test_observations rule applies on every repair
-                # entry point, so a legacy hook cannot bypass it (#1626).
-                validate_repair_preservation(
-                    raw,
-                    repaired,
-                    forbid_architecture_impact=forbid,
-                    test_observations_shape_defect=True,
-                )
-            elif forbid:
-                require_repair_architecture_impact_absent(repaired)
-        except NonRepairableEvidenceRejection as exc:
-            # Same terminal shape as execute_repair (#999): the rejection is an
-            # authority decision on the coder's claims, not invalid output.
-            return None, None, [
-                RepairAttemptResult(
-                    backend="gemini",
-                    model="legacy-test-hook",
-                    prompt="",
-                    output=repaired,
-                    returncode=0,
-                    outcome="semantic_evidence_rejection",
-                    diagnostic=str(exc),
-                    log_path=None,
-                    fallback_planned=False,
-                    evidence_rejection=exc,
-                )
-            ]
-        except AgentLoopError as exc:
-            return repaired, None, [
-                RepairAttemptResult(
-                    backend="gemini",
-                    model="legacy-test-hook",
-                    prompt="",
-                    output=repaired,
-                    returncode=0,
-                    outcome="invalid_output",
-                    diagnostic=str(exc),
-                    log_path=None,
-                    fallback_planned=False,
-                )
-            ]
-        decision = candidate_refusal(repaired, parsed)
-        if decision.refusal is None:
-            return repaired, decision.parsed, []
-        payload = _carrier_payload(decision.parsed)
-        return repaired, None, [
-            RepairAttemptResult(
-                backend="gemini",
-                model="legacy-test-hook",
-                prompt="",
-                output=repaired,
-                returncode=0,
-                outcome="architecture_contract_unsatisfied",
-                diagnostic=decision.refusal,
-                log_path=None,
-                fallback_planned=False,
-                validation_result=decision.parsed,
-                architecture_impact_degradations=(
-                    tuple(payload.architecture_impact_degradations) if payload is not None else ()
-                ),
-            )
-        ]
-    return execute_repair(
-        raw,
-        runner=runner,
-        config=config,
-        run_id=usage_context.run_id if usage_context is not None else None,
-        usage_context=usage_context,
-        validate=parse_response,
-        forbid_architecture_impact=forbid,
-        candidate_refusal=candidate_refusal,
-        **repair_kwargs,
-    )
-
-
-def _terminal_repair_evidence_rejection(
-    attempts: Sequence[RepairAttemptResult],
-) -> NonRepairableEvidenceRejection | None:
-    """Return the evidence rejection that stopped a repair chain, if any (#999).
-
-    Every repair entry point converts a candidate-side
-    ``NonRepairableEvidenceRejection`` into the same terminal
-    ``semantic_evidence_rejection`` attempt; this is the one recognition point.
-    """
-    if not attempts:
-        return None
-    terminal = attempts[-1]
-    if terminal.outcome != "semantic_evidence_rejection":
-        return None
-    return terminal.evidence_rejection
-
-
-def _evidence_reask_refusal(
-    rejection: NonRepairableEvidenceRejection,
-    *,
-    opted_in: bool,
-    already_used: bool,
-    public_text_is_transient: bool = False,
-    marker_safety_failure: bool = False,
-    response_failure_is_unsupported: bool = False,
-) -> str | None:
-    """The first term refusing the single coder re-ask, or ``None`` when eligible (#2052).
-
-    The terms are checked in the order :func:`_evidence_reask_eligible` applies
-    them, so a stopped turn names the exact reason in its log line.
-    """
-    if not opted_in:
-        return "not-opted-in"
-    if already_used:
-        return "budget-used"
-    if rejection.reason not in CITATION_REASKABLE_REASONS:
-        return "reason-not-reaskable"
-    if public_text_is_transient:
-        return "transient-public-text"
-    if marker_safety_failure:
-        return "marker-safety"
-    if response_failure_is_unsupported:
-        return "unsupported-failure"
-    return None
-
-
-def _evidence_reask_eligible(
-    rejection: NonRepairableEvidenceRejection,
-    *,
-    opted_in: bool,
-    already_used: bool,
-    blocked: bool,
-) -> bool:
-    """Whether a semantic evidence rejection earns the single coder re-ask (#1240).
-
-    Shared by the direct path and a repair-surfaced rejection (#999), so both
-    spend the same one-per-invocation budget.
-    """
-    return _evidence_reask_refusal(
-        rejection,
-        opted_in=opted_in,
-        already_used=already_used,
-        public_text_is_transient=blocked,
-    ) is None
+    if isinstance(exc, MissingPriorItemDispositionError):
+        return _prior_disposition_omission_reask_prompt(prompt, tuple(exc.missing_ids))
+    if (
+        isinstance(exc, NonRepairableEvidenceRejection)
+        and exc.reason in CITATION_REASKABLE_REASONS
+    ):
+        return _evidence_rejection_reask_prompt(prompt, str(exc), reason=exc.reason)
+    return prompt
 
 
 def _evidence_reask_log_purpose(reason: str) -> str:
     """What the coder is re-asked to do, by rejection reason (#2052)."""
     if reason == TESTS_RUN_WORKDIR_REASON:
         return "correct its tests_run report"
-    return "cite a verified passing observation"
+    if reason in _FRESH_EVIDENCE_REASONS:
+        return "cite a verified passing observation"
+    return "resend its response"
 
 
-def _semantic_evidence_last_error(
-    rejection: NonRepairableEvidenceRejection, *, repair_surfaced: bool
-) -> str:
-    action = (
-        "repair chain stopped" if repair_surfaced else "repair skipped"
-    )
-    return (
-        f"{rejection} (semantic evidence rejection; "
-        f"{action} because reformatting cannot change it)"
-    )
+def _semantic_evidence_last_error(rejection: NonRepairableEvidenceRejection) -> str:
+    return f"{rejection} (semantic evidence rejection)"
 
 
 @dataclass(frozen=True)
@@ -995,74 +704,6 @@ def _refresh_plan_validation_capture(
     )
 
 
-def _refused_contract_attempt(
-    attempts: Sequence[RepairAttemptResult],
-) -> RepairAttemptResult | None:
-    """The last repair candidate refused for an unsatisfied contract, if any."""
-    for attempt in reversed(attempts):
-        if attempt.outcome == "architecture_contract_unsatisfied":
-            return attempt
-    return None
-
-
-def _log_repair_attempts(config: AgentLoopConfig, prefix: str, attempts: Sequence[RepairAttemptResult]) -> None:
-    for attempt in attempts:
-        diagnostic = attempt.diagnostic or "(none)"
-        log(
-            config,
-            f"{prefix}: repair backend={attempt.backend} model={attempt.model} "
-            f"outcome={attempt.outcome} returncode="
-            f"{attempt.returncode if attempt.returncode is not None else 'none'}; "
-            f"diagnostic={diagnostic}; log={attempt.log_path or '(none)'}; "
-            f"fallback_planned={'yes' if attempt.fallback_planned else 'no'}",
-        )
-
-
-def _capture_terminal_plan_repair_rejection(
-    attempt: RepairAttemptResult,
-    *,
-    repair_expected_kind: str | None,
-    validate: Callable[[str], object],
-    contract_diagnostic: Callable[[object], str | None] | None = None,
-) -> DeterministicPlanValidationExhaustion | None:
-    """Capture a deterministically rejected final planning repair candidate.
-
-    Repair diagnostics can also describe preservation checks or backend output,
-    so re-run the authoritative validator and retain only its exact diagnostic.
-    Shape and marker-safety checks keep unrelated or unsafe repair output out of
-    the durable planning-diagnostic channel.
-    """
-    candidate = attempt.output
-    if (
-        attempt.outcome != "invalid_output"
-        or repair_expected_kind not in {"plan_state", "plan_revision"}
-        or _recognized_structured_public_response_kind(candidate) != repair_expected_kind
-    ):
-        return None
-    try:
-        parsed = validate(candidate)
-    except AgentLoopError as exc:
-        if "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc):
-            return None
-        return DeterministicPlanValidationExhaustion(
-            candidate_kind=repair_expected_kind,
-            candidate_text=candidate,
-            diagnostic=str(exc),
-            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
-        )
-    # ``validate`` is the non-refusing parse on required-contract sites; the
-    # pure diagnostic check never mutates the retained unsatisfied candidate.
-    diagnostic = contract_diagnostic(parsed) if contract_diagnostic is not None else None
-    if diagnostic is not None:
-        return DeterministicPlanValidationExhaustion(
-            candidate_kind=repair_expected_kind,
-            candidate_text=candidate,
-            diagnostic=diagnostic,
-            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
-        )
-    return None
-
-
 def _semantic_patch_payload_rejection(
     exc: AgentLoopError,
     *,
@@ -1137,38 +778,9 @@ class _QuotaReplay:
     session_id: str | None
     timeout_seconds: int | None
     invocation_kwargs: dict[str, object]
-
-
-# Bound on the tool-owned receipt list handed to a test_observations repair.
-_TEST_TURN_RECEIPTS_LIMIT = 16
-
-
-def _test_turn_receipts(acquisition: AgentResult | None) -> tuple[dict[str, str], ...]:
-    """This turn's run-tests receipts for a test_observations repair (#1626).
-
-    Built only from the acquisition's closed, tool-owned catalog, never from
-    model text, and bounded.  The repair model may cite only these; the
-    downstream receipt binding remains the authoritative check.
-    """
-    from .local_test_evidence import redact_test_command
-
-    receipts: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for observation in getattr(acquisition, "test_turn_observations", ()) or ():
-        receipt_id = getattr(observation, "receipt_id", None)
-        if not isinstance(receipt_id, str) or not receipt_id.strip() or receipt_id in seen:
-            continue
-        seen.add(receipt_id)
-        command = getattr(observation, "command", ())
-        safe_command = redact_test_command(command)[0] if command else ""
-        receipts.append({
-            "command": safe_command,
-            "receipt_id": receipt_id,
-            "outcome": str(getattr(observation, "outcome", "unknown")),
-        })
-        if len(receipts) >= _TEST_TURN_RECEIPTS_LIMIT:
-            break
-    return tuple(receipts)
+    # The same-agent re-ask this dispatch carried, so a replay keeps its
+    # evidence scope and head guard (#2066).
+    reask: _PendingReask | None = None
 
 
 class _ProviderEnvelopeFailure(Exception):
@@ -1186,8 +798,8 @@ class _ProviderEnvelopeFailure(Exception):
 def _run_validated_agent(*args, **kwargs):
     """Run one validated agent turn, then remove its per-turn response directories.
 
-    Every backend invocation inside the turn (the first attempt, format
-    repairs, retries and completion recovery) allocates its own private
+    Every backend invocation inside the turn (the first attempt, same-agent
+    re-asks, retries and completion recovery) allocates its own private
     directory; they are all removed once the turn has finished with them,
     whatever its outcome (#1560).  A cleanup failure is only logged.
     """
@@ -1361,8 +973,8 @@ def _run_validated_agent_in_scope(
     ) -> _AcceptedCandidate | None:
         """Accept the original response with today's #927 drop (#1626).
 
-        Only after a repair of a non-array test_observations produced no
-        accepted candidate.  The fallback validator differs from the primary
+        Only after the same-agent re-asks of a non-array test_observations
+        produced no accepted candidate (#2066).  The fallback validator differs from the primary
         one only in its ``degrade-after-repair`` mode, so every other defect
         still rejects; it runs the same contract refusal and is accepted
         through the same boundary with the matching strict re-parse.
@@ -1408,65 +1020,6 @@ def _run_validated_agent_in_scope(
             )
             return None
 
-    def accept_repaired_test_observations_fallback(
-        source: str,
-        *,
-        repaired: str | None,
-        attempts: Sequence[RepairAttemptResult],
-        repair_kwargs: Mapping[str, object],
-    ) -> _AcceptedCandidate | None:
-        """Fall back on a rejected repair candidate (#1626).
-
-        Only when the source's test_observations is the fallback-degradable
-        non-array shape, and the candidate keeps that exact value; a
-        candidate that changed the field (to an array, or to other or empty
-        prose) was judged by the scoped preservation rule and is never
-        rescued.  The candidate must also pass today's unflagged
-        preservation against the source, and it inherits the source's
-        architecture near-miss record.
-        """
-        if test_observations_fallback_validate is None:
-            return None
-        candidates = [
-            attempt.output for attempt in reversed(attempts)
-            if attempt.outcome == "invalid_output" and attempt.output
-        ]
-        if repaired and repaired not in candidates:
-            candidates.insert(0, repaired)
-        forbid = False
-        source_records: tuple[ParseDegradation, ...] = ()
-        if degrade_architecture_impact:
-            near_miss = normalize_architecture_impact_near_miss(
-                source,
-                required_contract=require_architecture_impact_contract,
-                expected_kind=repair_expected_kind,
-            )
-            forbid = near_miss.forbid_architecture_impact
-            source_records = (near_miss.record,) if near_miss.record is not None else ()
-        for candidate in dict.fromkeys(candidates):
-            if not candidate_retains_source_test_observations(source, candidate):
-                continue
-            try:
-                validate_repair_preservation(
-                    source,
-                    candidate,
-                    unresolved_item_ids=repair_kwargs.get("unresolved_item_ids"),
-                    optional_item_ids=repair_kwargs.get("optional_item_ids") or (),
-                    surfaced_requirement_ids=repair_kwargs.get("surfaced_requirement_ids"),
-                    reviewer_requirement_ids=repair_kwargs.get("reviewer_requirement_ids"),
-                    allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
-                    evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
-                    forbid_architecture_impact=forbid,
-                )
-            except AgentLoopError:
-                continue
-            accepted = accept_test_observations_fallback(
-                candidate, source_records=source_records
-            )
-            if accepted is not None:
-                return accepted
-        return None
-
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
         salvage_context=salvage_context,
@@ -1510,19 +1063,12 @@ def _run_validated_agent_in_scope(
         if antigravity_attempts is not None
         else config.agent_max_retries + 2
     )
-    if reask_on_prior_disposition_omission or reask_on_missing_judgement_field:
-        # One dedicated slot shared by both re-ask kinds (#1167, #1185); that never consumes agent_max_retries.
-        max_attempts += 1
-    if reask_on_evidence_rejection:
-        # One dedicated slot that never consumes agent_max_retries (#1240).
-        max_attempts += 1
+    # The shared same-agent re-ask budget (#2066); it never consumes
+    # agent_max_retries or Antigravity fallback state.
+    max_attempts += MAX_SAME_AGENT_REASKS
     if antigravity_structured_kind is not None:
         # One dedicated structured-off replay after agy rejects agent-loop's
         # request schema (#2039); never consumes agent_max_retries.
-        max_attempts += 1
-    if require_risk_test_matrix_contract:
-        # One dedicated planner replay for a fresh matrix integrity refusal;
-        # never consumes agent_max_retries or Antigravity fallback state.
         max_attempts += 1
     # Run-scoped wait budget, fetched lazily so an unset option never creates one.
     quota_wait_budget: quota_wait.QuotaWaitBudget | None = None
@@ -1571,25 +1117,19 @@ def _run_validated_agent_in_scope(
     # treating it as accepted executable-replacement evidence.
     latest_replay_refusal_detail: str | None = None
     next_timeout_seconds = timeout_seconds
-    marker_safety_repair_attempted = False
     settings_lock_retry_used = False
     # One structured-off replay per turn after a request-schema rejection
     # (#2039); the replayed dispatch is set only by that branch.
     structured_request_fallback_used = False
     pending_structured_off_replay: _QuotaReplay | None = None
-    # A field-naming diagnostic for the next attempt's prompt, set only by an
-    # unsatisfied architecture-impact contract and consumed by one attempt.
-    pending_contract_reprompt: str | None = None
-    omission_reask_used = False
-    matrix_integrity_replay_used = False
-    terminal_integrity_contract: str | None = None
-    pending_matrix_integrity_reprompt: str | None = None
-    pending_omission_reask_ids: tuple[str, ...] | None = None
-    pending_judgement_reask: tuple[str, tuple[str, ...], str | None] | None = None
-    evidence_reask_used = False
-    pending_evidence_reask_detail: str | None = None
-    pending_evidence_reask_reason: str | None = None
-    pending_evidence_reask_session: str | None = None
+    # The single same-agent re-ask rule (#2066): one shared budget for every
+    # deterministic validation failure, replacing the repair pass and the
+    # per-defect re-ask slots.
+    is_coder_turn = role == "coder" or repair_expected_kind in _CODER_EXPECTED_KINDS
+    reasks_used = 0
+    pending_reask: _PendingReask | None = None
+    reask_budget_exhausted = False
+    reask_skip_detail: str | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
             config.claude_cmd,
@@ -1697,6 +1237,60 @@ def _run_validated_agent_in_scope(
             failure_category="transient",
         )
 
+    def schedule_reask(
+        *,
+        message: str,
+        result: AgentResult,
+        hint_prompt: str | None = None,
+        fresh_evidence: bool = False,
+    ) -> bool:
+        """Schedule one same-agent re-ask; False when none may run (#2066).
+
+        A coder re-ask needs a readable checkout head as its baseline; without
+        one the turn fails as before.  The re-ask resumes the response's own
+        session when there is one and otherwise resends the full prompt.
+        """
+        nonlocal reasks_used, pending_reask, reask_budget_exhausted, reask_skip_detail
+        if reasks_used >= MAX_SAME_AGENT_REASKS:
+            reask_budget_exhausted = True
+            return False
+        head_before: str | None = None
+        if is_coder_turn:
+            probe = _read_reask_head(runner, config)
+            if not probe.available or not probe.value:
+                reask_skip_detail = (
+                    "coder re-ask skipped: the checkout head could not be read "
+                    f"({probe.kind})"
+                )
+                log(config, f"{agent_name}: {reask_skip_detail}")
+                return False
+            head_before = probe.value
+        reasks_used += 1
+        reask_session = result.session_id or session_id
+        pending_reask = _PendingReask(
+            number=reasks_used,
+            prompt=build_reask_prompt(
+                hint_prompt if hint_prompt is not None else prompt,
+                message,
+                reasks_used,
+                coder=is_coder_turn,
+                fresh_evidence=fresh_evidence,
+                config=config,
+            ),
+            session_id=reask_session,
+            fresh_evidence=fresh_evidence,
+            head_before=head_before,
+        )
+        log(
+            config,
+            f"{agent_name}: response rejected ("
+            f"{sanitize_validator_message(message, config=config, limit=300)}); "
+            f"re-asking the same agent ({reasks_used}/{MAX_SAME_AGENT_REASKS}"
+            + ("; fresh test evidence allowed" if fresh_evidence else "")
+            + ("; resuming session)" if reask_session else "; fresh turn)"),
+        )
+        return True
+
     attempt = 0
     # A while loop: a quota wait may extend max_attempts mid-turn.
     while attempt < max_attempts:
@@ -1739,8 +1333,8 @@ def _run_validated_agent_in_scope(
             invocation_kwargs = dict(pending_quota_replay.invocation_kwargs)
             if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = f"quota-wait-{quota_replays_used}"
+            dispatch_reask = pending_quota_replay.reask
             pending_quota_replay = None
-            pending_contract_reprompt = None
         elif pending_structured_off_replay is not None:
             # The exact dispatch agy rejected for its schema, re-sent without
             # schema flags (#2039): not a corrective re-prompt.
@@ -1748,6 +1342,7 @@ def _run_validated_agent_in_scope(
             attempt_session_id = pending_structured_off_replay.session_id
             next_timeout_seconds = pending_structured_off_replay.timeout_seconds
             invocation_kwargs = dict(pending_structured_off_replay.invocation_kwargs)
+            dispatch_reask = pending_structured_off_replay.reask
             pending_structured_off_replay = None
         else:
             if backend_agent == "claude":
@@ -1758,57 +1353,23 @@ def _run_validated_agent_in_scope(
                 )
             elif is_executable_replacement_replay:
                 invocation_kwargs["attempt_suffix"] = executable_replacement_policies[backend_agent][2]
-            if pending_matrix_integrity_reprompt is not None:
-                attempt_prompt = _fresh_matrix_contract_retry_prompt(
-                    prompt, pending_matrix_integrity_reprompt
-                )
-                if backend_agent == "claude":
-                    invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
-                pending_matrix_integrity_reprompt = None
-            elif pending_judgement_reask is not None:
-                # Same frozen prompt and session as the original turn (#1185).
-                attempt_prompt = _missing_judgement_field_reask_prompt(
-                    prompt, *pending_judgement_reask
-                )
-                if backend_agent == "claude":
-                    invocation_kwargs["attempt_suffix"] = "judgement-reask"
-                pending_judgement_reask = None
-            elif pending_omission_reask_ids is not None:
-                # Reuse the frozen prompt and session: publishing or rebuilding the
-                # prompt between the two turns would reopen #1156.
-                attempt_prompt = _prior_disposition_omission_reask_prompt(
-                    prompt, pending_omission_reask_ids
-                )
-                if backend_agent == "claude":
-                    invocation_kwargs["attempt_suffix"] = "omission-reask"
-                pending_omission_reask_ids = None
-            elif pending_contract_reprompt is not None and document_path_rejection is not None:
-                attempt_prompt = _architecture_document_path_retry_prompt(
-                    prompt, *document_path_rejection
-                )
-            else:
-                attempt_prompt = (
-                    _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
-                    if pending_contract_reprompt is not None
-                    else prompt
-                )
-            pending_contract_reprompt = None
+            attempt_prompt = prompt
             attempt_session_id = session_id
-            if pending_evidence_reask_detail is not None:
-                # Same frozen prompt plus the sanitized rejection; resume the
-                # rejected acquisition's own session when one exists (#1240).
-                attempt_prompt = _evidence_rejection_reask_prompt(
-                    prompt, pending_evidence_reask_detail,
-                    reason=pending_evidence_reask_reason,
-                )
-                attempt_session_id = pending_evidence_reask_session
+            dispatch_reask = pending_reask
+            pending_reask = None
+            if dispatch_reask is not None:
+                # The same agent, the model that produced the rejected response
+                # (the Antigravity chain is not advanced) and its own session.
+                attempt_prompt = dispatch_reask.prompt
+                attempt_session_id = dispatch_reask.session_id
                 if backend_agent == "claude":
-                    invocation_kwargs["attempt_suffix"] = "evidence-reask"
-                pending_evidence_reask_detail = None
-                pending_evidence_reask_reason = None
-                pending_evidence_reask_session = None
+                    invocation_kwargs["attempt_suffix"] = f"reask{dispatch_reask.number}"
         last_dispatch = _QuotaReplay(
-            attempt_prompt, attempt_session_id, next_timeout_seconds, dict(invocation_kwargs)
+            attempt_prompt,
+            attempt_session_id,
+            next_timeout_seconds,
+            dict(invocation_kwargs),
+            reask=dispatch_reask,
         )
         if usage_context is not None:
             usage_context.note_agent_dispatch()
@@ -1840,10 +1401,13 @@ def _run_validated_agent_in_scope(
                     f"{agent_name}: shared agy settings lock wait expired ({exc}); "
                     "retrying the lock wait once",
                 )
-        # Keep this acquisition result fixed through every validation and
-        # repair callback for the current response. Repair itself may replace
-        # runner.latest_test_turn_id, but it cannot replace this snapshot.
-        validation_acquisition = result
+        # The active evidence acquisition (#2066): the latest dispatch whose
+        # instruction allowed test runs -- a primary or ordinary-retry
+        # dispatch, or a fresh-evidence re-ask.  A resend-only re-ask inherits
+        # it unchanged, so its own receipts are never admitted and catalogs
+        # are never merged.  The snapshot stays fixed through every callback.
+        if dispatch_reask is None or dispatch_reask.fresh_evidence:
+            validation_acquisition = result
         audit_result = result
         if result.text_source == "structured_output":
             # The payload recovered from the agy envelope won (#2029, #2049):
@@ -1896,6 +1460,26 @@ def _run_validated_agent_in_scope(
             )
             if result.antigravity_log_path is not None:
                 usage_record.agy_log_path = str(result.antigravity_log_path)
+
+        if dispatch_reask is not None and dispatch_reask.head_before is not None:
+            # Coder head guard (#2066): a re-ask may change only the response
+            # text.  A moved (or unreadable) head is never accepted and gets
+            # no further re-ask; pr_loop's post-push coder-record path then
+            # handles the moved head (#2086).
+            head_after = _read_reask_head(runner, config)
+            if not head_after.available or head_after.value != dispatch_reask.head_before:
+                after_label = head_after.value if head_after.available else f"unavailable ({head_after.kind})"
+                last_error = (
+                    f"coder re-ask {dispatch_reask.number} moved the checkout head "
+                    f"({dispatch_reask.head_before} -> {after_label}); the re-asked "
+                    "response was not accepted"
+                )
+                last_classification_text = ""
+                last_failure_category = "deterministic"
+                if usage_record is not None:
+                    usage_record.validation_status = "invalid"
+                log(config, f"{agent_name}: {last_error}")
+                break
 
         # A backend always loads the uniquely assigned public response file.
         # On a timeout/nonzero exit, that artifact can still be a complete
@@ -1956,7 +1540,7 @@ def _run_validated_agent_in_scope(
                         session_id=result.session_id,
                         usage=usage,
                         model_used=result.model_used,
-                        **_response_identity_fields(result),
+                        **_response_identity_fields(result, acquisition_result=validation_acquisition),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=result.returncode,
                     )
@@ -2113,6 +1697,9 @@ def _run_validated_agent_in_scope(
                 # observation does not make provider errors final.
             else:
                 executable_replacement_replay_pending = True
+                # A replayed re-ask stays a re-ask: same prompt, evidence
+                # scope and head baseline, no extra budget.
+                pending_reask = dispatch_reask
                 if usage_record is not None:
                     usage_record.outcome = (
                         "self_update_interruption"
@@ -2173,8 +1760,18 @@ def _run_validated_agent_in_scope(
             last_failure_category = "deterministic"
             if usage_record is not None:
                 usage_record.validation_status = "invalid"
-            should_retry = True
-            pending_contract_reprompt = last_error
+            if schedule_reask(
+                message=last_error,
+                result=result,
+                hint_prompt=_reask_hint_prompt(
+                    prompt,
+                    artifact_contract_refusal,
+                    contract_unsatisfied=True,
+                    document_path_rejection=document_path_rejection,
+                ),
+            ):
+                continue
+            break
         elif artifact_canonicalization_failure is not None:
             # The authoritative artifact was otherwise valid but its accepted
             # text failed the strict canonical comparison.  Report that
@@ -2470,53 +2067,6 @@ def _run_validated_agent_in_scope(
                     last_failure_category = "transient"
                     public_text_is_transient = True
                 if (
-                    reask_on_missing_judgement_field
-                    and not omission_reask_used
-                    and isinstance(exc, MissingJudgementFieldError)
-                    and not public_text_is_transient
-                    and not marker_safety_failure
-                    and last_failure_category != "unsupported_model"
-                    and not contract_unsatisfied
-                ):
-                    # A missing reviewer judgement cannot be supplied by repair:
-                    # re-ask the same reviewer once through the shared slot (#1185).
-                    omission_reask_used = True
-                    pending_judgement_reask = (
-                        exc.field_path, exc.allowed_values, exc.observed_preview
-                    )
-                    if usage_record is not None:
-                        usage_record.validation_status = "invalid"
-                    log(
-                        config,
-                        f"{agent_name}: review gave no valid {exc.field_path} (allowed: "
-                        f"{' | '.join(exc.allowed_values)}); re-asking the same reviewer "
-                        "once (no repair)",
-                    )
-                    continue
-                if (
-                    reask_on_prior_disposition_omission
-                    and not omission_reask_used
-                    and isinstance(exc, MissingPriorItemDispositionError)
-                    and not public_text_is_transient
-                    and not marker_safety_failure
-                    and last_failure_category != "unsupported_model"
-                ):
-                    # A missing carried-item disposition is a missing judgement
-                    # that only the reviewer can supply: re-ask the same reviewer
-                    # once, outside the retry budget and the Antigravity model
-                    # fallback, and never through repair (#1167).
-                    omission_reask_used = True
-                    pending_omission_reask_ids = tuple(exc.missing_ids)
-                    if usage_record is not None:
-                        usage_record.validation_status = "invalid"
-                    log(
-                        config,
-                        f"{agent_name}: review omitted disposition(s) for carried item(s) "
-                        f"{', '.join(pending_omission_reask_ids)}; re-asking the same reviewer "
-                        "once (no repair)",
-                    )
-                    continue
-                if (
                     last_failure_category == "deterministic"
                     and not marker_safety_failure
                     and repair_expected_kind in {"plan_state", "plan_revision"}
@@ -2567,29 +2117,33 @@ def _run_validated_agent_in_scope(
                     terminal_public_response = recovery_outcome.terminal_public_response
                     if recovery_outcome.contract_unsatisfied:
                         recovery_contract_retry = True
-                        # No repair, no terminal comment: one ordinary retry
-                        # with the field-naming re-prompt.  The resume stays
-                        # attempted, so there is never a second one.
-                        should_retry = True
-                        pending_contract_reprompt = recovery_outcome.error
+                        # No terminal comment: the unmet contract goes back to
+                        # the same agent through the shared re-ask budget.
+                        # The resume stays attempted, so there is never a
+                        # second one.
+                        if schedule_reask(
+                            message=recovery_outcome.error,
+                            result=result,
+                            hint_prompt=_architecture_contract_retry_prompt(
+                                prompt, recovery_outcome.error
+                            ),
+                        ):
+                            if usage_record is not None:
+                                usage_record.validation_status = "invalid"
+                            continue
+                        should_retry = False
                     else:
                         should_retry = False
                         break
                 if not recovery_contract_retry:
                     response_failure_is_unsupported = last_failure_category == "unsupported_model"
-                    # Marker near-misses are a separate first-attempt nudge for common footer typos;
-                    # structured JSON protocol drift still remains repairable when retries are exhausted.
+                    # Marker near-misses keep a first-attempt ordinary nudge
+                    # only when no same-agent re-ask can be scheduled.
                     should_retry = replacement_stability_failed or public_text_is_transient or (
                         not response_failure_is_unsupported
                         and attempt == 1
                         and _is_retryable_marker_near_miss(classification_text)
                     )
-                    if contract_unsatisfied:
-                        # A contract-only failure skips the futile repair pass and
-                        # takes one ordinary retry with a field-naming re-prompt,
-                        # within the existing budget and attempt bound.
-                        should_retry = True
-                        pending_contract_reprompt = str(exc)
                     if (
                         result.raw_output
                         and result.raw_output != classification_text
@@ -2641,50 +2195,59 @@ def _run_validated_agent_in_scope(
                                 session_id=result.session_id,
                                 usage=usage,
                                 model_used=result.model_used,
-                                **_response_identity_fields(result),
+                                **_response_identity_fields(result, acquisition_result=validation_acquisition),
                             )
-                    if (
-                        not response_failure_is_unsupported
-                        and repair_expected_kind == "plan_revision"
-                        and result.response_file_text
-                        and not isinstance(exc, UnknownPriorItemDispositionError)
-                        and _plan_revision_missing_human_acknowledgement(
-                            result.text,
-                            context=_HumanRequirementsRecoveryContext(
-                                surfaced_requirement_ids=tuple(
-                                    repair_surfaced_requirement_ids or ()
-                                ),
-                                requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                            ),
-                        )
-                    ):
+                    human_ack_context = _HumanRequirementsRecoveryContext(
+                        surfaced_requirement_ids=tuple(repair_surfaced_requirement_ids or ()),
+                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                    )
+
+                    def recover_human_ack(candidate: str) -> ValidatedAgentResponse | None:
+                        """Deterministic plan_revision acknowledgement recovery for a candidate."""
+                        if not (
+                            repair_expected_kind == "plan_revision"
+                            and result.response_file_text
+                            and _plan_revision_missing_human_acknowledgement(
+                                candidate, context=human_ack_context
+                            )
+                        ):
+                            return None
                         recovered = _recover_plan_revision_human_requirements_acknowledgement(
                             result,
+                            **({} if candidate is result.text else {"text": candidate}),
                             validate=validate,
-                            context=_HumanRequirementsRecoveryContext(
-                                surfaced_requirement_ids=tuple(
-                                    repair_surfaced_requirement_ids or ()
-                                ),
-                                requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                            ),
+                            context=human_ack_context,
                             config=config,
                             agent_name=agent_name,
                         )
-                        if recovered is not None:
-                            recovered_text, marker_value = recovered
-                            if usage_record is not None:
-                                usage_record.validation_status = "validated"
-                            return _accepted_validated_response(
-                                accept_candidate(recovered_text, marker_value),
-                                session_id=result.session_id,
-                                usage=usage,
-                                model_used=result.model_used,
-                                **_response_identity_fields(result),
-                            )
+                        if recovered is None:
+                            return None
+                        recovered_text, recovered_marker = recovered
+                        if usage_record is not None:
+                            usage_record.validation_status = "validated"
+                        return _accepted_validated_response(
+                            accept_candidate(recovered_text, recovered_marker),
+                            session_id=result.session_id,
+                            usage=usage,
+                            model_used=result.model_used,
+                            **_response_identity_fields(result, acquisition_result=validation_acquisition),
+                        )
+
                     if (
-                        use_repair
-                        and not public_text_is_transient
-                        and not response_failure_is_unsupported
+                        not response_failure_is_unsupported
+                        and not isinstance(exc, UnknownPriorItemDispositionError)
+                    ):
+                        recovered_ack = recover_human_ack(result.text)
+                        if recovered_ack is not None:
+                            return recovered_ack
+                    # Purely mechanical normalization runs for every turn, with
+                    # no model call and independent of the retired repair flag
+                    # (#2066); every rewritten candidate is re-validated.
+                    normalization_allowed = (
+                        not public_text_is_transient and not response_failure_is_unsupported
+                    )
+                    if (
+                        normalization_allowed
                         and repair_expected_kind in {"plan_state", "plan_revision"}
                     ):
                         matrix_normalized = attempt_risk_test_matrix_string_list_normalization(
@@ -2720,14 +2283,9 @@ def _run_validated_agent_in_scope(
                                     session_id=result.session_id,
                                     usage=usage,
                                     model_used=result.model_used,
-                                    **_response_identity_fields(result),
+                                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
-                    if (
-                        use_repair
-                        and not public_text_is_transient
-                        and not response_failure_is_unsupported
-                        and repair_expected_kind == "plan_revision_patch"
-                    ):
+                    if normalization_allowed and repair_expected_kind == "plan_revision_patch":
                         disposition_normalized = attempt_semantic_patch_disposition_normalization(text)
                         if disposition_normalized is not None:
                             try:
@@ -2747,23 +2305,22 @@ def _run_validated_agent_in_scope(
                                     session_id=result.session_id,
                                     usage=usage,
                                     model_used=result.model_used,
-                                    **_response_identity_fields(result),
+                                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
-                    # A semantic patch can only ever be recovered by the deterministic
-                    # strip (repair must preserve it byte-for-byte), so it always has to
-                    # prove that every removed ID is canonically resolved history (#872).
-                    # An incomplete ledger demands the same proof for every kind (#862).
+                    # A semantic patch must always prove that every removed ID
+                    # is canonically resolved history (#872).  An incomplete
+                    # ledger demands the same proof for every kind (#862);
+                    # without it the response is re-asked, never stripped.
                     strip_requires_history_proof = (
                         ledger_incomplete or repair_expected_kind == "plan_revision_patch"
                     )
                     normalized: str | None = None
                     # An authority rejection exposed only once the envelope is
-                    # normalized is as unrepairable as one on the raw text (#990).
+                    # normalized is as unfixable by normalization as one on the
+                    # raw text (#990).
                     normalized_evidence_rejection: NonRepairableEvidenceRejection | None = None
                     if (
-                        use_repair
-                        and not public_text_is_transient
-                        and not response_failure_is_unsupported
+                        normalization_allowed
                         and repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
                         and not (
                             isinstance(exc, UnknownPriorItemDispositionError)
@@ -2782,8 +2339,6 @@ def _run_validated_agent_in_scope(
                                 # trailing defect but the normalized candidate still has unknown
                                 # prior dispositions. Try stripping them from the normalized text
                                 # so both defects are resolved in one deterministic pass.
-                                # Only apply when the original error was structural; when it was
-                                # already UnknownPriorItemDispositionError, block 2 handles it.
                                 normalized_history_strip = (
                                     strip_requires_history_proof
                                     and _history_strip_allowed(
@@ -2810,43 +2365,9 @@ def _run_validated_agent_in_scope(
                                         try:
                                             marker_value = validate(stripped_from_normalized)
                                         except AgentLoopError:
-                                            if (
-                                                repair_expected_kind == "plan_revision"
-                                                and result.response_file_text
-                                                and _plan_revision_missing_human_acknowledgement(
-                                                    stripped_from_normalized,
-                                                    context=_HumanRequirementsRecoveryContext(
-                                                        surfaced_requirement_ids=tuple(
-                                                            repair_surfaced_requirement_ids or ()
-                                                        ),
-                                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                                    ),
-                                                )
-                                            ):
-                                                recovered = _recover_plan_revision_human_requirements_acknowledgement(
-                                                    result,
-                                                    text=stripped_from_normalized,
-                                                    validate=validate,
-                                                    context=_HumanRequirementsRecoveryContext(
-                                                        surfaced_requirement_ids=tuple(
-                                                            repair_surfaced_requirement_ids or ()
-                                                        ),
-                                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                                    ),
-                                                    config=config,
-                                                    agent_name=agent_name,
-                                                )
-                                                if recovered is not None:
-                                                    recovered_text, marker_value = recovered
-                                                    if usage_record is not None:
-                                                        usage_record.validation_status = "validated"
-                                                    return _accepted_validated_response(
-                                                        accept_candidate(recovered_text, marker_value),
-                                                        session_id=result.session_id,
-                                                        usage=usage,
-                                                        model_used=result.model_used,
-                                                        **_response_identity_fields(result),
-                                                    )
+                                            recovered_ack = recover_human_ack(stripped_from_normalized)
+                                            if recovered_ack is not None:
+                                                return recovered_ack
                                         else:
                                             removed = ", ".join(sorted(norm_exc.unknown_ids))
                                             allowed_str = ", ".join(sorted(norm_exc.allowed_ids)) or "(none)"
@@ -2874,7 +2395,7 @@ def _run_validated_agent_in_scope(
                                                 session_id=result.session_id,
                                                 usage=usage,
                                                 model_used=result.model_used,
-                                                **_response_identity_fields(result),
+                                                **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                             )
                             except NonRepairableEvidenceRejection as norm_exc:
                                 normalized_evidence_rejection = norm_exc
@@ -2892,7 +2413,7 @@ def _run_validated_agent_in_scope(
                                     session_id=result.session_id,
                                     usage=usage,
                                     model_used=result.model_used,
-                                    **_response_identity_fields(result),
+                                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
                     history_strip = (
                         strip_requires_history_proof
@@ -2905,9 +2426,7 @@ def _run_validated_agent_in_scope(
                         )
                     )
                     if (
-                        use_repair
-                        and not public_text_is_transient
-                        and not response_failure_is_unsupported
+                        normalization_allowed
                         and isinstance(exc, UnknownPriorItemDispositionError)
                         and (not strip_requires_history_proof or history_strip)
                         and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
@@ -2921,43 +2440,9 @@ def _run_validated_agent_in_scope(
                             try:
                                 marker_value = validate(stripped_text)
                             except AgentLoopError:
-                                if (
-                                    repair_expected_kind == "plan_revision"
-                                    and result.response_file_text
-                                    and _plan_revision_missing_human_acknowledgement(
-                                        stripped_text,
-                                        context=_HumanRequirementsRecoveryContext(
-                                            surfaced_requirement_ids=tuple(
-                                                repair_surfaced_requirement_ids or ()
-                                            ),
-                                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                        ),
-                                    )
-                                ):
-                                    recovered = _recover_plan_revision_human_requirements_acknowledgement(
-                                        result,
-                                        text=stripped_text,
-                                        validate=validate,
-                                        context=_HumanRequirementsRecoveryContext(
-                                            surfaced_requirement_ids=tuple(
-                                                repair_surfaced_requirement_ids or ()
-                                            ),
-                                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                        ),
-                                        config=config,
-                                        agent_name=agent_name,
-                                    )
-                                    if recovered is not None:
-                                        recovered_text, marker_value = recovered
-                                        if usage_record is not None:
-                                            usage_record.validation_status = "validated"
-                                        return _accepted_validated_response(
-                                            accept_candidate(recovered_text, marker_value),
-                                            session_id=result.session_id,
-                                            usage=usage,
-                                            model_used=result.model_used,
-                                            **_response_identity_fields(result),
-                                        )
+                                recovered_ack = recover_human_ack(stripped_text)
+                                if recovered_ack is not None:
+                                    return recovered_ack
                             else:
                                 removed = ", ".join(sorted(exc.unknown_ids))
                                 allowed_str = ", ".join(sorted(exc.allowed_ids)) or "(none)"
@@ -2982,7 +2467,7 @@ def _run_validated_agent_in_scope(
                                     session_id=result.session_id,
                                     usage=usage,
                                     model_used=result.model_used,
-                                    **_response_identity_fields(result),
+                                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
                     payload_rejection = (
                         _semantic_patch_payload_rejection(
@@ -2998,15 +2483,20 @@ def _run_validated_agent_in_scope(
                         )
                         else None
                     )
+                    evidence_rejection = (
+                        exc
+                        if isinstance(exc, NonRepairableEvidenceRejection)
+                        else normalized_evidence_rejection
+                    )
                     if payload_rejection is not None:
-                        # Repair may change only a semantic patch's envelope, and
-                        # this rejection names its payload: no repair output can
-                        # satisfy both. Hand it to the bounded replan (#979).
+                        # A semantic patch payload rejection goes to the
+                        # bounded replan, which re-asks the planner with the
+                        # full plan context (#979).
                         candidate_text, rejection_diagnostic = payload_rejection
                         log(
                             config,
                             f"{agent_name}: semantic patch payload rejected ({rejection_diagnostic}); "
-                            "repair may change only the envelope, routing to bounded replan",
+                            "routing to bounded replan",
                         )
                         bounded_replan_rejection = DeterministicPlanValidationExhaustion(
                             candidate_kind="plan_revision",
@@ -3018,463 +2508,119 @@ def _run_validated_agent_in_scope(
                         )
                         should_retry = False
                         last_failure_category = "deterministic"
-                    elif (
-                        evidence_rejection := (
-                            exc
-                            if isinstance(exc, NonRepairableEvidenceRejection)
-                            else normalized_evidence_rejection
+                    else:
+                        # A plain-prose response that names an auth, billing
+                        # or similar provider stop is a provider failure, not a
+                        # response defect: it keeps its stop and spends no
+                        # re-ask.  An attempted structured response is re-asked
+                        # whatever words its prose contains.
+                        provider_stop_prose = (
+                            last_failure_category in _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES
+                            and recover_payload(text) is None
+                            and not text.lstrip().startswith(("{", "`"))
                         )
-                    ) is not None:
-                        # Selecting a real broker handle that is not an
-                        # authoritative passing observation is an authority
-                        # decision. Repair may only reshape the envelope around
-                        # the coder's claims, so it cannot satisfy this; running
-                        # it (and its fallback chain) only burns its timeout and
-                        # then misreports the stop as that timeout (#990).
-                        evidence_reask_refusal = _evidence_reask_refusal(
-                            evidence_rejection,
-                            opted_in=reask_on_evidence_rejection,
-                            already_used=evidence_reask_used,
-                            public_text_is_transient=public_text_is_transient,
-                            marker_safety_failure=marker_safety_failure,
-                            response_failure_is_unsupported=response_failure_is_unsupported,
-                        )
-                        if evidence_reask_refusal is None:
-                            # A non-citable selected observation is missing
-                            # judgement only the coder can supply (rerun and
-                            # re-cite): re-ask once, outside the retry budget
-                            # and fallback, never via repair (#1240).
-                            evidence_reask_used = True
-                            pending_evidence_reask_detail = str(evidence_rejection)
-                            pending_evidence_reask_reason = evidence_rejection.reason
-                            pending_evidence_reask_session = result.session_id or session_id
-                            if usage_record is not None:
-                                usage_record.validation_status = "invalid"
+                        if (
+                            not public_text_is_transient
+                            and not response_failure_is_unsupported
+                            and not provider_stop_prose
+                        ):
+                            # The single same-agent re-ask rule (#2066): the
+                            # validator's message goes back to the agent that
+                            # produced the response, at most twice per turn.
+                            reask_cause = evidence_rejection if evidence_rejection is not None else exc
+                            fresh_evidence = (
+                                is_coder_turn
+                                and isinstance(reask_cause, NonRepairableEvidenceRejection)
+                                and reask_cause.reason in _FRESH_EVIDENCE_REASONS
+                            )
+                            if schedule_reask(
+                                message=str(reask_cause),
+                                result=result,
+                                hint_prompt=_reask_hint_prompt(
+                                    prompt,
+                                    reask_cause,
+                                    contract_unsatisfied=contract_unsatisfied,
+                                    document_path_rejection=document_path_rejection,
+                                ),
+                                fresh_evidence=fresh_evidence,
+                            ):
+                                if usage_record is not None:
+                                    usage_record.validation_status = "invalid"
+                                continue
+                            # No re-ask is left (or the coder head could not be
+                            # read): the turn fails as before, without an
+                            # ordinary retry of the same deterministic defect.
+                            should_retry = False
+                        if evidence_rejection is not None:
                             log(
                                 config,
                                 f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
-                                "re-asking the coder once to "
-                                f"{_evidence_reask_log_purpose(evidence_rejection.reason)} "
-                                "(no repair)"
-                                + (
-                                    "; resuming session"
-                                    if pending_evidence_reask_session
-                                    else "; fresh turn"
-                                ),
+                                "no same-agent re-ask left",
                             )
-                            continue
-                        log(
-                            config,
-                            f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
-                            "not repairable by reformatting, skipping repair pass; "
-                            f"no coder re-ask ({evidence_reask_refusal})",
-                        )
-                        last_error = _semantic_evidence_last_error(
-                            evidence_rejection, repair_surfaced=False
-                        )
-                        last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
-                        should_retry = False
-                        last_failure_category = "deterministic"
-                    elif (
-                        # A reviewer turn without a repair kind (signed-source
-                        # classification, #2035) opts in explicitly, so it keeps
-                        # its own backend output channel while an exhausted
-                        # judgement re-ask still takes this deterministic path.
-                        (repair_expected_kind in {"plan_review", "pr_review"} or reviewer_judgement_turn)
-                        and isinstance(exc, MissingJudgementFieldError)
-                    ):
-                        # Reformatting cannot supply the reviewer's decision (#1185).
-                        allowed = " | ".join(exc.allowed_values)
-                        log(
-                            config,
-                            f"{agent_name}: reviewer gave no valid {exc.field_path} "
-                            f"(allowed: {allowed}); not repairable by reformatting, "
-                            "skipping repair pass",
-                        )
-                        last_error = (
-                            f"{exc} (repair skipped because the reviewer did not supply "
-                            f"{exc.field_path} (allowed: {allowed}); a repair pass cannot "
-                            "supply the reviewer's decision)"
-                        )
-                        last_classification_text = _JUDGEMENT_FIELD_CLASSIFICATION
-                        last_failure_category = "deterministic"
-                    elif (
-                        use_repair
-                        and not public_text_is_transient
-                        and not response_failure_is_unsupported
-                        and (not marker_safety_failure or not marker_safety_repair_attempted)
-                        and not (
-                            isinstance(exc, UnknownPriorItemDispositionError)
-                            and ledger_incomplete
-                        )
-                        # Repair may not supply an assessment the response lacks,
-                        # so a response whose only defect is the unsatisfied
-                        # contract has nothing left for a repair model to fix.
-                        and not contract_unsatisfied
-                    ):
-                        log(config, f"{agent_name}: schema validation failed ({exc}); attempting repair pass")
-                        repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
-                        if repair_unresolved_item_ids is not None:
-                            repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
-                            if repair_optional_item_ids and repair_expected_kind == "coder_followup":
-                                repair_kwargs["optional_item_ids"] = tuple(repair_optional_item_ids)
-                        if repair_expected_kind in {"issue_implementation", "plan_state", "plan_revision"}:
-                            repair_kwargs["surfaced_requirement_ids"] = tuple(
-                                repair_surfaced_requirement_ids or ()
-                            )
-                            repair_kwargs["requires_direct_discussion_ack"] = (
-                                repair_requires_direct_discussion_ack
-                            )
-                            if (
-                                require_execution_strategy_contract
-                                and repair_expected_kind in {"plan_state", "plan_revision"}
-                            ):
-                                repair_kwargs["require_execution_strategy_contract"] = True
-                            if (
-                                require_risk_test_matrix_contract
-                                and repair_expected_kind in {"plan_state", "plan_revision"}
-                            ):
-                                repair_kwargs["require_risk_test_matrix_contract"] = True
-                            if (
-                                reject_unsolicited_risk_test_matrix_contract
-                                and repair_expected_kind == "plan_revision"
-                            ):
-                                repair_kwargs["reject_unsolicited_risk_test_matrix_contract"] = True
-                        elif (
-                            repair_expected_kind == "coder_followup"
-                            and (
-                                repair_surfaced_requirement_ids is not None
-                                or repair_requires_direct_discussion_ack
-                            )
-                        ):
-                            repair_kwargs["surfaced_requirement_ids"] = tuple(repair_surfaced_requirement_ids or ())
-                            repair_kwargs["requires_direct_discussion_ack"] = repair_requires_direct_discussion_ack
-                        elif (
-                            repair_expected_kind in {"plan_review", "pr_review"}
-                            and repair_reviewer_requirement_ids is not None
-                        ):
-                            repair_kwargs["reviewer_requirement_ids"] = tuple(
-                                repair_reviewer_requirement_ids
-                            )
-                        if isinstance(exc, UnknownPriorItemDispositionError):
-                            repair_kwargs["allowed_prior_item_ids"] = exc.allowed_ids
-                            repair_kwargs["unknown_prior_item_ids"] = exc.unknown_ids
-                            repair_kwargs["same_round_context"] = exc.same_round_description
-                        elif repair_allowed_prior_item_ids is not None:
-                            repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
-                        if repair_expected_kind == "pr_review" and repair_evidence_row_ids is not None:
-                            repair_kwargs["evidence_row_id_universe"] = tuple(repair_evidence_row_ids)
-                        # Classified from the source, not from the first error:
-                        # an earlier-checked defect in the same response must
-                        # not hide the test_observations shape defect (#1626).
-                        test_observations_shape_defect = (
-                            repair_expected_kind in {"coder_followup", "issue_implementation"}
-                            and (
-                                isinstance(exc, TestObservationsShapeError)
-                                or source_has_test_observations_shape_defect(
-                                    normalized if normalized is not None else text
-                                )
-                            )
-                        )
-                        if test_observations_shape_defect:
-                            repair_kwargs["test_observations_shape_defect"] = True
-                            repair_kwargs["test_turn_receipts"] = _test_turn_receipts(
-                                validation_acquisition
-                            )
-                        original_validation_error = str(exc)
-                        if marker_safety_failure:
-                            marker_safety_repair_attempted = True
-                        repaired, repaired_marker, repair_attempts = _run_structured_repair(
-                            normalized if normalized is not None else text,
-                            runner=runner,
-                            config=config,
-                            usage_context=usage_context,
-                            validate=validate,
-                            repair_kwargs=repair_kwargs,
-                            require_architecture_impact_contract=require_architecture_impact_contract,
-                            degrade_architecture_impact=degrade_architecture_impact,
-                            parse_response=parse_response,
-                            contract_refusal=(
-                                contract_refusal if require_architecture_impact_contract else None
-                            ),
-                        )
-                        _log_repair_attempts(config, agent_name, repair_attempts)
-                        terminal_repair = repair_attempts[-1] if repair_attempts else None
-                        # A repair candidate that exposed a semantic evidence
-                        # rejection stopped the chain (#999); it takes the same
-                        # #990/#1240 route as a direct rejection and outranks
-                        # every other post-repair classification.
-                        terminal_evidence_rejection = _terminal_repair_evidence_rejection(
-                            repair_attempts
-                        )
-                        fallback = None
-                        if (
-                            test_observations_shape_defect
-                            and terminal_evidence_rejection is None
-                            and repaired_marker is None
-                        ):
-                            # Dropping a malformed observation field may expose
-                            # an authority refusal. Use the shared correction route.
-                            try:
-                                fallback = (
-                                    accept_test_observations_fallback(
-                                        normalized if normalized is not None else text
-                                    )
-                                    if isinstance(exc, TestObservationsShapeError)
-                                    and exc.fallback_degradable
-                                    else None
-                                )
-                                if fallback is None:
-                                    fallback = accept_repaired_test_observations_fallback(
-                                        normalized if normalized is not None else text,
-                                        repaired=repaired,
-                                        attempts=repair_attempts,
-                                        repair_kwargs=repair_kwargs,
-                                    )
-                            except NonRepairableEvidenceRejection as fallback_exc:
-                                terminal_evidence_rejection = fallback_exc
-                        # A refused contract candidate outranks every later
-                        # non-accepting failure in the same chain: it is a complete
-                        # response whose only defect is the contract.
-                        refused_contract = (
-                            _refused_contract_attempt(repair_attempts)
-                            if repaired_marker is None and terminal_evidence_rejection is None
-                            else None
-                        )
-                        if terminal_evidence_rejection is not None:
-                            # The rejected candidate is never a plan-validation
-                            # exhaustion; earlier attempts were already logged
-                            # by _log_repair_attempts above.
-                            plan_validation_exhaustion = None
-                            plan_validation_capture_eligible = False
-                            evidence_reask_refusal = _evidence_reask_refusal(
-                                terminal_evidence_rejection,
-                                opted_in=reask_on_evidence_rejection,
-                                already_used=evidence_reask_used,
-                                public_text_is_transient=public_text_is_transient,
-                                marker_safety_failure=marker_safety_failure,
-                                response_failure_is_unsupported=response_failure_is_unsupported,
-                            )
-                            if evidence_reask_refusal is None:
-                                # Repair preserved the coder's own claims, so
-                                # the coder is re-asked on the primary turn's
-                                # session, never the repair session.
-                                evidence_reask_used = True
-                                pending_evidence_reask_detail = str(terminal_evidence_rejection)
-                                pending_evidence_reask_reason = terminal_evidence_rejection.reason
-                                pending_evidence_reask_session = result.session_id or session_id
-                                if usage_record is not None:
-                                    usage_record.validation_status = "invalid"
-                                log(
-                                    config,
-                                    f"{agent_name}: semantic evidence rejected by the repair "
-                                    f"candidate ({terminal_evidence_rejection}); re-asking the "
-                                    "coder once to "
-                                    f"{_evidence_reask_log_purpose(terminal_evidence_rejection.reason)}"
-                                    + (
-                                        "; resuming session"
-                                        if pending_evidence_reask_session
-                                        else "; fresh turn"
-                                    ),
-                                )
-                                continue
-                            log(
-                                config,
-                                f"{agent_name}: semantic evidence rejected by the repair "
-                                f"candidate ({terminal_evidence_rejection}); repair chain stopped; "
-                                f"no coder re-ask ({evidence_reask_refusal})",
-                            )
-                            last_error = _semantic_evidence_last_error(
-                                terminal_evidence_rejection, repair_surfaced=True
-                            )
+                            last_error = _semantic_evidence_last_error(evidence_rejection)
                             last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
                             should_retry = False
                             last_failure_category = "deterministic"
-                        elif refused_contract is not None:
-                            # Deterministic, never a repair-provider failure; the
-                            # planning capture is built from the refused candidate
-                            # itself so the retained candidate and records are kept.
+                        elif (
+                            (repair_expected_kind in {"plan_review", "pr_review"} or reviewer_judgement_turn)
+                            and isinstance(exc, MissingJudgementFieldError)
+                        ):
+                            # Only the reviewer can supply its decision; the
+                            # terminal error names the field and its values.
+                            last_error = (
+                                f"{exc} (the reviewer did not supply {exc.field_path} "
+                                f"(allowed: {' | '.join(exc.allowed_values)}))"
+                            )
+                            last_classification_text = _JUDGEMENT_FIELD_CLASSIFICATION
                             last_failure_category = "deterministic"
-                            last_classification_text = (
-                                f"structured {repair_expected_kind} repair failed the "
-                                "architecture_impact contract"
-                            )
-                            should_retry = True
-                            pending_contract_reprompt = refused_contract.diagnostic
-                            if repair_expected_kind in {"plan_state", "plan_revision"}:
-                                plan_validation_exhaustion = DeterministicPlanValidationExhaustion(
-                                    candidate_kind=repair_expected_kind,
-                                    candidate_text=refused_contract.output,
-                                    diagnostic=refused_contract.diagnostic,
-                                    candidate_digest=hashlib.sha256(
-                                        refused_contract.output.encode("utf-8")
-                                    ).hexdigest(),
+                        elif (
+                            last_failure_category == "deterministic"
+                            and not marker_safety_failure
+                            and (
+                                missing_substance := review_substance_missing(
+                                    text, expected_kind=repair_expected_kind
                                 )
-                                plan_validation_capture_eligible = True
-                        elif (
-                            terminal_repair is not None
-                            and terminal_repair.outcome == "fresh_contract_integrity"
+                            ) is not None
                         ):
-                            # A fresh planning response with no mechanically
-                            # recoverable contract must not be repaired by
-                            # synthesis. Execution-recommendation integrity keeps
-                            # its established planner replay, while a risk-matrix
-                            # integrity failure is deterministic and fail-fast.
-                            # The original structured validator rejection remains
-                            # authoritative for terminal diagnostic persistence.
-                            should_retry = terminal_repair.integrity_contract == "execution_recommendation"
-                            if (
-                                terminal_repair.integrity_contract == "risk_test_matrix"
-                                and not matrix_integrity_replay_used
-                            ):
-                                matrix_integrity_replay_used = True
-                                pending_matrix_integrity_reprompt = original_validation_error
-                            terminal_integrity_contract = terminal_repair.integrity_contract
-                            last_failure_category = "fresh-contract-integrity"
-                            last_classification_text = (
-                                "fresh planning execution recommendation requires a new planner turn"
-                                if terminal_repair.integrity_contract == "execution_recommendation"
-                                else "fresh planning risk-test-matrix contract is not mechanically recoverable"
-                            )
-                        elif (
-                            terminal_repair is not None
-                            and terminal_repair.outcome == "review_substance_integrity"
-                        ):
-                            # The reviewer's own turn produced no review, usually
-                            # because its tooling cut the turn short. That is a
-                            # reviewer availability failure, not a verdict: retry
-                            # within the configured policy and never let repair
-                            # synthesize a blocking item on the reviewer's behalf.
+                            # A reviewer turn that still carries no review
+                            # substance after the re-asks (narration, a tool
+                            # cut short) is a reviewer availability failure,
+                            # never a verdict: keep the ordinary retry and
+                            # Antigravity format-fallback policy (#2029).
                             plan_validation_exhaustion = None
                             plan_validation_capture_eligible = False
-                            if (
-                                last_failure_category
-                                not in _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES
-                            ):
-                                # A provider/credential diagnostic the reviewer's own
-                                # output already named stays authoritative: refusing
-                                # its repair says nothing about availability, and a
-                                # rerun cannot fix an auth or billing failure.
-                                should_retry = True
-                                format_failure = True
-                                last_failure_category = "agent-unavailable"
-                                last_classification_text = (
-                                    "reviewer response carried no recoverable review substance; "
-                                    "repair refused"
-                                )
-                        elif (
-                            terminal_repair is not None
-                            and terminal_repair.outcome == "semantic_patch_integrity"
-                        ):
-                            # A malformed semantic payload has no authenticated
-                            # decision set for an envelope-only repair to retain.
-                            # Give the planner a fresh attempt; never let a repair
-                            # model synthesize operations, rationales, or bindings.
                             should_retry = True
-                            last_failure_category = "semantic-patch-integrity"
+                            format_failure = True
+                            last_failure_category = "agent-unavailable"
+                            last_error = f"{last_error} (no review substance: {missing_substance})"
                             last_classification_text = (
-                                "semantic patch is not mechanically recoverable; planner retry required"
+                                "reviewer response carried no recoverable review substance "
+                                f"({missing_substance})"
                             )
-                        elif terminal_repair is not None:
-                            repaired_exhaustion = _capture_terminal_plan_repair_rejection(
-                                terminal_repair,
-                                repair_expected_kind=repair_expected_kind,
-                                validate=(
-                                    parse_response if require_architecture_impact_contract else validate
-                                ),
-                                contract_diagnostic=(
-                                    _architecture_contract_diagnostic
-                                    if require_architecture_impact_contract else None
-                                ),
-                            )
-                            if repaired_exhaustion is not None:
-                                # The repair candidate, rather than the source
-                                # candidate, is the final deterministic rejection.
-                                plan_validation_exhaustion = repaired_exhaustion
-                                plan_validation_capture_eligible = True
-                                last_failure_category = "deterministic"
-                                last_classification_text = (
-                                    f"structured {repair_expected_kind} repair failed trusted validation"
-                                )
-                            else:
-                                # A terminal repair transport/provider failure (or
-                                # non-matching/unsafe output) cannot persist stale
-                                # source-candidate provenance.
-                                plan_validation_exhaustion = None
-                                plan_validation_capture_eligible = False
-                                if terminal_repair.outcome == "timeout":
-                                    last_failure_category = "timeout"
-                                elif terminal_repair.outcome != "invalid_output":
-                                    # Includes a terminal transient_provider_error
-                                    # (agy model-access failure), even after
-                                    # earlier invalid_output attempts: it is a
-                                    # resumable provider failure, not a
-                                    # deterministic plan-validation rejection.
-                                    last_failure_category = "repair-provider-failure"
-                        if terminal_evidence_rejection is None and repaired is not None:
-                            if repaired_marker is None:
-                                repair_detail = (
-                                    repair_attempts[-1].diagnostic
-                                    if repair_attempts
-                                    else "repair output failed validation"
-                                )
-                                last_error = (
-                                    f"{original_validation_error}; repair failure: {repair_detail}"
-                                )
-                                log(
-                                    config,
-                                    f"{agent_name}: repair pass produced invalid output ({repair_detail})",
-                                )
-                            else:
-                                marker_value = repaired_marker
-                                try:
-                                    # The repaired candidate was parsed under
-                                    # the primary attempt's acquisition, never
-                                    # the repair turn's.
-                                    accepted_repair = accept_candidate(
-                                        repaired, marker_value, validation_acquisition
-                                    )
-                                except _AcceptedTextCanonicalizationError as canon_exc:
-                                    accepted_repair = None
-                                    last_error = f"{original_validation_error}; repair failure: {canon_exc}"
-                                    last_failure_category = "deterministic"
-                                    log(config, f"{agent_name}: repaired response not accepted ({canon_exc})")
-                            if repaired_marker is not None and accepted_repair is not None:
-                                if isinstance(exc, UnknownPriorItemDispositionError):
-                                    removed = ", ".join(sorted(exc.unknown_ids))
-                                    allowed = ", ".join(sorted(exc.allowed_ids)) or "(none)"
-                                    log(
-                                        config,
-                                        f"{agent_name}: repair pass removed unknown prior-item "
-                                        f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed}",
-                                    )
-                                else:
-                                    log(config, f"{agent_name}: repair pass recovered malformed response")
-                                if usage_record is not None:
-                                    usage_record.validation_status = "validated"
-                                return _accepted_validated_response(
-                                    accepted_repair,
-                                    session_id=result.session_id,
-                                    usage=usage,
-                                    model_used=result.model_used,
-                                    **_response_identity_fields(result),
-                                )
-                        elif terminal_evidence_rejection is None and repair_attempts:
-                            details = "; ".join(
-                                f"{attempt.backend}/{attempt.model}: {attempt.outcome}"
-                                + (f" ({attempt.diagnostic})" if attempt.diagnostic else "")
-                                for attempt in repair_attempts
-                            )
-                            last_error = f"{original_validation_error}; repair invocation failure: {details}"
-                        if (
-                            test_observations_shape_defect
-                            and terminal_evidence_rejection is None
+                        elif (
+                            isinstance(exc, TestObservationsShapeError)
+                            and exc.fallback_degradable
+                            and not public_text_is_transient
+                            and not response_failure_is_unsupported
                         ):
-                            # Accept only a fallback that passed every guard.
+                            # Re-ask first, degrade after the re-asks (#1626,
+                            # #2066): accept the latest response with today's
+                            # recorded drop of the non-array field.
+                            try:
+                                fallback = accept_test_observations_fallback(
+                                    normalized if normalized is not None else text
+                                )
+                            except NonRepairableEvidenceRejection as fallback_exc:
+                                fallback = None
+                                last_error = _semantic_evidence_last_error(fallback_exc)
+                                last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+                                should_retry = False
+                                last_failure_category = "deterministic"
                             if fallback is not None:
                                 log(
                                     config,
-                                    f"{agent_name}: repair failed; degraded test_observations",
+                                    f"{agent_name}: same-agent re-asks exhausted; degraded "
+                                    "test_observations",
                                 )
                                 if usage_record is not None:
                                     usage_record.validation_status = "validated"
@@ -3483,7 +2629,7 @@ def _run_validated_agent_in_scope(
                                     session_id=result.session_id,
                                     usage=usage,
                                     model_used=result.model_used,
-                                    **_response_identity_fields(result),
+                                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
             else:
                 if usage_record is not None:
@@ -3493,18 +2639,9 @@ def _run_validated_agent_in_scope(
                     session_id=result.session_id,
                     usage=usage,
                     model_used=result.model_used,
-                    **_response_identity_fields(result),
+                    **_response_identity_fields(result, acquisition_result=validation_acquisition),
                 )
 
-        if pending_matrix_integrity_reprompt is not None:
-            if usage_record is not None:
-                usage_record.validation_status = "invalid"
-            log(
-                config,
-                f"{agent_name}: retrying planner turn once (fresh risk-test-matrix "
-                "contract; outside retry budget)",
-            )
-            continue
         if should_retry:
             quota = None
             if antigravity_attempts is not None:
@@ -3659,18 +2796,15 @@ def _run_validated_agent_in_scope(
         last_classification_text = "\n".join(
             part for part in (last_classification_text, latest_replay_refusal_detail) if part
         ).strip()
-    if matrix_integrity_replay_used and last_failure_category == "fresh-contract-integrity":
-        if terminal_integrity_contract == "risk_test_matrix":
-            replay_note = (
-                "one automatic planner replay was already attempted "
-                "and also failed the fresh risk-test-matrix contract"
+    if reask_budget_exhausted:
+        last_error = (
+            REASK_TERMINAL_PREFIX.format(
+                count=reasks_used, plural="" if reasks_used == 1 else "s"
             )
-        else:
-            replay_note = (
-                "one automatic planner replay for the risk-test-matrix contract was "
-                f"already attempted; the final failure is the {terminal_integrity_contract} contract"
-            )
-        last_error = f"{last_error}; {replay_note}"
+            + f"; last validator message: {last_error}"
+        )
+    elif reask_skip_detail is not None:
+        last_error = f"{last_error}; {reask_skip_detail}"
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,

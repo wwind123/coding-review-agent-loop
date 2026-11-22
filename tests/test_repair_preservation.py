@@ -2198,82 +2198,6 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
     return result, refusals
 
 
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-def test_repair_of_corroborated_near_miss_is_accepted_as_changed_with_record(tmp_path, path):
-    source = _deg_text(_DEG_CORROBORATED, extra_key=True)
-    repaired_text = _deg_text(dict(_DEG_CORROBORATED, status="changed"))
-    (repaired, parsed, attempts), refusals = _deg_run_repair(
-        tmp_path, source, repaired_text, path=path
-    )
-    assert repaired.strip() == repaired_text.strip()
-    assert parsed.architecture_impact.status == "changed"
-    (record,) = parsed.architecture_impact_degradations
-    assert record.outcome == "normalized-to-changed"
-    assert refusals[0][3] is None
-
-
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-def test_repair_of_uncorroborated_near_miss_is_refused_after_records_attach(tmp_path, path):
-    source = _deg_text(_DEG_UNCORROBORATED, extra_key=True)
-    repaired_text = _deg_text(None)
-    (repaired, parsed, attempts), refusals = _deg_run_repair(
-        tmp_path, source, repaired_text, path=path
-    )
-    assert parsed is None
-    terminal = attempts[-1]
-    # The refused candidate is recorded on its own attempt; the execute path
-    # returns no accepted text at all.
-    assert terminal.output.strip() == repaired_text.strip()
-    if path == "execute":
-        assert repaired is None
-    assert terminal.outcome == "architecture_contract_unsatisfied"
-    assert terminal.validation_result.architecture_impact is None
-    assert [r.outcome for r in terminal.validation_result.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
-    assert "architecture_impact" in terminal.diagnostic
-    assert [r.outcome for r in terminal.architecture_impact_degradations] == ["degraded-to-undetermined"]
-    # The record was attached before the refusal ran.
-    refused_parsed, _text, _records, diagnostic = refusals[0]
-    assert diagnostic is not None
-    assert [r.outcome for r in refused_parsed.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
-    assert "undetermined" not in terminal.output
-
-
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-@pytest.mark.parametrize("source_impact", [None, _DEG_UNCORROBORATED], ids=["omission", "removal"])
-def test_repair_cannot_fabricate_an_assessment_under_a_required_contract(
-    tmp_path, path, source_impact
-):
-    source = _deg_text(source_impact, extra_key=True)
-    (repaired, parsed, attempts), refusals = _deg_run_repair(
-        tmp_path, source, _deg_text(_DEG_FABRICATED_UNCHANGED), path=path
-    )
-    assert parsed is None
-    assert attempts[-1].outcome == "invalid_output"
-    assert "must not introduce one" in attempts[-1].diagnostic
-    assert refusals == []
-
-
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-def test_non_required_review_repair_cannot_invent_a_reviewer_status(tmp_path, path):
-    """A reviewer's architecture decision is never supplied by repair (#1185)."""
-    from agent_loop_helpers import malformed_pr_review_source
-
-    source = malformed_pr_review_source(state="approved", summary="Looks good overall.")
-    repaired_text = _deg_text(
-        _DEG_FABRICATED_UNCHANGED, rendered=_deg_pr_review(summary="Looks good overall.")
-    )
-    (repaired, parsed, attempts), _refusals = _deg_run_repair(
-        tmp_path, source, repaired_text, path=path, required=False, kind="pr_review"
-    )
-    assert parsed is None
-    assert attempts[-1].outcome == "invalid_output"
-    assert "architecture_impact.status" in attempts[-1].diagnostic
-
-
 def _deg_review_text(kind, impact, *, extra_key=False):
     from agent_loop_helpers import structured_plan_review
 
@@ -2283,43 +2207,6 @@ def _deg_review_text(kind, impact, *, extra_key=False):
         else structured_plan_review(summary="Looks good overall.")
     )
     return _deg_text(impact, extra_key=extra_key, rendered=rendered)
-
-
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-@pytest.mark.parametrize("kind", ["pr_review", "plan_review"])
-@pytest.mark.parametrize("fabricated", ["unchanged", "changed"])
-def test_review_repair_cannot_restore_a_normalization_removed_assessment(
-    tmp_path, path, kind, fabricated
-):
-    # Through the real repair seam, with no required contract: pre-repair
-    # normalization removes the uncorroborated `modified`, and a repair that
-    # puts back any assessment is refused on both repair paths.
-    source = _deg_review_text(kind, _DEG_UNCORROBORATED, extra_key=True)
-    laundered = (
-        _DEG_FABRICATED_UNCHANGED
-        if fabricated == "unchanged"
-        else dict(_DEG_CORROBORATED, status="changed")
-    )
-    (repaired, parsed, attempts), _refusals = _deg_run_repair(
-        tmp_path, source, _deg_review_text(kind, laundered), path=path, required=False, kind=kind
-    )
-    assert parsed is None
-    assert attempts[-1].outcome == "invalid_output"
-    assert "must not introduce one" in attempts[-1].diagnostic
-
-
-@pytest.mark.parametrize("path", ["legacy", "execute"])
-@pytest.mark.parametrize("kind", ["pr_review", "plan_review"])
-def test_review_repair_without_an_assessment_is_accepted_with_the_record(tmp_path, path, kind):
-    source = _deg_review_text(kind, _DEG_UNCORROBORATED, extra_key=True)
-    (repaired, parsed, attempts), _refusals = _deg_run_repair(
-        tmp_path, source, _deg_review_text(kind, None), path=path, required=False, kind=kind
-    )
-    assert parsed is not None
-    assert parsed.architecture_impact is None
-    assert [r.outcome for r in parsed.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
 
 
 # --- #1290: coverage-map fields are preserve-only for repair ------------------

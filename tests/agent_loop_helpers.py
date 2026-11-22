@@ -66,6 +66,7 @@ from coding_review_agent_loop.agent_failure import (
     _split_reconstructable_plan_revision_response,
 )
 from coding_review_agent_loop.validated_agent import _run_validated_agent
+from coding_review_agent_loop.response_reask import REASK_PROMPT_HEADER
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
@@ -431,6 +432,10 @@ class FakeRunner(Runner):
         self.git_probe_calls = []
         self.issue_urls = list(issue_urls) if issue_urls is not None else None
         self.public_response_outputs = list(public_response_outputs or [])
+        # Same-agent re-ask replay state (#2066); see _next_agent_output.
+        self._last_agent_outputs = {}
+        self._serving_reask = False
+        self.reask_replays = 0
         self.advance_git_head_on_pr = advance_git_head_on_pr
         self.advance_pr_head_on_coder_followup = advance_pr_head_on_coder_followup
         self._coder_followup_counter = 0
@@ -680,13 +685,26 @@ class FakeRunner(Runner):
             )
         return output
 
-    def _next_agent_output(self, outputs):
+    def _next_agent_output(self, outputs, *, prompt=None):
+        # A same-agent re-ask (#2066) with nothing scripted for it resends the
+        # agent's previous answer, as an agent that cannot correct itself
+        # would; it never touches the checkout.  An explicitly scripted re-ask
+        # answer is served normally.
+        is_reask = isinstance(prompt, str) and REASK_PROMPT_HEADER in prompt
+        self._serving_reask = is_reask
         if not outputs:
+            last = self._last_agent_outputs.get(id(outputs))
+            if is_reask and last is not None:
+                self.reask_replays += 1
+                return last
             raise AgentInvocationError(
                 "scripted agent output exhausted",
                 failure_category="deterministic",
             )
         output = outputs.pop(0)
+        self._last_agent_outputs[id(outputs)] = (
+            output if isinstance(output, (dict, tuple)) else (output, 0)
+        )
         if isinstance(output, dict):
             return output
         if isinstance(output, tuple):
@@ -732,7 +750,7 @@ class FakeRunner(Runner):
         response_path.write_text(response, encoding="utf-8")
 
     def _maybe_advance_git_head_for_agent_pr(self, text: str) -> None:
-        if not self.advance_git_head_on_pr:
+        if not self.advance_git_head_on_pr or self._serving_reask:
             return
         has_pr_identity = "<!-- AGENT_PR:" in text or "github.com/OWNER/REPO/pull/" in text
         if not has_pr_identity and text.lstrip().startswith("{"):
@@ -783,7 +801,7 @@ class FakeRunner(Runner):
         self._move_head(f"{self.git_head}-agent-{self._agent_pr_counter}", cwd=self._last_agent_cwd)
 
     def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
-        if not self.advance_pr_head_on_coder_followup:
+        if not self.advance_pr_head_on_coder_followup or self._serving_reask:
             return
         if '"kind": "coder_followup"' not in "\n".join(cmd):
             return
@@ -862,7 +880,7 @@ class FakeRunner(Runner):
         ensure_log_dir_ignored(log_path.parent)
 
         if cmd[:1] == ["claude"]:
-            output, returncode = self._next_agent_output(self.claude_outputs)
+            output, returncode = self._next_agent_output(self.claude_outputs, prompt=input_text or "\n".join(cmd))
             if isinstance(output, str):
                 output = self._normalize_legacy_agent_output(output, input_text or "\n".join(cmd))
             self._maybe_write_public_response_file(cmd, prompt=input_text)
@@ -873,7 +891,7 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
         if cmd[:2] == ["codex", "exec"]:
-            output = self._next_agent_output(self.codex_outputs)
+            output = self._next_agent_output(self.codex_outputs, prompt=input_text or "\n".join(cmd))
             if isinstance(output, dict):
                 public_response = output.get("public_response", "")
                 stdout = output.get("stdout", "")
@@ -896,7 +914,7 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, stdout, "", returncode)
 
         if cmd[:1] == ["gemini"]:
-            output = self._next_agent_output(self.gemini_outputs)
+            output = self._next_agent_output(self.gemini_outputs, prompt=input_text or "\n".join(cmd))
             explicit_stdout = False
             if isinstance(output, dict):
                 stdout = output.get("stdout", "")
@@ -916,7 +934,8 @@ class FakeRunner(Runner):
 
         if cmd[:1] == ["agy"]:
             output = self._next_agent_output(
-                self.antigravity_catalog_outputs if "models" in cmd else self.antigravity_outputs
+                self.antigravity_catalog_outputs if "models" in cmd else self.antigravity_outputs,
+                prompt=input_text or "\n".join(cmd),
             )
             if isinstance(output, dict):
                 stdout = output.get("stdout", "")
@@ -1247,7 +1266,7 @@ class FakeRunner(Runner):
         cmd, cwd_path = self._record_command(args, cwd, input_text=input_text)
 
         if cmd[:1] == ["claude"]:
-            output, returncode = self._next_agent_output(self.claude_outputs)
+            output, returncode = self._next_agent_output(self.claude_outputs, prompt=input_text or "\n".join(cmd))
             if isinstance(output, str):
                 output = self._normalize_legacy_agent_output(
                     output, input_text or "\n".join(cmd)
@@ -1258,7 +1277,7 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
         if cmd[:2] == ["codex", "exec"]:
-            output = self._next_agent_output(self.codex_outputs)
+            output = self._next_agent_output(self.codex_outputs, prompt=input_text or "\n".join(cmd))
             if isinstance(output, dict):
                 public_response = output.get("public_response", "")
                 stdout = output.get("stdout", "")

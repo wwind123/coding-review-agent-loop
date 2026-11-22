@@ -24,7 +24,7 @@ def validate_coverage_turn(runner, *, coverage_scope, coverage_report, run_agent
         if result.containment is not None and result.containment.managed_cleanup_unconfirmed:
             raise AgentLoopError('Screenshot coverage cleanup could not be verified; retry is blocked')
         # Only deterministic envelope cleanup is permitted. No second acquisition.
-        from .repair import attempt_envelope_normalization
+        from .response_normalization import attempt_envelope_normalization
         artifact = result.response_file_text
         if not artifact:
             raise AgentLoopError('Screenshot coverage requires the acquisition response artifact')

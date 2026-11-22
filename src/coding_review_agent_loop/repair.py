@@ -37,6 +37,14 @@ from .repair_preservation import (
     validate_repair_preservation,
 )
 from .protocol_markers import sanitize_historical_text, scan_reserved_markers
+from .response_normalization import (  # noqa: F401 - relocated (#2066)
+    _SIGNATURE_LINE_RE,
+    attempt_envelope_normalization,
+    attempt_risk_test_matrix_string_list_normalization,
+    attempt_semantic_patch_disposition_normalization,
+    strip_unknown_prior_item_dispositions,
+    unknown_dispositions_are_resolved_history,
+)
 from .usage import RunUsageContext, estimate_usage
 from .protocol_risk import (
     normalize_risk_test_matrix_string_lists,
@@ -73,7 +81,6 @@ if TYPE_CHECKING:
     from .config import AgentLoopConfig
     from .runner import Runner
 
-_SIGNATURE_LINE_RE = re.compile(r"(?m)^--\s+\S[^\n]*")
 
 _OVERSIZED_REPAIR_PROMPT_DIRECTIVE = (
     "Treat the preceding stdin as the complete repair task. Output only the repaired "
@@ -81,277 +88,6 @@ _OVERSIZED_REPAIR_PROMPT_DIRECTIVE = (
     "PUBLIC_RESPONSE_MARKER."
 )
 
-
-def strip_unknown_prior_item_dispositions(
-    raw: str,
-    *,
-    allowed_ids: frozenset[str],
-    expected_kind: str | None,
-) -> str | None:
-    """Remove disposition entries whose item_id is not in allowed_ids.
-
-    Returns the normalized text (JSON + trailing footer/signature) on success,
-    or None when the input cannot be parsed or nothing needs to be removed.
-    The caller must re-validate the returned text before using it.
-    """
-    if expected_kind not in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}:
-        return None
-    disposition_field = (
-        "prior_item_dispositions"
-        if expected_kind == "pr_review"
-        else "prior_plan_item_dispositions"
-    )
-    stripped = raw.lstrip()
-    if not stripped.startswith("{"):
-        return None
-    try:
-        payload, json_end = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("kind") != expected_kind:
-        return None
-    dispositions = payload.get(disposition_field)
-    if not isinstance(dispositions, list):
-        return None
-    filtered = [
-        e for e in dispositions if isinstance(e, dict) and e.get("item_id") in allowed_ids
-    ]
-    if len(filtered) == len(dispositions):
-        return None
-    json_str = json.dumps({**payload, disposition_field: filtered}, ensure_ascii=False)
-    tail = stripped[json_end:]
-    if tail and not tail.startswith("\n"):
-        tail = "\n" + tail
-    return json_str + tail
-
-
-def unknown_dispositions_are_resolved_history(
-    raw: str,
-    *,
-    unknown_ids: Sequence[str],
-    resolved_history_ids: Sequence[str],
-    expected_kind: str | None,
-) -> bool:
-    """Return True when every unknown disposition is a no-op on resolved history.
-
-    Used to allow the deterministic strip when the round ledger may be
-    incomplete: each unknown ID must be one that recorded history proves was
-    canonically resolved, and every entry for it must itself be ``resolved``.
-    Any other shape (active disposition, unparseable text, wrong kind, an ID
-    outside history) returns False so the caller keeps failing closed.
-    """
-    if expected_kind not in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}:
-        return False
-    unknown = frozenset(unknown_ids)
-    if not unknown or not unknown <= frozenset(resolved_history_ids):
-        return False
-    disposition_field = (
-        "prior_item_dispositions"
-        if expected_kind == "pr_review"
-        else "prior_plan_item_dispositions"
-    )
-    stripped = raw.lstrip()
-    if not stripped.startswith("{"):
-        return False
-    try:
-        payload, _json_end = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict) or payload.get("kind") != expected_kind:
-        return False
-    dispositions = payload.get(disposition_field)
-    if not isinstance(dispositions, list):
-        return False
-    seen: set[str] = set()
-    for entry in dispositions:
-        if not isinstance(entry, dict):
-            return False
-        item_id = entry.get("item_id")
-        if item_id not in unknown:
-            continue
-        if entry.get("disposition") != "resolved":
-            return False
-        seen.add(item_id)
-    return seen == unknown
-
-
-def attempt_risk_test_matrix_string_list_normalization(
-    raw: str, *, expected_kind: str | None
-) -> tuple[str, tuple[str, ...]] | None:
-    """Wrap lone-string risk matrix list fields, preserving all other bytes.
-
-    Semantic patches are excluded: they must be preserved byte-for-byte.
-    """
-    if expected_kind not in {"plan_state", "plan_revision"}:
-        return None
-    start = len(raw) - len(raw.lstrip())
-    brace = raw.find("{", start)
-    if brace < 0:
-        return None
-    try:
-        payload, json_end = json.JSONDecoder().raw_decode(raw[brace:])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    normalized, paths = normalize_risk_test_matrix_string_lists(payload)
-    if not paths:
-        return None
-    new_json = json.dumps(normalized, ensure_ascii=False)
-    return raw[:brace] + new_json + raw[brace + json_end :], paths
-
-
-def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
-    """Trim envelope-only trailing material without changing structured JSON."""
-    if expected_kind == 'screenshot-coverage':
-        from .repair_preservation import recover_payload
-        value = recover_payload(raw)
-        if value is None or value.get('kind') != expected_kind:
-            return None
-        return json.dumps(value)
-    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
-        return None
-
-    stripped = raw.lstrip()
-    if not stripped.startswith("{"):
-        # Deterministic recovery for the common JSON-fence/leading-envelope
-        # shape. The source object is still parsed and validated below; this
-        # only removes material outside the structured response.
-        brace_index = stripped.find("{")
-        if brace_index < 0:
-            return None
-        stripped = stripped[brace_index:]
-    try:
-        payload, json_end = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-
-    json_text = stripped[:json_end].rstrip()
-    trailing = stripped[json_end:]
-    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "plan_revision_patch", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
-    state_match = state_re.search(trailing)
-    if state_match is None:
-        return None
-
-    before_footer = re.sub(
-        r"(?im)^\s*(?:`{3,}|~{3,})(?:json)?\s*$\n?",
-        "",
-        trailing[: state_match.start()],
-    )
-    after_footer_raw = trailing[state_match.end() :]
-    footer = trailing[state_match.start() : state_match.end()].strip()
-
-    # Normalize reversed-order envelope: JSON + signature + footer → JSON + footer + signature.
-    # Applies when before_footer is exactly one signature line and nothing follows the footer.
-    if not after_footer_raw.strip():
-        before_stripped = before_footer.strip()
-        sig_candidate = _SIGNATURE_LINE_RE.search(before_stripped)
-        if sig_candidate is not None and before_stripped == before_stripped[sig_candidate.start() : sig_candidate.end()].strip():
-            footer_state = state_match.group(1).lower()
-            payload_state = payload.get("state")
-            state_ok = not (
-                isinstance(payload_state, str)
-                and payload_state.strip()
-                and payload_state.strip() != footer_state
-            )
-            if state_ok:
-                return f"{json_text}\n{footer}\n{before_stripped}"
-
-    preserved_before = ""
-    if expected_kind in {"pr_review", "plan_review"}:
-        before_lstripped = before_footer.lstrip()
-        marker_match = HUMAN_REQUIREMENTS_RESOLVED_RE.match(before_lstripped)
-        if marker_match is not None and before_lstripped[marker_match.end() :].strip() == "":
-            preserved_before = before_lstripped[: marker_match.end()].strip()
-        elif before_footer.strip():
-            return None
-    elif expected_kind in {"plan_state", "plan_revision", "plan_revision_patch"} and before_footer.strip():
-        parsed_human_requirements = parse_human_requirements_acknowledgement(before_footer)
-        if (
-            parsed_human_requirements.marker_present
-            and parsed_human_requirements.section_present
-        ):
-            preserved_before = before_footer.strip()
-        else:
-            return None
-    elif before_footer.strip():
-        return None
-
-    after_footer_lstripped = after_footer_raw.lstrip()
-    preserved_after = ""
-    if expected_kind == "pr_review":
-        marker_match = HUMAN_REQUIREMENTS_RESOLVED_RE.match(after_footer_lstripped)
-        if marker_match is not None:
-            preserved_after = after_footer_lstripped[: marker_match.end()].strip()
-            after_footer_lstripped = after_footer_lstripped[marker_match.end() :]
-        signature_match = _SIGNATURE_LINE_RE.match(after_footer_lstripped.lstrip())
-    else:
-        signature_match = _SIGNATURE_LINE_RE.search(after_footer_lstripped)
-
-    if signature_match is None:
-        return None
-    signature_source = (
-        after_footer_lstripped.lstrip()
-        if expected_kind == "pr_review"
-        else after_footer_lstripped
-    )
-    signature = signature_source[signature_match.start() : signature_match.end()].strip()
-
-    parts = [json_text]
-    if preserved_before:
-        parts.append(preserved_before)
-    parts.append(footer)
-    if preserved_after:
-        parts.append(preserved_after)
-    parts.append(signature)
-    return "\n".join(parts)
-
-
-def attempt_semantic_patch_disposition_normalization(raw: str) -> str | None:
-    """Rename the lossless ``rationale`` disposition alias to ``note``.
-
-    This is deliberately narrower than model repair: it neither selects nor
-    changes a disposition, and it refuses ambiguous rows that contain both
-    names. The strict semantic-patch parser remains authoritative afterward.
-    """
-    stripped = raw.lstrip()
-    if not stripped.startswith("{"):
-        return None
-    try:
-        payload, json_end = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict) or payload.get("kind") != "plan_revision_patch":
-        return None
-    dispositions = payload.get("prior_plan_item_dispositions")
-    if not isinstance(dispositions, list):
-        return None
-
-    normalized_dispositions: list[object] = []
-    changed = False
-    for entry in dispositions:
-        if not isinstance(entry, dict):
-            return None
-        normalized_entry = dict(entry)
-        if "rationale" in normalized_entry:
-            if "note" in normalized_entry:
-                return None
-            rationale = normalized_entry.pop("rationale")
-            if not isinstance(rationale, str) or not rationale.strip():
-                return None
-            normalized_entry["note"] = rationale
-            changed = True
-        normalized_dispositions.append(normalized_entry)
-    if not changed:
-        return None
-
-    normalized_payload = {**payload, "prior_plan_item_dispositions": normalized_dispositions}
-    tail = stripped[json_end:]
-    return json.dumps(normalized_payload, ensure_ascii=False) + tail
 
 # v14 prompt — issue #1389: blocking reviews may keep off-scope future_followups and
 # may disposition carried items as "future":
@@ -1399,33 +1135,7 @@ def _decision_records(parsed: object) -> tuple:
     return tuple(getattr(carrier, "architecture_impact_degradations", ()) or ())
 
 
-_KNOWN_ERROR_RE = re.compile(
-    r"(?i)(fatal|error|exception|authentication|unauthorized|forbidden|quota|rate.?limit|timed?.?out)"
-)
-_SECRET_RE = re.compile(
-    r"(?i)\b(api[_-]?key|token|authorization|password)\b\s*[:=]\s*\S+"
-)
-
-
-def _sanitize_diagnostic(text: str, *, config: AgentLoopConfig | None = None) -> str:
-    clean = strip_ansi(text)
-    clean = _SECRET_RE.sub(r"\1=<redacted>", clean)
-    paths: list[Path] = [Path.home()]
-    repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
-    if config is not None:
-        paths.extend(
-            (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir)
-        )
-    for path in paths:
-        rendered = str(path)
-        if rendered and rendered != "/":
-            clean = clean.replace(rendered, "<path>")
-    clean = clean.replace(str(repair_root), "<repair-path>")
-    lines = [line.strip() for line in clean.splitlines() if line.strip()]
-    matching = [line for line in lines if _KNOWN_ERROR_RE.search(line)]
-    selected = matching[-1:] if matching else lines[-20:]
-    encoded = "\n".join(selected).encode("utf-8")[-4096:]
-    return encoded.decode("utf-8", errors="ignore")
+from .response_reask import _sanitize_diagnostic  # noqa: E402,F401 - moved (#2066)
 
 
 def _risk_test_matrix_repair_guidance() -> str:

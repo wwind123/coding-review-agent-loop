@@ -334,16 +334,14 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first \
   --plan-execution-mode implement-one-shot \
   --agent-permissions sandboxed \
   --coder claude --reviewer codex --reviewer claude \
-  --repair-backend claude --repair-model MODEL \
   --semantic-followup-backend claude \
   --test-command "python -m pytest tests/ -q"
 ```
 
 Instead of `--semantic-followup-backend claude` you may pass
-`--no-semantic-followup-dedupe`. Both helper backends must be overridden
-because their defaults are rejected in this mode: the default repair backend
-(`antigravity`) and the default semantic-followup backend (`antigravity`) have
-no role grant. Codex or Claude repair needs an explicit `--repair-model`.
+`--no-semantic-followup-dedupe`. The semantic-followup helper must be
+overridden because its default backend (`antigravity`) has no role grant in this
+mode. No repair backend runs any more, so `--repair-backend` needs no override.
 
 What each role gets:
 
@@ -1538,21 +1536,18 @@ structured turns read the single JSON answer from agy's JSON envelope. Disable i
 `--antigravity-structured-output off`; see
 [Structured output](docs/local_agent_loop.md#structured-output).
 
-Malformed structured responses get a format-repair pass. By default it uses
-Antigravity with the repair chain `Gemini 3.8 Flash (Medium)`, then
-`Claude Opus 5.5 (Medium)`, followed by the Antigravity chain above. Use
-`--repair-backend` and repeatable `--repair-model` to change it. The default
-requires the `agy` CLI even when no role uses Antigravity; on a host without it,
-pass `--repair-backend codex --repair-model MODEL` (or `claude`). Models that
-`agy models` does not list are skipped. When `agy` reports a transient
-`model-access validation errors` failure on its own output (stdout with no
-response artifact and no structured JSON response), that repair model is
-retried once, and then the next model in the chain is tried. If the chain ends
-on that transient failure, the run stops with a resumable
-`repair-provider-failure` and a suggestion to re-run the same command. It is
-not reported as a deterministic plan-validation failure. A valid repaired
-response is always accepted, and model-authored text that only quotes the
-phrase is still treated as invalid output.
+A structured response that fails validation is re-asked to the same agent
+(the same model, and its own session when there is one) with the validator's
+message and an instruction to resend the complete response only, at most twice
+per turn. No other model reformats it. A re-asked coder is told not to touch
+the checkout, and the checkout head is compared before and after the re-ask.
+Purely mechanical fixes (envelope trimming, lone-string matrix list fields,
+lossless aliases) run in code without a model call. If both re-asks fail, the
+turn fails as before. The former `--repair-backend`, `--repair-model`,
+`--repair-reasoning-effort`, `--repair-timeout-seconds` and
+`--containment-repair-*` flags are deprecated no-ops for one release: they
+still parse, print a deprecation notice and no longer require the `agy` CLI.
+See [the CLI guide](docs/local_agent_loop.md#agent-backends).
 
 Backend-specific authentication, model selection, fallback, timeout, and
 executable-replacement behavior are documented under

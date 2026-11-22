@@ -57,6 +57,8 @@ from .scratch import make_private_dirs, scratch_root
 
 CONTAINMENT_MODES = frozenset({"auto", "required", "off"})
 CONTAINED_ROLES = ("coder", "reviewer", "repair", "test-gate")
+# Roles whose overrides are parsed for compatibility but never applied (#2066).
+DEPRECATED_NOOP_ROLES = frozenset({"repair"})
 DEFAULT_SLICE = "agent-loop.slice"
 DEFAULT_OS_HEADROOM_PERCENT = 25.0
 DEFAULT_OPTIONAL_COUNTERS = (
@@ -541,6 +543,12 @@ def policy_from_values(values: Mapping[str, object], *, prefix: str = "containme
 
     role_values: dict[str, dict[str, object | None]] = {}
     for role in CONTAINED_ROLES:
+        if role in DEPRECATED_NOOP_ROLES:
+            # --containment-repair-* are deprecated no-ops (#2066): no repair
+            # process runs, so an invalid or inconsistent repair-only value is
+            # discarded here and can never reject configuration or a runner.
+            role_values[role] = {}
+            continue
         role_values[role] = {
             "memory_high": value(f"{prefix}_{role}_memory_high"),
             "memory_max": value(f"{prefix}_{role}_memory_max"),

@@ -57,18 +57,48 @@ def _restore_process_environment():
         yield
 
 
-@pytest.fixture(autouse=True)
-def _no_real_repair():
-    """Prevent attempt_repair from calling the real Gemini CLI in all tests.
+def _retired_structured_repair(*_args, **_kwargs):
+    raise AssertionError(
+        "the structured repair pass was retired by #2066; no production path calls it"
+    )
 
-    The stub sits on ``validated_agent``, the only module that binds
-    ``attempt_repair`` (#1186).  Tests that explicitly test repair behaviour
-    patch that binding themselves, which takes precedence over this fixture.
-    Unit tests for attempt_repair itself patch subprocess.run directly, so
-    they are unaffected here.
-    """
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
-        yield
+
+# Seams the validated turn no longer binds (#2066).  Production code never
+# reads them; they exist only so legacy ``patch(...)`` calls in tests that
+# merely forbid or stub repair stay inert.  Stage 2 of #2066 deletes these
+# shims with the repair modules.  tests/test_response_reask.py asserts the
+# production modules do not define them.
+RETIRED_REPAIR_SEAMS = {
+    "validated_agent": {
+        "attempt_repair": lambda *_args, **_kwargs: None,
+        "_ORIGINAL_ATTEMPT_REPAIR": lambda *_args, **_kwargs: None,
+        "_run_structured_repair": _retired_structured_repair,
+        "_log_repair_attempts": lambda *_args, **_kwargs: None,
+    },
+    "pr_loop": {
+        "_run_structured_repair": _retired_structured_repair,
+        "_log_repair_attempts": lambda *_args, **_kwargs: None,
+    },
+    "plan_first_loop": {
+        "_run_structured_repair": _retired_structured_repair,
+        "_log_repair_attempts": lambda *_args, **_kwargs: None,
+    },
+}
+
+
+def install_retired_repair_seams(monkeypatch) -> None:
+    import importlib
+
+    for module_name, names in RETIRED_REPAIR_SEAMS.items():
+        module = importlib.import_module(f"coding_review_agent_loop.{module_name}")
+        for name, value in names.items():
+            monkeypatch.setattr(module, name, value, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _retired_repair_seams(monkeypatch):
+    install_retired_repair_seams(monkeypatch)
+    yield
 
 
 @pytest.fixture

@@ -2,7 +2,7 @@
 
 How the test suite exercises the orchestrator, when the architecture set must change, how architecture context is injected, and how semantic-claim validation degrades the narrowest offending element: architecture-impact parser modes and canonicalization, the reviewer status re-ask, `test_observations` citation degradation, and the `protocol.py` shape-check audit.
 
-Source paths: `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/prompt_support.py`, `src/coding_review_agent_loop/review_diff.py`, `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/protocol_risk.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
+Source paths: `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/prompt_support.py`, `src/coding_review_agent_loop/review_diff.py`, `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/protocol_common.py`, `src/coding_review_agent_loop/protocol_discuss.py`, `src/coding_review_agent_loop/protocol_risk.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/response_reask.py`, `src/coding_review_agent_loop/response_normalization.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
 
 ## Reader admission integration
 
@@ -110,43 +110,86 @@ reattached, so later strict re-parses of posted text still succeed.
 
 A required assessment that is omitted, removed, or `undetermined` does not
 satisfy the contract. The validators return it without raising, and
-`_run_validated_agent` refuses it. The refusal is deterministic and makes no
-repair call. It takes an ordinary retry whose prompt names `architecture_impact`
-and its accepted values, within the existing `--agent-max-retries` budget and
-attempt bound. This applies to a primary response, a response-file artifact
-from a timeout or nonzero exit, a completion-recovery response, and a repair
-candidate. The refused response is kept on the final error.
+`_run_validated_agent` refuses it as a deterministic validation failure. This
+applies to a primary response, a response-file artifact from a timeout or
+nonzero exit, and a completion-recovery response. The refused response is
+kept on the final error.
 
-A reviewer's own `architecture_impact.status` that is the sole defect in its
-assessment (absent, null, blank, non-string, or outside `changed | unchanged`)
-is a different transition from that ordinary contract retry. The
-validator raises a typed `MissingJudgementFieldError` with the unchanged message,
-and `_run_validated_agent` re-asks the same reviewer once with the frozen prompt
-and original session plus a short section naming the field and its allowed
-values, so peer visibility matches the original turn and nothing is published or
-spooled between the two turns. The re-ask shares the single slot of the carried
-disposition re-ask, so one invocation never re-asks twice, and it consumes
-neither `--agent-max-retries` nor the Antigravity model fallback. A second
-failure, or a flag-off invocation, makes no repair call and ends as a
-deterministic reviewer failure that names the field and the allowed values.
-Repair is skipped because it cannot supply the reviewer's decision. Any repair
-still reached for a reviewer, such as when a structural defect masks the status,
-is refused by repair preservation if the candidate introduces, changes, or drops
-an `architecture_impact.status` that the source did not decide, whether or not
-the source carries a `kind`. Mixed defects, near-miss aliases, and planner
-responses keep their existing routing.
+### The same-agent re-ask rule (#2066)
+
+No second model reformats a rejected response. A deterministic validation
+failure of any structured response goes back to the agent that produced it:
+the same agent, the model that produced the response (an Antigravity chain is
+not advanced), and the response's own session when there is one (otherwise
+the full original prompt). The re-ask prompt is the original prompt plus a
+bounded, marker-free copy of the validator message
+(`response_reask.build_reask_prompt`) and an instruction to resend the
+complete response only. A turn gets at most two re-asks
+(`MAX_SAME_AGENT_REASKS`). They replace the former repair pass, content
+preservation and the separate omission, judgement, evidence,
+architecture-contract and risk-matrix replay slots. The re-asks consume neither
+`--agent-max-retries` nor the Antigravity model fallback, and transient,
+provider, quota, timeout and unsupported-model failures keep their own retry
+paths without spending a re-ask. A plain-prose response that names an auth or
+billing stop is a provider failure, not a re-ask cause.
+
+Typed defects keep a targeted hint section ahead of the generic re-ask
+appendix: the missing carried item IDs (`MissingPriorItemDispositionError`),
+the judgement field and its allowed values (`MissingJudgementFieldError`),
+the architecture contract field or the out-of-set canonical document path,
+and the evidence rejection reason.
+
+A coder re-ask (role `coder`, or a `coder_followup`/`issue_implementation`
+turn) also carries an instruction not to modify, commit or push the checkout.
+The assigned checkout head is read before and after each coder re-ask. An
+unreadable baseline means no re-ask; a moved or unreadable head after the
+re-ask fails the turn with a deterministic error naming both heads, never
+accepts the re-asked response, and makes no further re-ask. pr_loop's
+post-turn head comparison and the post-push coder record (#2086) then handle
+the moved head.
+
+The evidence scope is decided by the instruction. One active acquisition is
+kept, initially the primary dispatch. A `NonRepairableEvidenceRejection`
+whose reason is `non-passing-selector`, `launch-integrity` or
+`report-workdir` makes the old observations non-citable: that re-ask keeps
+the rerun-tests prompt, still forbids commits and pushes, and its dispatch
+becomes the active acquisition. Every other cause, including a refused
+`tests_run` entry, is a resend-only re-ask that inherits the active
+acquisition unchanged. Validation, strict re-parsing, accepted and
+rejected-candidate metadata and pr_loop's evidence derivation all read the
+active acquisition, so receipts produced during a resend-only dispatch are
+never admitted and catalogs are never merged.
+
+When both re-asks fail, the turn fails as before: the same
+`AgentInvocationError`, the deterministic category, the plan-validation
+exhaustion capture for the last planner candidate and the bounded replan for
+semantic-patch payload rejections. The message is prefixed with
+`response rejected after 2 same-agent re-asks`. A reviewer response that
+still carries no review substance (narration, an envelope-only payload) is a
+reviewer availability failure (`agent-unavailable`) that keeps the ordinary
+retry and Antigravity format-fallback policy, never a verdict.
+
+Purely mechanical normalization stays in code and runs for every turn with
+no model call (`response_normalization.py`): envelope trimming, the
+lone-string risk-matrix list fields, the semantic-patch `rationale` alias, and
+the unknown prior-item disposition strip when the IDs are proven resolved
+history (an incomplete ledger without that proof is re-asked, never
+stripped). Image turns use the same envelope normalization. Architecture
+near-miss canonicalization (`canonicalize_architecture_near_miss_text`) also
+lives there and runs at the shared acceptance boundary. The
+`--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
+`--repair-timeout-seconds` and `--containment-repair-*` flags are deprecated
+no-ops: they still parse, print one deprecation notice, are never validated
+and no longer require the agy CLI; containment drops the repair-only overrides
+before policy parsing. `repair.py`, `repair_preservation.py` and
+`shape_check_audit.py` are unreachable at runtime and are deleted in stage 2.
 
 Semantic patch values stay strict. Canonical plan assembly and topology
-checkpoint publication refuse a degraded status. Repair normalizes a near miss
-before the repair prompt is built. It pins the absence of any removed
-assessment, and of an omitted required one, and it refuses an unsatisfied
-candidate before counting it as a success. Acknowledgement-only review repairs
-validate new output strictly and keep the accepted assessment. Every
-degradation produces a bounded, parser-derived record. Records travel on the
-parsed result and in an optional round-metadata field, from which resumed
-review carriers are rebuilt, and they appear in the round summary. A
-decomposition surfaces its records in a plain parent-issue comment, whether it
-was accepted or refused.
+checkpoint publication refuse a degraded status. Every degradation produces a
+bounded, parser-derived record. Records travel on the parsed result and in an
+optional round-metadata field, from which resumed review carriers are
+rebuilt, and they appear in the round summary. A decomposition surfaces its
+records in a plain parent-issue comment, whether it was accepted or refused.
 
 Model-authored `test_observations` citations in coder follow-ups and issue
 implementations also degrade per element. A malformed citation is dropped with
@@ -158,40 +201,20 @@ the follow-up comment and the round summary, and are restored onto the coder
 carrier on resume. Canonical `risk_test_matrix_evidence` citations stay
 strict: a verified row must never stand on fewer citations than it declared.
 
-The `test_observations` field as a whole is decoded first and repaired before
-it degrades (#1626). In every parse mode, a string that decodes to a JSON
-array is used as that array, with one `citations-decoded-from-string` record
-that renders on its own line ahead of the drop list. The parser takes a
-`test_observations_mode`. The default, `degrade`, keeps today's single field
+The `test_observations` field as a whole is decoded first and re-asked before
+it degrades (#1626, #2066). In every parse mode, a string that decodes to a
+JSON array is used as that array, with one `citations-decoded-from-string`
+record that renders on its own line ahead of the drop list. The parser takes
+a `test_observations_mode`. The default, `degrade`, keeps today's single field
 drop and is used by every historical, resume and legacy re-parse. Fresh coder
 follow-up and issue-implementation turns build their validators with
 `_architecture_and_test_observation_mode_validators`. Their primary pair is
 `repair-first`: a value that is still not an array, or more than eight
-malformed items, raises the repairable `TestObservationsShapeError`. The
-validated turn then runs the structured repair with a targeted instruction
-and the acquisition's tool-owned run-tests receipts. Both receipt
-prohibitions are narrowed to canonical matrix-evidence envelopes. A scoped
-preservation rule classifies the source as the parser does. A native or
-decoded array pins its valid citations and lets malformed ones be corrected
-or removed. Prose must be moved into `summary` or an item note, never
-deleted. If repair yields no accepted candidate, a non-array value falls back
-to the `degrade-after-repair` pair. That pair accepts the original through
-the same acceptance boundary, with a drop record whose rule says repair was
-attempted, and never spends an agent retry. The over-bound case stays fatal.
-The validated turn classifies the shape defect from the source payload
-(`source_has_test_observations_shape_defect`), not from the first validation
-error, so a response whose other repairable defect is reported first still
-gets the targeted repair. When the original still carries that other defect,
-the fallback also tries a rejected repair candidate, but only when the
-source's own `test_observations` is the degradable non-array value and the
-candidate keeps that exact value (`candidate_retains_source_test_observations`).
-A native or encoded array source, including the over-bound case, is never
-degraded this way, and a candidate that changed the field (to an array, or to
-other or empty prose) was judged by the scoped preservation rule and is never
-rescued. The
-candidate must also pass the unflagged preservation rules against the source,
-it inherits the source's architecture near-miss record, and it is accepted
-only with the after-repair drop record.
+malformed items, raises `TestObservationsShapeError`, which is re-asked. If
+the re-asks yield no accepted candidate, a non-array value falls back to the
+`degrade-after-repair` pair (the historical rule name stays parseable). That
+pair accepts the latest response through the same acceptance boundary, with a
+drop record, and never spends an agent retry. The over-bound case stays fatal.
 
 Every function, method and nested def in `protocol.py`, `protocol_common.py`, `protocol_discuss.py` and `protocol_risk.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as

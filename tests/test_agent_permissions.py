@@ -1150,7 +1150,6 @@ def test_run_agent_result_refuses_unsupported_agent(tmp_path, sandbox):
         ({"implementation_coder": "antigravity"}, "--implementation-coder"),
         ({"reviewer": ("claude", "gemini")}, "--reviewer"),
         ({"discuss_analyzer": "gemini"}, "--discuss-analyzer"),
-        ({"repair_backend": "antigravity", "repair_models": ("m",)}, "--repair-backend claude|codex --repair-model MODEL"),
         ({"semantic_followup_backend": "gemini"}, "--no-semantic-followup-dedupe"),
     ],
 )
@@ -1187,9 +1186,15 @@ def test_antigravity_reviewer_refusal_explains_the_gap_and_the_trade(tmp_path):
 
 def test_non_reviewer_refusal_omits_the_board_trade(tmp_path):
     with pytest.raises(AgentLoopError) as info:
-        sandboxed_config(tmp_path, repair_backend="antigravity")
+        sandboxed_config(tmp_path, discuss_analyzer="antigravity")
     assert "`agy --sandbox` restricts only its terminal" in str(info.value)
     assert "review board" not in str(info.value)
+
+
+def test_retired_repair_backend_is_not_a_sandboxed_selection(tmp_path):
+    # --repair-backend is a deprecated no-op (#2066): no repair agent runs.
+    config = sandboxed_config(tmp_path, repair_backend="antigravity")
+    assert config.agent_permissions == "sandboxed"
 
 
 @pytest.mark.parametrize("provider", ["antigravity", "gemini"])
@@ -1282,10 +1287,9 @@ def test_configured_agent_selections_covers_every_agent_typed_field():
     }
     # auto_agent_dirs and default_checkout_stores record defaulted directories; they select no agent.
     agent_fields -= {"auto_agent_dirs", "default_checkout_stores"}
-    agent_fields |= {"repair_backend"}  # a str-typed agent selection
     covered = {
         "coder", "implementation_coder", "reviewer", "primary_reviewer",
-        "primary_plan_reviewer", "discuss_analyzer", "repair_backend", "semantic_followup_backend",
+        "primary_plan_reviewer", "discuss_analyzer", "semantic_followup_backend",
     }
     assert agent_fields == covered
     source = Path(ap.__file__).read_text(encoding="utf-8")

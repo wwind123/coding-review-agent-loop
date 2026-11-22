@@ -1019,12 +1019,9 @@ def test_issue_loop_plan_revision_rejects_missing_human_requirements_acknowledge
                 "### Human requirements\n"
                 "- Requirement 1: the plan preserves backward compatibility."
             )),
+            # The same marker-less revision is resent on both same-agent
+            # re-asks (#2066).
             structured_plan_revision(summary="Revised plan."),
-            "Revised plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the revised plan still preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
         ],
         codex_outputs=[
             structured_plan_review(
@@ -1084,192 +1081,6 @@ def test_issue_loop_plan_revision_accepts_human_requirements_acknowledgement(tmp
     assert "Missing a regression test." in claude_calls[1][-1]
     assert len(runner.comments) == 5
     assert runner.comments[2].startswith("## Revised plan")
-
-
-def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp_path):
-    requirement = HumanReviewRequirement(
-        source_type="Issue body",
-        author="maintainer",
-        created_at="2026-05-17T08:00:00Z",
-        url="https://github.com/OWNER/REPO/issues/56",
-        body="Preserve backward compatibility.",
-    )
-    malformed_revision = (
-        "### Prior plan review item dispositions\n"
-        "- item-1: resolved by adding compatibility tests.\n\n"
-        "### Revised plan\n"
-        "- Preserve backward compatibility.\n"
-        "- Add regression tests.\n\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: the revised plan preserves backward compatibility.\n\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    repaired_revision = _add_default_requirement_disposition(structured_plan_revision(
-        summary="Revised plan with compatibility tests.",
-        prior_plan_item_dispositions=[
-            {
-                "item_id": "item-1",
-                "disposition": "resolved",
-                "note": "Added compatibility tests.",
-            }
-        ],
-        plan_steps=["Preserve backward compatibility.", "Add regression tests."],
-        human_requirements=(
-            f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the revised plan preserves backward compatibility.\n"
-        ),
-    ), requirement_id=requirement.requirement_id)
-    runner = FakeRunner(
-        issue_payload={
-            "author": {"login": "maintainer"},
-            "createdAt": "2026-05-17T08:00:00Z",
-            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
-        },
-        claude_outputs=[
-            _initial_plan_state(human_requirements=(
-                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-                "### Human requirements\n"
-                "- Requirement 1: the plan preserves backward compatibility."
-            )),
-            malformed_revision,
-        ],
-        codex_outputs=[
-            structured_plan_review(
-                state="blocking",
-                summary="Missing a regression test.",
-                blocking_plan_issues=["Missing a regression test."],
-            ),
-            structured_plan_review(
-                summary="Plan looks sound.",
-                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-                human_requirements_resolved=True,
-            ),
-        ],
-    )
-    config = make_config(tmp_path, agent_max_retries=0)
-    captured_repairs = []
-
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append((raw, expected_kind))
-        return repaired_revision
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-
-    assert len(captured_repairs) == 1
-    assert captured_repairs[0][1] == "plan_revision"
-    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in captured_repairs[0][0]
-    public_revision = _strip_round_metadata(runner.comments[2])
-    assert '"kind": "plan_revision"' not in public_revision
-    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in public_revision
-    assert "### Human requirements" in public_revision
-
-
-def test_issue_loop_plan_revision_repair_rejects_wrong_kind_from_human_requirements_text(tmp_path):
-    malformed_revision = (
-        "### Revised plan\n"
-        "- Preserve backward compatibility.\n\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: the revised plan preserves backward compatibility.\n\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    wrong_kind_repair = (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "coder_followup",
-                "state": "blocking",
-                "summary": "Revised the plan.",
-                "addressed_items": [],
-                "remaining_items": [],
-                "human_requirement_dispositions": [],
-                "human_requirements": {
-                    "addressed_ids": ["Requirement 1"],
-                    "checked_discussion_directly": False,
-                },
-            }
-        )
-        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    runner = FakeRunner(
-        issue_payload={
-            "author": {"login": "maintainer"},
-            "createdAt": "2026-05-17T08:00:00Z",
-            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
-        },
-        claude_outputs=[
-            _initial_plan_state(human_requirements=(
-                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-                "### Human requirements\n"
-                "- Requirement 1: the plan preserves backward compatibility."
-            )),
-            malformed_revision,
-        ],
-        codex_outputs=[
-            structured_plan_review(
-                state="blocking",
-                summary="Missing a regression test.",
-                blocking_plan_issues=["Missing a regression test."],
-            )
-        ],
-    )
-    config = make_config(tmp_path, agent_max_retries=0)
-    captured_kinds = []
-
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_kinds.append(expected_kind)
-        return wrong_kind_repair
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        with pytest.raises(AgentLoopError, match="expected `plan_revision`"):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert captured_kinds == ["plan_revision"]
-
-
-def test_issue_loop_plan_revision_repair_without_human_ack_fails_clearly(tmp_path):
-    malformed_revision = (
-        "### Revised plan\n"
-        "- Preserve backward compatibility.\n\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: the revised plan preserves backward compatibility.\n\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    repaired_without_ack = structured_plan_revision(
-        summary="Revised plan with compatibility tests.",
-        plan_steps=["Preserve backward compatibility.", "Add regression tests."],
-    )
-    runner = FakeRunner(
-        issue_payload={
-            "author": {"login": "maintainer"},
-            "createdAt": "2026-05-17T08:00:00Z",
-            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
-        },
-        claude_outputs=[
-            _initial_plan_state(human_requirements=(
-                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-                "### Human requirements\n"
-                "- Requirement 1: the plan preserves backward compatibility."
-            )),
-            malformed_revision,
-        ],
-        codex_outputs=[
-            structured_plan_review(
-                state="blocking",
-                summary="Missing a regression test.",
-                blocking_plan_issues=["Missing a regression test."],
-            )
-        ],
-    )
-    config = make_config(tmp_path, agent_max_retries=0)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_without_ack):
-        with pytest.raises(AgentLoopError, match="missing required signed human requirements marker"):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
 
 def test_issue_loop_plan_first_requires_reviewers_to_disposition_prior_items(tmp_path):
@@ -1629,9 +1440,9 @@ def test_acknowledgement_blockers_propagate_through_plan_revision(
         "before plan approval."
     )
     assert all("Orchestrator plan review:\n\n" + item.text in feedback for item in items)
-    # Repair still runs independently after the planner-disposition blocker.
-    assert len(repair_inputs) == (2 if missing_panel else 1)
-    assert all(ids == (requirement.requirement_id,) for _text, ids in repair_inputs)
+    # No acknowledgement repair runs any more (#2066): the missing marker is
+    # re-injected as the blocking item above and the reviewer is asked again.
+    assert repair_inputs == []
     records = _plan_round_records(runner)
     revised = next(r for r in records if r.role == "coder" and r.round_number == 2)
     assert [item.item_id for item in revised.prior_items] == item_ids
@@ -2728,117 +2539,6 @@ def test_issue_loop_plan_first_keeps_blocking_review_when_future_followups_are_m
     assert "Tighten the plan-review prompt wording." in claude_calls[1][-1]
     assert runner.comments[1].startswith("**Review verdict:** Blocking\n\nStill blocked.")
     assert "### Future follow-ups" not in runner.comments[1]
-
-
-@pytest.mark.parametrize(
-    "event", ["forged-link", "signed-amendment", "requirement-added", "requirement-withdrawn"],
-)
-def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
-    tmp_path, monkeypatch, event
-):
-    """#1377 items 16/17: the acknowledgement repair is an agent turn, so the
-    run re-reads the issue after it.  Board history changed during the repair
-    refuses before the repaired record is published, and a requirement change
-    during it refuses at the approval boundary; neither approves nor hands off."""
-    import datetime
-    from coding_review_agent_loop.github import TrustedHumanActor
-
-    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
-    from coding_review_agent_loop.board_change import (
-        PLAN_BOARD_CHANGE_LINK_HEADING,
-        PLAN_BOARD_CHANGE_LINK_MARKER,
-    )
-
-    requirement, plan_output, unacknowledged, repaired, panel = (
-        _repaired_acknowledgement_fixtures()
-    )
-    runner = _FakeRunner(
-        claude_outputs=[plan_output], codex_outputs=[unacknowledged], gemini_outputs=[panel],
-        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
-    )
-    requirements = [requirement]
-    real_get_issue_context = discuss_loop.get_issue_context
-
-    def _patched(runner_arg, *, config, issue_number):
-        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
-        return replace(context, human_requirements=tuple(requirements))
-
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
-
-    def operator_comment(body):
-        runner.issue_comments.append({
-            "body": body, "author": {"login": "operator"}, "_rest_author_id": 81,
-            "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-        })
-
-    def fake_repair(raw, cmd, **kwargs):
-        if event == "forged-link":
-            operator_comment(
-                f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->"
-            )
-        elif event == "signed-amendment":
-            operator_comment(format_reviewer_board_amendment_comment(
-                flow="plan", issue=56, pr_number=None,
-                original_required_reviewers=("Codex", "Gemini"),
-                policy="all-reviewers", primary_reviewer=None,
-                removed_reviewers=("Gemini",), effective_from_round=1,
-                rationale="Gemini quota exhausted.",
-            ))
-        elif event == "requirement-added":
-            requirements.append(HumanReviewRequirement(
-                source_type="Issue comment", author="maintainer",
-                created_at="2026-05-17T09:00:00Z",
-                url="https://github.com/OWNER/REPO/issues/56#issuecomment-9",
-                body="Also keep the audit trail.",
-            ))
-        else:
-            requirements.clear()
-        return repaired
-
-    refusal = {
-        "forged-link": "history is inconsistent after an acknowledgement repair",
-        "signed-amendment": "recorded while this run was active .*after an acknowledgement repair",
-        "requirement-added": "requirement\\(s\\) changed after plan approval: added",
-        "requirement-withdrawn": "requirement\\(s\\) changed after plan approval: withdrawn",
-    }[event]
-    config = make_config(
-        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
-        agent_max_retries=0, agent_retry_backoff_seconds=0,
-        human_reviewer_trusted_actors=(TrustedHumanActor("operator", 81),),
-    )
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        with pytest.raises(AgentLoopError, match=refusal):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    codex_records = [
-        record for record in _plan_round_records(runner)
-        if record.role == "reviewer" and record.agent == "Codex"
-    ]
-    if event in {"forged-link", "signed-amendment"}:
-        # The repaired result is never published under the old board history.
-        assert len(codex_records) == 1
-        assert codex_records[0].surfaced_reviewer_requirement_ids == ()
-    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
-    # Only the initial planner turn ran: no revision and no implementation coder.
-    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == 1
-    if event == "signed-amendment":
-        # A clean rerun resolves and activates the amendment: the board becomes
-        # Codex alone and Gemini is never invoked again.  (The resumed Codex
-        # record is rendered prose, which the existing substance gate never
-        # repairs, so this one-round rerun then stops at its round budget.)
-        event = "none"
-        start_commands, start_comments = len(runner.commands), len(runner.issue_comments)
-        with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-            with pytest.raises(AgentLoopError):
-                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-        assert not any(
-            cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands[start_commands:]
-        )
-        (audit,) = [c["body"] for c in runner.issue_comments[start_comments:]]
-        assert audit.startswith("Reviewer board amendment applied.")
-        assert "Required board now: Codex" in audit
-        assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 
 # --- Future follow-ups on blocking plan reviews (#1389) ----------------------

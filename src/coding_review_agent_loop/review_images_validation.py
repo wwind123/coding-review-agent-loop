@@ -4,14 +4,14 @@ from __future__ import annotations
 from .agent_failure import ValidatedAgentResponse, _response_identity_fields
 from .architecture_contract import _accept_candidate, _with_validation_context
 from .errors import AgentLoopError
-from .repair import attempt_envelope_normalization
+from .response_normalization import attempt_envelope_normalization
 
 
 def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, prompt,
                         validate, role=None, session_id=None, timeout_seconds=None,
                         label=None, use_repair=False, repair_expected_kind=None,
                         strict_revalidate=None, usage_context=None, **_unused):
-    """Repair the text envelope only; never reassess or resume the image turn.
+    """Normalize the text envelope only; never reassess or resume the image turn.
 
     Missing proof is terminal before any candidate, file recovery, normalization
     or diagnostic enters the ordinary text recovery state machine.
@@ -39,9 +39,8 @@ def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, promp
         try:
             parsed = response_validator(text)
         except (AgentLoopError, ValueError):
-            if not use_repair:
-                raise
-            # This deliberately has no backend, prompt, path or image access.
+            # Deterministic envelope normalization always runs (#2066); it
+            # deliberately has no backend, prompt, path or image access.
             # The immutable original proof remains out of band.
             normalized = attempt_envelope_normalization(text, expected_kind=repair_expected_kind)
             if normalized is None:

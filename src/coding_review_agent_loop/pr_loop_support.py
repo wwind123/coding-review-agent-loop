@@ -5873,7 +5873,7 @@ def unchanged_head_stop_message(
     citation_sentence = ""
     if citation_diagnosis is not None and citation_diagnosis.non_array_drop:
         citation_sentence = (
-            " The coder's test_observations were not a JSON array (format repair "
+            " The coder's test_observations were not a JSON array (same-agent re-asks "
             f"attempted: {'yes' if citation_diagnosis.repair_attempted else 'no'}); "
             f"{citation_diagnosis.uncited_receipts} run-tests receipt(s) from that turn "
             "went uncited, so the blocker may be a tool format problem rather than a "

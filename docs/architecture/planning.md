@@ -254,36 +254,32 @@ non-passing or whose launch integrity is failing or unknown (real broker
 handles, so selecting one is an authority decision), and legacy canonical
 fields. The
 catalog-authority rejections (collisions and non-passing or non-authoritative
-selectors) never route to structured repair, since reformatting cannot change
-them: the rejection names the failing launch condition(s) or outcome/provenance and carries the redacted, bounded command and observation timestamp, and the run stops once, naming the rejection as a
-`semantic-evidence-rejection` rather than a repair timeout. Collisions, and every
-caller that has not opted in, stop once as described. The approved-plan
-implementation hand-off opts into exactly one coder re-ask for non-passing or
-non-authoritative selector rejections: it quotes the sanitized, bounded
-rejection, resumes the rejected acquisition's session when the provider supports
-it, and requires a rerun and a citation from the re-ask turn's invocation-local
-catalog, outside `agent_max_retries`, model fallback, and repair. A second
-rejection stops with the same classification. A rejection exposed only by a
-structured repair candidate, after normalization could not fix the envelope,
-stops the repair chain on that candidate with no fallback model and takes the
-same route (one opted-in re-ask, otherwise a `semantic-evidence-rejection`
-stop), whatever the repair transport outcome (#999).
+selectors) name the failing launch condition(s) or outcome/provenance and carry
+the redacted, bounded command and observation timestamp. They go through the
+shared same-agent re-ask rule (#2066; see
+[testing and document maintenance](testing-and-doc-maintenance.md#the-same-agent-re-ask-rule-2066)):
+a non-passing or non-authoritative selector, or an outside-checkout receipt
+command, earns a fresh-evidence re-ask that quotes the sanitized rejection,
+resumes the rejected acquisition's session when the provider supports it, and
+requires a rerun and a citation from the re-ask turn's own catalog, which
+becomes the active acquisition. A collision is a resend-only re-ask that keeps
+the active catalog. Re-asks spend neither `agent_max_retries` nor model
+fallback, and no repair model runs. When the two re-asks are spent the run
+stops once, naming the rejection as a `semantic-evidence-rejection`.
 
 PR follow-ups and both initial and coverage-reask implementation acquisitions
-opt into the same single semantic-evidence re-ask (#1738, #1768).
+use the same rule (#1738, #1768).
 Structured report partition and strict citation workdir guards run inside the
-validated acquisition, including normalized and repaired candidates. Only their
+validated acquisition, including normalized candidates. Only their
 typed report refusals join the re-askable reasons; operational and authorization
 errors retain existing handling. The two guards keep separate reasons (#2052): a
 refused `tests_run` display-partition entry is `tests-run-workdir`, and its
 re-ask quotes the refusal and asks the coder to resubmit a corrected `tests_run`
 (in-checkout runs and out-of-checkout runs as separate literal entries, valid
 `test_observations` left alone). A refused receipt citation stays
-`report-workdir` and keeps the citation wording. Both reasons spend the same
-single shared allowance. A rejection that is not re-asked logs its first
-refusing term (`not-opted-in`, `budget-used`, `reason-not-reaskable`,
-`transient-public-text`, `marker-safety` or `unsupported-failure`); eligibility
-itself is unchanged. A scratch-input receipt remains inadmissible:
+`report-workdir` and keeps the citation wording; it is a fresh-evidence cause,
+while the `tests_run` correction is resend-only and keeps the active catalog.
+Both spend the shared two-re-ask budget. A scratch-input receipt remains inadmissible:
 feedback requests admissible replacement evidence without hiding failures.
 The report, citation and receipt-admission guards share output-destination
 interpretation: explicit long output options may point outside the checkout.
@@ -298,11 +294,10 @@ runner-frozen resolved command, which is independently checked, including behind
 execution prefixes, shell command strings, compound clauses and managed
 `run-tests` wrappers, using the same clause expansion as path validation. An output
 destination alone neither degrades evidence to context nor hides failures.
-Guard and selector refusals share one allowance in either order, outside ordinary
-retries. A repair-surfaced refusal stops repair and spends only an unused
-allowance. A semantic refusal exposed by the post-repair observation-field
-fallback takes that same route; dropping a malformed field cannot swallow a
-refusal or reset the allowance. Correction resumes the acquisition session when available and uses
+Guard and selector refusals share the two re-asks in either order, outside
+ordinary retries. A semantic refusal exposed by the post-re-ask
+observation-field fallback takes that same route; dropping a malformed field
+cannot swallow a refusal or reset the budget. Correction resumes the acquisition session when available and uses
 its own closed catalog. Only a fully validated replacement may publish progress
 or settle findings; terminal rejection and pushed-head recovery remain intact.
 Exhausted initial implementation correction is a pre-authentication acquisition
@@ -323,8 +318,8 @@ the probe does not recognize. It is kept and reaches post-authentication
 derivation, which still refuses it: the row stays unverified, no receipt
 citation is produced, and an `inadmissible-execution` diagnostic says the suite
 start was never verified and names the citable runners. The run does not stop,
-no re-ask budget is spent, and no repair runs, on the direct follow-up, the
-implementation hand-off or a structured-repair candidate. Such a row also
+no re-ask budget is spent on the direct follow-up or the implementation
+hand-off. Such a row also
 carries the `suite-start-unverified` capture disqualifier, so it is
 `not-capture-limited` and automatic evidence conversion never hands it to a
 human: the coder can capture the check by wrapping it in a pytest test. Every

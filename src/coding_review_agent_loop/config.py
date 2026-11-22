@@ -751,25 +751,8 @@ class AgentLoopConfig:
             raise AgentLoopError("--worktree-setup-timeout must be a positive integer.")
         if self.test_python is not None:
             object.__setattr__(self, "test_python", validate_test_python(self.test_python))
-        if self.repair_backend not in {"antigravity", "gemini", "codex", "claude"}:
-            raise AgentLoopError("--repair-backend must be antigravity, gemini, codex, or claude.")
-        if self.repair_backend in {"codex", "claude"}:
-            if self.repair_models == DEFAULT_REPAIR_MODELS:
-                raise AgentLoopError(
-                    "Codex/Claude repair requires an explicit --repair-model. "
-                    "Pass --repair-model MODEL (for example "
-                    "--repair-backend codex --repair-model MODEL); "
-                    "repeat it for a fallback chain."
-                )
-            _validate_effort_value(
-                self.repair_backend, self.repair_reasoning_effort, "--repair-reasoning-effort"
-            )
-        elif self.repair_reasoning_effort:
-            raise AgentLoopError("--repair-reasoning-effort requires --repair-backend codex or claude.")
-        if not self.repair_models or any(not model.strip() for model in self.repair_models):
-            raise AgentLoopError("--repair-model must contain at least one nonblank model.")
-        if self.repair_timeout_seconds <= 0:
-            raise AgentLoopError("--repair-timeout-seconds must be greater than zero.")
+        # The repair_* fields are deprecated no-ops (#2066): no repair backend
+        # runs, so they are never validated and can never fail a run.
         if self.implementation_coder_model and self.implementation_coder is None:
             object.__setattr__(self, "implementation_coder", self.coder)
         if self.implementation_codex_reasoning_effort and self.implementation_coder is None:
@@ -2212,15 +2195,40 @@ def _resolve_agent_memory_dir(
     return resolved
 
 
-def _repair_backend_only_hint(backend: str, override_flag: str) -> str:
-    return (
-        f" It is needed only because the malformed-response repair backend is {backend} "
-        "(--repair-backend; the default is antigravity, which requires the agy CLI even "
-        "when no role uses Antigravity). Alternatively, pass "
-        "--repair-backend codex --repair-model MODEL or "
-        "--repair-backend claude --repair-model MODEL "
-        f"to repair with a configured agent, or install the CLI / pass {override_flag} <path>."
+DEPRECATED_REPAIR_FLAG_DESTS = (
+    ("repair_backend", "--repair-backend"),
+    ("repair_model", "--repair-model"),
+    ("repair_reasoning_effort", "--repair-reasoning-effort"),
+    ("repair_timeout_seconds", "--repair-timeout-seconds"),
+    ("containment_repair_memory_high", "--containment-repair-memory-high"),
+    ("containment_repair_memory_max", "--containment-repair-memory-max"),
+    ("containment_repair_memory_swap_max", "--containment-repair-memory-swap-max"),
+    ("containment_repair_tasks_max", "--containment-repair-tasks-max"),
+)
+
+
+def deprecated_repair_flags(args: argparse.Namespace) -> tuple[str, ...]:
+    """The deprecated no-op repair flags an invocation passed (#2066)."""
+    return tuple(
+        flag
+        for dest, flag in DEPRECATED_REPAIR_FLAG_DESTS
+        if getattr(args, dest, None) not in (None, "", [], ())
     )
+
+
+def warn_deprecated_repair_flags(args: argparse.Namespace) -> str | None:
+    """Print one deprecation notice when any repair flag was passed; return it."""
+    flags = deprecated_repair_flags(args)
+    if not flags:
+        return None
+    notice = (
+        "agent-loop: deprecated no-op flag(s) ignored: "
+        + ", ".join(flags)
+        + ". A rejected structured response is now re-asked to the same agent (at most "
+        "twice) instead of a repair backend; these flags will be removed in a later release."
+    )
+    print(notice, file=sys.stderr)
+    return notice
 
 
 def preflight_agent_commands(
@@ -2249,13 +2257,11 @@ def preflight_agent_commands(
             *((discuss_analyzer,) if discuss_analyzer is not None else ()),
         )
     )
-    repair_backend = getattr(args, "repair_backend", "antigravity")
-    configured_agents = dict.fromkeys((*role_agents, repair_backend))
-    for agent in configured_agents:
+    # No repair backend is preflighted: --repair-backend is a no-op (#2066).
+    for agent in role_agents:
         command, override_flag = command_options[agent]
         resolved = shutil.which(command)
         if resolved is None:
-            repair_only = agent == repair_backend and agent not in role_agents
             if os.path.isabs(command):
                 message = (
                     f"{command} not found or not executable; "
@@ -2266,8 +2272,6 @@ def preflight_agent_commands(
                     f"{command} CLI not found on PATH; install it or pass "
                     f"{override_flag} <path>."
                 )
-            if repair_only:
-                message += _repair_backend_only_hint(agent, override_flag)
             raise AgentLoopError(message)
         runner.remember_agent_command(command, resolved, override_flag)
 
@@ -2383,7 +2387,6 @@ def validate_sandboxed_args(
                     or getattr(args, "primary_plan_reviewer", None)
                 ),
                 discuss_analyzer=getattr(args, "discuss_analyzer", None),
-                repair_backend=getattr(args, "repair_backend", "antigravity"),
                 semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
                 semantic_followup_backend=getattr(
                     args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
@@ -2458,6 +2461,7 @@ def config_from_args(
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
     validate_sandboxed_args(args, configured_reviewers, named_seats=named_seats)
+    warn_deprecated_repair_flags(args)
     if not getattr(args, "reconcile_post_merge_obligations", False):
         preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
 
@@ -2678,10 +2682,6 @@ def config_from_args(
         implementation_coder_model=getattr(args, "implementation_coder_model", ""),
         implementation_codex_reasoning_effort=getattr(args, "implementation_codex_reasoning_effort", ""),
         implementation_claude_effort=getattr(args, "implementation_claude_effort", ""),
-        repair_backend=getattr(args, "repair_backend", "antigravity"),
-        repair_models=tuple(getattr(args, "repair_model", None) or DEFAULT_REPAIR_MODELS),
-        repair_reasoning_effort=getattr(args, "repair_reasoning_effort", ""),
-        repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),
         discuss_analyzer=getattr(args, "discuss_analyzer", None),
         discuss_research=getattr(args, "discuss_research", "none") or "none",
         discuss_result_mode=getattr(args, "discuss_result_mode", "triage") or "triage",
@@ -2911,10 +2911,6 @@ def config_from_args(
         containment_reviewer_memory_max=getattr(args, "containment_reviewer_memory_max", None),
         containment_reviewer_memory_swap_max=getattr(args, "containment_reviewer_memory_swap_max", None),
         containment_reviewer_tasks_max=getattr(args, "containment_reviewer_tasks_max", None),
-        containment_repair_memory_high=getattr(args, "containment_repair_memory_high", None),
-        containment_repair_memory_max=getattr(args, "containment_repair_memory_max", None),
-        containment_repair_memory_swap_max=getattr(args, "containment_repair_memory_swap_max", None),
-        containment_repair_tasks_max=getattr(args, "containment_repair_tasks_max", None),
         containment_test_gate_memory_high=getattr(args, "containment_test_gate_memory_high", None),
         containment_test_gate_memory_max=getattr(args, "containment_test_gate_memory_max", None),
         containment_test_gate_memory_swap_max=getattr(args, "containment_test_gate_memory_swap_max", None),

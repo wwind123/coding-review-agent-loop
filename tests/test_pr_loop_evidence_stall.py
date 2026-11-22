@@ -404,18 +404,6 @@ def test_stall_rounds_flag_defaults_validates_and_parses(tmp_path):
         config_from_args(parser.parse_args([*base, "--pr-evidence-stall-rounds", "-1"]), FakeRunner())
 
 
-def test_untagged_matrix_tag_without_an_applicable_matrix_is_rejected_and_repaired_away(tmp_path):
-    """`tag-validation` through the live validator: a tag with no matrix cannot be accepted."""
-    runner = FakeRunner(
-        claude_outputs=[_coder(1)],
-        codex_outputs=[_review([_tagged()]), _review([_tagged()]), _review(resolved=["item-1"])],
-    )
-    config = _config(tmp_path)
-    with pytest.raises(AgentLoopError) as raised:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "evidence_row_ids" in str(raised.value) or "risk-test matrix" in str(raised.value)
-
-
 # --- workflow-level coverage for the remaining matrix transitions -----------
 
 import dataclasses  # noqa: E402

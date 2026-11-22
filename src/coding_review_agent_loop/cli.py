@@ -468,36 +468,31 @@ def build_parser() -> argparse.ArgumentParser:
                 "Overrides agy's five-minute print-mode default."
             ),
         )
+        # The cross-model repair pass was replaced by the same-agent re-ask
+        # rule (#2066); these flags stay parseable for one release.
         subparser.add_argument(
             "--repair-backend",
-            choices=("antigravity", "gemini", "codex", "claude"),
-            default="antigravity",
+            default=None,
             help=(
-                "Malformed-response repair backend (default: antigravity, which requires "
-                "the agy CLI even when no role uses Antigravity). Use "
-                "--repair-backend codex|claude --repair-model MODEL to repair with a "
-                "configured agent instead."
+                "Deprecated no-op. A rejected structured response is re-asked to the same "
+                "agent instead of a repair backend; this flag is ignored and will be removed."
             ),
         )
         subparser.add_argument(
             "--repair-model",
             action="append",
             default=None,
-            help=(
-                "Repair model to try. Repeat to configure an explicit fallback chain "
-                f"(default: {' -> '.join(DEFAULT_REPAIR_MODELS)}; required for Codex/Claude)."
-            ),
+            help="Deprecated no-op (see --repair-backend).",
         )
         subparser.add_argument(
             "--repair-reasoning-effort",
-            default="",
-            help="Codex/Claude repair effort (default: medium, independent of coder/reviewer effort).",
+            default=None,
+            help="Deprecated no-op (see --repair-backend).",
         )
         subparser.add_argument(
             "--repair-timeout-seconds",
-            type=int,
-            default=120,
-            help="Per-attempt malformed-response repair timeout (default: 120).",
+            default=None,
+            help="Deprecated no-op (see --repair-backend).",
         )
         agy_model_group = subparser.add_mutually_exclusive_group()
         agy_model_group.add_argument(
@@ -646,8 +641,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "exact resolved test invocation; every other role is read-only, writes only "
                 "its response file, and (Claude) inspects only through `agent-loop inspect`. "
                 "Sandboxed mode rejects every --<agent>-arg, Gemini/Antigravity on any "
-                "selection path (including the default repair and semantic-followup "
-                "backends), and a committing Codex coder. 'dangerous' equals "
+                "selection path (including the default semantic-followup backend), and a "
+                "committing Codex coder. 'dangerous' equals "
                 "--dangerous-agent-permissions."
             ),
         )
@@ -2138,7 +2133,11 @@ def add_containment_options(parser: argparse.ArgumentParser) -> None:
                 f"--containment-{role}-{option}",
                 dest=f"containment_{role}_{suffix}",
                 default=None,
-                help=f"Override {label} for the {role} role.",
+                help=(
+                    "Deprecated no-op: no repair process runs any more (#2066)."
+                    if role == "repair"
+                    else f"Override {label} for the {role} role."
+                ),
             )
     add_test_worker_options(parser)
 

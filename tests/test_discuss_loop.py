@@ -3149,27 +3149,6 @@ def test_discuss_loop_required_research_renders_sourced_facts(tmp_path):
     assert "Gemini CLI remains available for enterprise users." in final
 
 
-def test_discuss_loop_required_research_missing_research_repaired(tmp_path):
-    # The debater omits the research object; the repair pass restores it, so
-    # `required` mode is enforced by validation with repair as fallback.
-    from unittest.mock import patch
-
-    repaired = _discuss_review_text(outcome="implement", research=_SOURCED_RESEARCH)
-    runner = FakeRunner(
-        codex_outputs=[_discuss_review_text(outcome="implement")],
-        gemini_outputs=[repaired],
-    )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_research="required")
-
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
-    ):
-        result = run_discuss_loop(runner, issue_number=56, config=config)
-
-    assert result == 0
-    assert "### Sourced facts" in runner.comments[0]
-
-
 def test_discuss_loop_required_research_fails_when_repair_cannot_restore(tmp_path):
     # conftest neuters the repair pass, so the missing research object survives
     # repair and the debater invocation fails instead of being silently accepted.
@@ -3839,104 +3818,6 @@ def test_discuss_debater_checkout_inspected_claim_valid_reference_passes_through
 
     result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
-    assert result == 0
-    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
-
-
-def test_discuss_debater_checkout_inspected_claim_invalid_reference_triggers_repair(tmp_path):
-    # A debater cites a checkout-inspected path:line that does not exist in its
-    # own assigned checkout; the evidence check rejects the vote the same way
-    # any other malformed structured response is rejected, so the existing
-    # repair path re-checks the repaired text against the same validator (#541).
-    from unittest.mock import patch
-
-    config = make_config(tmp_path, reviewer=("codex", "gemini"))
-    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
-    invalid = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence("src/missing.py:1")
-    )
-    repaired = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
-    )
-    runner = FakeRunner(
-        codex_outputs=[invalid],
-        gemini_outputs=[_discuss_review_text(outcome="implement")],
-    )
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
-        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
-
-    assert result == 0
-    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
-
-
-def test_discuss_debater_checkout_inspected_claim_implausibly_large_line_triggers_repair(tmp_path):
-    # A debater cites a checkout-inspected line number far beyond Python
-    # 3.11+'s default int-conversion digit limit; this must be rejected as
-    # AgentLoopError (triggering the normal repair path) rather than crashing
-    # the debater turn with an uncaught ValueError (#541 review).
-    from unittest.mock import patch
-
-    config = make_config(tmp_path, reviewer=("codex", "gemini"))
-    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
-    huge_line = "9" * 4500
-    invalid = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence(f"src.py:{huge_line}")
-    )
-    repaired = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
-    )
-    runner = FakeRunner(
-        codex_outputs=[invalid],
-        gemini_outputs=[_discuss_review_text(outcome="implement")],
-    )
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
-        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
-
-    assert result == 0
-    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
-
-
-def test_discuss_debater_checkout_inspected_claim_unreadable_file_triggers_repair(tmp_path):
-    # The referenced file exists (passes is_file()) but cannot be opened; an
-    # OSError from open() must be translated into AgentLoopError (triggering
-    # the normal repair path) rather than crashing the debater turn (#541
-    # review).
-    from unittest.mock import patch
-
-    # The OSError is injected rather than produced with chmod(0o000), which
-    # root ignores (#1028).
-    from pathlib import Path
-
-    config = make_config(tmp_path, reviewer=("codex", "gemini"))
-    unreadable = config.codex_dir / "secret.py"
-    unreadable.write_text("line one\nline two\n", encoding="utf-8")
-    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
-    real_open = Path.open
-
-    def failing_open(self, *args, **kwargs):
-        if self == unreadable.resolve():
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_open(self, *args, **kwargs)
-
-    invalid = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence("secret.py:1")
-    )
-    repaired = _discuss_review_text(
-        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
-    )
-    runner = FakeRunner(
-        codex_outputs=[invalid],
-        gemini_outputs=[_discuss_review_text(outcome="implement")],
-    )
-
-    with patch.object(Path, "open", failing_open), patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
-    ) as repair:
-        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
-
-    assert repair.called
     assert result == 0
     assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
 

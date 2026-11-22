@@ -1,5 +1,7 @@
 """Pure-move and facade-use guards for the orchestrator split (#1181, #1189, #1186)."""
+import re
 import types
+from pathlib import Path
 
 import pytest
 
@@ -45,25 +47,25 @@ def test_registered_modules_bind_the_facades_objects():
 
 def test_coherence_guard_rejects_divergent_binding_hidden_by_a_test_patch(tmp_path, monkeypatch):
     (tmp_path / "split_probe_consumer.py").write_text(
-        "def attempt_repair(*args, **kwargs):\n    return None\n", encoding="utf-8"
+        "def attempt_envelope_normalization(*args, **kwargs):\n    return None\n", encoding="utf-8"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     import split_probe_consumer
 
     stub = lambda *args, **kwargs: None  # noqa: E731
-    monkeypatch.setattr(orchestrator, "attempt_repair", stub)
-    monkeypatch.setattr(split_probe_consumer, "attempt_repair", stub)
+    monkeypatch.setattr(orchestrator, "attempt_envelope_normalization", stub)
+    monkeypatch.setattr(split_probe_consumer, "attempt_envelope_normalization", stub)
     # Under a test patch of both bindings the divergence looks coherent in-process...
     assert guard.incoherent_bindings(orchestrator, [split_probe_consumer]) == []
     # ...but the pristine fresh-interpreter check still rejects it.
     assert guard.fresh_incoherent_bindings(["split_probe_consumer"], extra_path=tmp_path) == [
-        "split_probe_consumer.attempt_repair is not the facade's object"
+        "split_probe_consumer.attempt_envelope_normalization is not the facade's object"
     ]
 
 
 def test_fresh_coherence_check_accepts_identical_bindings(tmp_path):
     (tmp_path / "split_probe_coherent.py").write_text(
-        "from coding_review_agent_loop.orchestrator import attempt_repair\n", encoding="utf-8"
+        "from coding_review_agent_loop.orchestrator import attempt_envelope_normalization\n", encoding="utf-8"
     )
     assert guard.fresh_incoherent_bindings(["split_probe_coherent"], extra_path=tmp_path) == []
 
@@ -76,15 +78,18 @@ def test_package_modules_import_without_the_facade():
     assert guard.package_import_problems() == []
 
 
-def test_autouse_repair_stub_is_bound_on_validated_agent():
-    # tests/conftest.py stubs attempt_repair on validated_agent, the only
-    # module that binds it, so the repair path never reaches the real CLI.
-    import coding_review_agent_loop.repair as repair
-    import coding_review_agent_loop.validated_agent as validated_agent
+def test_retired_repair_seams_are_bound_only_by_the_test_shim():
+    # #2066: the validated turn and the lifecycle loops no longer bind the
+    # repair pass.  tests/conftest.py installs inert stand-ins under these
+    # names only so legacy patches stay inert; the production sources must
+    # never define or import them.
+    from conftest import RETIRED_REPAIR_SEAMS
 
-    assert validated_agent.attempt_repair is not repair.attempt_repair
-    assert validated_agent._ORIGINAL_ATTEMPT_REPAIR is repair.attempt_repair
-    assert validated_agent.attempt_repair(raw="x", gemini_cmd="gemini") is None
+    package = Path(guard.__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
+    for module_name, names in RETIRED_REPAIR_SEAMS.items():
+        source = (package / f"{module_name}.py").read_text(encoding="utf-8")
+        for name in names:
+            assert re.search(rf"\b{name}\b", source) is None, (module_name, name)
 
 
 def test_no_test_file_imports_or_patches_the_orchestrator_facade():
