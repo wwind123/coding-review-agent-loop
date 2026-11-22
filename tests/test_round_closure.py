@@ -410,3 +410,52 @@ def test_unrecorded_head_advance_after_closure_recovers_the_closure_ledger(new_i
     obligation = resumed.prior_items[-1]
     assert obligation.obligation_identity == evidence_obligation_identity(EVIDENCE, "Codex")
     assert resumed.next_unresolved_item_number == 6
+
+
+@pytest.mark.parametrize("closure", [
+    lambda: PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=HEAD,
+        phase=ROUND_CLOSED_INCOMPLETE_PHASE,
+        round_closure=build_round_closure_payload(
+            flow="pr", round_number=1, subject=HEAD,
+            published=[("Codex", 11), ("Gemini", 12)],
+            unreplayable=[("Antigravity", "spool outcome missing")],
+            item_number_high_water=0,
+        ),
+    ),
+    lambda: PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=HEAD,
+        phase=__import__("coding_review_agent_loop.signed_input_record", fromlist=["x"]).SIGNED_INPUT_SUPERSESSION_PHASE,
+        surfaced_reviewer_requirement_ids=("hr-" + "a" * 64, "hr-" + "b" * 64),
+        signed_input_supersession=__import__(
+            "coding_review_agent_loop.signed_input_record", fromlist=["x"]
+        ).decode_supersession_payload({
+            "round": 1, "head": HEAD,
+            "superseded": [{"agent": "Codex", "comment_id": 11, "route": "carrier"}],
+            "previous_requirement_ids": ["hr-" + "a" * 64],
+            "requirement_ids": ["hr-" + "a" * 64, "hr-" + "b" * 64],
+            "item_number_high_water": 0,
+        }, round_number=1, subject=HEAD),
+    ),
+], ids=["closed-incomplete", "legacy-supersession"])
+def test_empty_ledger_closure_without_coder_is_a_coherent_head_advance_handoff(closure):
+    """Item-5: round 1 with no coder record, approving reviews and a closure
+    carrying no ledger, then a push: resume proceeds as an ordinary fresh
+    review (no refusal) and never admits the closed reviews."""
+    metadata = closure()
+    assert is_round_closure_boundary(metadata)
+    review = lambda agent: PostedRoundMetadata(
+        flow="pr", role="reviewer", agent=agent, round_number=1, subject=HEAD,
+        state="approved", phase="publication",
+    )
+    comments = [SimpleNamespace(body=_attach_round_metadata(text, meta)) for text, meta in (
+        ("Codex approves.", review("Codex")),
+        ("Gemini approves.", review("Gemini")),
+        ("Round 1 closed.", metadata),
+    )]
+    assert _resume_pr_round(comments, head_sha=NEXT_HEAD, configured_reviewers=("codex", "gemini")) is None
+    # Control: without the closure the same reviews are the coherence proof.
+    assert _resume_pr_round(comments[:2], head_sha=NEXT_HEAD, configured_reviewers=("codex", "gemini")) is None
+    from coding_review_agent_loop.code_approval import _latest_pr_approved_reviews_for_head
+    assert _latest_pr_approved_reviews_for_head(
+        comments, head_sha=HEAD, configured_reviewers=("codex", "gemini")) == {}

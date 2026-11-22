@@ -242,7 +242,9 @@ settles the ledger with no dispositions (prior items stay open), appends the
 record's new items and restores its evidence obligations at their reserved
 numbers, so a restart from the record alone rebuilds the same ledger. An
 unrecorded head advance after a closure recovers the same ledger from the
-record rather than from the round's coder record. On the
+record rather than from the round's coder record; a validated closure is a
+coherent handoff even when its ledger is empty, so such a push resumes as an
+ordinary fresh review instead of refusing. On the
 plan flow `plan_round_closure.py` treats the record as settling its round:
 `project_plan_history` drops the round's plan reviews from every projected
 reader (resume, panel evidence, carried approvals, visibility) and

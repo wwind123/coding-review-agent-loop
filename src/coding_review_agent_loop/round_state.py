@@ -1577,7 +1577,10 @@ def _latest_prior_pr_subject_is_coherent(
         return False
     if any(
         (record.metadata.role == "coder" or is_complete_code_review(record.metadata)
-         or _is_acknowledgement_failure_boundary(record.metadata))
+         or _is_acknowledgement_failure_boundary(record.metadata)
+         # A validated closure boundary is a complete handoff even with an
+         # empty ledger: its reviews are inert, never the coherence proof (#2064).
+         or is_round_closure_boundary(record.metadata))
         and not scope_present(record.metadata)
         for record in selection.current_round_records
     ):
