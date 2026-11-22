@@ -253,6 +253,8 @@ from .round_closure import (
     closed_round_reviewer_indexes,
     closure_item_number_high_water,
     is_round_closure_boundary,
+    is_unvalidated_closure_summary,
+    restore_closure_evidence_obligations,
 )
 from .plan_round_closure import (
     _plan_round_is_reconciled,
@@ -428,12 +430,15 @@ def _pr_round_is_reconciled(records: Sequence[round_metadata.PostedRoundRecord])
 
     The scheduler-prelaunch summary the PR loop posts before review (also the
     secondary-audit panel opening) is a pre-reviewer checkpoint, exactly as it
-    is for plans (#905); legacy unlabeled summaries still count.
+    is for plans (#905); legacy unlabeled summaries still count.  A summary in
+    a closure phase settles the round only when it validates as a closure
+    boundary (#2064): a malformed one leaves the round open.
     """
     return any(
         record.metadata.role == "summary"
         and not scope_present(record.metadata)
         and record.metadata.phase not in PR_PRE_RECONCILIATION_PHASES
+        and not is_unvalidated_closure_summary(record.metadata)
         for record in records
     )
 
@@ -1433,7 +1438,32 @@ def _recover_unrecorded_pr_head_advance(
         if record.metadata.role in {"reviewer", "summary"}
     )
 
-    if latest_coder_record is not None and not reviewer_records_after_coder:
+    # A closure boundary after the round's coder record owns the ledger (#2064):
+    # its reviews are inert, so recover from the record's prior and new items
+    # and restore its reserved evidence obligations.
+    closure_record = next((
+        record for record in reversed(current_round_records)
+        if is_round_closure_boundary(record.metadata)
+        and (latest_coder_record is None or record.index > latest_coder_record.index)
+    ), None)
+    if closure_record is not None:
+        round_number = closure_record.metadata.round_number
+        recovered_items = _active_pr_items(closure_record.metadata.prior_items)
+        _append_active_pr_new_items(recovered_items, (closure_record,))
+        recovered_items, _ = restore_closure_evidence_obligations(
+            recovered_items, closure_record.metadata,
+            next_item_number=_max_unresolved_item_number_from_records(records) + 1,
+        )
+        recovered_items = list(recovered_items)
+        coder_output = (
+            latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body
+            if latest_coder_record is not None else None
+        )
+        compact_prior_summaries = (
+            latest_coder_record.metadata.compact_prior_summaries
+            if latest_coder_record is not None else ()
+        )
+    elif latest_coder_record is not None and not reviewer_records_after_coder:
         round_number = latest_coder_record.metadata.round_number
         recovered_items = _active_pr_items(latest_coder_record.metadata.prior_items)
         coder_output = latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body

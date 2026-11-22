@@ -136,14 +136,68 @@ def test_malformed_or_misbound_payload_decodes_as_none(mutate):
     assert decode_round_closure_payload(raw, flow="pr", round_number=2, subject=HEAD) is None
 
 
+def _legacy_malformed():
+    from coding_review_agent_loop.signed_input_record import SIGNED_INPUT_SUPERSESSION_PHASE
+    return PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject=HEAD,
+        prior_items=(PRIOR,), phase=SIGNED_INPUT_SUPERSESSION_PHASE,
+        signed_input_supersession={"round": 2},
+    )
+
+
+def _colliding():
+    # The reserved obligation number 5 names an unrelated ordinary finding.
+    other = UnresolvedReviewItem(
+        item_id="item-5", reviewer="Gemini", source_round=2, text="Unrelated finding.",
+        status="blocking", source_status="blocking",
+    )
+    return _closure(new_items=(NEW, other))
+
+
+@pytest.mark.parametrize("closure", [
+    lambda: _closure(payload={"round": 2}),
+    _legacy_malformed,
+    _colliding,
+], ids=["malformed-payload", "malformed-legacy-supersession", "obligation-number-collision"])
+def test_unvalidated_closure_summary_never_closes_or_settles_the_round(closure):
+    """Item-1/item-3 class: a closure-phase summary that does not validate is
+    neither a closure nor a reconciliation; the round stays open for settlement."""
+    from coding_review_agent_loop.round_closure import is_unvalidated_closure_summary
+    comments = _pr_comments(closure=closure())
+    (_, _, record) = _extract_round_metadata_records(comments, flow="pr")
+    assert not is_round_closure_boundary(record.metadata)
+    assert is_unvalidated_closure_summary(record.metadata)
+    records = _extract_round_metadata_records(comments, flow="pr")
+    assert closed_round_review_indexes(records) == frozenset()
+    resumed = _resume_pr_round(comments, head_sha=HEAD, configured_reviewers=("codex", "gemini"))
+    assert resumed.reconciliation_record is None
+    # Ordinary settlement stays available: the round is not read as reconciled.
+    assert resumed.reconciled is False
+    assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}
+
+
 def test_malformed_record_never_closes_the_round():
     comments = _pr_comments(closure=_closure(payload={"round": 2}))
     (_, _, record) = _extract_round_metadata_records(comments, flow="pr")
     assert record.metadata.round_closure is None
     assert not is_round_closure_boundary(record.metadata)
     resumed = _resume_pr_round(comments, head_sha=HEAD, configured_reviewers=("codex", "gemini"))
-    assert resumed.reconciliation_record is None
+    assert resumed.reconciliation_record is None and resumed.reconciled is False
     assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}
+
+
+def test_already_materialized_obligation_at_its_reserved_number_restores_idempotently():
+    """Item-3: the reserved number may name the same obligation, never another item."""
+    seed = _closure(new_items=())
+    materialized, _ = restore_closure_evidence_obligations([], seed, next_item_number=6)
+    (obligation,) = materialized
+    closure = _closure(new_items=(NEW, obligation))
+    assert is_round_closed_incomplete(closure)
+    items, next_number = restore_closure_evidence_obligations(
+        [PRIOR, NEW, obligation], closure, next_item_number=6)
+    assert [item.item_id for item in items] == ["item-3", "item-4", "item-5"]
+    assert next_number == 6
+    assert not is_round_closed_incomplete(_colliding())
 
 
 @pytest.mark.parametrize("change", [{"agent": "Codex"}, {"role": "reviewer"}])
@@ -328,3 +382,31 @@ def test_legacy_supersession_predicate_stays_pr_only():
         phase=SIGNED_INPUT_SUPERSESSION_PHASE, signed_input_supersession={"round": 2},
     )
     assert not is_round_closure_boundary(legacy_plan)
+
+
+# --- head advance after a closure boundary (item-2) ---------------------------
+
+
+NEXT_HEAD = "e" * 40
+
+
+@pytest.mark.parametrize("new_items", [(NEW,), ()], ids=["with-new-items", "obligation-only"])
+def test_unrecorded_head_advance_after_closure_recovers_the_closure_ledger(new_items):
+    """A coder record, published reviews and a closure at the old head, then a
+    push: recovery takes the closure's ledger, including its reserved
+    evidence obligation, never only the coder's prior items."""
+    coder = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject=HEAD,
+        prior_items=(PRIOR,), raw_structured_coder_response="Coder follow-up.",
+    )
+    comments = [SimpleNamespace(body=_attach_round_metadata("Coder follow-up.", coder)),
+                *_pr_comments(closure=_closure(new_items=new_items))]
+    resumed = _resume_pr_round(comments, head_sha=NEXT_HEAD, configured_reviewers=("codex", "gemini"))
+    assert resumed is not None and resumed.unrecorded_head_advance
+    assert resumed.round_number == 2
+    assert resumed.completed_reviews == ()
+    ids = [item.item_id for item in resumed.prior_items]
+    assert ids == ["item-3", *(["item-4"] if new_items else []), "item-5"]
+    obligation = resumed.prior_items[-1]
+    assert obligation.obligation_identity == evidence_obligation_identity(EVIDENCE, "Codex")
+    assert resumed.next_unresolved_item_number == 6

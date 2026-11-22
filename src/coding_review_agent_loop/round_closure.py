@@ -31,9 +31,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from .signed_input_record import is_supersession_boundary
+from .signed_input_record import SIGNED_INPUT_SUPERSESSION_PHASE, is_supersession_boundary
 
 ROUND_CLOSED_INCOMPLETE_PHASE = "round-closed-incomplete"
+# Summary phases that close a round only when their payload validates.
+CLOSURE_PHASES = frozenset({ROUND_CLOSED_INCOMPLETE_PHASE, SIGNED_INPUT_SUPERSESSION_PHASE})
 CLOSURE_FLOWS = frozenset({"pr", "plan"})
 _MAX_TEXT = 4000
 
@@ -165,8 +167,43 @@ def build_round_closure_payload(
     )
 
 
+def _obligations_fit_ledger(metadata: object, payload: Mapping[str, object]) -> bool:
+    """Reserved obligation numbers never name a different ledger item.
+
+    A reserved number may coincide with an item of the record's own
+    ``prior_items``/``new_items`` only when that item is the same evidence
+    obligation already materialized (same reviewer/text identity), so restore
+    stays idempotent and item IDs are never reused for another item.
+    """
+    from .unresolved_items import evidence_obligation_identity
+
+    items: dict[str, object] = {}
+    for item in (*getattr(metadata, "prior_items", ()), *getattr(metadata, "new_items", ())):
+        for item_id in (item.item_id, *item.alias_item_ids):
+            items.setdefault(item_id, item)
+    for entry in payload["evidence_obligations"]:  # type: ignore[union-attr]
+        existing = items.get(f"item-{entry['item_number']}")
+        if existing is None:
+            continue
+        identity = evidence_obligation_identity(str(entry["text"]), str(entry["reviewer"]))
+        if not (
+            getattr(existing, "is_machine_obligation", False)
+            and getattr(existing, "reviewer", None) == entry["reviewer"]
+            and identity in (
+                getattr(existing, "obligation_identity", None),
+                *getattr(existing, "alias_obligation_identities", ()),
+            )
+        ):
+            return False
+    return True
+
+
 def is_round_closed_incomplete(metadata: object) -> bool:
-    """A decoded, tool-owned closed-incomplete record (PR or plan flow)."""
+    """A decoded, tool-owned closed-incomplete record (PR or plan flow).
+
+    A record whose reserved obligation numbers collide with a different item
+    of its own ledger is malformed and never closes a round.
+    """
     payload = getattr(metadata, "round_closure", None)
     return (
         getattr(metadata, "flow", None) in CLOSURE_FLOWS
@@ -175,6 +212,20 @@ def is_round_closed_incomplete(metadata: object) -> bool:
         and getattr(metadata, "phase", None) == ROUND_CLOSED_INCOMPLETE_PHASE
         and isinstance(payload, Mapping)
         and payload.get("flow") == getattr(metadata, "flow", None)
+        and _obligations_fit_ledger(metadata, payload)
+    )
+
+
+def is_unvalidated_closure_summary(metadata: object) -> bool:
+    """A summary in a closure phase whose record does not validate.
+
+    Such a record (malformed payload, ledger collision, wrong author role) is
+    neither a closure nor a reconciliation: it never closes or settles a round.
+    """
+    return (
+        getattr(metadata, "role", None) == "summary"
+        and getattr(metadata, "phase", None) in CLOSURE_PHASES
+        and not is_round_closure_boundary(metadata)
     )
 
 

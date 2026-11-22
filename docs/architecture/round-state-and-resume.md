@@ -227,8 +227,11 @@ published reviewers (with comment IDs), the unreplayable reviewers (with a
 cause), the round's published exact-head evidence requests as obligations with
 a reserved item number, and the item-number high-water mark; the round's
 ledger uses the ordinary `prior_items` and `new_items` fields. A malformed or
-mis-bound payload never closes a round, and only records admitted by the
-unchanged author authentication are read. `is_round_closure_boundary` is the
+mis-bound payload, or a reserved obligation number that names a different
+item of the record's own ledger, never closes a round; such a closure-phase
+summary also never counts as a reconciliation, so the round stays open for
+ordinary settlement. Only records admitted by the unchanged author
+authentication are read. `is_round_closure_boundary` is the
 one closure predicate: the new record on either flow, or a legacy PR
 `signed-input-supersession` record, which keeps closing rounds for one release
 window. On the PR flow the record closes round N like a reconciliation with no
@@ -237,7 +240,9 @@ scheduler history and approval carry (`closed_round_review_indexes`), a later
 scheduler checkpoint in the round is inert, and the closed-round rollover
 settles the ledger with no dispositions (prior items stay open), appends the
 record's new items and restores its evidence obligations at their reserved
-numbers, so a restart from the record alone rebuilds the same ledger. On the
+numbers, so a restart from the record alone rebuilds the same ledger. An
+unrecorded head advance after a closure recovers the same ledger from the
+record rather than from the round's coder record. On the
 plan flow `plan_round_closure.py` treats the record as settling its round:
 `project_plan_history` drops the round's plan reviews from every projected
 reader (resume, panel evidence, carried approvals, visibility) and

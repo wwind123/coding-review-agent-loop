@@ -885,3 +885,49 @@ def test_2064_closed_incomplete_reviews_never_approve_or_carry(tmp_path, monkeyp
     reconciliation = _last_reconciliation(runner, 2).metadata
     assert reconciliation.prior_items == (finding,)
     assert not any("Delete these" in comment for comment in runner.comments)
+
+
+def test_2064_closed_incomplete_plan_reviews_never_carry_plan_approval():
+    """Row closed-review-no-approval, plan approval classification: an exact-key
+    plan approval carried from a closed-incomplete plan round never counts."""
+    from coding_review_agent_loop import panel_evidence
+    from coding_review_agent_loop.plan_review_scheduling import (
+        PlanCandidateKey, surfaced_requirement_id_digest,
+    )
+    from coding_review_agent_loop.round_closure import (
+        ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
+    )
+    from coding_review_agent_loop.round_metadata import PostedRoundRecord
+
+    key = PlanCandidateKey(
+        subject="a" * 64, aggregate_plan_identity="b" * 64,
+        execution_strategy_identity="c" * 32, risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest=surfaced_requirement_id_digest(("req-1",)),
+    )
+    approval = PostedRoundRecord(index=1, body="Gemini plan review.", metadata=PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Gemini", round_number=1, subject=key.subject,
+        state="approved", plan_candidate_key=key.as_dict(),
+        surfaced_reviewer_requirement_ids=("req-1",),
+    ))
+    closure = PostedRoundRecord(index=2, body="Planning round 1 closed, incomplete.", metadata=PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=1, subject=key.subject,
+        phase=ROUND_CLOSED_INCOMPLETE_PHASE,
+        round_closure=build_round_closure_payload(
+            flow="plan", round_number=1, subject=key.subject,
+            published=[("Gemini", None)], unreplayable=[("Codex", "spool outcome missing")],
+            item_number_high_water=0,
+        ),
+    ))
+    assert closure.metadata.round_closure is not None
+
+    def carried(records):
+        return panel_evidence._carried_plan_approvals(
+            records, current_key=key, required_reviewers=("Codex", "Gemini"),
+            surfaced_requirement_ids=("req-1",),
+            panel_evidence=panel_evidence.PlanPanelEvidence(opening_index=0, opening_source="operator"),
+            primary_reviewer="Codex",
+        )
+
+    # Control: the same approval carries while its round is open.
+    assert carried((approval,)) == ("Gemini",)
+    assert carried((approval, closure)) == ()
