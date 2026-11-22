@@ -80,6 +80,7 @@ from .pr_board_state import (
     resolve_pr_board_state,
     resolve_pr_owning_issue,
 )
+from .round_closure import is_round_closed_incomplete, restore_closure_evidence_obligations
 from .round_state import (
     canonical_deferred_history_items,
     drop_inert_post_reconciliation_checkpoints,
@@ -4794,8 +4795,8 @@ def run_pr_loop(
                 closed_reconciliation = current_resume.reconciliation_record.metadata
                 closed_clearances: list[tuple[str, str]] = []
                 unresolved_items, closed_future_items = _settle_pr_round_ledger(
-                    closed_reconciliation.prior_items,
-                    _reconciliation_dispositions_by_item(closed_reconciliation),
+                    closed_reconciliation.prior_items,  # A closed-incomplete round settles no prior item (#2064).
+                    {} if is_round_closed_incomplete(closed_reconciliation) else _reconciliation_dispositions_by_item(closed_reconciliation),
                     closed_reconciliation.new_items,
                     compact=use_compact_pr_context,
                     reconciliation_mode=pr_reconciliation_mode,
@@ -4824,6 +4825,9 @@ def run_pr_loop(
                     next_unresolved_item_number,
                     current_resume.next_unresolved_item_number,
                 )
+                if is_round_closed_incomplete(closed_reconciliation):  # Its record carries the round's evidence obligations (#2064).
+                    unresolved_items, next_unresolved_item_number = restore_closure_evidence_obligations(
+                        unresolved_items, closed_reconciliation, next_item_number=next_unresolved_item_number, clearances=evidence_clearances, pre_clearance_items=closed_reconciliation.prior_items, known_heads=known_pr_heads(native_history(runner, config, pr_number, pr_comments), current_pr_subject))
                 for review in current_resume.completed_reviews:
                     for request_text in review.metadata.evidence_requests:
                         unresolved_items, consumed_item_number = _upsert_evidence_obligation(
