@@ -33,6 +33,17 @@ from .protocol_markers import (
     historical_text_fragments,
 )
 
+from .response_normalization import (  # noqa: F401 - relocated (#2066)
+    _FENCED_JSON_PREFIX_RE,
+    ArchitectureNearMissNormalization,
+    _payload,
+    _payload_and_trailing,
+    _rewrite_architecture_near_miss,
+    canonicalize_architecture_near_miss_text,
+    normalize_architecture_impact_near_miss,
+    recover_payload,
+)
+
 
 _KINDS = {
     "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "plan_state",
@@ -40,10 +51,6 @@ _KINDS = {
     "task_result", "screenshot-coverage",
 }
 
-_FENCED_JSON_PREFIX_RE = re.compile(
-    r"\A[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?:json)?[ \t]*\r?\n",
-    re.IGNORECASE,
-)
 _FINDING_METADATA_KEYS = {
     "id", "item_id", "severity", "category", "state", "disposition", "verdict",
 }
@@ -696,50 +703,6 @@ def _schema_valid_architecture_entry(value: object) -> bool:
     repair must preserve, in either representation.
     """
     return render_architecture_list_entry(value) is not None
-
-
-def _payload_and_trailing(text: str) -> tuple[dict | None, str]:
-    """Split *text* into its recovered JSON object and the prose that follows.
-
-    The trailing remainder is the only part of a source that can carry freeform
-    reviewer prose: the recovered object's own fields are structured data, not
-    findings.
-    """
-    text, _ = normalize_response_file_structured_text(text)
-    stripped = text.lstrip()
-    fence = _FENCED_JSON_PREFIX_RE.match(stripped)
-    if fence:
-        fence_char = re.escape(fence.group("fence")[0])
-        fence_length = len(fence.group("fence"))
-        closing_fence = re.search(
-            rf"(?m)^[ \t]{{0,3}}{fence_char}{{{fence_length},}}[ \t]*(?:\r?\n|\Z)",
-            stripped[fence.end():],
-        )
-        if closing_fence:
-            stripped = stripped[fence.end():fence.end() + closing_fence.start()]
-        else:
-            stripped = stripped[fence.end():]
-        text = stripped
-    try:
-        parsed = _extract_json_object_prefix(text)
-    except AgentLoopError:
-        return None, text
-    if not parsed:
-        return None, text
-    return parsed[0], parsed[1]
-
-
-def _payload(text: str) -> dict | None:
-    return _payload_and_trailing(text)[0]
-
-
-def recover_payload(text: str) -> dict | None:
-    """Return the JSON object mechanically recoverable from *text*, if any.
-
-    Shared with the repair admission gate so the gate and the grounding guard
-    agree on exactly which sources carry a recoverable structured payload.
-    """
-    return _payload(text)
 
 
 def require_recoverable_semantic_patch(raw: str) -> None:
@@ -1822,75 +1785,3 @@ def require_repair_architecture_impact_absent(repaired: str) -> None:
             "Repair content preservation failed for architecture_impact: the source "
             "carried no assessment, so repair must not introduce one."
         )
-
-
-@dataclass(frozen=True)
-class ArchitectureNearMissNormalization:
-    """Pre-repair normalization result; the record stays out of band."""
-
-    raw: str
-    record: ParseDegradation | None
-    forbid_architecture_impact: bool
-
-
-def _rewrite_architecture_near_miss(raw: str) -> tuple[str, ParseDegradation | None, dict | None, bool]:
-    """Deterministically rewrite a top-level near miss to its wire-valid form.
-
-    A corroborated `modified` becomes `changed`; every other near miss has its
-    optional object removed.  Only the JSON object span is rewritten; the
-    footer and signature bytes that follow it are kept.
-    """
-    payload, trailing = _payload_and_trailing(raw)
-    impact = payload.get("architecture_impact") if isinstance(payload, dict) else None
-    if not isinstance(impact, dict):
-        return raw, None, payload, False
-    kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "response"
-    near_miss = classify_architecture_status_near_miss(
-        impact, context=f"{kind}.architecture_impact"
-    )
-    if near_miss is None:
-        return raw, None, payload, False
-    resolved, record = near_miss
-    rewritten = dict(payload)
-    removed = resolved != "changed"
-    if removed:
-        rewritten.pop("architecture_impact")
-    else:
-        rewritten["architecture_impact"] = {**impact, "status": resolved}
-    normalized = json.dumps(rewritten, ensure_ascii=False) + (
-        trailing if trailing.startswith(("\n", "\r")) else "\n" + trailing.lstrip()
-    )
-    return normalized, record, rewritten, removed
-
-
-def canonicalize_architecture_near_miss_text(text: str) -> str:
-    """Return accepted text with any near-miss status in its wire-valid form."""
-    return _rewrite_architecture_near_miss(text)[0]
-
-
-def normalize_architecture_impact_near_miss(
-    raw: str, *, required_contract: bool, expected_kind: str | None = None
-) -> ArchitectureNearMissNormalization:
-    """Resolve the status near miss in the raw payload before repair (#924).
-
-    Deterministic normalization runs before the LLM repair pass.  A
-    corroborated `modified` becomes a wire-valid `changed` that preservation
-    then pins; every other near miss has its whole optional object removed,
-    which is exactly what the parser-only `undetermined` status stands for.
-    Any other payload, including an unparseable one, is returned unchanged.
-
-    The absence pin has two triggers.  A normalization removal is pinned for
-    every kind, including optional-assessment reviews, so repair can never put
-    back a stronger claim.  Under a required contract, a recoverable source of
-    the expected kind that simply omits the assessment is pinned too.
-    """
-    normalized, record, payload, removed = _rewrite_architecture_near_miss(raw)
-    forbid = removed or bool(
-        required_contract
-        and isinstance(payload, dict)
-        and "architecture_impact" not in payload
-        and (expected_kind is None or payload.get("kind") == expected_kind)
-    )
-    return ArchitectureNearMissNormalization(
-        raw=normalized, record=record, forbid_architecture_impact=forbid
-    )

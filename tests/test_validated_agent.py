@@ -74,8 +74,11 @@ def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, reco
     assert [r.outcome for r in preserved.architecture_impact_degradations] == records
     assert error.value.failure_category == "deterministic"
     assert "architecture_impact" in str(error.value)
-    # The same retry budget as the former raise: one agent turn, no extras.
-    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 1
+    assert "response rejected after 2 same-agent re-asks" in str(error.value)
+    # The primary turn plus the two shared same-agent re-asks (#2066).
+    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_calls) == 3
+    assert "Previous response not accepted: architecture_impact" in claude_calls[1][-1]
 
 
 def test_seam_accepts_a_corroborated_near_miss_with_its_record(tmp_path):
@@ -155,17 +158,19 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
             text, required_architecture_impact_contract=1, architecture_status_mode=mode))
     )
     persisted = []
-    runner = _FakeRunner(claude_outputs=[source])
-    with patch.object(validated_agent_module, "attempt_repair", lambda raw, cmd, **kw: repaired):
-        with pytest.raises(_DegInvocationError) as error:
-            validated_agent_module._run_validated_agent(
-                runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
-                prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                **validators, use_repair=True, repair_expected_kind=kind,
-                require_architecture_impact_contract=True,
-                plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
-            )
+    # The planner corrects the unexpected key on its first re-ask but still
+    # leaves the contract unsatisfied on both re-asks (#2066).
+    runner = _FakeRunner(claude_outputs=[source, repaired, repaired])
+    with pytest.raises(_DegInvocationError) as error:
+        validated_agent_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            **validators, use_repair=True, repair_expected_kind=kind,
+            require_architecture_impact_contract=True,
+            plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
+        )
 
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 3
     assert error.value.failure_category == "deterministic"
     assert error.value.failure_category != "repair-provider-failure"
     exhaustion = error.value.plan_validation_exhaustion
@@ -176,11 +181,10 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
     assert f"{kind} must include architecture_impact" in exhaustion.diagnostic
     assert persisted == [exhaustion]
     preserved = error.value.preserved_unsatisfied_response
-    # The retained candidate keeps its out-of-band record.
+    # The retained candidate is the planner's own latest response; it omitted
+    # the assessment, so it carries no near-miss record of its own.
     assert preserved.text == repaired
-    assert [r.outcome for r in preserved.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == []
     assert "undetermined" not in preserved.text
 
 
@@ -272,12 +276,15 @@ def test_unsatisfied_response_file_artifact_is_a_deterministic_contract_retry(tm
 @pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])
 def test_unsatisfied_artifact_exhaustion_preserves_the_artifact(tmp_path, returncode):
     artifact = _deg_with(structured_issue_implementation(), _DEG_UNCORROBORATED)
+    # The primary turn and both same-agent re-asks (#2066) leave the same
+    # unsatisfied artifact.
     runner = _r2_FakeRunner(
-        claude_outputs=[("provider diagnostics only", returncode)],
-        public_response_outputs=[artifact],
+        claude_outputs=[("provider diagnostics only", returncode)] * 3,
+        public_response_outputs=[artifact] * 3,
     )
     with pytest.raises(_DegInvocationError) as error:
         _r2_run(runner, tmp_path, retries=0)
+    assert len(_r2_claude_prompts(runner)) == 3
     assert error.value.failure_category == "deterministic"
     preserved = error.value.preserved_unsatisfied_response
     assert preserved.text == artifact

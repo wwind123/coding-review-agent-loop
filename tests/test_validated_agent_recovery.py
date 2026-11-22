@@ -93,20 +93,17 @@ def test_gemini_pre_marker_429_does_not_suppress_structured_review_repair(tmp_pa
         summary="Review passed after repair.",
         reviewer="Google Gemini",
     )
-    runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}])
+    runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}, {"stdout": repaired_review}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-    captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append(raw)
-        assert expected_kind == "pr_review"
-        return repaired_review
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert captured_repairs == [malformed_public_review]
-    assert "429" not in captured_repairs[0]
+    # The pre-marker 429 does not make the structured defect transient: the
+    # same reviewer is re-asked with the validator message (#2066).
+    gemini_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(gemini_prompts) == 2
+    assert "re-ask 1 of 2" in gemini_prompts[1]
+    assert "may not include prose between the JSON object" in gemini_prompts[1]
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
     assert any("Review passed after repair." in comment for comment in runner.comments)
 
@@ -137,21 +134,18 @@ def test_gemini_response_file_repair_ignores_raw_stdout_transient_diagnostics(tm
     )
     runner = FakeRunner(
         gemini_outputs=[
-            {"stdout": "Attempt 1 failed with status 429. No capacity available, then recovered."}
+            {"stdout": "Attempt 1 failed with status 429. No capacity available, then recovered."},
+            {"stdout": "re-asked"},
         ],
-        public_response_outputs=[{"text": malformed_public_review}],
+        public_response_outputs=[{"text": malformed_public_review}, {"text": repaired_review}],
     )
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-    captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append(raw)
-        return repaired_review
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert captured_repairs == [malformed_public_review]
+    gemini_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(gemini_prompts) == 2
+    assert "same_pr_followups must be a JSON array" in gemini_prompts[1]
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
     assert any("Response file review passed after repair." in comment for comment in runner.comments)
 
@@ -408,10 +402,10 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
         remaining_items=[],
         reviewer="Anthropic Claude",
     )
-    runner = FakeRunner(claude_outputs=[malformed_followup])
+    runner = FakeRunner(claude_outputs=[malformed_followup, repaired_followup])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_followup) as repair_mock:
+    if True:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -428,11 +422,11 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
         )
 
     assert response.text == repaired_followup
-    repair_mock.assert_called_once_with(
-        malformed_followup,
-        config.gemini_cmd,
-        expected_kind="coder_followup",
-    )
+    # Transient words in the coder's prose do not make the structured defect
+    # transient: the coder is re-asked to resend the response only (#2066).
+    claude_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_prompts) == 2
+    assert "Do not modify, commit or push anything" in claude_prompts[1]
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 
@@ -611,10 +605,10 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
         ),
         reviewer="Google Gemini",
     )
-    runner = FakeRunner(gemini_outputs=[malformed_review])
+    runner = FakeRunner(gemini_outputs=[malformed_review, repaired_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review) as repair_mock:
+    if True:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -631,23 +625,31 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
         )
 
     assert response.text == repaired_review
-    repair_mock.assert_called_once_with(
-        malformed_review,
-        config.gemini_cmd,
-        expected_kind="pr_review",
-    )
+    gemini_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(gemini_prompts) == 2 and "re-ask 1 of 2" in gemini_prompts[1]
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 
-def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_path, monkeypatch):
+def test_resend_only_coder_reask_keeps_the_primary_acquisition_catalog(tmp_path, monkeypatch):
+    """`coder-reask-frozen-acquisition` (#2066): a resend-only re-ask inherits the catalog."""
     malformed = structured_coder_followup(summary="Needs envelope repair") + "\ntrailing text"
-    repaired = structured_coder_followup(summary="Repaired semantic response")
+    corrected = structured_coder_followup(summary="Corrected semantic response")
     acquisition_observation = object()
-    result = AgentResult(
+    reask_observation = object()
+    primary = AgentResult(
         text=malformed,
         returncode=0,
+        session_id="coder-session",
         test_turn_id="coder-turn",
         test_turn_observations=(acquisition_observation,),
+    )
+    # The re-ask dispatch has its own (forbidden) receipt catalog.
+    reask = AgentResult(
+        text=corrected,
+        returncode=0,
+        session_id="coder-session",
+        test_turn_id="reask-turn",
+        test_turn_observations=(reask_observation,),
     )
     runner = FakeRunner()
     seen_catalogs = []
@@ -655,21 +657,13 @@ def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_pa
     def validate(text):
         catalog = response_validation._current_test_turn_observations(runner)
         seen_catalogs.append(catalog)
-        if text != repaired:
+        if text != corrected:
             raise AgentLoopError("malformed response")
-        assert catalog == (acquisition_observation,)
         return text
 
-    def repair_with_new_broker_turn(raw, *, runner, validate, **kwargs):
-        # A real repair starts a new containment/broker turn. The acquisition
-        # context must still resolve the coder's original selector catalog.
-        runner._latest_test_turn_id = "repair-turn"
-        runner._local_test_observations = []
-        parsed = validate(repaired)
-        return repaired, parsed, []
-
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", repair_with_new_broker_turn)
-    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result):
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=[primary, reask]
+    ) as invoke:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -680,13 +674,18 @@ def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_pa
             role="coder",
             use_repair=True,
             repair_expected_kind="coder_followup",
+            session_id="caller-session",
         )
 
-    assert response.text == repaired
+    assert response.text == corrected
+    # Validation, strict acceptance and the accepted metadata all read the
+    # primary dispatch's closed catalog; the re-ask's receipts never enter.
     assert response.acquisition_test_turn_id == "coder-turn"
     assert response.acquisition_test_observations == (acquisition_observation,)
-    assert len(seen_catalogs) >= 2
-    assert all(catalog == (acquisition_observation,) for catalog in seen_catalogs)
+    assert seen_catalogs and all(catalog == (acquisition_observation,) for catalog in seen_catalogs)
+    reask_call = invoke.call_args_list[1].kwargs
+    assert reask_call["session_id"] == "coder-session"
+    assert "Do not modify, commit or push anything" in reask_call["prompt"]
 
 
 def test_claude_completion_recovery_keeps_original_acquisition_catalog(
@@ -732,6 +731,67 @@ def test_claude_completion_recovery_keeps_original_acquisition_catalog(
     assert response.marker_value.pr_number == 77
     assert response.acquisition_test_turn_id == "original-coder-turn"
     assert response.acquisition_test_observations == (original_observation,)
+
+
+@pytest.mark.parametrize(
+    "recovery_session, expected_session",
+    [("sess-recovery", "sess-recovery"), (None, "sess-primary")],
+    ids=["recovery-session", "resumed-session-fallback"],
+)
+def test_completion_recovery_contract_reask_follows_the_recovered_producer(
+    tmp_path, recovery_session, expected_session
+):
+    """Review item-6: the recovered response, not the primary one, drives the re-ask."""
+    from coding_review_agent_loop.validated_agent import _CompletionRecoveryOutcome
+
+    valid = structured_issue_implementation(pr_number=77)
+    primary = AgentResult(
+        text="I'll wait for the background tests to finish.", returncode=0,
+        session_id="sess-primary", configured_model="model-a", observed_model="model-a",
+    )
+    recovered = AgentResult(
+        text="recovered but missing architecture_impact", returncode=0,
+        session_id=recovery_session, configured_model="model-a", observed_model="model-b",
+    )
+    outcome = _CompletionRecoveryOutcome(
+        validated=None, result=recovered,
+        error="the response omitted the required architecture_impact",
+        classification_text="architecture_impact contract unsatisfied",
+        failure_category="deterministic", terminal_public_response=None,
+        contract_unsatisfied=True,
+    )
+    recoveries = []
+
+    def fake_recovery(*args, **kwargs):
+        recoveries.append(kwargs["session_id"])
+        return outcome
+
+    def validate(text):
+        if text == valid:
+            return validate_structured_issue_implementation(text)
+        raise AgentLoopError("response deferred to background work")
+
+    config = make_config(tmp_path, coder="claude", claude_model="model-a", agent_max_retries=0)
+    with patch.object(validated_agent, "_attempt_claude_completion_recovery", fake_recovery), \
+        patch_object_in(
+            (validated_agent, response_validation), "run_agent_result",
+            side_effect=[primary, AgentResult(text=valid, returncode=0, session_id=expected_session)],
+        ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="claude", config=config, prompt="Finish the implementation.",
+            marker_description="structured issue implementation", validate=validate,
+            completion_recovery=CompletionRecoveryPolicy(issue_number=56),
+        )
+
+    assert response.marker_value.pr_number == 77
+    assert recoveries == ["sess-primary"]
+    assert invoke.call_count == 2
+    reask = invoke.call_args_list[1].kwargs
+    # The correction goes to the model that produced the recovered response,
+    # on the recovery's own session (or the resumed one when it has none).
+    assert reask["config"].claude_model == "model-b"
+    assert reask["session_id"] == expected_session
+    assert "re-ask 1 of 2" in reask["prompt"]
 
 
 def test_claude_self_update_replay_recovers_valid_response_with_remaining_timeout(tmp_path):
@@ -2165,7 +2225,8 @@ def test_codex_usage_limit_with_auth_is_not_retried(tmp_path, error):
     assert out.failure_category == "non-retryable"
 
 
-def test_guard_correction_freezes_its_own_acquisition_catalog(tmp_path):
+def test_tests_run_correction_is_resend_only_and_inherits_the_primary_catalog(tmp_path):
+    """A refused tests_run entry is a resend-only re-ask (#2066): the catalog carries forward."""
     from coding_review_agent_loop.protocol import validate_structured_coder_followup
     rejected = structured_coder_followup(tests_run=['pytest tests/test_api.py /outside/test_api.py'])
     accepted = structured_coder_followup(tests_run=['pytest tests/test_api.py'])
@@ -2191,11 +2252,13 @@ def test_guard_correction_freezes_its_own_acquisition_catalog(tmp_path):
         )
     assert invoke.call_count == 2
     assert len(seen) >= 2
-    assert all(catalog == (first,) for catalog in seen[:-1])
-    assert seen[-1] == (second,)
-    assert response.acquisition_test_turn_id == 'correction'
-    assert response.acquisition_test_observations == (second,)
-    assert invoke.call_args_list[1].kwargs['session_id'] == 'coder-session'
+    assert all(catalog == (first,) for catalog in seen)
+    assert response.acquisition_test_turn_id == 'rejected'
+    assert response.acquisition_test_observations == (first,)
+    reask = invoke.call_args_list[1].kwargs
+    assert reask['session_id'] == 'coder-session'
+    assert 'Previous response not accepted: tests_run report' in reask['prompt']
+    assert 'Do not modify, commit or push anything' in reask['prompt']
 
 
 def test_followup_workdir_composition_preserves_operational_errors(tmp_path, monkeypatch):
@@ -2448,8 +2511,558 @@ def test_classification_reask_exhausted_takes_judgement_failure_path(tmp_path):
         with pytest.raises(AgentLoopError) as info:
             _run_production_classification(runner, config)
     message = str(info.value)
-    assert "repair skipped because the reviewer did not supply requirement_evidence" in message
+    assert "response rejected after 2 same-agent re-asks" in message
+    assert "requirement_evidence" in message
     assert "schema-validation" not in message
     assert getattr(info.value, "failure_category", None) == "deterministic"
-    assert len(_codex_commands(runner)) == 2
+    # The primary turn plus the two shared same-agent re-asks; never a third.
+    assert len(_codex_commands(runner)) == 3
     assert repairs == []
+
+
+# ---------------------------------------------------------------------------
+# #2066: the single same-agent re-ask rule
+# ---------------------------------------------------------------------------
+
+
+def _drop_field(text: str, field: str) -> str:
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload.pop(field)
+    return json.dumps(payload) + text[end:]
+
+
+def _review_validator(text):
+    return _validate_review_response(
+        text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
+    )
+
+
+def _probe(value):
+    from coding_review_agent_loop.workdir_guard import GitProbeResult
+
+    if value is None:
+        return GitProbeResult(command=("git", "rev-parse", "HEAD"), kind="exception", detail="boom")
+    return GitProbeResult(command=("git", "rev-parse", "HEAD"), kind="available", value=value)
+
+
+def _script_heads(monkeypatch, heads):
+    """Fake head probe for the coder re-ask guard; records every read."""
+    reads = []
+    remaining = list(heads)
+
+    def read(_runner, _config):
+        reads.append(True)
+        return _probe(remaining.pop(0) if remaining else "unscripted-head")
+
+    monkeypatch.setattr(validated_agent, "_read_reask_head", read)
+    return reads
+
+
+def test_reviewer_missing_required_field_is_reasked_to_the_same_agent_and_accepted(tmp_path):
+    """`reviewer-missing-field-reask`."""
+    valid = structured_pr_review(summary="Looks good.")
+    missing = _drop_field(valid, "summary")
+    primary = AgentResult(text=missing, returncode=0, session_id="review-session", model_used="gpt-x")
+    corrected = AgentResult(text=valid, returncode=0, session_id="review-session", model_used="gpt-x")
+    config = make_config(tmp_path, agent_max_retries=0)
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=[primary, corrected]
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="codex", config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            session_id="caller-session",
+        )
+    assert response.text == valid
+    assert invoke.call_count == 2
+    first, reask = (call.kwargs for call in invoke.call_args_list)
+    # Same agent, same session, the validator message and a resend-only rule.
+    assert reask["agent"] == first["agent"] == "codex"
+    assert reask["session_id"] == "review-session"
+    assert reask["prompt"].startswith("Review the PR.")
+    assert "re-ask 1 of 2" in reask["prompt"]
+    assert "pr_review is missing required field(s): summary" in reask["prompt"]
+    assert "Resend the complete corrected response only" in reask["prompt"]
+    assert "Do not modify, commit or push" not in reask["prompt"]
+
+
+def test_two_failed_reasks_end_the_turn_with_a_clear_deterministic_error(tmp_path):
+    """`two-reasks-fail-terminal`."""
+    missing = _drop_field(structured_pr_review(), "summary")
+    results = [AgentResult(text=missing, returncode=0, session_id="s") for _ in range(4)]
+    config = make_config(tmp_path, agent_max_retries=3)
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        with pytest.raises(AgentInvocationError) as info:
+            _run_validated_agent(
+                FakeRunner(), agent="codex", config=config, prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            )
+    # Exactly three dispatches: no third re-ask and no ordinary retry, even
+    # with a retry budget available.
+    assert invoke.call_count == 3
+    message = str(info.value)
+    assert info.value.failure_category == "deterministic"
+    assert "response rejected after 2 same-agent re-asks; last validator message:" in message
+    assert "missing required field(s): summary" in message
+    assert info.value.rejected_candidate is not None
+    assert info.value.rejected_candidate.text == missing
+
+
+def test_planner_exhaustion_after_reasks_captures_the_last_candidate(tmp_path):
+    """`planner-exhaustion-capture`."""
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    candidates = [
+        _drop_field(structured_plan_state(summary=f"Plan {index}."), "plan_steps")
+        for index in range(3)
+    ]
+    results = [AgentResult(text=text, returncode=0, session_id="planner") for text in candidates]
+    persisted = []
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ):
+        with pytest.raises(AgentInvocationError) as info:
+            _run_validated_agent(
+                FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Plan the issue.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                validate=validate_structured_plan_state, role="planner",
+                repair_expected_kind="plan_state",
+                plan_validation_failure_handler=lambda exhaustion, error: persisted.append((exhaustion, error)),
+            )
+    exhaustion = info.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert exhaustion.candidate_kind == "plan_state"
+    # The last candidate, never a stale one from an earlier attempt.
+    assert exhaustion.candidate_text == candidates[-1]
+    assert "plan_steps" in exhaustion.diagnostic
+    assert persisted == [(exhaustion, info.value)]
+
+
+def _coder_turn(tmp_path, results, **kwargs):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        try:
+            response = _run_validated_agent(
+                FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Address review feedback.", marker_description="structured coder follow-up",
+                validate=validate_structured_coder_followup, role="coder",
+                repair_expected_kind="coder_followup", **kwargs,
+            )
+        except AgentInvocationError as error:
+            return error, invoke
+    return response, invoke
+
+
+def test_coder_reask_with_an_unchanged_head_is_accepted(tmp_path, monkeypatch):
+    """`coder-reask-head-unchanged`."""
+    valid = structured_coder_followup(summary="Updated.")
+    reads = _script_heads(monkeypatch, ["H", "H"])
+    response, invoke = _coder_turn(tmp_path, [
+        AgentResult(text=_drop_field(valid, "summary"), returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ])
+    assert response.text == valid
+    # The head is read before and after the re-ask; neither read is skipped.
+    assert len(reads) == 2
+    reask_prompt = invoke.call_args_list[1].kwargs["prompt"]
+    assert "Do not modify, commit or push anything" in reask_prompt
+    assert "do not touch the checkout" in reask_prompt
+
+
+def test_coder_reask_that_moved_the_head_fails_closed(tmp_path, monkeypatch):
+    """`coder-reask-head-moved` (unit part)."""
+    valid = structured_coder_followup(summary="Updated.")
+    invalid = _drop_field(valid, "summary")
+    _script_heads(monkeypatch, ["H1", "H2"])
+    error, invoke = _coder_turn(tmp_path, [
+        AgentResult(text=invalid, returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ])
+    assert isinstance(error, AgentInvocationError)
+    # The re-asked (valid) response is not accepted and no further re-ask runs.
+    assert invoke.call_count == 2
+    assert error.failure_category == "deterministic"
+    assert "coder re-ask 1 moved the checkout head (H1 -> H2)" in str(error)
+    # The rejected candidate carries the turn's last parsed candidate for the
+    # post-push coder-record path (#2086).
+    assert error.rejected_candidate is not None and error.rejected_candidate.text == invalid
+
+
+def test_coder_reask_with_an_unreadable_head_after_the_reask_fails_closed(tmp_path, monkeypatch):
+    valid = structured_coder_followup(summary="Updated.")
+    _script_heads(monkeypatch, ["H1", None])
+    error, invoke = _coder_turn(tmp_path, [
+        AgentResult(text=_drop_field(valid, "summary"), returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ])
+    assert isinstance(error, AgentInvocationError)
+    assert invoke.call_count == 2
+    assert "moved the checkout head (H1 -> unavailable" in str(error)
+
+
+def _non_array_observations(text, *, fenced=False):
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload["test_observations"] = "I ran the tests and they passed."
+    rendered = json.dumps(payload)
+    if fenced:
+        return "```json\n" + rendered + "\n```" + text[end:]
+    return rendered + text[end:]
+
+
+def _observation_coder_turn(tmp_path, results):
+    """A coder follow-up turn with the fresh repair-first / degrade validator pair."""
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    def mode(observations_mode):
+        def validate(text):
+            parsed = validate_structured_coder_followup(
+                text, test_observations_mode=observations_mode
+            )
+            if parsed is None:
+                # As the PR follow-up caller does: a non-structured envelope
+                # (for example a fenced object) is a validation failure.
+                raise AgentLoopError("Agent response did not use the required structured format.")
+            return parsed
+
+        return validate
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        try:
+            response = _run_validated_agent(
+                FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Address review feedback.", marker_description="structured coder follow-up",
+                validate=mode("repair-first"), strict_revalidate=mode("repair-first"),
+                test_observations_fallback_validate=mode("degrade-after-repair"),
+                test_observations_fallback_strict_revalidate=mode("degrade-after-repair"),
+                role="coder", repair_expected_kind="coder_followup",
+            )
+        except AgentInvocationError as error:
+            return error, invoke
+    return response, invoke
+
+
+@pytest.mark.parametrize("cause", ["missing-summary", "non-array-observations", "fenced-non-array-observations"])
+def test_head_probe_unavailable_means_no_coder_reask(tmp_path, monkeypatch, cause):
+    """`head-probe-unavailable`, for every re-ask cause (review item-1).
+
+    A head-guard refusal is not exhaustion: the turn fails with one dispatch,
+    and the non-array degradation, earned only by spent re-asks, never runs.
+    """
+    valid = structured_coder_followup(summary="Updated.")
+    invalid = {
+        "missing-summary": _drop_field(valid, "summary"),
+        "non-array-observations": _non_array_observations(valid),
+        "fenced-non-array-observations": _non_array_observations(valid, fenced=True),
+    }[cause]
+    reads = _script_heads(monkeypatch, [None])
+    error, invoke = _observation_coder_turn(tmp_path, [
+        AgentResult(text=invalid, returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ])
+    assert isinstance(error, AgentInvocationError), error
+    # An unavailable probe is never treated as an unchanged head.
+    assert invoke.call_count == 1
+    assert len(reads) == 1
+    assert error.failure_category == "deterministic"
+    assert "coder re-ask skipped: the checkout head could not be read" in str(error)
+    assert "response rejected after" not in str(error)
+
+
+def test_envelope_normalized_non_array_observations_are_reasked_then_degraded(tmp_path, monkeypatch):
+    """Review item-2: the normalized candidate's own rejection carries forward."""
+    from coding_review_agent_loop.protocol_risk import TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+
+    fenced = _non_array_observations(structured_coder_followup(summary="Updated."), fenced=True)
+    _script_heads(monkeypatch, ["H"] * 4)
+    response, invoke = _observation_coder_turn(
+        tmp_path, [AgentResult(text=fenced, returncode=0, session_id="coder") for _ in range(3)]
+    )
+    assert not isinstance(response, AgentInvocationError), response
+    assert invoke.call_count == 3
+    # The re-ask names the defect left after envelope normalization.
+    reask_prompt = invoke.call_args_list[1].kwargs["prompt"]
+    assert "test_observations" in reask_prompt
+    records = response.marker_value.test_observation_degradations
+    assert [record.rule for record in records] == [TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE]
+    assert not response.text.startswith("```")
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_reask_is_pinned_to_the_model_that_produced_the_response(tmp_path, backend):
+    """Review item-3: a response from model B under configured A is re-asked on B, twice."""
+    from coding_review_agent_loop.agents.codex import _codex_model_args
+
+    valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
+    model_field = f"{backend}_model"
+    config = make_config(tmp_path, agent_max_retries=0, **{model_field: "model-a"})
+    results = [
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="model-a", observed_model="model-b"),
+        # The pinned re-ask now reports B as configured: the pin must hold.
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+        AgentResult(text=valid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        _run_validated_agent(
+            FakeRunner(), agent=backend, config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    configs = [call.kwargs["config"] for call in invoke.call_args_list]
+    assert [getattr(c, model_field) for c in configs] == ["model-a", "model-b", "model-b"]
+    if backend == "codex":
+        for reask in configs[1:]:
+            args = _codex_model_args(reask, role="reviewer")
+            assert args[args.index("--model") + 1] == "model-b"
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize(
+    "model_args", [("--model", "model-a"), ("--model=model-a",)], ids=["separate", "equals"]
+)
+def test_reask_pin_replaces_a_passthrough_model_argument(tmp_path, backend, model_args):
+    """Review item-3: a model given through agent arguments is replaced by the pin, twice."""
+    from coding_review_agent_loop.agents.codex import _codex_model_args
+    from coding_review_agent_loop.config import configured_model_for
+
+    valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
+    args_field = f"{backend}_args"
+    config = make_config(
+        tmp_path, agent_max_retries=0, **{args_field: ("--verbose", *model_args, "--keep")}
+    )
+    assert configured_model_for(config, backend, role="reviewer") is None
+    results = [
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model=None, observed_model="model-b"),
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+        AgentResult(text=valid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent=backend, config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.marker_value.summary == "Looks good."
+    configs = [call.kwargs["config"] for call in invoke.call_args_list]
+    assert len(configs) == 3
+    assert getattr(configs[0], args_field) == ("--verbose", *model_args, "--keep")
+    for reask in configs[1:]:
+        # The passthrough model is gone, unrelated arguments are kept, and the
+        # invocation requests the producer model.
+        assert getattr(reask, args_field) == ("--verbose", "--keep")
+        assert configured_model_for(reask, backend, role="reviewer") == "model-b"
+        if backend == "codex":
+            args = _codex_model_args(reask, role="reviewer")
+            assert args[args.index("--model") + 1] == "model-b"
+        if backend == "gemini":
+            assert reask.gemini_model == "model-b"
+
+
+def test_named_seat_reasks_stay_on_the_producer_model(tmp_path):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    seat = SeatAgent(ReviewerSeat("panel-a", "codex", ("seat-a", "seat-b")), tmp_path)
+    valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
+    results = [
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="seat-a", observed_model="seat-b"),
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="seat-b", observed_model="seat-b"),
+        AgentResult(text=valid, returncode=0, session_id="s",
+                    configured_model="seat-b", observed_model="seat-b"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        _run_validated_agent(
+            FakeRunner(), agent=seat, config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    agents = [call.kwargs["agent"] for call in invoke.call_args_list]
+    assert [a.model_chain[0] for a in agents] == ["seat-a", "seat-b", "seat-b"]
+    assert all(str(a) == "panel-a" for a in agents)
+
+
+def test_reask_pin_keeps_the_configured_model_when_the_producer_matches(tmp_path):
+    valid = structured_pr_review(summary="Looks good.")
+    config = make_config(tmp_path, agent_max_retries=0, claude_model="model-a")
+    results = [
+        AgentResult(text=_drop_field(valid, "summary"), returncode=0, session_id="s",
+                    configured_model="model-a", observed_model="model-a"),
+        AgentResult(text=valid, returncode=0, session_id="s"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        _run_validated_agent(
+            FakeRunner(), agent="claude", config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert invoke.call_args_list[1].kwargs["config"] is invoke.call_args_list[0].kwargs["config"]
+
+
+def test_reask_pin_reissues_a_named_seat_with_the_producer_model_first(tmp_path):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    seat = SeatAgent(ReviewerSeat("panel-a", "codex", ("seat-a", "seat-b")), tmp_path)
+    config = make_config(tmp_path)
+    pinned, pinned_config = validated_agent._pin_producer_model(seat, config, "codex", "seat-b")
+    assert isinstance(pinned, SeatAgent) and str(pinned) == "panel-a"
+    assert pinned.model_chain == ("seat-b", "seat-a")
+    assert pinned.backend == "codex" and pinned.workdir == tmp_path
+    assert pinned_config is config
+    # Antigravity keeps its chain position across re-asks: never pinned.
+    assert validated_agent._pin_producer_model("antigravity", config, "antigravity", "m") == ("antigravity", config)
+
+
+def test_transient_failures_do_not_consume_the_reask_budget(tmp_path):
+    """`transient-no-reask-budget`."""
+    valid = structured_pr_review(summary="Looks good.")
+    missing = _drop_field(valid, "summary")
+    results = [
+        AgentResult(text="", returncode=1, raw_output="HTTP 503 Service Unavailable; please retry later"),
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        AgentResult(text=valid, returncode=0, session_id="s"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.text == valid
+    assert invoke.call_count == 4
+    prompts = [call.kwargs["prompt"] for call in invoke.call_args_list]
+    # The transient failure used the ordinary retry (same prompt); both
+    # re-asks stayed available for the validation failures that followed.
+    assert prompts[1] == "Review the PR."
+    assert "re-ask 1 of 2" in prompts[2]
+    assert "re-ask 2 of 2" in prompts[3]
+
+
+def test_test_observations_degrade_after_reask_exhaustion(tmp_path, monkeypatch):
+    """`test-observations-degrade`."""
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    from coding_review_agent_loop.protocol_risk import TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+
+    source = structured_coder_followup(summary="Updated.")
+    payload, end = json.JSONDecoder().raw_decode(source)
+    payload["test_observations"] = "I ran the tests and they passed."
+    prose = json.dumps(payload) + source[end:]
+    _script_heads(monkeypatch, ["H", "H", "H", "H"])
+    results = [AgentResult(text=prose, returncode=0, session_id="coder") for _ in range(3)]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Address review feedback.", marker_description="structured coder follow-up",
+            validate=lambda text: validate_structured_coder_followup(text, test_observations_mode="repair-first"),
+            strict_revalidate=lambda text: validate_structured_coder_followup(text, test_observations_mode="repair-first"),
+            test_observations_fallback_validate=lambda text: validate_structured_coder_followup(
+                text, test_observations_mode="degrade-after-repair"
+            ),
+            test_observations_fallback_strict_revalidate=lambda text: validate_structured_coder_followup(
+                text, test_observations_mode="degrade-after-repair"
+            ),
+            role="coder", repair_expected_kind="coder_followup",
+        )
+    assert invoke.call_count == 3
+    records = response.marker_value.test_observation_degradations
+    # Accepted only with its recorded drop, never silently.
+    assert [record.rule for record in records] == [TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE]
+
+
+def test_marker_unsafe_response_is_reasked_without_echoing_the_marker(tmp_path):
+    """`marker-unsafe-reask`."""
+    marker = "<!-- AGENT_ISSUE_PR_HANDOFF: eyJpc3N1ZV9udW1iZXIiOjF9 -->"
+    valid = structured_pr_review(summary="Looks good.")
+    unsafe = structured_pr_review(summary=f"Looks good. {marker}")
+    results = [
+        AgentResult(text=unsafe, returncode=0, session_id="s"),
+        AgentResult(text=valid, returncode=0, session_id="s"),
+    ]
+    runner = FakeRunner()
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            runner, agent="codex", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.text == valid
+    reask_prompt = invoke.call_args_list[1].kwargs["prompt"]
+    assert "re-ask 1 of 2" in reask_prompt
+    assert "AGENT_ISSUE_PR_HANDOFF:" not in reask_prompt
+    assert "<!--" not in reask_prompt.split("## Previous response rejected", 1)[1]
+    # The unsafe text was never posted anywhere.
+    assert not any("AGENT_ISSUE_PR_HANDOFF: eyJ" in comment for comment in runner.comments)
+
+
+def test_reask_prompt_is_bounded_and_redacted():
+    from coding_review_agent_loop.response_reask import (
+        VALIDATOR_MESSAGE_MAX_CHARS,
+        build_reask_prompt,
+    )
+
+    message = "token=SECRET123 " + "x" * (VALIDATOR_MESSAGE_MAX_CHARS * 3)
+    prompt = build_reask_prompt("Original.", message, 2, coder=True, fresh_evidence=True)
+    appendix = prompt.split("Original.", 1)[1]
+    assert "SECRET123" not in appendix
+    assert len(appendix) < VALIDATOR_MESSAGE_MAX_CHARS + 1200
+    assert "re-ask 2 of 2" in appendix
+    assert "rerun the covering test through the test wrapper" in appendix
+    assert "Do not edit files, commit, push" in appendix
+
+
+@pytest.mark.parametrize("classification", [
+    "structured plan_state repair failed trusted validation",
+    "structured pr_review repair failed trusted validation",
+    "structured plan_state response failed trusted validation",
+])
+def test_legacy_repair_classifications_still_parse(classification):
+    """`legacy-repair-records`: historical repair wording keeps its classification."""
+    from coding_review_agent_loop import agent_failure
+
+    assert agent_failure._is_structured_schema_rejection(classification)
+    suggestion = agent_failure._failure_suggestion(
+        "deterministic", "rejected", "Claude", classification_text=classification
+    )
+    assert "failed schema validation" in suggestion
+
+
+def test_legacy_repair_provider_failure_category_still_classifies():
+    from coding_review_agent_loop import agent_failure
+
+    suggestion = agent_failure._failure_suggestion(
+        "repair-provider-failure", "repair invocation failure: transient_provider_error", "Claude"
+    )
+    assert "the round is resumable" in suggestion

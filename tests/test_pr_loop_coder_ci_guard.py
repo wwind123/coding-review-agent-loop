@@ -892,33 +892,6 @@ def _prose_before_footer(response):
     return f"{head.rstrip()}\n## Changes made\nProse the envelope forbids.\n{footer}{tail}"
 
 
-def test_loop_driven_format_repair_of_guarded_coder_inherits_the_guard(tmp_path, monkeypatch):
-    """A malformed guarded coder response reaches the real repair chain; the
-    repair subprocess launch carries the guard, the next reviewer does not."""
-    malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
-    repaired = structured_coder_followup(addressed_items=["item-1"])
-    runner, record, dispatches, _ = _managed_guard_loop(
-        tmp_path, monkeypatch, claude_outputs=[malformed], antigravity_outputs=[repaired],
-        real_repair=True,
-    )
-
-    names = [name for name, _env in runner.launch_envs]
-    repair_indexes = [
-        index for index, (name, env) in enumerate(runner.launch_envs)
-        # The `agy models` catalog probe has no role and runs no tools.
-        if name == "agy" and "agy-catalog-" not in env.get("AGENT_LOOP_WORKDIR", "")
-    ]
-    assert repair_indexes, names
-    for index in repair_indexes:
-        env = runner.launch_envs[index][1]
-        assert env.get("AGENT_LOOP_CODER_CI_DISPATCH_GUARD") == "managed"
-        assert env["PATH"].split(os.pathsep)[0] == env[_GUARD_DIR_ENV]
-    after = [env for name, env in runner.launch_envs[max(repair_indexes) + 1:] if name == "codex"]
-    assert after and not any(_GUARD_DIR_ENV in env for env in after)
-    assert not record.exists()
-    _assert_single_correlated_dispatch(runner, dispatches, runner.pr_payload["headRefOid"])
-
-
 def test_rejected_guarded_coder_turn_still_publishes_dispatch_audit(tmp_path, monkeypatch):
     """#1366 item-3: a bypass dispatch followed by a response that fails
     validation and repair is still surfaced, without masking the rejection."""

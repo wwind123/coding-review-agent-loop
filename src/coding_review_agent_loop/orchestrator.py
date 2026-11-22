@@ -430,23 +430,16 @@ from .protocol_discuss import (
     serialize_discuss_final_synthesis,
 )
 from .protocol import parse_review
-from .repair import (
-    CandidateDecision,
-    RepairAttemptResult,
+from .response_normalization import (
     attempt_envelope_normalization,
     attempt_semantic_patch_disposition_normalization,
-    attempt_repair,
-    execute_repair,
-    strip_unknown_prior_item_dispositions,
-    unknown_dispositions_are_resolved_history,
-    require_recoverable_fresh_execution_contract,
-    require_recoverable_fresh_risk_test_matrix_contract,
-    require_recoverable_review_substance,
-)
-from .repair_preservation import (
     canonicalize_architecture_near_miss_text,
     normalize_architecture_impact_near_miss,
     recover_payload,
+    strip_unknown_prior_item_dispositions,
+    unknown_dispositions_are_resolved_history,
+)
+from .repair_preservation import (
     require_recoverable_semantic_patch,
     require_repair_architecture_impact_absent,
     validate_repair_preservation,
@@ -895,16 +888,11 @@ from .validated_agent import (
     _end_run_telemetry,
     _resolve_usage_metadata,
     _persist_usage_summary,
-    _ORIGINAL_ATTEMPT_REPAIR,
-    _run_structured_repair,
     CompletionRecoveryPolicy,
     _CompletionRecoveryOutcome,
     _post_completion_recovery_terminal_comment,
     _synthesized_completion_recovery_unavailable,
     _attempt_claude_completion_recovery,
-    _refused_contract_attempt,
-    _log_repair_attempts,
-    _capture_terminal_plan_repair_rejection,
     _semantic_patch_payload_rejection,
     _history_strip_reason,
     _history_strip_allowed,

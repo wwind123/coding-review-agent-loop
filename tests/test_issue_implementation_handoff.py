@@ -488,7 +488,6 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
     monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
@@ -663,7 +662,6 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
     monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None

@@ -96,8 +96,12 @@ def test_pr_loop_retries_plain_agent_state_near_miss_once(tmp_path, terminator):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert runner.comments == [f"**Review verdict:** Approved\n\n{valid}"]
+    # A footer near miss is a deterministic defect: the same reviewer is
+    # re-asked with the validator message, with no ordinary-retry backoff (#2066).
     sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
-    assert sleep_commands == [["sleep", "1"]]
+    assert sleep_commands == []
+    gemini_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(gemini_prompts) == 2 and "re-ask 1 of 2" in gemini_prompts[1]
 
 def test_pr_loop_exhausted_transient_retry_reports_attempt_logs(tmp_path):
     diagnostic = "[ERROR] Invalid stream: The model returned an empty response or malformed tool call."
@@ -134,11 +138,14 @@ def test_pr_loop_treats_markerless_prose_review_as_unavailable(tmp_path):
     output = "I reviewed the PR and it looks fine."
     runner = FakeRunner(gemini_outputs=[output] * 3)
     config = make_config(
-        tmp_path, reviewer="gemini", agent_retry_backoff_seconds=0
+        tmp_path, reviewer="gemini", agent_retry_backoff_seconds=0, agent_max_retries=0
     )
 
-    with pytest.raises(AgentLoopError, match="review_substance_integrity"):
+    # The same reviewer is re-asked twice (#2066), then the turn is a reviewer
+    # availability failure; no verdict is synthesized on its behalf.
+    with pytest.raises(AgentLoopError, match="response rejected after 2 same-agent re-asks") as info:
         run_pr_loop(runner, pr_number=77, config=config)
+    assert "Failure category: agent-unavailable" in str(info.value)
 
     assert runner.comments == []
 
@@ -712,12 +719,8 @@ def test_pr_loop_single_narration_only_reviewer_stops_fatally(tmp_path):
         agent_retry_backoff_seconds=0,
     )
 
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
-    ):
-        with pytest.raises(AgentLoopError, match="review_substance_integrity"):
-            run_pr_loop(runner, pr_number=77, config=config)
+    with pytest.raises(AgentLoopError, match="response rejected after 2 same-agent re-asks"):
+        run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any("PR review incomplete" in body for body in runner.comments)
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
@@ -811,36 +814,6 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
     return outcome, records, repair_calls
 
 
-def test_pr_acknowledgement_repair_keeps_the_accepted_assessment_and_record(
-    tmp_path, monkeypatch
-):
-    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch)
-    assert repair_calls, "the acknowledgement repair must run through the flow"
-    assert '"modified"' not in repair_calls[0]
-    # Exactly one reviewer publication, made from the accepted carrier before
-    # the gate; the successful repair posts nothing new.
-    assert len(records) == 1
-    assert records[0].architecture_impact is None
-    assert [r.outcome for r in records[0].architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
-    assert outcome == 0, outcome
-
-
-@pytest.mark.parametrize("status", ["unchanged", "none"])
-def test_pr_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
-    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch, repaired_status=status)
-    assert repair_calls
-    refusal = {"unchanged": "must not introduce one", "none": "must be `changed` or `unchanged`"}
-    assert _ack_pr_run.repair_results
-    for _text, validated, attempts in _ack_pr_run.repair_results:
-        assert validated is None
-        assert refusal[status] in attempts[-1].diagnostic
-    # The refused repair leaves the approval unacknowledged: nothing merges.
-    assert outcome != 0
-    assert all(record.architecture_impact is None for record in records)
-
-
 def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
     """Interrupt right after Codex's review is posted, then resume the round."""
     requirement = HumanReviewRequirement(
@@ -923,7 +896,7 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         return repaired
 
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((architecture_contract, pr_loop, plan_first_loop), "_resumed_review_architecture", spy_resumed
-    ), patch_object_in((architecture_contract, pr_loop, plan_first_loop), "_pin_acknowledgement_repair", spy_pin):
+    ), patch_object_in((architecture_contract,), "_pin_acknowledgement_repair", spy_pin):
         try:
             outcome = run_pr_loop(runner, pr_number=77, config=config)
         except AgentLoopError as exc:
@@ -1127,7 +1100,7 @@ def test_validated_turn_removes_its_turn_directories_after_failure(tmp_path, tur
     with pytest.raises(AgentInvocationError) as info:
         _run_validated(runner, config, _validate_exact("VALID"))
     # Diagnostics read the response file before cleanup.
-    assert "Reason: invalid response" in str(info.value)
+    assert "Reason: response rejected after 2 same-agent re-asks; last validator message: invalid response" in str(info.value)
     # Failure diagnostics ran while the turn directory still existed.
     assert diagnosed and all(diagnosed)
     assert len(turn_dirs) >= 1
@@ -1424,70 +1397,6 @@ def _followup_turn_1626(tmp_path, outputs, *, repair=None, run_cli_repair=None, 
     return outcome, calls, coder_turns
 
 
-def test_prose_test_observations_are_repaired_to_a_cited_array_1626(tmp_path):
-    """Matrix row `prose-repair-succeeds`."""
-    response, calls, coder_turns = _followup_turn_1626(
-        tmp_path, [_followup_text_1626(_PROSE_1626)], repair=_REPAIRED_1626,
-    )
-    assert isinstance(response, ValidatedAgentResponse), response
-    assert response.text == _REPAIRED_1626
-    assert [item.receipt_id for item in response.marker_value.test_observations] == ["receipt-pass"]
-    assert response.marker_value.test_observation_degradations == ()
-    # The targeted repair received the tool-owned receipts of this turn.
-    [kwargs] = calls
-    assert kwargs["test_observations_shape_defect"] is True
-    assert kwargs["test_turn_receipts"] == (
-        {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "outcome": "passed"},
-    )
-    assert len(coder_turns) == 1, "no agent retry is consumed"
-    assert response.acquisition_test_observations[0].receipt_id == "receipt-pass"
-
-
-@pytest.mark.parametrize(
-    "repair",
-    [None, "prose"],
-    ids=["repair-unavailable", "repair-still-prose"],
-)
-def test_failed_repair_falls_back_to_the_after_repair_drop_1626(tmp_path, repair):
-    """Matrix row `prose-repair-fails-fallback` (legacy hook variants)."""
-    source = _followup_text_1626(_PROSE_1626)
-    response, calls, coder_turns = _followup_turn_1626(
-        tmp_path, [source], repair=(source if repair == "prose" else None),
-    )
-    assert isinstance(response, ValidatedAgentResponse), response
-    assert response.text == source
-    assert response.marker_value.test_observations == ()
-    [record] = response.marker_value.test_observation_degradations
-    assert record.outcome == "citation-dropped"
-    assert record.rule == _AFTER_REPAIR_RULE_1626
-    assert "PyICU" not in record.observed_preview
-    assert len(calls) == 1
-    assert len(coder_turns) == 1, "no agent retry is consumed"
-
-
-def test_exhausted_repair_chain_falls_back_to_the_after_repair_drop_1626(tmp_path, monkeypatch):
-    """Matrix row `prose-repair-fails-fallback` (real execute_repair, exhausted chain)."""
-    attempts = []
-
-    def failing_cli_repair(runner, config, prompt, *, model, log_path):
-        attempts.append((model, "## test_observations repair:" in prompt))
-        return SimpleNamespace(
-            text="", returncode=1, raw_output="model unavailable", usage=None,
-            raw_usage=None, observed_model=None, text_source="stdout",
-        )
-
-    source = _followup_text_1626(_PROSE_1626)
-    response, _calls, coder_turns = _followup_turn_1626(
-        tmp_path, [source], run_cli_repair=failing_cli_repair, monkeypatch=monkeypatch,
-        repair_backend="claude", repair_models=("repair-a", "repair-b"),
-    )
-    assert isinstance(response, ValidatedAgentResponse), response
-    assert attempts == [("repair-a", True), ("repair-b", True)]
-    [record] = response.marker_value.test_observation_degradations
-    assert record.rule == _AFTER_REPAIR_RULE_1626
-    assert len(coder_turns) == 1
-
-
 def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
     """Matrix row `fallback-architecture-near-miss`."""
     near_miss = {
@@ -1504,6 +1413,7 @@ def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
     assert isinstance(response, ValidatedAgentResponse), response
     parsed = response.marker_value
     assert parsed.architecture_impact.status == "changed"
+    # The degrade fallback runs only after both same-agent re-asks (#2066).
     assert [record.outcome for record in parsed.architecture_impact_degradations] == [
         "normalized-to-changed"
     ]
@@ -1511,7 +1421,7 @@ def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
     assert record.rule == _AFTER_REPAIR_RULE_1626
     # The accepted text is the canonicalized, strictly re-parsed form.
     assert '"modified"' not in response.text
-    assert len(coder_turns) == 1
+    assert len(coder_turns) == 3
 
 
 def test_fallback_does_not_mask_another_fatal_defect_1626(tmp_path):
@@ -1520,7 +1430,10 @@ def test_fallback_does_not_mask_another_fatal_defect_1626(tmp_path):
     outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
     assert isinstance(outcome, AgentLoopError)
     assert not isinstance(outcome, ValidatedAgentResponse)
-    assert len(calls) == 1
+    # Re-asked twice, never repaired, then rejected: the degrade fallback
+    # never masks the other fatal defect.
+    assert calls == []
+    assert len(coder_turns) == 3
 
 
 def test_valid_array_followup_runs_no_repair_1626(tmp_path):
@@ -1553,51 +1466,6 @@ def _with_earlier_defect_1626(text, defect):
     return json.dumps(payload) + text[end:]
 
 
-@pytest.mark.parametrize("defect", ["tests-run-string", "extra-top-level-key"])
-@pytest.mark.parametrize("repair_outcome", ["fixes-both", "fixes-other-keeps-prose", "unavailable"])
-def test_prose_with_an_earlier_checked_defect_still_gets_the_targeted_repair_1626(
-    tmp_path, defect, repair_outcome
-):
-    """Regression for review item-1: the shape defect is classified from the source.
-
-    The earlier defect raises first, yet the repair is still flagged with the
-    receipts; a candidate that fixed the other defect but kept the prose is
-    accepted by the after-repair fallback instead of failing the turn.
-    """
-    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), defect)
-    repair = {
-        "fixes-both": _REPAIRED_1626,
-        "fixes-other-keeps-prose": _followup_text_1626(_PROSE_1626),
-        "unavailable": None,
-    }[repair_outcome]
-    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=repair)
-    [kwargs] = calls
-    assert kwargs["test_observations_shape_defect"] is True
-    assert kwargs["test_turn_receipts"][0]["receipt_id"] == "receipt-pass"
-    assert len(coder_turns) == 1, "no agent retry is consumed"
-    if repair_outcome == "fixes-both":
-        assert isinstance(outcome, ValidatedAgentResponse), outcome
-        assert [item.receipt_id for item in outcome.marker_value.test_observations] == ["receipt-pass"]
-        assert outcome.marker_value.test_observation_degradations == ()
-    elif repair_outcome == "fixes-other-keeps-prose":
-        assert isinstance(outcome, ValidatedAgentResponse), outcome
-        assert outcome.text == repair
-        [record] = outcome.marker_value.test_observation_degradations
-        assert record.rule == _AFTER_REPAIR_RULE_1626
-    else:
-        # The original still carries the other defect: nothing is accepted.
-        assert isinstance(outcome, AgentLoopError)
-
-
-def test_repaired_candidate_fallback_keeps_unflagged_preservation_1626(tmp_path):
-    """A candidate that also lost content is never accepted by the fallback."""
-    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
-    lossy = _followup_text_1626(_PROSE_1626, summary="Done.")
-    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=lossy)
-    assert len(calls) == 1
-    assert isinstance(outcome, AgentLoopError)
-
-
 _NEAR_MISS_1626 = {
     "status": "modified", "rationale": "The loader changed shape.",
     "affected_components": ["loader"], "dependencies": ["json"],
@@ -1613,64 +1481,6 @@ _CITATION_1626 = {
 }
 
 
-@pytest.mark.parametrize(
-    "repaired_observations",
-    [[], [_CITATION_1626]],
-    ids=["empty-array", "cited-array"],
-)
-def test_candidate_fallback_never_rescues_an_array_that_deleted_the_prose_1626(
-    tmp_path, repaired_observations
-):
-    """Review items 3 and 6: a candidate rejected by scoped preservation stays rejected.
-
-    The earlier tests_run defect is fixed and test_observations became an
-    array, but the prose was deleted from summary and notes.  The scoped rule
-    refuses it, and the candidate fallback must not accept it either.
-    """
-    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
-    deleted = _followup_text_1626(repaired_observations)
-    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=deleted)
-    assert len(calls) == 1 and len(coder_turns) == 1
-    assert isinstance(outcome, AgentLoopError), outcome
-
-
-def test_candidate_fallback_never_rescues_an_emptied_decoded_array_1626(tmp_path):
-    """Review item 3: a JSON-array string with nine malformed items and one valid citation.
-
-    Repair to [] removes the valid decoded citation.  Scoped preservation
-    refuses it; the over-bound source is not fallback-degradable, and the
-    candidate is an array, so nothing is accepted.
-    """
-    malformed = [
-        {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
-        for index in range(9)
-    ]
-    source = _followup_text_1626(json.dumps([*malformed, _CITATION_1626]))
-    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=_followup_text_1626([]))
-    assert calls and calls[0]["test_observations_shape_defect"] is True
-    assert isinstance(outcome, AgentLoopError), outcome
-
-
-def test_candidate_fallback_keeps_the_source_architecture_record_1626(tmp_path):
-    """Review item 4: both the normalized-to-changed and after-repair records survive."""
-    source = _with_earlier_defect_1626(
-        _followup_text_1626(_PROSE_1626, architecture_impact=_NEAR_MISS_1626), "tests-run-string"
-    )
-    candidate = _followup_text_1626(
-        _PROSE_1626, architecture_impact={**_NEAR_MISS_1626, "status": "changed"}
-    )
-    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
-    assert isinstance(outcome, ValidatedAgentResponse), outcome
-    assert len(calls) == 1 and len(coder_turns) == 1
-    parsed = outcome.marker_value
-    assert parsed.architecture_impact.status == "changed"
-    assert [record.outcome for record in parsed.architecture_impact_degradations] == [
-        "normalized-to-changed"
-    ]
-    [record] = parsed.test_observation_degradations
-    assert record.rule == _AFTER_REPAIR_RULE_1626
-
-
 _OVER_BOUND_ENCODED_1626 = json.dumps([
     *[
         {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
@@ -1678,39 +1488,6 @@ _OVER_BOUND_ENCODED_1626 = json.dumps([
     ],
     _CITATION_1626,
 ])
-
-
-@pytest.mark.parametrize(
-    ("source_observations", "candidate_observations", "accepted"),
-    [
-        pytest.param(_OVER_BOUND_ENCODED_1626, "", False, id="over-bound-encoded-to-empty-string"),
-        pytest.param(_OVER_BOUND_ENCODED_1626, _PROSE_1626, False, id="over-bound-encoded-to-prose"),
-        pytest.param(_PROSE_1626, "", False, id="prose-to-empty-string"),
-        pytest.param(_PROSE_1626, "Tests passed.", False, id="prose-replaced"),
-        pytest.param(_PROSE_1626, {"note": _PROSE_1626}, False, id="prose-to-object"),
-        pytest.param(_PROSE_1626, _PROSE_1626, True, id="prose-kept-verbatim"),
-    ],
-)
-def test_candidate_fallback_requires_a_degradable_source_and_the_same_value_1626(
-    tmp_path, source_observations, candidate_observations, accepted
-):
-    """Review items 7 and 8, as one class with items 3 and 6.
-
-    The candidate fallback may only drop exactly what the pre-#1626 degrade
-    parse of the source would have dropped.  The source must itself be the
-    degradable non-array shape (an over-bound encoded array stays fatal), and
-    the candidate must keep that value verbatim (no lost or replaced prose).
-    """
-    source = _with_earlier_defect_1626(_followup_text_1626(source_observations), "tests-run-string")
-    candidate = _followup_text_1626(candidate_observations)
-    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
-    assert len(calls) == 1 and len(coder_turns) == 1
-    if accepted:
-        assert isinstance(outcome, ValidatedAgentResponse), outcome
-        [record] = outcome.marker_value.test_observation_degradations
-        assert record.rule == _AFTER_REPAIR_RULE_1626
-    else:
-        assert isinstance(outcome, AgentLoopError), outcome
 
 
 @pytest.mark.parametrize("parallel,healthy", [(False, False), (True, False), (True, True)])

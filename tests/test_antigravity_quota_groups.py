@@ -1058,8 +1058,8 @@ def test_silent_attempt_without_usable_agy_log_keeps_format_failure_path(
     assert isinstance(error, AgentInvocationError)
     assert "Antigravity unavailable" not in str(error)
     assert error.failure_category != "transient"
-    assert models == [GEM1]
-    assert repairs == [1]
+    assert models == [GEM1] * 3  # primary + two same-agent re-asks (#2066)
+    assert repairs == []
     assert not any("treating as quota exhaustion" in line for line in logs)
     if agy_log is None:
         assert any("no new matching agy log" in line for line in logs)
@@ -1081,7 +1081,7 @@ def test_silent_attempt_with_unreadable_agy_log_dir_keeps_today_behavior(tmp_pat
         )
         assert agy.quota_memory_for_current_run().entry("gemini") is None
     assert isinstance(error, AgentInvocationError)
-    assert models == [GEM1] and repairs == [1]
+    assert models == [GEM1] * 3 and repairs == []  # primary + two same-agent re-asks (#2066)
 
 
 def test_agy_log_lookup_exception_never_fails_the_turn(tmp_path, _isolated_agy_log_dir, monkeypatch):
@@ -1097,7 +1097,7 @@ def test_agy_log_lookup_exception_never_fails_the_turn(tmp_path, _isolated_agy_l
         assert agy.quota_memory_for_current_run().entry("gemini") is None
     assert "lookup exploded" not in str(error)
     assert any("agy log lookup failed: lookup exploded" in line for line in logs)
-    assert models == [GEM1] and repairs == [1]
+    assert models == [GEM1] * 3 and repairs == []  # primary + two same-agent re-asks (#2066)
 
 
 def test_prior_attempt_429_log_near_spawn_leaves_quota_unchanged(tmp_path, _isolated_agy_log_dir):
@@ -1119,9 +1119,9 @@ def test_prior_attempt_429_log_near_spawn_leaves_quota_unchanged(tmp_path, _isol
         )
         assert agy.quota_memory_for_current_run().entry("gemini") is None
         assert agy.quota_memory_for_current_run().entry("claude") is None
-    assert models == [GEM1]
+    assert models == [GEM1] * 3  # primary + two same-agent re-asks (#2066)
     assert "Antigravity unavailable" not in str(error)
-    assert repairs == [1]
+    assert repairs == []
     assert not any("treating as quota exhaustion" in line for line in logs)
     assert any("no new matching agy log" in line for line in logs)
 
@@ -1241,7 +1241,7 @@ def test_agy_log_created_after_the_locked_lookup_is_never_a_candidate(
     assert isinstance(error, AgentInvocationError)
     assert "Antigravity unavailable" not in str(error)
     assert intruder.name not in str(error)
-    assert models == [GEM1] and repairs == [1]
+    assert models == [GEM1] * 3 and repairs == []  # primary + two same-agent re-asks (#2066)
     assert not any("treating as quota exhaustion" in line for line in logs)
     assert any("no new matching agy log" in line for line in logs)
 
@@ -1336,12 +1336,14 @@ def test_repeated_narration_on_a_falls_back_to_b_and_accepts_its_review(tmp_path
     valid = structured_pr_review(reviewer=f"Google Antigravity: {MODEL_B}")
     with workdir_claims.workdir_claim_scope():
         response, error, models, logs, repairs = _review_turn(
-            tmp_path, [(NARRATION, 0), (NARRATION, 0), (valid, 0)], models=(MODEL_A, MODEL_B),
+            tmp_path, [(NARRATION, 0)] * 4 + [(valid, 0)], models=(MODEL_A, MODEL_B),
         )
     assert error is None
     assert response.model_used == MODEL_B
     assert response.marker_value.state == "approved"
-    assert models == [MODEL_A, MODEL_A, MODEL_B]
+    # The primary turn and both same-agent re-asks stay on A (#2066); each
+    # narration-only outcome then counts as one format failure.
+    assert models == [MODEL_A, MODEL_A, MODEL_A, MODEL_A, MODEL_B]
     assert repairs == []  # the substance gate refused repair before any backend call
     assert (
         f"Antigravity: {MODEL_A} produced no recoverable structured payload 2 times; "
@@ -1353,17 +1355,17 @@ def test_single_narration_with_no_retries_falls_back_at_once(tmp_path):
     valid = structured_pr_review(reviewer=f"Google Antigravity: {MODEL_B}")
     with workdir_claims.workdir_claim_scope():
         response, error, models, _logs, _repairs = _review_turn(
-            tmp_path, [(NARRATION, 0), (valid, 0)], models=(MODEL_A, MODEL_B), agent_max_retries=0,
+            tmp_path, [(NARRATION, 0)] * 3 + [(valid, 0)], models=(MODEL_A, MODEL_B), agent_max_retries=0,
         )
     assert error is None and response.model_used == MODEL_B
-    assert models == [MODEL_A, MODEL_B]
+    assert models == [MODEL_A, MODEL_A, MODEL_A, MODEL_B]
 
 
 @pytest.mark.parametrize(
     "models,outputs,expected_models",
     [
-        ((MODEL_A,), [(NARRATION, 0)] * 6, [MODEL_A, MODEL_A]),
-        ((MODEL_A, MODEL_B), [(NARRATION, 0)] * 6, [MODEL_A, MODEL_A, MODEL_B]),
+        ((MODEL_A,), [(NARRATION, 0)] * 6, [MODEL_A] * 4),
+        ((MODEL_A, MODEL_B), [(NARRATION, 0)] * 6, [MODEL_A] * 4 + [MODEL_B]),
     ],
     ids=["single-model", "chain-exhausted"],
 )
@@ -1375,10 +1377,11 @@ def test_seat_is_unavailable_only_when_the_chain_is_exhausted(tmp_path, models, 
     assert response is None
     assert isinstance(error, AgentInvocationError)
     assert error.failure_category == "agent-unavailable"
-    assert "review_substance_integrity" in str(error)
+    assert "response rejected after 2 same-agent re-asks" in str(error)
     assert models_run == expected_models
-    # Bounded by max_attempts (len(models) + retries + 2), and no synthesized verdict.
-    assert len(models_run) <= len(models) + 1 + 2
+    # Bounded by max_attempts (len(models) + retries + 2 + the two re-asks),
+    # and no synthesized verdict.
+    assert len(models_run) <= len(models) + 1 + 2 + 2
     assert repairs == []
 
 

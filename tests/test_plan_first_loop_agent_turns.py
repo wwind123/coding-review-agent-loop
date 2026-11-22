@@ -66,8 +66,10 @@ def test_plan_loop_retries_plain_agent_plan_state_near_miss_once(tmp_path):
 
     assert near_miss not in runner.comments
     assert any(comment == f"**Review verdict:** Approved\n\n{valid}" for comment in runner.comments)
+    # The footer near miss is re-asked to the same reviewer (#2066), with no
+    # ordinary-retry backoff.
     sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
-    assert sleep_commands == [["sleep", "1"]]
+    assert sleep_commands == []
 
 
 def test_run_plan_loop_freeform_initial_plan_includes_model(tmp_path):

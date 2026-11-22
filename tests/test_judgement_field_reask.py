@@ -1,4 +1,4 @@
-"""A missing or invalid reviewer judgement field is re-asked once (#1185)."""
+"""A missing or invalid reviewer judgement field is re-asked to the same reviewer (#1185, #2066)."""
 from unittest.mock import patch
 
 import pytest
@@ -150,29 +150,38 @@ def test_second_invalid_status_stops_without_repair(tmp_path):
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError, match="status"):
             _run(runner, config)
-    assert len(_codex(runner)) == 2
+    # The primary turn and the two shared re-asks; never a fourth dispatch.
+    assert len(_codex(runner)) == 3
     assert repairs == []
 
 
-def test_flag_off_has_no_reask_and_review_skips_repair(tmp_path):
+def test_retired_flag_off_still_reasks_through_the_shared_rule(tmp_path):
     runner = FakeRunner(codex_outputs=[BAD, BAD, BAD, BAD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError):
             _run(runner, config, judgement=False)
-    assert all(HEADING not in cmd for cmd in _codex(runner))
+    commands = _codex(runner)
+    assert len(commands) == 3
+    assert all(HEADING in cmd for cmd in commands[1:])
     assert repairs == []
 
 
 @pytest.mark.parametrize("first,second", [(OMITTED, BAD), (BAD, OMITTED)])
-def test_single_slot_is_shared(tmp_path, first, second):
+def test_both_causes_share_the_two_reask_budget(tmp_path, first, second):
     runner = FakeRunner(codex_outputs=[first, second, GOOD, GOOD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder([])):
-        with pytest.raises(AgentLoopError):
-            _run(runner, config, omission=True)
-    assert len(_codex(runner)) == 2
+        response = _run(runner, config, omission=True)
+    assert "GOOD" in response.text
+    commands = _codex(runner)
+    assert len(commands) == 3
+    # Each re-ask carries the typed hint for its own cause.
+    omission_heading = "Previous response not accepted: prior item dispositions"
+    for command, source in zip(commands[1:], (first, second)):
+        expected = omission_heading if source is OMITTED else HEADING
+        assert expected in command
 
 
 def _review(status, kind="pr_review", drop_kind=False):
@@ -293,9 +302,11 @@ def test_terminal_diagnostic_names_field_and_repair_refusal(tmp_path, status, ju
             _run_real(runner, config, judgement=judgement)
     message = str(info.value)
     assert "architecture_impact.status" in message
-    assert "changed | unchanged" in message and "repair skipped" in message
+    assert "changed | unchanged" in message
+    assert "response rejected after 2 same-agent re-asks" in message
     assert repairs == []
-    assert len(_codex(runner)) == (2 if judgement else 1)
+    # The retired opt-in flag no longer changes the shared budget.
+    assert len(_codex(runner)) == 3
 
 
 def test_real_validator_reasks_out_of_enum_status_once(tmp_path):
@@ -322,7 +333,7 @@ def test_real_validator_reasks_out_of_enum_status_once(tmp_path):
     ],
 )
 @pytest.mark.parametrize("status", ["update", _ABSENT])
-def test_mixed_defect_goes_to_repair_without_spending_the_reask(tmp_path, status, extra):
+def test_mixed_defect_is_reasked_without_the_judgement_hint(tmp_path, status, extra):
     bad = _pr("MIXED", _imp(status, **extra))
     runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
@@ -330,47 +341,17 @@ def test_mixed_defect_goes_to_repair_without_spending_the_reask(tmp_path, status
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError):
             _run_real(runner, config)
-    assert len(repairs) >= 1
-    assert all(HEADING not in cmd for cmd in _codex(runner))
+    assert repairs == []
+    commands = _codex(runner)
+    # A mixed defect is not a typed judgement miss: the shared re-asks carry
+    # the validator message, never the judgement-field hint.
+    assert len(commands) == 3
+    assert all(HEADING not in cmd for cmd in commands)
+    assert all("re-ask" in cmd for cmd in commands[1:])
 
 
 @pytest.mark.parametrize("drop_kind", [False, True])
-@pytest.mark.parametrize("source_impact", [_imp("update", unknown_key=1), None, ...])
-def test_invented_status_from_repair_is_never_accepted(tmp_path, drop_kind, source_impact):
-    # A structural defect masks the status defect so the response reaches repair;
-    # the repair model then fabricates a decision the reviewer never made.
-    source = structured_pr_review(summary="Masked.")
-    head, _, tail = source.partition("\n")
-    payload = json.loads(head)
-    if source_impact is not None and source_impact is not ...:
-        payload["architecture_impact"] = source_impact
-    elif source_impact is ...:
-        payload["architecture_impact"] = None
-    payload["blocking_items"] = "not-a-list"
-    if drop_kind:
-        del payload["kind"]
-    bad = json.dumps(payload) + "\n" + tail
-    fabricated = structured_pr_review(summary="Masked.")
-    fabricated = _with_impact(fabricated, _imp("unchanged"))
-    runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
-    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    calls: list[str] = []
-
-    def fake_attempt(raw, cmd, **kw):
-        calls.append(raw)
-        return fabricated
-
-    with patch.object(validated_agent, "attempt_repair", fake_attempt):
-        with pytest.raises(AgentLoopError) as info:
-            _run_real(runner, config)
-    assert calls, "repair was never attempted"
-    assert (
-        "Repair content preservation failed for architecture_impact.status" in str(info.value)
-    )
-
-
-@pytest.mark.parametrize("drop_kind", [False, True])
-def test_control_masked_source_with_declared_status_is_repaired(tmp_path, drop_kind):
+def test_control_masked_source_with_declared_status_is_reasked_and_accepted(tmp_path, drop_kind):
     # Same masked structural defect, but the reviewer declared the status: the
     # guard must let a status-preserving format repair through.
     head, _, tail = structured_pr_review(summary="Masked.").partition("\n")
@@ -381,11 +362,12 @@ def test_control_masked_source_with_declared_status_is_repaired(tmp_path, drop_k
         del payload["kind"]
     bad = json.dumps(payload) + "\n" + tail
     fixed = _with_impact(structured_pr_review(summary="Masked."), _imp("unchanged"))
-    runner = FakeRunner(codex_outputs=[bad])
+    runner = FakeRunner(codex_outputs=[bad, fixed])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch.object(validated_agent, "attempt_repair", lambda raw, cmd, **kw: fixed):
-        response = _run_real(runner, config)
+    # The reviewer itself resends the corrected review; no repair model runs.
+    response = _run_real(runner, config)
     assert "Masked." in response.text
+    assert len(_codex(runner)) == 2
 
 
 def _pr_panel(target_round2):

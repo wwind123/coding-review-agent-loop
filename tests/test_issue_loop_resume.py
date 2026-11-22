@@ -879,7 +879,8 @@ def test_rejected_legacy_evidence_response_resumes_same_pr_without_reimplementat
     runner.codex_outputs = ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
-    assert first_coder_calls == 1
+    # The rejected implementation and its two same-agent re-asks (#2066).
+    assert first_coder_calls == 3
     assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == first_coder_calls
     assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
     assert not any("PR #" in comment and "duplicate" in comment.lower() for comment in runner.comments)

@@ -982,7 +982,7 @@ def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tm
         return result
     monkeypatch.setattr(pr_loop, "_reconcile_human_requirements_ack_item", reconcile)
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3)) == 0
-    assert len(calls) == 2
+    assert calls == []  # no acknowledgement repair runs (#2066)
     assert clears
     from types import SimpleNamespace
     records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr")
@@ -1004,7 +1004,7 @@ def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_pat
     )
     with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
-    assert len(calls) == 1
+    assert calls == []  # no acknowledgement repair runs (#2066)
     from types import SimpleNamespace
     failures = [r for r in _extract_round_metadata_records(
         [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
@@ -1066,7 +1066,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     before = records()
     publications = [r for r in before if r.metadata.phase == "publication"]
     assert {r.metadata.agent for r in publications} == {"Codex", "Gemini"}
-    assert len(calls) == 2
+    assert calls == []  # no acknowledgement repair runs (#2066)
     runner.codex_outputs.append(_code_requirement_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     runner.gemini_outputs.append(_code_requirement_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     if not fresh_read:
@@ -1101,7 +1101,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     after = records()
     assert len([r for r in after if r.metadata.phase == "publication"]) == 4
     assert not runner.codex_outputs and not runner.gemini_outputs
-    assert len(calls) == 2
+    assert calls == []  # no acknowledgement repair runs (#2066)
     assert snapshots and any(i.item_id == ACK_ID for i in snapshots[-1][0])
     assert not snapshots[-1][1]
     assert after[:len(before)] == before

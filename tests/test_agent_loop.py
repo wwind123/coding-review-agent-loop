@@ -1201,7 +1201,8 @@ def test_config_preflight_checks_only_unique_configured_agents(monkeypatch, tmp_
     config = config_from_args(args, Runner())
 
     assert config.coder == "codex"
-    assert checked == ["codex", "agy"]
+    # No repair backend is preflighted any more (#2066).
+    assert checked == ["codex"]
 
 
 def test_config_preflight_accepts_custom_absolute_command(tmp_path):
@@ -3128,13 +3129,12 @@ def test_sandboxed_rejects_every_passthrough_agent_arg(tmp_path, passthrough):
         config_from_args(args, FakeRunner())
 
 
-def test_sandboxed_names_default_repair_backend_before_command_preflight(tmp_path):
+def test_sandboxed_no_longer_names_a_repair_backend_before_command_preflight(tmp_path):
+    # --repair-backend is a deprecated no-op (#2066): sandboxed mode needs no
+    # repair selection, while the semantic follow-up selection still applies.
     args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", "--semantic-followup-backend", "claude")
-    with pytest.raises(AgentLoopError, match="--repair-backend claude\\|codex --repair-model MODEL"):
-        config_from_args(args, FakeRunner())
-    args = _permission_args(
-        tmp_path, "--agent-permissions", "sandboxed", "--repair-backend", "codex", "--repair-model", "m"
-    )
+    config_from_args(args, FakeRunner())
+    args = _permission_args(tmp_path, "--agent-permissions", "sandboxed")
     with pytest.raises(AgentLoopError, match="--no-semantic-followup-dedupe"):
         config_from_args(args, FakeRunner())
 
@@ -5264,34 +5264,16 @@ def _preflight_args(monkeypatch, extra, missing=("agy",)):
     return args, detection_calls, which_calls
 
 
-def _assert_repair_hint(message):
-    assert "--repair-backend" in message
-    assert "default is antigravity" in message
-    assert "--repair-backend codex --repair-model MODEL" in message
-    assert "--repair-backend claude --repair-model MODEL" in message
-    assert "--antigravity-cmd" in message
-
-
 @pytest.mark.parametrize("extra", [[], ["--repair-backend", "antigravity"]])
-def test_config_preflight_names_repair_backend_when_agy_missing(monkeypatch, extra):
-    args, detection_calls, _ = _preflight_args(monkeypatch, extra)
-
-    with pytest.raises(AgentLoopError, match="agy CLI not found on PATH") as exc:
-        config_from_args(args, Runner())
-
-    _assert_repair_hint(str(exc.value))
-    assert detection_calls == []
-
-
-def test_config_preflight_repair_hint_for_absolute_antigravity_cmd(monkeypatch):
-    args, _, _ = _preflight_args(
-        monkeypatch, ["--antigravity-cmd", "/missing/agy"], missing=("/missing/agy",)
+def test_config_preflight_never_requires_agy_for_the_retired_repair_backend(monkeypatch, extra):
+    args, _, which_calls = _preflight_args(monkeypatch, extra)
+    monkeypatch.setattr(
+        "coding_review_agent_loop.config.detect_repo",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
     )
-
-    with pytest.raises(AgentLoopError, match="not found or not executable") as exc:
+    with pytest.raises(RuntimeError, match="past preflight"):
         config_from_args(args, Runner())
-
-    _assert_repair_hint(str(exc.value))
+    assert "agy" not in which_calls
 
 
 def test_config_preflight_antigravity_role_keeps_generic_message(monkeypatch):
@@ -5309,17 +5291,6 @@ def test_config_preflight_antigravity_role_keeps_generic_message(monkeypatch):
     assert str(exc.value) == "agy CLI not found on PATH; install it or pass --antigravity-cmd <path>."
 
 
-def test_config_preflight_default_repair_backend_is_antigravity(monkeypatch):
-    args, _, _ = _preflight_args(monkeypatch, [], missing=())
-    assert args.repair_backend == "antigravity"
-    monkeypatch.setattr(
-        "coding_review_agent_loop.config.detect_repo",
-        lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
-    )
-    with pytest.raises(RuntimeError, match="past preflight"):
-        config_from_args(args, Runner())
-
-
 def test_config_preflight_explicit_codex_repair_does_not_look_up_agy(monkeypatch):
     args, _, which_calls = _preflight_args(
         monkeypatch, ["--repair-backend", "codex", "--repair-model", "X"]
@@ -5335,22 +5306,19 @@ def test_config_preflight_explicit_codex_repair_does_not_look_up_agy(monkeypatch
     assert args.repair_model == ["X"]
 
 
-def test_config_preflight_codex_repair_without_model_example(monkeypatch):
+def test_config_preflight_codex_repair_without_model_is_accepted(monkeypatch):
     args, _, _ = _preflight_args(
-        monkeypatch, ["--repair-backend", "codex", "--repo", "owner/repo"]
+        monkeypatch, ["--repair-backend", "codex", "--repo", "owner/repo"], missing=()
     )
-    with pytest.raises(AgentLoopError, match="requires an explicit --repair-model") as exc:
-        config_from_args(args, Runner())
-    assert "--repair-model MODEL" in str(exc.value)
+    config_from_args(args, Runner())
 
 
-def test_repair_backend_help_names_default_and_alternative(capsys):
+def test_repair_backend_help_says_deprecated_noop(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["task", "x", "--help"])
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "default: antigravity" in help_text
-    assert "agy CLI even when no role uses Antigravity" in help_text
-    assert "--repair-backend codex|claude --repair-model MODEL" in help_text
+    assert "Deprecated no-op. A rejected structured response is re-asked to the same agent" in help_text
+    assert "agy CLI even when no role uses Antigravity" not in help_text
 
 
 # ── #1269: validated-agent loop driven with Codex provider-error streams ──────

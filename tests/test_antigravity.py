@@ -2978,7 +2978,9 @@ def test_validated_turn_rejects_structured_output_with_wrong_schema_version(tmp_
         )
     assert "schema_version" in str(excinfo.value)
     cmds = [c for c, _ in runner.commands if c[:1] == ["agy"]]
-    assert len(cmds) == 1 and "--output-format" in cmds[0] and "--json-schema" not in cmds[0]
+    # The primary turn and two same-agent re-asks (#2066), all structured.
+    assert len(cmds) == 3
+    assert all("--output-format" in cmd and "--json-schema" not in cmd for cmd in cmds)
 
 
 @pytest.mark.parametrize(

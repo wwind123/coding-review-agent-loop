@@ -1216,14 +1216,14 @@ def _format_invalid_agent_response_error(
     ):
         category_hint = (
             " Failure category: semantic-evidence-rejection (a risk-matrix claim selected a "
-            "test observation that cannot carry authority; repair was skipped because "
-            "reformatting cannot change it)."
+            "test observation that cannot carry authority, and the same-agent re-asks "
+            "did not produce a citable one)."
         )
     elif category == "deterministic" and classification_text == _JUDGEMENT_FIELD_CLASSIFICATION:
         category_hint = (
             " Failure category: reviewer-judgement (the reviewer did not supply a valid "
-            "judgement field after one re-ask; repair was skipped because reformatting "
-            "cannot supply the reviewer's decision, and a rerun asks the reviewer again)."
+            "judgement field after the same-agent re-asks; only the reviewer can supply "
+            "its decision, and a rerun asks the reviewer again)."
         )
     elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
         category_hint = (

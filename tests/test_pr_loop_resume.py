@@ -1731,7 +1731,7 @@ def _classification_failed_round(tmp_path, *, codex_state="approved", codex_bloc
     runner.codex_outputs = [published, bad, bad]
     runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in rids],
                                                 reviewer="Google Gemini", hr=True)]
-    with pytest.raises(AgentLoopError, match="repair skipped because the reviewer did not supply requirement_evidence"):
+    with pytest.raises(AgentLoopError, match="the reviewer did not supply requirement_evidence"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert not runner.codex_outputs and not runner.gemini_outputs
     return runner, config, rids

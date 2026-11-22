@@ -585,15 +585,15 @@ def _claude_commands(h):
     return [cmd for cmd, _cwd in h.runner.commands if cmd and cmd[0] == "claude"]
 
 
-@pytest.mark.parametrize("path", ["plain", "repair", "failed-exit-artifact", "completion-recovery"])
+@pytest.mark.parametrize("path", ["plain", "reask", "failed-exit-artifact", "completion-recovery"])
 def test_workflow_every_real_acceptance_path_reaches_the_single_coverage_reask(tmp_path, monkeypatch, path):
     from coverage_reask_helpers import CoverageHarness
 
     incomplete, ok = _real_agent_texts()
     outputs = [incomplete, ok, ok]
     repair_calls = []
-    if path == "repair":
-        outputs = [incomplete.replace('"kind"', "kind", 1), ok, ok]
+    if path == "reask":
+        outputs = [incomplete.replace('"kind"', "kind", 1), incomplete, ok, ok]
     elif path == "failed-exit-artifact":
         outputs = [("command failed", 1), ok, ok]
     elif path == "completion-recovery":
@@ -603,19 +603,17 @@ def test_workflow_every_real_acceptance_path_reaches_the_single_coverage_reask(t
         })
         outputs = [wait, incomplete, ok, ok]
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=outputs)
-    if path == "repair":
-        monkeypatch.setattr(
-            validated_agent_module, "attempt_repair",
-            lambda raw, *a, **k: repair_calls.append(k.get("expected_kind")) or incomplete,
-        )
     if path == "failed-exit-artifact":
         h.runner.public_response_outputs = [incomplete]
     assert h.run() == 0
     commands = _claude_commands(h)
-    expected_calls = 3 if path == "completion-recovery" else 2
+    # A malformed first response is re-asked to the same coder (#2066).
+    expected_calls = 3 if path in {"completion-recovery", "reask"} else 2
     assert len(commands) == expected_calls
     assert "row-man: missing-row" in commands[-1][-1]
-    assert repair_calls == (["issue_implementation"] if path == "repair" else [])
+    if path == "reask":
+        assert "re-ask 1 of 2" in commands[1][-1]
+    assert repair_calls == []
     comment = h.coder_comment()
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert h.run_pr_calls
@@ -1028,19 +1026,13 @@ def _report_refusal(text):
 
 
 @pytest.mark.parametrize("stage", ["initial", "coverage"])
-@pytest.mark.parametrize("surface", ["direct", "normalized", "repair"])
+@pytest.mark.parametrize("surface", ["direct", "normalized"])
 def test_workflow_report_correction_succeeds(tmp_path, monkeypatch, stage, surface):
     incomplete, ok = _real_agent_texts()
     refused = _report_refusal(ok)
     if surface == "normalized":
         payload, _end = json.JSONDecoder().raw_decode(refused)
         refused = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
-    elif surface == "repair":
-        repaired = refused
-        payload, end = json.JSONDecoder().raw_decode(refused)
-        payload["summary"] = ""
-        refused = json.dumps(payload) + refused[end:]
-        monkeypatch.setattr(validated_agent_module, "attempt_repair", lambda *_a, **_k: repaired)
     outputs = ([incomplete] if stage == "coverage" else []) + [json.dumps({"result": refused, "session_id": "refused-session"}), ok]
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=outputs)
     assert h.run() == 0
@@ -1056,8 +1048,8 @@ def test_workflow_report_correction_succeeds(tmp_path, monkeypatch, stage, surfa
 
 
 @pytest.mark.parametrize("order", ["report-report", "report-selector", "selector-report"])
-@pytest.mark.parametrize("surface", ["direct", "normalized", "repair"])
-def test_workflow_coverage_refusals_share_one_correction(tmp_path, monkeypatch, order, surface):
+@pytest.mark.parametrize("surface", ["direct", "normalized"])
+def test_workflow_coverage_refusals_share_the_reask_budget(tmp_path, monkeypatch, order, surface):
     incomplete, ok = _real_agent_texts()
     report = _report_refusal(ok)
     selector_payload, end = json.JSONDecoder().raw_decode(ok)
@@ -1073,15 +1065,11 @@ def test_workflow_coverage_refusals_share_one_correction(tmp_path, monkeypatch, 
     if surface == "normalized":
         payload, _end = json.JSONDecoder().raw_decode(first)
         first = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
-    elif surface == "repair":
-        repaired = first
-        payload, end = json.JSONDecoder().raw_decode(first)
-        payload["summary"] = ""
-        first = json.dumps(payload) + first[end:]
-        monkeypatch.setattr(validated_agent_module, "attempt_repair", lambda *_a, **_k: repaired)
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[incomplete, first, second])
     assert h.run() == 0
-    assert len(_claude_commands(h)) == 3
+    # The coverage re-ask, then both same-agent re-asks of its refused
+    # responses (the second resent unchanged): the budget is shared (#2066).
+    assert len(_claude_commands(h)) == 4
     assert "coverage re-ask response discarded" in h.coder_comment()
     assert "incomplete at" in h.coder_comment()
     assert h.run_pr_calls
@@ -1110,10 +1098,13 @@ def test_workflow_report_correction_refreshes_original_pr(tmp_path, monkeypatch,
         monkeypatch.setattr(issue_implementation, "publish_issue_created_authorization",
                             lambda *_a, **kw: events.append(("publish", kw["metadata"].head_sha)) or kw["handoff"])
     next_output = h.runner._next_agent_output
-    def push_during_correction(outputs):
-        if outputs is h.runner.claude_outputs and len(outputs) == 1:
+    def push_during_correction(outputs, **kwargs):
+        # The coder pushes during the coverage re-ask (which may commit and
+        # push); the tests_run correction that follows is a resend-only
+        # same-agent re-ask that must leave the head alone (#2066).
+        if outputs is h.runner.claude_outputs and len(outputs) == 2:
             h.commit_file("tests/test_corrected.py", push=True)
-        return next_output(outputs)
+        return next_output(outputs, **kwargs)
     monkeypatch.setattr(h.runner, "_next_agent_output", push_during_correction)
     assert h.run() == 0
     assert len(_claude_commands(h)) == 3

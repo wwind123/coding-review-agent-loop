@@ -1,4 +1,4 @@
-"""A reviewer that omits a carried-item disposition is re-asked once (#1167)."""
+"""A reviewer that omits a carried-item disposition is re-asked by the same reviewer (#1167, #2066)."""
 
 import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
@@ -132,7 +132,7 @@ def test_omission_is_reasked_once_on_same_model_and_accepted(tmp_path, backend):
         assert len(models) == 2 and models[0] == models[1] == "ModelA"
     assert repair_calls == []
     assert not any(_is_sleep(cmd) for cmd, _cwd in runner.commands)
-    assert any("re-asking the same reviewer once (no repair)" in line for line in logs)
+    assert any("re-asking the same agent (1/2" in line for line in logs)
     assert not any("retry" in line.lower() and "re-asking" not in line for line in logs)
 
 
@@ -144,35 +144,37 @@ def test_second_omission_follows_existing_path_with_no_third_invocation(tmp_path
         with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-4"):
             _run(runner, config)
 
-    assert len(_agent_commands(runner, "codex")) == 2
-    # The unchanged path is allowed to attempt (and be refused by) repair for
-    # the second omission; it never fabricates the missing disposition.
-    assert len(repair_calls) <= 1
+    # The primary turn plus the two shared re-asks; no repair ever runs, so
+    # nothing can fabricate the missing disposition.
+    assert len(_agent_commands(runner, "codex")) == 3
+    assert repair_calls == []
 
 
-def test_malformed_response_goes_to_repair_without_reask(tmp_path):
-    runner = FakeRunner(codex_outputs=["not json at all", "not json at all"])
+def test_malformed_response_is_reasked_without_the_omission_hint(tmp_path):
+    runner = FakeRunner(codex_outputs=["not json at all", "not json at all", "not json at all"])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repair_calls: list[str] = []
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)):
         with pytest.raises(AgentLoopError):
             _run(runner, config)
 
-    assert len(repair_calls) == 1
+    assert repair_calls == []
     commands = _agent_commands(runner, "codex")
+    assert len(commands) == 3
     assert not any(ADDENDUM_HEADING in "\n".join(cmd) for cmd in commands)
+    assert all("malformed review" in "\n".join(cmd) for cmd in commands[1:])
 
 
-def test_flag_off_does_not_reask(tmp_path):
+def test_retired_flag_off_still_reasks_the_omission(tmp_path):
     runner = FakeRunner(codex_outputs=[OMITTED, OMITTED, OMITTED])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder([])):
         with pytest.raises(AgentLoopError):
             _run(runner, config, reask=False)
 
-    assert not any(
-        ADDENDUM_HEADING in "\n".join(cmd) for cmd in _agent_commands(runner, "codex")
-    )
+    commands = _agent_commands(runner, "codex")
+    assert len(commands) == 3
+    assert all(ADDENDUM_HEADING in "\n".join(cmd) for cmd in commands[1:])
 
 
 def test_validator_raises_typed_omission_with_unchanged_message():
@@ -394,46 +396,30 @@ def test_parallel_worker_reasks_with_real_validator_without_repair_or_fallback(t
     assert not any("falling back" in line.lower() or "retrying" in line.lower() for line in logs)
 
 
-def test_parallel_worker_second_omission_stops_and_repair_cannot_fabricate(tmp_path):
+def test_parallel_worker_third_omission_stops_without_a_fourth_turn(tmp_path):
     runner = _panel_runner("codex", [
         structured_pr_review(summary="Omits item-1."),
         structured_pr_review(summary="Still omits item-1."),
-        structured_pr_review(summary="Third turn must never be requested."),
+        structured_pr_review(summary="Omits item-1 again."),
+        structured_pr_review(summary="Fourth turn must never be requested."),
     ])
-    repair_inputs: list[str] = []
+    with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-1"):
+        run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
 
-    def fabricating_repair(raw, *args, **kwargs):
-        repair_inputs.append(raw)
-        # A repair model asserting a judgement the reviewer never made.
-        return structured_pr_review(
-            summary="Still omits item-1.", prior_item_dispositions=_ITEM1_DISPOSED
-        )
-
-    with patch.object(validated_agent, "attempt_repair", fabricating_repair):
-        with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-1"):
-            run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
-
-    # The real preservation check rejected the fabricated disposition.
-    assert len(repair_inputs) == 1
     commands = _target_commands(runner, "codex")
-    assert len(commands) == 3  # round 1 + first omission + exactly one re-ask
-    assert ADDENDUM_HEADING in "\n".join(commands[2])
-    assert not any("Third turn must never" in cmd for cmd in map("\n".join, commands))
+    # Round 1 + the omission + exactly two shared re-asks; nothing is repaired.
+    assert len(commands) == 4
+    assert all(ADDENDUM_HEADING in "\n".join(cmd) for cmd in commands[2:])
+    assert not any("Fourth turn must never" in cmd for cmd in map("\n".join, commands))
 
 
-def test_parallel_worker_malformed_review_goes_to_repair_without_reask(tmp_path):
+def test_parallel_worker_malformed_review_is_reasked_without_the_omission_hint(tmp_path):
     runner = _panel_runner("codex", [malformed_pr_review_source(summary="Malformed envelope.")])
-    repair_calls: list[str] = []
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
 
-    def recording_repair(raw, *args, **kwargs):
-        repair_calls.append(raw)
-        return None
-
-    with patch.object(validated_agent, "attempt_repair", recording_repair):
-        with pytest.raises(AgentLoopError):
-            run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
-
-    assert len(repair_calls) >= 1
     commands = _target_commands(runner, "codex")
-    assert len(commands) == 2  # round 1 plus the single malformed round-2 turn
+    # Round 1, the malformed round-2 turn and its two re-asks (resending it).
+    assert len(commands) == 4
     assert not any(ADDENDUM_HEADING in "\n".join(cmd) for cmd in commands)
+    assert all("re-ask" in "\n".join(cmd) for cmd in commands[2:])

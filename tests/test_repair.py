@@ -15,7 +15,7 @@ from coding_review_agent_loop.repair import (
     require_recoverable_fresh_risk_test_matrix_contract,
 )
 from coding_review_agent_loop.errors import AgentLoopError, FreshContractIntegrityError
-from coding_review_agent_loop.validated_agent import _run_structured_repair
+_run_structured_repair = None  # the validated repair route was retired (#2066)
 from coding_review_agent_loop.protocol_risk import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
@@ -103,30 +103,6 @@ def test_fresh_matrix_repair_prompt_renders_exact_schema_and_examples():
     assert "Validator-accepted applicable matrix example" in prompt
     assert "Validator-accepted not-applicable matrix example" in prompt
     assert "Do not invent, omit, or weaken matrix scenarios." in prompt
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        '{"kind":"plan_revision_patch","operations":[{"op":"replace"',
-        '{"schema_version":1,"kind":"plan_revision_patch","operations":',
-    ],
-)
-def test_semantic_patch_repair_rejects_malformed_source_before_model_call(raw):
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        repaired, parsed, attempts = _run_structured_repair(
-            raw,
-            runner=None,
-            config=SimpleNamespace(gemini_cmd="gemini"),
-            usage_context=None,
-            validate=lambda text: text,
-            repair_kwargs={"expected_kind": "plan_revision_patch"},
-        )
-
-    assert repaired is None
-    assert parsed is None
-    assert attempts[-1].outcome == "semantic_patch_integrity"
-    repair_mock.assert_not_called()
 
 
 def test_semantic_patch_disposition_normalization_renames_rationale_losslessly():
@@ -669,50 +645,6 @@ def test_planning_repair_prompt_uses_active_context(
     )
     assert must_contain in prompt
     assert "malformed response cannot establish a requirement" in prompt
-
-
-def test_plan_revision_repair_strips_fabricated_ack_without_signed_requirement_context(tmp_path):
-    malformed = structured_plan_revision(reviewer="Anthropic Claude").replace(
-        "\n<!-- AGENT_PLAN_STATE: blocking -->",
-        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
-        "### Human requirements\n"
-        "- Requirement 1: acceptance criteria mentioned in the issue.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->",
-        1,
-    )
-    repaired = structured_plan_revision(reviewer="Anthropic Claude")
-    runner = FakeRunner(claude_outputs=[malformed])
-    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired) as repair_mock:
-        def validate_without_ack(text):
-            if HUMAN_REQUIREMENTS_ADDRESSED_MARKER in text or "### Human requirements" in text:
-                raise AgentLoopError("fabricated human requirements acknowledgement")
-            return _validate_plan_revision_response(text, architecture_status_mode="legacy")
-
-        response = _run_validated_agent(
-            runner,
-            agent="claude",
-            config=config,
-            prompt="Revise the plan.",
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=validate_without_ack,
-            use_repair=True,
-            repair_expected_kind="plan_revision",
-            repair_surfaced_requirement_ids=(),
-            repair_requires_direct_discussion_ack=False,
-        )
-
-    assert response.text == repaired
-    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER not in response.text
-    assert "### Human requirements" not in response.text
-    repair_mock.assert_called_once_with(
-        malformed,
-        config.gemini_cmd,
-        expected_kind="plan_revision",
-        surfaced_requirement_ids=(),
-        requires_direct_discussion_ack=False,
-    )
 
 
 def test_repair_prompt_makes_research_intent_conditional_on_active_status():
@@ -1670,35 +1602,6 @@ def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path, stream)
     assert "timeout diagnostic" in result.stdout
     assert "timeout diagnostic" in log_path.read_text(encoding="utf-8")
 
-def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):
-    """Repair pass is invoked when schema validation fails; repaired output is used."""
-    malformed_review = malformed_pr_review_source(
-        state="approved", summary="Looks good overall."
-    )
-    repaired_review = (
-        '{"schema_version":1,"kind":"pr_review","state":"approved","summary":"Looks good overall.",'
-        '"blocking_items":[],"same_pr_followups":[],"future_followups":[],'
-        '"prior_item_dispositions":[]}'
-        "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
-    )
-    runner = FakeRunner(
-        codex_outputs=[malformed_review],
-    )
-    config = make_config(tmp_path, coder="claude", reviewer="codex", agent_max_retries=0)
-
-    captured_repairs = []
-
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append(raw)
-        assert expected_kind == "pr_review"
-        return repaired_review
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        run_pr_loop(runner, pr_number=77, config=config)
-
-    assert len(captured_repairs) == 1
-    assert "AGENT_STATE: approved" in captured_repairs[0]
-
 def test_run_validated_agent_envelope_normalization_recovers_duplicate_footer(tmp_path):
     malformed_review = (
         structured_pr_review(
@@ -1741,142 +1644,6 @@ def test_run_validated_agent_envelope_normalization_recovers_duplicate_footer(tm
         "item-2": "future",
         "item-3": "resolved",
     }
-
-def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(tmp_path):
-    malformed_review = (
-        structured_pr_review(
-            state="approved",
-            reviewer="Google Gemini",
-            blocking_items=["This is semantically inconsistent."],
-        )
-        + "\n\n<!-- AGENT_STATE: approved -->"
-    )
-    repaired_review = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=["This is semantically inconsistent."],
-    )
-    runner = FakeRunner(gemini_outputs=[malformed_review])
-    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-    normalized_review = attempt_envelope_normalization(malformed_review, expected_kind="pr_review")
-
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        return_value=repaired_review,
-    ) as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="gemini",
-            config=config,
-            prompt="Review the PR.",
-            marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: parse_structured_pr_review(
-                text,
-                reviewer="Google Gemini",
-            ).state,
-            use_repair=True,
-            repair_expected_kind="pr_review",
-        )
-
-    assert response.text == repaired_review
-    repair_mock.assert_called_once_with(
-        normalized_review,
-        config.gemini_cmd,
-        expected_kind="pr_review",
-    )
-
-def test_run_validated_agent_attempt_repair_uses_envelope_normalized(tmp_path, monkeypatch):
-    raw_text = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
-    ) + "\ngarbage"
-    normalized_text = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
-    )
-    repaired_text = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=["Fix the leak: The pool is never closed."],
-    )
-
-    monkeypatch.setattr(
-        "coding_review_agent_loop.validated_agent.attempt_envelope_normalization",
-        lambda text, expected_kind: normalized_text,
-    )
-    repair_inputs = []
-    monkeypatch.setattr(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
-    )
-
-    runner = FakeRunner(gemini_outputs=[(raw_text, 0)])
-    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-
-    def validate(text):
-        if text == repaired_text:
-            return parse_structured_pr_review(text, reviewer="Google Gemini").state
-        raise AgentLoopError("invalid")
-
-    response = _run_validated_agent(
-        runner,
-        agent="gemini",
-        config=config,
-        prompt="Review the PR.",
-        marker_description="<!-- AGENT_STATE: approved|blocking -->",
-        validate=validate,
-        use_repair=True,
-        repair_expected_kind="pr_review",
-    )
-
-    assert response.text == repaired_text
-    assert repair_inputs == [normalized_text]
-
-def test_run_validated_agent_attempt_repair_falls_back_to_text_when_no_normalization(tmp_path, monkeypatch):
-    raw_text = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
-    )
-    repaired_text = structured_pr_review(
-        state="blocking",
-        reviewer="Google Gemini",
-        blocking_items=["Fix the leak: The pool is never closed."],
-    )
-
-    monkeypatch.setattr(
-        "coding_review_agent_loop.validated_agent.attempt_envelope_normalization",
-        lambda text, expected_kind: None,
-    )
-    repair_inputs = []
-    monkeypatch.setattr(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
-    )
-
-    runner = FakeRunner(gemini_outputs=[(raw_text, 0)])
-    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-
-    def validate(text):
-        if text == repaired_text:
-            return parse_structured_pr_review(text, reviewer="Google Gemini").state
-        raise AgentLoopError("invalid")
-
-    response = _run_validated_agent(
-        runner,
-        agent="gemini",
-        config=config,
-        prompt="Review the PR.",
-        marker_description="<!-- AGENT_STATE: approved|blocking -->",
-        validate=validate,
-        use_repair=True,
-        repair_expected_kind="pr_review",
-    )
-
-    assert response.text == repaired_text
-    assert repair_inputs == [raw_text]
 
 def _plan_revision_validate_with_human_requirements(human_requirements):
     return lambda text: response_validation._validate_response_with_human_requirements(
@@ -2114,41 +1881,6 @@ def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypa
     assert len(recovery_calls) == 1
     assert recovery_calls[0] is stripped_from_normalized
 
-def test_run_pr_loop_repairs_format_failure_with_5xx_source_line_reference(tmp_path):
-    """A 500-series source line reference must not make deterministic format errors transient."""
-    malformed_review = malformed_pr_review_source(
-        state="approved",
-        summary=(
-            "Looks good overall. Note: orchestrator.py:577-581 currently falls back "
-            "to parse_plan_state(text)."
-        ),
-    )
-    repaired_review = structured_pr_review(
-        state="approved",
-        summary=(
-            "Looks good overall. Note: orchestrator.py:577-581 currently falls back "
-            "to parse_plan_state(text)."
-        ),
-        reviewer="OpenAI Codex",
-    )
-    runner = FakeRunner(
-        codex_outputs=[malformed_review],
-    )
-    config = make_config(tmp_path, coder="claude", reviewer="codex", agent_max_retries=0)
-
-    captured_repairs = []
-
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append(raw)
-        assert expected_kind == "pr_review"
-        return repaired_review
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        run_pr_loop(runner, pr_number=77, config=config)
-
-    assert len(captured_repairs) == 1
-    assert "orchestrator.py:577-581" in captured_repairs[0]
-
 def test_run_pr_loop_falls_back_to_error_when_repair_also_fails(tmp_path):
     """When repair also produces invalid output, the original error is raised."""
     malformed_review = (
@@ -2184,55 +1916,6 @@ def test_run_pr_loop_skips_repair_when_repair_returns_none(tmp_path):
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="Codex"):
             run_pr_loop(runner, pr_number=77, config=config)
-
-def test_run_pr_loop_uses_repair_pass_on_coder_followup_format_failure(tmp_path):
-    """Repair pass is invoked when coder followup schema validation fails; repaired output is used."""
-    malformed_coder_followup = (
-        '{"schema_version":1,"kind":"pr_review","state":"blocking","summary":"Fixed the bug.",'
-        '"blocking_items":[],"same_pr_followups":[],"future_followups":[],'
-        '"prior_item_dispositions":[]}'
-        "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    repaired_followup = (
-        '{"schema_version":1,"kind":"coder_followup","state":"blocking","summary":"Fixed the bug.",'
-        '"addressed_items":["item-1"],"remaining_items":[],'
-        '"human_requirement_dispositions": [],'
-        '"human_requirements":{"addressed_ids":[],"checked_discussion_directly":false},'
-        '"architecture_impact":{"status":"unchanged","rationale":"No architectural contract changed.",'
-        '"affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],'
-        '"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change",'
-        '"canonical_document_path":null,"canonical_document_rationale":""}}'
-        "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    runner = FakeRunner(
-        claude_outputs=[malformed_coder_followup],
-        codex_outputs=[
-            "Need a fix."
-            + blocking_issues("Fix the bug.")
-            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
-            "LGTM."
-            + prior_item_dispositions("[item-1] resolved")
-            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
-        ],
-    )
-    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, agent_max_retries=0)
-
-    captured_repairs = []
-    captured_unresolved_item_ids = []
-
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
-        captured_repairs.append(raw)
-        captured_unresolved_item_ids.append(tuple(unresolved_item_ids or ()))
-        assert expected_kind == "coder_followup"
-        return repaired_followup
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        result = run_pr_loop(runner, pr_number=77, config=config)
-
-    assert result == 0
-    assert len(captured_repairs) == 1
-    assert "pr_review" in captured_repairs[0]
-    assert captured_unresolved_item_ids == [("item-1",)]
 
 def test_run_pr_loop_falls_back_to_error_when_coder_followup_repair_also_fails(tmp_path):
     """When repair also produces invalid output for coder followup, the original error is raised."""
@@ -2594,102 +2277,6 @@ def _pr_payload_with_human_requirement():
         "reviews": [],
     }
 
-def test_pr_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
-    """When repair returns approved + HUMAN_REQUIREMENTS_RESOLVED, no synthetic item is injected."""
-    approved_without_marker = structured_pr_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-    )
-    repaired_with_marker = structured_pr_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=True,
-    )
-    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
-    repaired_with_marker = _with_code_classification(repaired_with_marker, (_PR_REQUIREMENT,))
-    runner = FakeRunner(
-        codex_outputs=[approved_without_marker],
-        pr_payload=_pr_payload_with_human_requirement(),
-    )
-    config = make_config(tmp_path, max_rounds=1)
-
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        assert expected_kind == "pr_review"
-        assert reviewer_requirement_ids == (_PR_REQUIREMENT.requirement_id,)
-        return repaired_with_marker
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_pr_loop(runner, pr_number=77, config=config)
-
-    assert result == 0
-    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert claude_calls == [], "Coder should not be woken when repair recovers the marker"
-
-def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_path):
-    """When repair returns valid blocking, treat as reviewer blocking — no synthetic item."""
-    approved_without_marker = structured_pr_review(
-        state="approved",
-        summary="The absolute URL missing from the redirect is a defect.",
-        # Issue #871: the reviewer's own finding, so the repaired blocking item
-        # preserves it instead of promoting the summary into a fabricated one.
-        blocking_items=["The absolute URL missing from the redirect is a defect."],
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-    )
-    repaired_blocking = structured_pr_review(
-        state="blocking",
-        summary="The absolute URL missing from the redirect is a defect.",
-        blocking_items=["The absolute URL missing from the redirect is a defect."],
-        reviewer="OpenAI Codex",
-    )
-    # Round 2: coder addresses item-1 (the repaired blocking item) + acks human requirements
-    coder_response = structured_coder_followup(
-        state="approved",
-        addressed_items=["item-1"],
-        remaining_items=[],
-        human_requirement_ids=["Requirement 1"],
-        reviewer="Anthropic Claude",
-    )
-    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
-    repaired_blocking = _with_code_classification(repaired_blocking, (_PR_REQUIREMENT,))
-    runner = FakeRunner(
-        claude_outputs=[coder_response],
-        codex_outputs=[
-            approved_without_marker,
-            structured_pr_review(
-                state="approved",
-                reviewer="OpenAI Codex",
-                human_requirements_resolved=True,
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        pr_payload=_pr_payload_with_human_requirement(),
-    )
-    config = make_config(tmp_path, max_rounds=2)
-
-    pr_review_repair_calls = []
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        if expected_kind == "pr_review" and reviewer_requirement_ids is not None:
-            pr_review_repair_calls.append(raw)
-            return repaired_blocking
-        return None  # don't interfere with coder_followup repair
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_pr_loop(runner, pr_number=77, config=config)
-
-    assert result == 0
-    assert pr_review_repair_calls, "Repair should have been attempted for the reviewer"
-    # The repaired blocking item text should appear in a coder prompt
-    claude_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert any("absolute URL missing" in p for p in claude_prompts), \
-        "Repaired blocking item should appear in coder prompt"
-    # There should be no synthetic Orchestrator item text
-    assert not any("Orchestrator" in p and "acknowledging the signed human requirements" in p
-                   for p in claude_prompts), \
-        "Synthetic orchestrator item must not appear when repair returned valid blocking"
-
-
 def test_pr_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     """When repair fails (returns None), synthetic blocking item is injected."""
     approved_without_marker = structured_pr_review(
@@ -2717,109 +2304,6 @@ def _issue_with_human_requirement():
         "createdAt": "2026-05-17T08:00:00Z",
         "body": "Keep the public API unchanged.\n\n-- Human Reviewer",
     }
-
-def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
-    """Plan loop: repair returning approved+marker suppresses synthetic."""
-    plan = _initial_plan_with_human_requirements()
-    approved_without_marker = structured_plan_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    repaired_with_marker = structured_plan_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=True,
-        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    runner = FakeRunner(
-        issue_payload=_issue_with_human_requirement(),
-        claude_outputs=[plan],
-        codex_outputs=[approved_without_marker],
-    )
-    config = make_config(tmp_path)
-
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        assert expected_kind == "plan_review"
-        assert reviewer_requirement_ids == (_PLAN_REQUIREMENT.requirement_id,)
-        return repaired_with_marker
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert result == 0
-    # No second claude call needed (no synthetic blocking item)
-    plan_revision_calls = [
-        cmd for cmd, _cwd in runner.commands
-        if cmd[:1] == ["claude"] and runner.claude_outputs == []
-    ]
-    # Verify plan approved comment was posted
-    assert any("Approved plan:" in comment for comment in runner.comments)
-
-def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_path):
-    """Plan loop: repair returning blocking is treated as reviewer's blocking, not synthetic."""
-    plan = _initial_plan_with_human_requirements()
-    approved_without_marker = structured_plan_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-        summary="The plan changes the public API.",
-        # Issue #871: the reviewer's own finding, so the repaired blocking issue
-        # preserves it instead of promoting the summary into a fabricated one.
-        blocking_plan_issues=["The plan changes the public API."],
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    repaired_blocking = structured_plan_review(
-        state="blocking",
-        summary="The plan changes the public API.",
-        blocking_plan_issues=["The plan changes the public API."],
-        reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    revision = structured_plan_revision(
-        summary="Revised plan preserving the public API.",
-        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-        human_requirements=(
-            "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves the public API.\n"
-        ),
-    )
-    runner = FakeRunner(
-        issue_payload=_issue_with_human_requirement(),
-        claude_outputs=[plan, revision],
-        codex_outputs=[
-            approved_without_marker,
-            structured_plan_review(
-                summary="Plan looks sound.",
-                human_requirements_resolved=True,
-                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-                human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The revised canonical plan preserves the API."}],
-            ),
-        ],
-    )
-    config = make_config(tmp_path, max_rounds=3)
-
-    call_count = [0]
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return repaired_blocking
-        return None  # subsequent calls not needed
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert result == 0
-    # Confirm the repaired blocking item text reached the coder
-    claude_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert any("plan changes the public API" in p for p in claude_prompts), \
-        "Repaired blocking item text must appear in coder prompt"
-    # No synthetic orchestrator text
-    assert not any("Orchestrator" in p and "acknowledging the signed human requirements" in p
-                   for p in claude_prompts), \
-        "Synthetic orchestrator item must not appear when repair returned valid blocking"
 
 def test_plan_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     """Plan loop: when repair fails, synthetic blocking item is injected."""
@@ -2966,120 +2450,6 @@ def test_repair_prompt_format_rule_allows_human_requirements_resolved_for_pr_pla
     assert "pr_review" in _REPAIR_PROMPT or "HUMAN_REQUIREMENTS_RESOLVED" in _REPAIR_PROMPT
     # Ensure the FORMAT rule no longer says "plan_revision only"
     assert "for plan_revision only" not in _REPAIR_PROMPT
-
-def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
-    """When repair returns blocking with same_pr_followups, those are recorded as same-pr items."""
-    approved_without_marker = structured_pr_review(
-        state="approved",
-        summary="Fix the error message formatting.",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-        same_pr_followups=["Fix the error message formatting."],
-    )
-    repaired_blocking = structured_pr_review(
-        state="blocking",
-        summary="Fix the error message formatting.",
-        same_pr_followups=["Fix the error message formatting."],
-        reviewer="OpenAI Codex",
-    )
-    # Coder addresses item-1 (same-pr followup)
-    coder_response = structured_coder_followup(
-        state="approved",
-        addressed_items=["item-1"],
-        remaining_items=[],
-        human_requirement_ids=["Requirement 1"],
-        reviewer="Anthropic Claude",
-    )
-    approved_without_marker = _with_code_classification(approved_without_marker, (_PR_REQUIREMENT,))
-    repaired_blocking = _with_code_classification(repaired_blocking, (_PR_REQUIREMENT,))
-    runner = FakeRunner(
-        claude_outputs=[coder_response],
-        codex_outputs=[
-            approved_without_marker,
-            structured_pr_review(
-                state="approved",
-                reviewer="OpenAI Codex",
-                human_requirements_resolved=True,
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        pr_payload=_pr_payload_with_human_requirement(),
-    )
-    config = make_config(tmp_path, max_rounds=2)
-
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        if expected_kind == "pr_review" and reviewer_requirement_ids is not None:
-            return repaired_blocking
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_pr_loop(runner, pr_number=77, config=config)
-
-    assert result == 0
-    # The same-pr followup text must appear in the coder's prompt
-    claude_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert any("error message formatting" in p for p in claude_prompts), \
-        "Same-PR followup from repaired review must appear in coder prompt"
-
-def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
-    """When repair returns blocking with same_plan_followups, those are recorded as same-plan items."""
-    plan = _initial_plan_with_human_requirements()
-    approved_without_marker = structured_plan_review(
-        state="approved",
-        reviewer="OpenAI Codex",
-        human_requirements_resolved=False,
-        summary="Add a regression test for the parser edge case.",
-        # Issue #871: the reviewer's own followup, so the repaired same-plan
-        # entry preserves it instead of promoting the summary into a new finding.
-        same_plan_followups=["Add a regression test for the parser edge case."],
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    repaired_blocking = structured_plan_review(
-        state="blocking",
-        summary="Add a regression test for the parser edge case.",
-        same_plan_followups=["Add a regression test for the parser edge case."],
-        reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
-    )
-    revision = structured_plan_revision(
-        summary="Revised plan with regression test.",
-        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-        human_requirements=(
-            "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves the public API.\n"
-        ),
-    )
-    runner = FakeRunner(
-        issue_payload=_issue_with_human_requirement(),
-        claude_outputs=[plan, revision],
-        codex_outputs=[
-            approved_without_marker,
-            structured_plan_review(
-                summary="Plan looks sound.",
-                human_requirements_resolved=True,
-                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-                human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The revised canonical plan preserves the API."}],
-            ),
-        ],
-    )
-    config = make_config(tmp_path, max_rounds=3)
-
-    call_count = [0]
-    def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
-        call_count[0] += 1
-        if call_count[0] == 1 and expected_kind == "plan_review":
-            return repaired_blocking
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert result == 0
-    # The same-plan followup text must appear in the coder's prompt
-    claude_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert any("regression test for the parser" in p for p in claude_prompts), \
-        "Same-plan followup from repaired review must appear in coder prompt"
 
 from coding_review_agent_loop.repair import strip_unknown_prior_item_dispositions
 
@@ -3335,52 +2705,6 @@ def test_run_validated_agent_deterministic_strip_logs_removed_and_allowed_ids(tm
     assert "item-1" in output
     assert "(none)" in output
 
-def test_run_validated_agent_deterministic_strip_falls_through_to_repair_on_secondary_failure(tmp_path):
-    missing_item = UnresolvedReviewItem(
-        item_id="item-2",
-        reviewer="OpenAI Codex",
-        source_round=1,
-        text="Must-fix item not dispositioned.",
-        status="blocking",
-    )
-    malformed_review = structured_pr_review(
-        state="approved",
-        summary="LGTM. item-2 is already covered by the current PR.",
-        prior_item_dispositions=[{"item_id": "item-9", "disposition": "resolved"}],
-        reviewer="Google Gemini",
-    )
-    repaired_review = structured_pr_review(
-        state="approved",
-        summary="LGTM. item-2 is already covered by the current PR.",
-        prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
-        reviewer="Google Gemini",
-    )
-    runner = FakeRunner(gemini_outputs=[malformed_review])
-    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review
-    ) as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="gemini",
-            config=config,
-            prompt="Review the PR.",
-            marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: _validate_review_response(
-                text,
-                reviewer="Google Gemini",
-                unresolved_items=(missing_item,), architecture_status_mode="legacy",
-            ),
-            use_repair=True,
-            repair_expected_kind="pr_review",
-            repair_allowed_prior_item_ids=("item-2",),
-            ledger_incomplete=False,
-        )
-
-    repair_mock.assert_called_once()
-    assert response.text == repaired_review
-
 def test_run_validated_agent_real_264_shape_approved_plan_review_same_round_item1_future_followups(tmp_path):
     malformed_review = structured_plan_review(
         state="approved",
@@ -3618,61 +2942,6 @@ def test_run_validated_agent_recovers_plan_revision_human_ack_from_message_text(
     assert response.text.index("### Human requirements") < response.text.index(
         "<!-- AGENT_PLAN_STATE: blocking -->"
     )
-
-@pytest.mark.parametrize(
-    "evidence",
-    [
-        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n",
-        "\n### Human requirements\n- Requirement 1: Covered.\n",
-        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n- Requirement 99: Covered.\n",
-        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n- Requirement 1: Covered.\n- Requirement 1: Covered again.\n",
-    ],
-)
-def test_run_validated_agent_refuses_invalid_plan_revision_human_ack_evidence(tmp_path, evidence):
-    human_requirements = (
-        HumanReviewRequirement(
-            source_type="Issue comment",
-            author="wwind123",
-            created_at="2026-06-05T00:00:00Z",
-            url="https://github.com/OWNER/REPO/issues/237#issuecomment-1",
-            body="Cover stdout acknowledgement recovery.",
-        ),
-    )
-    context = render_coder_human_requirements_prompt_context(
-        human_requirements,
-        requirement_scope="planning requirements",
-        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
-    )
-    runner = FakeRunner(
-        claude_outputs=[
-            (
-                structured_plan_revision(
-                    reviewer="Anthropic Claude",
-                    human_requirements=evidence,
-                ),
-                0,
-            )
-        ],
-        public_response_outputs=[{"text": structured_plan_revision(reviewer="Anthropic Claude")}],
-    )
-    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None) as repair_mock:
-        with pytest.raises(AgentLoopError, match="No review result was recorded"):
-            _run_validated_agent(
-                runner,
-                agent="claude",
-                config=config,
-                prompt="Revise the plan.",
-                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=_plan_revision_validate_with_human_requirements(human_requirements),
-                use_repair=True,
-                repair_expected_kind="plan_revision",
-                repair_surfaced_requirement_ids=context.surfaced_requirement_ids,
-                repair_requires_direct_discussion_ack=context.requires_direct_discussion_ack,
-            )
-
-    repair_mock.assert_called_once()
 
 def test_run_validated_agent_refuses_plan_revision_missing_direct_discussion_ack(tmp_path):
     context = render_coder_human_requirements_prompt_context(
@@ -3930,58 +3199,6 @@ def test_run_validated_agent_keeps_valid_response_file_authoritative_over_noisy_
 
     assert response.text == valid_followup
 
-def test_structured_plan_revision_transient_terms_before_footer_runs_repair(tmp_path):
-    malformed_revision = (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "plan_revision",
-                "state": "blocking",
-                "summary": "Revise handling for 429, quota, resource exhausted, transient, and timeout.",
-                "prior_plan_item_dispositions": [],
-                "plan_steps": [
-                    "Separate public-response validation from transient raw diagnostics.",
-                    "Keep capacity and quota retry handling for raw provider failures.",
-                ],
-            }
-        )
-        + "\n## Revised plan\nProse before the AGENT_PLAN_STATE footer is invalid.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    repaired_revision = structured_plan_revision(
-        summary="Revised transient classifier plan.",
-        plan_steps=[
-            "Separate public-response validation from transient raw diagnostics.",
-            "Keep capacity and quota retry handling for raw provider failures.",
-        ],
-        reviewer="Anthropic Claude",
-    )
-    runner = FakeRunner(claude_outputs=[malformed_revision])
-    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_revision) as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="claude",
-            config=config,
-            prompt="Revise the plan.",
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=lambda text: _validate_plan_revision_response(text, architecture_status_mode="legacy"),
-            use_repair=True,
-            repair_expected_kind="plan_revision",
-            repair_surfaced_requirement_ids=("Requirement 1",),
-        )
-
-    assert response.text == repaired_revision
-    repair_mock.assert_called_once_with(
-        malformed_revision,
-        config.gemini_cmd,
-        expected_kind="plan_revision",
-        surfaced_requirement_ids=("Requirement 1",),
-        requires_direct_discussion_ack=False,
-    )
-    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
-
 def test_run_validated_agent_repairs_unknown_prior_item_disposition_when_ledger_complete(tmp_path):
     malformed_review = structured_pr_review(
         state="approved",
@@ -4199,52 +3416,6 @@ def test_run_validated_agent_combined_envelope_and_disposition_fix(tmp_path):
     parsed = json.loads(response.text.split("\n")[0])
     assert parsed["prior_plan_item_dispositions"] == []
     assert parsed["state"] == "approved"
-
-def test_run_validated_agent_rejects_repair_that_invents_prior_item_id(tmp_path):
-    # item-3 is the legitimate carried prior item; item-1 is unknown and gets stripped
-    # deterministically, but item-3 is then missing → re-validation fails → falls through
-    # to generative repair → repair invents item-2 (also unknown) → rejected.
-    carried_item_3 = UnresolvedReviewItem(
-        item_id="item-3",
-        reviewer="OpenAI Codex",
-        source_round=1,
-        text="Must-fix prior item.",
-        status="blocking",
-    )
-    malformed_review = structured_pr_review(
-        state="approved",
-        summary="LGTM.",
-        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-        reviewer="Google Gemini",
-    )
-    repaired_review = structured_pr_review(
-        state="approved",
-        summary="LGTM.",
-        prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
-        reviewer="Google Gemini",
-    )
-    runner = FakeRunner(gemini_outputs=[malformed_review])
-    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review):
-        with pytest.raises(AgentLoopError) as exc_info:
-            _run_validated_agent(
-                runner,
-                agent="gemini",
-                config=config,
-                prompt="Review the PR.",
-                marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                validate=lambda text: _validate_review_response(
-                    text,
-                    reviewer="Google Gemini",
-                    unresolved_items=(carried_item_3,), architecture_status_mode="legacy",
-                ),
-                use_repair=True,
-                repair_expected_kind="pr_review",
-                repair_allowed_prior_item_ids=("item-3",),
-            )
-
-    assert "item-2" in str(exc_info.value)
 
 def test_run_validated_agent_preserves_valid_disposition_when_repair_removes_unknown(tmp_path):
     carried_item = UnresolvedReviewItem(
@@ -4783,72 +3954,6 @@ def test_substantive_malformed_reviewer_source_is_admitted():
         malformed_pr_review_source(state="blocking", blocking_items=["Fix the leak."]),
         expected_kind="pr_review",
     )
-
-
-def test_gate_refuses_before_any_repair_backend_call(tmp_path):
-    called = []
-
-    def fake_repair(raw, gemini_cmd, **kwargs):
-        called.append(raw)
-        return structured_plan_review(
-            state="blocking",
-            summary="Plan review incomplete: the test command was terminated.",
-            blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
-            reviewer="Google Antigravity",
-        )
-
-    config = make_config(tmp_path)
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-        repaired, parsed, attempts = validated_agent._run_structured_repair(
-            NARRATION_ONLY_REVIEWER_OUTPUT,
-            runner=None,
-            config=config,
-            usage_context=None,
-            validate=lambda text: text,
-            repair_kwargs={"expected_kind": "plan_review"},
-        )
-
-    assert called == []
-    assert repaired is None and parsed is None
-    assert [attempt.outcome for attempt in attempts] == ["review_substance_integrity"]
-    assert attempts[0].backend == "none"
-
-
-def test_legacy_attempt_repair_hook_runs_reviewer_grounding(tmp_path):
-    source = malformed_pr_review_source(
-        state="blocking",
-        summary="Fix the leak in the pool handler.",
-        blocking_items=["Fix the leak in the pool handler."],
-        reviewer="Google Gemini",
-    )
-    fabricated = structured_pr_review(
-        state="blocking",
-        summary="Fix the leak in the pool handler.",
-        blocking_items=[
-            "Fix the leak in the pool handler.",
-            "PR review incomplete: the test command was terminated.",
-        ],
-        prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
-        reviewer="Google Gemini",
-    )
-    config = make_config(tmp_path)
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair",
-               lambda raw, gemini_cmd, **kwargs: fabricated):
-        repaired, parsed, attempts = validated_agent._run_structured_repair(
-            source,
-            runner=None,
-            config=config,
-            usage_context=None,
-            validate=lambda text: text,
-            repair_kwargs={
-                "expected_kind": "pr_review",
-                "allowed_prior_item_ids": ("item-2",),
-            },
-        )
-
-    assert parsed is None
-    assert [attempt.outcome for attempt in attempts] == ["invalid_output"]
-    assert "grounding" in attempts[0].diagnostic
 
 
 def test_repair_prompt_alias_lines_match_the_guard_table():
@@ -5741,34 +4846,6 @@ def _run_followup_2026(runner, tmp_path, *, requirements=(), retries=0):
     )
 
 
-def test_configured_repair_adding_ack_placement_is_rejected_then_accepted_logs_once(tmp_path, caplog):
-    caplog.set_level("WARNING")
-    source = _broken_followup_2026(addressed_items=["item-1", _ACK_2026])
-    added = structured_coder_followup(addressed_items=["item-1", _ACK_2026], remaining_items=[_ACK_2026])
-    kept = structured_coder_followup(addressed_items=["item-1", _ACK_2026], summary="Second candidate.")
-    runner = FakeRunner(claude_outputs=[source])
-    outputs = [MagicMock(returncode=0, stdout=text, stderr="") for text in (added, kept)]
-    with _configured_repair_2026(None) as run:
-        run.side_effect = outputs
-        response = _run_validated_agent(
-            runner, agent="claude",
-            config=make_config(tmp_path, repair_backend="gemini", repair_models=("m1", "m2"),
-                               agent_max_retries=0),
-            prompt="Address feedback.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: _validate_followup_2026(
-                text, unresolved_items=_ITEMS_2026, human_requirements=(),
-                architecture_status_mode="legacy",
-            ),
-            use_repair=True, repair_expected_kind="coder_followup",
-            repair_unresolved_item_ids=("item-1",),
-        )
-    assert run.call_count == 2
-    assert "Second candidate." in response.text
-    assert response.marker_value.addressed_items == ("item-1",)
-    lines = _ack_lines_2026(caplog)
-    assert len(lines) == 1 and "counted as the coder's acknowledgement" in lines[0]
-
-
 def test_configured_repair_rejects_added_ack_placement_with_no_acceptance(tmp_path, caplog):
     caplog.set_level("WARNING")
     added = structured_coder_followup(addressed_items=["item-1", _ACK_2026])
@@ -5777,23 +4854,6 @@ def test_configured_repair_rejects_added_ack_placement_with_no_acceptance(tmp_pa
         with pytest.raises(AgentLoopError):
             _run_followup_2026(runner, tmp_path)
     assert _ack_lines_2026(caplog) == []
-
-
-def test_configured_repair_removing_remaining_ack_placement_keeps_ledger(tmp_path):
-    rid = _REQ_2026[0].requirement_id
-    signed = {"human_requirement_ids": [rid], "addressed_items": ["item-1"]}
-    original = _broken_followup_2026(remaining_items=[_ACK_2026], **signed)
-    repaired = structured_coder_followup(**signed)
-    runner = FakeRunner(claude_outputs=[original])
-    with _configured_repair_2026(repaired):
-        response = _run_followup_2026(runner, tmp_path, requirements=_REQ_2026)
-    assert response.text.startswith(repaired.split("\n")[0][:30])
-    pending = (_Item2026(item_id=_ACK_2026, reviewer="Orchestrator", source_round=1, text="Ack.", status="blocking"),)
-    fixed_original = structured_coder_followup(remaining_items=[_ACK_2026], **signed)
-    for output in (response.text, fixed_original):
-        assert _reconcile_2026(
-            pending, coder_output=output, human_requirements=_REQ_2026, source_round=2,
-        ) == []
 
 
 @pytest.mark.parametrize("bad_kind", [False, ["coder_followup"], {"k": "coder_followup"}])
@@ -5833,33 +4893,6 @@ def _with_dispositions_2026(text):
         {"requirement_id": "hr-" + "d" * 64, "disposition": "addressed", "evidence": "Done."}
     ]
     return json.dumps(payload) + text[split:]
-
-
-def test_configured_reviewer_repair_carrying_dispositions_field_is_accepted(tmp_path):
-    original = _with_dispositions_2026(
-        malformed_pr_review_source(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini")
-    )
-    repaired = _with_dispositions_2026(
-        structured_pr_review(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini")
-    )
-    runner = FakeRunner(gemini_outputs=[original])
-    with _configured_repair_2026(repaired) as repair:
-        response = _run_validated_agent(
-            runner, agent="gemini",
-            config=_repair_config_2026(tmp_path, reviewer="gemini", agent_max_retries=0),
-            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: _parse_review_2026(text, reviewer="Google Gemini").state,
-            use_repair=True, repair_expected_kind="pr_review",
-        )
-    assert repair.called
-    parsed = _parse_review_2026(response.text, reviewer="Google Gemini")
-    without = _parse_review_2026(
-        structured_pr_review(state="blocking", blocking_items=["Close the pool."], reviewer="Google Gemini"),
-        reviewer="Google Gemini",
-    )
-    assert parsed.dropped_human_requirement_dispositions is True
-    assert parsed.blocking_items == without.blocking_items
-    assert parsed.dispositions == without.dispositions
 
 
 # --- Issue #2049: envelope-only reviewer payloads ------------------------------

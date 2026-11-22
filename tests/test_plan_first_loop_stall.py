@@ -852,7 +852,7 @@ def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
     assert exhaustion is not None
     assert "related_scope_item_ids" in exhaustion.diagnostic
     assert "forbidden_side_effects" not in exhaustion.diagnostic
-    assert "one automatic planner replay" in str(error.value)
+    assert "response rejected after 2 same-agent re-asks" in str(error.value)
     assert '"forbidden_side_effects": ["Must not refuse"]' in exhaustion.candidate_text
     independent = _matrix_plan_candidate_1229(
         forbidden_side_effects=["Must not refuse"], related_scope_item_ids=""
@@ -860,12 +860,13 @@ def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
     assert exhaustion.candidate_text == independent
     assert exhaustion.candidate_digest == hashlib.sha256(independent.encode()).hexdigest()
     assert len(runner.diagnostic_posts) == 1
-    assert len(_claude_prompts_1229(runner)) == 2
+    # The primary turn and both same-agent re-asks (#2066).
+    assert len(_claude_prompts_1229(runner)) == 3
     replay_prompt = "\n".join(_claude_prompts_1229(runner)[1])
-    assert "Previous response not accepted: risk_test_matrix" in replay_prompt
+    assert "Previous response rejected (re-ask 1 of 2)" in replay_prompt
     assert "related_scope_item_ids" in replay_prompt
     assert "forbidden_side_effects must be a JSON array" not in replay_prompt
-    assert error.value.failure_category == "fresh-contract-integrity"
+    assert error.value.failure_category == "deterministic"
 
 
 def _issue_level_run_1229(tmp_path, outputs, **config_overrides):
@@ -933,7 +934,7 @@ def test_issue_level_bare_strings_are_accepted_on_first_planner_call(tmp_path, m
         assert path in err
 
 
-def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path, monkeypatch, capsys):
+def test_issue_level_unrecoverable_matrix_is_reasked_and_accepted(tmp_path, monkeypatch, capsys):
     from coding_review_agent_loop.protocol import validate_structured_plan_state
 
     bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
@@ -945,15 +946,14 @@ def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path,
     runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
     prompts = ["\n".join(c) for c in _claude_prompts_1229(runner)]
     assert len(prompts) == 2
-    heading = "Previous response not accepted: risk_test_matrix"
+    heading = "Previous response rejected (re-ask 1 of 2)"
     assert heading not in prompts[0] and heading in prompts[1]
     appended = prompts[1].split(heading, 1)[1]
-    assert str(expected.value) in appended
+    assert "forbidden_side_effects" in appended
     err = capsys.readouterr().err
-    assert err.count("repair backend=none model=fresh-matrix-contract-integrity") == 1
-    assert err.count("repair backend=") == 1
-    # Only the deterministic guard ran (backend=none); no repair model rewrote the matrix.
-    assert len(repair_calls) == 1
+    # The planner itself resent the matrix (#2066); no repair model ran.
+    assert "repair backend=" not in err
+    assert repair_calls == []
     assert posted
     assert _posted_matrix_1229(posted[0])["rows"][0]["forbidden_side_effects"] == ["Replay accepted"]
 

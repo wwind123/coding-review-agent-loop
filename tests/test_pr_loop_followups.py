@@ -411,7 +411,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
 
     patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(validated_agent, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(validated_agent, "execute_repair", forbidden_repair)
+    monkeypatch.setattr(validated_agent, "execute_repair", forbidden_repair, raising=False)  # retired seam (#2066)
     monkeypatch.setattr(
         response_validation,
         "stable_tracked_tree_snapshot",
@@ -1228,90 +1228,6 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
     assert "Keep the change narrowly scoped to the listed items" in followup_prompt
     assert "Do not take on\nlarger redesigns or unrelated future work" in followup_prompt
     assert "Add broader integration coverage later." in runner.comments[-1]
-
-
-def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_items(tmp_path):
-    """Same-PR dispatch must give repair the same item namespace as its prompt."""
-    malformed_coder_response = json.dumps(
-        {
-            "schema_version": 1,
-            "kind": "coder_followup",
-            "state": "approved",
-            "summary": "The visible follow-up is complete.",
-            "addressed_items": ["item-2"],
-            "remaining_items": [],
-            "human_requirements": {
-                "addressed_ids": [],
-                "checked_discussion_directly": False,
-            },
-            "human_requirement_dispositions": [],
-            # The source carries its own assessment: repair may fix the
-            # envelope but may not supply an omitted one (#925).
-            "architecture_impact": json.loads(
-                structured_coder_followup().split("\n<!--", 1)[0]
-            )["architecture_impact"],
-        }
-    )
-    repaired_coder_response = structured_coder_followup(
-        state="approved",
-        summary="The visible follow-up is complete.",
-        addressed_items=["item-2"],
-        remaining_items=[],
-    )
-    runner = FakeRunner(
-        codex_outputs=[
-            structured_pr_review(
-                state="approved",
-                future_followups=["Document the broader behavior in a later PR."],
-            ),
-            structured_pr_review(
-                state="approved",
-                summary="The current-PR behavior is fixed.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "future"},
-                    {"item_id": "item-2", "disposition": "resolved"},
-                ],
-            ),
-        ],
-        gemini_outputs=[
-            structured_pr_review(
-                state="blocking",
-                same_pr_followups=["Fix the current-PR behavior."],
-                reviewer="Google Gemini",
-            ),
-            structured_pr_review(
-                state="approved",
-                summary="The current-PR behavior is fixed.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "future"},
-                    {"item_id": "item-2", "disposition": "resolved"},
-                ],
-                reviewer="Google Gemini",
-            ),
-        ],
-        claude_outputs=[
-            malformed_coder_response,
-        ],
-    )
-    config = make_config(
-        tmp_path,
-        approved_followups="fix-and-summarize",
-        agent_max_retries=0,
-        reviewer=("codex", "gemini"),
-    )
-    repair_calls = []
-
-    def fake_attempt_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
-        repair_calls.append((expected_kind, kwargs.get("unresolved_item_ids")))
-        return repaired_coder_response
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert repair_calls == [("coder_followup", ("item-2",))]
-    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
-    assert "Fix the current-PR behavior." in followup_prompt
-    assert "Document the broader behavior in a later PR." not in followup_prompt
 
 
 def test_blocking_same_pr_followup_reaches_coder_even_when_approved_followups_ignored(tmp_path):
@@ -2206,27 +2122,7 @@ def test_1388_coder_listing_a_resolved_item_as_addressed_is_normalized(
     assert "- None." in addressed_section
 
 
-def test_1388_addressed_item_without_resolution_history_still_fails_closed(
-    tmp_path, monkeypatch, capsys,
-):
-    runner, config, repairs, resolved_claim = _run_1388_acknowledgement_round(
-        tmp_path, monkeypatch, recorded_history=False
-    )
-    # The rejection itself is under test, not the pushed head's record (#2086).
-    import coding_review_agent_loop.coder_followup_degradation as degradation
-    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
-
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=config)
-
-    assert resolved_claim in repairs
-    assert "listed already-resolved item(s)" not in capsys.readouterr().err
-    assert not any(
-        "Acknowledged the new signed requirement." in comment for comment in runner.comments
-    )
-
-
-@pytest.mark.parametrize('mode', ['display', 'partition', 'citation', 'normalized', 'escape', 'fallback', 'fallback-spent'])
+@pytest.mark.parametrize('mode', ['display', 'partition', 'citation', 'normalized', 'escape'])
 def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
     """#1738: drive acquisition, refusal/correction, publication and review."""
     import coding_review_agent_loop.workdir_guard as guard

@@ -201,5 +201,7 @@ def test_image_validation_guards_every_parse_against_reserved_records(
             marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
             validate=validate, use_repair=use_repair, repair_expected_kind="pr_review")
     assert parses == ([] if stage == "initial" else [original])
-    assert normalizations == ([original] if use_repair else [])
+    # Envelope normalization always runs since the repair flag retired
+    # (#2066); the normalized text is still guarded and rejected.
+    assert normalizations == [original]
     assert len(acquisitions) == 1 and images._closed

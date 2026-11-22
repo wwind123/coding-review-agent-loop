@@ -538,63 +538,37 @@ def test_architecture_records_label_and_read_back_invariants():
     assert "producing login and ID" in text
 
 
-def test_docs_describe_reviewer_repair_admission_and_grounding():
-    """Issue #871: the canonical documents name the refusal boundary."""
+def test_docs_describe_reviewer_substance_rule_without_the_retired_repair_pass():
+    """#871/#2029/#2066: no-substance reviewers are unavailable; no repair model runs."""
     doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
-    for fragment in (
-        "Reviewer repair is refused before any backend call",
-        "field unique",
-        "bare protocol state footer",
-        "agent-unavailable",
-        "empty-response",
-        "grounding check",
-        "Support is token\ncoverage",
-        "matched injectively",
-        "per-modifier occurrence counts",
-        "contraction normalization",
-        "negation-safe coverage predicate",
-        "manufacture an approval",
-    ):
-        assert fragment in doc, fragment
-
-    # Issue #871 round 7, item-8: the empty-finding rule must be stated once.
-    # An earlier round left a stale sentence saying an empty finding is a
-    # candidate that corresponds to an exempt-only target, directly next to the
-    # implemented rule that a genuinely empty entry is dropped. A reader of the
-    # security boundary cannot be handed both claims, so the superseded wording
-    # is asserted absent while the implemented rule is asserted present.
     normalized = " ".join(doc.split())
-    assert "genuinely empty entry such as `{}` is dropped" in normalized
-    assert (
-        "A declared source finding that carries no prose is a candidate only "
-        "when it really was nothing but a reserved marker" in normalized
-    )
-    assert (
-        "it corresponds solely to its own authorized neutralization" in normalized
-    )
-    assert (
-        "Every other exempt-only target is refused, whichever candidate it is "
-        "matched against" in normalized
-    )
-    assert (
-        "compared by marker identity and occurrence count over the registry's "
-        "historical replacement spans" in normalized
-    )
-    assert "represent the COMPLETE source marker multiset" in normalized
-    assert (
-        "a target matched to a substantive candidate must therefore retain "
-        "substantive content of its own" in normalized
-    )
-    assert "An empty or marker-only source finding" not in normalized
-    assert (
-        "a lead-in line before the first bullet is list structure that is "
-        "dropped" in normalized
-    )
-    assert "joins the first item" not in normalized
+    for fragment in (
+        "still carries no review substance is a reviewer availability failure, never a verdict",
+        "field unique to that review schema",
+        "bare protocol state footer",
+        "`agent-unavailable`",
+        "`empty-response`",
+        "no second model reformats it (#2066)",
+        "Those passes no longer run",
+    ):
+        assert fragment in normalized, fragment
+    # The retired repair pass is no longer described as live behavior.
+    for stale in (
+        "Reviewer repair is refused before any backend call",
+        "default repair chain",
+        "grounding check requires every repaired finding",
+        "local preservation guard additionally rejects",
+        "goes through the bounded format repair",
+        "owns bounded format repair",
+        "skip the structured repair pass",
+        "format repair attempted: yes|no",
+        "Format-repair turns never wait",
+    ):
+        assert stale not in normalized, stale
 
     architecture = _architecture_set_text()
-    assert "Reviewer repair is refused fail-closed" in architecture
-    assert "a refusal is a reviewer unavailability, never a synthesized verdict" in architecture
+    assert "Reviewer repair is refused fail-closed" not in architecture
+    assert "is a reviewer unavailability, never a synthesized verdict" in architecture
     assert "proposal to evaluate, never an" in architecture
 
 
@@ -812,7 +786,6 @@ def test_readme_sandboxed_example_passes_sandboxed_validation(tmp_path):
     config = config_from_args(args, FakeRunner())
     config = type(config)(**{**config.__dict__, "plan_execution_mode": args.plan_execution_mode})
     assert config.agent_permissions == "sandboxed"
-    assert config.repair_backend == "claude" and config.repair_models == ("MODEL",)
     assert config.semantic_followup_backend == "claude"
     agent_permissions.validate_sandboxed_selections(config)
     agent_permissions.validate_sandboxed_flow(config, command=args.command, plan_first=args.plan_first)
@@ -825,7 +798,7 @@ def test_readme_sandboxed_step_documents_requirements_and_limits():
     )[0]
     for phrase in (
         "--no-semantic-followup-dedupe",
-        "default repair backend\n(`antigravity`)",
+        "No repair backend runs any more",
         "Install agent-loop outside the agent checkouts",
         "`git` and `gh` found first on `PATH` must also live outside every\n  checkout",
         "`TMPDIR` must resolve outside every checkout",
@@ -976,7 +949,7 @@ def test_failed_managed_activation_state_report_is_documented():
 def test_antigravity_quota_group_docs_describe_default_chain():
     import re
 
-    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS, DEFAULT_REPAIR_MODELS
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
 
     guide = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
@@ -984,9 +957,8 @@ def test_antigravity_quota_group_docs_describe_default_chain():
     for model in DEFAULT_ANTIGRAVITY_MODELS:
         assert f"`{model}`" in guide
         assert f"`{model}`" in readme
-    for model in DEFAULT_REPAIR_MODELS:
-        assert f"`{model}`" in guide
-        assert f"`{model}`" in readme
+    # No repair chain exists any more (#2066): the retired repair models are
+    # not documented as a chain.
     removed = ("Gemini 3.7 Flash", "Gemini 3.6 Flash", "Gemini 3.1 Pro")
     chain_sentences = [
         sentence
@@ -997,7 +969,8 @@ def test_antigravity_quota_group_docs_describe_default_chain():
         or "default chain `" in sentence
         or "repair chain `" in sentence
     ]
-    assert len(chain_sentences) >= 4
+    assert len(chain_sentences) >= 3
+    assert not any("repair chain `" in sentence for sentence in chain_sentences)
     for sentence in chain_sentences:
         for name in removed:
             assert name not in sentence, sentence

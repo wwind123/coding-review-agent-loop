@@ -520,13 +520,6 @@ def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection
         selections.append(
             AgentSelection("discuss_analyzer", config.discuss_analyzer, "--discuss-analyzer claude|codex")
         )
-    selections.append(
-        AgentSelection(
-            "repair_backend",
-            config.repair_backend,
-            "--repair-backend claude|codex --repair-model MODEL",
-        )
-    )
     if config.semantic_followup_dedupe:
         selections.append(
             AgentSelection(
