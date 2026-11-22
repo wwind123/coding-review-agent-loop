@@ -667,12 +667,17 @@ class CoderFollowupRecovery:
         }
 
     def adopt(self, bounded: object, metadata: object, output: str | None, items: Sequence[object]):
-        """Adopt a synthesized fallback: its metadata, claim-free output and
-        the live ledger without the discarded response's annotations."""
+        """Adopt the posted coder record; return ``(metadata, output, ledger, discarded)``.
+
+        ``discarded`` is true when bounding fell back to a claim-free synthesized
+        record: the caller must then drop every other in-memory effect of the
+        response (fix history, cited-evidence progress, citation diagnosis),
+        exactly as a resume from the stored record would see none of them.
+        """
         adopted_metadata, adopted_output = adopt_bounded_coder_comment(bounded, metadata, output)
         if getattr(bounded, "coder_output", None) is None:
-            return adopted_metadata, adopted_output, items
-        return adopted_metadata, adopted_output, self.discarded_response_ledger(items)
+            return adopted_metadata, adopted_output, items, False
+        return adopted_metadata, adopted_output, self.discarded_response_ledger(items), True
 
     def discarded_response_ledger(self, items: Sequence[object]) -> list:
         """The ledger once a response is discarded for a claim-free fallback (#2086).

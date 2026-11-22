@@ -3416,3 +3416,75 @@ def test_disputed_response_forced_into_synthesis_carries_no_dispute_in_loop_or_r
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     for metadata in _records_1292(runner):
         assert not any(_is_disputed_item(item) for item in metadata.prior_items)
+
+
+@pytest.mark.parametrize("synthesized", [False, True], ids=["posted-structured", "forced-synthesis"])
+def test_discarded_citation_never_grants_the_unchanged_head_allowance_2086(
+    tmp_path, monkeypatch, capsys, synthesized
+):
+    """#2086 item-4: cited progress counts only when the posted record keeps the citation."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+
+    if synthesized:
+        real_fits = budget.round_comment_fits
+        monkeypatch.setattr(
+            budget, "round_comment_fits",
+            lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+        )
+    cited = _followup_1626([_citation_1626("pass-2")], summary="Re-ran the evidence command.")
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), cited],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(1),
+    )
+    err = capsys.readouterr().err
+    if not synthesized:  # control: the same citation grants the allowance when it is posted
+        assert outcome == 0, outcome
+        assert "granting one review round" in err
+        assert _reviews_run_1626(runner) == 3
+        return
+    assert isinstance(outcome, AgentLoopError)
+    assert "granting one review round" not in err
+    assert _reviews_run_1626(runner) == 2  # no extra review round on the unchanged head
+
+
+def test_discarded_fix_summary_never_reaches_the_next_coder_prompt_2086(tmp_path, monkeypatch):
+    """#2086 item-5: fix history is recorded only for the posted coder record."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+
+    real_fits = budget.round_comment_fits
+    forced = {"on": True}
+    monkeypatch.setattr(
+        budget, "round_comment_fits",
+        lambda body: (not forced["on"] or "## Orchestrator-synthesized coder record" in str(body)) and real_fits(body),
+    )
+    discarded = structured_coder_followup(
+        summary="DISCARDED-SUMMARY-2086 rewrote the parser.", addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "DISCARDED-NOTE-2086 parser rewritten."},
+        reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[discarded, _VALID_FOLLOWUP],
+        reviews=[_blocking_review_1292(), structured_pr_review(
+            state="blocking", summary="Still needs a test.", reviewer="Anthropic Claude",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "No regression test exists yet."}],
+        ), _approving_review_1292()],
+    )
+    real_run = runner.run
+
+    def run(args, **kwargs):  # only the first coder record is forced into synthesis
+        if list(args)[:1] == ["claude"] and forced["on"] and _coder_prompts_1292(runner):
+            forced["on"] = False
+        return real_run(args, **kwargs)
+
+    runner.run = run
+    config = make_config(tmp_path, coder="codex", reviewer="claude", max_rounds=4)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompts = _coder_prompts_1292(runner)
+    assert len(prompts) == 2
+    assert "DISCARDED-SUMMARY-2086" not in prompts[1]
+    assert "DISCARDED-NOTE-2086" not in prompts[1]
+    (first,) = [r for r in _records_1292(runner) if r.role == "coder"][:1]
+    assert first.coder_record_source == "synthesized"
