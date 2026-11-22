@@ -1798,10 +1798,20 @@ def test_manual_push_after_completed_head_review_recovery_does_not_revive_pre_ha
     assert _agent_order_1292(runner)[:1] == ["codex"]
 
 
-@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable"])
+@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable", "claim-synthesized"])
 def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
     tmp_path, monkeypatch, mode
 ):
+    synthesized = mode == "claim-synthesized"  # #2086 item-6: the discarded map is dropped
+    if synthesized:
+        import coding_review_agent_loop.coder_comment_budget as budget
+
+        real_fits = budget.round_comment_fits
+        monkeypatch.setattr(
+            budget, "round_comment_fits",
+            lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+        )
+        mode = "claim"
     with_matrix = mode in {"claim", "gap-only"}
     if with_matrix:
         plan_context = _followup_matrix_context()
@@ -1838,7 +1848,7 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         "execution_refs": [current.execution_ref],
         "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
         "test_locations": ["tests/test_orchestrator_pr.py"],
-        "workflow_path_claim": "The real PR follow-up caller reached post-head derivation.",
+        "workflow_path_claim": "The real PR follow-up caller reached DISCARDED-CLAIM-2086 derivation.",
         "outcome_assertions": ["The selected managed observation passed."],
         "forbidden_effect_assertions": ["The PR handoff was retained."],
         "caveats": [],
@@ -1903,6 +1913,15 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         pr_loop_support, pr_loop, issue_implementation, issue_loop,
     ), "_read_assigned_workdir_head", lambda *_a, **_k: head)
 
+    carried_maps = []
+    real_review_context = pr_loop._coder_followup_review_context
+
+    def recording_review_context(text, metadata, **kwargs):
+        if text:
+            carried_maps.append(kwargs.get("coverage_map"))
+        return real_review_context(text, metadata, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "_coder_followup_review_context", recording_review_context)
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
 
     assert len(coder_calls) == 1, "the follow-up path never sends a coverage re-ask"
@@ -1917,10 +1936,23 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
     review_prompts = [
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]
     ]
-    if with_matrix:
+    if synthesized:
+        from coding_review_agent_loop.risk_coverage_map import extract_coverage_map_section
+
+        assert "## Orchestrator-synthesized coder record" in coder_comment
+        assert "Risk-matrix coverage map" not in coder_comment
+        assert "DISCARDED-CLAIM-2086" not in coder_comment
+        # The live reviewer prompt matches what a resume restores from the posted record.
+        assert extract_coverage_map_section(coder_comment, expected_revision=head) is None
+        assert carried_maps == [None], "the discarded response's map must not be carried"
+        assert "### Risk-matrix coverage map" not in review_prompts[-1]
+        assert f"complete at {head}" not in review_prompts[-1]
+        assert "DISCARDED-CLAIM-2086" not in review_prompts[-1]
+    elif with_matrix:
         assert "### Risk-matrix coverage map" in coder_comment
         assert f"complete at {head}" in coder_comment
         assert "Risk-matrix coverage map" in review_prompts[-1]
+        assert carried_maps and all(carried_maps)
         assert "after one coverage re-ask" not in coder_comment
     else:
         assert "Risk-matrix coverage map" not in coder_comment

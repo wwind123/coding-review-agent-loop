@@ -9720,7 +9720,7 @@ def run_pr_loop(
             coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
             latest_coder_metadata, latest_coder_output, unresolved_items, coder_response_discarded = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
             if coder_response_discarded:  # a claim-free synthesized record: none of its claims count (#2086)
-                evidence_progress_receipts, followup_citations = frozenset(), None
+                evidence_progress_receipts, followup_citations, latest_coder_coverage_map = frozenset(), None, None
             elif isinstance(coder_response.marker_value, StructuredCoderFollowup):  # fix history only for the posted record
                 pr_finding_history.record_fix(coder_response.marker_value, published_round=coder_record_round, agent=coder_name)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
