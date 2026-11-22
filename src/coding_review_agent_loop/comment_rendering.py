@@ -1783,14 +1783,19 @@ def _render_public_coder_followup_comment(
                 if len(members) > 1:
                     if key not in emitted:
                         emitted.add(key)
-                        # The first member's own display label, never the raw
-                        # request: a deferred request stays unpublished (#1068).
-                        label = _format_unresolved_item_label(item_by_id[item_id], config)
-                        lines.append(
-                            "- Human-only exact-head evidence, one request repeated: "
-                            + ", ".join(members)
-                            + f" ({_bounded_excerpt(label, _BOUNDED_LABEL_CHARS)})"
-                        )
+                        if bound_level >= 3:
+                            # ID-only like every other item at these levels, so
+                            # a group never costs more than its member IDs.
+                            lines.append("- " + ", ".join(members))
+                        else:
+                            # The first member's own display label, never the raw
+                            # request: a deferred request stays unpublished (#1068).
+                            label = _format_unresolved_item_label(item_by_id[item_id], config)
+                            lines.append(
+                                "- Human-only exact-head evidence, one request repeated: "
+                                + ", ".join(members)
+                                + f" ({_bounded_excerpt(label, _BOUNDED_LABEL_CHARS)})"
+                            )
                     continue
             lines.extend(
                 render_item(item_id, note_label=note_label, note=notes.get(item_id), placeholder=placeholder)

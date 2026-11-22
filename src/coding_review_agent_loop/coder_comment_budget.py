@@ -14,9 +14,10 @@ then names the recovery command.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
+from .errors import AgentLoopError
 from .comment_rendering import MAX_CODER_BOUND_LEVEL, render_public_agent_comment
 from .protocol_common import HTML_COMMENT_RE, SIGNATURE_RE
 from .round_metadata import PostedRoundMetadata, _attach_round_metadata
@@ -38,6 +39,24 @@ class BoundedCoderComment:
     posted_body: str
     level: int
     metadata: PostedRoundMetadata
+
+
+def admitted_evidence_heads(runner, config, pr_number: int, comments, *current_heads: str | None) -> tuple[str, ...]:
+    """Every admitted PR head (and the given current heads) for evidence grouping.
+
+    Uses the same authenticated subject source as evidence ingestion, never SHA
+    mentions in untrusted prose.  Grouping is display-only, so an unavailable
+    history degrades to the current heads instead of failing the post.
+    """
+    from .native_evidence import known_pr_heads, native_history
+
+    current = tuple(head for head in current_heads if head)
+    try:
+        history = native_history(runner, config, pr_number, comments)
+    except AgentLoopError as error:
+        LOGGER.info("PR #%s: evidence grouping uses current heads only (%s)", pr_number, error)
+        history = ()
+    return tuple(dict.fromkeys((*current, *known_pr_heads(history))))
 
 
 def recovery_suffix(*, pr_number: int, head_sha: str | None) -> str:
@@ -81,7 +100,7 @@ def bounded_coder_round_comment(
     audit_note: str = "",
     render_kwargs: Mapping[str, object] | None = None,
     freeform_text: str | None = None,
-    evidence_heads: Sequence[str] = (),
+    evidence_heads: Sequence[str] | Callable[[], Sequence[str]] = (),
 ) -> BoundedCoderComment:
     """Return the coder round comment to post, bounded only when it cannot fit.
 
@@ -98,12 +117,17 @@ def bounded_coder_round_comment(
             audit_note=audit_note, freeform_text=freeform_text,
         )
     candidate = full
+    heads: Sequence[str] = ()
     for level in range(1, MAX_CODER_BOUND_LEVEL + 1):
+        if level == 2 and callable(evidence_heads):
+            heads = tuple(evidence_heads())  # resolved only when grouping is needed
+        elif level == 2:
+            heads = tuple(evidence_heads)
         visible = render_public_agent_comment(
             **render_kwargs,  # type: ignore[arg-type]
             bound_level=level,
             head_sha=head_sha,
-            evidence_heads=evidence_heads,
+            evidence_heads=heads,
         )
         candidate = _attach_round_metadata(
             _with_audit_note(audit_note, visible, level),
@@ -117,13 +141,23 @@ def bounded_coder_round_comment(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+_FOOTER_LINE_CHARS = 200
+
+
 def _split_trailer(body: str) -> tuple[list[str], str]:
-    """Content lines and the trailing signature/marker block, as posted."""
+    """Content lines and the short trailing footer (signature, state marker).
+
+    Only short footer-shaped lines are kept verbatim; a long trailing comment or
+    signature-shaped line is ordinary content, subject to the same budget.
+    """
     lines = body.rstrip("\n").splitlines()
     index = len(lines)
     while index > 0:
         candidate = lines[index - 1]
-        if not candidate.strip() or HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate):
+        footer = len(candidate) <= _FOOTER_LINE_CHARS and (
+            HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate)
+        )
+        if not candidate.strip() or footer:
             index -= 1
             continue
         break

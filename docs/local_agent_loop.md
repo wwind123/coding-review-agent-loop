@@ -3810,12 +3810,14 @@ it:
    are cut to short excerpts, and the summary is capped.
 2. Repeated native human-only exact-head evidence requests (the same request
    identity, repeated across reviewers or heads) also collapse into one line
-   that lists every item ID. The line reuses the item's own display label, so
+   that lists every item ID. Head SHAs in the request are matched against every
+   admitted PR head from the authenticated round history, so the same request
+   quoting different heads still groups. The line reuses the item's own display label, so
    a deferred request's text is still published only by the freeze notice.
    Row-converted obligations, screenshot requests, code findings and a request
    that appears only once keep their own lines.
 3. Item notes are dropped (each item keeps its ID under its disposition
-   heading). Tests run, out-of-checkout runs, test citations, sub-item progress
+   heading, and an evidence group line lists only its item IDs). Tests run, out-of-checkout runs, test citations, sub-item progress
    and matrix evidence become one count line each, the risk-matrix coverage map
    uses a compact one-line-per-row form, and the parse-degradation sections
    become one indicator line per kind under `### Parse degradations (bounded)`.

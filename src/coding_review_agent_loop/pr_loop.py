@@ -273,7 +273,7 @@ from .comment_rendering import (
     render_public_agent_comment,
     resolve_matrix_evidence_render,
 )
-from .coder_comment_budget import bounded_coder_round_comment
+from .coder_comment_budget import admitted_evidence_heads, bounded_coder_round_comment
 from .followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
@@ -553,6 +553,7 @@ from .pr_loop_support import (
 
 
 from .pr_loop_decisions import (
+    release_revalidation,
     _classify_pr_reviewer_prelaunch,
     _settle_pr_round_ledger,
     _route_post_approval_ci_failure,
@@ -2981,22 +2982,9 @@ def run_pr_loop(
             )
         # The signed-requirement IDs surfaced to the reviewers whose verdict the
         # next finalization relies on; ``None`` is an unverifiable baseline.
-        evidence_surfaced_baseline: tuple[str, ...] | None = None
-        evidence_revalidation_required = False
-        if (
-            evidence_boundary is not None
-            and evidence_boundary.phase == EVIDENCE_RELEASE_PHASE
-            and resumed_round is not None
-            and resumed_round.broken_evidence_freeze_head is None
-            and not resumed_round.head_advanced_without_record
-        ):
-            release_payload = evidence_boundary.evidence_release
-            evidence_revalidation_required = True
-            evidence_surfaced_baseline = (
-                release_payload.signed_requirement_ids_surfaced
-                if release_payload is not None and release_payload.valid
-                else None
-            )
+        evidence_revalidation_required, evidence_surfaced_baseline = release_revalidation(
+            evidence_boundary, resumed_round
+        )
 
         def collect_live_requirement_ids(context: PullRequestReviewContext) -> tuple[str, ...]:
             live_issue = (
@@ -9717,7 +9705,9 @@ def run_pr_loop(
             post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_round_comment(
                 public_comment, latest_coder_metadata, pr_number=pr_number,
                 head_sha=updated_pr_context.metadata.head_sha, audit_note=coder_dispatch_audit_note,
-                render_kwargs=coder_render_kwargs, freeform_text=coder_output, evidence_heads=(pre_turn_head,),
+                render_kwargs=coder_render_kwargs, freeform_text=coder_output,
+                evidence_heads=lambda: admitted_evidence_heads(runner, config, pr_number, pr_comments,
+                                                               pre_turn_head, updated_pr_context.metadata.head_sha),
             ).posted_body)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
                 predecessor, successor = pr_metadata.head_sha, updated_pr_context.metadata.head_sha

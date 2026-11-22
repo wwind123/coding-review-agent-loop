@@ -420,3 +420,75 @@ def test_metadata_only_overflow_names_the_recovery_command(tmp_path):
     assert "Round comment exceeds" in message
     assert f"agent-loop pr {PR} --review-unrecorded-head" in message
     assert HEAD in message
+
+
+def test_many_distinct_repeated_evidence_groups_still_fit_id_only(tmp_path):
+    """Item-1: a group line never costs more than its member IDs at levels 3-4."""
+    config = make_config(tmp_path)
+    items = []
+    for request in range(300):
+        for offset, reviewer in enumerate(("Codex", "Anthropic Claude")):
+            ledger, _ = _upsert_evidence_obligation(
+                [], item_number=2 * request + offset + 1, reviewer=reviewer,
+                text=f"Attach a human-only exact-head capture of release scenario {request} "
+                     + "with the full operator console transcript and timing table. " * 2,
+                source_round=2, current_head_sha=HEAD,
+            )
+            items.append(ledger[0])
+    ids = [item.item_id for item in items]
+    followup = _followup((), ids)
+    _full, result, parts = _post(followup, items, config)
+    assert result.level >= 3
+    remaining = _section(parts[-1], "### Remaining items")
+    assert _ids(remaining) == set(ids)
+    group_lines = [line for line in remaining.splitlines() if "," in line]
+    assert len(group_lines) == 300
+    assert all(re.fullmatch(r"- item-\d+, item-\d+", line) for line in group_lines)
+
+
+def test_grouping_needs_the_admitted_historical_heads(tmp_path):
+    """Item-2: requests quoting older PR heads collapse only when those heads are known."""
+    config = make_config(tmp_path)
+    items = [
+        _evidence_item(number, reviewer=reviewer, head=head)
+        for number, (reviewer, head) in enumerate(
+            [("Codex", OTHER_HEADS[0]), ("Anthropic Claude", OTHER_HEADS[1]), ("Codex", OTHER_HEADS[2])], 1
+        )
+    ]
+    assert all(item.candidate_head_sha is None for item in items)
+    followup = _followup((), [item.item_id for item in items])
+    kwargs = _kwargs(followup, items, config)
+    only_current = render_public_agent_comment(**kwargs, bound_level=2, head_sha=HEAD, evidence_heads=(HEAD,))
+    assert "one request repeated" not in only_current
+    admitted = render_public_agent_comment(
+        **kwargs, bound_level=2, head_sha=HEAD, evidence_heads=(HEAD, *OTHER_HEADS)
+    )
+    assert "one request repeated: item-1, item-2, item-3" in admitted
+
+
+def test_evidence_heads_are_resolved_lazily_only_when_grouping(tmp_path):
+    config = make_config(tmp_path)
+    calls = []
+    items = [_code_item(1)]
+    followup = _followup(["item-1"], note="Done.")
+    kwargs = _kwargs(followup, items, config)
+    bounded_coder_round_comment(
+        render_public_agent_comment(**kwargs), _metadata(items, raw=_raw(followup)), pr_number=PR,
+        head_sha=HEAD, render_kwargs=kwargs, evidence_heads=lambda: calls.append(1) or (HEAD,),
+    )
+    assert calls == []  # a fitting comment never reads history
+
+
+def test_freeform_trailing_long_comment_is_bounded_as_content():
+    """Item-3: only the short footer is immutable; a huge trailing comment is content."""
+    original = "Short narration.\n<!-- " + "n" * 70_000 + " -->"
+    full_body = _signed(original)
+    result = bounded_coder_round_comment(
+        full_body, _metadata([_code_item(1)]), pr_number=PR, head_sha=HEAD, freeform_text=original,
+    )
+    parts = [str(part) for part in prepare_round_comment(result.posted_body)]
+    assert all(len(part) <= MAX_GITHUB_BODY_CHARS for part in parts)
+    anchor = parts[-1]
+    assert "Short narration." in anchor and "n" * 1000 not in anchor
+    assert anchor.rstrip().endswith("-- Anthropic Claude: claude-opus-5-5 (medium)")
+    assert _hydrated(parts).metadata.raw_structured_coder_response == original
