@@ -18,7 +18,7 @@ from .child_topology import (
     parent_child_search_queries,
     preflight_flat_child_count,
 )
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .github import FoundIssue, create_issue, get_issue_found, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, decompress_record_payload, sanitize_historical_text
@@ -68,6 +68,10 @@ from .pr_round_ingestion import record_body
 from .round_transport import MAX_GITHUB_BODY_CHARS, MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
+# Why clearing a malformed or misplaced signed record is never automated (#2069).
+_SIGNED_RECORD_NOTE = (
+    "the record is signed human input that an automation must not author, edit or delete."
+)
 DECOMPOSITION_MARKER_RE = re.compile(
     r"<!--\s*AGENT_PLAN_DECOMPOSITION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
@@ -3697,24 +3701,49 @@ def collect_child_disposition_overrides(
                 ignored_sink.extend(ignored)
             for record in records:
                 if record.parent_issue != parent_issue or record.plan_hash != plan_hash:
-                    raise AgentLoopError(
-                        "Human decision required: signed child-disposition override at "
-                        f"{record.comment_locator} names parent #{record.parent_issue} / plan "
-                        f"{record.plan_hash}, but the bound topology is parent #{parent_issue} / "
-                        f"plan {plan_hash}. Remove or correct the record before rerunning."
+                    raise HumanDecisionRequiredError.decision(
+                        what=(
+                            "Human decision required: signed child-disposition override at "
+                            f"{record.comment_locator} names parent #{record.parent_issue} / plan "
+                            f"{record.plan_hash}, but the bound topology is parent #{parent_issue} / "
+                            f"plan {plan_hash}. Remove or correct the record before rerunning."
+                        ),
+                        clear=(
+                            f"Remove or correct the signed override at {record.comment_locator}, "
+                            "then rerun the same command."
+                        ),
+                        safe_to_automate=False,
+                        automation_note=_SIGNED_RECORD_NOTE,
                     )
                 if record.stage_id not in tuple(topology_stage_ids):
-                    raise AgentLoopError(
-                        "Human decision required: signed child-disposition override at "
-                        f"{record.comment_locator} names stage `{record.stage_id}`, which is not a "
-                        "stage of the bound topology. Remove or correct the record before rerunning."
+                    raise HumanDecisionRequiredError.decision(
+                        what=(
+                            "Human decision required: signed child-disposition override at "
+                            f"{record.comment_locator} names stage `{record.stage_id}`, which is not a "
+                            "stage of the bound topology. Remove or correct the record before rerunning."
+                        ),
+                        clear=(
+                            f"Remove or correct the signed override at {record.comment_locator}, "
+                            "then rerun the same command."
+                        ),
+                        safe_to_automate=False,
+                        automation_note=_SIGNED_RECORD_NOTE,
                     )
                 if local_stage_id is not None and record.stage_id != local_stage_id:
-                    raise AgentLoopError(
-                        "Human decision required: signed child-disposition override at "
-                        f"{record.comment_locator} names stage `{record.stage_id}`, but that child "
-                        f"issue is stage `{local_stage_id}`. Post stage overrides for other children "
-                        "on the parent issue or on their own child issue."
+                    raise HumanDecisionRequiredError.decision(
+                        what=(
+                            "Human decision required: signed child-disposition override at "
+                            f"{record.comment_locator} names stage `{record.stage_id}`, but that child "
+                            f"issue is stage `{local_stage_id}`. Post stage overrides for other children "
+                            "on the parent issue or on their own child issue."
+                        ),
+                        clear=(
+                            f"Move the signed override at {record.comment_locator} to the parent "
+                            f"issue or to stage `{record.stage_id}`'s own child issue, then rerun the "
+                            "same command."
+                        ),
+                        safe_to_automate=False,
+                        automation_note=_SIGNED_RECORD_NOTE,
                     )
                 found.append(record)
     scoped: list[ChildDispositionOverride] = []
@@ -3938,24 +3967,40 @@ def collect_child_plan_supersessions(
                 or record.parent_issue != parent_issue
                 or record.stage_id != stage_id
             ):
-                raise AgentLoopError(
-                    "Human decision required: signed child-plan supersession at "
-                    f"{record.comment_locator} names child #{record.child_issue} / parent "
-                    f"#{record.parent_issue} / stage `{record.stage_id}`, but this issue is child "
-                    f"#{child_issue} / parent #{parent_issue} / stage `{stage_id}`. Remove or "
-                    "correct the record before rerunning."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed child-plan supersession at "
+                        f"{record.comment_locator} names child #{record.child_issue} / parent "
+                        f"#{record.parent_issue} / stage `{record.stage_id}`, but this issue is child "
+                        f"#{child_issue} / parent #{parent_issue} / stage `{stage_id}`. Remove or "
+                        "correct the record before rerunning."
+                    ),
+                    clear=(
+                        f"Remove or correct the signed supersession at {record.comment_locator}, "
+                        "then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
             by_digest.setdefault(record.digest, record)
     by_hash: dict[str, ChildPlanSupersession] = {}
     for record in by_digest.values():
         other = by_hash.get(record.superseded_plan_hash)
         if other is not None:
-            raise AgentLoopError(
-                "Human decision required: two distinct signed child-plan supersession records "
-                f"name superseded plan {record.superseded_plan_hash} "
-                f"({other.comment_locator} and {record.comment_locator}). Keep exactly one "
-                "record per superseded plan hash before rerunning; records are never chosen "
-                "by comment order."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    "Human decision required: two distinct signed child-plan supersession records "
+                    f"name superseded plan {record.superseded_plan_hash} "
+                    f"({other.comment_locator} and {record.comment_locator}). Keep exactly one "
+                    "record per superseded plan hash before rerunning; records are never chosen "
+                    "by comment order."
+                ),
+                clear=(
+                f"Keep exactly one signed supersession record for plan "
+                f"{record.superseded_plan_hash}, remove the other, then rerun the same command."
+            ),
+                safe_to_automate=False,
+                automation_note=_SIGNED_RECORD_NOTE,
             )
         by_hash[record.superseded_plan_hash] = record
     return tuple(by_digest.values())

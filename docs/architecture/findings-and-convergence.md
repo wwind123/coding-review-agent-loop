@@ -349,6 +349,28 @@ constants; the non-convergence match reads only the first line, so item text
 further down cannot change the classification. Evidence-stall and evidence-freeze
 coverage is described below; disputed-items and finalization stops are unchanged.
 
+**Uniform human-decision stops** (#2069). Every human-decision stop raises
+`HumanDecisionRequiredError` (exit 4); a plain `AgentLoopError` never carries
+"human decision" text. The message is `render_human_decision` output in
+`errors.py`: the verbatim, possibly multi-line "what happened" part, then
+exactly two final lines, `To clear: <one action>` and
+`Safe to automate: yes|no - <reason>`. `parse_human_decision` inverts it.
+Errors are built through `HumanDecisionRequiredError.decision(...)` or from a
+registered full-message renderer listed in `HUMAN_DECISION_RENDERERS`, directly
+or through a same-function local. Each renderer keeps the leading prefix that
+history export and triage recognize. A stop that crosses functions carries the
+built error object: `PrStepBackDecision.deferred_stop` holds the deferred
+non-convergence error, and the plan step-back and primary-stall stops build a
+`PlanPrePanelHumanDecisionError` (both `PlanPrePanelSafetyError` and
+`HumanDecisionRequiredError`) that `stop_plan_pre_panel_decision` posts once
+and re-raises. Post-merge context is added with `exc.with_context`, which keeps
+it inside the "what" part. The bounded PR diagnostic shortens only the "what"
+part, so the two final lines still end the posted body.
+`tests/test_human_decision_stops.py` enforces this statically from the parsed
+source class graph: the phrase scan, the provenance rule and the renderer
+bodies. The hyphenated `human-decision` protocol status token is not a stop.
+The staged needs-human JSON outcome keeps exit 2.
+
 **Unchanged-head stop and evidence progress.** `_UnchangedHeadTracker` counts
 consecutive PR follow-ups that leave one head unchanged and stops at
 `MAX_UNCHANGED_HEAD_CODER_TURNS` (#985). It has one bounded exception

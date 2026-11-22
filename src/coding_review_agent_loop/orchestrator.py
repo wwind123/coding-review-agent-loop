@@ -659,6 +659,7 @@ from .plan_review_scheduling import (
     PLAN_HISTORY_TRANSPORT_FAILURE,
     PlanCandidateKey,
     PlanCrossCuttingContracts,
+    PlanPrePanelHumanDecisionError,
     PlanPrePanelSafetyError,
     PlanRevisionDescriptor,
     PlanReviewSchedulingContract,

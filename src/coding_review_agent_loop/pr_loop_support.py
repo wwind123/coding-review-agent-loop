@@ -50,6 +50,8 @@ from .errors import (
     AgentLoopError,
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
+    parse_human_decision,
+    render_human_decision,
 )
 from .github_retry import describe_gh_failure
 from .github import (
@@ -1882,9 +1884,13 @@ class _RepeatableRoundSequence:
     def repeat_current(self) -> None:
         self._repeats += 1
         if self._repeats > self.MAX_REPEATS_PER_ROUND:
-            raise HumanDecisionRequiredError(
-                f"Round {self._current} was re-run {self.MAX_REPEATS_PER_ROUND} times for new "
-                "signed human input without settling; human review required."
+            raise HumanDecisionRequiredError.decision(
+                what=f"Round {self._current} was re-run {self.MAX_REPEATS_PER_ROUND} times for "
+                "new signed human input without settling; human review required.",
+                clear="Stop posting new signed comments for this round, review the signed input "
+                "already posted, then rerun the same command.",
+                safe_to_automate=False,
+                automation_note="the unsettled input is signed human input that needs review.",
             )
         self._repeat = True
 
@@ -1931,7 +1937,7 @@ def _evidence_freeze_diagnostic(
     *, pr_number: int, head_sha: str | None, items: Sequence[UnresolvedReviewItem]
 ) -> str:
     evidence = _pending_evidence_obligations(items)
-    return (
+    what = (
         f"PR #{pr_number} is frozen at head {head_sha or 'unknown'} awaiting human-only "
         "exact-head evidence: "
         + "; ".join(
@@ -1945,6 +1951,13 @@ def _evidence_freeze_diagnostic(
         f"exactly `-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`. Pushing a new "
         "commit breaks the freeze and the new head needs full review and fresh evidence."
         + "\n" + scheduling_guidance(evidence)
+    )
+    return render_human_decision(
+        what=what,
+        clear="Post the exact-head evidence (or withdraw the request) in a PR comment whose "
+        f"last line is exactly `-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`.",
+        safe_to_automate=False,
+        automation_note="the evidence must come from a human; an automation must not author it.",
     )
 
 
@@ -4253,7 +4266,8 @@ class PrStepBackDecision:
     triggers: tuple[_step_back.PrClusterTrigger, ...] = ()
     # A non-convergence stop held back so the evidence-stall stop can decide
     # first at this dispatch (#1372); raised before any coder invocation.
-    deferred_stop: str | None = None
+    # Built from the registered renderer and carried, never rebuilt (#2069).
+    deferred_stop: HumanDecisionRequiredError | None = None
 
     def coder_guidance(self) -> str:
         if not self.triggers:
@@ -4496,8 +4510,8 @@ def _pr_step_back_decision(
                     f"PR step-back: escalating {reviewer} on the unmappable-anchor same-path "
                     "fallback",
                 )
-            raise HumanDecisionRequiredError(
-                f"PR #{pr_number}: "
+            raise HumanDecisionRequiredError.decision(
+                what=f"PR #{pr_number}: "
                 + _step_back.render_pr_step_back_human_decision(
                     reviewer=reviewer,
                     entry=episode.entry,
@@ -4506,7 +4520,13 @@ def _pr_step_back_decision(
                     window=window,
                     generalization=_step_back.step_back_generalization(fresh, episode.entry),
                     sibling_round=episode.sibling_round,
-                )
+                ),
+                clear="Accept a stated limitation: document it, resolve or defer the sibling, "
+                f"push the commit and rerun `agent-loop pr {pr_number}`; the other options "
+                "are listed above.",
+                safe_to_automate=False,
+                automation_note="choosing between continuing, accepting a limitation and "
+                "redesigning is a human judgement.",
             )
         if episode.entry is None:
             trigger_candidates.append(reviewer)
@@ -4518,7 +4538,7 @@ def _pr_step_back_decision(
         if non_convergence_k > 0 and config.pr_evidence_stall_rounds > 0
         else None
     )
-    deferred: str | None = None
+    deferred: HumanDecisionRequiredError | None = None
     for reviewer in tracked if non_convergence_k > 0 else ():
         stalled = _step_back.find_pr_non_convergence(
             fresh, reviewer, k=non_convergence_k, current_round=round_number,
@@ -4549,7 +4569,7 @@ def _pr_step_back_decision(
                 f"Round {round_number}: {reviewer}'s persisting items are all evidence the "
                 "evidence-stall stop may own; it decides first at this dispatch",
             )
-            deferred = message
+            deferred = HumanDecisionRequiredError(message)
             continue
         raise HumanDecisionRequiredError(message)
     if deferred is not None:
@@ -4698,7 +4718,7 @@ def render_evidence_stall_decision(
     row_lines = "\n".join(
         f"- `{clean(row_id)}`: {clean(explanation)}" for row_id, explanation in sorted(rows.items())
     )
-    return (
+    what = (
         f"PR #{pr_number} is stalled on evidence only at head `{head_sha}` "
         f"(approved matrix `{matrix_identity[:12]}`): for {k} consecutive reviews every open "
         "blocker has asked only for admissible citation evidence, no code finding, failing "
@@ -4715,6 +4735,13 @@ def render_evidence_stall_decision(
         "operator evidence at the final exact-head freeze.\n"
         "3. Override with a signed human decision through the existing signed-requirement "
         "path, then rerun the same command."
+    )
+    return render_human_decision(
+        what=what,
+        clear="Rerun the same command with `--pr-convert-evidence-rows` naming the rows listed "
+        "above (option 2); the other options are listed above.",
+        safe_to_automate=False,
+        automation_note="converting rows to operator evidence commits a human to supply it.",
     )
 
 
@@ -5794,16 +5821,23 @@ def render_pr_human_decision_diagnostic(label: str, message: str) -> str:
     Within :data:`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` this is exactly
     :func:`render_pr_scheduling_diagnostic`.  Otherwise the template, the first
     line and as many following whole lines as fit are kept verbatim, then an
-    omission note.  The raised exception and the CLI text are never bounded.
+    omission note.  A three-part message (#2069) is bounded inside its 'what'
+    part, so the 'To clear' and 'Safe to automate' lines still end the body.
+    The raised exception and the CLI text are never bounded.
     """
     full = render_pr_scheduling_diagnostic(label, message)
     if len(full) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT:
         return full
     prefix = render_pr_scheduling_diagnostic(label, "")
+    body, tail = message, ""
+    if parse_human_decision(message) is not None:
+        what, clear_line, automate_line = message.rsplit("\n", 2)
+        if len(clear_line) + len(automate_line) < PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT // 4:
+            body, tail = what, f"\n{clear_line}\n{automate_line}"
     # The note's digit count can only shrink from this upper bound.
-    reserve = len("\n" + _pr_human_decision_omission_note(len(message)))
+    reserve = len("\n" + _pr_human_decision_omission_note(len(body))) + len(tail)
     budget = max(PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT - len(prefix) - reserve, 0)
-    first, *rest = message.split("\n")
+    first, *rest = body.split("\n")
     if len(first) > budget:
         kept = first[:budget]
     else:
@@ -5812,7 +5846,7 @@ def render_pr_human_decision_diagnostic(label: str, message: str) -> str:
             if len(kept) + 1 + len(line) > budget:
                 break
             kept += "\n" + line
-    return prefix + kept + "\n" + _pr_human_decision_omission_note(len(message) - len(kept))
+    return prefix + kept + "\n" + _pr_human_decision_omission_note(len(body) - len(kept)) + tail
 
 
 

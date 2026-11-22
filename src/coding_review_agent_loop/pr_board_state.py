@@ -32,7 +32,7 @@ from .board_change import (
     resolve_board_lineage,
 )
 from .config import reviewers
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .reviewer_floor import board_floor_enabled, check_reviewer_floor
 from .round_state import _extract_round_metadata_records
 
@@ -429,11 +429,19 @@ def authenticate_named_legacy_pr_entry(
             "authenticated GitHub actor is unavailable in dry-run mode, so it cannot be admitted."
         )
 
-    def refuse(detail: str) -> AgentLoopError:
-        return AgentLoopError(
-            f"Human decision required: PR #{pr_number} has unanchored round history under a "
-            f"named reviewer board, and {detail}. Nothing was posted. Only records written by "
-            "the authenticated orchestrator actor can seed a named board."
+    def refuse(detail: str) -> HumanDecisionRequiredError:
+        return HumanDecisionRequiredError.decision(
+            what=(
+                f"Human decision required: PR #{pr_number} has unanchored round history under a "
+                f"named reviewer board, and {detail}. Nothing was posted. Only records written by "
+                "the authenticated orchestrator actor can seed a named board."
+            ),
+            clear=(
+                f"Remove the round records the authenticated orchestrator actor did not write, "
+                f"then rerun `agent-loop pr {pr_number}`."
+            ),
+            safe_to_automate=False,
+            automation_note="deleting PR round history is a human decision.",
         )
 
     pr_view = read_authenticated_protocol_comments(

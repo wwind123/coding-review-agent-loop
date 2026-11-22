@@ -5408,3 +5408,39 @@ def test_board_reentry_round_anchors_on_authority_records_only(candidate):
     # Only candidate records: nothing authoritative to anchor on, so round 1.
     only_candidates = [link, *with_candidates[3:]]
     assert board_reentry_round(comments(only_candidates), None) == 1
+
+
+def test_misplaced_signed_board_amendment_stops_with_a_three_part_exit_4_error():
+    """`board-amendment-exit4`: board_amendment.py wrong-flow amendment (#2069)."""
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.board_amendment import (
+        collect_reviewer_board_amendments,
+        format_reviewer_board_amendment_comment,
+    )
+    from coding_review_agent_loop.errors import (
+        HumanDecisionRequiredError,
+        parse_human_decision,
+    )
+
+    pr_body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=17,
+        original_required_reviewers=("Codex", "Claude", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=3, rationale="quota",
+    )
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        collect_reviewer_board_amendments(
+            [SimpleNamespace(body=pr_body)], flow="plan", issue_number=942
+        )
+    assert caught.value.EXIT_CODE == 4
+    text = str(caught.value)
+    assert text.startswith("Human decision required: signed reviewer-board amendment at ")
+    parts = parse_human_decision(text)
+    assert parts is not None
+    assert "is a `pr` record, but issue #942 only accepts `plan` amendments" in parts.what
+    assert parts.clear == (
+        "Remove the signed record from issue #942 (repost it on PR #17 if it is still "
+        "wanted), then rerun the same command."
+    )
+    assert parts.safe_to_automate is False

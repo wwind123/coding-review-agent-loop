@@ -33,12 +33,16 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .protocol import UnresolvedReviewItem, parse_signed_human_requirement_body
 from .round_metadata import (
     PostedRoundRecord,
 )
 
+# Why clearing a malformed or misplaced signed record is never automated (#2069).
+_SIGNED_RECORD_NOTE = (
+    "the record is signed human input that an automation must not author, edit or delete."
+)
 REVIEWER_BOARD_AMENDMENT_KIND = "reviewer-board-amendment"
 REVIEWER_BOARD_AMENDMENT_SCHEMA_VERSION = 1
 REVIEWER_BOARD_REMOVAL_REASON = "backend-unavailable"
@@ -530,25 +534,49 @@ def collect_reviewer_board_amendments(
                     if record.flow == "plan" and record.issue is not None
                     else "its own surface"
                 )
-                raise AgentLoopError(
-                    "Human decision required: signed reviewer-board amendment at "
-                    f"{record.comment_locator} is a `{record.flow}` record, but {surface} only "
-                    f"accepts `{flow}` amendments. Post this record on {target} instead, and "
-                    "remove it from here before rerunning."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed reviewer-board amendment at "
+                        f"{record.comment_locator} is a `{record.flow}` record, but {surface} only "
+                        f"accepts `{flow}` amendments. Post this record on {target} instead, and "
+                        "remove it from here before rerunning."
+                    ),
+                    clear=(
+                        f"Remove the signed record from {surface} (repost it on {target} if it is "
+                        "still wanted), then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
             if flow == "plan" and record.issue != issue_number:
-                raise AgentLoopError(
-                    "Human decision required: signed reviewer-board amendment at "
-                    f"{record.comment_locator} names issue #{record.issue}, but it is posted "
-                    f"on issue #{issue_number}. Post this record on issue #{record.issue}, "
-                    "or correct it, before rerunning."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed reviewer-board amendment at "
+                        f"{record.comment_locator} names issue #{record.issue}, but it is posted "
+                        f"on issue #{issue_number}. Post this record on issue #{record.issue}, "
+                        "or correct it, before rerunning."
+                    ),
+                    clear=(
+                        f"Correct the signed record at {record.comment_locator}, or move it to issue "
+                        f"#{record.issue}, then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
             if flow == "pr" and record.pr_number != pr_number:
-                raise AgentLoopError(
-                    "Human decision required: signed reviewer-board amendment at "
-                    f"{record.comment_locator} names PR #{record.pr_number}, but it is posted "
-                    f"on PR #{pr_number}. Post this record on PR #{record.pr_number}, "
-                    "or correct it, before rerunning."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed reviewer-board amendment at "
+                        f"{record.comment_locator} names PR #{record.pr_number}, but it is posted "
+                        f"on PR #{pr_number}. Post this record on PR #{record.pr_number}, "
+                        "or correct it, before rerunning."
+                    ),
+                    clear=(
+                        f"Correct the signed record at {record.comment_locator}, or move it to PR "
+                        f"#{record.pr_number}, then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
             by_digest.setdefault(record.digest, record)
     return tuple(sorted(by_digest.values(), key=lambda record: record.comment_index))
@@ -573,11 +601,19 @@ def reject_misplaced_pr_amendments(
         )
         for record in records:
             if record.flow == "pr":
-                raise AgentLoopError(
-                    "Human decision required: signed `pr` reviewer-board amendment at "
-                    f"{record.comment_locator} is posted on the owning issue. Post this "
-                    f"record on PR #{record.pr_number} instead, and remove it from issue "
-                    f"#{issue_number} before rerunning."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed `pr` reviewer-board amendment at "
+                        f"{record.comment_locator} is posted on the owning issue. Post this "
+                        f"record on PR #{record.pr_number} instead, and remove it from issue "
+                        f"#{issue_number} before rerunning."
+                    ),
+                    clear=(
+                        f"Remove the signed `pr` record from issue #{issue_number} (repost it on PR "
+                        f"#{record.pr_number} if it is still wanted), then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
 
 
@@ -603,11 +639,19 @@ def amend_contract(
     policy = getattr(original, "policy")
     primary = getattr(original, "primary_reviewer")
 
-    def fail(problem: str) -> AgentLoopError:
-        return AgentLoopError(
-            "Human decision required: signed reviewer-board amendment at "
-            f"{amendment.comment_locator} cannot be applied: {problem}. Correct or remove "
-            "the record before rerunning."
+    def fail(problem: str) -> HumanDecisionRequiredError:
+        return HumanDecisionRequiredError.decision(
+            what=(
+                "Human decision required: signed reviewer-board amendment at "
+                f"{amendment.comment_locator} cannot be applied: {problem}. Correct or remove "
+                "the record before rerunning."
+            ),
+            clear=(
+                f"Correct or remove the signed record at {amendment.comment_locator}, then rerun "
+                "the same command."
+            ),
+            safe_to_automate=False,
+            automation_note=_SIGNED_RECORD_NOTE,
         )
 
     if tuple(amendment.original_required_reviewers) != required:
@@ -689,18 +733,34 @@ def build_amendment_chain(
         if chain:
             previous = chain[-1]
             if record.effective_from_round <= previous.effective_from_round:
-                raise AgentLoopError(
-                    "Human decision required: chained reviewer-board amendment at "
-                    f"{record.comment_locator} is effective from round "
-                    f"{record.effective_from_round}, which does not follow round "
-                    f"{previous.effective_from_round} of the amendment it chains from "
-                    f"({previous.comment_locator})."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: chained reviewer-board amendment at "
+                        f"{record.comment_locator} is effective from round "
+                        f"{record.effective_from_round}, which does not follow round "
+                        f"{previous.effective_from_round} of the amendment it chains from "
+                        f"({previous.comment_locator})."
+                    ),
+                    clear=(
+                        f"Correct or remove the signed record at {record.comment_locator}, then "
+                        "rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
             if record.comment_index <= previous.comment_index:
-                raise AgentLoopError(
-                    "Human decision required: chained reviewer-board amendment at "
-                    f"{record.comment_locator} is posted before the amendment it chains "
-                    f"from ({previous.comment_locator})."
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: chained reviewer-board amendment at "
+                        f"{record.comment_locator} is posted before the amendment it chains "
+                        f"from ({previous.comment_locator})."
+                    ),
+                    clear=(
+                        f"Correct or remove the signed record at {record.comment_locator}, then "
+                        "rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
                 )
         contracts.append(
             amend_contract(
@@ -716,20 +776,30 @@ def build_amendment_chain(
         remaining.remove(record)
     for board, matches in contested:
         if any(record in remaining for record in matches):
-            raise AgentLoopError(
-                "Human decision required: signed reviewer-board amendments at "
-                + ", ".join(record.comment_locator for record in matches)
-                + f" all amend the board {list(board)}. The orchestrator never chooses "
-                "between them by comment order; keep exactly one and remove the others."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    "Human decision required: signed reviewer-board amendments at "
+                    + ", ".join(record.comment_locator for record in matches)
+                    + f" all amend the board {list(board)}. The orchestrator never chooses "
+                    "between them by comment order; keep exactly one and remove the others."
+                ),
+                clear="Keep exactly one of the named signed records, remove the others, then rerun the same command.",
+                safe_to_automate=False,
+                automation_note=_SIGNED_RECORD_NOTE,
             )
     if remaining:
-        raise AgentLoopError(
-            "Human decision required: signed reviewer-board amendment(s) at "
-            + ", ".join(record.comment_locator for record in remaining)
-            + " match no persisted scheduler contract board in this run's amendment "
-            "chain (original_required_reviewers must equal the persisted board, or the "
-            "board produced by the previous amendment). Correct or remove the record "
-            "before rerunning."
+        raise HumanDecisionRequiredError.decision(
+            what=(
+                "Human decision required: signed reviewer-board amendment(s) at "
+                + ", ".join(record.comment_locator for record in remaining)
+                + " match no persisted scheduler contract board in this run's amendment "
+                "chain (original_required_reviewers must equal the persisted board, or the "
+                "board produced by the previous amendment). Correct or remove the record "
+                "before rerunning."
+            ),
+            clear="Correct or remove the unmatched signed record(s), then rerun the same command.",
+            safe_to_automate=False,
+            automation_note=_SIGNED_RECORD_NOTE,
         )
     return tuple(contracts), tuple(chain)
 
@@ -793,12 +863,20 @@ def resolve_contract_lineage(
             )
     if not bearing:
         if amendments:
-            raise AgentLoopError(
-                "Human decision required: signed reviewer-board amendment(s) at "
-                + ", ".join(record.comment_locator for record in amendments)
-                + " are unmatched: this run has no persisted scheduler contract to amend "
-                "(all-reviewers PR runs and the non-staged plan path persist none). "
-                "Change the reviewer flags directly and delete the record."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    "Human decision required: signed reviewer-board amendment(s) at "
+                    + ", ".join(record.comment_locator for record in amendments)
+                    + " are unmatched: this run has no persisted scheduler contract to amend "
+                    "(all-reviewers PR runs and the non-staged plan path persist none). "
+                    "Change the reviewer flags directly and delete the record."
+                ),
+                clear=(
+                    "Delete the signed record(s) and change the reviewer flags directly, then "
+                    "rerun the same command."
+                ),
+                safe_to_automate=False,
+                automation_note=_SIGNED_RECORD_NOTE,
             )
         return ContractLineage(
             contracts=((configured_contract,) if configured_contract is not None else ()),
@@ -884,22 +962,38 @@ def require_amendment_activation(
         if amendment.effective_from_round != start_round_number:
             replacement = template(amendment, start_round_number)
             if replacement is None:
-                raise AgentLoopError(
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        "Human decision required: signed reviewer-board amendment at "
+                        f"{amendment.comment_locator} is effective from round "
+                        f"{amendment.effective_from_round}, which is not the round this resume "
+                        "re-enters. No safe replacement amendment round can be determined yet: "
+                        "the round this resume re-enters is open and partly published beside a "
+                        "seat that would need a fresh turn. No template is printed; inspect the "
+                        "PR's round records before posting a replacement."
+                    ),
+                    clear=(
+                        "Inspect the PR's round records, post a replacement signed amendment for a "
+                        "safe round, then rerun the same command."
+                    ),
+                    safe_to_automate=False,
+                    automation_note=_SIGNED_RECORD_NOTE,
+                )
+            raise HumanDecisionRequiredError.decision(
+                what=(
                     "Human decision required: signed reviewer-board amendment at "
                     f"{amendment.comment_locator} is effective from round "
-                    f"{amendment.effective_from_round}, which is not the round this resume "
-                    "re-enters. No safe replacement amendment round can be determined yet: "
-                    "the round this resume re-enters is open and partly published beside a "
-                    "seat that would need a fresh turn. No template is printed; inspect the "
-                    "PR's round records before posting a replacement."
-                )
-            raise AgentLoopError(
-                "Human decision required: signed reviewer-board amendment at "
-                f"{amendment.comment_locator} is effective from round "
-                f"{amendment.effective_from_round}, but this resume re-enters round "
-                f"{start_round_number}, the first round whose scheduler decision can use "
-                "the amended board. Replace the record with one effective from round "
-                f"{start_round_number}:\n\n{replacement}"
+                    f"{amendment.effective_from_round}, but this resume re-enters round "
+                    f"{start_round_number}, the first round whose scheduler decision can use "
+                    "the amended board. Replace the record with one effective from round "
+                    f"{start_round_number}:\n\n{replacement}"
+                ),
+                clear=(
+                    f"Replace the signed record with one effective from round {start_round_number}, "
+                    "then rerun the same command."
+                ),
+                safe_to_automate=False,
+                automation_note=_SIGNED_RECORD_NOTE,
             )
 
 

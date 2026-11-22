@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.github import HumanReviewRequirement
+from coding_review_agent_loop.errors import parse_human_decision
 from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey
 from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
 from coding_review_agent_loop.discuss_loop import _attach_round_metadata
@@ -612,7 +613,9 @@ def test_stall_message_names_every_working_remedy():
     suffixed = panel_evidence.plan_primary_stall_message(
         streak=8, threshold=8, plan_chars=1, step_back_status="plan-growth gate is off"
     )
-    assert suffixed.endswith(" Plan step-back did not apply: plan-growth gate is off.")
+    assert parse_human_decision(suffixed).what.endswith(
+        " Plan step-back did not apply: plan-growth gate is off."
+    )
     for needle in ("--plan-reset-stall-streak", "--plan-review-force-full"):
         assert needle in suffixed
 

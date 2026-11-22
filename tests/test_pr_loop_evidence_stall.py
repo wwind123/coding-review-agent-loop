@@ -1646,3 +1646,42 @@ def test_stall_diagnostic_failure_preserves_identical_stop(tmp_path, monkeypatch
     assert attempts == [loop.render_pr_human_decision_diagnostic("round 4", str(raised.value))]
     assert "Warning: could not post the human-decision diagnostic" in capsys.readouterr().err
     assert _coder_count(runner) == 3
+
+
+def test_a_deferred_non_convergence_stop_raises_the_carried_error_object(tmp_path, monkeypatch):
+    """`deferred-non-convergence-object` (#2069): the object built from the renderer
+    in pr_loop_support reaches the stop unchanged, three-part and prefixed."""
+    from coding_review_agent_loop.cli import main
+    from coding_review_agent_loop.errors import parse_human_decision
+    from coding_review_agent_loop.review_step_back import PR_NON_CONVERGENCE_DECISION_LEAD
+    import coding_review_agent_loop.cli as cli_module
+
+    carried = []
+    real_decision = pr_loop_module._pr_step_back_decision
+
+    def recording_decision(*args, **kwargs):
+        decision = real_decision(*args, **kwargs)
+        if decision.deferred_stop is not None:
+            carried.append(decision.deferred_stop)
+        return decision
+
+    monkeypatch.setattr(pr_loop_module, "_pr_step_back_decision", recording_decision)
+    runner = _evidence_only_runner(4, 3)
+    config = _config(
+        tmp_path, max_rounds=4, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3
+    )
+    with pytest.raises(HumanDecisionRequiredError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
+    assert carried and isinstance(carried[-1], HumanDecisionRequiredError)
+    assert raised.value is carried[-1]
+    message = str(raised.value)
+    assert message.startswith("PR #77: " + PR_NON_CONVERGENCE_DECISION_LEAD)
+    parts = parse_human_decision(message)
+    assert parts is not None and parts.safe_to_automate is False
+    assert _hd_diagnostics(runner)[0].rstrip().endswith(message.split("\n")[-1])
+
+    def raise_carried(*_args, **_kwargs):
+        raise raised.value
+
+    monkeypatch.setattr(cli_module, "run_pr_loop", raise_carried)
+    assert main(["pr", "77", "--repo", "OWNER/REPO"]) == 4

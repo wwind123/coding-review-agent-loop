@@ -1430,7 +1430,10 @@ def test_a_bounded_oversized_non_convergence_diagnostic_still_classifies():
     assert body.startswith(
         render_pr_scheduling_diagnostic("round 5", message.split("\n", 1)[0] + "\n")
     )
-    assert "characters of detail omitted from this diagnostic" in body.rsplit("\n", 1)[1]
+    # The omission note closes the bounded 'what' part; the clearing action and
+    # automation lines still end the body (#2069).
+    assert "characters of detail omitted from this diagnostic" in body.rsplit("\n", 3)[1]
+    assert body.split("\n")[-2:] == message.split("\n")[-2:]
     assert recognize_diagnostic(body).reason == "pr-non-convergence"
 
 
@@ -1539,3 +1542,33 @@ def test_history_counts_two_frozen_invocations_without_manufacturing_rounds():
         assert row["pr_rounds"] == expected
         assert row["outcome_complete"] is complete
         assert row["missing_reviewer_records"] == []
+
+
+def test_three_part_human_decision_diagnostics_keep_their_reason_labels():
+    """`history-export-recognition`: the #2069 three-part shape stays recognized."""
+    from coding_review_agent_loop.errors import parse_human_decision
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+
+    plan_cases = (
+        (step_back_stop_message(), "plan-step-back"),
+        (plan_primary_stall_message(streak=3, threshold=3, plan_chars=1200), "plan-primary-stall"),
+    )
+    for message, reason in plan_cases:
+        assert parse_human_decision(message) is not None
+        assert "\nTo clear: " in message and "\nSafe to automate: no - " in message
+        stop = recognize_diagnostic(render_plan_scheduling_diagnostic("round 4", message))
+        assert (stop.kind, stop.reason, stop.round_number, stop.terminal) == (
+            KIND_HUMAN_DECISION_STOP, reason, 4, True,
+        )
+    pr_cases = (
+        (_non_convergence_stop_message(), "pr-non-convergence"),
+        (_approach_alternative_stop_message(), "pr-step-back-approach-alternative"),
+        *_evidence_stop_messages(),
+    )
+    for message, reason in pr_cases:
+        assert parse_human_decision(message) is not None, reason
+        body = render_pr_human_decision_diagnostic("round 5", message)
+        stop = recognize_diagnostic(body)
+        assert (stop.kind, stop.reason, stop.round_number, stop.terminal) == (
+            KIND_HUMAN_DECISION_STOP, reason, 5, True,
+        )

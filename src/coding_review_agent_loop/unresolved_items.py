@@ -843,13 +843,18 @@ def _raise_if_maintained_disputed_items(
         f"- [{item.item_id}] disputed at {_format_dispute_time(times.get(item.item_id))}"
         for item in disputed_still_blocking
     )
-    raise HumanDecisionRequiredError(
-        f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
-        "after seeing coder counter-evidence. Human decision required to resolve the "
-        f"disagreement.\n\nDisputed items still unresolved:\n{item_lines}\n\n"
-        "Recovery: post a signed human decision, then rerun. The stop releases "
-        "automatically once a signed requirement created after an item's dispute "
-        "time is admitted; an item whose dispute time is unknown stays stopped."
+    raise HumanDecisionRequiredError.decision(
+        what=(
+            f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
+            "after seeing coder counter-evidence. Human decision required to resolve the "
+            f"disagreement.\n\nDisputed items still unresolved:\n{item_lines}\n\n"
+            "Recovery: post a signed human decision, then rerun. The stop releases "
+            "automatically once a signed requirement created after an item's dispute "
+            "time is admitted; an item whose dispute time is unknown stays stopped."
+        ),
+        clear="Post a signed human decision that settles the disputed items, then rerun the same command.",
+        safe_to_automate=False,
+        automation_note="only a human can author the signed decision that settles a dispute.",
     )
 
 

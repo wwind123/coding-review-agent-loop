@@ -1567,3 +1567,64 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     assert [c for c in runner.commands if c[:3] == ["gh", "issue", "close"]]
     assert not [c for c in runner.commands if "merge" in c and c[:2] == ["gh", "pr"]]
     assert "without replaying the merge" in capsys.readouterr().out
+
+
+# --- #2069: plan human-decision stops exit 4 with the three-part message -------
+
+
+def test_plan_step_back_stop_is_a_three_part_exit_4_pre_panel_error(tmp_path, monkeypatch, capsys):
+    """`plan-step-back-exit4`: one post, the renderer-built object, CLI exit 4."""
+    from coding_review_agent_loop import cli
+    from coding_review_agent_loop.errors import (
+        HumanDecisionRequiredError,
+        parse_human_decision,
+    )
+    from coding_review_agent_loop.plan_review_scheduling import PlanPrePanelHumanDecisionError
+
+    runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
+
+    assert isinstance(error, PlanPrePanelHumanDecisionError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
+    assert isinstance(error, HumanDecisionRequiredError)
+    parts = parse_human_decision(str(error))
+    assert parts is not None and parts.safe_to_automate is False
+    assert parts.what.startswith("human decision required: the planner stepped back at round 5")
+    assert parts.clear.startswith("Narrow the issue text to the simpler alternative")
+    diagnostics = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if comment["body"].startswith("Plan review scheduling diagnostic")
+    ]
+    # Posted exactly once, with the whole three-part message, and no further turn.
+    assert len(diagnostics) == 1
+    assert str(error) in diagnostics[0]
+    assert _m1103_agent_calls(runner)[-1] == "codex"
+
+    def raise_stop(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "run_issue_loop", raise_stop)
+    assert cli.main(["issue", "7", "--repo", "OWNER/REPO"]) == 4
+    assert "HUMAN DECISION REQUIRED" in capsys.readouterr().err
+
+
+def test_plan_primary_stall_stop_is_a_three_part_exit_4_pre_panel_error(tmp_path):
+    """`primary-stall-exit4`: the primary-stall stop is a human-decision error."""
+    from coding_review_agent_loop.errors import (
+        HumanDecisionRequiredError,
+        parse_human_decision,
+    )
+    from coding_review_agent_loop.panel_evidence import PLAN_PRIMARY_STALL_PREFIX
+
+    history = _m1275_history(tmp_path)
+    rerun, error, _messages = _m1275_resume(
+        tmp_path, history, plan_primary_stall_rounds=4, plan_growth_max_revisions=99,
+    )
+
+    assert isinstance(error, HumanDecisionRequiredError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
+    assert str(error).startswith(PLAN_PRIMARY_STALL_PREFIX)
+    parts = parse_human_decision(str(error))
+    assert parts is not None and parts.safe_to_automate is False
+    assert "Plan step-back did not apply" in parts.what
+    assert _m1103_agent_calls(rerun) == []

@@ -20,7 +20,7 @@ from .plan_round_closure import (
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace as dataclasses_replace
-from typing import Literal
+from typing import Literal, NoReturn
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .config import (
@@ -187,6 +187,7 @@ from .plan_review_scheduling import (
     PLAN_HISTORY_INTACT,
     PlanCandidateKey,
     PlanCrossCuttingContracts,
+    PlanPrePanelHumanDecisionError,
     PlanPrePanelSafetyError,
     PlanReviewSchedulingContract,
     PlanSchedulerSnapshot,
@@ -527,6 +528,21 @@ def _run_plan_first_loop_body(
         )
         raise PlanPrePanelSafetyError(message)
 
+    def stop_plan_pre_panel_decision(
+        exc: PlanPrePanelHumanDecisionError, *, round_number: int | None
+    ) -> NoReturn:
+        """Post a human-decision planning stop once, then re-raise the same error (#2069)."""
+        label = f"round {round_number}" if round_number is not None else "startup"
+        message = str(exc)
+        log(config, f"Planning {label}: {message}")
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=render_plan_scheduling_diagnostic(label, message),
+        )
+        raise exc
+
     def plan_step_back_measurements(assessment: object | None, text: str | None) -> str:
         if text:
             return text
@@ -561,8 +577,8 @@ def _run_plan_first_loop_body(
         assessment: object | None,
         measurements: str | None,
         post_review: bool = False,
-    ) -> str | None:
-        """Human-decision message once the primary rejected the step-back, else ``None``."""
+    ) -> PlanPrePanelHumanDecisionError | None:
+        """Human-decision stop once the primary rejected the step-back, else ``None``."""
         state = plan_step_back_state(records, panel_opening_index=panel_opening_index)
         if (
             state is None
@@ -571,7 +587,7 @@ def _run_plan_first_loop_body(
         ):
             return None
         anchor = plan_step_back_anchor(records, state.episode)
-        return render_step_back_human_decision(
+        return PlanPrePanelHumanDecisionError(render_step_back_human_decision(
             phase="plan",
             measurements=plan_step_back_measurements(assessment, measurements),
             step_back_round=state.episode.candidate_round,
@@ -581,7 +597,7 @@ def _run_plan_first_loop_body(
             dissolved=anchor.dissolved_ids,
             reintroduced=reintroduced_dissolved_items(records, state.episode, anchor),
             post_review=post_review,
-        )
+        ))
 
     def _stall_step_back_disposition() -> StallStepBackDisposition:
         """What the reached stall limit does about the plan step-back (#1275)."""
@@ -2350,7 +2366,7 @@ def _run_plan_first_loop_body(
                         measurements=plan_growth_measurements,
                     )
                     if step_back_stop is not None:
-                        stop_plan_pre_panel(step_back_stop, round_number=round_number)
+                        stop_plan_pre_panel_decision(step_back_stop, round_number=round_number)
             if (
                 config.plan_primary_stall_rounds > 0
                 and ownership_review_failure is None
@@ -2411,10 +2427,10 @@ def _run_plan_first_loop_body(
                                 if disposition.kind == DISPOSITION_ESCALATED
                                 else None
                             )
-                            stop_plan_pre_panel(
+                            stop_plan_pre_panel_decision(
                                 escalation
                                 if escalation is not None
-                                else plan_primary_stall_message(
+                                else PlanPrePanelHumanDecisionError(plan_primary_stall_message(
                                     streak=plan_primary_streak.count,
                                     threshold=config.plan_primary_stall_rounds,
                                     plan_chars=len(current_plan),
@@ -2422,7 +2438,7 @@ def _run_plan_first_loop_body(
                                         config.plan_primary_stall_rounds
                                     ),
                                     step_back_status=disposition.reason,
-                                ),
+                                )),
                                 round_number=round_number,
                             )
             plan_classification = classify_plan_transition(
@@ -4133,7 +4149,7 @@ def _run_plan_first_loop_body(
                 )
                 if step_back_stop is not None:
                     # Before the planner turn, so no further planner turn runs.
-                    stop_plan_pre_panel(step_back_stop, round_number=round_number)
+                    stop_plan_pre_panel_decision(step_back_stop, round_number=round_number)
 
         if round_number == plan_round_limit:
             if growth_guard_revision is not None:

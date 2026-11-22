@@ -29,6 +29,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .errors import render_human_decision
+
 from .plan_assembly import decode_assembled_plan_sidecar
 from .plan_growth import (
     PlanGrowthThresholds,
@@ -1370,7 +1372,7 @@ def render_step_back_human_decision(
                 "turn will be invoked. "
             )
         anchor_report = _render_anchor_report(dissolved, reintroduced) + " "
-    return (
+    what = (
         PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
         + f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
         f"reviewer has since blocked {blocks} round(s), reaching "
@@ -1383,6 +1385,17 @@ def render_step_back_human_decision(
         "which also ends the episode); adopt the simpler alternative (narrow the "
         "issue text; an issue edit ends the episode); or split (rerun with "
         "--plan-execution-mode auto, or re-file the issue as staged work)."
+    )
+    return render_human_decision(
+        what=what,
+        clear=(
+            "Narrow the issue text to the simpler alternative (an issue edit ends the "
+            "episode), then rerun the same command; the other options are listed above."
+        ),
+        safe_to_automate=False,
+        automation_note=(
+            "choosing between continuing, simplifying and splitting is a human judgement."
+        ),
     )
 
 
@@ -2602,7 +2615,7 @@ def render_pr_step_back_approach_alternative_decision(
         f"{entry.reviewer} on `{entry.path}` lines {entry.start}-{entry.end}"
         for entry in alternative.entries
     ) or "(no cluster recorded)"
-    return (
+    what = (
         f"PR #{pr_number}: "
         + PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT
         + f" (step-back turn at round {alternative.coder_round}, resulting head "
@@ -2613,6 +2626,16 @@ def render_pr_step_back_approach_alternative_decision(
         "or defer the findings, push the commit and rerun); or continue generalizing (rerun "
         "with --pr-step-back-rounds 0). A pushed head no longer equals the recorded head, so "
         "a rerun after a push does not stop again on this proposal."
+    )
+    return render_human_decision(
+        what=what,
+        clear=(
+            "Accept a stated limitation: document it, resolve or defer the findings, push "
+            f"the commit and rerun `agent-loop pr {pr_number}`; the other options are "
+            "listed above."
+        ),
+        safe_to_automate=False,
+        automation_note="approving or rejecting an approach change is a human judgement.",
     )
 
 
@@ -2971,7 +2994,7 @@ def render_pr_non_convergence_decision(
         if evidence
         else ""
     )
-    return (
+    what = (
         f"PR #{pr_number}: "
         + PR_NON_CONVERGENCE_DECISION_LEAD
         + result.reviewer
@@ -2996,4 +3019,16 @@ def render_pr_non_convergence_decision(
         "4. Convert evidence the environment cannot produce to the evidence freeze: have "
         "the reviewer re-file that item as an exact-head evidence request instead of a "
         "blocking finding."
+    )
+    return render_human_decision(
+        what=what,
+        clear=(
+            "Resolve or defer the persisting items with a signed human decision (option 2), "
+            "then rerun the same command; the other options are listed above."
+        ),
+        safe_to_automate=False,
+        automation_note=(
+            "deciding whether to continue, narrow or redesign a non-converging fix loop is "
+            "a human judgement."
+        ),
     )
