@@ -6450,25 +6450,22 @@ nothing but outside targets is context. An entry that names an outside path
 but may also test the checkout -- mixed operands, an outside config or ignore
 path, or a working directory the guard cannot track -- is refused with a
 message telling the coder to report the in-checkout run and the baseline as
-separate commands. A read-only inspection command (`du`, `ls`, `wc`, `stat`,
-`file`, `head`, `tail`, `cat`, or `find` with only name/type/size-style
-predicates), bare or wrapped in `agent-loop run-tests --`, tests nothing: when
-the guard recognises its whole command line and every file operand lies outside
-the checkout, it is out-of-checkout context too, for example
-`du -sk /tmp/coding-review-agent-loop/scratch/<dir>` (#2052). Operands resolve
-against the tracked working directory, so `du -sk ../sibling` is outside and
-`cd <parent> && du -sk checkout/tests` is inside. Such a command stays refused
-when it mixes inside and outside operands, uses an option its closed grammar
-does not list or one that reads a file list (`--files0-from`, `du -X`,
-`file -f`), names an unexpanded operand such as `"$DIR"`, runs a program
-named by a path other than a system toolchain directory (`../x/bin/du`,
-`/outside/bin/du`), is launched through `xargs`, `sudo`, `env` with options,
-or after a `PATH` change, uses a `find` executor or reference-file predicate
-(`-exec`, `-delete`, `-newer`), or cannot be parsed. For measurements and test
-runners alike, an operand the shell would expand counts as outside only when
-every expansion provably lies outside: a variable, substitution or brace is
-ambiguous, and so is a glob whose literal parent contains the checkout and
-could match it (`../*/tests`), or whose current matches reach it. Clauses are classified in execution order, so a managed `run-tests` clause resolves against the directory an earlier `cd` set; a number is an operand unless it follows an unknown option and names no existing path; and a measurement inside `sh -c` is plain only when the shell launcher itself is, including through a nested `run-tests` wrapper. One rule governs the rest: only a token the shell takes literally can prove a location. A `$` expansion or backtick anywhere in a clause (operand, option value, `find` predicate value or selector suffix) and a leading `~` (which may be quoted) keep the clause authoritative, and a `cd` or `-C` target of that kind leaves the working directory unknown; an assignment value counts only when it holds a substitution. A `path::name` node selector is located by its file part only for pytest; every other program sees the whole token as a filename. A refused
+separate commands. A read-only measurement of outside paths tests nothing and
+is out-of-checkout context too, for example
+`du -sk /tmp/coding-review-agent-loop/scratch/<dir>` (#2052). The rule is a
+narrow allowlist that never models the shell: the program, bare or after
+`agent-loop run-tests [--timeout-seconds N] --`, must be one of `du`, `ls`,
+`wc`, `stat`, `find`, `sha256sum`, `md5sum`, `file` or `df`; every option must
+be a listed flag that takes no value (for `find`, only `-type <letter>`,
+`-maxdepth <n>`, `-mindepth <n>`, `-print`, `-print0`, `-empty`, `-o`, `-a`
+and `-not`); and every operand must be a plain absolute path outside the
+checkout, not an ancestor of it, and with no `..`. No word may contain
+`$`, a backtick, `~`, a quote, a backslash, a glob or brace character, `=`,
+`::` or a shell operator, and nothing (no `cd`, `-C`, assignment or wrapper)
+may precede the program. Paths are compared as written and canonicalised, so
+an outside symlink into the checkout is never accepted. Anything else
+keeps the existing baseline-run classification above.
+A refused
 `tests_run` entry earns the coder's single semantic-evidence re-ask: the
 re-ask quotes the refusal and asks for a corrected `tests_run`, and a second
 refusal stops the turn. A managed-broker run whose

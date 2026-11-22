@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import fnmatch
-import glob
 import ipaddress
 import re
 import shlex
-from itertools import islice
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Sequence
@@ -625,37 +622,18 @@ class _Clause:
     # shell -c script, and whether the text has a subshell or substitution.
     shell_depth: int = 0
     in_subshell: bool = False
-    # A ``sh -c`` launcher (or one of its wrappers) that is not a PATH name or
-    # system toolchain program: the script's measurements are never plain.
-    launcher_untrusted: bool = False
-
-
-def _posix_tokens(text: str) -> list[str]:
-    """Shell-lex ``text``; raises ``ValueError`` for malformed quoting."""
-    # ``shlex.split`` only separates operators surrounded by whitespace.
-    # A shell does not impose that restriction, so use punctuation-aware
-    # lexing to keep adjacent commands from hiding in an argument token.
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
-def _lexes_cleanly(text: str) -> bool:
-    """Whether :func:`_tokenize` can lex ``text`` without its fallback (#2052)."""
-    try:
-        _posix_tokens(text)
-    except ValueError:
-        return False
-    return True
 
 
 def _tokenize(text: str) -> list[str]:
     try:
-        return _posix_tokens(text)
+        # ``shlex.split`` only separates operators surrounded by whitespace.
+        # A shell does not impose that restriction, so use punctuation-aware
+        # lexing to keep adjacent commands from hiding in an argument token.
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
-        # The fallback is observable: _validate_command_contents marks a
-        # display-partition entry it applied to as parse-failed (#2052).
         return text.split()
 
 
@@ -797,11 +775,6 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
             in_subshell=inner.in_subshell or clause.in_subshell,
         )
         expanded.extend(_expand_shell_clause(inner, depth + 1))
-    launcher_untrusted = clause.launcher_untrusted or not _launch_is_plain(
-        clause.tokens, *_program_position_indices(clause.tokens)
-    )
-    if launcher_untrusted:
-        expanded[1:] = [replace(inner, launcher_untrusted=True) for inner in expanded[1:]]
     return expanded
 
 
@@ -1421,25 +1394,6 @@ class _PathLog(list):
         self.ambiguous_target = False
         # An interpreter or executable outside the checkout was named.
         self.program_outside = False
-        # The tracked working directory; ``None`` means the assigned checkout
-        # until a resolvable move, and is cleared whenever cwd_unknown is set.
-        self.cwd_path: Path | None = None
-        # A read-only measurement (du, ls, ...) named only outside operands.
-        self.measured_outside = False
-        # Measurement operands whose location cannot be proved, such as an
-        # unexpanded variable or command substitution (#2052).
-        self.unresolved_inputs: list[str] = []
-        # The entry needed the whitespace fallback because shell lexing failed.
-        self.parse_failed = False
-        # ``PATH`` was reassigned, so a bare program name may resolve anywhere.
-        self.path_modified = False
-        # Nesting depth of managed commands launched by an untrusted sh -c.
-        self.inherited_untrusted = 0
-
-    def note_outside(self, location: str) -> None:
-        """Record an outside location once, however the command spelled it."""
-        if location not in self:
-            self.append(location)
 
 
 # Options whose following operand is a value (config file, plugin, expression,
@@ -1469,380 +1423,11 @@ _CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
 # Clause heads that never run tests themselves.  A shell's own clause is here
 # because its -c script is expanded into separate clauses.
 _NON_TEST_HEADS = frozenset({
-    "pwd", "echo", "printf", "true", "false", "export", "set",
+    "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
     "source", ".", "mkdir", "rm", "cp", "mv", "which", "git", "grep",
     "egrep", "fgrep",
     "sh", "bash", "zsh",
 })
-
-
-# Read-only inspection programs whose whole command line the guard can parse
-# (#2052).  A clause headed by one of these is a *measurement*: it tests
-# nothing, so an entry whose every measurement operand lies outside the
-# checkout is out-of-checkout context instead of an ambiguous test run.  The
-# grammar is closed: an option it does not list, or one that reads its file
-# list from another file, makes the clause ambiguous, which keeps the entry
-# from ever becoming context.
-@dataclass(frozen=True)
-class _MeasurementGrammar:
-    short_booleans: str = ""
-    long_booleans: frozenset[str] = frozenset()
-    # Value-taking options: short letters, and long names (separate or ``=``).
-    short_values: str = ""
-    long_values: frozenset[str] = frozenset()
-    # Long options whose value is optional and only given in ``=`` form.
-    optional_long_values: frozenset[str] = frozenset()
-    # Options naming a control file that may itself list checkout files.
-    indirect: frozenset[str] = frozenset()
-    # ``head -5`` style numeric counts.
-    numeric_count: bool = False
-
-
-_MEASUREMENT_GRAMMARS: dict[str, _MeasurementGrammar] = {
-    "du": _MeasurementGrammar(
-        short_booleans="abchkmsxlLHPDS0",
-        long_booleans=frozenset({
-            "--all", "--apparent-size", "--bytes", "--total", "--dereference-args",
-            "--human-readable", "--si", "--count-links", "--dereference",
-            "--no-dereference", "--separate-dirs", "--summarize", "--one-file-system",
-            "--null", "--inodes",
-        }),
-        short_values="dBt",
-        long_values=frozenset({
-            "--max-depth", "--block-size", "--threshold", "--exclude", "--time-style",
-        }),
-        indirect=frozenset({"--files0-from", "-X", "--exclude-from"}),
-    ),
-    "ls": _MeasurementGrammar(
-        short_booleans="aAlhdR1trSFinogGpQUXvs",
-        long_booleans=frozenset({
-            "--all", "--almost-all", "--human-readable", "--directory", "--recursive",
-            "--classify", "--inode", "--numeric-uid-gid", "--reverse", "--size",
-            "--color",
-        }),
-        short_values="Iw",
-        long_values=frozenset({"--ignore", "--width", "--sort", "--time-style"}),
-        optional_long_values=frozenset({"--color"}),
-    ),
-    "wc": _MeasurementGrammar(
-        short_booleans="cmlLw",
-        long_booleans=frozenset({
-            "--bytes", "--chars", "--lines", "--max-line-length", "--words",
-        }),
-        indirect=frozenset({"--files0-from"}),
-    ),
-    "stat": _MeasurementGrammar(
-        short_booleans="Lft",
-        long_booleans=frozenset({"--dereference", "--file-system", "--terse"}),
-        short_values="c",
-        long_values=frozenset({"--format", "--printf"}),
-    ),
-    "file": _MeasurementGrammar(
-        short_booleans="biLhzks",
-        long_booleans=frozenset({
-            "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
-            "--no-dereference", "--uncompress", "--keep-going", "--special-files",
-        }),
-        indirect=frozenset({"-f", "--files-from", "-m", "--magic-file"}),
-    ),
-    "head": _MeasurementGrammar(
-        short_booleans="qv",
-        long_booleans=frozenset({"--quiet", "--silent", "--verbose"}),
-        short_values="nc",
-        long_values=frozenset({"--lines", "--bytes"}),
-        numeric_count=True,
-    ),
-    "tail": _MeasurementGrammar(
-        short_booleans="qv",
-        long_booleans=frozenset({"--quiet", "--silent", "--verbose"}),
-        short_values="nc",
-        long_values=frozenset({"--lines", "--bytes"}),
-        numeric_count=True,
-    ),
-    "cat": _MeasurementGrammar(
-        short_booleans="AbeEnstTuv",
-        long_booleans=frozenset({
-            "--show-all", "--number-nonblank", "--number", "--squeeze-blank",
-            "--show-ends", "--show-tabs", "--show-nonprinting",
-        }),
-    ),
-    # ``find`` has its own expression grammar; see _find_operands.
-    "find": _MeasurementGrammar(),
-}
-# find predicates that take one value (a pattern, number or format), never a
-# file the predicate reads.
-_FIND_VALUE_PREDICATES = frozenset({
-    "-name", "-iname", "-path", "-ipath", "-regex", "-type", "-maxdepth",
-    "-mindepth", "-size", "-mtime", "-mmin", "-perm", "-user", "-group", "-printf",
-})
-_FIND_PLAIN_TOKENS = frozenset({
-    "-print", "-print0", "-prune", "-empty", "-ls", "-o", "-a", "-or", "-and",
-    "-not", "(", ")", "!",
-})
-
-
-def _find_operands(tokens: Sequence[str], start: int) -> list[str] | None:
-    """find's starting points, or ``None`` when its expression is not read-only.
-
-    Executors (``-exec``, ``-ok``, ``-delete``, ...), output files
-    (``-fprint``), and predicates naming a reference file (``-newer``,
-    ``-samefile``, ...) all fall outside the closed grammar.
-    """
-    index = start
-    while index < len(tokens) and tokens[index] in {"-H", "-L", "-P"}:
-        index += 1
-    starts: list[str] = []
-    while index < len(tokens) and not tokens[index].startswith(("-", "(", ")", "!")):
-        starts.append(tokens[index])
-        index += 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token in _FIND_VALUE_PREDICATES:
-            if index + 1 >= len(tokens):
-                return None
-            index += 2
-        elif token in _FIND_PLAIN_TOKENS:
-            index += 1
-        else:
-            return None
-    return starts
-
-
-def _measurement_operands(
-    tokens: Sequence[str], start: int, grammar: _MeasurementGrammar
-) -> list[str] | None:
-    """File operands of a measurement clause, or ``None`` if not fully recognised."""
-    operands: list[str] = []
-    index = start
-    terminated = False
-    while index < len(tokens):
-        token = tokens[index]
-        index += 1
-        if terminated:
-            operands.append(token)
-            continue
-        if token == "--":
-            terminated = True
-            continue
-        if token == "-":
-            # Standard input names no file.
-            continue
-        if token.startswith("--"):
-            name, equals, _ = token.partition("=")
-            if name in grammar.indirect:
-                return None
-            if name in grammar.long_values:
-                if not equals:
-                    if index >= len(tokens):
-                        return None
-                    index += 1
-                continue
-            if name in grammar.optional_long_values or (
-                not equals and name in grammar.long_booleans
-            ):
-                continue
-            return None
-        if token.startswith("-"):
-            body = token[1:]
-            if grammar.numeric_count and body.isdigit():
-                continue
-            for position, letter in enumerate(body):
-                if f"-{letter}" in grammar.indirect:
-                    return None
-                if letter in grammar.short_values:
-                    if position + 1 == len(body):
-                        # The value is the next token, never an operand.
-                        if index >= len(tokens):
-                            return None
-                        index += 1
-                    break
-                if letter not in grammar.short_booleans:
-                    return None
-            continue
-        operands.append(token)
-    return operands
-
-
-def _is_unexpanded(token: str) -> bool:
-    """Whether a token still holds shell expansion the guard cannot resolve."""
-    if "`" in token:
-        return True
-    remainder = token[len("$HOME/"):] if token.startswith("$HOME/") else token
-    return "$" in remainder
-
-
-# Shell expansion the guard cannot evaluate: it may produce any text,
-# including ``/`` and ``..``.  Glob characters only match names within one
-# directory, so a glob's literal parent directory bounds its matches.
-_UNKNOWN_EXPANSION_CHARS = frozenset("$`{")
-_GLOB_CHARS = frozenset("*?[")
-_GLOB_MATCH_LIMIT = 256
-OperandLocation = Literal["inside", "outside", "ambiguous"]
-
-
-def _operand_location(
-    raw: str, cwd: Path | None, assigned: Path, *, selector: bool = False
-) -> tuple[OperandLocation, str | None]:
-    """Where a reported operand can lie, and an outside location to record.
-
-    A literal operand is canonicalised against ``cwd``.  An operand the shell
-    would expand is outside only when every possible expansion is provably
-    outside (#2052): an unknown expansion (``$X``, a substitution, a brace)
-    or a ``..`` after a glob is ambiguous, and so is a glob whose literal
-    parent is an ancestor of the checkout (``../*/tests`` from the checkout)
-    or whose current matches reach it.  The second value is the outside
-    location to record as a violation, if any.
-    """
-
-    def inside(path: Path) -> bool:
-        return path == assigned or _is_inside(path, assigned)
-
-    text = raw
-    if selector and "::" in text and text.split("::", 1)[0]:
-        # A test runner's node selector (``path::name[param]``) runs its file
-        # part; a measurement keeps the whole filename (#2052).
-        text, _, suffix = text.partition("::")
-        if "$" in suffix or "`" in suffix:
-            # The shell may split the suffix into further operands.
-            _, note = _operand_location(text, cwd, assigned)
-            return "ambiguous", note
-    if text.startswith("$HOME/"):
-        text = str(Path.home()) + text[len("$HOME"):]
-    elif text == "~" or text.startswith("~/"):
-        text = str(Path.home()) + text[1:]
-    if text.startswith("/"):
-        path, offset = Path(text), 0
-    elif cwd is None:
-        return "ambiguous", None
-    else:
-        path, offset = cwd / text, len(cwd.parts)
-    parts = path.parts
-    first = next(
-        (
-            index for index in range(offset, len(parts))
-            if set(parts[index]) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS)
-        ),
-        None,
-    )
-    try:
-        if first is None:
-            resolved = _canonical(path)
-            return ("inside", None) if inside(resolved) else ("outside", str(resolved))
-        prefix = _canonical(Path(*parts[:first]))
-        note = None if inside(prefix) else str(prefix)
-        remainder = parts[first:]
-        if ".." in remainder or any(set(part) & _UNKNOWN_EXPANSION_CHARS for part in remainder):
-            return "ambiguous", note
-        if inside(prefix):
-            return "inside", None
-        if _is_inside(assigned, prefix):
-            # The glob's parent contains the checkout: a match may be the
-            # checkout, an ancestor of it, or a path inside it, unless some
-            # component cannot match the checkout's own path below the parent.
-            below = assigned.relative_to(prefix).parts
-            if all(
-                fnmatch.fnmatchcase(name, pattern)
-                for name, pattern in zip(below, remainder)
-            ):
-                return "ambiguous", note
-        pattern = str(prefix.joinpath(*remainder))
-        matches = list(islice(glob.iglob(pattern), _GLOB_MATCH_LIMIT + 1))
-        if len(matches) > _GLOB_MATCH_LIMIT or any(
-            inside(_canonical(Path(match))) for match in matches
-        ):
-            return "ambiguous", note
-        return "outside", pattern
-    except (OSError, RuntimeError, ValueError):
-        return "ambiguous", None
-
-
-# Prefix wrappers that neither supply operands nor move the working
-# directory; ``xargs`` (operands from stdin) and ``sudo`` are excluded, and
-# ``env`` is accepted only without options (``env -C``/``-S``).
-_MEASUREMENT_SAFE_WRAPPERS = frozenset({
-    "env", "nohup", "nice", "time", "timeout", "stdbuf", "command",
-})
-
-
-def _launch_is_plain(tokens: Sequence[str], positions: set[int], head: int | None) -> bool:
-    """Whether a clause runs its head program directly, from PATH or the toolchain.
-
-    Every program position (wrappers and the head) must be a bare name or an
-    executable in a system toolchain directory, and every prefix wrapper must
-    neither supply operands nor move the working directory, so neither an
-    outside nor a checkout-located program can hide behind a measurement
-    basename (#2052).
-    """
-    if head is None:
-        return False
-    env_options_closed = False
-    for index in range(head):
-        token = tokens[index]
-        if index in positions:
-            if _program_basename(token) not in _MEASUREMENT_SAFE_WRAPPERS:
-                return False
-            env_options_closed = _program_basename(token) == "env"
-            continue
-        if VAR_ASSIGNMENT_RE.match(token):
-            if token.split("=", 1)[0] in INTERPRETER_VALUE_ENV_VARS:
-                return False
-            continue
-        if env_options_closed and token.startswith("-"):
-            return False
-    for index in positions:
-        program = _strip_wrap(tokens[index])
-        if "/" not in program and "\\" not in program:
-            continue
-        if not _is_path_shaped(program):
-            return False
-        try:
-            located = _canonical(Path(_normalize_reported_path(program) or program))
-        except (OSError, RuntimeError, ValueError):
-            return False
-        if str(located.parent) not in _EXACT_TOOLCHAIN_DIRS:
-            return False
-    return True
-
-
-def _is_shell_literal(token: str) -> bool:
-    """Whether a lexed token means to the shell exactly what it reads as.
-
-    The lexer drops quotes, so expansion syntax that survives lexing may or
-    may not have been expanded: ``$`` and backticks may add words, run
-    commands, or name any directory, and a leading ``~`` may be a home path
-    or a quoted literal directory.  Such a token never proves a location
-    anywhere in a clause -- operand, option value, ``find`` predicate value
-    or selector suffix (#2052).  An assignment value is not word-split, so
-    only a substitution there runs anything.
-    """
-    if VAR_ASSIGNMENT_RE.match(token):
-        value = token.split("=", 1)[1]
-        return "$(" not in value and "`" not in value
-    return "$" not in token and "`" not in token and not token.startswith("~")
-
-
-_SELECTOR_RUNNERS = frozenset({"pytest", "py.test"})
-
-
-def _runs_pytest(tokens: Sequence[str], head: int) -> bool:
-    """Whether a clause runs pytest, whose operands may be node selectors."""
-    if _program_basename(tokens[head]) in _SELECTOR_RUNNERS:
-        return True
-    return any(
-        _program_basename(token) in _SELECTOR_RUNNERS and tokens[index - 1] in {"-m", "run"}
-        for index, token in enumerate(tokens[head + 1 :], start=head + 1)
-    )
-
-
-def _literal_directory(raw: str) -> Path | None:
-    """A working-directory target, or ``None`` when the shell would expand it.
-
-    ``cd /work/$NAME`` or ``cd /work/*`` may land anywhere, including the
-    checkout, so such a target leaves the directory unknown (#2052).
-    """
-    if not _is_shell_literal(raw) or set(raw) & (_UNKNOWN_EXPANSION_CHARS | _GLOB_CHARS):
-        return None
-    return _normalize_reported_path(raw)
 
 
 def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
@@ -1850,24 +1435,16 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
 
     This is fail-safe: a run counts as out-of-checkout context only with
     positive evidence that everything it tested lies elsewhere.  Every
-    positional operand that is not absolute is resolved against the tracked
-    working directory -- relative paths, bare words such as ``tests``, node
-    IDs such as ``test_a.py::t`` -- and classified by where it lands, so
-    ``../other`` from the checkout is an outside location and
-    ``checkout/tests`` from its parent is an inside one (#2052).  Every
-    outside location reaches the violation list.  The directory is the
-    confined in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
-    working-directory option (``-C``, ``--chdir``, ...) moved it;
-    ``--rootdir`` does not.  A test clause with no positional operand tests
-    its current directory.  An outside location after a value-taking or
-    unknown option is not a target, so an unrecognized report or config path
-    can never turn an in-checkout run into context; an inside path there
-    still counts, and every token after ``--`` is an operand.
-
-    A clause headed by a read-only measurement program (``du``, ``ls``, ...)
-    is classified through its closed grammar instead: its file operands set
-    ``measured_outside`` or ``inside_target``, and anything the grammar does
-    not recognise is ambiguous.
+    positional operand that does not resolve outside -- relative paths, bare
+    words such as ``tests``, node IDs such as ``test_a.py::t`` -- is an inside
+    target, resolved against the current directory.  That is the confined
+    in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
+    working-directory option (``-C``, ``--chdir``, ...) moved it; ``--rootdir``
+    does not.  A test clause with no positional operand tests its current
+    directory.  An outside path after a value-taking or unknown option is not
+    a target, so an unrecognized report or config path can never turn an
+    in-checkout run into context; an inside path there still counts, and
+    every token after ``--`` is an operand.
 
     The directory is tracked only through resolvable absolute moves outside
     any subshell.  After ``popd``, ``cd -``, a relative or unresolvable
@@ -1876,127 +1453,35 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     is ambiguous, which keeps the run authoritative.
     """
 
-    def inside(path: Path) -> bool:
-        return path == assigned or _is_inside(path, assigned)
-
     def outside(raw: str) -> bool | None:
         path = _normalize_reported_path(raw)
         if path is None:
             return None
-        return not inside(path)
-
-    def forget_cwd() -> None:
-        log.cwd_unknown = True
-        log.cwd_path = None
+        return not (path == assigned or _is_inside(path, assigned))
 
     tokens = clause.tokens
     if log.cwd_depth > clause.shell_depth:
         # The shell -c script that moved the directory has exited.
-        forget_cwd()
-    if any(token.startswith("PATH=") for token in tokens):
-        # A later bare program name may now resolve anywhere.
-        log.path_modified = True
-    if not all(_is_shell_literal(token) for token in tokens):
-        # Only what the shell takes literally can prove a location (#2052).
-        log.ambiguous_target = True
-    positions, head = _program_position_indices(tokens)
+        log.cwd_unknown = True
+    _, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
     forwarding = _npm_forwarding_separator(tokens, head)
     if head_name in {"cd", "pushd", "popd"}:
-        target = (
-            _literal_directory(tokens[head + 1]) if head + 1 < len(tokens) else None
-        )
-        if target is None or clause.in_subshell or head_name == "popd":
+        moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
+        if moved is None or clause.in_subshell or head_name == "popd":
             # Only one resolvable move outside any subshell is tracked; a
             # restore or unresolvable target leaves the directory unknown.
-            forget_cwd()
+            log.cwd_unknown = True
         else:
-            log.cwd_outside = not inside(target)
-            log.cwd_path = target
+            log.cwd_outside = moved
             log.cwd_depth = max(log.cwd_depth, clause.shell_depth)
-        return
-
-    cwd: Path | None = None if log.cwd_unknown else (log.cwd_path or assigned)
-    # Only pytest gives ``path::name`` selector meaning; any other program
-    # sees the whole token as a filename (#2052).
-    selector_runner = _runs_pytest(tokens, head)
-
-    def locate(operand: str, *, measurement: bool = False) -> OperandLocation:
-        kind, note = _operand_location(
-            operand, cwd, assigned, selector=not measurement and selector_runner
-        )
-        if note is not None and not _is_path_shaped(operand):
-            # The role pass already records (or, for an eligible scratch
-            # option value, deliberately exempts) absolute and home paths.
-            log.note_outside(note)
-        return kind
-
-    def record_relative(operand: str | None, *, measurement: bool = False) -> None:
-        if operand is None:
-            kind: OperandLocation = (
-                "ambiguous" if cwd is None else "inside" if inside(cwd) else "outside"
-            )
-            if kind == "outside":
-                log.note_outside(str(cwd))
-        else:
-            kind = locate(operand, measurement=measurement)
-        if kind == "ambiguous":
-            log.ambiguous_target = True
-        elif kind == "inside":
-            log.inside_target = True
-        elif measurement:
-            log.measured_outside = True
-        else:
-            log.outside_target = True
-
-    grammar = _MEASUREMENT_GRAMMARS.get(head_name)
-    if grammar is not None:
-        if log.parse_failed:
-            # A fallback-tokenized clause is never classified by the grammar.
-            log.ambiguous_target = True
-            return
-        if (
-            log.path_modified
-            or clause.launcher_untrusted
-            or log.inherited_untrusted
-            or not _launch_is_plain(tokens, positions, head)
-        ):
-            # Operand-supplying wrappers, PATH changes and path-named
-            # programs make the clause ambiguous on its own (#2052); its
-            # operands are still located below so outside ones are recorded.
-            log.ambiguous_target = True
-        for token in tokens[head + 1 :]:
-            # The role pass skips ``--option=/path`` values; an outside one
-            # (``--files0-from=/x/list``) is still an outside location.
-            value = token.partition("=")[2] if token.startswith("--") else ""
-            if _is_path_shaped(value):
-                path = _normalize_reported_path(value)
-                if path is not None and not inside(path):
-                    log.note_outside(value)
-        operands = (
-            _find_operands(tokens, head + 1)
-            if head_name == "find"
-            else _measurement_operands(tokens, head + 1, grammar)
-        )
-        if operands is None:
-            log.ambiguous_target = True
-            return
-        if not operands:
-            record_relative(None, measurement=True)
-        for raw in operands:
-            if _is_unexpanded(raw):
-                log.unresolved_inputs.append(raw)
-                log.ambiguous_target = True
-                continue
-            cleaned = _strip_wrap(raw)
-            if cleaned:
-                record_relative(cleaned, measurement=True)
         return
     if head_name in _NON_TEST_HEADS:
         return
 
+    cwd_outside: bool | None = None if log.cwd_unknown else log.cwd_outside
     index = head + 1
     while index < len(tokens):
         token = tokens[index]
@@ -2006,13 +1491,21 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         if token == "--":
             break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
-            cwd = _literal_directory(tokens[index + 1])
+            cwd_outside = outside(tokens[index + 1])
             index += 2
             continue
         for prefix in _CWD_FLAG_PREFIXES:
             if token.startswith(prefix):
-                cwd = _literal_directory(token[len(prefix) :])
+                cwd_outside = outside(token[len(prefix) :])
         index += 1
+
+    def record_relative() -> None:
+        if cwd_outside is None:
+            log.ambiguous_target = True
+        elif cwd_outside:
+            log.outside_target = True
+        else:
+            log.inside_target = True
 
     saw_positional = False
     terminated = False
@@ -2025,7 +1518,13 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             if not cleaned:
                 continue
             saw_positional = True
-            record_relative(cleaned)
+            if _is_path_shaped(cleaned):
+                if outside(cleaned):
+                    log.outside_target = True
+                else:
+                    log.inside_target = True
+            else:
+                record_relative()
             continue
         if index == forwarding:
             continue
@@ -2044,33 +1543,26 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         ):
             continue
         cleaned = _strip_wrap(token)
-        if not cleaned:
+        if not cleaned or cleaned.isdigit():
             continue
         after_unknown_option = previous.startswith("-") and not (
             _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
         )
-        if cleaned.isdigit() and after_unknown_option and (
-            cwd is None or not (cwd / cleaned).exists()
-        ):
-            # A number after an unknown option is taken as its value only when
-            # no such path exists to be a test target (#2052); otherwise it is
-            # an operand like any other.
+        if _is_path_shaped(cleaned):
+            is_outside = outside(cleaned)
+            if after_unknown_option and is_outside:
+                # Possibly an option value; an inside path still counts.
+                continue
+            saw_positional = True
+            if is_outside:
+                log.outside_target = True
+            else:
+                log.inside_target = True
             continue
-        if after_unknown_option:
-            kind = locate(cleaned)
-            if kind == "outside":
-                # Possibly an option value: an outside location is a
-                # violation but never a target; an inside path still counts.
-                continue
-            if kind == "ambiguous":
-                # Possibly an option value, possibly an operand that reaches
-                # the checkout: never context, and the implicit cwd remains.
-                log.ambiguous_target = True
-                continue
         saw_positional = True
-        record_relative(cleaned)
+        record_relative()
     if not saw_positional:
-        record_relative(None)
+        record_relative()
 
 
 def _validate_command_contents(
@@ -2090,43 +1582,19 @@ def _validate_command_contents(
             f"{raw_windows!r} in command {command!r}. Assigned checkout: {assigned}"
         )
 
-    if isinstance(path_violations, _PathLog) and not _lexes_cleanly(command):
-        # Malformed quoting falls back to whitespace tokens, which can hide a
-        # quoted outside path from the role pass.  Such an entry is never
-        # context, and one naming an outside path is refused (#2052).
-        path_violations.parse_failed = True
-        for token in command.split():
-            if not any(quote in token for quote in "'\""):
-                continue
-            cleaned = token.strip("'\"`;&|()")
-            path = _normalize_reported_path(cleaned) if _is_path_shaped(cleaned) else None
-            if path is not None and not (path == assigned or _is_inside(path, assigned)):
-                path_violations.note_outside(cleaned)
-
     clauses = _clauses_for_entry(command, origin)
     # A preflight (pwd/git status) can precede a managed test command. Apply
     # the exact wrapper contract per clause, not just to the whole report.
-    # Clauses are classified in execution order so a managed command sees the
-    # working directory an earlier ``cd`` clause established (#2052).
     ordinary_clauses: list[_Clause] = []
     for clause in clauses:
-        inherit = isinstance(path_violations, _PathLog) and clause.launcher_untrusted
-        if inherit:
-            # The managed inner argv is re-parsed into fresh clauses; an
-            # untrusted sh -c launcher above it still taints them (#2052).
-            path_violations.inherited_untrusted += 1
-        try:
-            managed = _validate_managed_command(
-                shlex.join(clause.tokens), assigned=assigned,
-                origin="structured" if clause.mode in {"structured", "code"} else "response",
-                path_violations=path_violations, display_partition=display_partition,
-            )
-        finally:
-            if inherit:
-                path_violations.inherited_untrusted -= 1
-        if managed:
-            continue
-        ordinary_clauses.append(clause)
+        if not _validate_managed_command(
+            shlex.join(clause.tokens), assigned=assigned,
+            origin="structured" if clause.mode in {"structured", "code"} else "response",
+            path_violations=path_violations, display_partition=display_partition,
+        ):
+            ordinary_clauses.append(clause)
+
+    for clause in ordinary_clauses:
         for raw_path, role in _path_roles(clause, display_partition=display_partition):
             _check_path_role(
                 raw_path,
@@ -2181,11 +1649,7 @@ def _validate_managed_command(
         managed = parse_managed_test_command(
             tokens, allow_command_name_launcher=True
         )
-    except ValueError:
-        if isinstance(path_violations, _PathLog):
-            path_violations.parse_failed = True
-        managed = None
-    except TestRuntimeConfigurationError:
+    except (ValueError, TestRuntimeConfigurationError):
         managed = None
     if managed is not None:
         # Leading assignments are command syntax even when extracted from a
@@ -2283,13 +1747,9 @@ def _partition_reported_tests_by_workdir(
     this way.  A command that names an outside path but may also test the
     checkout -- mixed operands, an outside config or ignore path, a directory
     the guard cannot track -- is ambiguous and refused with guidance to run
-    the two separately.  A read-only measurement (``du``, ``ls``, ``wc``,
-    ``stat``, ``find`` without executors, ...) whose every operand lies
-    outside is context too (#2052); one with an unexpanded operand, an
-    unparseable entry naming an outside path, and an indirect-input or
-    unrecognised option are refused.  Live remote targets, unvalidatable
-    Windows paths, and malformed shell text still fail closed, as do receipt
-    citations, which keep using the strict validator.
+    the two separately.  Live remote targets, unvalidatable Windows paths, and
+    malformed shell text still fail closed, as do receipt citations, which
+    keep using the strict validator.
     """
     if not tests_run:
         return ReportedTestsPartition(in_checkout=None if tests_run is None else ())
@@ -2302,43 +1762,27 @@ def _partition_reported_tests_by_workdir(
             command, assigned=assigned, origin="structured", path_violations=violations,
             display_partition=True,
         )
-        if not violations and not violations.unresolved_inputs:
+        if not violations:
             kept.append(command)
-        elif _tests_only_outside(violations):
+        elif _tests_only_outside(violations) or _is_outside_measurement(
+            command, assigned=Path(assigned_workdir)
+        ):
             context.append(command)
         else:
-            named = ", ".join(repr(p) for p in violations)
-            if violations.parse_failed:
-                message = (
-                    "Coder reported a test command that could not be parsed "
-                    "(unbalanced quoting) and names a path outside the assigned "
-                    f"checkout ({named}), in command {command!r}. Report each "
-                    "command with balanced quotes, and report in-checkout tests "
-                    "and any run outside the checkout as separate commands. "
-                    f"Assigned checkout: {assigned}"
-                )
-            elif violations.unresolved_inputs:
-                unresolved = ", ".join(repr(p) for p in violations.unresolved_inputs)
-                message = (
-                    "Coder reported a command whose operand location cannot be "
-                    f"proved ({unresolved}: an unexpanded variable or command "
-                    f"substitution), in command {command!r}. Name literal paths, "
-                    "and report in-checkout tests and any run outside the "
-                    "checkout as separate commands. Assigned checkout: "
-                    f"{assigned}"
-                )
-            else:
-                message = (
-                    "Coder reported a test command that names a path outside the "
-                    f"assigned checkout ({named}) "
-                    "but may also test the checkout itself, in command "
-                    f"{command!r}. Report in-checkout tests and any baseline run "
-                    "outside the checkout as separate commands; a baseline command "
-                    "must name only outside test targets, and a measurement of an "
-                    "outside directory (for example du or ls) must be its own "
-                    "entry naming only outside paths. Assigned checkout: "
-                    f"{assigned}"
-                )
+            message = (
+                "Coder reported a test command that names a path outside the "
+                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
+                "but may also test the checkout itself, in command "
+                f"{command!r}. Report in-checkout tests and any baseline run "
+                "outside the checkout as separate commands; a baseline command "
+                "must name only outside test targets. A measurement of an "
+                "outside directory is context only as its own entry: one of "
+                f"{', '.join(sorted(_MEASUREMENT_PROGRAMS))}, run bare or after "
+                "agent-loop run-tests --, with flag-only options and plain "
+                "absolute outside paths, and no quotes, variables, globs, "
+                "'=', '::', ~, cd or shell operators. Assigned checkout: "
+                f"{assigned}"
+            )
             if violations.program_outside and dependency_hint:
                 from .worktree_hints import with_remedy
 
@@ -2426,26 +1870,188 @@ def command_targets_outside_workdir(
     either: its failure may be a real in-checkout failure.  When
     ``executed_argv`` is supplied it is the argv judged (#1294).
     """
-    log = _command_path_violations(
-        executed_argv if executed_argv else argv, assigned_workdir=assigned_workdir
+    judged = executed_argv if executed_argv else argv
+    log = _command_path_violations(judged, assigned_workdir=assigned_workdir)
+    if not isinstance(log, _PathLog):
+        return False
+    if _tests_only_outside(log):
+        return True
+    # A read-only measurement is never test evidence (#2052).
+    command = judged if isinstance(judged, str) else shlex.join(_argv_tokens(judged))
+    return bool(log) and _is_outside_measurement(command, assigned=assigned_workdir)
+
+
+# Out-of-checkout measurement allowlist (#2052).  A ``tests_run`` entry that
+# measures outside paths (``du -sk /tmp/scratch``) tests nothing, so it is
+# context rather than an ambiguous test run.  The rule is deliberately
+# narrow and never models the shell: anything it does not recognise is
+# simply not a measurement, and falls back to the ordinary classification
+# (which refuses an entry naming an outside path, and the coder is re-asked
+# once with the refusal).  A wrong refusal is cheap; a wrong acceptance is
+# not.  Paths are compared lexically and never resolved: a symlink outside
+# the checkout counts as outside.
+_MEASUREMENT_PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
+    # program: (boolean short flag letters, boolean long flags)
+    "du": ("abchklmsxDHLPS0", frozenset({
+        "--all", "--apparent-size", "--bytes", "--total", "--human-readable",
+        "--si", "--summarize", "--one-file-system", "--separate-dirs",
+        "--count-links", "--dereference", "--dereference-args",
+        "--no-dereference", "--null", "--inodes",
+    })),
+    "ls": ("aAcdFghilnopQrRsStuUvX1", frozenset({
+        "--all", "--almost-all", "--human-readable", "--directory",
+        "--recursive", "--classify", "--inode", "--numeric-uid-gid",
+        "--reverse", "--size",
+    })),
+    "wc": ("clLmw", frozenset({
+        "--bytes", "--chars", "--lines", "--max-line-length", "--words",
+    })),
+    "stat": ("fLt", frozenset({"--dereference", "--file-system", "--terse"})),
+    "sha256sum": ("btz", frozenset({"--binary", "--text", "--zero", "--tag"})),
+    "md5sum": ("btz", frozenset({"--binary", "--text", "--zero", "--tag"})),
+    "file": ("bhiLksz", frozenset({
+        "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
+        "--no-dereference", "--uncompress", "--keep-going", "--special-files",
+    })),
+    "df": ("ahHiklPT", frozenset({
+        "--all", "--human-readable", "--si", "--inodes", "--local",
+        "--portability", "--print-type", "--total",
+    })),
+    # find has its own expression grammar; see _find_measurement_operands.
+    "find": ("", frozenset()),
+}
+# Launcher spellings accepted before ``run-tests``; each is matched exactly.
+_MEASUREMENT_LAUNCHERS = frozenset({
+    "agent-loop",
+    '"${AGENT_LOOP_EXECUTABLE:-agent-loop}"',
+    '"$AGENT_LOOP_EXECUTABLE"',
+})
+# Every word of the measured command must consist only of these characters,
+# which carry no shell meaning: no quote, backslash, ``$``, backtick, ``~``,
+# glob or brace character, ``=``, ``#``, ``!`` or shell operator.
+_MEASUREMENT_WORD_RE = re.compile(r"[A-Za-z0-9_./,+@%:-]+")
+_FIND_TYPE_LETTERS = frozenset("bcdflps")
+_FIND_PLAIN_PREDICATES = frozenset({"-print", "-print0", "-empty", "-o", "-a", "-not"})
+
+
+def _measurement_words(command: str) -> list[str] | None:
+    """The measured program's words, after an optional run-tests launcher."""
+    if "\n" in command or "\r" in command:
+        return None
+    words = command.split()
+    if len(words) >= 3 and words[0] in _MEASUREMENT_LAUNCHERS and words[1] == "run-tests":
+        index = 2
+        if words[index] == "--timeout-seconds":
+            if index + 1 >= len(words) or not words[index + 1].isdigit():
+                return None
+            index += 2
+        if index >= len(words) or words[index] != "--":
+            return None
+        words = words[index + 1 :]
+    if not words or not all(
+        _MEASUREMENT_WORD_RE.fullmatch(word) and "::" not in word for word in words
+    ):
+        return None
+    return words
+
+
+def _find_measurement_operands(args: Sequence[str]) -> list[str] | None:
+    """find's starting points, or ``None`` unless its expression is allowlisted."""
+    index = 0
+    starts: list[str] = []
+    while index < len(args) and not args[index].startswith("-"):
+        starts.append(args[index])
+        index += 1
+    while index < len(args):
+        token = args[index]
+        if token == "-type":
+            if index + 1 >= len(args) or args[index + 1] not in _FIND_TYPE_LETTERS:
+                return None
+            index += 2
+        elif token in {"-maxdepth", "-mindepth"}:
+            if index + 1 >= len(args) or not args[index + 1].isdigit():
+                return None
+            index += 2
+        elif token in _FIND_PLAIN_PREDICATES:
+            index += 1
+        else:
+            return None
+    return starts
+
+
+def _flag_measurement_operands(
+    args: Sequence[str], short_flags: str, long_flags: frozenset[str]
+) -> list[str] | None:
+    """Operands of a flag-only measurement, or ``None`` for any other option."""
+    operands: list[str] = []
+    terminated = False
+    for token in args:
+        if terminated or not token.startswith("-"):
+            operands.append(token)
+        elif token == "--":
+            terminated = True
+        elif token.startswith("--"):
+            if token not in long_flags:
+                return None
+        elif len(token) < 2 or any(letter not in short_flags for letter in token[1:]):
+            return None
+    return operands
+
+
+def _is_plain_outside_path(operand: str, assigned: Path) -> bool:
+    """A literal absolute path that is neither the checkout, in it, nor above it.
+
+    The classifier does not model symlinks, but refusing is always safe, so
+    the operand is compared both as written and canonicalised, against the
+    checkout both as given and canonicalised.
+    """
+    if not operand.startswith("/") or ".." in operand.split("/"):
+        return False
+    try:
+        paths = {Path(operand), _canonical(Path(operand))}
+        checkouts = {assigned, _canonical(assigned)}
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not any(
+        path == checkout or _is_inside(path, checkout) or _is_inside(checkout, path)
+        for path in paths
+        for checkout in checkouts
     )
-    return isinstance(log, _PathLog) and _tests_only_outside(log)
+
+
+def _is_outside_measurement(command: str, *, assigned: Path) -> bool:
+    """Whether ``command`` is an allowlisted read-only measurement of outside paths.
+
+    The program, bare or after ``agent-loop run-tests [--timeout-seconds N]
+    --``, must be one of :data:`_MEASUREMENT_PROGRAMS`; every option must be
+    an allowlisted flag (or, for ``find``, ``-type``/``-maxdepth``/
+    ``-mindepth`` with a literal value); and every operand must be a plain
+    absolute path outside the checkout.  No word may contain shell syntax,
+    so a ``cd``, an assignment, a pipeline, a quote or an expansion all make
+    the entry ineligible.
+    """
+    words = _measurement_words(command)
+    if not words or words[0] not in _MEASUREMENT_PROGRAMS:
+        return False
+    short_flags, long_flags = _MEASUREMENT_PROGRAMS[words[0]]
+    args = words[1:]
+    operands = (
+        _find_measurement_operands(args)
+        if words[0] == "find"
+        else _flag_measurement_operands(args, short_flags, long_flags)
+    )
+    return bool(operands) and all(
+        _is_plain_outside_path(operand, assigned) for operand in operands
+    )
 
 
 def _tests_only_outside(log: "_PathLog") -> bool:
-    """Whether a validated command names outside paths and tests nothing else.
-
-    A read-only measurement of outside paths qualifies too (#2052), unless
-    its program itself lies outside the checkout.  Unresolved operands and
-    unparseable entries never do.
-    """
+    """Whether a validated command names outside paths and tests nothing else."""
     return (
         bool(log)
+        and log.outside_target
         and not log.inside_target
         and not log.ambiguous_target
-        and not log.unresolved_inputs
-        and not log.parse_failed
-        and (log.outside_target or (log.measured_outside and not log.program_outside))
     )
 
 

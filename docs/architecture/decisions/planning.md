@@ -45,3 +45,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-21: Context classification requires every shell expansion of an operand to lie provably outside, and a measurement clause must launch a PATH-named or toolchain-directory program without operand-supplying wrappers, so a clause-local invalid program cannot be masked by another clause's outside target (#2052).
 
 - 2026-11-21: Outside-only classification trusts only shell-literal tokens (no `$`, backtick or leading `~` anywhere in a clause) and applies `path::name` selector syntax only to pytest, replacing per-case expansion patches with one rule (#2052).
+
+- 2026-11-21: Scope amendment: out-of-checkout measurement context is a fixed allowlist (program, flag-only options, plain absolute outside operands, no shell syntax) that never models the shell; the earlier per-case expansion, selector and cwd handling is removed and test-runner classification is back to its prior behaviour. A wrong refusal is recovered by the single `tests_run` re-ask; a wrong acceptance must not happen (#2052).

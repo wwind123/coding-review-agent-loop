@@ -1201,3 +1201,37 @@ def test_transient_public_text_blocks_tests_run_reask_and_is_logged_2052(tmp_pat
     assert error is not None
     assert not any("re-asking the coder once" in line for line in logged)
     assert any("no coder re-ask (transient-public-text)" in line for line in logged)
+
+
+@pytest.mark.parametrize("entry", [
+    pytest.param("du -sk /outside/dir/$NAME", id="dollar"),
+    pytest.param("du -sk /outside/dir/`pwd`", id="backtick"),
+    pytest.param("du -sk '/outside/dir'", id="quote"),
+    pytest.param("du -sk /outside/dir/*", id="glob"),
+    pytest.param("du --max-depth=1 /outside/dir", id="equals"),
+    pytest.param("sha256sum /outside/dir/file::part tests", id="double-colon"),
+    pytest.param("du -sk /outside/dir | sort", id="shell-operator"),
+    pytest.param("cd tests && du -sk /outside/dir", id="cd"),
+    pytest.param("du --exclude x -sk /outside/dir", id="value-option"),
+    pytest.param("find /outside/dir -exec true", id="find-executor"),
+    pytest.param("du -sk /outside/dir tests", id="mixed-operand"),
+])
+def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatch, no_repair, entry):
+    """Every disqualifying token class is refused and recovered by one coder re-ask."""
+    from agent_loop_helpers import structured_coder_followup
+
+    bad = structured_coder_followup(summary="Rejected report.", tests_run=[entry])
+    corrected = structured_coder_followup(
+        summary="Corrected report.", tests_run=["du -sk /outside/dir"],
+    )
+    response, error, invoke, logged = _run_followup(
+        tmp_path, monkeypatch, [_result(bad, session_id="acquired"), _result(corrected)],
+    )
+    assert error is None
+    assert invoke.call_count == 2
+    second = invoke.call_args_list[1].kwargs
+    assert second["session_id"] == "acquired"
+    assert "Previous response not accepted: tests_run report" in second["prompt"]
+    assert "may also test the checkout itself" in second["prompt"]
+    assert response.marker_value.out_of_checkout_tests_run == ("du -sk /outside/dir",)
+    assert response.marker_value.tests_run == ()
