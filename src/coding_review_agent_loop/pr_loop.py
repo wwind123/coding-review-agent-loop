@@ -275,7 +275,7 @@ from .comment_rendering import (
     resolve_matrix_evidence_render,
 )
 from .coder_comment_budget import admitted_evidence_heads, bounded_coder_round_comment
-from .coder_followup_degradation import CoderFollowupRecovery, adopt_bounded_coder_comment
+from .coder_followup_degradation import CoderFollowupRecovery
 from .followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
@@ -9723,7 +9723,7 @@ def run_pr_loop(
                                                                pre_turn_head, updated_pr_context.metadata.head_sha),
             )
             coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
-            latest_coder_metadata, latest_coder_output = adopt_bounded_coder_comment(bounded_coder_comment, latest_coder_metadata, latest_coder_output)
+            latest_coder_metadata, latest_coder_output, unresolved_items = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
                 predecessor, successor = pr_metadata.head_sha, updated_pr_context.metadata.head_sha
                 if predecessor and successor and predecessor != successor:

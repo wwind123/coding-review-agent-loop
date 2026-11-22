@@ -3379,3 +3379,40 @@ def test_same_head_release_still_revalidates_against_its_baseline(tmp_path, monk
         pass
     assert seen and seen[0] == ("evidence-release", (True, ("hr-baseline",)))
     assert _records_1292(runner, "head-review-recovery") == []
+
+
+def test_disputed_response_forced_into_synthesis_carries_no_dispute_in_loop_or_resume(tmp_path, monkeypatch):
+    """#2086 item-2: the synthesized fallback rolls back the discarded dispute."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+    from coding_review_agent_loop.unresolved_items import _is_disputed_item
+
+    real_fits = budget.round_comment_fits
+    # Every ordinary bound level "overflows"; only the synthesized fallback fits.
+    monkeypatch.setattr(
+        budget, "round_comment_fits",
+        lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+    )
+    disputing = structured_coder_followup(
+        summary="Disputed.", disputed_items=["item-1"],
+        dispute_evidence={"item-1": "The reviewer read a stale diff."}, reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(coder_outputs=[disputing], reviews=[_blocking_review_1292()])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError):  # interrupted: no reviewer output after the coder record
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    pushed = runner.pr_payload["headRefOid"]
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "synthesized"
+    assert record.raw_structured_coder_response is None
+    assert not any(_is_disputed_item(item) for item in record.prior_items)
+
+    monkeypatch.setattr(budget, "round_comment_fits", real_fits)
+    runner.claude_outputs.append(_blocking_review_1292())  # the reviewer keeps the finding
+    runner.claude_outputs.append(_approving_review_1292())
+    runner.codex_outputs.append(_VALID_FOLLOWUP)
+    # A held dispute would stop for a human decision; the discarded one must not.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    for metadata in _records_1292(runner):
+        assert not any(_is_disputed_item(item) for item in metadata.prior_items)

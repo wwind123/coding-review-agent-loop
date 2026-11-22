@@ -757,6 +757,11 @@ def _apply_dispute_evidence(
     return result
 
 
+# Ledger note prefixes written from a coder response's claims; a discarded
+# (synthesized-fallback) response's notes with these prefixes are rolled back.
+CODER_CLAIM_NOTE_PREFIXES: tuple[str, ...] = (CODER_DISPUTE_NOTE_PREFIX,)
+
+
 def _is_disputed_item(item: UnresolvedReviewItem) -> bool:
     """Return True if this item has been disputed by the coder via counter-evidence."""
     return any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)

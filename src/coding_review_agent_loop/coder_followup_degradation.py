@@ -663,7 +663,16 @@ class CoderFollowupRecovery:
                 self.runner, self.workdir, self.pre_turn_head, new_head
             ),
             "human_requirements_in_force": self.requirements_in_force,
+            "fallback_ledger": lambda items: rollback_discarded_annotations(items, self.ledger),
         }
+
+    def adopt(self, bounded: object, metadata: object, output: str | None, items: Sequence[object]):
+        """Adopt a synthesized fallback: its metadata, claim-free output and
+        the live ledger without the discarded response's annotations."""
+        adopted_metadata, adopted_output = adopt_bounded_coder_comment(bounded, metadata, output)
+        if getattr(bounded, "coder_output", None) is None:
+            return adopted_metadata, adopted_output, items
+        return adopted_metadata, adopted_output, rollback_discarded_annotations(items, self.ledger)
 
     def post(self, publish: Callable[[], object]) -> object:
         """Post the coder record; a failed degraded post surfaces the original error."""
@@ -681,6 +690,30 @@ class CoderFollowupRecovery:
     def unless_recorded(self, record: Callable[..., None]) -> Callable[..., None]:
         """Today's rejection record, skipped once a coder record was posted."""
         return (lambda *args, **kwargs: None) if self.record_posted else record
+
+
+def rollback_discarded_annotations(items: Sequence[object], pre_turn_ledger: Sequence[object]) -> list:
+    """Remove ledger annotations a discarded coder response introduced (#2086).
+
+    Applying a response's claims to the ledger (today: dispute counter-evidence
+    notes) happens before the record is bounded.  When the record falls back to
+    a claim-free synthesized one, every coder-claim note an item did not carry
+    in the pre-turn ledger is removed; all other ledger state is kept.
+    """
+    from dataclasses import replace as _replace
+
+    from .unresolved_items import CODER_CLAIM_NOTE_PREFIXES
+
+    before = {getattr(item, "item_id", None): tuple(getattr(item, "notes", ())) for item in pre_turn_ledger}
+    result = []
+    for item in items:
+        prior = before.get(item.item_id, ())
+        notes = tuple(
+            note for note in item.notes
+            if note in prior or not note.startswith(CODER_CLAIM_NOTE_PREFIXES)
+        )
+        result.append(item if notes == item.notes else _replace(item, notes=notes))
+    return result
 
 
 def adopt_bounded_coder_comment(bounded: object, metadata: object, output: str | None):

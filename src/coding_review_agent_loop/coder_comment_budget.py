@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import MISSING, dataclass, fields, replace
 
 from .errors import AgentLoopError
 from .comment_rendering import MAX_CODER_BOUND_LEVEL, render_public_agent_comment
@@ -100,7 +100,20 @@ _FALLBACK_CLEARED_FIELDS = {
     "addressed_sub_items": (),
     "sub_item_claim_degradations": (),
     "sub_item_degradations": (),
+    # The discarded response's assessment: unbounded prose, never spilled.
+    "architecture_impact": None,
 }
+# Fields the minimal fallback keeps when the first tier still cannot fit; every
+# other field is reset to its default (always a valid, empty value).
+_MINIMAL_FALLBACK_KEPT_FIELDS = frozenset({
+    "flow", "role", "agent", "round_number", "subject", "prior_items", "state", "phase",
+    "qualification_checkpoint", "followup_dispatch_head", "seat_binding",
+    "pr_board_root", "pr_board_identity", "pr_board_binding_init",
+    "reviewer_board_amendment_digest", "reviewer_board_change_digest",
+    "architecture_identity", "architecture_contract_version", "evidence_stall",
+    "coder_record_source", "coder_record_degradations", "human_requirements_degraded",
+    "post_merge_registry", "post_merge_diagnostics", "model_used",
+})
 FALLBACK_NOTE = (
     "The coder record did not fit GitHub's comment size limit at any bound level; "
     "this claim-free record was synthesized by the orchestrator."
@@ -115,14 +128,22 @@ def _synthesized_fallback(
     old_head: str | None,
     diffstat: Callable[[str], str] | None,
     human_requirements_in_force: bool,
+    ledger: Callable[[Sequence[object]], Sequence[object]] | None = None,
 ) -> BoundedCoderComment:
-    """The last bound level: a whole postable, claim-free synthesized record."""
+    """The last bound level: a whole postable, claim-free synthesized record.
+
+    ``ledger`` rolls back ledger annotations the discarded response introduced
+    (#2086), so the fallback carries no claim of it.  Only a candidate that
+    ``round_comment_fits`` is returned.
+    """
     from .coder_followup_degradation import bound_diffstat_text, synthesize_coder_record_text
 
     notes = tuple(dict.fromkeys((*metadata.coder_record_degradations, FALLBACK_NOTE)))[-16:]
+    prior_items = tuple(ledger(metadata.prior_items)) if ledger is not None else metadata.prior_items
     fallback = replace(
         metadata,
         **_FALLBACK_CLEARED_FIELDS,
+        prior_items=prior_items,
         coder_record_source="synthesized",
         coder_record_degradations=notes,
         human_requirements_degraded=bool(
@@ -140,20 +161,37 @@ def _synthesized_fallback(
         except Exception:  # noqa: BLE001 - display-only
             full_diffstat = "(diffstat unavailable)"
     attempts = ((2000, 40), (500, 10), (120, 3), (0, 0))
-    candidate = ""
-    text = ""
-    for id_chars, diff_lines in attempts:
-        text = synthesize_coder_record_text(
-            old_head=old_head, new_head=head_sha, item_ids=item_ids,
-            diffstat=bound_diffstat_text(full_diffstat, diff_lines) if diff_lines else "(omitted)",
-            reason="its record exceeded the GitHub comment size limit",
-            id_listing_chars=id_chars,
-        )
-        candidate = _attach_round_metadata(text, fallback, degradation_projection="compact")
-        if round_comment_fits(candidate):
-            break
-    LOGGER.info("PR #%s: coder round comment posted as the synthesized fallback", pr_number)
-    return BoundedCoderComment(candidate, FALLBACK_LEVEL, fallback, coder_output=text)
+    for tier in (fallback, _minimal_fallback(fallback)):
+        for id_chars, diff_lines in attempts:
+            text = synthesize_coder_record_text(
+                old_head=old_head, new_head=head_sha, item_ids=item_ids,
+                diffstat=bound_diffstat_text(full_diffstat, diff_lines) if diff_lines else "(omitted)",
+                reason="its record exceeded the GitHub comment size limit",
+                id_listing_chars=id_chars,
+            )
+            candidate = _attach_round_metadata(text, tier, degradation_projection="compact")
+            if round_comment_fits(candidate):
+                LOGGER.info("PR #%s: coder round comment posted as the synthesized fallback", pr_number)
+                return BoundedCoderComment(candidate, FALLBACK_LEVEL, tier, coder_output=text)
+    # Only the authoritative ledger and record identity remain, and even they
+    # cannot be transported: there is no postable record to return.
+    raise AgentLoopError(
+        f"PR #{pr_number}: even the minimal synthesized coder record cannot be transported "
+        "(the ledger itself exceeds the spill bound)."
+    )
+
+
+def _minimal_fallback(metadata: PostedRoundMetadata) -> PostedRoundMetadata:
+    """Reset every field outside the minimal kept set to its (valid) default."""
+    changes: dict[str, object] = {}
+    for field in fields(PostedRoundMetadata):
+        if field.name in _MINIMAL_FALLBACK_KEPT_FIELDS or not field.init:
+            continue
+        if field.default is not MISSING:
+            changes[field.name] = field.default
+        elif field.default_factory is not MISSING:  # type: ignore[misc]
+            changes[field.name] = field.default_factory()  # type: ignore[misc]
+    return replace(metadata, **changes)
 
 
 def bounded_coder_round_comment(
@@ -169,6 +207,7 @@ def bounded_coder_round_comment(
     fallback_old_head: str | None = None,
     fallback_diffstat: Callable[[str], str] | None = None,
     human_requirements_in_force: bool = False,
+    fallback_ledger: Callable[[Sequence[object]], Sequence[object]] | None = None,
 ) -> BoundedCoderComment:
     """Return the coder round comment to post, bounded only when it cannot fit.
 
@@ -182,6 +221,7 @@ def bounded_coder_round_comment(
     fallback = lambda: _synthesized_fallback(  # noqa: E731
         metadata, pr_number=pr_number, head_sha=head_sha, old_head=fallback_old_head,
         diffstat=fallback_diffstat, human_requirements_in_force=human_requirements_in_force,
+        ledger=fallback_ledger,
     )
     if render_kwargs is None:
         return _bounded_freeform(

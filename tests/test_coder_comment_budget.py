@@ -17,6 +17,7 @@ from coding_review_agent_loop.coder_comment_budget import (
 )
 from coding_review_agent_loop.comment_rendering import render_public_agent_comment
 from coding_review_agent_loop.protocol import (
+    ArchitectureImpact,
     StructuredCoderFollowup,
     StructuredHumanRequirementsPayload,
     UnresolvedReviewItem,
@@ -480,6 +481,86 @@ def test_fallback_omits_residual_metadata_and_keeps_the_ledger(tmp_path):
     assert [item.item_id for item in resumed.prior_items] == ["item-1", "item-2", "item-3"]
     assert all(item.status == "blocking" for item in resumed.prior_items)
     assert "Not claimed" in resumed.coder_output
+
+
+def _noise(label, count):
+    import hashlib
+
+    return "".join(hashlib.sha256(f"{label}-{n}".encode()).hexdigest() for n in range(count))
+
+
+def _residual(case):
+    """Large, poorly compressible residual metadata that never spills."""
+    if case == "architecture-impact":
+        from coding_review_agent_loop.architecture_contract import sanitize_architecture_impact
+
+        return {"architecture_impact": sanitize_architecture_impact(ArchitectureImpact(
+            status="changed", rationale=_noise("rationale", 1200),
+            affected_components=tuple(_noise(f"component-{n}", 20) for n in range(40)),
+            dependencies=("d",), execution_data_flows=("f",), persistence=("p",),
+            public_contracts=("c",), security_boundaries=("s",),
+            canonical_document_action="update",
+            canonical_document_path="docs/architecture/round-state-and-resume.md",
+            canonical_document_rationale="r",
+        )), "architecture_contract_version": 1}
+    if case == "compact-summaries":
+        return {"compact_prior_summaries": _summaries()}
+    # Outside the first-tier cleared set: only the minimal tier drops it.
+    return {"surfaced_reviewer_requirement_ids": tuple(
+        "hr-" + _noise(f"hr-{n}", 1) for n in range(1500)
+    )}
+
+
+@pytest.mark.parametrize("case", ["architecture-impact", "compact-summaries", "minimal-tier"])
+def test_fallback_always_returns_a_verified_postable_record_and_resumes(tmp_path, case):
+    """Rows oversize-never-terminal and fallback-residual-metadata-overflow (#2086 item-1)."""
+    config = make_config(tmp_path)
+    items = [_code_item(n) for n in range(1, 4)]
+    followup = _followup(["item-1"], ["item-2", "item-3"])
+    metadata = _metadata(items, raw=_raw(followup), **_residual(case))
+    _full, result, parts = _post(followup, items, config, metadata=metadata)  # asserts every part fits
+    assert result.level == FALLBACK_LEVEL
+    assert result.metadata.architecture_impact is None
+    assert result.metadata.compact_prior_summaries == ()
+    assert tuple(result.metadata.prior_items) == tuple(items)
+    assert result.metadata.surfaced_reviewer_requirement_ids == ()  # tier 1 or minimal tier
+    if case == "minimal-tier":
+        # The first tier keeps this field; only the minimal tier makes it fit.
+        assert metadata.surfaced_reviewer_requirement_ids
+    record = _hydrated(parts)
+    assert record.metadata.coder_record_source == "synthesized"
+    assert record.metadata.architecture_impact is None
+    resumed = _fallback_resume(parts)
+    assert resumed is not None and resumed.unrecorded_head_advance is False
+    assert [item.item_id for item in resumed.prior_items] == ["item-1", "item-2", "item-3"]
+
+
+def test_fallback_rolls_back_dispute_annotations_of_the_discarded_response(tmp_path):
+    """#2086 item-2: the fallback ledger carries no claim of the discarded response."""
+    from coding_review_agent_loop.coder_followup_degradation import rollback_discarded_annotations
+    from coding_review_agent_loop.unresolved_items import _apply_dispute_evidence, _is_disputed_item
+
+    config = make_config(tmp_path)
+    earlier = replace(_code_item(2), notes=("Coder disputes this item: an earlier round's evidence.",))
+    pre_turn = [_code_item(1), earlier]
+    annotated = _apply_dispute_evidence(
+        pre_turn, disputed_items=["item-1", "item-2"], dispute_evidence={"item-1": "x", "item-2": "y"},
+    )
+    assert _is_disputed_item(annotated[0])
+    followup = _followup((), disputed_items=("item-1", "item-2"), dispute_evidence={"item-1": "x", "item-2": "y"})
+    metadata = _metadata(annotated, raw=_raw(followup), compact_prior_summaries=_summaries())
+    kwargs = _kwargs(followup, annotated, config)
+    result = bounded_coder_round_comment(
+        render_public_agent_comment(**kwargs), metadata, pr_number=PR, head_sha=HEAD,
+        render_kwargs=kwargs,
+        fallback_ledger=lambda ledger: rollback_discarded_annotations(ledger, pre_turn),
+    )
+    assert result.level == FALLBACK_LEVEL
+    by_id = {item.item_id: item for item in result.metadata.prior_items}
+    assert not _is_disputed_item(by_id["item-1"])  # the discarded dispute is gone
+    assert by_id["item-2"].notes == earlier.notes  # pre-turn state is kept
+    resumed = _fallback_resume([str(part) for part in prepare_round_comment(result.posted_body)])
+    assert not _is_disputed_item({i.item_id: i for i in resumed.prior_items}["item-1"])
 
 
 def test_fallback_caps_an_oversized_id_listing_and_keeps_every_item_open(tmp_path):
