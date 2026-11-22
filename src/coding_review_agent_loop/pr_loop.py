@@ -273,6 +273,7 @@ from .comment_rendering import (
     render_public_agent_comment,
     resolve_matrix_evidence_render,
 )
+from .coder_comment_budget import admitted_evidence_heads, bounded_coder_round_comment
 from .followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
@@ -552,6 +553,7 @@ from .pr_loop_support import (
 
 
 from .pr_loop_decisions import (
+    release_revalidation,
     _classify_pr_reviewer_prelaunch,
     _settle_pr_round_ledger,
     _route_post_approval_ci_failure,
@@ -2980,22 +2982,9 @@ def run_pr_loop(
             )
         # The signed-requirement IDs surfaced to the reviewers whose verdict the
         # next finalization relies on; ``None`` is an unverifiable baseline.
-        evidence_surfaced_baseline: tuple[str, ...] | None = None
-        evidence_revalidation_required = False
-        if (
-            evidence_boundary is not None
-            and evidence_boundary.phase == EVIDENCE_RELEASE_PHASE
-            and resumed_round is not None
-            and resumed_round.broken_evidence_freeze_head is None
-            and not resumed_round.unrecorded_head_advance
-        ):
-            release_payload = evidence_boundary.evidence_release
-            evidence_revalidation_required = True
-            evidence_surfaced_baseline = (
-                release_payload.signed_requirement_ids_surfaced
-                if release_payload is not None and release_payload.valid
-                else None
-            )
+        evidence_revalidation_required, evidence_surfaced_baseline = release_revalidation(
+            evidence_boundary, resumed_round
+        )
 
         def collect_live_requirement_ids(context: PullRequestReviewContext) -> tuple[str, ...]:
             live_issue = (
@@ -3494,7 +3483,7 @@ def run_pr_loop(
                 current_resume.evidence_boundary
                 if current_resume is not None
                 and broken_freeze_head is None
-                and not current_resume.unrecorded_head_advance
+                and not current_resume.head_advanced_without_record
                 and current_resume.evidence_boundary is not None
                 and current_resume.evidence_boundary.subject == pr_metadata.head_sha
                 else None
@@ -9345,7 +9334,7 @@ def run_pr_loop(
                     and observation.receipt_id
                 )
                 latest_coder_output = coder_output
-                public_comment = coder_output
+                public_comment, coder_render_kwargs = coder_output, None
                 raw_structured_coder_response: str | None = None
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                     raw_structured_coder_response = coder_output
@@ -9516,7 +9505,8 @@ def run_pr_loop(
                     else None
                 )
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                    public_comment = render_public_agent_comment(
+                    # Kept so an oversized comment re-renders bounded from the same inputs (#2059).
+                    coder_render_kwargs = dict(
                         kind="coder_followup",
                         parsed=coder_response.marker_value,
                         agent=config.coder,
@@ -9529,6 +9519,7 @@ def run_pr_loop(
                         head_unchanged_sha=head_unchanged_sha,
                         coverage_assessment=followup_coverage_assessment,
                     )
+                    public_comment = render_public_agent_comment(**coder_render_kwargs)
                 elif head_unchanged_sha is not None:
                     public_comment = add_coder_followup_head_unchanged_notice(
                         public_comment, head_unchanged_sha
@@ -9711,19 +9702,13 @@ def run_pr_loop(
                     turn_started_at=coder_turn_started_at,
                     orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                 )
-            post_pr_comment(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                body=_attach_round_metadata(
-                    (
-                        f"{coder_dispatch_audit_note}\n\n{public_comment}"
-                        if coder_dispatch_audit_note
-                        else public_comment
-                    ),
-                    latest_coder_metadata,
-                ),
-            )
+            post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_round_comment(
+                public_comment, latest_coder_metadata, pr_number=pr_number,
+                head_sha=updated_pr_context.metadata.head_sha, audit_note=coder_dispatch_audit_note,
+                render_kwargs=coder_render_kwargs, freeform_text=coder_output,
+                evidence_heads=lambda: admitted_evidence_heads(runner, config, pr_number, pr_comments,
+                                                               pre_turn_head, updated_pr_context.metadata.head_sha),
+            ).posted_body)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
                 predecessor, successor = pr_metadata.head_sha, updated_pr_context.metadata.head_sha
                 if predecessor and successor and predecessor != successor:

@@ -594,7 +594,10 @@ If `agent-loop pr <number>` refuses to resume because a coder follow-up pushed a
 commit and was then rejected (or the PR head otherwise advanced without a
 recorded handoff), rerun with `--review-unrecorded-head`. It runs an ordinary
 review round of the current head with the recorded active items carried, never
-force-pushes, and never posts a record in the coder's name. See
+force-pushes, and never posts a record in the coder's name. The flag takes
+effect whenever it is given: it also skips a pending coder recovery at the
+first dispatch attempt and reviews the current head instead. An oversized coder
+follow-up comment is posted in bounded form rather than ending the run. See
 [rejected coder follow-ups](docs/local_agent_loop.md#rejected-coder-follow-ups-and-head-review-recovery-1292).
 
 For an issue-created managed-CI PR whose original authorization comment is

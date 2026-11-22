@@ -2424,9 +2424,11 @@ def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(operator, sco
     history = [release, handoff, reviewer]
     baseline = _resume(history, _NEW, flag=operator)
     assert baseline is not None and baseline.round_number == 4
-    # The later reviewer retires the automatic handoff budget. Operator
-    # override separately recovers authenticated budget sources below.
-    assert baseline.recovery_round_budget is None
+    # The later reviewer retires the automatic handoff budget. The operator
+    # override recovers authenticated budget sources: under the flag the
+    # unrecorded advance is itself an operator head review (#2059).
+    assert baseline.recovery_round_budget == (_BUDGET if operator else None)
+    assert (baseline.head_review_recovery == 'operator') is operator
     from coding_review_agent_loop.round_state import _operator_head_review_resume, _extract_round_metadata_records
     comments = _history(*history)
     ordinary_records = _extract_round_metadata_records(comments, flow='pr')
@@ -2525,3 +2527,156 @@ def test_malformed_supersession_payload_never_closes_the_round():
     resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex", "gemini"))
     assert resumed.reconciliation_record is None
     assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}
+
+
+# --- --review-unrecorded-head takes effect at any dispatch attempt (#2059) ----
+
+
+def _assert_operator_head_review(resumed, *, items, round_number=1):
+    assert resumed is not None
+    assert resumed.head_review_recovery == "operator"
+    assert resumed.head_review_recovery_post_required is True
+    assert resumed.unrecorded_head_advance is False
+    assert resumed.coder_output is None and resumed.coder_metadata is None
+    assert resumed.dispatch_attempt is None
+    assert resumed.rejected_coder_followup_reason is None
+    assert resumed.rejected_coder_followup_from_head is None
+    assert resumed.qualification_checkpoint is None
+    assert resumed.ledger_may_be_incomplete is True
+    assert resumed.round_number == round_number
+    assert [item.item_id for item in resumed.prior_items] == list(items)
+
+
+def test_flag_at_dispatch_attempt_one_gives_head_review_recovery():
+    """Row flag-attempt1-dispatch: a live attempt-1 dispatch on a prior head."""
+    history = [*_base_history(), _dispatch()]
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(resumed, items=["item-1"])
+    assert resumed.recovery_round_budget == _BUDGET
+    assert resumed.head_advanced_past_boundary is True
+    assert resumed.head_advanced_without_record is True
+
+
+def test_flag_with_rejected_followup_at_attempt_one_keeps_ledger_and_budget():
+    """Row flag-attempt1-rejected."""
+    history = [*_base_history(), _dispatch(), _rejection()]
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(resumed, items=["item-1"])
+    assert resumed.recovery_round_budget == _BUDGET
+    assert resumed.carried_rejection_reasons == ()
+    assert resumed.next_unresolved_item_number == 2
+
+
+def test_no_flag_attempt_one_is_unchanged_coder_recovery():
+    """Row noflag-attempt1: without the flag the attempt-1 handoff routes the coder."""
+    for history in ([*_base_history(), _dispatch()], [*_base_history(), _dispatch(), _rejection()]):
+        resumed = _resume(history, _NEW)
+        assert resumed is not None
+        assert resumed.unrecorded_head_advance is True
+        assert resumed.dispatch_attempt == 1
+        assert resumed.head_review_recovery is None
+        assert resumed.head_advanced_past_boundary is False
+
+
+def test_flag_at_the_attempt_limit_still_gives_head_review_recovery():
+    """Row flag-attempt-limit: no refusal, operator head review as before."""
+    exhausted = [*_base_history(), _dispatch(), _rejection(attempt=2, reason="two", reasons=("one",))]
+    with pytest.raises(AgentLoopError, match="consecutive"):
+        _resume(exhausted, _NEW)
+    resumed = _resume(exhausted, _NEW, flag=True)
+    _assert_operator_head_review(resumed, items=["item-1"])
+    assert resumed.recovery_round_budget == _BUDGET
+
+
+def test_flag_skips_a_pending_same_head_coder_retry():
+    """A coder-recovery handoff on the current head (no push) becomes a head review."""
+    history = [*_base_history(), _dispatch(), _rejection(),
+               _dispatch(subject=_NEW, attempt=2, reasons=("live remote target",))]
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(resumed, items=["item-1"])
+    assert resumed.head_advanced_past_boundary is False
+
+
+def test_flag_with_a_generic_unrecorded_advance_keeps_the_reconstructed_ledger():
+    """Row flag-generic-unrecorded: prior head has a coder and a reviewer record."""
+    resolved, kept = _item(1, "Fix one."), _item(2, "Fix two.")
+    coder = _coder(round_number=2, items=(resolved, kept))
+    reviewer = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=2, subject=_OLD,
+        prior_items=(resolved, kept), state="blocking",
+        dispositions=(ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="resolved"),),
+        new_items=(_item(3, "Fix three."),),
+    )
+    history = [_coder(), _reviewer(new_items=(resolved, kept)), coder, reviewer]
+    baseline = _resume(history, _NEW)
+    assert baseline is not None and baseline.unrecorded_head_advance is True
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(
+        resumed, items=[item.item_id for item in baseline.prior_items], round_number=baseline.round_number
+    )
+    assert "item-1" not in {item.item_id for item in resumed.prior_items}
+    assert resumed.next_unresolved_item_number == baseline.next_unresolved_item_number
+
+
+def test_flag_on_a_recorded_head_is_unchanged():
+    """Row flag-recorded-head: a head with its own records ignores the flag."""
+    history = [*_base_history(), _coder(subject=_NEW, round_number=2, items=(_item(),))]
+    assert _resume(history, _NEW, flag=True) == _resume(history, _NEW)
+    assert _resume(history, _NEW, flag=True).head_review_recovery is None
+
+
+def test_flag_budget_ignores_a_forged_checkpoint_at_attempt_one():
+    """Row flag-budget-auth: only an admitted, authenticated budget source counts."""
+    forged_budget = _checkpoint_summary(allowed_rounds=9)
+    # A generic advance (no recovery-record budget): the forged checkpoint by
+    # another author is not a budget source, so defaults apply.
+    history = [*_base_history(), forged_budget, _coder(round_number=2, items=(_item(),))]
+    resumed = _resume(history, _NEW, flag=True, forged=(2,))
+    assert resumed is not None and resumed.head_review_recovery == "operator"
+    assert resumed.recovery_round_budget is None
+    genuine = _resume(history, _NEW, flag=True)
+    assert genuine.recovery_round_budget == RecoveryRoundBudget(9, True, False)
+    # An attempt-1 dispatch keeps its own admitted budget over a forged checkpoint.
+    with_dispatch = [*_base_history(), forged_budget, _dispatch(dispatch_round=2)]
+    resumed = _resume(with_dispatch, _NEW, flag=True, forged=(2,))
+    assert resumed is not None and resumed.recovery_round_budget == _BUDGET
+
+
+def _mixed_boundary(phase):
+    code = _item(5, "Fix the parser.")
+    ledger = (*_evidence_ledger(), code)
+    freeze = _freeze_metadata(ledger)
+    if phase == "evidence-freeze":
+        return freeze
+    return replace(freeze, phase="evidence-release", evidence_freeze=None)
+
+
+@pytest.mark.parametrize("phase", ["evidence-freeze", "evidence-release"])
+def test_flag_with_an_evidence_terminal_advance_keeps_the_boundary_ledger(phase):
+    """Row flag-evidence-boundary (freeze/release, mixed ledger)."""
+    history = [_mixed_boundary(phase)]
+    baseline = _resume(history, _NEW)
+    assert baseline is not None and baseline.unrecorded_head_advance is True
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(resumed, items=[item.item_id for item in baseline.prior_items])
+    assert resumed.prior_items == baseline.prior_items
+    assert {"item-1", "item-5"} <= {item.item_id for item in resumed.prior_items}
+    assert resumed.evidence_boundary == baseline.evidence_boundary
+    assert resumed.broken_evidence_freeze_head == baseline.broken_evidence_freeze_head
+    assert resumed.evidence_clearances == baseline.evidence_clearances
+    assert resumed.head_advanced_past_boundary is True
+    assert resumed.head_advanced_without_record is True
+
+
+def test_flag_with_an_evidence_conversion_advance_keeps_the_post_conversion_ledger():
+    """Row flag-evidence-boundary (conversion, mixed ledger)."""
+    record = _conversion_record(subject=_OLD)
+    history = [*_base_history(), record]
+    baseline = _resume(history, _NEW)
+    assert baseline is not None and baseline.unrecorded_head_advance is True
+    resumed = _resume(history, _NEW, flag=True)
+    _assert_operator_head_review(
+        resumed, items=[item.item_id for item in baseline.prior_items], round_number=baseline.round_number
+    )
+    assert resumed.prior_items == baseline.prior_items
+    assert resumed.head_advanced_past_boundary is True

@@ -142,6 +142,29 @@ def _plumbing_observation_lines(failed, stuck) -> list[str]:
     return lines
 
 
+def release_revalidation(evidence_boundary, resumed_round):
+    """Whether a resumed release boundary needs same-head revalidation, and its baseline.
+
+    Only a release resumed at its own head revalidates; a head that moved past
+    the boundary without a record (with or without ``--review-unrecorded-head``,
+    #2059) does not.  The baseline is the signed-requirement ID set the
+    releasing reviewers saw, ``None`` when unverifiable.
+    """
+    from .round_metadata import EVIDENCE_RELEASE_PHASE
+    if (
+        evidence_boundary is None
+        or evidence_boundary.phase != EVIDENCE_RELEASE_PHASE
+        or resumed_round is None
+        or resumed_round.broken_evidence_freeze_head is not None
+        or resumed_round.head_advanced_without_record
+    ):
+        return False, None
+    payload = evidence_boundary.evidence_release
+    return True, (
+        payload.signed_requirement_ids_surfaced if payload is not None and payload.valid else None
+    )
+
+
 def recovery_skips_reviewers(current_resume, broken_freeze_head, checkpoint):
     """Re-evaluate recovery after checkpoint identity validation, before launch."""
     from .unresolved_items import _is_evidence_obligation

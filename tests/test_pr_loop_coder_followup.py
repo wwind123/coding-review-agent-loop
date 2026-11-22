@@ -2961,3 +2961,263 @@ def test_nine_cited_fixture_receipts_over_the_cap_publish_and_resolve_1995(tmp_p
     for receipt in referenced:
         line = next(line for line in bodies.splitlines() if f"receipt `{receipt}`" in line)
         assert "unknown or cross-turn" not in line
+
+
+# --- --review-unrecorded-head before the attempt limit (#2059) ---------------
+
+
+def test_operator_flag_at_dispatch_attempt_one_reviews_the_head_with_no_coder_turn(tmp_path):
+    """Row flag-attempt1-dispatch: a live attempt-1 dispatch from head A, head now B."""
+    records = [*_history_1292(), _dispatch_1292()]
+    # Without the flag the attempt-1 handoff routes the carried items through the coder.
+    plain = _stranded_runner_1292(
+        records, _B_1292, claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    assert run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude")) == 0
+    assert _agent_order_1292(plain)[0] == "claude"
+    assert _records_1292(plain, "head-review-recovery") == []
+
+    runner = _stranded_runner_1292(records, _B_1292)
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
+    assert _agent_order_1292(runner) == ["codex"]
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.head_review_recovery_source == "operator"
+    assert handoff.subject == _B_1292 and handoff.round_number == 1
+    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
+    assert [item.item_id for item in handoff.prior_items] == ["item-1"]
+    assert not any(record.role == "coder" and record.subject == _B_1292 for record in _records_1292(runner))
+    assert not any("--force" in " ".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["git"])
+
+
+def test_operator_flag_head_review_then_a_later_coder_dispatch_starts_at_attempt_one(tmp_path):
+    """Row flag-evidence-boundary (attempt lineage): the converted round restarts attempts."""
+    records = [*_history_1292(), _dispatch_1292(), _rejection_1292()]
+    runner = _stranded_runner_1292(
+        records, _B_1292,
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Still open.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking",
+                                          "note": "Not fixed yet."}],
+            ),
+            structured_pr_review(
+                state="approved", summary="Resolved.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
+    assert _agent_order_1292(runner)[:2] == ["codex", "claude"]
+    assert len(_records_1292(runner, "head-review-recovery")) == 1
+    later = [record for record in _records_1292(runner, "coder-dispatch") if record.subject == _B_1292]
+    assert later and all(record.dispatch_attempt == 1 for record in later)
+    assert all(record.recovery_dispatch is False for record in later)
+
+
+def test_operator_flag_after_a_release_with_a_mixed_ledger_runs_reviewers_first(tmp_path):
+    """Row flag-evidence-boundary (release, mixed ledger) at loop level."""
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+
+    evidence, _ = _upsert_evidence_obligation(
+        [], item_number=2, reviewer="Codex", text="Attach the live run.",
+        source_round=1, current_head_sha=_A_1292,
+    )
+    ledger = (_item_1292(), *evidence)
+    release = _meta_1292("summary", "evidence-release", subject=_A_1292, round_number=1, items=ledger)
+    records = [*_history_1292(), release]
+    resumed = _resume_pr_round(
+        _seed_comments_1292(records), head_sha=_B_1292, configured_reviewers=("codex",),
+        trusted_actor=_ACTOR_1292, review_unrecorded_head=True,
+    )
+    assert resumed is not None and resumed.head_review_recovery == "operator"
+    # The release-revalidation predicate keeps today's moved-head result: the
+    # head still advanced without a record, so no prior-baseline revalidation.
+    assert resumed.head_advanced_without_record is True
+    assert resumed.broken_evidence_freeze_head is None
+    assert resumed.evidence_boundary is not None and resumed.evidence_boundary.phase == "evidence-release"
+    same_head = _resume_pr_round(
+        _seed_comments_1292(records), head_sha=_A_1292, configured_reviewers=("codex",),
+        trusted_actor=_ACTOR_1292, review_unrecorded_head=True,
+    )
+    assert same_head is not None and same_head.head_advanced_without_record is False
+    assert same_head.evidence_boundary is not None
+
+    # No scripted reviewer output: the run stops at the first agent call, which
+    # shows what the loop dispatched first after posting the handoff record.
+    runner = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=flagged)
+    assert _agent_order_1292(runner) == ["codex"]
+    plain = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude"))
+    assert _agent_order_1292(plain) == ["claude"]  # without the flag: unchanged coder recovery
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.subject == _B_1292 and handoff.head_review_recovery_source == "operator"
+    assert {item.item_id for item in handoff.prior_items} >= {"item-1", "item-2"}
+
+
+def _seed_comments_1292(records):
+    from coding_review_agent_loop.github import IssueComment as _Comment
+
+    return [
+        _Comment(author=_ACTOR_1292[0], created_at=f"2026-05-20T09:{index:02d}:00Z",
+                 body=_attach_round_metadata("record\n-- Orchestrator", metadata), author_id=_ACTOR_1292[1])
+        for index, metadata in enumerate(records)
+    ]
+
+
+def test_oversized_coder_followup_posts_bounded_and_the_loop_continues(tmp_path):
+    """Row coder-body-oversized (pr-loop integration, #2059)."""
+    findings = [f"Finding {n}: " + "the handler drops the trailing field on retry. " * 12 for n in range(1, 61)]
+    item_ids = [f"item-{n}" for n in range(1, 61)]
+    long_note = "Rewrote the retry path and added regression coverage for this case. " * 14
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Many findings.", blocking_items=findings),
+            structured_pr_review(
+                state="approved", summary="All resolved.",
+                prior_item_dispositions=[{"item_id": item_id, "disposition": "resolved"} for item_id in item_ids],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(
+            summary="Addressed every finding.", addressed_items=item_ids,
+            addressed_item_notes={item_id: long_note for item_id in item_ids},
+        )],
+    )
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_order_1292(runner) == ["codex", "claude", "codex"]
+    coder_bodies = [
+        comment["body"] for comment in runner.pr_payload["comments"]
+        if "## Coder follow-up" in comment["body"]
+    ]
+    assert len(coder_bodies) == 1
+    (body,) = coder_bodies
+    assert "was shortened (bound level" in body
+    assert all(len(comment["body"]) <= 60_000 for comment in runner.pr_payload["comments"])
+    addressed = body[body.index("### Addressed items"):body.index("### Remaining items")]
+    assert set(re.findall(r"\bitem-\d+\b", addressed)) == set(item_ids)
+    (coder_record,) = [record for record in _records_1292(runner) if record.role == "coder"]
+    payload, _end = json.JSONDecoder().raw_decode(coder_record.raw_structured_coder_response)
+    assert payload["addressed_item_notes"]["item-60"] == long_note
+
+
+def test_real_coder_post_seam_resolves_admitted_historical_heads(tmp_path, monkeypatch):
+    """Item-2: the live caller groups with every admitted PR head, not only the pre-turn head."""
+    captured = []
+    original = pr_loop.bounded_coder_round_comment
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs["evidence_heads"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "bounded_coder_round_comment", spy)
+    records = [*_history_1292(), _dispatch_1292()]
+    runner = _stranded_runner_1292(
+        records, _B_1292, claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude")) == 0
+    assert captured and callable(captured[0])
+    heads = captured[0]()
+    assert _A_1292 in heads and _B_1292 in heads
+
+
+def _boundary_records_2059(phase, head):
+    from coding_review_agent_loop.round_metadata import EvidenceFreezeRecord, EvidenceReleaseRecord
+    from coding_review_agent_loop.unresolved_items import (
+        _upsert_evidence_obligation,
+        freeze_evidence_obligations,
+    )
+
+    evidence, _ = _upsert_evidence_obligation(
+        [], item_number=2, reviewer="Codex", text="Attach the live run capture.",
+        source_round=1, current_head_sha=head,
+    )
+    if phase == "evidence-conversion":
+        from test_round_state import _conversion_record
+
+        return [*_history_1292(), _conversion_record(subject=head)]
+    if phase == "evidence-freeze":
+        frozen = tuple(freeze_evidence_obligations(evidence, head_sha=head))
+        record = _meta_1292(
+            "summary", "evidence-freeze", subject=head, round_number=1, items=(_item_1292(), *frozen),
+            evidence_freeze=EvidenceFreezeRecord(head, tuple(i.obligation_identity for i in frozen), (), 5, False, False),
+        )
+    else:
+        record = _meta_1292(
+            "summary", "evidence-release", subject=head, round_number=1, items=(_item_1292(), *evidence),
+            evidence_release=EvidenceReleaseRecord(head, "findings", ("hr-baseline",), 5, False, False),
+        )
+    return [*_history_1292(), record]
+
+
+def _spy_release_revalidation(monkeypatch):
+    seen = []
+    original = pr_loop.release_revalidation
+
+    def spy(boundary, resumed):
+        result = original(boundary, resumed)
+        seen.append((boundary.phase if boundary is not None else None, result))
+        return result
+
+    monkeypatch.setattr(pr_loop, "release_revalidation", spy)
+    return seen
+
+
+@pytest.mark.parametrize("phase", ["evidence-freeze", "evidence-release", "evidence-conversion"])
+def test_operator_flag_after_each_evidence_boundary_runs_reviewers_first(tmp_path, monkeypatch, phase):
+    """Item-4 / row flag-evidence-boundary at loop level for freeze, release and conversion."""
+    seen = _spy_release_revalidation(monkeypatch)
+    records = _boundary_records_2059(phase, _A_1292)
+    baseline = _resume_pr_round(
+        _seed_comments_1292(records), head_sha=_B_1292, configured_reviewers=("codex",),
+        trusted_actor=_ACTOR_1292,
+    )
+    assert baseline is not None and baseline.unrecorded_head_advance is True
+    # No scripted reviewer output: the run stops at the first agent call, after
+    # any handoff record, showing which role the loop dispatched first.
+    runner = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=flagged)
+    assert _agent_order_1292(runner) == ["codex"]
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.subject == _B_1292 and handoff.head_review_recovery_source == "operator"
+    # The boundary's reconstructed ledger (code finding plus reopened or
+    # rebound evidence) is carried unchanged into the head review.
+    assert [i.item_id for i in handoff.prior_items] == [i.item_id for i in baseline.prior_items]
+    if phase != "evidence-conversion":
+        evidence = [i for i in handoff.prior_items if i.item_id == "item-2"]
+        assert evidence and evidence[0].lifecycle == "evidence_deferred"
+    assert not any(r.role == "coder" and r.subject == _B_1292 for r in _records_1292(runner))
+    if phase == "evidence-release":
+        assert seen[0] == ("evidence-release", (False, None))  # no revalidation of a moved head
+
+    # Without the flag the routing is unchanged: a broken freeze reviews the new
+    # head in full, while release and conversion advances route the coder first.
+    plain = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude"))
+    assert _agent_order_1292(plain) == (["codex"] if phase == "evidence-freeze" else ["claude"])
+    assert _records_1292(plain, "head-review-recovery") == []
+    if phase == "evidence-release":
+        assert seen[-1] == ("evidence-release", (False, None))
+
+
+def test_same_head_release_still_revalidates_against_its_baseline(tmp_path, monkeypatch):
+    """Row flag-evidence-boundary control: a release resumed at its own head revalidates."""
+    seen = _spy_release_revalidation(monkeypatch)
+    records = _boundary_records_2059("evidence-release", _A_1292)
+    runner = _stranded_runner_1292(records, _A_1292, codex_outputs=[])
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    try:
+        run_pr_loop(runner, pr_number=77, config=flagged)
+    except AgentLoopError:
+        pass
+    assert seen and seen[0] == ("evidence-release", (True, ("hr-baseline",)))
+    assert _records_1292(runner, "head-review-recovery") == []

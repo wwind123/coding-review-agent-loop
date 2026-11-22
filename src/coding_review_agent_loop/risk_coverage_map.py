@@ -366,16 +366,35 @@ def render_coverage_map(
     *,
     reask_used: bool = False,
     discard_note: str | None = None,
+    compact: str = "full",
 ) -> str:
-    """Render the orchestrator-authored coverage-map section (display only)."""
+    """Render the orchestrator-authored coverage-map section (display only).
+
+    ``compact`` selects the projection a bounded coder comment posts (#2059):
+    ``full`` (unchanged), ``compact`` (one short line per row, cited-test
+    counts instead of references) or ``minimal`` (per-kind counts and the
+    non-claim row IDs).  Every form keeps the heading and the verbatim status
+    line, so ``extract_coverage_map_section`` reads each of them.
+    """
     if assessment is None:
         return ""
+    if compact not in {"full", "compact", "minimal"}:
+        raise ValueError(f"unknown coverage-map projection: {compact}")
     lines = ["### Risk-matrix coverage map"]
     lines.append(
         "Orchestrator completeness check (existence and level only; whether each "
         "cited test really exercises its row is for the reviewer to judge)."
     )
-    for entry in assessment.entries:
+    if compact != "full":
+        lines.append(
+            f"Bounded {compact} form: the full map is derived from the coder response and "
+            "test evidence kept in round metadata."
+        )
+    if compact == "compact":
+        lines.extend(_compact_coverage_rows(assessment))
+    elif compact == "minimal":
+        lines.extend(_minimal_coverage_rows(assessment))
+    for entry in assessment.entries if compact == "full" else ():
         required = entry.required_level or "unclassified (no level check)"
         if entry.kind == "claim":
             declared = entry.declared_level or "undeclared"
@@ -409,6 +428,43 @@ def render_coverage_map(
     if discard_note:
         lines.append(f"- Note: {_bounded(discard_note)}")
     return "\n".join(lines)
+
+
+_COMPACT_DETAIL_CHARS = 120
+
+
+def _compact_coverage_rows(assessment: CoverageAssessment) -> list[str]:
+    lines: list[str] = []
+    for entry in assessment.entries:
+        required = entry.required_level or "unclassified"
+        row = f"- `{_bounded(entry.row_id)}`: {entry.kind}"
+        if entry.kind == "claim":
+            row += (
+                f", declared {entry.declared_level or 'undeclared'} vs required {required}, "
+                f"{len(entry.test_references)} cited test(s)"
+            )
+        elif entry.kind == "gap":
+            reason = _bounded(entry.gap_reason)[:_COMPACT_DETAIL_CHARS]
+            correction = _bounded(entry.gap_correction)[:_COMPACT_DETAIL_CHARS]
+            row += f" (required {required}) - reason: {reason}; correction: {correction}"
+        else:
+            row += f" (required {required})"
+        lines.append(row)
+    return lines
+
+
+def _minimal_coverage_rows(assessment: CoverageAssessment) -> list[str]:
+    counts: dict[str, int] = {}
+    for entry in assessment.entries:
+        counts[entry.kind] = counts.get(entry.kind, 0) + 1
+    lines = [
+        "- Rows: " + (", ".join(f"{kind} {count}" for kind, count in sorted(counts.items())) or "none")
+    ]
+    for kind in ("gap", "ambiguous", "missing"):
+        row_ids = [_bounded(entry.row_id) for entry in assessment.entries if entry.kind == kind]
+        if row_ids:
+            lines.append(f"- {kind.capitalize()} rows: " + ", ".join(f"`{row}`" for row in row_ids))
+    return lines
 
 
 COVERAGE_MAP_HEADING = "### Risk-matrix coverage map"

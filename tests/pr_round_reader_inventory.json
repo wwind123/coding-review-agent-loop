@@ -2356,12 +2356,6 @@
     },
     {
       "module": "comment_rendering",
-      "function": "_render_public_coder_followup_comment",
-      "classification": "presentation",
-      "admission": "comment_rendering._render_public_coder_followup_comment presents raw discussion or offline export; text is not an authority grant."
-    },
-    {
-      "module": "comment_rendering",
       "function": "_render_public_issue_implementation_comment",
       "classification": "presentation",
       "admission": "comment_rendering._render_public_issue_implementation_comment presents raw discussion or offline export; text is not an authority grant."
