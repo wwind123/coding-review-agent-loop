@@ -250,7 +250,8 @@ plan flow `plan_round_closure.py` treats the record as settling its round:
 reader (resume, panel evidence, carried approvals, visibility) and
 `select_plan_round_anchor` anchors the ledger at the record; plan approval
 carry still lets a closed plan review supersede that reviewer's earlier
-approval with a non-qualifying entry, exactly as the PR approval reader does,
+approval with a non-qualifying entry, exactly as the PR approval reader does
+(its live callers pass raw history, which carry projects itself),
 so resume rolls
 over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
 history and never approve. In this stage nothing writes the record yet.

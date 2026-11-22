@@ -1138,3 +1138,64 @@ def test_staged_dry_run_never_resolves_missed_close(tmp_path, monkeypatch):
     outcome = _staged_outcome(_staged_created(("agent-pr", "agent-pr")))
     assert _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch, config=make_config(tmp_path, dry_run=True)) == 0
     assert not runner.evidence_commands
+
+
+def _2064_append_closed_primary_block(history):
+    """Round 2 on the same key: the primary's block, then a closed-incomplete record."""
+    from coding_review_agent_loop.round_closure import (
+        ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
+    )
+    from coding_review_agent_loop.round_metadata import (
+        ROUND_RESUME_MARKER_RE, _attach_round_metadata, _decode_round_metadata,
+    )
+
+    approval_body = next(
+        c["body"] for c in history
+        if (m := ROUND_RESUME_MARKER_RE.search(c["body"])) is not None
+        and _decode_round_metadata(m.group("payload")).role == "reviewer"
+    )
+    approval = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(approval_body).group("payload"))
+    block = replace(approval, round_number=2, state="blocking")
+    closure = replace(
+        approval, role="summary", agent="Orchestrator", round_number=2, state=None,
+        phase=ROUND_CLOSED_INCOMPLETE_PHASE, plan_candidate_key=None,
+        round_closure=build_round_closure_payload(
+            flow="plan", round_number=2, subject=approval.subject,
+            published=[(approval.agent, None)],
+            unreplayable=[("Gemini", "spool outcome missing")],
+            item_number_high_water=0,
+        ),
+    )
+    assert closure.round_closure is not None
+    template = history[-1]
+    extra = [
+        dict(template, body=_attach_round_metadata("Plan review blocks.", block),
+             databaseId=9001, createdAt="2099-01-01T00:00:01Z"),
+        dict(template, body=_attach_round_metadata("Planning round 2 closed, incomplete.", closure),
+             databaseId=9002, createdAt="2099-01-01T00:00:02Z"),
+    ]
+    return [*history, *extra], approval.agent
+
+
+def test_2064_closed_primary_block_never_revives_an_older_carried_plan_approval(tmp_path):
+    """Item-6 on the live path: the growth seam's approval carry reads raw history.
+
+    The primary approved key K in round 1, then blocked K in round 2, which
+    closed incomplete.  The stale round-1 approval must not let the narrowing
+    seam skip the panel; contrast
+    test_narrow_staged_with_a_carried_primary_approval_schedules_no_panel.
+    """
+    history, primary = _2064_append_closed_primary_block(
+        _m1268_carried_history(tmp_path, complete=False))
+    assert primary == "Codex"
+    resumed = _FakeRunner(
+        issue_comments=list(history),
+        claude_outputs=[_m1268_narrowing_patch(_m1268_base(), one_shot=False)],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+
+    # The stale approval no longer lets the seam skip the review: the primary
+    # is freshly scheduled (the contrast test invokes only the planner).
+    assert "codex" in _m1103_agent_calls(resumed)

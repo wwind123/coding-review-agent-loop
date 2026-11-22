@@ -61,3 +61,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-22: A validated closure boundary counts as a coherent head-advance handoff even with an empty ledger and no coder record, so a push after it resumes as a fresh review without admitting the closed reviews (#2079, #2064).
 
 - 2026-11-22: In plan approval carry a closed-incomplete plan review supersedes that reviewer's earlier carried approval with a non-qualifying entry, matching the PR approval reader, so a stale approval never revives (#2079, #2064).
+
+- 2026-11-22: The planning loop's approval-carry call sites pass raw, scope-filtered plan history so a closed-incomplete review can still supersede an older approval; carry applies the projection itself (#2079, #2064).

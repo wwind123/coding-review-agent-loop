@@ -2187,7 +2187,11 @@ def _run_plan_first_loop_body(
             and (plan_growth_notice is not None or staged_mode_revision)
             and plan_primary_name is not None
         ):
-            plan_records = plan_history_records(refresh=True, round_number=round_number)
+            # Approval carry projects history itself; it needs the raw records so
+            # a closed-incomplete review still hides an older approval (#2064).
+            plan_records = plan_history_records(
+                refresh=True, round_number=round_number, include_idle_checkpoints=True
+            )
             growth_skip_panel = plan_primary_name in _carried_plan_approvals(
                 plan_records,
                 current_key=current_plan_key,
@@ -2234,8 +2238,10 @@ def _run_plan_first_loop_body(
                 required_reviewers=plan_reviewer_names,
             )
             plan_qualifying_approvals = _carried_plan_approvals(
+                # Raw history: carry projects it and keeps closed-incomplete
+                # reviews as non-qualifying supersessions (#2064).
                 tuple(
-                    record for record in plan_records
+                    record for record in raw_plan_records
                     if seat_binding is None or record.metadata.seat_binding == seat_binding
                 ),
                 current_key=current_plan_key,
