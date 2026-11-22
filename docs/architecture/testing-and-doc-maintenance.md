@@ -119,8 +119,10 @@ kept on the final error.
 
 No second model reformats a rejected response. A deterministic validation
 failure of any structured response goes back to the agent that produced it:
-the same agent, the model that produced the response (an Antigravity chain is
-not advanced), and the response's own session when there is one (otherwise
+the same agent, the model that produced the response (a Claude, Codex or Gemini
+response whose observed model differs from the configured one is re-asked on
+the observed model, a named seat is re-issued with that model first, and an
+Antigravity chain is not advanced), and the response's own session when there is one (otherwise
 the full original prompt). The re-ask prompt is the original prompt plus a
 bounded, marker-free copy of the validator message
 (`response_reask.build_reask_prompt`) and an instruction to resend the
@@ -214,7 +216,11 @@ malformed items, raises `TestObservationsShapeError`, which is re-asked. If
 the re-asks yield no accepted candidate, a non-array value falls back to the
 `degrade-after-repair` pair (the historical rule name stays parseable). That
 pair accepts the latest response through the same acceptance boundary, with a
-drop record, and never spends an agent retry. The over-bound case stays fatal.
+drop record, and never spends an agent retry. It runs only after both re-asks
+were spent; a coder head-guard refusal fails the turn instead. When envelope
+normalization exposes the defect, the normalized candidate and its own
+rejection carry forward to the re-ask and the degradation. The over-bound case
+stays fatal.
 
 Every function, method and nested def in `protocol.py`, `protocol_common.py`, `protocol_discuss.py` and `protocol_risk.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as

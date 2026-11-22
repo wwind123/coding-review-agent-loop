@@ -248,6 +248,47 @@ class _PendingReask:
     fresh_evidence: bool
     # The coder checkout head read before the re-ask; None for other roles.
     head_before: str | None
+    # The model the rejected response came from, when it differs from the
+    # configured one, so the re-ask goes to that same model.
+    producer_model: str | None = None
+
+
+_MODEL_FIELDS_BY_BACKEND = {
+    "claude": ("claude_model", "reviewer_claude_model"),
+    "codex": ("codex_model", "reviewer_codex_model"),
+    "gemini": ("gemini_model",),
+}
+
+
+def _pin_producer_model(
+    agent: AgentName, config: AgentLoopConfig, backend: str, model: str | None
+) -> tuple[AgentName, AgentLoopConfig]:
+    """Route a re-ask to the model that produced the rejected response (#2066).
+
+    Antigravity keeps its chain position across re-asks, so it needs no pin.
+    A named seat carries its own model chain, so the seat is re-issued with
+    the producer model first; a plain provider gets its model fields pinned.
+    A configuration that refuses the pin (for example a model passed through
+    agent arguments) keeps the configured model.
+    """
+    from .reviewer_seats import SeatAgent
+
+    if not model or backend not in _MODEL_FIELDS_BY_BACKEND:
+        return agent, config
+    if isinstance(agent, SeatAgent):
+        pinned = str.__new__(SeatAgent, str(agent))
+        pinned.backend = agent.backend
+        pinned.model_chain = (model, *(m for m in agent.model_chain if m != model))
+        pinned.effort = agent.effort
+        pinned.workdir = agent.workdir
+        return pinned, config
+    try:
+        return agent, dataclasses_replace(
+            config, **{field: model for field in _MODEL_FIELDS_BY_BACKEND[backend]}
+        )
+    except AgentLoopError as exc:
+        log(config, f"re-ask could not pin producer model {model!r} ({exc}); using the configured model")
+        return agent, config
 
 
 def _read_reask_head(runner: Runner, config: AgentLoopConfig) -> GitProbeResult:
@@ -1280,6 +1321,12 @@ def _run_validated_agent_in_scope(
             session_id=reask_session,
             fresh_evidence=fresh_evidence,
             head_before=head_before,
+            producer_model=(
+                result.observed_model
+                if result.observed_model
+                and result.observed_model != result.configured_model
+                else None
+            ),
         )
         log(
             config,
@@ -1373,12 +1420,17 @@ def _run_validated_agent_in_scope(
         )
         if usage_context is not None:
             usage_context.note_agent_dispatch()
+        dispatch_agent, dispatch_config = agent, attempt_config
+        if dispatch_reask is not None and dispatch_reask.producer_model:
+            dispatch_agent, dispatch_config = _pin_producer_model(
+                agent, attempt_config, backend_agent, dispatch_reask.producer_model
+            )
         while True:
             try:
                 result = run_agent_result(
                     runner,
-                    agent=agent,
-                    config=attempt_config,
+                    agent=dispatch_agent,
+                    config=dispatch_config,
                     prompt=attempt_prompt,
                     session_id=attempt_session_id,
                     run_id=usage_context.run_id if usage_context is not None else None,
@@ -2319,6 +2371,12 @@ def _run_validated_agent_in_scope(
                     # normalized is as unfixable by normalization as one on the
                     # raw text (#990).
                     normalized_evidence_rejection: NonRepairableEvidenceRejection | None = None
+                    # The rejection of the envelope-normalized candidate, when
+                    # normalization ran but did not make it acceptable: that
+                    # candidate and its own defect become the turn's state, so
+                    # the re-ask names the remaining defect and the
+                    # post-re-ask degradation sees it (#2066).
+                    normalized_rejection: AgentLoopError | None = None
                     if (
                         normalization_allowed
                         and repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
@@ -2335,6 +2393,7 @@ def _run_validated_agent_in_scope(
                             try:
                                 marker_value = validate(normalized)
                             except UnknownPriorItemDispositionError as norm_exc:
+                                normalized_rejection = norm_exc
                                 # Combined fix (issue #274): envelope normalization removed the
                                 # trailing defect but the normalized candidate still has unknown
                                 # prior dispositions. Try stripping them from the normalized text
@@ -2399,8 +2458,9 @@ def _run_validated_agent_in_scope(
                                             )
                             except NonRepairableEvidenceRejection as norm_exc:
                                 normalized_evidence_rejection = norm_exc
-                            except AgentLoopError:
-                                pass
+                                normalized_rejection = norm_exc
+                            except AgentLoopError as norm_exc:
+                                normalized_rejection = norm_exc
                             else:
                                 log(
                                     config,
@@ -2415,6 +2475,16 @@ def _run_validated_agent_in_scope(
                                     model_used=result.model_used,
                                     **_response_identity_fields(result, acquisition_result=validation_acquisition),
                                 )
+                    if normalized_rejection is not None and normalized is not None:
+                        text = normalized
+                        exc = normalized_rejection
+                        last_error = str(normalized_rejection)
+                        plan_validation_exhaustion = _refresh_plan_validation_capture(
+                            plan_validation_exhaustion,
+                            eligible=plan_validation_capture_eligible,
+                            text=normalized,
+                            diagnostic=str(normalized_rejection),
+                        )
                     history_strip = (
                         strip_requires_history_proof
                         and isinstance(exc, UnknownPriorItemDispositionError)
@@ -2602,6 +2672,10 @@ def _run_validated_agent_in_scope(
                             and exc.fallback_degradable
                             and not public_text_is_transient
                             and not response_failure_is_unsupported
+                            # A head-guard refusal is not exhaustion: the
+                            # degradation is earned only by spent re-asks.
+                            and reask_budget_exhausted
+                            and reask_skip_detail is None
                         ):
                             # Re-ask first, degrade after the re-asks (#1626,
                             # #2066): accept the latest response with today's
