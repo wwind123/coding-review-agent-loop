@@ -214,40 +214,45 @@ def _function_parameters(function: ast.AST) -> set[str]:
 
 
 def _local_bound_only_from(function: ast.AST, name: str, accept) -> bool:
-    """``name`` is a non-parameter local whose every binding satisfies ``accept``."""
+    """``name`` is a non-parameter local whose every binding satisfies ``accept``.
+
+    Only a single-target ``name = <value>`` (or annotated) assignment whose value
+    ``accept`` approves counts as a binding.  Any other binding form in the
+    function rejects: context managers, loop and comprehension targets, walrus,
+    augmented or multi-target assignments, unpacking, ``del``, imports, nested
+    definitions, exception names, match captures and global/nonlocal (#2069).
+    """
     if function is None or name in _function_parameters(function):
         return False
-    bindings = 0
+    accepted: set[int] = set()
     for node in _own_nodes(function):
-        if isinstance(node, ast.Assign):
-            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
-                if len(node.targets) != 1 or not accept(node.value):
-                    return False
-                bindings += 1
-            elif any(
-                isinstance(sub, ast.Name) and sub.id == name
-                for target in node.targets for sub in ast.walk(target)
-            ):
-                return False
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.target.id == name:
-                if node.value is None or not accept(node.value):
-                    return False
-                bindings += 1
-        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
             target = node.target
-            if isinstance(target, ast.Name) and target.id == name:
+        if isinstance(target, ast.Name) and target.id == name:
+            if not accept(node.value):
                 return False
-        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.comprehension)):
-            for sub in ast.walk(node.target if hasattr(node, "target") else node):
-                if isinstance(sub, ast.Name) and sub.id == name and isinstance(sub.ctx, ast.Store):
-                    if not isinstance(node, (ast.With, ast.AsyncWith)):
-                        return False
-        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            accepted.add(id(target))
+    for node in _own_nodes(function):
+        if isinstance(node, ast.Name) and node.id == name:
+            if isinstance(node.ctx, (ast.Store, ast.Del)) and id(node) not in accepted:
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return False
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name == name:
+                return False
+        elif isinstance(node, ast.MatchMapping) and node.rest == name:
             return False
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((alias.asname or alias.name.split(".")[0]) == name for alias in node.names):
+                return False
         elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
             return False
-    return bindings > 0
+    return bool(accepted)
 
 
 def _own_nodes(function: ast.AST):
@@ -576,6 +581,36 @@ _PROVENANCE_REJECTED = {
     "concatenation": (
         "from .render import registered\n"
         "def f():\n    raise HumanDecisionRequiredError('PR #1: ' + registered('x'))\n"
+    ),
+    "with-rebinding": (
+        "from .render import registered\n"
+        "def f(manager):\n    message = registered('x')\n    with manager() as message:\n"
+        "        raise HumanDecisionRequiredError(message)\n"
+    ),
+    "async-with-rebinding": (
+        "from .render import registered\n"
+        "async def f(manager):\n    message = registered('x')\n"
+        "    async with manager() as message:\n        raise HumanDecisionRequiredError(message)\n"
+    ),
+    "for-rebinding": (
+        "from .render import registered\n"
+        "def f(items):\n    message = registered('x')\n    for message in items:\n        pass\n"
+        "    raise HumanDecisionRequiredError(message)\n"
+    ),
+    "walrus-rebinding": (
+        "from .render import registered\n"
+        "def f(other):\n    message = registered('x')\n    if (message := other):\n        pass\n"
+        "    raise HumanDecisionRequiredError(message)\n"
+    ),
+    "unpack-rebinding": (
+        "from .render import registered\n"
+        "def f(pair):\n    message = registered('x')\n    message, _ = pair\n"
+        "    raise HumanDecisionRequiredError(message)\n"
+    ),
+    "import-rebinding": (
+        "from .render import registered\n"
+        "def f():\n    message = registered('x')\n    from os import sep as message\n"
+        "    raise HumanDecisionRequiredError(message)\n"
     ),
     "mixed-local": (
         "from .render import registered\n"

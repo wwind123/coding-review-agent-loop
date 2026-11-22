@@ -172,9 +172,10 @@ def reduce_history(history, *, repo, pr, head):
         if bound is None:
             raise HumanDecisionRequiredError.decision(
                 what='Visual lifecycle has no reliable head binding at ' + where,
-                clear='Inspect the named visual lifecycle comment, push a new head, then rerun the same command.',
+                # Raised for every head, so a push cannot clear it (#2069).
+                clear=f'Delete the unbound visual lifecycle record ({where}) from the PR, then rerun the same command.',
                 safe_to_automate=False,
-                automation_note='an unbound visual record needs a human to judge which head it covers.',
+                automation_note='deleting a PR history record needs a human to judge it.',
             )
         if bound == head:
             spent = True

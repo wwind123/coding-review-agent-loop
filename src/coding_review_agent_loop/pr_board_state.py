@@ -429,21 +429,6 @@ def authenticate_named_legacy_pr_entry(
             "authenticated GitHub actor is unavailable in dry-run mode, so it cannot be admitted."
         )
 
-    def refuse(detail: str) -> HumanDecisionRequiredError:
-        return HumanDecisionRequiredError.decision(
-            what=(
-                f"Human decision required: PR #{pr_number} has unanchored round history under a "
-                f"named reviewer board, and {detail}. Nothing was posted. Only records written by "
-                "the authenticated orchestrator actor can seed a named board."
-            ),
-            clear=(
-                f"Remove the round records the authenticated orchestrator actor did not write, "
-                f"then rerun `agent-loop pr {pr_number}`."
-            ),
-            safe_to_automate=False,
-            automation_note="deleting PR round history is a human decision.",
-        )
-
     pr_view = read_authenticated_protocol_comments(
         runner, config=config, surface_kind="pr", number=pr_number  # type: ignore[arg-type]
     )
@@ -490,7 +475,19 @@ def authenticate_named_legacy_pr_entry(
         or issue_full[unfiltered.latest_comment_index].comment_id
         != issue_view.authored[authored.latest_comment_index].comment_id
     ):
-        raise refuse(
-            f"the canonical issue-to-PR handoff record on issue #{owning_issue_number} is not "
-            "the latest one written by the authenticated actor"
+        raise HumanDecisionRequiredError.decision(
+            what=(
+                f"Human decision required: PR #{pr_number} has unanchored round history under a "
+                "named reviewer board, and the canonical issue-to-PR handoff record on issue "
+                f"#{owning_issue_number} is not the latest one written by the authenticated "
+                "actor. Nothing was posted. Only records written by the authenticated "
+                "orchestrator actor can seed a named board."
+            ),
+            clear=(
+                f"Delete every issue-to-PR handoff record on issue #{owning_issue_number} that "
+                "the authenticated orchestrator actor did not write, then rerun "
+                f"`agent-loop pr {pr_number}`."
+            ),
+            safe_to_automate=False,
+            automation_note="deleting a handoff record on the owning issue is a human decision.",
         )

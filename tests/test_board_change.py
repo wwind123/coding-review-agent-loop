@@ -5444,3 +5444,26 @@ def test_misplaced_signed_board_amendment_stops_with_a_three_part_exit_4_error()
         "wanted), then rerun the same command."
     )
     assert parts.safe_to_automate is False
+
+
+def test_named_legacy_handoff_refusal_is_cleared_by_its_named_action(tmp_path):
+    """#2069: deleting the non-actor handoff on the owning issue clears the stop."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError, parse_human_decision
+
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash, managed_ci_pr_mode=True)
+    body = _legacy("coder", "Claude", 1)
+    foreign = _owning_handoff(login="intruder", author_id=999)
+    runner = _managed_entry_runner(body, {56: [foreign]})
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        _owning_entry_check(runner, config, body, head_branch="agent-loop/managed-56")
+    parts = parse_human_decision(str(caught.value))
+    assert parts is not None and parts.safe_to_automate is False
+    assert parts.clear == (
+        "Delete every issue-to-PR handoff record on issue #56 that the authenticated "
+        "orchestrator actor did not write, then rerun `agent-loop pr 77`."
+    )
+    # Following the action leaves no non-actor handoff, and the check admits.
+    cleared = _managed_entry_runner(body, {56: []})
+    _owning_entry_check(cleared, config, body, head_branch="agent-loop/managed-56")
+    assert len(cleared.pr_payload["comments"]) == 1
