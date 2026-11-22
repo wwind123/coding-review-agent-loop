@@ -373,8 +373,9 @@ board check and the plan-lineage and plan-approval readers keep exit 4. The
 guard test checks this with a call graph built from the parsed source.
 Fallbacks that turn a caught error into a result, such as the plan-approval
 input derivation, legacy plan-history classification and signed-supersession
-reads, also call it first, so their underivable or undetermined results never
-carry a stop's text. A second guard resolves calls through imports, flags any
+reads, historical PR board-binding validation and the managed-CI
+source-authority fallback, also call it first, so their degraded results never
+carry or hide a stop. A second guard resolves calls through imports, flags any
 such fallback that can reach a stop, and lists the agent-turn failure
 policies and advisory previews that keep their degraded outcome, each with a
 reason.

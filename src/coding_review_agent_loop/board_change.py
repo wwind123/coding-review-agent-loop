@@ -52,7 +52,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from .errors import AgentLoopError, HumanDecisionRequiredError
+from .errors import AgentLoopError, HumanDecisionRequiredError, reraise_human_decision
 from .reviewer_floor import BoardSeat, SignedBoardAuthorization, distinct_providers
 
 BOARD_CHANGE_LINK_MARKER = "AGENT_PR_BOARD_CHANGE"
@@ -2214,7 +2214,12 @@ def lineage_binding_resolver(
             contract_from_metadata=_scheduler_contract_from_metadata,
             drift_error=lambda _persisted, detail: AgentLoopError(detail),
         )
-    except (AgentLoopError, StopIteration, ValueError, KeyError, TypeError):
+    except AgentLoopError as exc:
+        # A signed-record stop keeps exit 4 instead of reading as a refused
+        # binding (#2069).
+        reraise_human_decision(exc, "Found while validating historical PR reviewer-board bindings.")
+        return refuse
+    except (StopIteration, ValueError, KeyError, TypeError):
         return refuse
 
     def allowed(index: int, round_number: int) -> tuple[Mapping[str, object] | None, ...]:

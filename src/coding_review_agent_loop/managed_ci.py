@@ -32,7 +32,7 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .config import AgentLoopConfig
-from .errors import AgentLoopError
+from .errors import AgentLoopError, reraise_human_decision
 from .github import (
     _fetch_protocol_comment_envelope,
     read_actions_run,
@@ -2324,6 +2324,7 @@ def _activate_v2_managed_ci(
                         protection = replace(protection, state=authority.protection)
                         prior_audit = (authority.terminal_id, {"head": authority.head})
                     except AgentLoopError as exc:
+                        reraise_human_decision(exc, "Found while authenticating the managed-CI source authority.")
                         source_error = str(exc)
                         if MANAGED_LABEL in labels:
                             current_event = managed_ci_api._active_managed_label_event(runner, config=config, pr_number=pr_number)

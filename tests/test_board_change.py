@@ -5467,3 +5467,68 @@ def test_named_legacy_handoff_refusal_is_cleared_by_its_named_action(tmp_path):
     cleared = _managed_entry_runner(body, {56: []})
     _owning_entry_check(cleared, config, body, head_branch="agent-loop/managed-56")
     assert len(cleared.pr_payload["comments"]) == 1
+
+
+@pytest.mark.parametrize("entry", ["lineage-binding-resolver", "historical-bindings-match"])
+def test_historical_board_validation_keeps_a_misplaced_amendment_stop(monkeypatch, entry):
+    """item-10 (#2069): historical continuity validation re-raises the signed stop."""
+    from coding_review_agent_loop import cli
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from coding_review_agent_loop.board_change import lineage_binding_resolver
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError, parse_human_decision
+    from coding_review_agent_loop.managed_ci_authorization import _historical_bindings_match
+
+    root = _identity(("codex", "codex"), ("gemini", "gemini"))
+    link, _digest = _link_body(root, root.digest, root, _identity(("codex", "codex")), anchor=1, advance=True)
+    misplaced = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None, original_required_reviewers=("codex", "gemini"),
+        policy="all-reviewers", primary_reviewer=None, removed_reviewers=("gemini",),
+        effective_from_round=2, rationale="Wrong surface.",
+    )
+    actor = {"login": "orchestrator", "id": _ACTOR_ID}
+    comments = [
+        {"id": 1, "body": _record_body(1, root, root), "user": actor},
+        {"id": 2, "body": link, "user": actor},
+        {"id": 3, "body": misplaced, "user": actor},
+    ]
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        if entry == "lineage-binding-resolver":
+            lineage_binding_resolver(comments, actor_id=_ACTOR_ID)
+        else:
+            _historical_bindings_match(
+                comments, [1], {0: {"seat_binding_valid": True, "round_number": 1,
+                                    "seat_binding": root.seat_binding()}},
+                actor_id=_ACTOR_ID,
+            )
+    parts = parse_human_decision(str(caught.value))
+    assert parts is not None and parts.safe_to_automate is False
+    assert parts.what.startswith("Human decision required: signed reviewer-board amendment")
+    assert parts.what.endswith("Found while validating historical PR reviewer-board bindings.")
+
+    def raise_stop(*_args, **_kwargs):
+        raise caught.value
+
+    monkeypatch.setattr(cli, "run_pr_loop", raise_stop)
+    assert cli.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+
+
+def test_managed_ci_source_authority_fallback_keeps_a_human_decision_stop(monkeypatch, tmp_path):
+    """item-10 (#2069): managed-CI activation does not fall back to ordinary recovery on a stop."""
+    import ast
+    import inspect
+
+    from coding_review_agent_loop import managed_ci
+
+    source = inspect.getsource(managed_ci._activate_v2_managed_ci)
+    tree = ast.parse(source.lstrip() if source.startswith(" ") else source)
+    handlers = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler) and any(
+            isinstance(call, ast.Call) and getattr(call.func, "id", "") == "authenticate_source_authority"
+            for try_node in ast.walk(tree) if isinstance(try_node, ast.Try) and node in try_node.handlers
+            for stmt in try_node.body for call in ast.walk(stmt)
+        )
+    ]
+    assert handlers, "source-authority handler not found"
+    first = handlers[0].body[0]
+    assert isinstance(first, ast.Expr) and getattr(first.value.func, "id", "") == "reraise_human_decision"

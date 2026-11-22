@@ -1003,7 +1003,10 @@ KNOWN_TRANSPORT_FALLBACKS = {
     "review_images_coverage_run:gate": "visual coverage turn degrades to unavailable evidence",
     "triage:run_issue_triage": "advisory triage turn",
     "execution_policy:_print_dry_run_execution_preview": "dry-run topology preview text (review item-6, deferred)",
-    "managed_ci:_activate_v2_managed_ci": "managed-CI source authority falls back to ordinary recovery",
+    "discuss_loop:_run_discuss_semantic_finalization": "discuss semantic finalization turn failure keeps its degraded outcome",
+    "child_plan_binding:_fresh_child_resume_command": "advisory resume-command hint; the real failure is raised elsewhere",
+    "pr_loop_support:_pr_amendment_plan_board_hint": "advisory rerun hint text only",
+    "review_rounds:_unavailable_reviewer_amendment_advisory": "advisory amendment template; the stop stays authoritative",
 }
 
 
@@ -1108,11 +1111,16 @@ def check_transport_fallbacks(sources: dict[str, str]) -> list[str]:
                 names = handler_names(handler)
                 if names & index.exempt:
                     break
-                if not names & _BROAD_CATCHES or handler.name is None:
+                if not names & _BROAD_CATCHES:
                     continue
+                # Every broad handler counts, named or not, whether it carries
+                # the error text forward or just returns a degraded value
+                # (#2069 review item-10).
                 body = [n for stmt in handler.body for n in ast.walk(stmt)]
-                if any(
-                    isinstance(n, ast.Call) and _tail(n.func) == REWRAP_KEEPER for n in body
+                if handler.name is not None and any(
+                    isinstance(n, ast.Call) and _tail(n.func) == REWRAP_KEEPER
+                    and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == handler.name
+                    for n in body
                 ):
                     continue
                 last = handler.body[-1]
@@ -1120,8 +1128,7 @@ def check_transport_fallbacks(sources: dict[str, str]) -> list[str]:
                     last.exc is None or (isinstance(last.exc, ast.Name) and last.exc.id == handler.name)
                 ):
                     continue
-                if any(isinstance(n, ast.Name) and n.id == handler.name for n in body):
-                    violations.append(f"{module}:{handler.lineno}")
+                violations.append(f"{module}:{handler.lineno}")
     return violations
 
 
@@ -1169,8 +1176,14 @@ def test_transport_guard_flags_a_result_fallback_and_accepts_a_kept_stop():
         "def g():\n    try:\n        stop()\n    except HumanDecisionRequiredError:\n        return None\n"
         "def f():\n    try:\n        g()\n    except AgentLoopError as exc:\n        return str(exc)\n"
     )
+    unnamed = transport.replace(
+        "    except AgentLoopError as exc:\n        return ('undetermined', str(exc))\n",
+        "    except (AgentLoopError, ValueError):\n        return None\n",
+    )
     base = {"errors": _ERRORS_SOURCE, "stops": stops}
     assert check_transport_fallbacks({**base, "site": transport}) == ["site:6"]
+    # An unnamed handler that drops the stop for a degraded value is flagged too.
+    assert check_transport_fallbacks({**base, "site": unnamed}) == ["site:6"]
     assert check_transport_fallbacks({**base, "site": kept}) == []
     # A callee that swallows the stop itself does not make its callers reachable.
     assert check_transport_fallbacks({**base, "site": shielded}) == []
