@@ -3856,9 +3856,12 @@ round metadata, so resume reads it as the coder output. Reviewer and other
 round comments keep the transport behaviour described above.
 
 If even the most compact coder comment cannot fit (the round metadata, or a
-ledger whose item IDs alone exceed the budget), nothing is posted and the
-overflow error ends with the recovery command, for example `the coder's commit
-<sha> is pushed; recover with: agent-loop pr 2310 --review-unrecorded-head`.
+ledger whose item IDs alone exceed the budget), the loop posts a claim-free
+orchestrator-synthesized coder record instead of stopping (#2086): old and new
+head, a capped diffstat, and the carried item IDs listed as not claimed up to a
+fixed budget with an omitted-count line. The full ledger still rides the round
+metadata, nonessential metadata is omitted, and the review round runs on the
+new head.
 
 When the round-metadata marker alone, with its framing and an empty visible
 body, would exceed the budget, the message says so instead: `the derived round
@@ -9120,8 +9123,38 @@ instead of starting a recovery round.
 
 A coder turn can push and then be rejected by the post-response validators
 (for example a test run against a live remote target). The rejection discards
-the response but not the push, so the new head carries no coder or reviewer
-record. Three orchestrator-posted summary records, all written by the
+the response but not the push.
+
+**Degraded and synthesized coder records (#2086).** When a rejected coder
+follow-up moved the head, the loop posts a coder record for the new head and
+continues straight to the review round, with no second coder turn:
+
+- **Degraded record.** The final rejected candidate is revalidated against its
+  own acquisition's receipts after dropping each failing field and every claim
+  that depends on it: unknown item IDs, citations or risk-matrix selectors that
+  select no passing receipt of that acquisition, `tests_run` entries run outside
+  the assigned checkout or against a live target, and a malformed
+  `architecture_impact`. Missing or invalid `human_requirement_dispositions`
+  become `blocked` dispositions with fixed orchestrator evidence, so no signed
+  requirement counts as addressed and the acknowledgement obligation stays
+  open; a missing direct-discussion acknowledgement is recorded as not
+  acknowledged. A visible "Orchestrator degradation notes" section names every
+  drop.
+- **Synthesized record.** If nothing parses, or the rejection names no
+  droppable field, the record is built from git: old head, new head, a bounded
+  diffstat, and every carried item listed as not claimed. It carries no coder
+  claims.
+
+Dropped fields never count as claims, reviewers still review the exact head,
+and a later invocation resumes from the record with a review of the current
+head. A quota, human-decision or interrupt stop after a push posts a
+synthesized record best-effort and then stops as before. An unchanged head
+keeps the behaviour below, and if the coder record cannot be posted the
+original coder error is reported.
+
+The records below remain for unchanged-head recovery dispatches and for
+records written by earlier releases, where the new head carries no coder or
+reviewer record. Three orchestrator-posted summary records, all written by the
 authenticated GitHub actor, make that state resumable. None is a coder-role
 record, and nothing ever force-pushes or resets the branch.
 
@@ -9134,8 +9167,10 @@ record, and nothing ever force-pushes or resets the branch.
   record selection, and a valid first-attempt dispatch on the current head is
   skipped as a non-handoff.
 - **Rejected-follow-up record** (`coder-followup-rejected`). Written when a
-  dispatch is rejected after the head moved, or when a recovery dispatch
-  (attempt 2) is rejected at all. It is keyed to the head observed afterwards
+  recovery dispatch (attempt 2) is rejected on an unchanged head; earlier
+  releases also wrote it when a dispatch was rejected after the head moved,
+  and those records are still read. A rejection after a push now posts a
+  degraded or synthesized coder record instead (see below). It is keyed to the head observed afterwards
   and keeps the pre-turn head separately (`dispatch_head` and the from-head).
   Its reason is bounded to about 2000 characters, redacted for secrets and
   stripped of protocol markers. Its ledger is the pre-dispatch snapshot, never

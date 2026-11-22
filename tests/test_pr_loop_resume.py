@@ -2384,3 +2384,60 @@ def test_2064_legacy_signed_input_supersession_record_still_resumes_into_next_ro
     assert [c["body"] for c in runner.pr_payload["comments"][: len(kept)]] == kept
     assert not any(cmd[:2] == ["gh", "api"] and "DELETE" in cmd for cmd, _ in runner.commands)
     assert not any("Delete these" in comment for comment in runner.comments)
+
+
+# --- #2086: resume after a degraded or synthesized coder record ------------
+
+_UNKNOWN_ITEM_FOLLOWUP_2086 = structured_coder_followup(
+    summary="Added the test.", addressed_items=["item-1", "item-99"],
+    tests_run=["pytest tests/test_foo.py"], reviewer="OpenAI Codex",
+)
+
+
+@pytest.mark.parametrize(
+    ("coder_output", "source"),
+    [(_UNKNOWN_ITEM_FOLLOWUP_2086, "degraded"), ("No structured response at all.", "synthesized")],
+)
+def test_resume_after_a_degraded_or_synthesized_record_reviews_the_head_without_a_coder_turn(
+    tmp_path, coder_output, source
+):
+    """Row resume-from-degraded."""
+    blocking = structured_pr_review(
+        state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
+        reviewer="Anthropic Claude",
+    )
+    approving = structured_pr_review(
+        state="approved", summary="Resolved.", reviewer="Anthropic Claude",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+    # The reviewer outputs run out right after the coder record: an interruption.
+    runner = FakeRunner(claude_outputs=[blocking], codex_outputs=[coder_output])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    coder_records = [
+        metadata for comment in runner.pr_payload["comments"]
+        if (metadata := _metadata_from_body_2086(comment["body"])) is not None
+        and metadata.role == "coder"
+    ]
+    assert [(m.subject, m.coder_record_source) for m in coder_records] == [(pushed, source)]
+    coder_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
+
+    runner.claude_outputs.append(approving)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # No coder turn first: the resume reviewed the recorded head.
+    assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]] == coder_calls
+    reviews = [
+        metadata for comment in runner.pr_payload["comments"]
+        if (metadata := _metadata_from_body_2086(comment["body"])) is not None
+        and metadata.role == "reviewer" and metadata.subject == pushed
+    ]
+    assert [m.state for m in reviews] == ["approved"]
+
+
+def _metadata_from_body_2086(body):
+    match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_:-]+)\s*-->", body)
+    return round_metadata._decode_round_metadata(match.group("payload")) if match else None

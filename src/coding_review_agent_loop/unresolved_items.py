@@ -757,6 +757,11 @@ def _apply_dispute_evidence(
     return result
 
 
+# Ledger note prefixes written from a coder response's claims; a discarded
+# (synthesized-fallback) response's notes with these prefixes are rolled back.
+CODER_CLAIM_NOTE_PREFIXES: tuple[str, ...] = (CODER_DISPUTE_NOTE_PREFIX,)
+
+
 def _is_disputed_item(item: UnresolvedReviewItem) -> bool:
     """Return True if this item has been disputed by the coder via counter-evidence."""
     return any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)
@@ -1072,6 +1077,12 @@ def _upsert_human_requirements_ack_item(
     return retained
 
 
+HUMAN_REQUIREMENTS_DEGRADED_ACK_TEXT = (
+    "The latest coder record was degraded or synthesized by the orchestrator: no coder "
+    "claim about the signed human requirements was retained, so they remain unaddressed."
+)
+
+
 def _clear_human_requirements_ack_item(
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> list[UnresolvedReviewItem]:
@@ -1085,6 +1096,7 @@ def _reconcile_human_requirements_ack_item(
     human_requirements,
     source_round: int,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    human_requirements_degraded: bool = False,
 ) -> list[UnresolvedReviewItem]:
     if coder_output is None:
         return list(unresolved_items)
@@ -1092,6 +1104,13 @@ def _reconcile_human_requirements_ack_item(
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     if not prompt_context.surfaced_requirement_ids and not prompt_context.requires_direct_discussion_ack:
         return _clear_human_requirements_ack_item(unresolved_items)
+    if human_requirements_degraded:
+        # An orchestrator-normalized or synthesized coder record (#2086): its
+        # wire-valid human-requirements fields are not a coder claim, so they
+        # never clear the acknowledgement obligation, whatever they validate to.
+        return _upsert_human_requirements_ack_item(
+            unresolved_items, source_round=source_round, text=HUMAN_REQUIREMENTS_DEGRADED_ACK_TEXT,
+        )
     # Parse the applicable structured response mode first.  Schema, footer,
     # layout, and reviewer-item errors belong to the response validator; they
     # must not be relabeled as a human-requirements obligation here.
@@ -1391,6 +1410,7 @@ def _validate_coder_followup_response(
     excluded_item_ids: Sequence[str] = (),
     test_observations_mode: str = "degrade",
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    degraded_unacknowledged: bool = False,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1435,6 +1455,7 @@ def _validate_coder_followup_response(
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
             reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            degraded_unacknowledged=degraded_unacknowledged,
         )
         return structured_followup
 

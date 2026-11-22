@@ -492,6 +492,22 @@ class PreservedUnsatisfiedResponse:
     architecture_impact_degradations: tuple = ()
 
 
+@dataclass(frozen=True)
+class RejectedCandidate:
+    """The final rejected candidate of a validated turn, frozen at rejection (#2086).
+
+    ``test_turn_id`` and ``test_turn_observations`` are the candidate's own
+    acquisition and its closed catalog, never the runner's latest test turn,
+    which a repair launch may replace.
+    """
+
+    text: str
+    test_turn_id: str | None = None
+    test_turn_observations: tuple[object, ...] = ()
+    session_id: str | None = None
+    model_used: str | None = None
+
+
 class AgentInvocationError(AgentLoopError):
     """Raised when an agent invocation fails after retries/repair.
 
@@ -511,9 +527,12 @@ class AgentInvocationError(AgentLoopError):
         plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None,
         preserved_unsatisfied_response: PreservedUnsatisfiedResponse | None = None,
         bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None,
+        rejected_candidate: "RejectedCandidate | None" = None,
     ) -> None:
         super().__init__(message)
         self.failure_category = failure_category
+        # The final rejected candidate and its frozen acquisition (#2086).
+        self.rejected_candidate = rejected_candidate
         # Protocol-valid text (agent-declared AGENT_UNAVAILABLE text verbatim,
         # or an orchestrator-synthesized rendering) already persisted/posted by
         # a bounded completion-recovery attempt (#588). None for every other

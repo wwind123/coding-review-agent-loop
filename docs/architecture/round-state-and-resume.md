@@ -451,12 +451,16 @@ fields. Empty pushes still change candidate revision authority even with equal
 trees; legitimate architecture transitions invalidate approvals, and persisting
 the fresh observation makes repeated unchanged gates stable.
 
-A rejected coder follow-up is recoverable. A coder turn can push and
-then be rejected by a post-response validator, which discards the response but
-not the push. Before every PR coder dispatch the orchestrator therefore posts a
+A rejected coder follow-up that moved the head gets a coder record (#2086):
+the final candidate, minus unknown IDs, citations without a passing receipt in
+its own acquisition catalog, outside-checkout tests and a malformed
+`architecture_impact` (invalid dispositions become `blocked`), revalidated under
+that catalog; else a git-synthesized record. Review then runs on the new head.
+`human_requirements_degraded` keeps the acknowledgement item open.
+Before every PR coder dispatch the orchestrator still posts a
 `coder-dispatch` summary (dispatch round and head, immutable ledger snapshot,
-bounded round budget, attempt number, carried reasons); on a rejection after a
-push, or any rejected recovery dispatch, it posts a `coder-followup-rejected`
+bounded round budget, attempt number, carried reasons); a rejected recovery
+dispatch on an unchanged head posts a `coder-followup-rejected`
 summary keyed to the observed head with a bounded, redacted reason. Ordinary
 selection never sees dispatch records. Resume admits these records only from
 the authenticated GitHub actor, using author identities fetched from REST and
@@ -472,19 +476,12 @@ is an ordinary review round of the current head: it carries only the ledger, the
 bounded budget and a `head-review-recovery` handoff that supersedes earlier
 checkpoints, and never overrides review scheduling or merge-conflict routing.
 Nothing force-pushes or writes a coder-role record on the operator's behalf.
-`--review-unrecorded-head` takes effect whenever it is given (#2059): resume
-first builds its result as without the flag, including any evidence-boundary
-ledger reconstruction. Every outcome routed through coder recovery (a coder
-handoff at any attempt, or any unrecorded head advance) then passes through one
-conversion point, `_as_operator_head_review`, which turns it into an operator
-head review. The conversion keeps the ledger, round, item numbering and
-evidence-boundary fields and clears coder output, the attempt lineage and the
-qualification checkpoint, so a later coder starts at attempt 1. The budget is
-the handoff's own admitted budget, or else the shared authenticated search.
-The moved-head fact is kept in `head_advanced_past_boundary`, and the
-evidence-boundary predicates read `head_advanced_without_record`, so a moved
-head after a release still skips release-baseline revalidation. Without the
-flag every resume result is unchanged.
+`--review-unrecorded-head` takes effect whenever given (#2059): every outcome
+routed through coder recovery passes through `_as_operator_head_review`, which
+keeps the ledger, round, numbering and evidence-boundary fields and clears coder
+output, attempt lineage and checkpoint; the budget is the handoff's admitted
+budget or the shared authenticated search. `head_advanced_past_boundary` keeps
+the moved-head fact, so release-baseline revalidation is still skipped.
 
 The PR-loop coder follow-up comment is size-bounded at its posting seam
 (`coder_comment_budget.py`, #2059). A comment that fits the transport is posted
@@ -496,8 +493,10 @@ indicators shrink everything else, including the sections that
 `_attach_round_metadata` inserts (its `degradation_projection`). Each trial is
 measured with the exact preparation that posts it. Round metadata keeps the
 complete response, and for free-form output the original text, so resume never
-reads the bounded projection as the coder output. The transport overflow error
-remains the last resort and then names `agent-loop pr N --review-unrecorded-head`.
+reads the bounded projection as the coder output. If no level fits, a
+claim-free synthesized record posts: `prior_items` spills as usual, listing and
+diffstat are capped, nonessential metadata is omitted, and the caller adopts it.
+The overflow error never escapes the coder seam (#2086).
 Reviewer and other round comments are not bounded.
 
 A PR round closed by its reconciliation summary is final. It receives no new

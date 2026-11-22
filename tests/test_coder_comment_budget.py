@@ -10,11 +10,14 @@ from types import SimpleNamespace
 import pytest
 
 from coding_review_agent_loop.coder_comment_budget import (
+    FALLBACK_LEVEL,
+    FALLBACK_NOTE,
     FREEFORM_OMISSION_NOTE,
     bounded_coder_round_comment,
 )
 from coding_review_agent_loop.comment_rendering import render_public_agent_comment
 from coding_review_agent_loop.protocol import (
+    ArchitectureImpact,
     StructuredCoderFollowup,
     StructuredHumanRequirementsPayload,
     UnresolvedReviewItem,
@@ -104,13 +107,14 @@ def _kwargs(followup, items, config, **extra):
     )
 
 
-def _post(followup, items, config, metadata=None, **render_extra):
+def _post(followup, items, config, metadata=None, fallback_old_head=None, fallback_diffstat=None, **render_extra):
     kwargs = _kwargs(followup, items, config, **render_extra)
     metadata = metadata or _metadata(items, raw=_raw(followup))
     full = render_public_agent_comment(**kwargs)
     result = bounded_coder_round_comment(
         full, metadata, pr_number=PR, head_sha=HEAD, render_kwargs=kwargs,
         evidence_heads=(HEAD, PRIOR, *OTHER_HEADS),
+        fallback_old_head=fallback_old_head, fallback_diffstat=fallback_diffstat,
     )
     parts = [str(part) for part in prepare_round_comment(result.posted_body)]
     assert all(len(part) <= MAX_GITHUB_BODY_CHARS for part in parts)
@@ -409,17 +413,175 @@ def test_fitting_freeform_output_is_unchanged():
     assert result.posted_body == _attach_round_metadata(_signed(original), metadata)
 
 
-def test_metadata_only_overflow_names_the_recovery_command(tmp_path):
-    """Row metadata-only-overflow: even the ID-only body cannot fit."""
+def _fallback_resume(parts):
+    return _resume_pr_round(
+        [SimpleNamespace(body=part) for part in parts], head_sha=HEAD, configured_reviewers=("codex",)
+    )
+
+
+def test_oversize_at_every_bound_level_posts_the_synthesized_fallback(tmp_path):
+    """Row oversize-never-terminal: no bound level fits; the record still posts.
+
+    The caller adopts a claim-free synthesized record; the transport overflow
+    error never escapes and no recovery command is named.
+    """
     config = make_config(tmp_path)
     ids = [f"item-{n}" for n in range(1, 9001)]
     followup = _followup(ids)
-    with pytest.raises(RoundCommentOverflowError) as raised:
-        _post(followup, (), config, metadata=_metadata(()))
-    message = str(raised.value)
-    assert "Round comment exceeds" in message
-    assert f"agent-loop pr {PR} --review-unrecorded-head" in message
-    assert HEAD in message
+    old = "a" * 40
+    _full, result, parts = _post(
+        followup, (), config, metadata=_metadata(()), fallback_old_head=old,
+        fallback_diffstat=lambda new: f" src/a.py | 2 +-\n 1 file changed ({new[:7]})",
+    )
+    assert result.level == FALLBACK_LEVEL
+    assert "--review-unrecorded-head" not in result.posted_body
+    assert result.coder_output is not None
+    assert "orchestrator synthesized this coder record from git" in result.coder_output
+    assert f"`{old}`" in result.coder_output and f"`{HEAD}`" in result.coder_output
+    assert "src/a.py" in result.coder_output
+    # Claim-free: none of the rejected response's structured claims survive.
+    assert _ids(result.coder_output) == set()
+    assert result.metadata.coder_record_source == "synthesized"
+    assert result.metadata.raw_structured_coder_response is None
+    assert FALLBACK_NOTE in result.metadata.coder_record_degradations
+    record = _hydrated(parts)
+    assert record.metadata.coder_record_source == "synthesized"
+    assert "## Orchestrator-synthesized coder record" in record.body
+    assert "### Orchestrator degradation notes" in record.body
+    resumed = _fallback_resume(parts)
+    assert resumed is not None and resumed.unrecorded_head_advance is False
+    assert resumed.coder_metadata.coder_record_source == "synthesized"
+
+
+def _summaries(count=400):
+    """Large, poorly compressible, non-spillable residual metadata."""
+    import hashlib
+
+    return tuple(
+        f"Round {n}: " + "".join(hashlib.sha256(f"{n}-{k}".encode()).hexdigest() for k in range(8))
+        for n in range(count)
+    )
+
+
+def test_fallback_omits_residual_metadata_and_keeps_the_ledger(tmp_path):
+    """Row fallback-residual-metadata-overflow, including resume."""
+    config = make_config(tmp_path)
+    items = [_code_item(n) for n in range(1, 4)]
+    followup = _followup(["item-1"], ["item-2", "item-3"])
+    metadata = _metadata(items, raw=_raw(followup), compact_prior_summaries=_summaries())
+    _full, result, parts = _post(followup, items, config, metadata=metadata)
+    assert result.level == FALLBACK_LEVEL
+    assert result.metadata.compact_prior_summaries == ()
+    assert result.metadata.raw_structured_coder_response is None
+    assert tuple(result.metadata.prior_items) == tuple(items)  # never dropped or truncated
+    record = _hydrated(parts)
+    assert [item.item_id for item in record.metadata.prior_items] == ["item-1", "item-2", "item-3"]
+    resumed = _fallback_resume(parts)
+    assert resumed is not None and resumed.unrecorded_head_advance is False
+    assert [item.item_id for item in resumed.prior_items] == ["item-1", "item-2", "item-3"]
+    assert all(item.status == "blocking" for item in resumed.prior_items)
+    assert "Not claimed" in resumed.coder_output
+
+
+def _noise(label, count):
+    import hashlib
+
+    return "".join(hashlib.sha256(f"{label}-{n}".encode()).hexdigest() for n in range(count))
+
+
+def _residual(case):
+    """Large, poorly compressible residual metadata that never spills."""
+    if case == "architecture-impact":
+        from coding_review_agent_loop.architecture_contract import sanitize_architecture_impact
+
+        return {"architecture_impact": sanitize_architecture_impact(ArchitectureImpact(
+            status="changed", rationale=_noise("rationale", 1200),
+            affected_components=tuple(_noise(f"component-{n}", 20) for n in range(40)),
+            dependencies=("d",), execution_data_flows=("f",), persistence=("p",),
+            public_contracts=("c",), security_boundaries=("s",),
+            canonical_document_action="update",
+            canonical_document_path="docs/architecture/round-state-and-resume.md",
+            canonical_document_rationale="r",
+        )), "architecture_contract_version": 1}
+    if case == "compact-summaries":
+        return {"compact_prior_summaries": _summaries()}
+    # Outside the first-tier cleared set: only the minimal tier drops it.
+    return {"surfaced_reviewer_requirement_ids": tuple(
+        "hr-" + _noise(f"hr-{n}", 1) for n in range(1500)
+    )}
+
+
+@pytest.mark.parametrize("case", ["architecture-impact", "compact-summaries", "minimal-tier"])
+def test_fallback_always_returns_a_verified_postable_record_and_resumes(tmp_path, case):
+    """Rows oversize-never-terminal and fallback-residual-metadata-overflow (#2086 item-1)."""
+    config = make_config(tmp_path)
+    items = [_code_item(n) for n in range(1, 4)]
+    followup = _followup(["item-1"], ["item-2", "item-3"])
+    metadata = _metadata(items, raw=_raw(followup), **_residual(case))
+    _full, result, parts = _post(followup, items, config, metadata=metadata)  # asserts every part fits
+    assert result.level == FALLBACK_LEVEL
+    assert result.metadata.architecture_impact is None
+    assert result.metadata.compact_prior_summaries == ()
+    assert tuple(result.metadata.prior_items) == tuple(items)
+    assert result.metadata.surfaced_reviewer_requirement_ids == ()  # tier 1 or minimal tier
+    if case == "minimal-tier":
+        # The first tier keeps this field; only the minimal tier makes it fit.
+        assert metadata.surfaced_reviewer_requirement_ids
+    record = _hydrated(parts)
+    assert record.metadata.coder_record_source == "synthesized"
+    assert record.metadata.architecture_impact is None
+    resumed = _fallback_resume(parts)
+    assert resumed is not None and resumed.unrecorded_head_advance is False
+    assert [item.item_id for item in resumed.prior_items] == ["item-1", "item-2", "item-3"]
+
+
+def test_fallback_rolls_back_dispute_annotations_of_the_discarded_response(tmp_path):
+    """#2086 item-2: the fallback ledger carries no claim of the discarded response."""
+    from coding_review_agent_loop.coder_followup_degradation import rollback_discarded_annotations
+    from coding_review_agent_loop.unresolved_items import _apply_dispute_evidence, _is_disputed_item
+
+    config = make_config(tmp_path)
+    earlier = replace(_code_item(2), notes=("Coder disputes this item: an earlier round's evidence.",))
+    pre_turn = [_code_item(1), earlier]
+    annotated = _apply_dispute_evidence(
+        pre_turn, disputed_items=["item-1", "item-2"], dispute_evidence={"item-1": "x", "item-2": "y"},
+    )
+    assert _is_disputed_item(annotated[0])
+    followup = _followup((), disputed_items=("item-1", "item-2"), dispute_evidence={"item-1": "x", "item-2": "y"})
+    metadata = _metadata(annotated, raw=_raw(followup), compact_prior_summaries=_summaries())
+    kwargs = _kwargs(followup, annotated, config)
+    result = bounded_coder_round_comment(
+        render_public_agent_comment(**kwargs), metadata, pr_number=PR, head_sha=HEAD,
+        render_kwargs=kwargs,
+        fallback_ledger=lambda ledger: rollback_discarded_annotations(ledger, pre_turn),
+    )
+    assert result.level == FALLBACK_LEVEL
+    by_id = {item.item_id: item for item in result.metadata.prior_items}
+    assert not _is_disputed_item(by_id["item-1"])  # the discarded dispute is gone
+    assert by_id["item-2"].notes == earlier.notes  # pre-turn state is kept
+    resumed = _fallback_resume([str(part) for part in prepare_round_comment(result.posted_body)])
+    assert not _is_disputed_item({i.item_id: i for i in resumed.prior_items}["item-1"])
+
+
+def test_fallback_caps_an_oversized_id_listing_and_keeps_every_item_open(tmp_path):
+    """Row fallback-oversized-ledger: the ID-only listing alone exceeds the limit."""
+    config = make_config(tmp_path)
+    items = [
+        UnresolvedReviewItem(
+            item_id=f"item-{n}", reviewer="Codex", source_round=1, text="Short.", status="blocking"
+        )
+        for n in range(1, 9001)
+    ]
+    assert len(", ".join(f"`{item.item_id}`" for item in items)) > MAX_GITHUB_BODY_CHARS
+    followup = _followup([item.item_id for item in items])
+    metadata = _metadata(items, raw=_raw(followup), compact_prior_summaries=_summaries())
+    _full, result, parts = _post(followup, items, config, metadata=metadata)
+    assert result.level == FALLBACK_LEVEL
+    assert "more item(s) omitted from this listing; all remain open" in result.coder_output
+    resumed = _fallback_resume(parts)
+    assert resumed is not None
+    assert len(resumed.prior_items) == 9000
+    assert {item.status for item in resumed.prior_items} == {"blocking"}
 
 
 def test_many_distinct_repeated_evidence_groups_still_fit_id_only(tmp_path):

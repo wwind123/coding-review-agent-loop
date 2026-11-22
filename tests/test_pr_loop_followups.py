@@ -1675,11 +1675,12 @@ def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tm
         ] * 2,
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a degraded record (#2086)
 
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert len(runner.comments) == 3
+    assert len(runner.comments) == 2  # the review and the dispatch record
     assert runner.comments[0].startswith("**Review verdict:** Blocking")
     assert not any("Added the test." in comment for comment in runner.comments)
 
@@ -1710,6 +1711,7 @@ def test_pr_loop_refuses_structured_followup_mixed_outside_tests(tmp_path, comma
         ] * 2,
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a degraded record (#2086)
 
     with pytest.raises(AgentLoopError, match="as separate commands"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -2210,6 +2212,9 @@ def test_1388_addressed_item_without_resolution_history_still_fails_closed(
     runner, config, repairs, resolved_claim = _run_1388_acknowledgement_round(
         tmp_path, monkeypatch, recorded_history=False
     )
+    # The rejection itself is under test, not the pushed head's record (#2086).
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
 
     with pytest.raises(AgentLoopError):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -2272,6 +2277,7 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
     )
     config = make_config(tmp_path, coder='codex', reviewer='claude', agent_max_retries=0)
     if mode == 'fallback-spent':
+        runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a degraded record (#2086)
         with pytest.raises(AgentLoopError, match='semantic-evidence-rejection'):
             run_pr_loop(runner, pr_number=77, config=config)
         prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ['codex']]

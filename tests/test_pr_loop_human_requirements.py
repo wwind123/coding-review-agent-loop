@@ -282,6 +282,7 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
         max_rounds=2,
         agent_max_retries=0,
     )
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a degraded record (#2086)
 
     with pytest.raises(
         AgentLoopError,
@@ -1609,3 +1610,56 @@ def test_invalid_signed_fields_with_ack_placement_fail_like_without_it():
         errors.append(str(error.value))
     assert errors[0] == errors[1]
     assert "unknown unresolved reviewer item IDs" not in errors[0]
+
+
+def test_valid_ack_forced_into_synthesis_keeps_the_ack_open_in_loop_and_resume(tmp_path, monkeypatch):
+    """#2086 item-3: a discarded (synthesized-fallback) acknowledgement never clears the obligation."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+    from types import SimpleNamespace
+
+    _exhaust_ack_repair(monkeypatch)
+    requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
+    valid_ack = structured_coder_followup(human_requirement_ids=[requirement_id])
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(),
+        codex_outputs=[_code_requirement_review()],  # round 1 opens the obligation; then interrupted
+        claude_outputs=[valid_ack],
+    )
+    real_fits = budget.round_comment_fits
+    monkeypatch.setattr(
+        budget, "round_comment_fits",
+        lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+    )
+    adopted, cleared_by_coder = [], []
+    real_adopt = degradation.CoderFollowupRecovery.adopt
+
+    def adopt(self, bounded, metadata, output, items):
+        result = real_adopt(self, bounded, metadata, output, items)
+        cleared_by_coder.append(any(i.item_id == ACK_ID for i in items))
+        adopted.append(result[2])
+        return result
+
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "adopt", adopt)
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3))
+
+    assert cleared_by_coder == [False]  # the valid acknowledgement cleared it before bounding
+    (live,) = adopted
+    assert any(item.item_id == ACK_ID for item in live)  # restored before the next review
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+    )
+    (coder,) = [r for r in records if r.metadata.role == "coder"]
+    assert coder.metadata.coder_record_source == "synthesized"
+    assert coder.metadata.human_requirements_degraded is True
+    assert any(item.item_id == ACK_ID for item in coder.metadata.prior_items)
+
+    # Resume from the posted record: the reviewer still sees the open obligation.
+    monkeypatch.setattr(budget, "round_comment_fits", real_fits)
+    before = len(runner.commands)
+    runner.codex_outputs.append(_code_requirement_review())
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3))
+    prompts = [cmd[-1] for cmd, _cwd in runner.commands[before:] if cmd[:1] == ["codex"]]
+    assert prompts and ACK_ID in prompts[0]

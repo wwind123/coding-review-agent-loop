@@ -827,6 +827,7 @@ def test_failed_v1_qualification_then_guarded_fix_turn_skips_the_orchestrator_ru
 def test_rejected_guarded_fix_turn_passes_records_and_posts_nothing_for_own_run(
     tmp_path, monkeypatch,
 ):
+    _legacy_rejection_path(monkeypatch)
     malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
     runner, contract, rejected = _failed_qualification_fix_loop(
         tmp_path, monkeypatch, coder_run=False, claude_outputs=[malformed],
@@ -877,6 +878,14 @@ def test_coder_retry_inherits_the_guard_and_reviewer_stays_unguarded(tmp_path, m
     assert len(dispatches) == 1
 
 
+def _legacy_rejection_path(monkeypatch):
+    """Keep the rejected-turn path for a pushed head (a record that cannot be
+    built); the degraded coder record (#2086) posts the ordinary audit note."""
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
+
+
 def _prose_before_footer(response):
     """Markdown between the JSON object and the footer needs format repair."""
     head, footer, tail = response.partition("<!-- AGENT_STATE:")
@@ -913,6 +922,7 @@ def test_loop_driven_format_repair_of_guarded_coder_inherits_the_guard(tmp_path,
 def test_rejected_guarded_coder_turn_still_publishes_dispatch_audit(tmp_path, monkeypatch):
     """#1366 item-3: a bypass dispatch followed by a response that fails
     validation and repair is still surfaced, without masking the rejection."""
+    _legacy_rejection_path(monkeypatch)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
     runner, _record, dispatches, _ = _managed_guard_loop(

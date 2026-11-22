@@ -275,6 +275,7 @@ from .comment_rendering import (
     resolve_matrix_evidence_render,
 )
 from .coder_comment_budget import admitted_evidence_heads, bounded_coder_round_comment
+from .coder_followup_degradation import CoderFollowupRecovery
 from .followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
@@ -3332,6 +3333,7 @@ def run_pr_loop(
                 coder_output=latest_coder_output,
                 human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments))),
                 source_round=round_number, reviewer_owned_requirement_ids=(reviewer_owned_requirement_ids := reviewer_owned_ids(human_requirements, resumed_coder_requirements)),
+                human_requirements_degraded=bool(latest_coder_metadata is not None and latest_coder_metadata.human_requirements_degraded),
             )
             # A CI obligation is bound to the head that failed.  Only a
             # strictly different live head may become a qualification
@@ -9268,18 +9270,7 @@ def run_pr_loop(
             followup_citations: FollowupCitationDiagnosis | None = None
             evidence_progress_receipts: frozenset[str] = frozenset()
             _followup_derived_risk_evidence = None
-            try:
-                visual_run.coder_heads.add(pr_metadata.head_sha)
-                coder_response = _run_validated_agent(
-                    runner,
-                    agent=config.coder,
-                    config=coder_config,
-                    prompt=followup_prompt,
-                    session_id=coder_session_id,
-                    marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                    require_architecture_impact_contract=True,
-                    architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
+            _validate_coder_followup_response_by_mode = lambda mode, observations_mode, degraded_unacknowledged=False: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
@@ -9309,8 +9300,23 @@ def run_pr_loop(
                             if approved_plan_context is not None and approved_plan_context.matrix_available
                             else None
                         ), architecture_status_mode=mode,
-                        test_observations_mode=observations_mode,
-                    ), config=config)),
+                        test_observations_mode=observations_mode, degraded_unacknowledged=degraded_unacknowledged,
+                    ), config=config)
+            coder_recovery = CoderFollowupRecovery(runner, config=config, pr_number=pr_number, pre_turn_head=pre_turn_head, ledger=pre_turn_ledger, coder_name=coder_name, record_round=round_number + 1, validator_factory=_validate_coder_followup_response_by_mode, human_requirements_context=coder_human_requirements_context,
+                reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, allowed_item_ids=(*repair_unresolved_item_ids, *coder_optional_item_ids, *coder_resolved_item_ids, *coder_excluded_item_ids), workdir=active_workdir(config), metadata_factory=bound_pr_metadata, qualification_checkpoint=qualification_checkpoint,
+                observe_head=lambda: get_observed_pr_review_context(runner, config=config, pr_number=pr_number).metadata.head_sha, post_body=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
+            try:
+                visual_run.coder_heads.add(pr_metadata.head_sha)
+                coder_response = coder_recovery.run(lambda: _run_validated_agent(
+                    runner,
+                    agent=config.coder,
+                    config=coder_config,
+                    prompt=followup_prompt,
+                    session_id=coder_session_id,
+                    marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                    require_architecture_impact_contract=True,
+                    architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
+                    **_architecture_and_test_observation_mode_validators(_validate_coder_followup_response_by_mode),
                     usage_context=usage_context,
                     role="coder",
                     use_repair=True,
@@ -9328,7 +9334,7 @@ def run_pr_loop(
                     ),
                     reask_on_evidence_rejection=True,
                     operation_description="PR feedback follow-up",
-                )
+                ))
                 coder_output = coder_response.text
                 coder_session_id = coder_response.session_id
                 # Frozen before any post-authentication correction, from the
@@ -9390,7 +9396,7 @@ def run_pr_loop(
                 unresolved_items = _reconcile_human_requirements_ack_item(
                     unresolved_items,
                     coder_output=coder_output,
-                    human_requirements=coder_requirements,
+                    human_requirements=coder_requirements, human_requirements_degraded=coder_recovery.human_requirements_degraded,
                     source_round=round_number, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                 )
                 updated_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number,
@@ -9459,11 +9465,6 @@ def run_pr_loop(
                 # loop round; the matrix-evidence anchor must use that number.
                 coder_record_round = round_number + 1
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                    pr_finding_history.record_fix(
-                        coder_response.marker_value,
-                        published_round=coder_record_round,
-                        agent=coder_name,
-                    )
                     log_declared_generalization(
                         coder_response.marker_value,
                         log=lambda message: log(config, message),
@@ -9654,7 +9655,7 @@ def run_pr_loop(
                     scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                     qualification_checkpoint=qualification_checkpoint,
                     followup_dispatch_head=followup_dispatch_head,
-                    step_back_entries=step_back_entries,
+                    step_back_entries=step_back_entries, **coder_recovery.metadata_fields(),
                     **_test_observation_degradation_fields(coder_response.marker_value),
                     **_architecture_metadata_fields(
                         config, result=coder_response.marker_value
@@ -9680,7 +9681,7 @@ def run_pr_loop(
                 # A coder that pushed and was then rejected leaves a head with no
                 # coder or reviewer record; persist why, then surface the original
                 # error unchanged.
-                _record_coder_followup_rejection(
+                coder_recovery.unless_recorded(_record_coder_followup_rejection)(
                     runner,
                     config=config,
                     pr_number=pr_number,
@@ -9709,13 +9710,19 @@ def run_pr_loop(
                     turn_started_at=coder_turn_started_at,
                     orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                 )
-            post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_round_comment(
+            bounded_coder_comment = bounded_coder_round_comment(
                 public_comment, latest_coder_metadata, pr_number=pr_number,
                 head_sha=updated_pr_context.metadata.head_sha, audit_note=coder_dispatch_audit_note,
-                render_kwargs=coder_render_kwargs, freeform_text=coder_output,
+                render_kwargs=coder_render_kwargs, freeform_text=coder_output, **coder_recovery.budget_kwargs(),
                 evidence_heads=lambda: admitted_evidence_heads(runner, config, pr_number, pr_comments,
                                                                pre_turn_head, updated_pr_context.metadata.head_sha),
-            ).posted_body)
+            )
+            coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
+            latest_coder_metadata, latest_coder_output, unresolved_items, coder_response_discarded = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
+            if coder_response_discarded:  # a claim-free synthesized record: none of its claims count (#2086)
+                evidence_progress_receipts, followup_citations, latest_coder_coverage_map = frozenset(), None, None
+            elif isinstance(coder_response.marker_value, StructuredCoderFollowup):  # fix history only for the posted record
+                pr_finding_history.record_fix(coder_response.marker_value, published_round=coder_record_round, agent=coder_name)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
                 predecessor, successor = pr_metadata.head_sha, updated_pr_context.metadata.head_sha
                 if predecessor and successor and predecessor != successor:

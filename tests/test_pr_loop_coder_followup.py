@@ -51,6 +51,7 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_pr_review,
 )
+import coding_review_agent_loop.coder_followup_degradation as coder_followup_degradation
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.execution_policy as execution_policy
 import coding_review_agent_loop.issue_implementation as issue_implementation
@@ -677,41 +678,224 @@ def _coder_prompts_1292(runner):
     return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
 
 
-def test_post_push_rejection_records_the_pushed_head_and_resumes_a_coder_recovery(tmp_path):
-    runner = _rejected_push_runner_1292(coder_outputs=[_LIVE_TARGET_FOLLOWUP, _VALID_FOLLOWUP])
+def _legacy_rejection_writer(monkeypatch):
+    """Simulate a pre-#2086 release: a post-push rejection writes the legacy
+    rejected-follow-up record instead of a degraded coder record.
+
+    The legacy recovery readers stay until stage 2 of #2065 replaces them with
+    migration reads, so these tests still need records in that shape.
+    """
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
+
+
+def _unknown_id_and_citation_followup():
+    """Unknown item ID plus a citation that selects no passing receipt (#2086)."""
+    payload = json.loads(
+        structured_coder_followup(
+            summary="Added the test.", addressed_items=["item-1", "item-99"],
+            tests_run=["pytest tests/test_foo.py"], reviewer="OpenAI Codex",
+        ).split("\n", 1)[0]
+    )
+    payload["test_observations"] = [
+        {"command": "pytest tests/test_foo.py", "receipt_id": "rcpt-not-in-catalog", "claim": "current-result"}
+    ]
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+
+
+def _coder_records_2086(runner, subject=None):
+    return [
+        record for record in _records_1292(runner)
+        if record.role == "coder" and (subject is None or record.subject == subject)
+    ]
+
+
+def _comment_bodies_2086(runner, needle):
+    return [comment["body"] for comment in runner.pr_payload["comments"] if needle in comment["body"]]
+
+
+def test_post_push_unknown_id_and_citation_post_a_degraded_record_and_review_runs(tmp_path):
+    """Row degrade-unknown-id-citation (issue #2065 acceptance 1)."""
+    runner = _rejected_push_runner_1292(coder_outputs=[_unknown_id_and_citation_followup()])
     config = make_config(tmp_path, coder="codex", reviewer="claude")
-
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-
-    pushed = runner.pr_payload["headRefOid"]
-    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
-    (dispatch,) = _records_1292(runner, "coder-dispatch")
-    (rejection,) = _records_1292(runner, "coder-followup-rejected")
-    assert (dispatch.subject, dispatch.dispatch_head, dispatch.dispatch_attempt) == ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "6367c48dd193d56ea7b0baad25b19455e529f5ee", 1)
-    assert dispatch.recovery_dispatch is False and dispatch.round_number == 2
-    assert rejection.subject == pushed  # keyed to the pushed head ...
-    assert rejection.dispatch_head == rejection.rejected_coder_followup_from_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
-    assert rejection.round_number == rejection.dispatch_round == 1
-    assert "live remote target" in rejection.rejected_coder_followup_reason
-    assert [item.item_id for item in rejection.prior_items] == ["item-1"]
-    assert rejection.recovery_round_budget.allowed_rounds == config.max_rounds
-    assert not any(record.role == "coder" for record in _records_1292(runner) if record.subject == pushed)
-    assert runner.pr_payload["headRefOid"] == pushed  # no reset or force-push
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    recovery_prompt = _coder_prompts_1292(runner)[2]
-    assert "live remote target" in recovery_prompt
-    assert "attempt 1" in recovery_prompt
-    assert "`6367c48dd193d56ea7b0baad25b19455e529f5ee`" in recovery_prompt and f"`{pushed}`" in recovery_prompt
-    assert "Nothing from that attempt was reviewed or recorded" in recovery_prompt
-    second_dispatch = _records_1292(runner, "coder-dispatch")[1]
-    assert second_dispatch.dispatch_attempt == 2 and second_dispatch.recovery_dispatch is True
-    assert second_dispatch.dispatch_round == 1  # the original slot
-    assert second_dispatch.carried_rejection_reasons
-    assert any(record.role == "coder" for record in _records_1292(runner))
-    assert [cmd[:1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]  # reviewers ran
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "degraded"
+    notes = " ".join(record.coder_record_degradations)
+    assert "`item-99`" in notes and "`rcpt-not-in-catalog`" in notes
+    (body,) = _comment_bodies_2086(runner, "### Orchestrator degradation notes")
+    assert "`item-99`" in body and "`rcpt-not-in-catalog`" in body
+    # Dropped fields are not claims: the stored response no longer names them.
+    stored = json.loads(record.raw_structured_coder_response.split("\n", 1)[0])
+    assert stored["addressed_items"] == ["item-1"]
+    assert "test_observations" not in stored or stored["test_observations"] == []
+    assert "rcpt-not-in-catalog" not in (record.local_test_evidence or "")
+    # No legacy rejection record; the reviewer round ran on the pushed head.
+    assert _records_1292(runner, "coder-followup-rejected") == []
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
+    assert reviews and reviews[-1].state == "approved"
+    assert len(_coder_prompts_1292(runner)) == 1  # no second coder turn
+
+
+def test_post_push_outside_checkout_tests_run_is_dropped_and_review_runs(tmp_path):
+    """Row degrade-outside-checkout at the integration seam."""
+    runner = _rejected_push_runner_1292()
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    pushed = runner.pr_payload["headRefOid"]
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "degraded"
+    assert any("tests_run" in note for note in record.coder_record_degradations)
+    assert "https://live.example" not in record.raw_structured_coder_response
+    assert "https://live.example" not in (record.local_test_evidence or "")
+
+
+def test_post_push_unparseable_response_posts_a_git_synthesized_record_and_review_runs(tmp_path):
+    """Row synth-unparseable (issue #2065 acceptance 2)."""
+    runner = _rejected_push_runner_1292(coder_outputs=["I pushed a fix but forgot the format."])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    pushed = runner.pr_payload["headRefOid"]
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "synthesized"
+    assert record.raw_structured_coder_response is None or "coder_followup" not in record.raw_structured_coder_response
+    assert record.risk_test_matrix_evidence is None
+    (body,) = _comment_bodies_2086(runner, "## Orchestrator-synthesized coder record")
+    assert "`6367c48dd193d56ea7b0baad25b19455e529f5ee`" in body and f"`{pushed}`" in body
+    assert "**Diffstat:**" in body
+    assert "**Not claimed (every carried item stays open):** `item-1`" in body
+    assert "### Addressed items" not in body  # carries no coder claims
+    assert _records_1292(runner, "coder-followup-rejected") == []
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
+    assert reviews and reviews[-1].state == "approved"
+    assert len(_coder_prompts_1292(runner)) == 1
+
+
+def test_unchanged_head_rejection_posts_no_coder_record_and_surfaces_the_error(tmp_path):
+    """Row unchanged-head-rejection: today's behaviour."""
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[_unknown_id_and_citation_followup()], advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-99"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.pr_payload["headRefOid"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert _coder_records_2086(runner) == []
+    assert _comment_bodies_2086(runner, "Orchestrator degradation notes") == []
+    assert _comment_bodies_2086(runner, "Orchestrator-synthesized") == []
+
+
+def _stopping_turn_2086(monkeypatch, runner, error):
+    """A coder turn that pushes, then stops with ``error``."""
+    original = pr_loop._run_validated_agent
+
+    def turn(*args, **kwargs):
+        if kwargs.get("role") != "coder":
+            return original(*args, **kwargs)
+        runner.pr_payload["headRefOid"] = "e" * 40
+        raise error
+
+    monkeypatch.setattr(pr_loop, "_run_validated_agent", turn)
+    return original
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: __import__("coding_review_agent_loop.errors", fromlist=["x"]).QuotaResetExceededError("quota reset is too far away"),
+    lambda: __import__("coding_review_agent_loop.errors", fromlist=["x"]).HumanDecisionRequiredError("a human decision is required"),
+    lambda: KeyboardInterrupt(),
+], ids=["quota", "human-decision", "interrupt"])
+def test_stopping_error_after_push_posts_a_synthesized_record_and_reraises(tmp_path, monkeypatch, make_error):
+    """Row infra-error-after-push: posted best-effort, the error re-raises, and
+    the next run reviews the new head without a coder turn."""
+    error = make_error()
+    runner = _rejected_push_runner_1292(coder_outputs=[], reviews=[_blocking_review_1292(), _approving_review_1292()])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    original = _stopping_turn_2086(monkeypatch, runner, error)
+
+    with pytest.raises(type(error)):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    (record,) = _coder_records_2086(runner, "e" * 40)
+    assert record.coder_record_source == "synthesized"
+    assert type(error).__name__ in " ".join(record.coder_record_degradations)
+    assert [item.item_id for item in record.prior_items] == ["item-1"]
+    assert _records_1292(runner, "coder-followup-rejected") == []
+    assert not any(r.role == "reviewer" and r.subject == "e" * 40 for r in _records_1292(runner))
+
+    monkeypatch.setattr(pr_loop, "_run_validated_agent", original)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0  # never approval by failure
+    assert any(
+        r.role == "reviewer" and r.subject == "e" * 40 and r.state == "approved"
+        for r in _records_1292(runner)
+    )
+    assert _coder_prompts_1292(runner) == []  # resume reviewed the head, no coder rerun
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: __import__("coding_review_agent_loop.errors", fromlist=["x"]).CheckoutVerificationError(
+        "assigned checkout changed outside agent-loop"),
+    lambda: __import__("coding_review_agent_loop.pr_head_sync", fromlist=["x"]).PrHeadObservationError(
+        "PR-head verification failed"),
+], ids=["checkout-verification", "pr-head-observation"])
+def test_fail_closed_error_after_push_posts_no_record_and_surfaces_unchanged_2086(tmp_path, monkeypatch, make_error):
+    """#2086 item-7: a post-push fail-closed error (for example a repair or
+    re-ask launch refused by checkout verification) is never recovered."""
+    error = make_error()
+    runner = _rejected_push_runner_1292(coder_outputs=[], reviews=[_blocking_review_1292(), _approving_review_1292()])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    _stopping_turn_2086(monkeypatch, runner, error)
+    diffstats = []
+    real_diffstat = coder_followup_degradation.bounded_diffstat
+    monkeypatch.setattr(coder_followup_degradation, "bounded_diffstat",
+                        lambda *a, **k: diffstats.append(a) or real_diffstat(*a, **k))
+
+    with pytest.raises(type(error)) as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert raised.value is error
+    assert _coder_records_2086(runner) == []
+    assert _comment_bodies_2086(runner, "Orchestrator-synthesized") == []
+    assert _comment_bodies_2086(runner, "Orchestrator degradation notes") == []
+    assert diffstats == []  # nothing ran in the unverified checkout
+    assert not any(r.role == "reviewer" and r.subject == "e" * 40 for r in _records_1292(runner))
+
+
+def test_degraded_record_post_failure_surfaces_the_original_error(tmp_path, capsys):
+    """Row post-failure: no approval, no fabricated record, no review this run."""
+    runner = _rejected_push_runner_1292(coder_outputs=[_unknown_id_and_citation_followup()])
+    original = runner.run
+
+    def failing_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["gh", "pr", "comment"]:
+            body_path = Path(cmd[cmd.index("--body-file") + 1]) if "--body-file" in cmd else None
+            text = body_path.read_text(encoding="utf-8") if body_path else "\n".join(cmd)
+            if "Orchestrator degradation notes" in text:
+                raise AgentLoopError("GitHub write failed")
+        return original(cmd, *args, **kwargs)
+
+    runner.run = failing_run
+    config = make_config(tmp_path, coder="codex", reviewer="claude", quiet=False)
+
+    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs") as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert "GitHub write failed" in str(raised.value.__cause__)
+    assert "could not post the degraded coder record" in capsys.readouterr().err
+    pushed = runner.pr_payload["headRefOid"]
+    assert _coder_records_2086(runner, pushed) == []
+    assert _records_1292(runner, "coder-followup-rejected") == []
+    assert not any(r.role == "reviewer" and r.subject == pushed for r in _records_1292(runner))
 
 
 def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_unchanged(tmp_path):
@@ -738,7 +922,8 @@ def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_un
     assert resumed is None or resumed.rejected_coder_followup_reason is None
 
 
-def test_rejection_record_ledger_is_the_pre_dispatch_snapshot(tmp_path):
+def test_rejection_record_ledger_is_the_pre_dispatch_snapshot(tmp_path, monkeypatch):
+    _legacy_rejection_writer(monkeypatch)
     disputing = structured_coder_followup(
         summary="Disputed.", disputed_items=["item-1"], dispute_evidence={"item-1": "x"},
         tests_run=["pytest tests/test_foo.py https://live.example"], reviewer="OpenAI Codex",
@@ -772,7 +957,8 @@ def test_dispatch_record_failure_stops_before_the_coder_runs(tmp_path):
     assert _coder_prompts_1292(runner) == []
 
 
-def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_limit(tmp_path):
+def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_limit(tmp_path, monkeypatch):
+    _legacy_rejection_writer(monkeypatch)
     runner = _rejected_push_runner_1292(
         coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP, _VALID_FOLLOWUP],
         reviews=[_blocking_review_1292(), _approving_review_1292()],
@@ -1174,7 +1360,8 @@ def test_malformed_live_recovery_record_stops_before_any_agent_call_and_the_flag
     assert resumed is None or resumed.rejected_coder_followup_reason is None
 
 
-def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruption(tmp_path):
+def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruption(tmp_path, monkeypatch):
+    _legacy_rejection_writer(monkeypatch)
     """Rows recovery-rejected-no-push and rejection-superseded (the full chain)."""
     runner = _rejected_push_runner_1292(
         coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP],
@@ -1410,6 +1597,7 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
     tmp_path, monkeypatch
 ):
     """Row rejection-budget-preserved, through the real watcher on the final round."""
+    _legacy_rejection_writer(monkeypatch)
     failed_check = PullRequestCheck(
         name="final-ci/exact-head", kind="check_run", status="failure",
         url="https://github.com/OWNER/REPO/actions/runs/555",
@@ -1640,10 +1828,20 @@ def test_manual_push_after_completed_head_review_recovery_does_not_revive_pre_ha
     assert _agent_order_1292(runner)[:1] == ["codex"]
 
 
-@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable"])
+@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable", "claim-synthesized"])
 def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
     tmp_path, monkeypatch, mode
 ):
+    synthesized = mode == "claim-synthesized"  # #2086 item-6: the discarded map is dropped
+    if synthesized:
+        import coding_review_agent_loop.coder_comment_budget as budget
+
+        real_fits = budget.round_comment_fits
+        monkeypatch.setattr(
+            budget, "round_comment_fits",
+            lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+        )
+        mode = "claim"
     with_matrix = mode in {"claim", "gap-only"}
     if with_matrix:
         plan_context = _followup_matrix_context()
@@ -1680,7 +1878,7 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         "execution_refs": [current.execution_ref],
         "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
         "test_locations": ["tests/test_orchestrator_pr.py"],
-        "workflow_path_claim": "The real PR follow-up caller reached post-head derivation.",
+        "workflow_path_claim": "The real PR follow-up caller reached DISCARDED-CLAIM-2086 derivation.",
         "outcome_assertions": ["The selected managed observation passed."],
         "forbidden_effect_assertions": ["The PR handoff was retained."],
         "caveats": [],
@@ -1745,6 +1943,15 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         pr_loop_support, pr_loop, issue_implementation, issue_loop,
     ), "_read_assigned_workdir_head", lambda *_a, **_k: head)
 
+    carried_maps = []
+    real_review_context = pr_loop._coder_followup_review_context
+
+    def recording_review_context(text, metadata, **kwargs):
+        if text:
+            carried_maps.append(kwargs.get("coverage_map"))
+        return real_review_context(text, metadata, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "_coder_followup_review_context", recording_review_context)
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
 
     assert len(coder_calls) == 1, "the follow-up path never sends a coverage re-ask"
@@ -1759,10 +1966,23 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
     review_prompts = [
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]
     ]
-    if with_matrix:
+    if synthesized:
+        from coding_review_agent_loop.risk_coverage_map import extract_coverage_map_section
+
+        assert "## Orchestrator-synthesized coder record" in coder_comment
+        assert "Risk-matrix coverage map" not in coder_comment
+        assert "DISCARDED-CLAIM-2086" not in coder_comment
+        # The live reviewer prompt matches what a resume restores from the posted record.
+        assert extract_coverage_map_section(coder_comment, expected_revision=head) is None
+        assert carried_maps == [None], "the discarded response's map must not be carried"
+        assert "### Risk-matrix coverage map" not in review_prompts[-1]
+        assert f"complete at {head}" not in review_prompts[-1]
+        assert "DISCARDED-CLAIM-2086" not in review_prompts[-1]
+    elif with_matrix:
         assert "### Risk-matrix coverage map" in coder_comment
         assert f"complete at {head}" in coder_comment
         assert "Risk-matrix coverage map" in review_prompts[-1]
+        assert carried_maps and all(carried_maps)
         assert "after one coverage re-ask" not in coder_comment
     else:
         assert "Risk-matrix coverage map" not in coder_comment
@@ -3221,3 +3441,112 @@ def test_same_head_release_still_revalidates_against_its_baseline(tmp_path, monk
         pass
     assert seen and seen[0] == ("evidence-release", (True, ("hr-baseline",)))
     assert _records_1292(runner, "head-review-recovery") == []
+
+
+def test_disputed_response_forced_into_synthesis_carries_no_dispute_in_loop_or_resume(tmp_path, monkeypatch):
+    """#2086 item-2: the synthesized fallback rolls back the discarded dispute."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+    from coding_review_agent_loop.unresolved_items import _is_disputed_item
+
+    real_fits = budget.round_comment_fits
+    # Every ordinary bound level "overflows"; only the synthesized fallback fits.
+    monkeypatch.setattr(
+        budget, "round_comment_fits",
+        lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+    )
+    disputing = structured_coder_followup(
+        summary="Disputed.", disputed_items=["item-1"],
+        dispute_evidence={"item-1": "The reviewer read a stale diff."}, reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(coder_outputs=[disputing], reviews=[_blocking_review_1292()])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError):  # interrupted: no reviewer output after the coder record
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    pushed = runner.pr_payload["headRefOid"]
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "synthesized"
+    assert record.raw_structured_coder_response is None
+    assert not any(_is_disputed_item(item) for item in record.prior_items)
+
+    monkeypatch.setattr(budget, "round_comment_fits", real_fits)
+    runner.claude_outputs.append(_blocking_review_1292())  # the reviewer keeps the finding
+    runner.claude_outputs.append(_approving_review_1292())
+    runner.codex_outputs.append(_VALID_FOLLOWUP)
+    # A held dispute would stop for a human decision; the discarded one must not.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    for metadata in _records_1292(runner):
+        assert not any(_is_disputed_item(item) for item in metadata.prior_items)
+
+
+@pytest.mark.parametrize("synthesized", [False, True], ids=["posted-structured", "forced-synthesis"])
+def test_discarded_citation_never_grants_the_unchanged_head_allowance_2086(
+    tmp_path, monkeypatch, capsys, synthesized
+):
+    """#2086 item-4: cited progress counts only when the posted record keeps the citation."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+
+    if synthesized:
+        real_fits = budget.round_comment_fits
+        monkeypatch.setattr(
+            budget, "round_comment_fits",
+            lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
+        )
+    cited = _followup_1626([_citation_1626("pass-2")], summary="Re-ran the evidence command.")
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), cited],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(1),
+    )
+    err = capsys.readouterr().err
+    if not synthesized:  # control: the same citation grants the allowance when it is posted
+        assert outcome == 0, outcome
+        assert "granting one review round" in err
+        assert _reviews_run_1626(runner) == 3
+        return
+    assert isinstance(outcome, AgentLoopError)
+    assert "granting one review round" not in err
+    assert _reviews_run_1626(runner) == 2  # no extra review round on the unchanged head
+
+
+def test_discarded_fix_summary_never_reaches_the_next_coder_prompt_2086(tmp_path, monkeypatch):
+    """#2086 item-5: fix history is recorded only for the posted coder record."""
+    import coding_review_agent_loop.coder_comment_budget as budget
+
+    real_fits = budget.round_comment_fits
+    forced = {"on": True}
+    monkeypatch.setattr(
+        budget, "round_comment_fits",
+        lambda body: (not forced["on"] or "## Orchestrator-synthesized coder record" in str(body)) and real_fits(body),
+    )
+    discarded = structured_coder_followup(
+        summary="DISCARDED-SUMMARY-2086 rewrote the parser.", addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "DISCARDED-NOTE-2086 parser rewritten."},
+        reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[discarded, _VALID_FOLLOWUP],
+        reviews=[_blocking_review_1292(), structured_pr_review(
+            state="blocking", summary="Still needs a test.", reviewer="Anthropic Claude",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "No regression test exists yet."}],
+        ), _approving_review_1292()],
+    )
+    real_run = runner.run
+
+    def run(args, **kwargs):  # only the first coder record is forced into synthesis
+        if list(args)[:1] == ["claude"] and forced["on"] and _coder_prompts_1292(runner):
+            forced["on"] = False
+        return real_run(args, **kwargs)
+
+    runner.run = run
+    config = make_config(tmp_path, coder="codex", reviewer="claude", max_rounds=4)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompts = _coder_prompts_1292(runner)
+    assert len(prompts) == 2
+    assert "DISCARDED-SUMMARY-2086" not in prompts[1]
+    assert "DISCARDED-NOTE-2086" not in prompts[1]
+    (first,) = [r for r in _records_1292(runner) if r.role == "coder"][:1]
+    assert first.coder_record_source == "synthesized"

@@ -2252,6 +2252,7 @@ def test_run_pr_loop_falls_back_to_error_when_coder_followup_repair_also_fails(t
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, agent_max_retries=0)
 
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a coder record (#2086)
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value="still broken output"):
         with pytest.raises(AgentLoopError, match="Claude"):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -2274,6 +2275,7 @@ def test_run_pr_loop_skips_repair_when_coder_followup_repair_returns_none(tmp_pa
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, agent_max_retries=0)
 
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a coder record (#2086)
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="Claude"):
             run_pr_loop(runner, pr_number=77, config=config)
