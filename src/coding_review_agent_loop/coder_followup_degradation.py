@@ -663,7 +663,7 @@ class CoderFollowupRecovery:
                 self.runner, self.workdir, self.pre_turn_head, new_head
             ),
             "human_requirements_in_force": self.requirements_in_force,
-            "fallback_ledger": lambda items: rollback_discarded_annotations(items, self.ledger),
+            "fallback_ledger": self.discarded_response_ledger,
         }
 
     def adopt(self, bounded: object, metadata: object, output: str | None, items: Sequence[object]):
@@ -672,7 +672,33 @@ class CoderFollowupRecovery:
         adopted_metadata, adopted_output = adopt_bounded_coder_comment(bounded, metadata, output)
         if getattr(bounded, "coder_output", None) is None:
             return adopted_metadata, adopted_output, items
-        return adopted_metadata, adopted_output, rollback_discarded_annotations(items, self.ledger)
+        return adopted_metadata, adopted_output, self.discarded_response_ledger(items)
+
+    def discarded_response_ledger(self, items: Sequence[object]) -> list:
+        """The ledger once a response is discarded for a claim-free fallback (#2086).
+
+        Every ledger change the discarded response's claims caused is undone,
+        keeping unrelated changes: its coder-claim notes are removed, and while
+        signed requirements are in force the acknowledgement obligation it may
+        have cleared is open again (the pre-turn item when one existed).
+        """
+        rolled = rollback_discarded_annotations(items, self.ledger)
+        if not self.requirements_in_force:
+            return rolled
+        from .unresolved_items import (
+            HUMAN_REQUIREMENTS_DEGRADED_ACK_TEXT,
+            _upsert_human_requirements_ack_item,
+        )
+
+        prior = next(
+            (item for item in self.ledger if getattr(item, "item_id", None) == HUMAN_REQUIREMENTS_ACK_ITEM_ID),
+            None,
+        )
+        if prior is not None:
+            return [item for item in rolled if item.item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID] + [prior]
+        return _upsert_human_requirements_ack_item(
+            rolled, source_round=max(self.record_round - 1, 1), text=HUMAN_REQUIREMENTS_DEGRADED_ACK_TEXT,
+        )
 
     def post(self, publish: Callable[[], object]) -> object:
         """Post the coder record; a failed degraded post surfaces the original error."""
