@@ -22,17 +22,18 @@ def _latest_pr_approved_reviews_for_head(
     reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
     require_architecture_contract: bool = False,
 ) -> dict[str, PostedRoundRecord]:
-    from .round_state import _extract_round_metadata_records, superseded_review_indexes
+    from .round_state import _extract_round_metadata_records, closed_round_review_indexes
 
     if not head_sha:
         return {}
     configured_names = {agent_display_name(agent) for agent in configured_reviewers}
     latest_by_reviewer = {}
     records = _extract_round_metadata_records(comments, flow="pr")
-    # A review closed by a signed-input supersession record is history only
-    # (#2054): it never carries approval, whatever the live signed set is, and
-    # it hides that reviewer's earlier same-head reviews too.
-    superseded = superseded_review_indexes(records)
+    # A review of a round closed by a closed-incomplete record (#2064) or a
+    # legacy signed-input supersession record (#2054) is history only: it
+    # never carries approval, and it hides that reviewer's earlier same-head
+    # reviews too.
+    superseded = closed_round_review_indexes(records)
     for record in reversed(records):
         metadata = record.metadata
         if (

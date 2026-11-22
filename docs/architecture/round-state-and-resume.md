@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/round_closure.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 `round_metadata.py` owns round value types, semantic validation, field codecs,
 diagnostic transport and recovery, board stamp contexts, attach/strip helpers,
@@ -218,6 +218,43 @@ new findings, and partial-round recovery lists no deletion target for the
 round. The rollover consumes one round of the budget: with none left the
 ordinary round-limit stop fires and nothing is posted. Managed-CI
 authorization and qualification records are untouched.
+
+A tool-owned `round-closed-incomplete` Orchestrator summary (#2064,
+`round_closure.py`) closes a PR or plan round in which some reviews were
+published but some reviewer's outcome cannot be replayed. Its strictly
+decoded `round_closure` payload binds flow, round and subject and lists the
+published reviewers (with comment IDs), the unreplayable reviewers (with a
+cause), the round's published exact-head evidence requests as obligations with
+a reserved item number, and the item-number high-water mark; the round's
+ledger uses the ordinary `prior_items` and `new_items` fields. A malformed or
+mis-bound payload, or a reserved obligation number that names a different
+item of the record's own ledger, never closes a round; such a closure-phase
+summary also never counts as a reconciliation, so the round stays open for
+ordinary settlement. Only records admitted by the unchanged author
+authentication are read. `is_round_closure_boundary` is the
+one closure predicate: the new record on either flow, or a legacy PR
+`signed-input-supersession` record, which keeps closing rounds for one release
+window. On the PR flow the record closes round N like a reconciliation with no
+completed reviews; its reviewer records are inert for resume, panel evidence,
+scheduler history and approval carry (`closed_round_review_indexes`), a later
+scheduler checkpoint in the round is inert, and the closed-round rollover
+settles the ledger with no dispositions (prior items stay open), appends the
+record's new items and restores its evidence obligations at their reserved
+numbers, so a restart from the record alone rebuilds the same ledger. An
+unrecorded head advance after a closure recovers the same ledger from the
+record rather than from the round's coder record; a validated closure is a
+coherent handoff even when its ledger is empty, so such a push resumes as an
+ordinary fresh review instead of refusing. On the
+plan flow `plan_round_closure.py` treats the record as settling its round:
+`project_plan_history` drops the round's plan reviews from every projected
+reader (resume, panel evidence, carried approvals, visibility) and
+`select_plan_round_anchor` anchors the ledger at the record; plan approval
+carry still lets a closed plan review supersede that reviewer's earlier
+approval with a non-qualifying entry, exactly as the PR approval reader does
+(its live callers pass raw history, which carry projects itself),
+so resume rolls
+over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
+history and never approve. In this stage nothing writes the record yet.
 It reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
 round and history-wide numbering into a fresh review on the new head without

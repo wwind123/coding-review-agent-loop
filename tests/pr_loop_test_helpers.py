@@ -483,3 +483,67 @@ def _init_followup_checkout(workdir):
     git("add", "-A")
     git("commit", "-q", "-m", "followup head")
     return git("rev-parse", "HEAD")
+
+
+# ---------------------------------------------------------------------------
+# closed-round boundaries on resume (#2054, #2064)
+# ---------------------------------------------------------------------------
+
+_CLOSURE_HEAD = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+
+
+class _InterruptedAfterReviews(Exception):
+    pass
+
+
+def _published_round_one_without_reconciliation(tmp_path, monkeypatch):
+    """Round 1: Codex and Gemini both approve the head, then the run stops
+    before reconciliation.  Returns ``(runner, config)``."""
+    import pytest
+
+    import coding_review_agent_loop.pr_loop as pr_loop
+    from coding_review_agent_loop.cli import run_pr_loop
+    from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review()],
+        gemini_outputs=[structured_pr_review(reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real = pr_loop.post_pr_comment
+
+    def post(*args, **kwargs):
+        real(*args, **kwargs)
+        if len([r for r in _pr_records(runner) if r.metadata.role == "reviewer"]) == 2:
+            raise _InterruptedAfterReviews()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pr_loop, "post_pr_comment", post)
+        with pytest.raises(_InterruptedAfterReviews):
+            run_pr_loop(runner, pr_number=77, config=config)
+    reviews = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    assert sorted((r.metadata.agent, r.metadata.state) for r in reviews) == [
+        ("Codex", "approved"), ("Gemini", "approved")]
+    assert all(r.metadata.round_number == 1 and r.metadata.subject == _CLOSURE_HEAD for r in reviews)
+    assert not [r for r in _pr_records(runner) if r.metadata.phase == "reconciliation"]
+    return runner, config
+
+
+def _append_orchestrator_record(runner, body):
+    """Append a record authored like the invocation actor's own comments."""
+    template = next(
+        comment for comment in runner.pr_payload["comments"]
+        if "AGENT_LOOP_META" in comment.get("body", "")
+    )
+    comments = runner.pr_payload["comments"]
+    comments.append(
+        dict({key: value for key, value in template.items() if key not in {"id", "databaseId", "url"}},
+             body=body, createdAt=f"2026-11-22T00:00:{len(comments):02d}Z")
+    )
+
+
+def _round_two_reviews(runner):
+    return [
+        record for record in _pr_records(runner)
+        if record.metadata.role == "reviewer" and record.metadata.round_number == 2
+    ]

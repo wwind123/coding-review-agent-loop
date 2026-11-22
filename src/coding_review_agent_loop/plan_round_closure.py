@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from .round_closure import closed_round_reviewer_indexes, is_round_closed_incomplete
+
 if TYPE_CHECKING:
     from .round_metadata import (
         PostedRoundRecord,
@@ -27,12 +29,17 @@ def _plan_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     The reconciliation record carries `phase="reconciliation"`.  A legacy
     summary record written before the phase labels existed carries the default
     `authoritative` phase and still counts, so historical rounds resume exactly
-    as they did before staged planning existed.
+    as they did before staged planning existed.  A trusted plan-flow
+    closed-incomplete record (#2064) settles its round too: it carries the
+    round's ledger, and the round's plan reviews are inert history.
     """
     return any(
         record.metadata.flow == "plan"
-        and record.metadata.role == "summary"
-        and record.metadata.phase in {"reconciliation", "authoritative"}
+        and (
+            (record.metadata.role == "summary"
+             and record.metadata.phase in {"reconciliation", "authoritative"})
+            or is_round_closed_incomplete(record.metadata)
+        )
         for record in records
     )
 
@@ -42,9 +49,15 @@ def plan_round_key(record: PostedRoundRecord) -> tuple[str, int]:
 
 
 def project_plan_history(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
-    """Drop only idle planning checkpoints after settlement, keeping used openings."""
+    """Drop idle planning checkpoints after settlement, keeping used openings.
+
+    Plan reviews of a round closed by a closed-incomplete record (#2064) are
+    dropped as well, so no projected reader (resume, panel evidence, carried
+    approvals, visibility) admits them as resumed, visible-peer or approving
+    reviews.  Raw records stay available for lineage readers.
+    """
     closed: set[tuple[str, int]] = set()
-    idle: set[int] = set()
+    idle: set[int] = set(closed_round_reviewer_indexes(records, flow="plan"))
     ordered = sorted(records, key=lambda record: record.index)
     for position, record in enumerate(ordered):
         metadata = record.metadata

@@ -249,7 +249,13 @@ def _select_current_round_records(
     )
 
 
-from .signed_input_record import is_supersession_boundary
+from .round_closure import (
+    closed_round_reviewer_indexes,
+    closure_item_number_high_water,
+    is_round_closure_boundary,
+    is_unvalidated_closure_summary,
+    restore_closure_evidence_obligations,
+)
 from .plan_round_closure import (
     _plan_round_is_reconciled,
     project_plan_history,
@@ -301,7 +307,7 @@ def inert_post_reconciliation_checkpoint_indexes(
         metadata = record.metadata
         key = (metadata.round_number, metadata.subject)
         if (metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata)) \
-                or is_supersession_boundary(metadata):
+                or is_round_closure_boundary(metadata):
             closed.add(key)
         elif metadata.phase in _PR_ROUND_REOPENING_PHASES:
             closed.discard(key)
@@ -320,36 +326,22 @@ def _is_inert_post_reconciliation_checkpoint(
     return record.index in inert_indexes
 
 
-def superseded_review_indexes(
+def closed_round_review_indexes(
     records: Sequence[round_metadata.PostedRoundRecord],
 ) -> frozenset[int]:
-    """Indexes of PR reviewer records closed by a later supersession record (#2054).
+    """Indexes of PR reviewer records closed by a later closure boundary (#2054, #2064).
 
-    A signed-input supersession record closes its round at its head: every
-    reviewer record of that round and head published before it is history
-    only: readers that drop inert records (resume, panel evidence and
-    scheduler history) never see it.  Approval carry already rejects it,
-    because it does not cover the grown signed set.
+    A closed-incomplete record, or a legacy signed-input supersession record,
+    closes its round at its subject: every reviewer record of that round and
+    subject published before it is history only.  Readers that drop inert
+    records (resume, panel evidence and scheduler history) never see it, and
+    approval carry rejects it explicitly.
     """
-    boundaries = [
-        (record.index, record.metadata.round_number, record.metadata.subject)
-        for record in records
-        if is_supersession_boundary(record.metadata)
-    ]
-    if not boundaries:
-        return frozenset()
-    return frozenset(
-        record.index
-        for record in records
-        if record.metadata.flow == "pr"
-        and record.metadata.role == "reviewer"
-        and any(
-            record.index < index
-            and record.metadata.round_number == round_number
-            and record.metadata.subject == subject
-            for index, round_number, subject in boundaries
-        )
-    )
+    return closed_round_reviewer_indexes(records, flow="pr")
+
+
+# Pre-#2064 name, kept for existing callers.
+superseded_review_indexes = closed_round_review_indexes
 
 
 def drop_inert_post_reconciliation_checkpoints(
@@ -357,10 +349,10 @@ def drop_inert_post_reconciliation_checkpoints(
 ) -> tuple[round_metadata.PostedRoundRecord, ...]:
     """``records`` without the inert post-reconciliation checkpoints (#1553).
 
-    Reviews superseded by a signed-input supersession record (#2054) are
+    Reviews of a round closed by a closure boundary (#2054, #2064) are
     dropped as well: they are history only for every authority reader.
     """
-    inert = inert_post_reconciliation_checkpoint_indexes(records) | superseded_review_indexes(records)
+    inert = inert_post_reconciliation_checkpoint_indexes(records) | closed_round_review_indexes(records)
     if not inert:
         return tuple(records)
     return tuple(
@@ -438,12 +430,15 @@ def _pr_round_is_reconciled(records: Sequence[round_metadata.PostedRoundRecord])
 
     The scheduler-prelaunch summary the PR loop posts before review (also the
     secondary-audit panel opening) is a pre-reviewer checkpoint, exactly as it
-    is for plans (#905); legacy unlabeled summaries still count.
+    is for plans (#905); legacy unlabeled summaries still count.  A summary in
+    a closure phase settles the round only when it validates as a closure
+    boundary (#2064): a malformed one leaves the round open.
     """
     return any(
         record.metadata.role == "summary"
         and not scope_present(record.metadata)
         and record.metadata.phase not in PR_PRE_RECONCILIATION_PHASES
+        and not is_unvalidated_closure_summary(record.metadata)
         for record in records
     )
 
@@ -452,6 +447,8 @@ def _max_unresolved_item_number_from_records(records: Sequence[round_metadata.Po
     max_number = 0
     for record in records:
         max_number = max(max_number, record.original_item_number_high_water)
+        # A closed-incomplete record reserves its evidence obligations' numbers (#2064).
+        max_number = max(max_number, closure_item_number_high_water(record.metadata))
         for item in (*record.metadata.prior_items, *record.metadata.new_items):
             for item_id in (item.item_id, *item.alias_item_ids):
                 if match := re.fullmatch(r"item-(\d+)", item_id):
@@ -1441,7 +1438,32 @@ def _recover_unrecorded_pr_head_advance(
         if record.metadata.role in {"reviewer", "summary"}
     )
 
-    if latest_coder_record is not None and not reviewer_records_after_coder:
+    # A closure boundary after the round's coder record owns the ledger (#2064):
+    # its reviews are inert, so recover from the record's prior and new items
+    # and restore its reserved evidence obligations.
+    closure_record = next((
+        record for record in reversed(current_round_records)
+        if is_round_closure_boundary(record.metadata)
+        and (latest_coder_record is None or record.index > latest_coder_record.index)
+    ), None)
+    if closure_record is not None:
+        round_number = closure_record.metadata.round_number
+        recovered_items = _active_pr_items(closure_record.metadata.prior_items)
+        _append_active_pr_new_items(recovered_items, (closure_record,))
+        recovered_items, _ = restore_closure_evidence_obligations(
+            recovered_items, closure_record.metadata,
+            next_item_number=_max_unresolved_item_number_from_records(records) + 1,
+        )
+        recovered_items = list(recovered_items)
+        coder_output = (
+            latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body
+            if latest_coder_record is not None else None
+        )
+        compact_prior_summaries = (
+            latest_coder_record.metadata.compact_prior_summaries
+            if latest_coder_record is not None else ()
+        )
+    elif latest_coder_record is not None and not reviewer_records_after_coder:
         round_number = latest_coder_record.metadata.round_number
         recovered_items = _active_pr_items(latest_coder_record.metadata.prior_items)
         coder_output = latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body
@@ -1555,7 +1577,10 @@ def _latest_prior_pr_subject_is_coherent(
         return False
     if any(
         (record.metadata.role == "coder" or is_complete_code_review(record.metadata)
-         or _is_acknowledgement_failure_boundary(record.metadata))
+         or _is_acknowledgement_failure_boundary(record.metadata)
+         # A validated closure boundary is a complete handoff even with an
+         # empty ledger: its reviews are inert, never the coherence proof (#2064).
+         or is_round_closure_boundary(record.metadata))
         and not scope_present(record.metadata)
         for record in selection.current_round_records
     ):
@@ -2291,8 +2316,8 @@ def _resume_pr_round_from_records(
             and metadata.subject == head_sha
             and record.index > reopened_below
         ) or (
-            # A signed-input supersession record closes the round (#2054).
-            is_supersession_boundary(metadata)
+            # A closure boundary closes the round (#2054, #2064).
+            is_round_closure_boundary(metadata)
             and metadata.round_number == anchor_metadata.round_number
             and metadata.subject == head_sha
             and record.index > reopened_below

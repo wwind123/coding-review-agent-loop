@@ -2328,3 +2328,59 @@ def test_2035_managed_qualification_checkpoint_survives_classification_resume(tm
     # Parallel publications post in completion order; the settlement follows them.
     assert sorted(reviewers[:2]) == [("Codex", "publication", "approved"), ("Gemini", "publication", "approved")]
     assert reviewers[2:] == [("Codex", "authoritative", "approved")]
+
+
+# --- legacy signed-input supersession records keep closing rounds (#2064) ------
+
+
+def test_2064_legacy_signed_input_supersession_record_still_resumes_into_next_round(
+    tmp_path, monkeypatch
+):
+    """Row legacy-supersession-resume: an old record closes round 1 for one release
+    window; the run opens round 2 without stopping, deleting or writing a new record."""
+    from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
+    from coding_review_agent_loop.signed_input_record import (
+        SIGNED_INPUT_SUPERSESSION_PHASE, decode_supersession_payload,
+    )
+    from agent_loop_helpers import structured_pr_review
+    from pr_loop_test_helpers import (
+        _CLOSURE_HEAD, _append_orchestrator_record, _pr_records,
+        _published_round_one_without_reconciliation, _round_two_reviews,
+    )
+
+    runner, config = _published_round_one_without_reconciliation(tmp_path, monkeypatch)
+    old, added = "hr-" + "a" * 64, "hr-" + "b" * 64
+    payload = decode_supersession_payload({
+        "round": 1, "head": _CLOSURE_HEAD,
+        "superseded": [{"agent": "Codex", "comment_id": None, "route": "edit-history"},
+                       {"agent": "Gemini", "comment_id": None, "route": "edit-history"}],
+        "previous_requirement_ids": [old], "requirement_ids": [old, added],
+        "item_number_high_water": 0,
+    }, round_number=1, subject=_CLOSURE_HEAD)
+    assert payload is not None
+    _append_orchestrator_record(runner, _attach_round_metadata(
+        "Review round 1 is superseded by new signed input.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1,
+            subject=_CLOSURE_HEAD, prior_items=(), phase=SIGNED_INPUT_SUPERSESSION_PHASE,
+            signed_input_supersession=payload,
+        ),
+    ))
+    boundary_index = len(runner.pr_payload["comments"]) - 1
+    kept = [comment["body"] for comment in runner.pr_payload["comments"]]
+    runner.codex_outputs.append(structured_pr_review())
+    runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    records = _pr_records(runner)
+    later = [record for record in records if record.index > boundary_index]
+    assert later and all(record.metadata.round_number >= 2 for record in later)
+    assert sorted(r.metadata.agent for r in _round_two_reviews(runner)) == ["Codex", "Gemini"]
+    # Read-only legacy window: no new supersession or closure record is written.
+    assert [r.index for r in records if r.metadata.phase == SIGNED_INPUT_SUPERSESSION_PHASE] == [boundary_index]
+    assert not [r for r in records if r.metadata.phase == ROUND_CLOSED_INCOMPLETE_PHASE]
+    # Nothing was deleted and no deletion was requested.
+    assert [c["body"] for c in runner.pr_payload["comments"][: len(kept)]] == kept
+    assert not any(cmd[:2] == ["gh", "api"] and "DELETE" in cmd for cmd, _ in runner.commands)
+    assert not any("Delete these" in comment for comment in runner.comments)
