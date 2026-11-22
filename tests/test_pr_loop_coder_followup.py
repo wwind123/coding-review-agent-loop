@@ -51,6 +51,7 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_pr_review,
 )
+import coding_review_agent_loop.coder_followup_degradation as coder_followup_degradation
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.execution_policy as execution_policy
 import coding_review_agent_loop.issue_implementation as issue_implementation
@@ -839,6 +840,35 @@ def test_stopping_error_after_push_posts_a_synthesized_record_and_reraises(tmp_p
         for r in _records_1292(runner)
     )
     assert _coder_prompts_1292(runner) == []  # resume reviewed the head, no coder rerun
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: __import__("coding_review_agent_loop.errors", fromlist=["x"]).CheckoutVerificationError(
+        "assigned checkout changed outside agent-loop"),
+    lambda: __import__("coding_review_agent_loop.pr_head_sync", fromlist=["x"]).PrHeadObservationError(
+        "PR-head verification failed"),
+], ids=["checkout-verification", "pr-head-observation"])
+def test_fail_closed_error_after_push_posts_no_record_and_surfaces_unchanged_2086(tmp_path, monkeypatch, make_error):
+    """#2086 item-7: a post-push fail-closed error (for example a repair or
+    re-ask launch refused by checkout verification) is never recovered."""
+    error = make_error()
+    runner = _rejected_push_runner_1292(coder_outputs=[], reviews=[_blocking_review_1292(), _approving_review_1292()])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    _stopping_turn_2086(monkeypatch, runner, error)
+    diffstats = []
+    real_diffstat = coder_followup_degradation.bounded_diffstat
+    monkeypatch.setattr(coder_followup_degradation, "bounded_diffstat",
+                        lambda *a, **k: diffstats.append(a) or real_diffstat(*a, **k))
+
+    with pytest.raises(type(error)) as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert raised.value is error
+    assert _coder_records_2086(runner) == []
+    assert _comment_bodies_2086(runner, "Orchestrator-synthesized") == []
+    assert _comment_bodies_2086(runner, "Orchestrator degradation notes") == []
+    assert diffstats == []  # nothing ran in the unverified checkout
+    assert not any(r.role == "reviewer" and r.subject == "e" * 40 for r in _records_1292(runner))
 
 
 def test_degraded_record_post_failure_surfaces_the_original_error(tmp_path, capsys):

@@ -34,6 +34,7 @@ from .architecture_contract import _with_validation_context
 from .errors import (
     TESTS_RUN_WORKDIR_REASON,
     AgentLoopError,
+    CheckoutVerificationError,
     HumanDecisionRequiredError,
     NonRepairableEvidenceRejection,
     QuotaResetExceededError,
@@ -551,9 +552,12 @@ class CoderFollowupRecovery:
         """Run the coder turn; turn a post-push rejection into a coder record."""
         from .pr_head_sync import PrHeadObservationError
 
+        # Fail-closed errors mean the head or the checkout cannot be trusted:
+        # they surface untouched, with no record, diffstat or review (#2086).
+        fail_closed = (PrHeadObservationError, CheckoutVerificationError)
         try:
             return invoke()
-        except PrHeadObservationError:
+        except fail_closed:
             raise
         except (QuotaResetExceededError, HumanDecisionRequiredError, KeyboardInterrupt) as error:
             self._post_synthesized_best_effort(error)
