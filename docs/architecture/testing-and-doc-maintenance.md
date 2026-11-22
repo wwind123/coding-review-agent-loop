@@ -121,7 +121,8 @@ No second model reformats a rejected response. A deterministic validation
 failure of any structured response goes back to the agent that produced it:
 the same agent, the model that produced the response (a Claude, Codex or Gemini
 response whose observed model differs from the configured one is re-asked on
-the observed model, a named seat is re-issued with that model first, and an
+the observed model for every later re-ask of the turn, replacing a `--model`
+passthrough argument; a named seat is re-issued with that model first, and an
 Antigravity chain is not advanced), and the response's own session when there is one (otherwise
 the full original prompt). The re-ask prompt is the original prompt plus a
 bounded, marker-free copy of the validator message

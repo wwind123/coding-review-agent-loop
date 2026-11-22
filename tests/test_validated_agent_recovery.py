@@ -2770,6 +2770,54 @@ def test_reask_is_pinned_to_the_model_that_produced_the_response(tmp_path, backe
             assert args[args.index("--model") + 1] == "model-b"
 
 
+@pytest.mark.parametrize("backend", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize(
+    "model_args", [("--model", "model-a"), ("--model=model-a",)], ids=["separate", "equals"]
+)
+def test_reask_pin_replaces_a_passthrough_model_argument(tmp_path, backend, model_args):
+    """Review item-3: a model given through agent arguments is replaced by the pin, twice."""
+    from coding_review_agent_loop.agents.codex import _codex_model_args
+    from coding_review_agent_loop.config import configured_model_for
+
+    valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
+    args_field = f"{backend}_args"
+    config = make_config(
+        tmp_path, agent_max_retries=0, **{args_field: ("--verbose", *model_args, "--keep")}
+    )
+    assert configured_model_for(config, backend, role="reviewer") is None
+    results = [
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model=None, observed_model="model-b"),
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+        AgentResult(text=valid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent=backend, config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.marker_value.summary == "Looks good."
+    configs = [call.kwargs["config"] for call in invoke.call_args_list]
+    assert len(configs) == 3
+    assert getattr(configs[0], args_field) == ("--verbose", *model_args, "--keep")
+    for reask in configs[1:]:
+        # The passthrough model is gone, unrelated arguments are kept, and the
+        # invocation requests the producer model.
+        assert getattr(reask, args_field) == ("--verbose", "--keep")
+        assert configured_model_for(reask, backend, role="reviewer") == "model-b"
+        if backend == "codex":
+            args = _codex_model_args(reask, role="reviewer")
+            assert args[args.index("--model") + 1] == "model-b"
+        if backend == "gemini":
+            assert reask.gemini_model == "model-b"
+
+
 def test_named_seat_reasks_stay_on_the_producer_model(tmp_path):
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 

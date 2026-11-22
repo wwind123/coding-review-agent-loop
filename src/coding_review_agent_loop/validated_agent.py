@@ -258,6 +258,24 @@ _MODEL_FIELDS_BY_BACKEND = {
     "codex": ("codex_model", "reviewer_codex_model"),
     "gemini": ("gemini_model",),
 }
+_ARGS_FIELD_BY_BACKEND = {"claude": "claude_args", "codex": "codex_args", "gemini": "gemini_args"}
+
+
+def _without_model_args(args: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop ``--model VALUE`` and ``--model=VALUE`` from passthrough arguments."""
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == "--model":
+            skip_value = True
+            continue
+        if arg.startswith("--model="):
+            continue
+        kept.append(arg)
+    return tuple(kept)
 
 
 def _pin_producer_model(
@@ -268,8 +286,9 @@ def _pin_producer_model(
     Antigravity keeps its chain position across re-asks, so it needs no pin.
     A named seat carries its own model chain, so the seat is re-issued with
     the producer model first; a plain provider gets its model fields pinned.
-    A configuration that refuses the pin (for example a model passed through
-    agent arguments) keeps the configured model.
+    A model passed through the provider's agent arguments (``--model VALUE``
+    or ``--model=VALUE``) is replaced by the pin, keeping every unrelated
+    argument, so the pin is never silently abandoned.
     """
     from .reviewer_seats import SeatAgent
 
@@ -282,13 +301,10 @@ def _pin_producer_model(
         pinned.effort = agent.effort
         pinned.workdir = agent.workdir
         return pinned, config
-    try:
-        return agent, dataclasses_replace(
-            config, **{field: model for field in _MODEL_FIELDS_BY_BACKEND[backend]}
-        )
-    except AgentLoopError as exc:
-        log(config, f"re-ask could not pin producer model {model!r} ({exc}); using the configured model")
-        return agent, config
+    args_field = _ARGS_FIELD_BY_BACKEND[backend]
+    updates: dict[str, object] = {field: model for field in _MODEL_FIELDS_BY_BACKEND[backend]}
+    updates[args_field] = _without_model_args(getattr(config, args_field))
+    return agent, dataclasses_replace(config, **updates)
 
 
 def _read_reask_head(runner: Runner, config: AgentLoopConfig) -> GitProbeResult:
