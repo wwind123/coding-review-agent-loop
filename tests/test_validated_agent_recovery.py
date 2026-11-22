@@ -2738,15 +2738,19 @@ def test_envelope_normalized_non_array_observations_are_reasked_then_degraded(tm
 
 @pytest.mark.parametrize("backend", ["claude", "codex"])
 def test_reask_is_pinned_to_the_model_that_produced_the_response(tmp_path, backend):
-    """Review item-3: a response from model B under configured A is re-asked on B."""
+    """Review item-3: a response from model B under configured A is re-asked on B, twice."""
     from coding_review_agent_loop.agents.codex import _codex_model_args
 
     valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
     model_field = f"{backend}_model"
     config = make_config(tmp_path, agent_max_retries=0, **{model_field: "model-a"})
     results = [
-        AgentResult(text=_drop_field(valid, "summary"), returncode=0, session_id="s",
+        AgentResult(text=invalid, returncode=0, session_id="s",
                     configured_model="model-a", observed_model="model-b"),
+        # The pinned re-ask now reports B as configured: the pin must hold.
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="model-b", observed_model="model-b"),
         AgentResult(text=valid, returncode=0, session_id="s",
                     configured_model="model-b", observed_model="model-b"),
     ]
@@ -2758,12 +2762,39 @@ def test_reask_is_pinned_to_the_model_that_produced_the_response(tmp_path, backe
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
         )
-    first, reask = (call.kwargs["config"] for call in invoke.call_args_list)
-    assert getattr(first, model_field) == "model-a"
-    assert getattr(reask, model_field) == "model-b"
+    configs = [call.kwargs["config"] for call in invoke.call_args_list]
+    assert [getattr(c, model_field) for c in configs] == ["model-a", "model-b", "model-b"]
     if backend == "codex":
-        args = _codex_model_args(reask, role="reviewer")
-        assert args[args.index("--model") + 1] == "model-b"
+        for reask in configs[1:]:
+            args = _codex_model_args(reask, role="reviewer")
+            assert args[args.index("--model") + 1] == "model-b"
+
+
+def test_named_seat_reasks_stay_on_the_producer_model(tmp_path):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    seat = SeatAgent(ReviewerSeat("panel-a", "codex", ("seat-a", "seat-b")), tmp_path)
+    valid = structured_pr_review(summary="Looks good.")
+    invalid = _drop_field(valid, "summary")
+    results = [
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="seat-a", observed_model="seat-b"),
+        AgentResult(text=invalid, returncode=0, session_id="s",
+                    configured_model="seat-b", observed_model="seat-b"),
+        AgentResult(text=valid, returncode=0, session_id="s",
+                    configured_model="seat-b", observed_model="seat-b"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        _run_validated_agent(
+            FakeRunner(), agent=seat, config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    agents = [call.kwargs["agent"] for call in invoke.call_args_list]
+    assert [a.model_chain[0] for a in agents] == ["seat-a", "seat-b", "seat-b"]
+    assert all(str(a) == "panel-a" for a in agents)
 
 
 def test_reask_pin_keeps_the_configured_model_when_the_producer_matches(tmp_path):

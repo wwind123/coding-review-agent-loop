@@ -1171,6 +1171,11 @@ def _run_validated_agent_in_scope(
     pending_reask: _PendingReask | None = None
     reask_budget_exhausted = False
     reask_skip_detail: str | None = None
+    # The model that produced the turn's responses once it diverged from the
+    # configuration: kept for every later re-ask of the turn, so a pinned
+    # re-ask whose result now reports the pinned model as configured is not
+    # sent back to the configured model (#2066).
+    turn_producer_model: str | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
             config.claude_cmd,
@@ -1292,6 +1297,7 @@ def _run_validated_agent_in_scope(
         session when there is one and otherwise resends the full prompt.
         """
         nonlocal reasks_used, pending_reask, reask_budget_exhausted, reask_skip_detail
+        nonlocal turn_producer_model
         if reasks_used >= MAX_SAME_AGENT_REASKS:
             reask_budget_exhausted = True
             return False
@@ -1307,6 +1313,12 @@ def _run_validated_agent_in_scope(
                 return False
             head_before = probe.value
         reasks_used += 1
+        observed_producer = result.observed_model or turn_producer_model
+        if observed_producer and (
+            turn_producer_model is not None
+            or observed_producer != result.configured_model
+        ):
+            turn_producer_model = observed_producer
         reask_session = result.session_id or session_id
         pending_reask = _PendingReask(
             number=reasks_used,
@@ -1321,12 +1333,7 @@ def _run_validated_agent_in_scope(
             session_id=reask_session,
             fresh_evidence=fresh_evidence,
             head_before=head_before,
-            producer_model=(
-                result.observed_model
-                if result.observed_model
-                and result.observed_model != result.configured_model
-                else None
-            ),
+            producer_model=turn_producer_model,
         )
         log(
             config,
