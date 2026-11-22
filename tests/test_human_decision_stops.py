@@ -983,3 +983,194 @@ def test_qualification_board_check_keeps_a_misplaced_amendment_stop_at_exit_4(mo
 
     monkeypatch.setattr(cli, "run_pr_loop", raise_cli)
     assert cli.main(["pr", "12", "--repo", "owner/repo"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# Fallback handlers must not transport a stop's text (#2069, items 7-9)
+# ---------------------------------------------------------------------------
+
+# Handlers that turn a caught error into a fallback result and that the
+# resolved call graph can reach a stop through.  Each stays as it was for a
+# stated reason and is tracked as follow-up; a new entry needs a new reason.
+KNOWN_TRANSPORT_FALLBACKS = {
+    "discuss_loop:_run_discuss_analyzer": "discuss analyzer turn failure keeps its degraded outcome",
+    "discuss_loop:_run_discuss_final_analyzer": "discuss final analyzer turn failure keeps its degraded outcome",
+    "discuss_loop:_run_discuss_evidence_reconciler": "discuss evidence reconciler turn failure policy",
+    "discuss_loop:_debater_worker": "discuss debater failure policy records the failed seat",
+    "discuss_loop:_run_discuss_loop": "discuss debater failure policy records the failed seat",
+    "plan_first_loop:_plan_reviewer_worker": "plan reviewer turn failure is recorded per seat",
+    "pr_loop:_pr_reviewer_worker": "PR reviewer turn failure is recorded per seat",
+    "review_images_coverage_run:gate": "visual coverage turn degrades to unavailable evidence",
+    "triage:run_issue_triage": "advisory triage turn",
+    "execution_policy:_print_dry_run_execution_preview": "dry-run topology preview text (review item-6, deferred)",
+    "managed_ci:_activate_v2_managed_ci": "managed-CI source authority falls back to ordinary recovery",
+}
+
+
+def _resolved_stop_graph(index: _Index):
+    defs = {
+        module: {
+            node.name: node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for module, tree in index.trees.items()
+    }
+
+    def resolve(module, func):
+        if isinstance(func, ast.Name):
+            if func.id in defs[module]:
+                return module, func.id
+            imported = index.imports.get(module, {}).get(func.id)
+            if imported and imported[1] and func.id and imported[1] in defs.get(imported[0], {}):
+                return imported[0], imported[1]
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            imported = index.imports.get(module, {}).get(func.value.id)
+            if imported and imported[1] is None and func.attr in defs.get(imported[0], {}):
+                return imported[0], func.attr
+        return None
+
+    def handler_names(handler):
+        types = (
+            handler.type.elts if isinstance(handler.type, ast.Tuple)
+            else [handler.type] if handler.type is not None else []
+        )
+        return {_tail(item) for item in types} or {"BaseException"}
+
+    def escaping_calls(module, function):
+        found = set()
+
+        def visit(node, shielded):
+            if isinstance(node, ast.Try):
+                catches = any(
+                    handler_names(h) & index.exempt and not isinstance(h.body[-1], ast.Raise)
+                    for h in node.handlers
+                )
+                for stmt in node.body:
+                    visit(stmt, shielded or catches)
+                for handler in node.handlers:
+                    for stmt in handler.body:
+                        visit(stmt, shielded)
+                for stmt in [*node.orelse, *node.finalbody]:
+                    visit(stmt, shielded)
+                return
+            if isinstance(node, ast.Call) and not shielded:
+                target = resolve(module, node.func)
+                if target:
+                    found.add(target)
+            for child in ast.iter_child_nodes(node):
+                visit(child, shielded)
+
+        visit(function, False)
+        return found
+
+    def constructs(function):
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call):
+                tail = _tail(node.func)
+                if tail in index.exempt or (
+                    tail == DECISION_FACTORY and isinstance(node.func, ast.Attribute)
+                    and _tail(node.func.value) in index.exempt
+                ):
+                    return True
+        return False
+
+    graph = {
+        (module, name): escaping_calls(module, node)
+        for module, functions in defs.items() for name, node in functions.items()
+    }
+    reach = {key for key in graph if constructs(defs[key[0]][key[1]])}
+    changed = True
+    while changed:
+        changed = False
+        for key, called in graph.items():
+            if key not in reach and called & reach:
+                reach.add(key)
+                changed = True
+    return resolve, handler_names, reach
+
+
+def check_transport_fallbacks(sources: dict[str, str]) -> list[str]:
+    """``module:line`` of broad handlers that carry a reachable stop's text into a fallback."""
+    index = build_index(sources)
+    resolve, handler_names, reach = _resolved_stop_graph(index)
+    violations: list[str] = []
+    for module, tree in index.trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            calls = {
+                target for stmt in node.body for call in ast.walk(stmt)
+                if isinstance(call, ast.Call) for target in [resolve(module, call.func)] if target
+            }
+            if not calls & reach:
+                continue
+            for handler in node.handlers:
+                names = handler_names(handler)
+                if names & index.exempt:
+                    break
+                if not names & _BROAD_CATCHES or handler.name is None:
+                    continue
+                body = [n for stmt in handler.body for n in ast.walk(stmt)]
+                if any(
+                    isinstance(n, ast.Call) and _tail(n.func) == REWRAP_KEEPER for n in body
+                ):
+                    continue
+                last = handler.body[-1]
+                if isinstance(last, ast.Raise) and (
+                    last.exc is None or (isinstance(last.exc, ast.Name) and last.exc.id == handler.name)
+                ):
+                    continue
+                if any(isinstance(n, ast.Name) and n.id == handler.name for n in body):
+                    violations.append(f"{module}:{handler.lineno}")
+    return violations
+
+
+def _enclosing_function(source: str, line: int) -> str | None:
+    best = None
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.lineno <= line <= node.end_lineno:
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best.name if best else None
+
+
+def test_no_fallback_transports_a_reachable_human_decision_stop():
+    sources = load_tree_sources()
+    found = set()
+    unexpected = []
+    for site in check_transport_fallbacks(sources):
+        module, line = site.split(":")
+        key = f"{module}:{_enclosing_function(sources[module], int(line))}"
+        found.add(key)
+        if key not in KNOWN_TRANSPORT_FALLBACKS:
+            unexpected.append(site)
+    assert unexpected == []
+    # Every known entry still exists, so the list cannot silently go stale.
+    assert set(KNOWN_TRANSPORT_FALLBACKS) <= found
+
+
+def test_transport_guard_flags_a_result_fallback_and_accepts_a_kept_stop():
+    stops = (
+        "from .errors import HumanDecisionRequiredError\n"
+        "def stop():\n    raise HumanDecisionRequiredError.decision(what='w', clear='c',"
+        " safe_to_automate=False, automation_note='n')\n"
+    )
+    transport = (
+        "from .stops import stop\nfrom .errors import AgentLoopError, reraise_human_decision\n"
+        "def f():\n    try:\n        stop()\n    except AgentLoopError as exc:\n"
+        "        return ('undetermined', str(exc))\n"
+    )
+    kept = transport.replace(
+        "        return ('undetermined', str(exc))\n",
+        "        reraise_human_decision(exc, 'ctx')\n        return ('undetermined', str(exc))\n",
+    )
+    shielded = (
+        "from .stops import stop\nfrom .errors import AgentLoopError, HumanDecisionRequiredError\n"
+        "def g():\n    try:\n        stop()\n    except HumanDecisionRequiredError:\n        return None\n"
+        "def f():\n    try:\n        g()\n    except AgentLoopError as exc:\n        return str(exc)\n"
+    )
+    base = {"errors": _ERRORS_SOURCE, "stops": stops}
+    assert check_transport_fallbacks({**base, "site": transport}) == ["site:6"]
+    assert check_transport_fallbacks({**base, "site": kept}) == []
+    # A callee that swallows the stop itself does not make its callers reachable.
+    assert check_transport_fallbacks({**base, "site": shielded}) == []

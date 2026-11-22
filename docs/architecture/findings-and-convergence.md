@@ -371,6 +371,13 @@ a human-decision stop first calls `reraise_human_decision(exc, context)`. That
 call re-raises the stop with the context inside 'what', so the qualification
 board check and the plan-lineage and plan-approval readers keep exit 4. The
 guard test checks this with a call graph built from the parsed source.
+Fallbacks that turn a caught error into a result, such as the plan-approval
+input derivation, legacy plan-history classification and signed-supersession
+reads, also call it first, so their underivable or undetermined results never
+carry a stop's text. A second guard resolves calls through imports, flags any
+such fallback that can reach a stop, and lists the agent-turn failure
+policies and advisory previews that keep their degraded outcome, each with a
+reason.
 `tests/test_human_decision_stops.py` enforces this statically from the parsed
 source class graph: the phrase scan, the provenance rule and the renderer
 bodies. The hyphenated `human-decision` protocol status token is not a stop.
