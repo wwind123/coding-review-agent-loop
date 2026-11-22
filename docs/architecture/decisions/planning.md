@@ -47,3 +47,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-21: Outside-only classification trusts only shell-literal tokens (no `$`, backtick or leading `~` anywhere in a clause) and applies `path::name` selector syntax only to pytest, replacing per-case expansion patches with one rule (#2052).
 
 - 2026-11-21: Scope amendment: out-of-checkout measurement context is a fixed allowlist (program, flag-only options, plain absolute outside operands, no shell syntax) that never models the shell; the earlier per-case expansion, selector and cwd handling is removed and test-runner classification is back to its prior behaviour. A wrong refusal is recovered by the single `tests_run` re-ask; a wrong acceptance must not happen (#2052).
+
+- 2026-11-21: The measurement allowlist is mandatory, not an alternative: an entry naming a measurement program anywhere is context only through it, never through the test-runner predicate, and one with a variable, substitution or unbalanced quote is refused even when it records no path; real test runners keep their prior handling (#2052).

@@ -1992,18 +1992,40 @@ def test_allowlisted_outside_measurement_is_context_2052(measure_layout, command
     pytest.param("agent-loop run-tests du -sk {outside}", id="launcher-no-separator"),
     pytest.param("agent-loop run-tests --timeout-seconds x -- du -sk {outside}", id="launcher-bad-timeout"),
     pytest.param("/tmp/agent-loop run-tests -- du -sk {outside}", id="launcher-path"),
+    # Forms the test-runner predicate alone would accept: the allowlist is
+    # mandatory for any entry naming a measurement program.
+    pytest.param("find {outside} -name x=$PATTERN", id="find-assignment-value"),
+    pytest.param("du --exclude x=$EXCLUDES -sk {outside}", id="long-assignment-value"),
+    pytest.param("ls -I x=$EXCLUDES {outside}", id="short-assignment-value"),
+    pytest.param("du -s '{outside}'", id="quoted-outside"),
+    pytest.param("cd {outside} && du -sk .", id="cd-outside"),
+    pytest.param("bash -c 'du -sk {outside}'", id="shell-c"),
+    pytest.param("ls tests && pytest {outside}/t.py", id="measurement-clause"),
+    # Unresolved-only operands record no path, yet are refused (item-21).
+    pytest.param('du -sk "$DIR"', id="unresolved-variable"),
+    pytest.param("du -sk `pwd`", id="unresolved-substitution"),
+    pytest.param('{wrap} -- du -sk "$DIR"', id="wrapped-unresolved"),
+    pytest.param("du -sk '{outside}", id="malformed-quote"),
+    pytest.param("{wrap} -- du -sk '{outside}", id="wrapped-malformed-quote"),
 ])
 def test_disqualified_measurement_is_never_allowlisted_2052(measure_layout, command):
-    """Each disqualifying token class keeps the entry off the allowlist.
+    """Each disqualifying token class is refused through both public entry points.
 
-    The allowlist predicate itself is checked directly, so a class cannot
-    pass by relying on the ordinary classifier; where that classifier also
-    refuses the entry, the coder gets the re-ask (see the acquisition test in
-    test_semantic_evidence_repair_routing.py).
+    The display partition raises the refusal the acquisition re-asks on (see
+    test_semantic_evidence_repair_routing.py), and the journal relabel keeps
+    the run authoritative.  The allowlist predicate rejects it as well, so no
+    class can pass by relying on the test-runner classifier.
     """
     command = _measure_fmt(command, measure_layout)
     assert not workdir_guard._is_outside_measurement(
         command, assigned=measure_layout.checkout
+    )
+    with pytest.raises(workdir_guard.ReportWorkdirRefusal):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=measure_layout.checkout,
+        )
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
     )
 
 
@@ -2042,9 +2064,14 @@ def test_ambiguous_outside_entry_is_refused_2052(measure_layout, command):
     )
 
 
-@pytest.mark.parametrize("command", ["du -sk", "du -sk tests", "ls tests"])
+@pytest.mark.parametrize("command", [
+    "du -sk", "du -sk tests", "ls tests", "{wrap} -- du -sk tests",
+    # Real test runners keep main's handling, expansions included.
+    'pytest -k "$EXPR" tests',
+])
 def test_in_checkout_measurement_is_kept_2052(measure_layout, command):
     """An in-checkout measurement keeps main's in-checkout handling."""
+    command = _measure_fmt(command, measure_layout)
     partition = workdir_guard.partition_reported_tests_by_workdir(
         [command], assigned_workdir=measure_layout.checkout,
     )

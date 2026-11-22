@@ -1762,16 +1762,25 @@ def _partition_reported_tests_by_workdir(
             command, assigned=assigned, origin="structured", path_violations=violations,
             display_partition=True,
         )
-        if not violations:
-            kept.append(command)
-        elif _tests_only_outside(violations) or _is_outside_measurement(
-            command, assigned=Path(assigned_workdir)
+        measurement = _names_measurement_program(command)
+        if measurement and _is_outside_measurement(command, assigned=Path(assigned_workdir)):
+            context.append(command)
+        elif not violations and not (
+            measurement and _measurement_location_unprovable(command)
         ):
+            kept.append(command)
+        elif not measurement and _tests_only_outside(violations):
             context.append(command)
         else:
+            located = (
+                "names a path outside the assigned checkout "
+                f"({', '.join(repr(p) for p in violations)})"
+                if violations
+                else "names an operand whose location cannot be read literally "
+                "(a variable, command substitution or unbalanced quote)"
+            )
             message = (
-                "Coder reported a test command that names a path outside the "
-                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
+                f"Coder reported a test command that {located} "
                 "but may also test the checkout itself, in command "
                 f"{command!r}. Report in-checkout tests and any baseline run "
                 "outside the checkout as separate commands; a baseline command "
@@ -1872,13 +1881,14 @@ def command_targets_outside_workdir(
     """
     judged = executed_argv if executed_argv else argv
     log = _command_path_violations(judged, assigned_workdir=assigned_workdir)
-    if not isinstance(log, _PathLog):
+    if not isinstance(log, _PathLog) or not log:
         return False
-    if _tests_only_outside(log):
-        return True
-    # A read-only measurement is never test evidence (#2052).
     command = judged if isinstance(judged, str) else shlex.join(_argv_tokens(judged))
-    return bool(log) and _is_outside_measurement(command, assigned=assigned_workdir)
+    if _names_measurement_program(command):
+        # A measurement is context only through the allowlist (#2052); the
+        # test-runner predicate never applies to it.
+        return _is_outside_measurement(command, assigned=assigned_workdir)
+    return _tests_only_outside(log)
 
 
 # Out-of-checkout measurement allowlist (#2052).  A ``tests_run`` entry that
@@ -2017,6 +2027,77 @@ def _is_plain_outside_path(operand: str, assigned: Path) -> bool:
         for path in paths
         for checkout in checkouts
     )
+
+
+def _names_measurement_program(command: str) -> bool:
+    """Whether any program position in the entry names a measurement program.
+
+    Such an entry is out-of-checkout context only through the allowlist,
+    never through the test-runner predicate (#2052).  Wrappers and managed
+    ``run-tests`` inner commands are searched too; an entry the clause
+    splitter refuses counts as a measurement, which can only refuse more.
+    """
+
+    def search(text: str, depth: int) -> bool:
+        try:
+            clauses = _clauses_for_entry(text, "structured")
+        except AgentLoopError:
+            return True
+        for clause in clauses:
+            tokens = clause.tokens
+            positions, head = _program_position_indices(tokens)
+            indices = set(positions) | ({head} if head is not None else set())
+            if any(
+                0 <= index < len(tokens)
+                and _program_basename(tokens[index]) in _MEASUREMENT_PROGRAMS
+                for index in indices
+            ):
+                return True
+            try:
+                managed = parse_managed_test_command(
+                    tokens, allow_command_name_launcher=True
+                )
+            except (ValueError, TestRuntimeConfigurationError):
+                managed = None
+            if managed is not None and depth < 8 and search(
+                shlex.join(managed.inner_argv), depth + 1
+            ):
+                return True
+        return False
+
+    try:
+        shlex.split(command)
+    except ValueError:
+        # Malformed quoting defeats program-position parsing (a quoted
+        # launcher hides the managed inner command), so any word naming a
+        # measurement program counts.
+        if any(
+            _program_basename(_strip_wrap(word)) in _MEASUREMENT_PROGRAMS
+            for word in command.split()
+        ):
+            return True
+    return search(command, 0)
+
+
+def _measurement_location_unprovable(command: str) -> bool:
+    """Whether a measurement entry's operand locations cannot be read literally.
+
+    A ``$`` expansion (other than the documented launcher variable), a
+    backtick substitution or unbalanced quoting can hide an outside -- or
+    any -- operand without the guard recording a path, so such a measurement
+    is refused and re-asked rather than kept (#2052).
+    """
+    stripped = command
+    for launcher in _MEASUREMENT_LAUNCHERS:
+        if launcher != "agent-loop":
+            stripped = stripped.replace(launcher, "")
+    if "$" in stripped or "`" in stripped:
+        return True
+    try:
+        shlex.split(command)
+    except ValueError:
+        return True
+    return False
 
 
 def _is_outside_measurement(command: str, *, assigned: Path) -> bool:

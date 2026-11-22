@@ -6463,8 +6463,14 @@ checkout, not an ancestor of it, and with no `..`. No word may contain
 `$`, a backtick, `~`, a quote, a backslash, a glob or brace character, `=`,
 `::` or a shell operator, and nothing (no `cd`, `-C`, assignment or wrapper)
 may precede the program. Paths are compared as written and canonicalised, so
-an outside symlink into the checkout is never accepted. Anything else
-keeps the existing baseline-run classification above.
+an outside symlink into the checkout is never accepted. The allowlist is the
+only route to context for an entry that names one of those programs anywhere
+(including after a wrapper, in `sh -c`, or beside a test runner): such an entry
+that fails the rule and names an outside path is refused, and so is one whose
+operand cannot be read literally (`du -sk "$DIR"`, an unbalanced quote) even
+though it records no path. A measurement with only in-checkout operands
+(`du -sk tests`) and every entry without a measurement program keep the
+existing classification above.
 A refused
 `tests_run` entry earns the coder's single semantic-evidence re-ask: the
 re-ask quotes the refusal and asks for a corrected `tests_run`, and a second

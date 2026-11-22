@@ -1215,6 +1215,14 @@ def test_transient_public_text_blocks_tests_run_reask_and_is_logged_2052(tmp_pat
     pytest.param("du --exclude x -sk /outside/dir", id="value-option"),
     pytest.param("find /outside/dir -exec true", id="find-executor"),
     pytest.param("du -sk /outside/dir tests", id="mixed-operand"),
+    # Forms the test-runner predicate alone would accept (item-14).
+    pytest.param("find /outside/dir -name x=$PATTERN", id="find-assignment-value"),
+    pytest.param("du --exclude x=$EXCLUDES -sk /outside/dir", id="assignment-value"),
+    pytest.param("du -s '/outside/dir'", id="quoted-outside"),
+    # Unresolved-only operands record no outside path (item-21).
+    pytest.param('du -sk "$DIR"', id="unresolved-variable"),
+    pytest.param("du -sk `pwd`", id="unresolved-substitution"),
+    pytest.param("du -sk '/outside/dir", id="malformed-quote"),
 ])
 def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatch, no_repair, entry):
     """Every disqualifying token class is refused and recovered by one coder re-ask."""
@@ -1233,5 +1241,6 @@ def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatc
     assert second["session_id"] == "acquired"
     assert "Previous response not accepted: tests_run report" in second["prompt"]
     assert "may also test the checkout itself" in second["prompt"]
+    assert "not citable" not in second["prompt"]
     assert response.marker_value.out_of_checkout_tests_run == ("du -sk /outside/dir",)
     assert response.marker_value.tests_run == ()
