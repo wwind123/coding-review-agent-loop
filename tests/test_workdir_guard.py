@@ -1877,3 +1877,233 @@ def test_exported_launcher_reports_validate_inner_targets(tmp_path, launcher):
     validate_test_commands_within_workdir([prefix + "tests/test_example.py"], assigned_workdir=tmp_path)
     with pytest.raises(AgentLoopError):
         validate_test_commands_within_workdir([prefix + "/outside/foreign/test_example.py"], assigned_workdir=tmp_path)
+
+
+# --- #2052: allowlisted read-only measurements of outside paths are context ---
+#
+# Scope amendment (2026-11-21): the rule is a narrow allowlist that never
+# models the shell.  A wrong refusal is recovered by the single coder re-ask;
+# a wrong acceptance must never happen.
+
+
+@pytest.fixture
+def measure_layout(tmp_path, monkeypatch):
+    """An assigned checkout at <parent>/checkout and an unrelated outside directory."""
+    monkeypatch.setattr(workdir_guard, "scratch_root", lambda: tmp_path / "no-scratch-root")
+    parent = tmp_path / "parent"
+    checkout = parent / "checkout"
+    (checkout / "tests").mkdir(parents=True)
+    outside = tmp_path / "outside" / "dir"
+    outside.mkdir(parents=True)
+    return SimpleNamespace(parent=parent, checkout=checkout, outside=outside)
+
+
+def _measure_fmt(command, layout):
+    return command.format(
+        outside=layout.outside, parent=layout.parent, checkout=layout.checkout,
+        wrap='"${{AGENT_LOOP_EXECUTABLE:-agent-loop}}" run-tests'.format(),
+    )
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk {outside}",
+    "agent-loop run-tests -- du -sk {outside}",
+    # The issue's exact hand-off.
+    "{wrap} --timeout-seconds 30 -- du -sk {outside}",
+    '"$AGENT_LOOP_EXECUTABLE" run-tests -- du -sk {outside}',
+    "find {outside} -maxdepth 1 -type f",
+    "find {outside} -mindepth 1 -type d -print",
+    "ls -la {outside}",
+    "wc -l {outside}/f",
+    "stat {outside}",
+    "sha256sum {outside}/f",
+    "md5sum -b {outside}/f",
+    "file -b {outside}/f",
+    "df -h {outside}",
+    "du -sh --apparent-size -- {outside} {outside}/f",
+])
+def test_allowlisted_outside_measurement_is_context_2052(measure_layout, command):
+    """Contrast: plain allowlisted measurements of outside paths become context."""
+    command = _measure_fmt(command, measure_layout)
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command, "pytest tests"], assigned_workdir=measure_layout.checkout,
+    )
+    assert partition.in_checkout == ("pytest tests",)
+    assert partition.out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+    # Context is never evidence.
+    assert not workdir_guard.command_is_admissible_evidence(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", [
+    # Each disqualifying token class.
+    pytest.param("du -sk {outside}/$NAME", id="dollar"),
+    pytest.param("du -sk {outside}/`pwd`", id="backtick"),
+    pytest.param("du -sk {outside} ~/x", id="tilde"),
+    pytest.param("du -sk '{outside}'", id="single-quote"),
+    pytest.param('du -sk "{outside}"', id="double-quote"),
+    pytest.param("du -sk {outside}/*", id="glob-star"),
+    pytest.param("du -sk {outside}/?", id="glob-question"),
+    pytest.param("du -sk {outside}/[ab]", id="glob-bracket"),
+    pytest.param("du -sk {outside}/{{a,b}}", id="brace"),
+    pytest.param("du --max-depth=1 {outside}", id="equals"),
+    pytest.param("sha256sum {outside}/file::part", id="double-colon"),
+    pytest.param("du -sk {outside}/a\\ b", id="backslash"),
+    pytest.param("du -sk {outside}; true", id="semicolon"),
+    pytest.param("du -sk {outside} & true", id="ampersand"),
+    pytest.param("du -sk {outside} | sort", id="pipe"),
+    pytest.param("du -sk {outside} < /dev/null", id="redirect-in"),
+    pytest.param("du -sk {outside} > /dev/null", id="redirect-out"),
+    pytest.param("(du -sk {outside})", id="subshell"),
+    pytest.param("du -sk {outside}\npytest tests", id="newline"),
+    # A preceding cd, -C, assignment, wrapper or path-named program.
+    pytest.param("cd {checkout} && du -sk {outside}", id="cd"),
+    pytest.param("env -C {outside} du -sk {outside}", id="dash-C"),
+    pytest.param("LC_ALL=C du -sk {outside}", id="assignment"),
+    pytest.param("nice du -sk {outside}", id="wrapper"),
+    pytest.param("/usr/bin/du -sk {outside}", id="path-program"),
+    pytest.param("cat {outside}/f", id="unlisted-program"),
+    # Value-taking or unlisted options.
+    pytest.param("du --exclude x -sk {outside}", id="long-value-option"),
+    pytest.param("ls -I x {outside}", id="short-value-option"),
+    pytest.param("du -d 1 {outside}", id="separate-value"),
+    pytest.param("du --files0-from {outside}/list", id="indirect-input"),
+    pytest.param("du -X {outside}/ex {outside}", id="exclude-from"),
+    pytest.param("sha256sum -c {outside}/sums", id="checksum-check"),
+    pytest.param("du -sk - {outside}", id="stdin"),
+    pytest.param("find {outside} -name x", id="find-name"),
+    pytest.param("find {outside} -newer {outside}/ref", id="find-newer"),
+    pytest.param("find {outside} -exec true", id="find-exec"),
+    pytest.param("find {outside} -delete", id="find-delete"),
+    pytest.param("find {outside} -maxdepth x", id="find-nonnumeric"),
+    pytest.param("find {outside} -type q", id="find-bad-type"),
+    pytest.param("find -L {outside}", id="find-leading-option"),
+    # Operands that are not plain absolute outside paths.
+    pytest.param("du -sk {outside} tests", id="mixed-relative"),
+    pytest.param("du -sk {outside} {checkout}/tests", id="mixed-absolute"),
+    pytest.param("du -sk {outside} ../sibling", id="relative-outside"),
+    pytest.param("du -sk {outside} {parent}", id="checkout-ancestor"),
+    pytest.param("du -sk {outside}/../dir", id="dot-dot"),
+    # Malformed launcher prefixes.
+    pytest.param("agent-loop run-tests du -sk {outside}", id="launcher-no-separator"),
+    pytest.param("agent-loop run-tests --timeout-seconds x -- du -sk {outside}", id="launcher-bad-timeout"),
+    pytest.param("/tmp/agent-loop run-tests -- du -sk {outside}", id="launcher-path"),
+    # Forms the test-runner predicate alone would accept: the allowlist is
+    # mandatory for any entry naming a measurement program.
+    pytest.param("find {outside} -name x=$PATTERN", id="find-assignment-value"),
+    pytest.param("du --exclude x=$EXCLUDES -sk {outside}", id="long-assignment-value"),
+    pytest.param("ls -I x=$EXCLUDES {outside}", id="short-assignment-value"),
+    pytest.param("du -s '{outside}'", id="quoted-outside"),
+    pytest.param("cd {outside} && du -sk .", id="cd-outside"),
+    pytest.param("bash -c 'du -sk {outside}'", id="shell-c"),
+    pytest.param("ls tests && pytest {outside}/t.py", id="measurement-clause"),
+    # Unresolved-only operands record no path, yet are refused (item-21).
+    pytest.param('du -sk "$DIR"', id="unresolved-variable"),
+    pytest.param("du -sk `pwd`", id="unresolved-substitution"),
+    pytest.param('{wrap} -- du -sk "$DIR"', id="wrapped-unresolved"),
+    pytest.param("du -sk '{outside}", id="malformed-quote"),
+    pytest.param("{wrap} -- du -sk '{outside}", id="wrapped-malformed-quote"),
+    # Launcher spellings are exempt only in the leading launcher position.
+    pytest.param('du -sk "$AGENT_LOOP_EXECUTABLE"', id="launcher-variable-operand"),
+    pytest.param('du -sk "${{AGENT_LOOP_EXECUTABLE:-agent-loop}}"', id="launcher-default-operand"),
+    pytest.param('{wrap} -- du -sk "$AGENT_LOOP_EXECUTABLE"', id="wrapped-launcher-operand"),
+    # Relative-only and glob-only operands record no absolute path (item-22).
+    pytest.param("du -sk ../scratch", id="relative-only-outside"),
+    pytest.param("du -sk *", id="glob-only"),
+    pytest.param("pytest tests && du -sk", id="measurement-beside-runner"),
+])
+def test_disqualified_measurement_is_never_allowlisted_2052(measure_layout, command):
+    """Each disqualifying token class is refused through both public entry points.
+
+    The display partition raises the refusal the acquisition re-asks on (see
+    test_semantic_evidence_repair_routing.py), and the journal relabel keeps
+    the run authoritative.  The allowlist predicate rejects it as well, so no
+    class can pass by relying on the test-runner classifier.
+    """
+    command = _measure_fmt(command, measure_layout)
+    assert not workdir_guard._is_outside_measurement(
+        command, assigned=measure_layout.checkout
+    )
+    with pytest.raises(workdir_guard.ReportWorkdirRefusal):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=measure_layout.checkout,
+        )
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk {outside}/$NAME",
+    "du -sk '{outside}'",
+    "du -sk {outside}/*",
+    "du --max-depth=1 {outside}",
+    "du -sk {outside}; true",
+    "cd {checkout} && du -sk {outside}",
+    "nice du -sk {outside}",
+    "du --exclude x -sk {outside}",
+    "find {outside} -name x",
+    "find {outside} -exec true",
+    "du -sk {outside} tests",
+    "du -sk {outside} {checkout}/tests",
+    "du -sk {outside} ../sibling",
+    "pytest tests {outside}/test_a.py",
+    "pytest -c {outside}/pytest.ini tests",
+    "pytest tests && du -sk {outside}",
+])
+def test_ambiguous_outside_entry_is_refused_2052(measure_layout, command):
+    """An entry naming an outside path that is not provably outside-only is refused."""
+    command = _measure_fmt(command, measure_layout)
+    with pytest.raises(
+        workdir_guard.ReportWorkdirRefusal, match="may also test the checkout itself"
+    ) as refusal:
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=measure_layout.checkout,
+        )
+    assert "measurement of an outside directory is context only as its own entry" in str(
+        refusal.value
+    )
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=measure_layout.checkout
+    )
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk", "du -sk tests", "ls tests", "{wrap} -- du -sk tests",
+    "du -sk {checkout}/tests", "find tests -maxdepth 1 -type f",
+    # Real test runners keep main's handling, expansions included.
+    'pytest -k "$EXPR" tests',
+])
+def test_in_checkout_measurement_is_kept_2052(measure_layout, command):
+    """An in-checkout measurement keeps main's in-checkout handling."""
+    command = _measure_fmt(command, measure_layout)
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=measure_layout.checkout,
+    )
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+
+
+def test_measurement_operand_symlinked_into_checkout_is_not_allowlisted_2052(measure_layout):
+    """Refusing is always safe: an outside link that resolves inside is not allowlisted."""
+    link = measure_layout.outside / "link"
+    link.symlink_to(measure_layout.checkout / "tests")
+    assert not workdir_guard._is_outside_measurement(
+        f"du -sk {link}", assigned=measure_layout.checkout
+    )
+
+
+def test_measurement_allowlist_accepts_argv_sequences_2052(measure_layout):
+    """The journal relabel may pass an argv list; it is judged by the same rule."""
+    argv = ["du", "-sk", str(measure_layout.outside)]
+    assert workdir_guard.command_targets_outside_workdir(
+        argv, assigned_workdir=measure_layout.checkout
+    )
+    assert not workdir_guard.command_targets_outside_workdir(
+        ["du", "-sk", str(measure_layout.outside), "tests"],
+        assigned_workdir=measure_layout.checkout,
+    )

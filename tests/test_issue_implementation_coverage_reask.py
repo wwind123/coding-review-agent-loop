@@ -1047,7 +1047,8 @@ def test_workflow_report_correction_succeeds(tmp_path, monkeypatch, stage, surfa
     commands = _claude_commands(h)
     assert len(commands) == (3 if stage == "coverage" else 2)
     assert "refused-session" in commands[-1]
-    assert "Previous response not accepted: test evidence" in commands[-1][-1]
+    # A refused tests_run entry gets the tests_run re-ask, not citation wording (#2052).
+    assert "Previous response not accepted: tests_run report" in commands[-1][-1]
     assert "/outside/shim.cjs" in commands[-1][-1]
     assert "outside/shim" not in h.coder_comment()
     assert h.run_pr_calls

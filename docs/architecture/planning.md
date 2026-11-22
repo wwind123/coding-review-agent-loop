@@ -274,7 +274,16 @@ opt into the same single semantic-evidence re-ask (#1738, #1768).
 Structured report partition and strict citation workdir guards run inside the
 validated acquisition, including normalized and repaired candidates. Only their
 typed report refusals join the re-askable reasons; operational and authorization
-errors retain existing handling. A scratch-input receipt remains inadmissible:
+errors retain existing handling. The two guards keep separate reasons (#2052): a
+refused `tests_run` display-partition entry is `tests-run-workdir`, and its
+re-ask quotes the refusal and asks the coder to resubmit a corrected `tests_run`
+(in-checkout runs and out-of-checkout runs as separate literal entries, valid
+`test_observations` left alone). A refused receipt citation stays
+`report-workdir` and keeps the citation wording. Both reasons spend the same
+single shared allowance. A rejection that is not re-asked logs its first
+refusing term (`not-opted-in`, `budget-used`, `reason-not-reaskable`,
+`transient-public-text`, `marker-safety` or `unsupported-failure`); eligibility
+itself is unchanged. A scratch-input receipt remains inadmissible:
 feedback requests admissible replacement evidence without hiding failures.
 The report, citation and receipt-admission guards share output-destination
 interpretation: explicit long output options may point outside the checkout.

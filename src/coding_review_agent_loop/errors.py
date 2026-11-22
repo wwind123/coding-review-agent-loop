@@ -252,9 +252,13 @@ class NonRepairableEvidenceRejection(AgentLoopError):
     not a formatting defect: repair may only reshape the envelope around the
     coder's own claims, so it is never invoked for this class (#990).
 
-    ``reason`` classifies the rejection: only selector rejections
+    ``reason`` classifies the rejection: only selector rejections and
+    workdir-guard refusals of the coder's own report
     (``CITATION_REASKABLE_REASONS``) may be re-asked of the coder; anything
     unclassified defaults to the terminal ``catalog-collision`` (#1240).
+    ``tests-run-workdir`` marks a refused ``tests_run`` display partition and
+    selects a ``tests_run``-specific re-ask prompt; ``report-workdir`` stays
+    the receipt-citation refusal (#2052).
     """
 
     def __init__(self, message: str = "", *, reason: str = "catalog-collision") -> None:
@@ -266,8 +270,13 @@ class ReportWorkdirRefusal(AgentLoopError):
     """A structured display partition or receipt workdir guard refused a report."""
 
 
+# A ``tests_run`` entry the display partition refused (#2052). It shares the
+# single per-invocation re-ask budget with the citation reasons (#1738).
+TESTS_RUN_WORKDIR_REASON = "tests-run-workdir"
+
 CITATION_REASKABLE_REASONS = frozenset({
     "non-passing-selector", "launch-integrity", "report-workdir",
+    TESTS_RUN_WORKDIR_REASON,
 })
 
 

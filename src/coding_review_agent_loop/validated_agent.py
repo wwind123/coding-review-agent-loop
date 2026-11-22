@@ -20,6 +20,7 @@ from .agents.registry import agent_display_name, agent_signature, run_agent_resu
 from .config import AgentLoopConfig
 from .errors import (
     CITATION_REASKABLE_REASONS,
+    TESTS_RUN_WORKDIR_REASON,
     AgentInvocationError,
     AgentLoopError,
     AgentSettingsLockWaitTimeout,
@@ -521,6 +522,35 @@ def _terminal_repair_evidence_rejection(
     return terminal.evidence_rejection
 
 
+def _evidence_reask_refusal(
+    rejection: NonRepairableEvidenceRejection,
+    *,
+    opted_in: bool,
+    already_used: bool,
+    public_text_is_transient: bool = False,
+    marker_safety_failure: bool = False,
+    response_failure_is_unsupported: bool = False,
+) -> str | None:
+    """The first term refusing the single coder re-ask, or ``None`` when eligible (#2052).
+
+    The terms are checked in the order :func:`_evidence_reask_eligible` applies
+    them, so a stopped turn names the exact reason in its log line.
+    """
+    if not opted_in:
+        return "not-opted-in"
+    if already_used:
+        return "budget-used"
+    if rejection.reason not in CITATION_REASKABLE_REASONS:
+        return "reason-not-reaskable"
+    if public_text_is_transient:
+        return "transient-public-text"
+    if marker_safety_failure:
+        return "marker-safety"
+    if response_failure_is_unsupported:
+        return "unsupported-failure"
+    return None
+
+
 def _evidence_reask_eligible(
     rejection: NonRepairableEvidenceRejection,
     *,
@@ -533,12 +563,19 @@ def _evidence_reask_eligible(
     Shared by the direct path and a repair-surfaced rejection (#999), so both
     spend the same one-per-invocation budget.
     """
-    return (
-        opted_in
-        and not already_used
-        and rejection.reason in CITATION_REASKABLE_REASONS
-        and not blocked
-    )
+    return _evidence_reask_refusal(
+        rejection,
+        opted_in=opted_in,
+        already_used=already_used,
+        public_text_is_transient=blocked,
+    ) is None
+
+
+def _evidence_reask_log_purpose(reason: str) -> str:
+    """What the coder is re-asked to do, by rejection reason (#2052)."""
+    if reason == TESTS_RUN_WORKDIR_REASON:
+        return "correct its tests_run report"
+    return "cite a verified passing observation"
 
 
 def _semantic_evidence_last_error(
@@ -1545,6 +1582,7 @@ def _run_validated_agent_in_scope(
     pending_judgement_reask: tuple[str, tuple[str, ...], str | None] | None = None
     evidence_reask_used = False
     pending_evidence_reask_detail: str | None = None
+    pending_evidence_reask_reason: str | None = None
     pending_evidence_reask_session: str | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
@@ -1754,12 +1792,14 @@ def _run_validated_agent_in_scope(
                 # Same frozen prompt plus the sanitized rejection; resume the
                 # rejected acquisition's own session when one exists (#1240).
                 attempt_prompt = _evidence_rejection_reask_prompt(
-                    prompt, pending_evidence_reask_detail
+                    prompt, pending_evidence_reask_detail,
+                    reason=pending_evidence_reask_reason,
                 )
                 attempt_session_id = pending_evidence_reask_session
                 if backend_agent == "claude":
                     invocation_kwargs["attempt_suffix"] = "evidence-reask"
                 pending_evidence_reask_detail = None
+                pending_evidence_reask_reason = None
                 pending_evidence_reask_session = None
         last_dispatch = _QuotaReplay(
             attempt_prompt, attempt_session_id, next_timeout_seconds, dict(invocation_kwargs)
@@ -2985,29 +3025,30 @@ def _run_validated_agent_in_scope(
                         # the coder's claims, so it cannot satisfy this; running
                         # it (and its fallback chain) only burns its timeout and
                         # then misreports the stop as that timeout (#990).
-                        if _evidence_reask_eligible(
+                        evidence_reask_refusal = _evidence_reask_refusal(
                             evidence_rejection,
                             opted_in=reask_on_evidence_rejection,
                             already_used=evidence_reask_used,
-                            blocked=(
-                                public_text_is_transient
-                                or marker_safety_failure
-                                or response_failure_is_unsupported
-                            ),
-                        ):
+                            public_text_is_transient=public_text_is_transient,
+                            marker_safety_failure=marker_safety_failure,
+                            response_failure_is_unsupported=response_failure_is_unsupported,
+                        )
+                        if evidence_reask_refusal is None:
                             # A non-citable selected observation is missing
                             # judgement only the coder can supply (rerun and
                             # re-cite): re-ask once, outside the retry budget
                             # and fallback, never via repair (#1240).
                             evidence_reask_used = True
                             pending_evidence_reask_detail = str(evidence_rejection)
+                            pending_evidence_reask_reason = evidence_rejection.reason
                             pending_evidence_reask_session = result.session_id or session_id
                             if usage_record is not None:
                                 usage_record.validation_status = "invalid"
                             log(
                                 config,
                                 f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
-                                "re-asking the coder once to cite a verified passing observation "
+                                "re-asking the coder once to "
+                                f"{_evidence_reask_log_purpose(evidence_rejection.reason)} "
                                 "(no repair)"
                                 + (
                                     "; resuming session"
@@ -3019,7 +3060,8 @@ def _run_validated_agent_in_scope(
                         log(
                             config,
                             f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
-                            "not repairable by reformatting, skipping repair pass",
+                            "not repairable by reformatting, skipping repair pass; "
+                            f"no coder re-ask ({evidence_reask_refusal})",
                         )
                         last_error = _semantic_evidence_last_error(
                             evidence_rejection, repair_surfaced=False
@@ -3199,21 +3241,21 @@ def _run_validated_agent_in_scope(
                             # by _log_repair_attempts above.
                             plan_validation_exhaustion = None
                             plan_validation_capture_eligible = False
-                            if _evidence_reask_eligible(
+                            evidence_reask_refusal = _evidence_reask_refusal(
                                 terminal_evidence_rejection,
                                 opted_in=reask_on_evidence_rejection,
                                 already_used=evidence_reask_used,
-                                blocked=(
-                                    public_text_is_transient
-                                    or marker_safety_failure
-                                    or response_failure_is_unsupported
-                                ),
-                            ):
+                                public_text_is_transient=public_text_is_transient,
+                                marker_safety_failure=marker_safety_failure,
+                                response_failure_is_unsupported=response_failure_is_unsupported,
+                            )
+                            if evidence_reask_refusal is None:
                                 # Repair preserved the coder's own claims, so
                                 # the coder is re-asked on the primary turn's
                                 # session, never the repair session.
                                 evidence_reask_used = True
                                 pending_evidence_reask_detail = str(terminal_evidence_rejection)
+                                pending_evidence_reask_reason = terminal_evidence_rejection.reason
                                 pending_evidence_reask_session = result.session_id or session_id
                                 if usage_record is not None:
                                     usage_record.validation_status = "invalid"
@@ -3221,7 +3263,8 @@ def _run_validated_agent_in_scope(
                                     config,
                                     f"{agent_name}: semantic evidence rejected by the repair "
                                     f"candidate ({terminal_evidence_rejection}); re-asking the "
-                                    "coder once to cite a verified passing observation"
+                                    "coder once to "
+                                    f"{_evidence_reask_log_purpose(terminal_evidence_rejection.reason)}"
                                     + (
                                         "; resuming session"
                                         if pending_evidence_reask_session
@@ -3232,7 +3275,8 @@ def _run_validated_agent_in_scope(
                             log(
                                 config,
                                 f"{agent_name}: semantic evidence rejected by the repair "
-                                f"candidate ({terminal_evidence_rejection}); repair chain stopped",
+                                f"candidate ({terminal_evidence_rejection}); repair chain stopped; "
+                                f"no coder re-ask ({evidence_reask_refusal})",
                             )
                             last_error = _semantic_evidence_last_error(
                                 terminal_evidence_rejection, repair_surfaced=True

@@ -1762,18 +1762,37 @@ def _partition_reported_tests_by_workdir(
             command, assigned=assigned, origin="structured", path_violations=violations,
             display_partition=True,
         )
-        if not violations:
+        measurement = _names_measurement_program(command)
+        if measurement and _is_outside_measurement(command, assigned=Path(assigned_workdir)):
+            context.append(command)
+        elif not violations and not (
+            measurement
+            and not _is_inside_measurement(command, assigned=Path(assigned_workdir))
+        ):
             kept.append(command)
-        elif _tests_only_outside(violations):
+        elif not measurement and _tests_only_outside(violations):
             context.append(command)
         else:
+            located = (
+                "names a path outside the assigned checkout "
+                f"({', '.join(repr(p) for p in violations)})"
+                if violations
+                else "names a measurement whose operands are not provably inside "
+                "the checkout (a relative path leaving it, a glob, a variable, "
+                "a command substitution, a quote, a shell operator or an "
+                "option that takes a value)"
+            )
             message = (
-                "Coder reported a test command that names a path outside the "
-                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
+                f"Coder reported a test command that {located} "
                 "but may also test the checkout itself, in command "
                 f"{command!r}. Report in-checkout tests and any baseline run "
                 "outside the checkout as separate commands; a baseline command "
-                "must name only outside test targets. Assigned checkout: "
+                "must name only outside test targets. A measurement of an "
+                "outside directory is context only as its own entry: one of "
+                f"{', '.join(sorted(_MEASUREMENT_PROGRAMS))}, run bare or after "
+                "agent-loop run-tests --, with flag-only options and plain "
+                "absolute outside paths, and no quotes, variables, globs, "
+                "'=', '::', ~, cd or shell operators. Assigned checkout: "
                 f"{assigned}"
             )
             if violations.program_outside and dependency_hint:
@@ -1863,10 +1882,273 @@ def command_targets_outside_workdir(
     either: its failure may be a real in-checkout failure.  When
     ``executed_argv`` is supplied it is the argv judged (#1294).
     """
-    log = _command_path_violations(
-        executed_argv if executed_argv else argv, assigned_workdir=assigned_workdir
+    judged = executed_argv if executed_argv else argv
+    log = _command_path_violations(judged, assigned_workdir=assigned_workdir)
+    if not isinstance(log, _PathLog) or not log:
+        return False
+    command = judged if isinstance(judged, str) else shlex.join(_argv_tokens(judged))
+    if _names_measurement_program(command):
+        # A measurement is context only through the allowlist (#2052); the
+        # test-runner predicate never applies to it.
+        return _is_outside_measurement(command, assigned=assigned_workdir)
+    return _tests_only_outside(log)
+
+
+# Out-of-checkout measurement allowlist (#2052).  A ``tests_run`` entry that
+# measures outside paths (``du -sk /tmp/scratch``) tests nothing, so it is
+# context rather than an ambiguous test run.  The rule is deliberately
+# narrow and never models the shell: anything it does not recognise is
+# simply not a measurement, and falls back to the ordinary classification
+# (which refuses an entry naming an outside path, and the coder is re-asked
+# once with the refusal).  A wrong refusal is cheap; a wrong acceptance is
+# not.  Paths are compared lexically and never resolved: a symlink outside
+# the checkout counts as outside.
+_MEASUREMENT_PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
+    # program: (boolean short flag letters, boolean long flags)
+    "du": ("abchklmsxDHLPS0", frozenset({
+        "--all", "--apparent-size", "--bytes", "--total", "--human-readable",
+        "--si", "--summarize", "--one-file-system", "--separate-dirs",
+        "--count-links", "--dereference", "--dereference-args",
+        "--no-dereference", "--null", "--inodes",
+    })),
+    "ls": ("aAcdFghilnopQrRsStuUvX1", frozenset({
+        "--all", "--almost-all", "--human-readable", "--directory",
+        "--recursive", "--classify", "--inode", "--numeric-uid-gid",
+        "--reverse", "--size",
+    })),
+    "wc": ("clLmw", frozenset({
+        "--bytes", "--chars", "--lines", "--max-line-length", "--words",
+    })),
+    "stat": ("fLt", frozenset({"--dereference", "--file-system", "--terse"})),
+    "sha256sum": ("btz", frozenset({"--binary", "--text", "--zero", "--tag"})),
+    "md5sum": ("btz", frozenset({"--binary", "--text", "--zero", "--tag"})),
+    "file": ("bhiLksz", frozenset({
+        "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
+        "--no-dereference", "--uncompress", "--keep-going", "--special-files",
+    })),
+    "df": ("ahHiklPT", frozenset({
+        "--all", "--human-readable", "--si", "--inodes", "--local",
+        "--portability", "--print-type", "--total",
+    })),
+    # find has its own expression grammar; see _find_measurement_operands.
+    "find": ("", frozenset()),
+}
+# Launcher spellings accepted before ``run-tests``; each is matched exactly.
+_MEASUREMENT_LAUNCHERS = frozenset({
+    "agent-loop",
+    '"${AGENT_LOOP_EXECUTABLE:-agent-loop}"',
+    '"$AGENT_LOOP_EXECUTABLE"',
+})
+# Every word of the measured command must consist only of these characters,
+# which carry no shell meaning: no quote, backslash, ``$``, backtick, ``~``,
+# glob or brace character, ``=``, ``#``, ``!`` or shell operator.
+_MEASUREMENT_WORD_RE = re.compile(r"[A-Za-z0-9_./,+@%:-]+")
+_FIND_TYPE_LETTERS = frozenset("bcdflps")
+_FIND_PLAIN_PREDICATES = frozenset({"-print", "-print0", "-empty", "-o", "-a", "-not"})
+
+
+def _measurement_words(command: str) -> list[str] | None:
+    """The measured program's words, after an optional run-tests launcher."""
+    if "\n" in command or "\r" in command:
+        return None
+    words = command.split()
+    if len(words) >= 3 and words[0] in _MEASUREMENT_LAUNCHERS and words[1] == "run-tests":
+        index = 2
+        if words[index] == "--timeout-seconds":
+            if index + 1 >= len(words) or not words[index + 1].isdigit():
+                return None
+            index += 2
+        if index >= len(words) or words[index] != "--":
+            return None
+        words = words[index + 1 :]
+    if not words or not all(
+        _MEASUREMENT_WORD_RE.fullmatch(word) and "::" not in word for word in words
+    ):
+        return None
+    return words
+
+
+def _find_measurement_operands(args: Sequence[str]) -> list[str] | None:
+    """find's starting points, or ``None`` unless its expression is allowlisted."""
+    index = 0
+    starts: list[str] = []
+    while index < len(args) and not args[index].startswith("-"):
+        starts.append(args[index])
+        index += 1
+    while index < len(args):
+        token = args[index]
+        if token == "-type":
+            if index + 1 >= len(args) or args[index + 1] not in _FIND_TYPE_LETTERS:
+                return None
+            index += 2
+        elif token in {"-maxdepth", "-mindepth"}:
+            if index + 1 >= len(args) or not args[index + 1].isdigit():
+                return None
+            index += 2
+        elif token in _FIND_PLAIN_PREDICATES:
+            index += 1
+        else:
+            return None
+    return starts
+
+
+def _flag_measurement_operands(
+    args: Sequence[str], short_flags: str, long_flags: frozenset[str]
+) -> list[str] | None:
+    """Operands of a flag-only measurement, or ``None`` for any other option."""
+    operands: list[str] = []
+    terminated = False
+    for token in args:
+        if terminated or not token.startswith("-"):
+            operands.append(token)
+        elif token == "--":
+            terminated = True
+        elif token.startswith("--"):
+            if token not in long_flags:
+                return None
+        elif len(token) < 2 or any(letter not in short_flags for letter in token[1:]):
+            return None
+    return operands
+
+
+def _is_plain_outside_path(operand: str, assigned: Path) -> bool:
+    """A literal absolute path that is neither the checkout, in it, nor above it.
+
+    The classifier does not model symlinks, but refusing is always safe, so
+    the operand is compared both as written and canonicalised, against the
+    checkout both as given and canonicalised.
+    """
+    if not operand.startswith("/") or ".." in operand.split("/"):
+        return False
+    try:
+        paths = {Path(operand), _canonical(Path(operand))}
+        checkouts = {assigned, _canonical(assigned)}
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not any(
+        path == checkout or _is_inside(path, checkout) or _is_inside(checkout, path)
+        for path in paths
+        for checkout in checkouts
     )
-    return isinstance(log, _PathLog) and _tests_only_outside(log)
+
+
+def _names_measurement_program(command: str) -> bool:
+    """Whether any program position in the entry names a measurement program.
+
+    Such an entry is out-of-checkout context only through the allowlist,
+    never through the test-runner predicate (#2052).  Wrappers and managed
+    ``run-tests`` inner commands are searched too; an entry the clause
+    splitter refuses counts as a measurement, which can only refuse more.
+    """
+
+    def search(text: str, depth: int) -> bool:
+        try:
+            clauses = _clauses_for_entry(text, "structured")
+        except AgentLoopError:
+            return True
+        for clause in clauses:
+            tokens = clause.tokens
+            positions, head = _program_position_indices(tokens)
+            indices = set(positions) | ({head} if head is not None else set())
+            if any(
+                0 <= index < len(tokens)
+                and _program_basename(tokens[index]) in _MEASUREMENT_PROGRAMS
+                for index in indices
+            ):
+                return True
+            try:
+                managed = parse_managed_test_command(
+                    tokens, allow_command_name_launcher=True
+                )
+            except (ValueError, TestRuntimeConfigurationError):
+                managed = None
+            if managed is not None and depth < 8 and search(
+                shlex.join(managed.inner_argv), depth + 1
+            ):
+                return True
+        return False
+
+    try:
+        shlex.split(command)
+    except ValueError:
+        # Malformed quoting defeats program-position parsing (a quoted
+        # launcher hides the managed inner command), so any word naming a
+        # measurement program counts.
+        if any(
+            _program_basename(_strip_wrap(word)) in _MEASUREMENT_PROGRAMS
+            for word in command.split()
+        ):
+            return True
+    return search(command, 0)
+
+
+def _allowlisted_measurement_operands(command: str) -> list[str] | None:
+    """Operands of an entry that matches the measurement allowlist shape.
+
+    The program, bare or after ``agent-loop run-tests [--timeout-seconds N]
+    --`` (the launcher is recognised only in that leading position), must be
+    one of :data:`_MEASUREMENT_PROGRAMS`; every option must be an
+    allowlisted flag (or, for ``find``, ``-type``/``-maxdepth``/
+    ``-mindepth`` with a literal value); and no word may contain shell
+    syntax, so a ``cd``, an assignment, a pipeline, a quote, a glob or an
+    expansion all return ``None``.
+    """
+    words = _measurement_words(command)
+    if not words or words[0] not in _MEASUREMENT_PROGRAMS:
+        return None
+    short_flags, long_flags = _MEASUREMENT_PROGRAMS[words[0]]
+    args = words[1:]
+    if words[0] == "find":
+        return _find_measurement_operands(args)
+    return _flag_measurement_operands(args, short_flags, long_flags)
+
+
+def _is_outside_measurement(command: str, *, assigned: Path) -> bool:
+    """Whether ``command`` is an allowlisted read-only measurement of outside paths.
+
+    Every operand must be a plain absolute path outside the checkout.
+    """
+    operands = _allowlisted_measurement_operands(command)
+    return bool(operands) and all(
+        _is_plain_outside_path(operand, assigned) for operand in operands
+    )
+
+
+def _is_plain_inside_path(operand: str, assigned: Path) -> bool:
+    """A literal relative path with no ``..``, or an absolute path in the checkout."""
+    if ".." in operand.split("/"):
+        return False
+    if not operand.startswith("/"):
+        return True
+    try:
+        path = Path(operand)
+        canonical_checkout = _canonical(assigned)
+        resolved = _canonical(path)
+        written_inside = any(
+            path == checkout or _is_inside(path, checkout)
+            for checkout in {assigned, canonical_checkout}
+        )
+        return written_inside and (
+            resolved == canonical_checkout or _is_inside(resolved, canonical_checkout)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _is_inside_measurement(command: str, *, assigned: Path) -> bool:
+    """Whether a measurement entry provably measures only the checkout.
+
+    The mirror of :func:`_is_outside_measurement`: the same allowlist
+    shape, with every operand a plain path inside the checkout (or none,
+    which measures the confined working directory).  A measurement entry
+    that is neither is refused and re-asked (#2052), so a relative path
+    leaving the checkout (``../scratch``), a glob, or an operand the shell
+    would expand can never be kept as an in-checkout entry.
+    """
+    operands = _allowlisted_measurement_operands(command)
+    return operands is not None and all(
+        _is_plain_inside_path(operand, assigned) for operand in operands
+    )
 
 
 def _tests_only_outside(log: "_PathLog") -> bool:

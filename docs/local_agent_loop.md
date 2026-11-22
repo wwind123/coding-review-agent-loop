@@ -6514,7 +6514,33 @@ nothing but outside targets is context. An entry that names an outside path
 but may also test the checkout -- mixed operands, an outside config or ignore
 path, or a working directory the guard cannot track -- is refused with a
 message telling the coder to report the in-checkout run and the baseline as
-separate commands. A managed-broker run whose
+separate commands. A read-only measurement of outside paths tests nothing and
+is out-of-checkout context too, for example
+`du -sk /tmp/coding-review-agent-loop/scratch/<dir>` (#2052). The rule is a
+narrow allowlist that never models the shell: the program, bare or after
+`agent-loop run-tests [--timeout-seconds N] --`, must be one of `du`, `ls`,
+`wc`, `stat`, `find`, `sha256sum`, `md5sum`, `file` or `df`; every option must
+be a listed flag that takes no value (for `find`, only `-type <letter>`,
+`-maxdepth <n>`, `-mindepth <n>`, `-print`, `-print0`, `-empty`, `-o`, `-a`
+and `-not`); and every operand must be a plain absolute path outside the
+checkout, not an ancestor of it, and with no `..`. No word may contain
+`$`, a backtick, `~`, a quote, a backslash, a glob or brace character, `=`,
+`::` or a shell operator, and nothing (no `cd`, `-C`, assignment or wrapper)
+may precede the program. Paths are compared as written and canonicalised, so
+an outside symlink into the checkout is never accepted. The allowlist is the
+only route to context for an entry that names one of those programs anywhere
+(including after a wrapper, in `sh -c`, or beside a test runner): such an entry
+that fails the rule is refused. It is kept as an in-checkout entry only when
+it has the same allowlist shape with every operand a plain path inside the
+checkout, or no operand at all (`du -sk`, `du -sk tests`); so `du -sk "$DIR"`,
+`du -sk ../scratch`, `du -sk *`, an unbalanced quote, or a measurement chained
+after a test runner is refused and re-asked even though it records no outside
+path. The launcher variable is exempt only as the leading launcher. Entries
+without a measurement program keep the existing classification above.
+A refused
+`tests_run` entry earns the coder's single semantic-evidence re-ask: the
+re-ask quotes the refusal and asks for a corrected `tests_run`, and a second
+refusal stops the turn. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
 evidence, so it can never back a verified row. On the failure side the
