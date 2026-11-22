@@ -31,6 +31,7 @@ from .plan_round_closure import (
 from .round_metadata import (
     PostedRoundRecord,
 )
+from .signed_input_record import is_supersession_boundary
 from .round_state import (
     _extract_round_metadata_records,
 )
@@ -435,14 +436,29 @@ def _compute(
     context: RecoveryVisibilityContext | None = None,
     boundary: int | None = None,
 ) -> PartialRoundRecovery:
+    round_records = _extract_round_metadata_records(comments, flow=flow)
     if flow == "plan" and _reconciling_summaries(
-        _extract_round_metadata_records(comments, flow=flow),
+        round_records,
         flow=flow, round_number=round_number, subject=subject,
     ):
         return PartialRoundRecovery(
             verified=False,
             reason=(f"Planning round {round_number} is reconciled and closed; "
                     f"resume necessary fresh reviews in round {round_number + 1}. "
+                    "Do not delete historical reviews or attachments."),
+        )
+    if flow == "pr" and any(
+        is_supersession_boundary(record.metadata)
+        and record.metadata.round_number == round_number
+        and record.metadata.subject == subject
+        for record in round_records
+    ):
+        # A signed-input supersession record closed the round (#2054): its
+        # reviews are history and never deletion targets.
+        return PartialRoundRecovery(
+            verified=False,
+            reason=(f"PR round {round_number} was closed by a signed-input supersession "
+                    f"record; resume opens round {round_number + 1}. "
                     "Do not delete historical reviews or attachments."),
         )
     gate_indices, opening_targets = _frame(

@@ -2478,3 +2478,50 @@ def test_extracted_metadata_board_contexts_share_identity_and_reset():
         finally:
             resetter(token)
         assert replay() == record
+
+
+def _supersession_records(*, malformed=False):
+    from coding_review_agent_loop.signed_input_record import (
+        SIGNED_INPUT_SUPERSESSION_PHASE, decode_supersession_payload,
+    )
+    head = "a" * 40
+    a, b = "hr-" + "a" * 64, "hr-" + "b" * 64
+    reviewer = lambda agent, state: PostedRoundMetadata(
+        flow="pr", role="reviewer", agent=agent, round_number=2, subject=head, state=state,
+        phase="publication", surfaced_reviewer_requirement_ids=(a,))
+    payload = decode_supersession_payload({
+        "round": 2, "head": head,
+        "superseded": [{"agent": "Codex", "comment_id": 11, "route": "carrier"},
+                       {"agent": "Gemini", "comment_id": 12, "route": "edit-history"}],
+        "previous_requirement_ids": [a], "requirement_ids": [a, b], "item_number_high_water": 4,
+    }, round_number=2, subject=head)
+    supersession = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject=head,
+        phase=SIGNED_INPUT_SUPERSESSION_PHASE, surfaced_reviewer_requirement_ids=(a, b),
+        signed_input_supersession=None if malformed else payload)
+    bodies = [
+        _attach_round_metadata("Codex approves.", reviewer("Codex", "approved")),
+        _attach_round_metadata("Gemini blocks.", reviewer("Gemini", "blocking")),
+        _attach_round_metadata("Round 2 superseded by new signed input.", supersession),
+    ]
+    return head, [SimpleNamespace(body=body) for body in bodies]
+
+
+def test_supersession_record_closes_round_on_resume_after_interruption():
+    """`interrupt-after-boundary` (#2054): an admitted record closes round N with no
+    completed reviews, so the rerun rolls over without a second record."""
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    head, comments = _supersession_records()
+    resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex", "gemini"))
+    assert resumed.round_number == 2 and resumed.reconciled
+    assert resumed.completed_reviews == ()
+    assert resumed.reconciliation_record.index == 2
+    assert resumed.reconciliation_record.metadata.signed_input_supersession["item_number_high_water"] == 4
+
+
+def test_malformed_supersession_payload_never_closes_the_round():
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    head, comments = _supersession_records(malformed=True)
+    resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex", "gemini"))
+    assert resumed.reconciliation_record is None
+    assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}

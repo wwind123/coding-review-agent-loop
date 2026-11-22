@@ -161,7 +161,8 @@ def test_conflicting_classification_gets_one_real_continuation(resolved):
             run()
         message = str(error.value)
         assert f"{SOURCE.requirement_id}: Codex: mixed, Gemini: code" in message
-        assert "follow-up signed comment that separates exact-head evidence answers from code requirements" in message
+        assert "Post a new follow-up signed comment (do not edit the existing signed comment) that separates exact-head evidence answers from code requirements" in message
+        assert "opens a fresh review round against the added source" in message
         assert "no coder was dispatched" in message
     assert len(calls) == 1
     assert "Agreement is decided by role" in calls[0]

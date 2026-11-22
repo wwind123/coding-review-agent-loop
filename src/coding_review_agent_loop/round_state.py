@@ -249,6 +249,7 @@ def _select_current_round_records(
     )
 
 
+from .signed_input_record import is_supersession_boundary
 from .plan_round_closure import (
     _plan_round_is_reconciled,
     project_plan_history,
@@ -299,7 +300,8 @@ def inert_post_reconciliation_checkpoint_indexes(
     for record in sorted(records, key=lambda item: item.index):
         metadata = record.metadata
         key = (metadata.round_number, metadata.subject)
-        if metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata):
+        if (metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata)) \
+                or is_supersession_boundary(metadata):
             closed.add(key)
         elif metadata.phase in _PR_ROUND_REOPENING_PHASES:
             closed.discard(key)
@@ -318,11 +320,47 @@ def _is_inert_post_reconciliation_checkpoint(
     return record.index in inert_indexes
 
 
+def superseded_review_indexes(
+    records: Sequence[round_metadata.PostedRoundRecord],
+) -> frozenset[int]:
+    """Indexes of PR reviewer records closed by a later supersession record (#2054).
+
+    A signed-input supersession record closes its round at its head: every
+    reviewer record of that round and head published before it is history
+    only: readers that drop inert records (resume, panel evidence and
+    scheduler history) never see it.  Approval carry already rejects it,
+    because it does not cover the grown signed set.
+    """
+    boundaries = [
+        (record.index, record.metadata.round_number, record.metadata.subject)
+        for record in records
+        if is_supersession_boundary(record.metadata)
+    ]
+    if not boundaries:
+        return frozenset()
+    return frozenset(
+        record.index
+        for record in records
+        if record.metadata.flow == "pr"
+        and record.metadata.role == "reviewer"
+        and any(
+            record.index < index
+            and record.metadata.round_number == round_number
+            and record.metadata.subject == subject
+            for index, round_number, subject in boundaries
+        )
+    )
+
+
 def drop_inert_post_reconciliation_checkpoints(
     records: Sequence[round_metadata.PostedRoundRecord],
 ) -> tuple[round_metadata.PostedRoundRecord, ...]:
-    """``records`` without the inert post-reconciliation checkpoints (#1553)."""
-    inert = inert_post_reconciliation_checkpoint_indexes(records)
+    """``records`` without the inert post-reconciliation checkpoints (#1553).
+
+    Reviews superseded by a signed-input supersession record (#2054) are
+    dropped as well: they are history only for every authority reader.
+    """
+    inert = inert_post_reconciliation_checkpoint_indexes(records) | superseded_review_indexes(records)
     if not inert:
         return tuple(records)
     return tuple(
@@ -2168,6 +2206,12 @@ def _resume_pr_round_from_records(
         if (
             metadata.role == "summary"
             and metadata.phase == "reconciliation"
+            and metadata.round_number == anchor_metadata.round_number
+            and metadata.subject == head_sha
+            and record.index > reopened_below
+        ) or (
+            # A signed-input supersession record closes the round (#2054).
+            is_supersession_boundary(metadata)
             and metadata.round_number == anchor_metadata.round_number
             and metadata.subject == head_sha
             and record.index > reopened_below

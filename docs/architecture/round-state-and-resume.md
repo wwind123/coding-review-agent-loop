@@ -181,7 +181,43 @@ boundary are deletion targets. Publications after the boundary remain peers.
 A posted review that resume rejects keeps the deletion-only refusal, but the
 refusal names the failing predicate (changed signed requirement set, reconciled
 round, approved-plan, acquisition or seat-binding change), except where the
-classification-only resume below admits it (#2035).
+classification-only resume below admits it (#2035), or where the signed set
+only grew (#2054).
+
+When every published review of an unreconciled same-head round is
+rejected only because the signed requirement set grew
+since publication (a strict digest superset,
+with the same round, head, seat binding, approved plan and acquisition
+identity), and every such review proves its publication unedited, resume posts
+a tool-owned `signed-input-supersession` Orchestrator summary before any
+scheduling record or reviewer launch, then takes the closed-round rollover
+into round N+1 (`signed_input_supersession.py`). A review proves it is
+unedited either through its frozen spool carrier on this host, which must
+classify `complete` against the actor-bound listing with exactly the record's
+anchor and sidecar comment IDs, or, without a carrier, through GitHub edit
+history showing that its anchor and sidecars were never edited. A partly
+public carrier of another reviewer, a malformed or legacy spool record, an
+unreadable history, an edit, a withdrawn or edited signed source (an ID
+missing from the live set), a capture-scoped round, an evidence boundary or a
+recovery, conflict, evidence or conversion pass keeps today's refusal. The
+record carries the ledger resume rebuilt for round N (its input ledger plus the
+durable evidence requests resume already restores for reviews invalidated by
+new input, so a signed answer can clear them, #1922), the superseded reviewers
+(agent, anchor comment ID, integrity route), the old and new surfaced IDs and
+the item-number high-water mark. On a board of two or more reviewers one
+public review is already a peer for every reviewer still to launch. A
+one-reviewer board rolls over only when its published review's carrier is
+still spooled, because that carrier cannot be resumed against the grown set;
+without a carrier its fresh same-round turn already applies. A malformed payload never closes a round. On
+resume the record closes round N like a reconciliation with no completed
+reviews, so an interrupted rerun rolls over without a second record. Reviewer
+records it supersedes are inert for resume, panel evidence and scheduler
+history (`drop_inert_post_reconciliation_checkpoints`); approval carry already
+rejects them. They stay on GitHub as history, add no votes, dispositions or
+new findings, and partial-round recovery lists no deletion target for the
+round. The rollover consumes one round of the budget: with none left the
+ordinary round-limit stop fires and nothing is posted. Managed-CI
+authorization and qualification records are untouched.
 It reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
 round and history-wide numbering into a fresh review on the new head without

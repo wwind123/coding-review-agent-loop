@@ -327,14 +327,62 @@ def test_2035_changed_requirement_set_refuses_with_named_cause(tmp_path, change)
     assert current != set(rids)
     before = len(runner.commands)
     runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)], hr=True)]
+    if change == "added":
+        # Pure growth now rolls over into round 2 instead of refusing (#2054).
+        runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)],
+                                                    reviewer="Google Gemini", hr=True)]
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert any("superseded by new signed input" in c for c in runner.comments)
+        assert not any("Delete these" in c for c in runner.comments)
+        assert _no_deletes(runner)
+        return
     with pytest.raises(PartialReviewRoundError) as error:
         run_pr_loop(runner, pr_number=77, config=config)
     message = str(error.value)
     assert "Codex's own review for this round is already posted but no longer accepted" in message
     assert "the signed requirement set changed since publication" in message
-    expected_word = {"added": "added", "edited": "added", "withdrawn": "withdrawn"}[change]
+    expected_word = {"edited": "added", "withdrawn": "withdrawn"}[change]
     assert expected_word in message.split("signed requirement set changed since publication", 1)[1]
     # No fresh turn beside public peers, and no classification continuation.
     assert not any(cmd[:1] in (["codex"], ["gemini"]) for cmd, _ in runner.commands[before:])
     assert runner.codex_outputs
     assert _no_deletes(runner)
+
+
+def _supersession_meta():
+    from coding_review_agent_loop.signed_input_record import (
+        SIGNED_INPUT_SUPERSESSION_PHASE, decode_supersession_payload,
+    )
+    a, b = "hr-" + "a" * 64, "hr-" + "b" * 64
+    return PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=ROUND, subject=HEAD,
+        phase=SIGNED_INPUT_SUPERSESSION_PHASE, surfaced_reviewer_requirement_ids=(a, b),
+        signed_input_supersession=decode_supersession_payload({
+            "round": ROUND, "head": HEAD,
+            "superseded": [{"agent": name, "comment_id": None, "route": "edit-history"} for name in REVIEWERS],
+            "previous_requirement_ids": [a], "requirement_ids": [a, b], "item_number_high_water": 0,
+        }, round_number=ROUND, subject=HEAD),
+    )
+
+
+def test_superseded_round_lists_no_deletion_target():
+    """`recovery-listing-closed` (#2054): a round closed by a signed-input
+    supersession record keeps its reviews as history."""
+    history = _History()
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    codex = history.add_record(_meta(agent="Codex"), text="Codex approves.")
+    gemini = history.add_record(_meta(agent="Gemini"), text="Gemini blocks.")
+    assert _supersession_meta().signed_input_supersession is not None
+    # Without the record the round's reviews are deletion targets today.
+    before = _recover(history.comments, history.comments, resolver=None)
+    assert history.ids([codex, gemini]) <= _listed(before)
+    boundary = history.add_record(_supersession_meta(), text="Round superseded by new signed input.")
+    recovery = _recover(history.comments, history.comments, resolver=None)
+    assert recovery.targets == () and recovery.uncertain == ()
+    assert not recovery.verified and "signed-input supersession" in recovery.reason
+    assert "Do not delete" in recovery.reason
+    # The resume walk closes the round from the record with no completed reviews.
+    resumed = _resume_pr_round(history.comments, head_sha=HEAD, configured_reviewers=("codex", "gemini"),
+                               reconciliation_mode="aggregate", trusted_actor=ACTOR)
+    assert resumed.round_number == ROUND and resumed.reconciled and resumed.completed_reviews == ()
+    assert resumed.reconciliation_record.index == boundary

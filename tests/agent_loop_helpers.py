@@ -1489,6 +1489,26 @@ class FakeRunner(Runner):
                         "merge_base_commit": {"sha": tip if self.compare_status == "behind" else "d" * 40 if self.compare_status == "diverged" else head}}
                 return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
 
+        paginated_comments = (
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=100", cmd[3])
+            if cmd[:3] == ["gh", "api", "--paginate"] and len(cmd) == 4
+            else None
+        )
+        if paginated_comments is not None and paginated_comments.group(1) == str(self.pr_payload.get("number", 77)):
+            # Managed-CI continuity (#2054 tests) reads the PR's REST comment
+            # history as one flat paginated array; serve the same REST shape.
+            rows, page = [], 1
+            while True:
+                result = self._run_locked(["gh", "api", f"{cmd[3]}&page={page}"], cwd=cwd, check=check,
+                                          input_text=input_text)
+                if result.returncode != 0:
+                    return result
+                batch = json.loads(result.stdout or "[]")
+                rows.extend(batch)
+                if len(batch) < 100:
+                    return CommandResult(cmd, cwd_path, json_dumps(rows), "", 0)
+                page += 1
+
         rest_comments = (
             re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)(?:&since=[^&]+)?", cmd[2])
             if cmd[:2] == ["gh", "api"] and len(cmd) > 2
@@ -1543,6 +1563,29 @@ class FakeRunner(Runner):
             return CommandResult(
                 cmd, cwd_path, json_dumps(self._issue_payload_for(number)), "", 0
             )
+
+        if cmd[:3] == ["gh", "api", "graphql"] and any(
+            "SignedInputEditHistory" in part for part in cmd[3:]
+        ):
+            # PR comment edit history (#2054).  A comment may set
+            # ``_edit_history`` to a node override, or ``None`` for an
+            # unreadable history; the default is a never-edited comment.
+            self.edit_history_calls = getattr(self, "edit_history_calls", 0) + 1
+            number = self.pr_payload.get("number", 77)
+            comments = self.pr_payload.get("comments", [])
+            self._ensure_fixture_comment_ids(comments, number)
+            nodes = []
+            for comment in comments:
+                node = {"databaseId": comment.get("id", comment.get("databaseId")),
+                        "lastEditedAt": None, "includesCreatedEdit": False,
+                        "userContentEdits": {"totalCount": 0, "nodes": []}}
+                if "_edit_history" in comment:
+                    override = comment["_edit_history"]
+                    node = {"databaseId": node["databaseId"]} if override is None else {**node, **override}
+                nodes.append(node)
+            payload = {"data": {"repository": {"pullRequest": {"comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}}
+            return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:3] == ["gh", "api", "graphql"]:
             self.pr_commit_calls += 1
