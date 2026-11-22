@@ -314,6 +314,13 @@ class PostedRoundMetadata:
     # on PR coder follow-up records and omitted from the encoding when None,
     # so historical records decode unchanged and re-encode byte-identically.
     followup_dispatch_head: str | None = None
+    # Orchestrator-owned coder record provenance (#2086): ``degraded`` (invalid
+    # fields dropped) or ``synthesized`` (built from git); the bounded notes
+    # name what was dropped, and ``human_requirements_degraded`` keeps the
+    # acknowledgement obligation open.  All omitted when unset.
+    coder_record_source: str | None = None
+    coder_record_degradations: tuple[str, ...] = ()
+    human_requirements_degraded: bool = False
     # Human-only exact-head evidence (#1068).  ``evidence_requests`` is the
     # reviewer's parsed request list, written on the reviewer record itself so
     # a deferred request is durable from the moment that record is posted.
@@ -467,6 +474,7 @@ class PostedRoundMetadata:
             self.followup_dispatch_head
         ):
             raise ValueError("invalid followup_dispatch_head: expected a hex Git commit SHA")
+        _validate_coder_record_provenance(self)
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -2406,6 +2414,12 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.followup_dispatch_head is not None:
         payload["followup_dispatch_head"] = metadata.followup_dispatch_head
+    if metadata.coder_record_source is not None:
+        payload["coder_record_source"] = metadata.coder_record_source
+    if metadata.coder_record_degradations:
+        payload["coder_record_degradations"] = list(metadata.coder_record_degradations)
+    if metadata.human_requirements_degraded:
+        payload["human_requirements_degraded"] = True
     if metadata.evidence_stall is not None:
         payload["evidence_stall"] = dict(metadata.evidence_stall)
     if metadata.step_back_entries:
@@ -2661,6 +2675,60 @@ def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
     if not _is_followup_dispatch_head(value):
         raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
     return str(value)
+
+
+CODER_RECORD_SOURCES = frozenset({"structured", "degraded", "synthesized"})
+MAX_CODER_RECORD_DEGRADATIONS = 16
+MAX_CODER_RECORD_DEGRADATION_CHARS = 300
+
+
+def _validate_coder_record_provenance(metadata: "PostedRoundMetadata") -> None:
+    source, notes = metadata.coder_record_source, metadata.coder_record_degradations
+    if source is None and not notes and not metadata.human_requirements_degraded:
+        return
+    if metadata.role != "coder" or metadata.flow != "pr":
+        raise ValueError("coder record provenance is only valid on PR coder records")
+    if source is not None and source not in CODER_RECORD_SOURCES:
+        raise ValueError("invalid coder_record_source")
+    if len(notes) > MAX_CODER_RECORD_DEGRADATIONS or any(
+        not isinstance(note, str) or not note or len(note) > MAX_CODER_RECORD_DEGRADATION_CHARS
+        or "<!--" in note or "-->" in note
+        for note in notes
+    ):
+        raise ValueError("coder_record_degradations must be bounded orchestrator notes")
+    if not isinstance(metadata.human_requirements_degraded, bool):
+        raise ValueError("human_requirements_degraded must be a boolean")
+
+
+def _decode_coder_record_provenance(payload: Mapping[str, object]) -> dict[str, object]:
+    # Absent is historical; a present malformed value is rejected, never read
+    # as absence.  A forged true flag can only keep an obligation open.
+    fields: dict[str, object] = {}
+    if "coder_record_source" in payload:
+        fields["coder_record_source"] = payload["coder_record_source"]
+    if "coder_record_degradations" in payload:
+        notes = payload["coder_record_degradations"]
+        if not isinstance(notes, list):
+            raise ValueError("coder_record_degradations must be a list")
+        fields["coder_record_degradations"] = tuple(notes)
+    if "human_requirements_degraded" in payload:
+        if payload["human_requirements_degraded"] is not True:
+            raise ValueError("human_requirements_degraded must be true when present")
+        fields["human_requirements_degraded"] = True
+    return fields
+
+
+def render_coder_record_degradations_section(metadata: "PostedRoundMetadata") -> str | None:
+    """The visible orchestrator note for a degraded or synthesized coder record."""
+    if metadata.coder_record_source not in {"degraded", "synthesized"} and not metadata.coder_record_degradations:
+        return None
+    heading = "### Orchestrator degradation notes"
+    lead = (
+        "> The coder response was rejected after the head moved; dropped fields do not "
+        "count as claims (not addressed, not evidence)."
+    )
+    lines = [heading, "", lead, *(f"- {note}" for note in metadata.coder_record_degradations)]
+    return "\n".join(lines)
 
 
 STEP_BACK_PHASES = frozenset({"plan", "pr"})
@@ -3116,6 +3184,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_board_identity=_decode_board_object(payload, "plan_board_identity"),
             plan_board_binding_init=_decode_board_object(payload, "plan_board_binding_init"),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            **_decode_coder_record_provenance(payload),
             evidence_stall=_decode_evidence_stall(payload),
             **_decode_conversion_fields(payload),
             signed_input_supersession=(
@@ -3277,6 +3346,9 @@ def _attach_round_metadata(
         )
         if sub_item_records is not None and sub_item_records not in str(body):
             body = _insert_before_trailing_markers(str(body), sub_item_records)
+    coder_record_notes = render_coder_record_degradations_section(metadata)
+    if coder_record_notes is not None and coder_record_notes not in str(body):
+        body = _insert_before_trailing_markers(str(body), coder_record_notes)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():

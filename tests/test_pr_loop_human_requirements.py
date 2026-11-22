@@ -282,6 +282,7 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
         max_rounds=2,
         agent_max_retries=0,
     )
+    runner.advance_pr_head_on_coder_followup = False  # a pushed head gets a degraded record (#2086)
 
     with pytest.raises(
         AgentLoopError,

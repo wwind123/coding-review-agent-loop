@@ -590,9 +590,12 @@ Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
 behavior in detail.
 
-If `agent-loop pr <number>` refuses to resume because a coder follow-up pushed a
-commit and was then rejected (or the PR head otherwise advanced without a
-recorded handoff), rerun with `--review-unrecorded-head`. It runs an ordinary
+A coder follow-up that pushes a commit and is then rejected no longer leaves the
+head unrecorded: the loop posts a degraded coder record (invalid fields dropped
+and noted) or, when nothing parses, a git-synthesized one, and reviews the new
+head. If `agent-loop pr <number>` still refuses to resume because the PR head
+advanced without a recorded handoff (for example from an earlier release),
+rerun with `--review-unrecorded-head`. It runs an ordinary
 review round of the current head with the recorded active items carried, never
 force-pushes, and never posts a record in the coder's name. The flag takes
 effect whenever it is given: it also skips a pending coder recovery at the

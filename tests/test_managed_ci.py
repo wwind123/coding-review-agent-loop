@@ -15480,6 +15480,14 @@ def _pr_loop_stubs_1367(monkeypatch, handoff_box, events):
     ), "post_pr_comment", post_and_stop)
 
 
+def _legacy_rejection_writer_2086(monkeypatch):
+    """Simulate a pre-#2086 release whose post-push rejection wrote the legacy
+    rejected-follow-up record; the #1367 recovery chain stays readable."""
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
+
+
 @pytest.mark.parametrize("predecessor_review", ["real", "absent", "foreign"])
 def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh_grant(
     tmp_path, monkeypatch, predecessor_review,
@@ -15491,6 +15499,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     the original authorization.  The recovery coder pushes H2; continuity
     H1 -> H2 publishes only when the real predecessor review is correlated.
     """
+    _legacy_rejection_writer_2086(monkeypatch)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=5,
@@ -15714,6 +15723,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     qualification snapshot refuses before any dispatch, qualification or
     merge.
     """
+    _legacy_rejection_writer_2086(monkeypatch)
     config_a = _m1376_seat_config(tmp_path, "gpt-a")
     runner = _RecoveryRoundCommentRunner1367(
         issue_events=[label_event()], authenticated_actor=("agent-loop", 1),
@@ -16877,3 +16887,136 @@ def test_readiness_owner_probe_failure_is_read_only(monkeypatch, tmp_path, paylo
     assert not readiness.workflow_v2
     probe.assert_called_once_with(runner, context, 'repos/OWNER/REPO')
     runner.run.assert_not_called()
+
+
+# --- #2086: issue-created continuity after a degraded coder record ---------
+
+
+def _degraded_round_comment(comment_id, *, subject, round_number, source):
+    return {
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                coder_record_source=source,
+                coder_record_degradations=("Dropped unknown item ID(s) `item-99`; they are not addressed.",),
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("source", ["degraded", "synthesized"])
+def test_continuity_correlation_finds_a_degraded_coder_record_and_publishes(tmp_path, source):
+    """Row managed-continuity-degraded: the ordinary correlation, no legacy recovery shape."""
+    new_head = "e9bff449de155dd0be5fd76276214538b0dfd315"
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.intent_comments.extend([
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _degraded_round_comment(89, subject=new_head, round_number=2, source=source),
+    ])
+    runner.rest_pr["head"]["sha"] = new_head
+
+    selected = _managed_ci_authorization.find_actor_round_metadata_comment_ids(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head=new_head, round_number=1,
+        after_comment_id=initial.authorization_comment_id or 0,
+    )
+    assert selected == (88, 89)
+    continued = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=initial,
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head=new_head,
+        round_comment_ids=selected,
+    )
+    assert continued.authorization_kind == "continuity"
+    assert continued.head_sha == new_head
+
+
+def test_degraded_follow_up_publishes_issue_created_continuity_in_the_pr_loop(tmp_path, monkeypatch):
+    """Row managed-continuity-degraded through the real PR-loop coder seam."""
+    unknown = structured_coder_followup(
+        summary="Repaired.", addressed_items=["item-1", "item-99"], reviewer="Anthropic Claude",
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="A repair is required.",
+                blocking_items=["Fix the managed recovery edge case."],
+            ),
+        ],
+        claude_outputs=[unknown],
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="root",
+        authorization_kind="creation", authorization_comment_id=17,
+    )
+    selected, published = [], []
+
+    class _Published(Exception):
+        pass
+
+    def select(*_args, **kwargs):
+        # The degraded coder record is already posted on the new head.
+        records = [
+            metadata for comment in runner.pr_payload["comments"]
+            if (match := re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<p>[A-Za-z0-9+/=_:-]+)\s*-->", comment["body"]))
+            and (metadata := _decode_round_metadata_2086(match.group("p"))).role == "coder"
+        ]
+        selected.append((kwargs, records))
+        # Ordinary correlation: no legacy rejected-recovery chain inputs.
+        assert "fresh_comment_id" not in kwargs and "authorization_records" not in kwargs
+        return (88, 89)
+
+    def publish(*_args, **kwargs):
+        published.append(kwargs)
+        raise _Published
+
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(
+        pr_loop, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "find_actor_round_metadata_comment_ids", select)
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=2,
+    )
+
+    with pytest.raises(_Published):
+        pr_loop.run_pr_loop(
+            runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+            managed_ci_issue_number=56,
+        )
+
+    ((kwargs, coder_records),) = selected
+    new_head = runner.pr_payload["headRefOid"]
+    assert kwargs["predecessor_head"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert kwargs["new_head"] == new_head
+    assert [(m.subject, m.coder_record_source) for m in coder_records] == [(new_head, "degraded")]
+    assert published[0]["round_comment_ids"] == (88, 89)
+    assert published[0]["new_head"] == new_head
+
+
+def _decode_round_metadata_2086(payload):
+    from coding_review_agent_loop.round_metadata import _decode_round_metadata
+
+    return _decode_round_metadata(payload)

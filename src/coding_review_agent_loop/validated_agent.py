@@ -29,6 +29,7 @@ from .errors import (
     PreservedUnsatisfiedResponse,
     NonRepairableEvidenceRejection,
     QuotaResetExceededError,
+    RejectedCandidate,
     ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
     MissingJudgementFieldError,
@@ -1270,6 +1271,9 @@ def _run_validated_agent_in_scope(
             "together with its strict re-parse."
         )
     validation_acquisition: AgentResult | None = None
+    # The last candidate text parsed, with the acquisition it was parsed
+    # under; carried on the final rejection for post-push degradation (#2086).
+    last_candidate: tuple[str, AgentResult | None] | None = None
     # The last response refused for an unsatisfied architecture-impact
     # contract.  It is retained and surfaced, never silently discarded.
     preserved_unsatisfied: PreservedUnsatisfiedResponse | None = None
@@ -1332,6 +1336,8 @@ def _run_validated_agent_in_scope(
         return result
 
     def parse_response(text: str) -> object:
+        nonlocal last_candidate
+        last_candidate = (text, validation_acquisition)
         return _with_validation_context(
             response_validator, runner=runner, acquisition=validation_acquisition
         )(text)
@@ -3732,6 +3738,17 @@ def _run_validated_agent_in_scope(
         plan_validation_exhaustion=plan_validation_exhaustion,
         preserved_unsatisfied_response=preserved_unsatisfied,
         bounded_replan_rejection=bounded_replan_rejection,
+        rejected_candidate=(
+            RejectedCandidate(
+                text=last_candidate[0],
+                test_turn_id=getattr(last_candidate[1], "test_turn_id", None),
+                test_turn_observations=tuple(getattr(last_candidate[1], "test_turn_observations", ()) or ()),
+                session_id=getattr(last_candidate[1], "session_id", None),
+                model_used=getattr(last_candidate[1], "model_used", None),
+            )
+            if last_candidate is not None and last_candidate[1] is not None
+            else None
+        ),
     )
     if (
         plan_validation_failure_handler is not None

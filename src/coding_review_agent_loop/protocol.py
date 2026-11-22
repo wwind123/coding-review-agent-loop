@@ -1623,7 +1623,15 @@ def validate_structured_human_requirements_acknowledgement(
     marker_present: bool = True,
     section_present: bool = True,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    degraded_unacknowledged: bool = False,
 ) -> None:
+    """Validate a structured acknowledgement.
+
+    ``degraded_unacknowledged`` is passed only for an orchestrator-degraded
+    coder record (#2086): it skips only the missing direct-discussion
+    acknowledgement raise, so the record says "not acknowledged" instead of
+    fabricating the acknowledgement.
+    """
     if not surfaced_requirement_ids and not requires_direct_discussion_ack:
         if addressed_ids:
             _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
@@ -1710,7 +1718,7 @@ def validate_structured_human_requirements_acknowledgement(
             )
         return
 
-    if not checked_discussion_directly:
+    if not checked_discussion_directly and not degraded_unacknowledged:
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             "Coder response must acknowledge that the prompt omitted the detailed signed human requirements "
             f"and that it {HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK}."
