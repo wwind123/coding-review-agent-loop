@@ -733,6 +733,67 @@ def test_claude_completion_recovery_keeps_original_acquisition_catalog(
     assert response.acquisition_test_observations == (original_observation,)
 
 
+@pytest.mark.parametrize(
+    "recovery_session, expected_session",
+    [("sess-recovery", "sess-recovery"), (None, "sess-primary")],
+    ids=["recovery-session", "resumed-session-fallback"],
+)
+def test_completion_recovery_contract_reask_follows_the_recovered_producer(
+    tmp_path, recovery_session, expected_session
+):
+    """Review item-6: the recovered response, not the primary one, drives the re-ask."""
+    from coding_review_agent_loop.validated_agent import _CompletionRecoveryOutcome
+
+    valid = structured_issue_implementation(pr_number=77)
+    primary = AgentResult(
+        text="I'll wait for the background tests to finish.", returncode=0,
+        session_id="sess-primary", configured_model="model-a", observed_model="model-a",
+    )
+    recovered = AgentResult(
+        text="recovered but missing architecture_impact", returncode=0,
+        session_id=recovery_session, configured_model="model-a", observed_model="model-b",
+    )
+    outcome = _CompletionRecoveryOutcome(
+        validated=None, result=recovered,
+        error="the response omitted the required architecture_impact",
+        classification_text="architecture_impact contract unsatisfied",
+        failure_category="deterministic", terminal_public_response=None,
+        contract_unsatisfied=True,
+    )
+    recoveries = []
+
+    def fake_recovery(*args, **kwargs):
+        recoveries.append(kwargs["session_id"])
+        return outcome
+
+    def validate(text):
+        if text == valid:
+            return validate_structured_issue_implementation(text)
+        raise AgentLoopError("response deferred to background work")
+
+    config = make_config(tmp_path, coder="claude", claude_model="model-a", agent_max_retries=0)
+    with patch.object(validated_agent, "_attempt_claude_completion_recovery", fake_recovery), \
+        patch_object_in(
+            (validated_agent, response_validation), "run_agent_result",
+            side_effect=[primary, AgentResult(text=valid, returncode=0, session_id=expected_session)],
+        ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="claude", config=config, prompt="Finish the implementation.",
+            marker_description="structured issue implementation", validate=validate,
+            completion_recovery=CompletionRecoveryPolicy(issue_number=56),
+        )
+
+    assert response.marker_value.pr_number == 77
+    assert recoveries == ["sess-primary"]
+    assert invoke.call_count == 2
+    reask = invoke.call_args_list[1].kwargs
+    # The correction goes to the model that produced the recovered response,
+    # on the recovery's own session (or the resumed one when it has none).
+    assert reask["config"].claude_model == "model-b"
+    assert reask["session_id"] == expected_session
+    assert "re-ask 1 of 2" in reask["prompt"]
+
+
 def test_claude_self_update_replay_recovers_valid_response_with_remaining_timeout(tmp_path):
     """A spawned updater interruption gets one stable, bounded full replay."""
     identity = ExecutableIdentity("claude", "claude", (1, 1, 1), (1, 1, 1))

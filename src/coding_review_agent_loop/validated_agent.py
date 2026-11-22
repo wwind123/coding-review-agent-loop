@@ -2195,10 +2195,17 @@ def _run_validated_agent_in_scope(
                         # No terminal comment: the unmet contract goes back to
                         # the same agent through the shared re-ask budget.
                         # The resume stays attempted, so there is never a
-                        # second one.
+                        # second one.  The recovered response is the one
+                        # rejected, so its producer model and session drive
+                        # the re-ask; the resumed session is the fallback.
+                        recovery_producer = recovery_outcome.result
+                        if not recovery_producer.session_id:
+                            recovery_producer = dataclasses_replace(
+                                recovery_producer, session_id=result.session_id
+                            )
                         if schedule_reask(
                             message=recovery_outcome.error,
-                            result=result,
+                            result=recovery_producer,
                             hint_prompt=_architecture_contract_retry_prompt(
                                 prompt, recovery_outcome.error
                             ),
