@@ -59,3 +59,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-22: A closure-phase summary that does not validate (malformed payload, or a reserved obligation number naming a different ledger item) neither closes nor reconciles its round. Unrecorded-head-advance recovery after a closure boundary takes the record's ledger, including reserved evidence obligations (#2079, #2064).
 
 - 2026-11-22: A validated closure boundary counts as a coherent head-advance handoff even with an empty ledger and no coder record, so a push after it resumes as a fresh review without admitting the closed reviews (#2079, #2064).
+
+- 2026-11-22: In plan approval carry a closed-incomplete plan review supersedes that reviewer's earlier carried approval with a non-qualifying entry, matching the PR approval reader, so a stale approval never revives (#2079, #2064).

@@ -248,7 +248,10 @@ ordinary fresh review instead of refusing. On the
 plan flow `plan_round_closure.py` treats the record as settling its round:
 `project_plan_history` drops the round's plan reviews from every projected
 reader (resume, panel evidence, carried approvals, visibility) and
-`select_plan_round_anchor` anchors the ledger at the record, so resume rolls
+`select_plan_round_anchor` anchors the ledger at the record; plan approval
+carry still lets a closed plan review supersede that reviewer's earlier
+approval with a non-qualifying entry, exactly as the PR approval reader does,
+so resume rolls
 over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
 history and never approve. In this stage nothing writes the record yet.
 It reopens scheduler checkpoint admission after

@@ -931,3 +931,56 @@ def test_2064_closed_incomplete_plan_reviews_never_carry_plan_approval():
     # Control: the same approval carries while its round is open.
     assert carried((approval,)) == ("Gemini",)
     assert carried((approval, closure)) == ()
+
+
+@pytest.mark.parametrize("closed_state", ["blocking", "approved"])
+def test_2064_closed_plan_review_supersedes_an_earlier_carried_plan_approval(closed_state):
+    """Item-6: an approval of key K in round 1 never revives after the same
+    reviewer's later review of K in closed-incomplete round 2, whatever that
+    closed review's verdict; this mirrors the PR approval reader."""
+    from coding_review_agent_loop import panel_evidence
+    from coding_review_agent_loop.plan_review_scheduling import (
+        PlanCandidateKey, surfaced_requirement_id_digest,
+    )
+    from coding_review_agent_loop.round_closure import (
+        ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
+    )
+    from coding_review_agent_loop.round_metadata import PostedRoundRecord
+
+    key = PlanCandidateKey(
+        subject="a" * 64, aggregate_plan_identity="b" * 64,
+        execution_strategy_identity="c" * 32, risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest=surfaced_requirement_id_digest(("req-1",)),
+    )
+
+    def review(index, round_number, state):
+        return PostedRoundRecord(index=index, body="Gemini plan review.", metadata=PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Gemini", round_number=round_number,
+            subject=key.subject, state=state, plan_candidate_key=key.as_dict(),
+            surfaced_reviewer_requirement_ids=("req-1",),
+        ))
+
+    closure = PostedRoundRecord(index=3, body="Planning round 2 closed, incomplete.", metadata=PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=2, subject=key.subject,
+        phase=ROUND_CLOSED_INCOMPLETE_PHASE,
+        round_closure=build_round_closure_payload(
+            flow="plan", round_number=2, subject=key.subject,
+            published=[("Gemini", None)], unreplayable=[("Codex", "spool outcome missing")],
+            item_number_high_water=0,
+        ),
+    ))
+    assert closure.metadata.round_closure is not None
+    earlier, later = review(1, 1, "approved"), review(2, 2, closed_state)
+
+    def carried(records):
+        return panel_evidence._carried_plan_approvals(
+            records, current_key=key, required_reviewers=("Codex", "Gemini"),
+            surfaced_requirement_ids=("req-1",),
+            panel_evidence=panel_evidence.PlanPanelEvidence(opening_index=0, opening_source="operator"),
+            primary_reviewer="Codex",
+        )
+
+    # Control: the round-1 approval alone carries.
+    assert carried((earlier,)) == ("Gemini",)
+    # The closed round-2 review hides it, and itself never carries.
+    assert carried((earlier, later, closure)) == ()

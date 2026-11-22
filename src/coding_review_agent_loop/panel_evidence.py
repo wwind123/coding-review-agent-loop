@@ -869,10 +869,23 @@ def _carried_plan_approvals(
     required = set(required_reviewers)
     surfaced = {str(item) for item in surfaced_requirement_ids}
     from .plan_round_closure import project_plan_history
+    from .round_closure import closed_round_reviewer_indexes
 
+    # Reviews of a closed-incomplete plan round (#2064) are dropped by the
+    # projection, but each still supersedes its reviewer's earlier carry with
+    # a non-qualifying entry, as the PR approval reader does: a stale earlier
+    # approval never comes back once that reviewer's later review is closed.
+    closed = closed_round_reviewer_indexes(records, flow="plan")
     carried: dict[str, tuple[bool, int]] = {}
-    for record in sorted(project_plan_history(records), key=lambda item: item.index):
+    for record in sorted(
+        (*project_plan_history(records), *(r for r in records if r.index in closed)),
+        key=lambda item: item.index,
+    ):
         metadata = record.metadata
+        if record.index in closed:
+            if metadata.agent in required:
+                carried[metadata.agent] = (False, metadata.round_number)
+            continue
         previous_key = _plan_key_from_payload(metadata.scheduler_plan_previous_key)
         checkpoint_key = _plan_key_from_payload(metadata.plan_candidate_key)
         contradictory_prelaunch = bool(
