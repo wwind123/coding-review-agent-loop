@@ -52,6 +52,7 @@ from .errors import (
     IssueImplementationConflictError,
     parse_human_decision,
     render_human_decision,
+    reraise_human_decision,
 )
 from .github_retry import describe_gh_failure
 from .github import (
@@ -3831,6 +3832,7 @@ def _verify_strict_managed_plan_binding(
             trusted_actor=trusted_actor,
         )
     except AgentLoopError as exc:
+        reraise_human_decision(exc, "Found while verifying the approving plan board for qualification.")
         raise fail(f"the approving plan board cannot be verified: {exc}") from exc
     resumed_plan = _resume_plan_round(
         plan_comments,
@@ -3855,6 +3857,7 @@ def _verify_strict_managed_plan_binding(
             trusted_actor=trusted_actor, error_message="the canonical plan is not completely approved",
         )
     except AgentLoopError as exc:
+        reraise_human_decision(exc, "Found while verifying the canonical plan approval for qualification.")
         raise fail(str(exc)) from exc
     if approved_plan_hash(plan_text) != expected_plan_hash:
         raise fail("the issue's canonical approved plan changed")
@@ -3985,9 +3988,8 @@ def _fresh_pr_qualification_snapshot(
                     fresh_issue.comments, issue_number=fresh_issue.number
                 )
             except AgentLoopError as exc:
-                raise AgentLoopError(
-                    f"{exc} No qualification or merge is permitted."
-                ) from exc
+                reraise_human_decision(exc, "No qualification or merge is permitted.")
+                raise AgentLoopError(f"{exc} No qualification or merge is permitted.") from exc
     if parent_issue_context is not None:
         fresh_parent = get_issue_context(
             runner, config=config, issue_number=parent_issue_context.number

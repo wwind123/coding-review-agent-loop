@@ -63,6 +63,7 @@ from .errors import (
     DependencyNotMergedError,
     HumanDecisionRequiredError,
     UnmetDependency,
+    reraise_human_decision,
 )
 from .integration_close import require_child_closed_or_report
 from .github import (
@@ -940,6 +941,9 @@ def _refuse_plain_mode_over_planning(
                 prove_poster_incompleteness=True,
             )
         except AgentLoopError as exc:
+            reraise_human_decision(
+                exc, f"Plain issue mode found this while reading issue #{issue_number}'s plan history."
+            )
             raise AgentLoopError(unreadable_message.format(exc)) from exc
         if classification.state == "approved":
             proven.append(

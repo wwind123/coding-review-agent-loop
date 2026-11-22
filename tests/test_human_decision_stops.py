@@ -798,3 +798,188 @@ def test_pr_loop_adds_post_merge_context_through_with_context():
     calls = [node for node in ast.walk(stop) if isinstance(node, ast.Call)]
     assert any(_tail(call.func) == "with_context" for call in calls)
     assert not any(_tail(call.func) == DECISION_ERROR for call in calls)
+
+
+# ---------------------------------------------------------------------------
+# Re-wrap handlers keep human-decision stops (#2069, review item-5)
+# ---------------------------------------------------------------------------
+
+_BROAD_CATCHES = {"AgentLoopError", "Exception", "RuntimeError", "BaseException"}
+REWRAP_KEEPER = "reraise_human_decision"
+
+
+def _reachable_stop_functions(index: _Index) -> set[str]:
+    """Uniquely named module-level functions that can raise a human-decision stop.
+
+    The call graph is built from parsed source over module-level functions
+    whose names are unique in the package, so a name resolves to one body.
+    """
+    functions: dict[str, list[ast.AST]] = {}
+    for tree in index.trees.values():
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.setdefault(node.name, []).append(node)
+    unique = {name: nodes[0] for name, nodes in functions.items() if len(nodes) == 1}
+
+    def constructs_stop(function: ast.AST) -> bool:
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            tail = _tail(node.func)
+            if tail in index.exempt:
+                return True
+            if (
+                tail == DECISION_FACTORY and isinstance(node.func, ast.Attribute)
+                and _tail(node.func.value) in index.exempt
+            ):
+                return True
+        return False
+
+    calls = {
+        name: {_tail(node.func) for node in ast.walk(body) if isinstance(node, ast.Call)}
+        for name, body in unique.items()
+    }
+    reach = {name for name, body in unique.items() if constructs_stop(body)}
+    changed = True
+    while changed:
+        changed = False
+        for name, called in calls.items():
+            if name not in reach and called & reach:
+                reach.add(name)
+                changed = True
+    return reach
+
+
+def check_rewrap_handlers(sources: dict[str, str]) -> list[str]:
+    """``module:line`` of re-wraps that would turn a reachable stop into a plain error.
+
+    A try block whose body calls a function that can raise a human-decision
+    stop must not rebuild the caught error into a non-exempt error unless the
+    handler first calls ``reraise_human_decision(<caught>, ...)`` or an earlier
+    handler of the same try catches the human-decision class.
+    """
+    index = build_index(sources)
+    reach = _reachable_stop_functions(index)
+    violations: list[str] = []
+    for module, tree in index.trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            body_calls = {
+                _tail(call.func) for stmt in node.body for call in ast.walk(stmt)
+                if isinstance(call, ast.Call)
+            }
+            if not body_calls & reach:
+                continue
+            exempt_handled = False
+            for handler in node.handlers:
+                types = (
+                    handler.type.elts if isinstance(handler.type, ast.Tuple)
+                    else [handler.type] if handler.type is not None else []
+                )
+                names = {_tail(item) for item in types} or {"BaseException"}
+                if names & index.exempt:
+                    exempt_handled = True
+                    continue
+                if exempt_handled or handler.name is None or not names & _BROAD_CATCHES:
+                    continue
+                caught = handler.name
+                handler_nodes = [n for stmt in handler.body for n in ast.walk(stmt)]
+                kept = any(
+                    isinstance(n, ast.Call) and _tail(n.func) == REWRAP_KEEPER
+                    and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == caught
+                    for n in handler_nodes
+                )
+                if kept:
+                    continue
+                for raised in handler_nodes:
+                    if not (isinstance(raised, ast.Raise) and isinstance(raised.exc, ast.Call)):
+                        continue
+                    arguments = [*raised.exc.args, *(k.value for k in raised.exc.keywords)]
+                    if any(
+                        isinstance(sub, ast.Name) and sub.id == caught
+                        for argument in arguments for sub in ast.walk(argument)
+                    ) and _tail(raised.exc.func) not in index.exempt:
+                        violations.append(f"{module}:{raised.lineno}")
+    return violations
+
+
+def test_no_handler_rewraps_a_reachable_human_decision_stop_into_a_plain_error():
+    assert check_rewrap_handlers(load_tree_sources()) == []
+
+
+_REWRAP_STOP = (
+    "from .errors import AgentLoopError, HumanDecisionRequiredError, reraise_human_decision\n"
+    "def stop():\n    raise HumanDecisionRequiredError.decision(what='w', clear='c',"
+    " safe_to_automate=False, automation_note='n')\n"
+    "def entry():\n    stop()\n"
+)
+
+
+@pytest.mark.parametrize(
+    "handler, flagged",
+    [
+        ("    except AgentLoopError as exc:\n        raise AgentLoopError(f'{exc} more')\n", True),
+        ("    except Exception as exc:\n        raise RuntimeError(str(exc))\n", True),
+        ("    except AgentLoopError as exc:\n        reraise_human_decision(exc, 'more')\n"
+         "        raise AgentLoopError(f'{exc} more')\n", False),
+        ("    except HumanDecisionRequiredError:\n        raise\n"
+         "    except AgentLoopError as exc:\n        raise AgentLoopError(str(exc))\n", False),
+        ("    except AgentLoopError as exc:\n        raise\n", False),
+    ],
+    ids=["plain-rewrap", "broad-rewrap", "kept", "earlier-exempt-handler", "bare-reraise"],
+)
+def test_rewrap_guard_self_test(handler, flagged):
+    site = "from .stops import entry\nfrom .errors import *\ndef f():\n    try:\n        entry()\n" + handler
+    violations = check_rewrap_handlers({"errors": _ERRORS_SOURCE.replace(
+        "def render_human_decision", "def reraise_human_decision(exc, context):\n    pass\n\n"
+        "def render_human_decision"), "stops": _REWRAP_STOP, "site": site})
+    assert bool(violations) is flagged, violations
+
+
+def test_reraise_human_decision_keeps_class_shape_and_passes_plain_errors_through():
+    from coding_review_agent_loop.errors import reraise_human_decision
+
+    stop = HumanDecisionRequiredError.decision(
+        what="Human decision required: x.", clear="Do y.", safe_to_automate=False,
+        automation_note="signed input.",
+    )
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        reraise_human_decision(stop, "No qualification or merge is permitted.")
+    parts = parse_human_decision(str(caught.value))
+    assert parts.what.endswith("No qualification or merge is permitted.")
+    assert parts.clear == "Do y."
+    # Context already present is not appended twice.
+    with pytest.raises(HumanDecisionRequiredError) as again:
+        reraise_human_decision(caught.value, "No qualification or merge is permitted.")
+    assert again.value is caught.value
+    assert reraise_human_decision(AgentLoopError("plain"), "context") is None
+
+
+def test_qualification_board_check_keeps_a_misplaced_amendment_stop_at_exit_4(monkeypatch):
+    """item-5: the qualification gate no longer turns a board stop into exit 1."""
+    from coding_review_agent_loop import pr_board_state
+    from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+
+    def resolve_with_real_collection(runner, *, config, pr_number, comments, **_kwargs):
+        collect_reviewer_board_amendments(comments, flow="pr", pr_number=pr_number)
+        raise AssertionError("expected the misplaced amendment to stop")
+
+    monkeypatch.setattr(pr_board_state, "resolve_pr_board_state", resolve_with_real_collection)
+    check = pr_board_state.qualification_board_check(
+        object(), config=SimpleNamespace(), pr_number=12, expected=None,
+    )
+    misplaced = SimpleNamespace(body=_signed_pr_amendment_body(pr_number=99))
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        check([misplaced])
+    parts = parse_human_decision(str(caught.value))
+    assert parts is not None and parts.safe_to_automate is False
+    assert parts.what.startswith("Human decision required: signed reviewer-board amendment")
+    assert parts.what.endswith("No qualification or merge is permitted.")
+    assert "names PR #99, but it is posted on PR #12" in parts.what
+
+    def raise_cli(*_args, **_kwargs):
+        raise caught.value
+
+    monkeypatch.setattr(cli, "run_pr_loop", raise_cli)
+    assert cli.main(["pr", "12", "--repo", "owner/repo"]) == 4

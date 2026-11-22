@@ -139,6 +139,20 @@ class HumanDecisionRequiredError(AgentLoopError):
         return rebuilt
 
 
+def reraise_human_decision(exc: BaseException, context: str) -> None:
+    """Re-raise a caught human-decision stop with ``context`` inside 'what' (#2069).
+
+    Call it first in an ``except AgentLoopError`` handler that would otherwise
+    rebuild the caught error into a plain ``AgentLoopError``: a
+    ``HumanDecisionRequiredError`` keeps its class, exit code 4 and three-part
+    shape.  Any other error returns so the handler can re-wrap it as before.
+    """
+    if isinstance(exc, HumanDecisionRequiredError):
+        if context.strip() and context.strip() in str(exc):
+            raise exc
+        raise exc.with_context(context) from exc
+
+
 # Full-message renderers whose output a HumanDecisionRequiredError may be
 # built from directly (#2069).  Each returns ``render_human_decision`` output
 # whose leading bytes are the prefix history export and triage recognize.

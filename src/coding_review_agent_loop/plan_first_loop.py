@@ -86,6 +86,7 @@ from .errors import (
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
     QuotaResetExceededError,
+    reraise_human_decision,
 )
 from .github import (
     IssueContext,
@@ -1301,6 +1302,11 @@ def _run_plan_first_loop_body(
                 drift_error=plan_contract_drift_error,
             )
         except AgentLoopError as exc:
+            reraise_human_decision(
+                exc,
+                f"Planning round {round_number}: found while re-reading the plan board "
+                f"history {boundary}. No further agent was invoked and nothing was approved.",
+            )
             raise AgentLoopError(
                 f"Planning round {round_number}: the plan board history is inconsistent "
                 f"{boundary}: {exc} No further agent was invoked and nothing was approved."

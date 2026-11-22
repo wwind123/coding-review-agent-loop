@@ -366,6 +366,11 @@ non-convergence error, and the plan step-back and primary-stall stops build a
 and re-raises. Post-merge context is added with `exc.with_context`, which keeps
 it inside the "what" part. The bounded PR diagnostic shortens only the "what"
 part, so the two final lines still end the posted body.
+A handler that re-wraps a caught `AgentLoopError` around a call that can raise
+a human-decision stop first calls `reraise_human_decision(exc, context)`. That
+call re-raises the stop with the context inside 'what', so the qualification
+board check and the plan-lineage and plan-approval readers keep exit 4. The
+guard test checks this with a call graph built from the parsed source.
 `tests/test_human_decision_stops.py` enforces this statically from the parsed
 source class graph: the phrase scan, the provenance rule and the renderer
 bodies. The hyphenated `human-decision` protocol status token is not a stop.

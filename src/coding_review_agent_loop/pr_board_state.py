@@ -32,7 +32,7 @@ from .board_change import (
     resolve_board_lineage,
 )
 from .config import reviewers
-from .errors import AgentLoopError, HumanDecisionRequiredError
+from .errors import AgentLoopError, HumanDecisionRequiredError, reraise_human_decision
 from .reviewer_floor import board_floor_enabled, check_reviewer_floor
 from .round_state import _extract_round_metadata_records
 
@@ -290,6 +290,7 @@ def qualification_board_check(
                     + ", ".join(expected.names)
                 )
         except AgentLoopError as exc:
+            reraise_human_decision(exc, "No qualification or merge is permitted.")
             if "no qualification or merge is permitted" in str(exc):
                 raise
             raise AgentLoopError(f"{exc} No qualification or merge is permitted.") from exc
