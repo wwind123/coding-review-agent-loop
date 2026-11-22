@@ -145,23 +145,31 @@ _FOOTER_LINE_CHARS = 200
 
 
 def _split_trailer(body: str) -> tuple[list[str], str]:
-    """Content lines and the short trailing footer (signature, state marker).
+    """Content lines and the required footer: the final signature line and at
+    most one short state-marker comment directly above it.
 
-    Only short footer-shaped lines are kept verbatim; a long trailing comment or
-    signature-shaped line is ordinary content, subject to the same budget.
+    The footer is bounded by construction (at most two short lines); every
+    other trailing line, whatever its shape or count, is ordinary content
+    under the same budget.
     """
     lines = body.rstrip("\n").splitlines()
     index = len(lines)
-    while index > 0:
-        candidate = lines[index - 1]
-        footer = len(candidate) <= _FOOTER_LINE_CHARS and (
-            HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate)
-        )
-        if not candidate.strip() or footer:
-            index -= 1
-            continue
-        break
-    return lines[:index], "\n".join(lines[index:]).strip("\n")
+    while index > 0 and not lines[index - 1].strip():
+        index -= 1
+    footer_start = index
+    if index > 0 and len(lines[index - 1]) <= _FOOTER_LINE_CHARS and SIGNATURE_RE.match(lines[index - 1]):
+        footer_start = index - 1
+        above = footer_start
+        while above > 0 and not lines[above - 1].strip():
+            above -= 1
+        if (
+            above > 0
+            and len(lines[above - 1]) <= _FOOTER_LINE_CHARS
+            and HTML_COMMENT_RE.match(lines[above - 1])
+        ):
+            footer_start = above - 1
+    trailer = "\n".join(line for line in lines[footer_start:index] if line.strip())
+    return lines[:footer_start], trailer
 
 
 def _close_comments(text: str) -> str:

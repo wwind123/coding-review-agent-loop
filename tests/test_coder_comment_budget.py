@@ -492,3 +492,26 @@ def test_freeform_trailing_long_comment_is_bounded_as_content():
     assert "Short narration." in anchor and "n" * 1000 not in anchor
     assert anchor.rstrip().endswith("-- Anthropic Claude: claude-opus-5-5 (medium)")
     assert _hydrated(parts).metadata.raw_structured_coder_response == original
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "<!-- " + "n" * 70_000 + " -->",  # one long trailing comment
+        "\n".join(f"<!-- note {n}: " + "c" * 180 + " -->" for n in range(400)),  # many short comments
+        "\n".join(f"-- Signature-shaped line {n} " + "s" * 150 for n in range(400)),  # many signature-shaped lines
+    ],
+    ids=["one-long-comment", "many-short-comments", "many-signature-shaped-lines"],
+)
+def test_freeform_trailing_lines_of_any_shape_are_budgeted_content(tail):
+    """Item-3 (generalized): only the final signature and one state marker are immutable."""
+    original = "Short narration.\n" + tail + "\n<!-- AGENT_STATE: blocking -->"
+    result = bounded_coder_round_comment(
+        _signed(original), _metadata([_code_item(1)]), pr_number=PR, head_sha=HEAD, freeform_text=original,
+    )
+    parts = [str(part) for part in prepare_round_comment(result.posted_body)]
+    assert all(len(part) <= MAX_GITHUB_BODY_CHARS for part in parts)
+    anchor = parts[-1]
+    assert "Short narration." in anchor and FREEFORM_OMISSION_NOTE in anchor
+    assert anchor.rstrip().endswith("<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude: claude-opus-5-5 (medium)")
+    assert _hydrated(parts).metadata.raw_structured_coder_response == original
