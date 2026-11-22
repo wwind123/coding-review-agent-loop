@@ -1766,7 +1766,8 @@ def _partition_reported_tests_by_workdir(
         if measurement and _is_outside_measurement(command, assigned=Path(assigned_workdir)):
             context.append(command)
         elif not violations and not (
-            measurement and _measurement_location_unprovable(command)
+            measurement
+            and not _is_inside_measurement(command, assigned=Path(assigned_workdir))
         ):
             kept.append(command)
         elif not measurement and _tests_only_outside(violations):
@@ -1776,8 +1777,10 @@ def _partition_reported_tests_by_workdir(
                 "names a path outside the assigned checkout "
                 f"({', '.join(repr(p) for p in violations)})"
                 if violations
-                else "names an operand whose location cannot be read literally "
-                "(a variable, command substitution or unbalanced quote)"
+                else "names a measurement whose operands are not provably inside "
+                "the checkout (a relative path leaving it, a glob, a variable, "
+                "a command substitution, a quote, a shell operator or an "
+                "option that takes a value)"
             )
             message = (
                 f"Coder reported a test command that {located} "
@@ -2079,50 +2082,72 @@ def _names_measurement_program(command: str) -> bool:
     return search(command, 0)
 
 
-def _measurement_location_unprovable(command: str) -> bool:
-    """Whether a measurement entry's operand locations cannot be read literally.
+def _allowlisted_measurement_operands(command: str) -> list[str] | None:
+    """Operands of an entry that matches the measurement allowlist shape.
 
-    A ``$`` expansion (other than the documented launcher variable), a
-    backtick substitution or unbalanced quoting can hide an outside -- or
-    any -- operand without the guard recording a path, so such a measurement
-    is refused and re-asked rather than kept (#2052).
+    The program, bare or after ``agent-loop run-tests [--timeout-seconds N]
+    --`` (the launcher is recognised only in that leading position), must be
+    one of :data:`_MEASUREMENT_PROGRAMS`; every option must be an
+    allowlisted flag (or, for ``find``, ``-type``/``-maxdepth``/
+    ``-mindepth`` with a literal value); and no word may contain shell
+    syntax, so a ``cd``, an assignment, a pipeline, a quote, a glob or an
+    expansion all return ``None``.
     """
-    stripped = command
-    for launcher in _MEASUREMENT_LAUNCHERS:
-        if launcher != "agent-loop":
-            stripped = stripped.replace(launcher, "")
-    if "$" in stripped or "`" in stripped:
-        return True
-    try:
-        shlex.split(command)
-    except ValueError:
-        return True
-    return False
+    words = _measurement_words(command)
+    if not words or words[0] not in _MEASUREMENT_PROGRAMS:
+        return None
+    short_flags, long_flags = _MEASUREMENT_PROGRAMS[words[0]]
+    args = words[1:]
+    if words[0] == "find":
+        return _find_measurement_operands(args)
+    return _flag_measurement_operands(args, short_flags, long_flags)
 
 
 def _is_outside_measurement(command: str, *, assigned: Path) -> bool:
     """Whether ``command`` is an allowlisted read-only measurement of outside paths.
 
-    The program, bare or after ``agent-loop run-tests [--timeout-seconds N]
-    --``, must be one of :data:`_MEASUREMENT_PROGRAMS`; every option must be
-    an allowlisted flag (or, for ``find``, ``-type``/``-maxdepth``/
-    ``-mindepth`` with a literal value); and every operand must be a plain
-    absolute path outside the checkout.  No word may contain shell syntax,
-    so a ``cd``, an assignment, a pipeline, a quote or an expansion all make
-    the entry ineligible.
+    Every operand must be a plain absolute path outside the checkout.
     """
-    words = _measurement_words(command)
-    if not words or words[0] not in _MEASUREMENT_PROGRAMS:
-        return False
-    short_flags, long_flags = _MEASUREMENT_PROGRAMS[words[0]]
-    args = words[1:]
-    operands = (
-        _find_measurement_operands(args)
-        if words[0] == "find"
-        else _flag_measurement_operands(args, short_flags, long_flags)
-    )
+    operands = _allowlisted_measurement_operands(command)
     return bool(operands) and all(
         _is_plain_outside_path(operand, assigned) for operand in operands
+    )
+
+
+def _is_plain_inside_path(operand: str, assigned: Path) -> bool:
+    """A literal relative path with no ``..``, or an absolute path in the checkout."""
+    if ".." in operand.split("/"):
+        return False
+    if not operand.startswith("/"):
+        return True
+    try:
+        path = Path(operand)
+        canonical_checkout = _canonical(assigned)
+        resolved = _canonical(path)
+        written_inside = any(
+            path == checkout or _is_inside(path, checkout)
+            for checkout in {assigned, canonical_checkout}
+        )
+        return written_inside and (
+            resolved == canonical_checkout or _is_inside(resolved, canonical_checkout)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _is_inside_measurement(command: str, *, assigned: Path) -> bool:
+    """Whether a measurement entry provably measures only the checkout.
+
+    The mirror of :func:`_is_outside_measurement`: the same allowlist
+    shape, with every operand a plain path inside the checkout (or none,
+    which measures the confined working directory).  A measurement entry
+    that is neither is refused and re-asked (#2052), so a relative path
+    leaving the checkout (``../scratch``), a glob, or an operand the shell
+    would expand can never be kept as an in-checkout entry.
+    """
+    operands = _allowlisted_measurement_operands(command)
+    return operands is not None and all(
+        _is_plain_inside_path(operand, assigned) for operand in operands
     )
 
 

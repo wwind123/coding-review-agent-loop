@@ -6466,11 +6466,13 @@ may precede the program. Paths are compared as written and canonicalised, so
 an outside symlink into the checkout is never accepted. The allowlist is the
 only route to context for an entry that names one of those programs anywhere
 (including after a wrapper, in `sh -c`, or beside a test runner): such an entry
-that fails the rule and names an outside path is refused, and so is one whose
-operand cannot be read literally (`du -sk "$DIR"`, an unbalanced quote) even
-though it records no path. A measurement with only in-checkout operands
-(`du -sk tests`) and every entry without a measurement program keep the
-existing classification above.
+that fails the rule is refused. It is kept as an in-checkout entry only when
+it has the same allowlist shape with every operand a plain path inside the
+checkout, or no operand at all (`du -sk`, `du -sk tests`); so `du -sk "$DIR"`,
+`du -sk ../scratch`, `du -sk *`, an unbalanced quote, or a measurement chained
+after a test runner is refused and re-asked even though it records no outside
+path. The launcher variable is exempt only as the leading launcher. Entries
+without a measurement program keep the existing classification above.
 A refused
 `tests_run` entry earns the coder's single semantic-evidence re-ask: the
 re-ask quotes the refusal and asks for a corrected `tests_run`, and a second

@@ -2007,6 +2007,14 @@ def test_allowlisted_outside_measurement_is_context_2052(measure_layout, command
     pytest.param('{wrap} -- du -sk "$DIR"', id="wrapped-unresolved"),
     pytest.param("du -sk '{outside}", id="malformed-quote"),
     pytest.param("{wrap} -- du -sk '{outside}", id="wrapped-malformed-quote"),
+    # Launcher spellings are exempt only in the leading launcher position.
+    pytest.param('du -sk "$AGENT_LOOP_EXECUTABLE"', id="launcher-variable-operand"),
+    pytest.param('du -sk "${{AGENT_LOOP_EXECUTABLE:-agent-loop}}"', id="launcher-default-operand"),
+    pytest.param('{wrap} -- du -sk "$AGENT_LOOP_EXECUTABLE"', id="wrapped-launcher-operand"),
+    # Relative-only and glob-only operands record no absolute path (item-22).
+    pytest.param("du -sk ../scratch", id="relative-only-outside"),
+    pytest.param("du -sk *", id="glob-only"),
+    pytest.param("pytest tests && du -sk", id="measurement-beside-runner"),
 ])
 def test_disqualified_measurement_is_never_allowlisted_2052(measure_layout, command):
     """Each disqualifying token class is refused through both public entry points.
@@ -2066,6 +2074,7 @@ def test_ambiguous_outside_entry_is_refused_2052(measure_layout, command):
 
 @pytest.mark.parametrize("command", [
     "du -sk", "du -sk tests", "ls tests", "{wrap} -- du -sk tests",
+    "du -sk {checkout}/tests", "find tests -maxdepth 1 -type f",
     # Real test runners keep main's handling, expansions included.
     'pytest -k "$EXPR" tests',
 ])

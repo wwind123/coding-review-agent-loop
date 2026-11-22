@@ -1223,6 +1223,14 @@ def test_transient_public_text_blocks_tests_run_reask_and_is_logged_2052(tmp_pat
     pytest.param('du -sk "$DIR"', id="unresolved-variable"),
     pytest.param("du -sk `pwd`", id="unresolved-substitution"),
     pytest.param("du -sk '/outside/dir", id="malformed-quote"),
+    # Launcher variables as operands, relative-only and glob-only operands.
+    pytest.param('du -sk "$AGENT_LOOP_EXECUTABLE"', id="launcher-variable-operand"),
+    pytest.param(
+        '"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests -- du -sk "$AGENT_LOOP_EXECUTABLE"',
+        id="wrapped-launcher-operand",
+    ),
+    pytest.param("du -sk ../scratch", id="relative-only-outside"),
+    pytest.param("du -sk *", id="glob-only"),
 ])
 def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatch, no_repair, entry):
     """Every disqualifying token class is refused and recovered by one coder re-ask."""
