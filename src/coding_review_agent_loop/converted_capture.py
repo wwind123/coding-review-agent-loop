@@ -57,4 +57,9 @@ def recheck_capture(runner, config, *, pr_number, items, head, plan, expected):
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     fresh = recovery_capture(runner, config, pr_number=pr_number, items=items, head=head, plan=plan)
     if context.metadata.head_sha != head or tuple(i.item_id for i in fresh) != tuple(i.item_id for i in expected):
-        raise HumanDecisionRequiredError("Converted capture inputs changed before dispatch; evidence barriers retained.")
+        raise HumanDecisionRequiredError.decision(
+            what="Converted capture inputs changed before dispatch; evidence barriers retained.",
+            clear=f"Rerun `agent-loop pr {pr_number}` so the converted capture is recomputed from the current head.",
+            safe_to_automate=True,
+            automation_note="a rerun only recomputes the capture from live state; no evidence is authored.",
+        )

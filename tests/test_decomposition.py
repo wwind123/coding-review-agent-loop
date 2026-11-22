@@ -4937,3 +4937,40 @@ def test_parent_resume_before_pr_does_not_reuse_parent_session(
     assert sessions == [None if existing else "parent-session"]
     assert runner.issues == []
     assert sum(bool(PHASE_IMPLEMENTATION_MARKER_RE.search(body)) for body in runner.comments) == (0 if existing else 1)
+
+
+def test_child_override_bound_to_another_parent_or_plan_stops_with_exit_4():
+    """`decomposition-exit4`: decomposition.py wrong parent/plan override (#2069)."""
+    from coding_review_agent_loop.decomposition import (
+        collect_child_disposition_overrides,
+        format_child_disposition_override_comment,
+    )
+    from coding_review_agent_loop.errors import (
+        HumanDecisionRequiredError,
+        parse_human_decision,
+    )
+    from coding_review_agent_loop.github import IssueComment
+
+    for parent_issue, plan_hash in ((56, "plan-hash"), (55, "other-plan")):
+        body = format_child_disposition_override_comment(
+            parent_issue=parent_issue,
+            plan_hash=plan_hash,
+            stage_id="stage-one",
+            disposition="requires-child-planning",
+            rationale="Wrong binding.",
+        )
+        comment = IssueComment(author="human", created_at="2026-01-01T00:00:00Z", body=body)
+        with pytest.raises(HumanDecisionRequiredError) as caught:
+            collect_child_disposition_overrides(
+                parent_comments=(comment,),
+                parent_issue=55,
+                plan_hash="plan-hash",
+                topology_stage_ids=("stage-one",),
+                routed_stage_id="stage-one",
+            )
+        parts = parse_human_decision(str(caught.value))
+        assert parts is not None
+        assert parts.what.startswith("Human decision required: signed child-disposition override")
+        assert "but the bound topology is parent #55 / plan plan-hash" in parts.what
+        assert parts.clear.startswith("Remove or correct the signed override at parent issue #55")
+        assert parts.safe_to_automate is False

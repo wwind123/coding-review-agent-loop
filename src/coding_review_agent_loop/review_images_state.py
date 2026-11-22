@@ -148,7 +148,12 @@ class Admission:
 def reduce_history(history, *, repo, pr, head):
     """Strict validation happens only on authenticated, decodable candidates."""
     if not getattr(history, 'complete', True):
-        raise HumanDecisionRequiredError('Visual history identity coverage is incomplete: ' + history.diagnostic)
+        raise HumanDecisionRequiredError.decision(
+            what='Visual history identity coverage is incomplete: ' + history.diagnostic,
+            clear='Rerun the same command once GitHub returns the complete authenticated visual history.',
+            safe_to_automate=True,
+            automation_note='a rerun only rereads history; no record is written or changed.',
+        )
     spent = False
     terminal = None
     latest = None
@@ -165,7 +170,13 @@ def reduce_history(history, *, repo, pr, head):
         identity = history.identities.get(record.index)
         where = f'comment {identity or record.index}'
         if bound is None:
-            raise HumanDecisionRequiredError('Visual lifecycle has no reliable head binding at ' + where)
+            raise HumanDecisionRequiredError.decision(
+                what='Visual lifecycle has no reliable head binding at ' + where,
+                # Raised for every head, so a push cannot clear it (#2069).
+                clear=f'Delete the unbound visual lifecycle record ({where}) from the PR, then rerun the same command.',
+                safe_to_automate=False,
+                automation_note='deleting a PR history record needs a human to judge it.',
+            )
         if bound == head:
             spent = True
         if not lifecycle_present(m):
@@ -173,7 +184,12 @@ def reduce_history(history, *, repo, pr, head):
             latest = original = None
             heads.add(bound)
             if not is_visual_review(m) and bound == head:
-                raise HumanDecisionRequiredError('Malformed legacy visual scope at ' + where)
+                raise HumanDecisionRequiredError.decision(
+                    what='Malformed legacy visual scope at ' + where,
+                    clear='Push a new head so the legacy visual record no longer binds it, then rerun the same command.',
+                    safe_to_automate=False,
+                    automation_note='a malformed visual record needs a human to judge it.',
+                )
             continue
         try:
             value = validate(record, repo=repo, pr=pr)
@@ -220,7 +236,12 @@ def reduce_history(history, *, repo, pr, head):
             invalid_heads.add(bound)
             latest = original = None
             if bound == head:
-                raise HumanDecisionRequiredError(f'Visual lifecycle refused at {where}: {exc}') from exc
+                raise HumanDecisionRequiredError.decision(
+                    what=f'Visual lifecycle refused at {where}: {exc}',
+                    clear='Inspect the named visual lifecycle comment, push a new head, then rerun the same command.',
+                    safe_to_automate=False,
+                    automation_note='an invalid visual record needs a human to judge it.',
+                ) from exc
     return Admission(spent, terminal, latest, original,
         'durable visual opportunity is spent; completion is unknown' if spent and terminal is None else '')
 

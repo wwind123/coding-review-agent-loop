@@ -1,7 +1,7 @@
 """Reviewer-owned signed-source routing; classification never grants acceptance."""
 from dataclasses import dataclass, replace
 
-from .errors import AgentLoopError, MissingJudgementFieldError
+from .errors import AgentLoopError, MissingJudgementFieldError, render_human_decision
 from .github import HumanReviewRequirement
 
 
@@ -180,12 +180,18 @@ def _role_conflict_message(conflicts, previous_entries, reviewer_name):
         roles = [(name, p["role"]) for name, p in previous_entries if p["requirement_id"] == rid]
         roles.append((reviewer_name, entry["role"]))
         details.append(f"{rid}: " + ", ".join(f"{name}: {role}" for name, role in sorted(roles)))
-    return ("Signed-source classification remained conflicting; retained signed sources and pending evidence "
+    what = ("Signed-source classification remained conflicting; retained signed sources and pending evidence "
             "require reviewer agreement or a human decision before coder dispatch. Reviewer roles per source: "
             + "; ".join(details) + ". Post a new follow-up signed comment (do not edit the existing "
             "signed comment) that separates exact-head evidence answers from code requirements; the next "
             "resume opens a fresh review round against the added source. Or have reviewers converge on "
             "one role on rerun; no coder was dispatched.")
+    return render_human_decision(
+        what=what,
+        clear=("Post a new follow-up signed comment (do not edit the existing one) that separates "
+               "exact-head evidence answers from code requirements, then rerun the same command."),
+        safe_to_automate=False,
+        automation_note="the clarifying signed comment must come from a human.")
 
 
 # The signed-source classification continuation's validated-turn options. A
@@ -253,15 +259,25 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
         parsed, text = response.marker_value, response.text
         if pinned_review is not None:
             if _pinned_signature(parsed) != _pinned_signature(pinned_review):
-                raise HumanDecisionRequiredError(
-                    f"{reviewer_name}'s review was restored from its published record, and its "
-                    "signed-source classification continuation changed the published verdict or "
-                    "findings. A restored review cannot change its verdict or findings after its "
-                    "peers are public; no coder was dispatched.")
+                raise HumanDecisionRequiredError.decision(
+                    what=(
+                        f"{reviewer_name}'s review was restored from its published record, and its "
+                        "signed-source classification continuation changed the published verdict or "
+                        "findings. A restored review cannot change its verdict or findings after its "
+                        "peers are public; no coder was dispatched."),
+                    clear=("Post a new follow-up signed comment that clarifies the signed sources, "
+                           "then rerun the same command."),
+                    safe_to_automate=False,
+                    automation_note="the clarifying signed comment must come from a human.")
             parsed = replace(pinned_review, requirement_evidence=parsed.requirement_evidence,
                              exact_head_evidence_requests=parsed.exact_head_evidence_requests)
         if {r.requirement_id for r in requirements} - {e["requirement_id"] for e in parsed.requirement_evidence}:
-            raise HumanDecisionRequiredError("Signed-source classification remained absent; no coder was dispatched for human evidence.")
+            raise HumanDecisionRequiredError.decision(
+                what="Signed-source classification remained absent; no coder was dispatched for human evidence.",
+                clear=("Post a new follow-up signed comment that separates exact-head evidence answers "
+                       "from code requirements, then rerun the same command."),
+                safe_to_automate=False,
+                automation_note="the clarifying signed comment must come from a human.")
         conflicts = conflicts_with_previous(parsed)
         if conflicts:
             raise HumanDecisionRequiredError(_role_conflict_message(conflicts, previous_entries, reviewer_name))

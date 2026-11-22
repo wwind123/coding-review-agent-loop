@@ -24,7 +24,7 @@ from .board_amendment import (
     stale_unread_amendment_locator,
 )
 from .decomposition import approved_plan_hash
-from .errors import AgentLoopError
+from .errors import AgentLoopError, render_human_decision
 from .github import IssueContext, HumanReviewRequirement
 from .issue_pr_handoff import IssuePrHandoffMetadata
 from .logging import log
@@ -1229,7 +1229,7 @@ def plan_primary_stall_message(
         if legacy_undigested
         else ""
     )
-    return (
+    what = (
         PLAN_PRIMARY_STALL_PREFIX
         + f"{streak} consecutive primary-phase "
         f"planning round(s) with no exact-plan primary approval, reaching "
@@ -1249,6 +1249,21 @@ def plan_primary_stall_message(
         "recording, rerun with --plan-reset-stall-streak to retire them."
         + legacy_note
         + step_back_note
+    )
+    return render_human_decision(
+        what=what,
+        clear=(
+            "Rerun the same command with --plan-reset-stall-streak to retire the counted "
+            "rounds; the other options are listed above."
+            if legacy_undigested
+            else "Edit the issue title or body to narrow it, then rerun the same command; "
+            "the other options are listed above."
+        ),
+        safe_to_automate=False,
+        automation_note=(
+            "narrowing the issue, retiring the streak or widening the board is a human "
+            "judgement."
+        ),
     )
 
 

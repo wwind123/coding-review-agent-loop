@@ -58,7 +58,13 @@ from .decomposition import (
 )
 from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
 from .child_topology import NeedsHumanDecision, parent_child_search_queries
-from .errors import AgentLoopError, DependencyNotMergedError, UnmetDependency
+from .errors import (
+    AgentLoopError,
+    DependencyNotMergedError,
+    HumanDecisionRequiredError,
+    UnmetDependency,
+    reraise_human_decision,
+)
 from .integration_close import require_child_closed_or_report
 from .github import (
     _REST_ISSUE_COMMENT_PAGE_SIZE,
@@ -484,6 +490,10 @@ def _resolve_execution_policy(
 
 
 CHILD_ROUTE_HUMAN = "human"
+# Why clearing a signed child-disposition override is never automated (#2069).
+_SIGNED_OVERRIDE_NOTE = (
+    "the override is signed human input that an automation must not author, edit or delete."
+)
 
 
 @dataclass(frozen=True)
@@ -548,11 +558,16 @@ def resolve_child_execution_route(
     if phase.automation != "agent-pr":
         if overrides:
             record = overrides[0]
-            raise AgentLoopError(
-                "Human decision required: signed child-disposition override at "
-                f"{record.comment_locator} names stage `{stage_label}`, which is a "
-                f"{phase.automation} stage. Human-owned stages keep their human stop and can "
-                "never be converted to an agent-pr route; remove the record before rerunning."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    "Human decision required: signed child-disposition override at "
+                    f"{record.comment_locator} names stage `{stage_label}`, which is a "
+                    f"{phase.automation} stage. Human-owned stages keep their human stop and can "
+                    "never be converted to an agent-pr route; remove the record before rerunning."
+                ),
+                clear=f"Remove the signed override at {record.comment_locator}, then rerun the same command.",
+                safe_to_automate=False,
+                automation_note=_SIGNED_OVERRIDE_NOTE,
             )
         return ChildExecutionRoute(CHILD_ROUTE_HUMAN, None, "automation")
     if recorded_handoff is not None:
@@ -563,25 +578,41 @@ def resolve_child_execution_route(
             and record.digest != recorded_handoff.override_digest
         ]
         if disagreeing:
-            raise AgentLoopError(
-                f"Human decision required: stage `{stage_label}` was already dispatched with "
-                f"disposition `{effective}` (recorded phase handoff), but the signed override at "
-                f"{disagreeing[0].comment_locator} now requests `{disagreeing[0].disposition}`. "
-                "An override cannot change a recorded route; remove the record or repair the "
-                "handoff manually."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    f"Human decision required: stage `{stage_label}` was already dispatched with "
+                    f"disposition `{effective}` (recorded phase handoff), but the signed override at "
+                    f"{disagreeing[0].comment_locator} now requests `{disagreeing[0].disposition}`. "
+                    "An override cannot change a recorded route; remove the record or repair the "
+                    "handoff manually."
+                ),
+                clear=(
+                    f"Remove the signed override at {disagreeing[0].comment_locator}, then rerun "
+                    "the same command."
+                ),
+                safe_to_automate=False,
+                automation_note=_SIGNED_OVERRIDE_NOTE,
             )
         return ChildExecutionRoute(effective, recorded_handoff.override_digest, "handoff")
     distinct: dict[str, ChildDispositionOverride] = {}
     for record in overrides:
         distinct.setdefault(record.digest, record)
     if len(distinct) > 1:
-        raise AgentLoopError(
-            f"Human decision required: stage `{stage_label}` has {len(distinct)} distinct signed "
-            "child-disposition override records ("
-            + "; ".join(
-                f"{record.comment_locator} -> {record.disposition}" for record in distinct.values()
-            )
-            + "). Comment order never selects one; remove the superseded record(s) before rerunning."
+        raise HumanDecisionRequiredError.decision(
+            what=(
+                f"Human decision required: stage `{stage_label}` has {len(distinct)} distinct signed "
+                "child-disposition override records ("
+                + "; ".join(
+                    f"{record.comment_locator} -> {record.disposition}" for record in distinct.values()
+                )
+                + "). Comment order never selects one; remove the superseded record(s) before rerunning."
+            ),
+            clear=(
+                "Remove the superseded signed override record(s) so exactly one remains, then "
+                "rerun the same command."
+            ),
+            safe_to_automate=False,
+            automation_note=_SIGNED_OVERRIDE_NOTE,
         )
     override = next(iter(distinct.values()), None)
     if override is not None:
@@ -593,9 +624,17 @@ def resolve_child_execution_route(
     elif phase_disposition in {EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING}:
         effective, digest, origin = phase_disposition, None, "phase"
     else:
-        raise AgentLoopError(
-            f"Human decision required: stage `{stage_label}` is an agent-pr stage whose persisted "
-            f"disposition `{phase_disposition}` is contradictory; repair the approved topology."
+        raise HumanDecisionRequiredError.decision(
+            what=(
+                f"Human decision required: stage `{stage_label}` is an agent-pr stage whose persisted "
+                f"disposition `{phase_disposition}` is contradictory; repair the approved topology."
+            ),
+            clear=(
+                f"Re-plan the parent so stage `{stage_label}` carries a valid disposition, then "
+                "rerun the same command."
+            ),
+            safe_to_automate=False,
+            automation_note="repairing an approved topology is a reviewed planning decision.",
         )
     if effective == EXECUTION_DISPOSITION_DIRECT:
         problems = phase_direct_readiness_problems(phase)
@@ -604,12 +643,20 @@ def resolve_child_execution_route(
                 f"the signed override at {override.comment_locator}"
                 if override is not None else "the persisted approved phase"
             )
-            raise AgentLoopError(
-                f"Human decision required: {requested_by} selects direct-implementation for stage "
-                f"`{stage_label}`, but the reviewed parent stage alone is not direct-ready: "
-                + "; ".join(problems)
-                + ". Override records never supply readiness evidence; revise the parent plan "
-                "or route the child to planning."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    f"Human decision required: {requested_by} selects direct-implementation for stage "
+                    f"`{stage_label}`, but the reviewed parent stage alone is not direct-ready: "
+                    + "; ".join(problems)
+                    + ". Override records never supply readiness evidence; revise the parent plan "
+                    "or route the child to planning."
+                ),
+                clear=(
+                    f"Revise the parent plan so stage `{stage_label}` is direct-ready, then rerun "
+                    "the same command."
+                ),
+                safe_to_automate=False,
+                automation_note="revising an approved parent plan is a reviewed planning decision.",
             )
     return ChildExecutionRoute(effective, digest, origin)
 
@@ -894,6 +941,9 @@ def _refuse_plain_mode_over_planning(
                 prove_poster_incompleteness=True,
             )
         except AgentLoopError as exc:
+            reraise_human_decision(
+                exc, f"Plain issue mode found this while reading issue #{issue_number}'s plan history."
+            )
             raise AgentLoopError(unreadable_message.format(exc)) from exc
         if classification.state == "approved":
             proven.append(

@@ -22,7 +22,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .protocol_common import normalize_staging_feasibility
 from .review_scheduling import (
     POST_PANEL_PREFIX,
@@ -143,6 +143,15 @@ class PlanPrePanelSafetyError(AgentLoopError):
 
     Raised instead of silently spending the secondary panel early, or of
     continuing over a record set that cannot be read at all.
+    """
+
+
+class PlanPrePanelHumanDecisionError(PlanPrePanelSafetyError, HumanDecisionRequiredError):
+    """A pre-panel planning stop that is a human decision boundary (#2069).
+
+    The plan step-back and primary-stall stops keep their pre-panel safety
+    semantics (``except PlanPrePanelSafetyError`` still matches) and exit 4
+    like every other human-decision stop.
     """
 
 

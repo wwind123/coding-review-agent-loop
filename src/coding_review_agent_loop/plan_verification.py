@@ -36,7 +36,7 @@ from pathlib import Path
 from collections.abc import Callable, Sequence
 
 from .pr_round_ingestion import record_body
-from .errors import AgentLoopError
+from .errors import AgentLoopError, reraise_human_decision
 from .reviewer_floor import BoardSeat, SignedBoardAuthorization, distinct_providers
 
 BOARD_CHANGE_AUDIT_HEADING = "Reviewer board change recorded at issue-to-PR handoff."
@@ -1036,6 +1036,9 @@ def build_plan_approval_inputs(
     return replace(inputs, scope_start_round=scope_start_round)
 
 
+_INPUTS_CONTEXT = "Found while deriving the plan approval inputs."
+
+
 def _build_plan_approval_inputs(
     runner: object | None,
     *,
@@ -1058,6 +1061,7 @@ def _build_plan_approval_inputs(
     try:
         parent_number = _infer_staged_parent_issue(issue_context)  # type: ignore[arg-type]
     except AgentLoopError as exc:
+        reraise_human_decision(exc, _INPUTS_CONTEXT)
         return PlanApprovalInputs(requirements, derivable=False, underivable_reason=str(exc))
     if parent_number is None or parent_number == getattr(issue_context, "number", None):
         return PlanApprovalInputs(requirements)
@@ -1071,6 +1075,7 @@ def _build_plan_approval_inputs(
         try:
             parent = get_issue_context(runner, config=config, issue_number=parent_number)  # type: ignore[arg-type]
         except AgentLoopError as exc:
+            reraise_human_decision(exc, _INPUTS_CONTEXT)
             return PlanApprovalInputs(requirements, derivable=False, underivable_reason=str(exc))
     parent_ids = tuple(sorted(
         requirement.requirement_id for requirement in getattr(parent, "human_requirements", ())
@@ -1087,6 +1092,9 @@ def _build_plan_approval_inputs(
             issue_context=issue_context, parent_issue_context=parent,  # type: ignore[arg-type]
         )
     except AgentLoopError as exc:
+        # A signed-override stop must keep exit 4, never become an
+        # underivable input (#2069).
+        reraise_human_decision(exc, _INPUTS_CONTEXT)
         return PlanApprovalInputs(
             requirements, parent_ids, derivable=False, underivable_reason=str(exc),
         )
@@ -1214,6 +1222,8 @@ def classify_plan_approval(
             comments, issue_number=issue_number, trusted_actor=trusted_actor,
         )
     except AgentLoopError as exc:
+        # A signed-amendment stop keeps exit 4 on legacy history too (#2069).
+        reraise_human_decision(exc, "Found while reading the plan board history.")
         if lineage_bearing:
             # A malformed plan board lineage fails closed.
             raise
@@ -1273,6 +1283,7 @@ def classify_plan_approval(
             supersession_check is not None and supersession_check(plan_hash)
         )
     except AgentLoopError as exc:
+        reraise_human_decision(exc, "Found while reading the signed child-plan supersession state.")
         return result("undetermined", f"the signed supersession state cannot be read: {exc}")
     if superseded:
         return result("unfinished", "a validated signed plan supersession is pending")

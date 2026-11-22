@@ -52,7 +52,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError, reraise_human_decision
 from .reviewer_floor import BoardSeat, SignedBoardAuthorization, distinct_providers
 
 BOARD_CHANGE_LINK_MARKER = "AGENT_PR_BOARD_CHANGE"
@@ -1122,11 +1122,19 @@ def derive_legacy_root(
         # Signed evidence takes precedence whenever PR round history exists,
         # including coder-only history and never-published seats (D1a).
         if not records:
-            raise AgentLoopError(
-                "Human decision required: signed reviewer-board amendment(s) at "
-                + ", ".join(getattr(record, "comment_locator") for record in amendments)
-                + " are unmatched: this PR has no round history to amend yet. Change "
-                "the reviewer flags directly and delete the record."
+            raise HumanDecisionRequiredError.decision(
+                what=(
+                    "Human decision required: signed reviewer-board amendment(s) at "
+                    + ", ".join(getattr(record, "comment_locator") for record in amendments)
+                    + " are unmatched: this PR has no round history to amend yet. Change "
+                    "the reviewer flags directly and delete the record."
+                ),
+                clear=(
+                    "Delete the signed record(s) and change the reviewer flags directly, then "
+                    "rerun the same command."
+                ),
+                safe_to_automate=False,
+                automation_note="the record is signed human input that an automation must not author, edit or delete.",
             )
         original = tuple(getattr(amendments[0], "original_required_reviewers"))
         outside = [name for name in posters if name not in original]
@@ -1759,10 +1767,20 @@ def build_board_change_candidate(
     The surface is the lineage's own; ``pr_number`` is its surface number.
     """
     if lineage.pending_amendments:
-        raise AgentLoopError(
-            "Human decision required: the configured reviewer board differs from the board "
-            "of a pending signed reviewer-board amendment. Rerun once with the amended board "
-            "so the signed amendment takes effect, then change the board."
+        raise HumanDecisionRequiredError.decision(
+            what=(
+                "Human decision required: the configured reviewer board differs from the board "
+                "of a pending signed reviewer-board amendment. Rerun once with the amended board "
+                "so the signed amendment takes effect, then change the board."
+            ),
+            clear=(
+                "Rerun once with the amended board so the signed amendment takes effect, then "
+                "change the board."
+            ),
+            safe_to_automate=True,
+            automation_note=(
+                "the rerun uses the board a human already signed and changes no signed record."
+            ),
         )
     view = lineage.current_identity
     latest = lineage.latest
@@ -2196,7 +2214,12 @@ def lineage_binding_resolver(
             contract_from_metadata=_scheduler_contract_from_metadata,
             drift_error=lambda _persisted, detail: AgentLoopError(detail),
         )
-    except (AgentLoopError, StopIteration, ValueError, KeyError, TypeError):
+    except AgentLoopError as exc:
+        # A signed-record stop keeps exit 4 instead of reading as a refused
+        # binding (#2069).
+        reraise_human_decision(exc, "Found while validating historical PR reviewer-board bindings.")
+        return refuse
+    except (StopIteration, ValueError, KeyError, TypeError):
         return refuse
 
     def allowed(index: int, round_number: int) -> tuple[Mapping[str, object] | None, ...]:

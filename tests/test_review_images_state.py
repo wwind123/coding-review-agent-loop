@@ -220,3 +220,34 @@ def test_verified_pr_round_writer_refuses_untrusted_body_before_transport(tmp_pa
         post_verified_trusted_pr_round_comment(runner,config=make_config(tmp_path),pr_number=77,
             body='untrusted text',expected_author_login='coding-review-agent-loop',expected_author_id=424242)
     assert runner.commands==[]
+
+
+def _without(records, index):
+    return history(*(r for r in records if r.index != index))
+
+
+@pytest.mark.parametrize('case', ['unbound-head', 'refused-at-head', 'legacy-at-head'])
+def test_each_visual_stop_is_cleared_by_its_named_action(case):
+    """#2069: following the 'To clear' line of each visual stop lets reduction proceed."""
+    from coding_review_agent_loop.errors import parse_human_decision
+
+    if case == 'unbound-head':
+        bad = record(binding(), subject=OTHER)  # lifecycle head contradicts the subject
+        expected, apply = 'Delete the unbound visual lifecycle record (comment 100)', \
+            lambda: reduce(_without([bad], 0), OTHER)
+    elif case == 'refused-at-head':
+        bad = record(dict(binding(), version=2))
+        expected, apply = 'push a new head', lambda: reduce(history(bad), OTHER)
+    else:
+        bad = record(binding(), visual_lifecycle=None, visual_lifecycle_present=False,
+                     review_scope={'kind': 'visible-defects', 'head': HEAD})
+        expected, apply = 'Push a new head', lambda: reduce(history(bad), OTHER)
+    with pytest.raises(HumanDecisionRequiredError) as caught:
+        reduce(history(bad))
+    parts = parse_human_decision(str(caught.value))
+    assert parts is not None and expected in parts.clear
+    if case == 'unbound-head':
+        # A push alone does not clear it: the unbound record stops every head.
+        with pytest.raises(HumanDecisionRequiredError):
+            reduce(history(bad), OTHER)
+    assert apply().spent is False

@@ -273,6 +273,24 @@ the summary, or a child without an issue number) is an ordinary failure
 | 4 | The run reached a human decision boundary. |
 | 5 | A decomposition prerequisite is not merged: an earlier stage of this child's parent topology is not delivered yet. Finish that stage, then rerun. |
 
+Every human-decision stop exits 4. This includes malformed or misplaced signed
+reviewer-board amendments, child-disposition overrides and child-plan
+supersession records, and the plan step-back and primary-stall stops. The
+message after the `agent-loop: HUMAN DECISION REQUIRED` header always has
+three parts:
+
+```text
+<what happened; may span several lines>
+To clear: <the one command or action that clears the stop>
+Safe to automate: yes|no - <why>
+```
+
+Nothing follows the `Safe to automate` line. A queue runner can therefore treat
+exit 4 as "needs a person" and read the last two lines to decide whether it may
+take the clearing action itself. Most signed-record stops say `no`: the clearing
+action edits signed human input, which an automation must not author or delete.
+The staged outcome printed as JSON keeps exit code 2.
+
 These codes apply to the `issue` command. `agent-loop run-tests` passes through
 the wrapped command's own exit status, so pytest's exit code 5 (no tests
 collected) can appear there with a different meaning.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -21,10 +22,151 @@ class CheckoutVerificationError(AgentLoopError):
     """
 
 
+TO_CLEAR_LABEL = "To clear: "
+SAFE_TO_AUTOMATE_LABEL = "Safe to automate: "
+_SAFE_TO_AUTOMATE_RE = re.compile(r"Safe to automate: (yes|no) - (\S.*)")
+
+
+@dataclass(frozen=True)
+class HumanDecisionParts:
+    """The three parts of a human-decision stop message (#2069)."""
+
+    what: str
+    clear: str
+    safe_to_automate: bool
+    automation_note: str
+
+
+def _single_line(label: str, value: str) -> str:
+    text = " ".join(str(value).split())
+    if not text:
+        raise ValueError(f"human-decision {label} must be non-blank")
+    return text
+
+
+def render_human_decision(
+    *, what: str, clear: str, safe_to_automate: bool, automation_note: str
+) -> str:
+    """Render the uniform three-part human-decision stop message (#2069).
+
+    ``what`` (what happened) is kept verbatim and may span lines; it is
+    followed by exactly two final labelled lines: ``To clear: <the one
+    command or action that clears the stop>`` and ``Safe to automate:
+    yes|no - <reason>``.  Nothing ever follows the ``Safe to automate`` line.
+    """
+    body = str(what).rstrip()
+    if not body.strip():
+        raise ValueError("human-decision what must be non-blank")
+    verdict = "yes" if safe_to_automate else "no"
+    return (
+        f"{body}\n{TO_CLEAR_LABEL}{_single_line('clear', clear)}\n"
+        f"{SAFE_TO_AUTOMATE_LABEL}{verdict} - {_single_line('automation note', automation_note)}"
+    )
+
+
+def parse_human_decision(text: str) -> HumanDecisionParts | None:
+    """Inverse of :func:`render_human_decision`; ``None`` for any other shape."""
+    lines = str(text).split("\n")
+    if len(lines) < 3:
+        return None
+    match = _SAFE_TO_AUTOMATE_RE.fullmatch(lines[-1])
+    clear_line = lines[-2]
+    if match is None or not clear_line.startswith(TO_CLEAR_LABEL):
+        return None
+    clear = clear_line[len(TO_CLEAR_LABEL):]
+    what = "\n".join(lines[:-2])
+    if not clear.strip() or not what.strip():
+        return None
+    return HumanDecisionParts(
+        what=what,
+        clear=clear,
+        safe_to_automate=match.group(1) == "yes",
+        automation_note=match.group(2),
+    )
+
+
 class HumanDecisionRequiredError(AgentLoopError):
-    """The run reached a deliberate operator decision boundary."""
+    """The run reached a deliberate operator decision boundary.
+
+    Every human-decision stop raises this class (exit code 4) with the
+    three-part message from :func:`render_human_decision` (#2069).  Build it
+    with :meth:`decision`, or from a registered renderer's output (see
+    ``HUMAN_DECISION_RENDERERS``); a message that must cross functions
+    travels as an already-built error object.
+    """
 
     EXIT_CODE = 4
+
+    @classmethod
+    def decision(
+        cls, *, what: str, clear: str, safe_to_automate: bool, automation_note: str
+    ):
+        return cls(
+            render_human_decision(
+                what=what,
+                clear=clear,
+                safe_to_automate=safe_to_automate,
+                automation_note=automation_note,
+            )
+        )
+
+    def with_context(self, extra: str):
+        """The same stop with ``extra`` appended inside the 'what' part.
+
+        Context therefore never trails the ``Safe to automate`` line, and the
+        result keeps this error's class.
+        """
+        text = str(self)
+        parts = parse_human_decision(text)
+        if parts is None:
+            parts = HumanDecisionParts(
+                what=text,
+                clear="Resolve the condition described above, then rerun the same command.",
+                safe_to_automate=False,
+                automation_note="the stop message did not name a clearing action.",
+            )
+        extra_text = str(extra).strip()
+        what = f"{parts.what}\n{extra_text}" if extra_text else parts.what
+        rebuilt = type(self)(
+            render_human_decision(
+                what=what,
+                clear=parts.clear,
+                safe_to_automate=parts.safe_to_automate,
+                automation_note=parts.automation_note,
+            )
+        )
+        rebuilt.__cause__ = self.__cause__
+        return rebuilt
+
+
+def reraise_human_decision(exc: BaseException, context: str) -> None:
+    """Re-raise a caught human-decision stop with ``context`` inside 'what' (#2069).
+
+    Call it first in an ``except AgentLoopError`` handler that would otherwise
+    rebuild the caught error into a plain ``AgentLoopError``: a
+    ``HumanDecisionRequiredError`` keeps its class, exit code 4 and three-part
+    shape.  Any other error returns so the handler can re-wrap it as before.
+    """
+    if isinstance(exc, HumanDecisionRequiredError):
+        if context.strip() and context.strip() in str(exc):
+            raise exc
+        raise exc.with_context(context) from exc
+
+
+# Full-message renderers whose output a HumanDecisionRequiredError may be
+# built from directly (#2069).  Each returns ``render_human_decision`` output
+# whose leading bytes are the prefix history export and triage recognize.
+# tests/test_human_decision_stops.py enforces both the provenance rule and the
+# shape of every renderer listed here.
+HUMAN_DECISION_RENDERERS: tuple[tuple[str, str], ...] = (
+    ("review_step_back", "render_pr_non_convergence_decision"),
+    ("review_step_back", "render_pr_step_back_approach_alternative_decision"),
+    ("review_step_back", "render_step_back_human_decision"),
+    ("panel_evidence", "plan_primary_stall_message"),
+    ("pr_loop_support", "render_evidence_stall_decision"),
+    ("pr_loop_support", "_evidence_freeze_diagnostic"),
+    ("requirement_evidence", "_role_conflict_message"),
+)
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ import pytest
 
 from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
-from coding_review_agent_loop.errors import HumanDecisionRequiredError
+from coding_review_agent_loop.errors import HumanDecisionRequiredError, parse_human_decision
 from coding_review_agent_loop.github import (
     CiWatchOutcome,
     PullRequestCheck,
@@ -2139,13 +2139,18 @@ def test_an_oversized_non_convergence_stop_posts_a_bounded_diagnostic(tmp_path, 
     runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
     message = _nc_stop(runner, _sb_config(tmp_path))
     assert len(pr_loop.render_pr_scheduling_diagnostic("round 4", message)) > MAX_GITHUB_BODY_CHARS
-    assert message.endswith("blocking finding.")  # the exception text is never bounded
+    # The exception text is never bounded and keeps the three-part shape (#2069).
+    parts = parse_human_decision(message)
+    assert parts is not None and parts.what.endswith("blocking finding.")
     (posted,) = _hd_diagnostics(runner)
     assert posted == pr_loop.render_pr_human_decision_diagnostic("round 4", message)
     assert len(posted) <= pr_loop.PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
     first_line = message.split("\n", 1)[0]
     assert posted.startswith(pr_loop.render_pr_scheduling_diagnostic("round 4", first_line + "\n"))
-    assert posted.endswith("the full text is in the CLI output of this run)")
+    clear_line, automate_line = message.split("\n")[-2:]
+    assert posted.endswith(
+        "the full text is in the CLI output of this run)\n" + clear_line + "\n" + automate_line
+    )
     assert recognize_diagnostic(posted).reason == "pr-non-convergence"
 
 

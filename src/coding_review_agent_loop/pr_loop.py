@@ -2298,7 +2298,7 @@ def run_pr_loop(
             exc: HumanDecisionRequiredError, *, round_number: int
         ) -> NoReturn:
             if post_merge_run.diagnostics:
-                exc = HumanDecisionRequiredError(str(exc) + "\n" + post_merge_run.context())
+                exc = exc.with_context(post_merge_run.context())
             _stop_for_human_decision(
                 runner, config=config, pr_number=pr_number, exc=exc,
                 round_number=round_number, post_comment=post_pr_comment,
@@ -6149,10 +6149,19 @@ def run_pr_loop(
                                and item.status in {"blocking", "same-pr"}]
             reason = visual_run.blocker_stop_reason(visual_blockers, pr_metadata.head_sha, visual_outcome)
             if visual_blockers and reason is not None:
-                stop_for_human_decision(HumanDecisionRequiredError(
-                    f"Unresolved visual findings {', '.join(item.item_id for item in visual_blockers)} "
-                    f"at head {pr_metadata.head_sha}: {reason}. A new head with changed images and explicit visual dispositions "
-                    "or an explicit human decision is required."), round_number=round_number)
+                stop_for_human_decision(HumanDecisionRequiredError.decision(
+                    what=(
+                        f"Unresolved visual findings {', '.join(item.item_id for item in visual_blockers)} "
+                        f"at head {pr_metadata.head_sha}: {reason}. A new head with changed images and explicit visual dispositions "
+                        "or an explicit human decision is required."
+                    ),
+                    clear=(
+                        "Push a new head with changed images and explicit visual dispositions, "
+                        f"then rerun `agent-loop pr {pr_number}`."
+                    ),
+                    safe_to_automate=False,
+                    automation_note="visual findings need a human or reviewer judgement on the images.",
+                ), round_number=round_number)
 
             if use_compact_pr_context:
                 pr_compact_prior_summaries = list(
@@ -8772,14 +8781,11 @@ def run_pr_loop(
             # decision below; on paths where that decision is not evaluated (the
             # final allowed round, a merge-conflict round) it stops here instead.
             deferred_non_convergence = step_back_decision.deferred_stop
-            if deferred_non_convergence and (
+            if deferred_non_convergence is not None and (
                 round_number == allowed_rounds
                 or any(item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items)
             ):
-                stop_for_human_decision(
-                    HumanDecisionRequiredError(deferred_non_convergence),
-                    round_number=round_number,
-                )
+                stop_for_human_decision(deferred_non_convergence, round_number=round_number)
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -8929,13 +8935,10 @@ def run_pr_loop(
                 )
                 stage_same_head_conversion_review(current_round=round_number)
                 continue
-            if deferred_non_convergence:
+            if deferred_non_convergence is not None:
                 # The evidence stall did not stop at this dispatch, so it cannot own
                 # the window: the non-convergence stop fires before any coder turn.
-                stop_for_human_decision(
-                    HumanDecisionRequiredError(deferred_non_convergence),
-                    round_number=round_number,
-                )
+                stop_for_human_decision(deferred_non_convergence, round_number=round_number)
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)
