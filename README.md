@@ -125,7 +125,7 @@ as for a ready/unlabeled PR. If a qualified PR is converted back to draft and
 pushed by hand, the label suppresses ordinary CI for that push. Remove the label
 to restore it.
 
-While a managed draft waits for review, coder and format-repair turns cannot
+While a managed draft waits for review, coder turns and their same-agent re-asks cannot
 dispatch ordinary CI themselves. Their prompts say that a skipped
 `pull_request` check is expected. A per-turn `gh` guard refuses
 `gh workflow run`, `gh run rerun`, and `gh api` dispatch or rerun POSTs. A
@@ -513,7 +513,7 @@ staged parent/child topology) before invoking an agent; an ordinary PR with no
 planning provenance continues through the normal no-plan path.
 
 Signed human instructions are rendered as `Requirement hr-<digest>` and use the
-same content-derived ID in acknowledgements, repair, round metadata, and resume.
+same content-derived ID in acknowledgements, re-asks, round metadata, and resume.
 Insertion or chronological reordering cannot change an existing instruction's
 ID, while an edited body receives a new ID. Historical positional
 acknowledgements require a fresh acknowledgement against the currently surfaced
@@ -1183,7 +1183,7 @@ tells an agent to relay a decision, the relay must be disclosed in the comment.
 - GitHub is the only supported forge, and every selected agent backend must be
   installed and authenticated locally.
 - Agent CLIs can exhaust quota, time out, update themselves, or return malformed
-  structured output. Retries, repair passes, and salvage reduce lost work but
+  structured output. Retries, same-agent re-asks, and salvage reduce lost work but
   cannot guarantee unattended completion. A usage limit with a parsed reset
   stops the run (exit code 3) unless you opt in to waiting for it with
   `--wait-for-quota-reset DURATION` (for example `6h`; see
@@ -2192,7 +2192,7 @@ full, contract-verified rerun.
 - [`docs/local_agent_loop.md`](docs/local_agent_loop.md): detailed lifecycle, protocol, recovery, CI, memory, and safety reference.
 
 The detailed guide is intentionally the source for protocol schemas, durable
-markers, repair passes, fallback ladders, CI provenance, and compatibility
+markers, same-agent re-asks, fallback ladders, CI provenance, and compatibility
 behavior. Those internals are not required for a first successful run.
 
 ## Development

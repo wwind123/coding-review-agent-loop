@@ -59,7 +59,7 @@ legacy records keep their exact historical mode/source lookup and serializer.
 Plan-only retains its existing approved-follow-up audit record, explicit split
 materialization, and unfiled-scope warning, but creates no fresh decision,
 canonical topology, phase-child handoff, or dispatch. Old unversioned comments and two-field
-typed stages remain legacy-undecided. A bounded repair can only reformat a
+typed stages remain legacy-undecided. Mechanical normalization can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
 
@@ -747,9 +747,7 @@ only the waiting seat is affected, never every Antigravity seat as a backend
 outage. In a parallel PR round the other seats' reviews stay withheld in the
 private round spool, so rerunning once the lock is free replays them and runs
 only the contended seat; a sequential round reports just that seat unavailable
-and a rerun completes it. Direct Antigravity format repair gets the same one re-wait
-and records an exhausted wait as `settings_lock_contention`, without trying
-another repair model.
+and a rerun completes it.
 
 ### Changing the PR reviewer board mid-run
 
@@ -969,8 +967,8 @@ produce, such as an authenticated live-CLI run at the exact PR head. Reviewers
 report it in the optional `exact_head_evidence_requests` list of the structured
 `pr_review` response, separately from `blocking_items`. A request is never a
 code finding and is never sent to the coder. Listing the same text as both a
-request and a finding is invalid and goes through the bounded format repair,
-which must keep the typed request.
+request and a finding is invalid and is re-asked to the same reviewer, whose
+corrected response must keep the typed request.
 
 Reviewers link signed requirements using the optional `requirement_evidence`
 entries in their structured review. A `human-only` entry names the original
@@ -996,8 +994,8 @@ recovery notes). Classification alone cannot clear evidence. The requester
 must also attest adequacy through live signed citations and exact-head binding,
 before or after a freeze. Missing classification triggers one real reviewer
 continuation when evidence is involved; absent or conflicting classification
-cannot silently discard instructions. Format repair cannot invent these roles,
-links or leftover instructions.
+cannot silently discard instructions. Neither mechanical normalization nor a
+re-ask supplies these roles, links or leftover instructions.
 
 Each request becomes a `human-exact-head-evidence` obligation owned by the
 reviewer that asked for it. Its identity comes from the normalized request text
@@ -1159,7 +1157,7 @@ The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Claude Opus 5.5 
 - **Groups.** Each chain entry belongs to a quota group derived from its name: names starting with `Gemini` form the `gemini` group, names starting with `Claude` the `claude` group, and any other name is its own group. `--antigravity-quota-group MODEL=GROUP` (repeatable) overrides the derivation; `MODEL` must be in the configured chain. Groups are a **skipping heuristic, not a guarantee of independent quota**: agy can fail every model for an account-wide limit.
 - **Exhaustion is read from the provider's own error frame only** (the `Error:` line plus its indented continuation lines, a JSON error object, or agy's `AGY_ERROR:` line), taken from the raw output, never from transcript text. Capacity-only wording (`high traffic`, `capacity exhausted`), short resets (300 s or less), bare `429` and auth/billing failures are never exhaustion.
 - **Credits exception.** agy's `credits balance is too low` error is billing wording, but the balance belongs to a model family, not the account. It counts as quota exhaustion (the group cools down and the chain falls back, logging `Antigravity model "<failed>" out of credits; falling back to "<next>"`) only when the credits wording sits in a terminal provider frame that shows `429` with `RESOURCE_EXHAUSTED` or an `AGY_ERROR` JSON `"retryable": true`, or in the provider error line immediately before that frame. Credits wording elsewhere in the transcript never qualifies. Auth words (`unauthorized`, `forbidden`, `invalid api key`, `authentication`), a numeric 401/403 in a terminal provider frame, and dirty-checkout failures take precedence: they are non-retryable with no retry or fallback, even when the same output also has timeout or `429` wording, unless a typed runner retry decision (a target executable mid self-update, capture diagnostics or replacement stability) applies. Codex and Claude billing classification is unchanged. When every group is exhausted, the stop is the transient `Antigravity unavailable on all models` error, not a billing failure.
-- **Silent quota failure.** agy sometimes ends a quota-exhausted turn with no output at all: no response file, and stdout empty or holding only its own `run ended with no output and no recorded error` warning. For such an attempt agent-loop reads agy's own CLI log, `~/.gemini/antigravity-cli/log/cli-<YYYYMMDD_HHMMSS>.log`. It uses only a log this attempt created: the log directory is listed under the shared agy settings lock just before agy starts, and only a name absent from that list qualifies. The candidate must also have a name stamp within 2s before to 10s after the spawn, be a regular file (not a symlink), and have an mtime from 1s before the spawn to 2s after exit. The candidates are also listed under that lock, after agy exits and before the lock is released, so a log written by another agent-loop agy turn can never be a candidate; agy runs started by hand outside agent-loop do not take the lock and are guarded only by the exactly-one-candidate rule. Exactly one such log must exist; none or several means no lookup result, and an older log is never used. When that log has an error-severity `agent executor error` / `generating and executing` line with `RESOURCE_EXHAUSTED` and `429`, the attempt counts as quota exhaustion for the attempted model's group, with no format repair, and logs `Antigravity printed no output; agy log <file> shows RESOURCE_EXHAUSTED (code 429); treating as quota exhaustion`. The group cooldown, fallback and `Antigravity unavailable on all models` stop then apply as for a printed quota error. agy's start-up auth and credits-refresh log lines are never classified. A missing, unreadable, ambiguous or older log, or one without that line, keeps the ordinary format-failure path. A located log's path is recorded as `agy_log_path` in the usage record, and every log located during the turn is named as `agy log: <path>` in whichever terminal error ends it: the ordinary failure, the `Antigravity unavailable on all models` stop, or a parsed quota-reset stop.
+- **Silent quota failure.** agy sometimes ends a quota-exhausted turn with no output at all: no response file, and stdout empty or holding only its own `run ended with no output and no recorded error` warning. For such an attempt agent-loop reads agy's own CLI log, `~/.gemini/antigravity-cli/log/cli-<YYYYMMDD_HHMMSS>.log`. It uses only a log this attempt created: the log directory is listed under the shared agy settings lock just before agy starts, and only a name absent from that list qualifies. The candidate must also have a name stamp within 2s before to 10s after the spawn, be a regular file (not a symlink), and have an mtime from 1s before the spawn to 2s after exit. The candidates are also listed under that lock, after agy exits and before the lock is released, so a log written by another agent-loop agy turn can never be a candidate; agy runs started by hand outside agent-loop do not take the lock and are guarded only by the exactly-one-candidate rule. Exactly one such log must exist; none or several means no lookup result, and an older log is never used. When that log has an error-severity `agent executor error` / `generating and executing` line with `RESOURCE_EXHAUSTED` and `429`, the attempt counts as quota exhaustion for the attempted model's group, with no re-ask, and logs `Antigravity printed no output; agy log <file> shows RESOURCE_EXHAUSTED (code 429); treating as quota exhaustion`. The group cooldown, fallback and `Antigravity unavailable on all models` stop then apply as for a printed quota error. agy's start-up auth and credits-refresh log lines are never classified. A missing, unreadable, ambiguous or older log, or one without that line, keeps the ordinary format-failure path. A located log's path is recorded as `agy_log_path` in the usage record, and every log located during the turn is named as `agy log: <path>` in whichever terminal error ends it: the ordinary failure, the `Antigravity unavailable on all models` stop, or a parsed quota-reset stop.
 - **On exhaustion** the whole group is skipped: there are no same-model retries, no sleeps and no sibling walk. The turn jumps once to the first entry of another group. A second verified exhaustion in the same turn is treated as a shared limit and stops the turn; further groups are not tried.
 - **Run-scoped memory.** An exhausted group is remembered for the logical run (shared by nested loops and reviewer threads, dropped when the run ends) until its parsed reset, or, with no parsed reset, for `--antigravity-quota-cooldown-seconds` (default 600, max 3600). Later turns skip a cooling group and re-probe it afterwards; each transition is logged once. Nothing is latched for the rest of the run. Memory is not persisted across processes, so a rerun rediscovers exhaustion once.
 - **Early stop.** When every group in the chain is cooling down, the turn stops without invoking agy: `Antigravity unavailable on all models`, naming the last frame, the models tried and when groups become eligible again. `QuotaResetExceededError` is raised only when every group has a parsed long reset; unverified text never stops an Antigravity turn. With `--wait-for-quota-reset`, that verified stop (including the shared-limit stop) waits for the earliest group reset instead when every reset is within DURATION (see [Waiting for a quota reset](#waiting-for-a-quota-reset)). Transient capacity failures (`high traffic`) still retry the same model, then fall back. Each capacity failure logs its attempt duration.
@@ -1169,9 +1167,9 @@ The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Claude Opus 5.5 
 
 ### Structured output
 
-When the installed `agy` advertises `--output-format`, structured turns ask agy for its JSON envelope with `--output-format json`. These are PR and plan reviews, plan state and revisions, coder follow-ups, issue implementations and task results. No request schema is sent: agy's `--json-schema` channel keeps only the properties the schema declares in `structured_output`, which stripped every review field (#2049), so `structured_output` is never used as the answer. agent-loop takes the answer in this order: a non-empty response file; otherwise exactly one JSON object of the expected kind (or `agent_unavailable`), bare or in a single ```json fence, in the envelope's `response` text; otherwise the stdout marker in that text. A recovered object gets its footer marker (carrying the object's own state) and signature appended in code, so a model that writes its payload only in chat still yields a usable response; an object without a state is never given one and falls back to the marker text. Candidates are counted over the whole `response`, before the stdout marker is considered. Two or more top-level objects (including one before and one after the marker), a single object of another kind or without a kind, or a state footer outside the object that contradicts it is a format failure: no object is picked, no repair runs, and the failure is classified only from a tool-authored diagnostic, so it counts toward the format fallback to the next chain model. agent-loop's own validators stay authoritative. A reviewer payload carrying only `schema_version`, `kind` and `state` is never accepted and is refused repair. A non-`SUCCESS` envelope is treated as an operational failure reported by agy, and no payload is recovered from its prose. Its decoded error is classified as the final provider line, so model narration cannot hide it. Auth and billing errors stop without retry or fallback, and quota or capacity errors take the quota path. A fallback response that then fails validation is never counted as a format failure. A turn that must carry content outside the JSON keeps the response-file channel. Such turns include those with signed human requirements to acknowledge, a required direct-discussion acknowledgement, or a reviewer's resolved-requirements marker. Repair, classification and discuss turns also keep it.
+When the installed `agy` advertises `--output-format`, structured turns ask agy for its JSON envelope with `--output-format json`. These are PR and plan reviews, plan state and revisions, coder follow-ups, issue implementations and task results. No request schema is sent: agy's `--json-schema` channel keeps only the properties the schema declares in `structured_output`, which stripped every review field (#2049), so `structured_output` is never used as the answer. agent-loop takes the answer in this order: a non-empty response file; otherwise exactly one JSON object of the expected kind (or `agent_unavailable`), bare or in a single ```json fence, in the envelope's `response` text; otherwise the stdout marker in that text. A recovered object gets its footer marker (carrying the object's own state) and signature appended in code, so a model that writes its payload only in chat still yields a usable response; an object without a state is never given one and falls back to the marker text. Candidates are counted over the whole `response`, before the stdout marker is considered. Two or more top-level objects (including one before and one after the marker), a single object of another kind or without a kind, or a state footer outside the object that contradicts it is a format failure: no object is picked, and the failure is classified only from a tool-authored diagnostic, so it counts toward the format fallback to the next chain model. agent-loop's own validators stay authoritative. A reviewer payload carrying only `schema_version`, `kind` and `state` is never accepted as a review. A non-`SUCCESS` envelope is treated as an operational failure reported by agy, and no payload is recovered from its prose. Its decoded error is classified as the final provider line, so model narration cannot hide it. Auth and billing errors stop without retry or fallback, and quota or capacity errors take the quota path. A fallback response that then fails validation is never counted as a format failure. A turn that must carry content outside the JSON keeps the response-file channel. Such turns include those with signed human requirements to acknowledge, a required direct-discussion acknowledgement, or a reviewer's resolved-requirements marker. Classification and discuss turns also keep it.
 
-If agy or the provider still rejects agent-loop's structured request (an `INVALID_ARGUMENT` that names a request schema, reported in a non-`SUCCESS` envelope, in stdout outside the envelope, or in the silent attempt's own agy CLI log), agent-loop logs a warning and replays that turn once without the JSON flags. The replay uses the same prompt and model, consumes no retry, is not a format failure and gets no repair; a failed replay is classified normally. The next turn tries structured output again. Model prose that quotes such an error never triggers the replay. Use `--antigravity-structured-output off` to disable the channel persistently.
+If agy or the provider still rejects agent-loop's structured request (an `INVALID_ARGUMENT` that names a request schema, reported in a non-`SUCCESS` envelope, in stdout outside the envelope, or in the silent attempt's own agy CLI log), agent-loop logs a warning and replays that turn once without the JSON flags. The replay uses the same prompt and model, consumes no retry, is not a format failure; a failed replay is classified normally. The next turn tries structured output again. Model prose that quotes such an error never triggers the replay. Use `--antigravity-structured-output off` to disable the channel persistently.
 
 The capability is probed once per agy command with `agy --help`. A probe that fails, an older agy, or `--antigravity-arg` values that already set `--output-format` or `--json-schema` keep the legacy channel. `--antigravity-structured-output off` (default `auto`) disables the JSON envelope explicitly. When a prompt is too large for argv, the short `--print` directive names the response file (or asks for exactly one JSON object as the final answer) and tells the model not to answer in chat.
 
@@ -1190,7 +1188,7 @@ commands, protocol schemas, and recovery contracts.
 The tool shells out to authenticated agent and GitHub CLIs. Durable round,
 plan, handoff, and CI metadata is recorded on GitHub; response files, subprocess
 logs, salvage, and advisory memory are local. The orchestrator validates agent
-responses, owns bounded format repair, and revalidates live state before
+responses, re-asks a rejected response to the same agent, and revalidates live state before
 qualification or merge. See [state and recovery](architecture/round-state-and-resume.md).
 
 ### Architecture context
@@ -1389,7 +1387,7 @@ startup, Node-loader, or updater diagnostics. Antigravity additionally permits
 recognized `agy` version/model startup chrome; unknown lines are treated as
 progress and suppress replay. A valid response-file artifact is accepted before
 this gate, even for a failed or timed-out command; a malformed artifact follows
-normal validation/repair.
+normal validation and the same-agent re-ask.
 
 Gemini takes a read-only `HEAD` and exact `git status --porcelain` snapshot
 immediately before `run_with_log`, then lazily takes the after snapshot only for
@@ -2886,7 +2884,7 @@ The derived object and bounded diagnostics are carried through public comments,
 review context, round metadata, retry, and idempotent replay. Execution
 selectors are not persisted as receipt authority. Missing or malformed claims
 trigger bounded semantic correction that preserves the committed work and
-authenticated PR; it never asks repair to recreate rows, identities, receipts,
+authenticated PR; it never asks a model to recreate rows, identities, receipts,
 mappings, statuses, or an evidence envelope. If correction is exhausted or a
 head race occurs, the same PR remains resumable with complete non-verified
 evidence. Planned tests and unverified command text remain non-evidence.
@@ -2896,7 +2894,7 @@ The claim-row keys come from one machine-owned schema: `row_id`,
 `test_locations`, `workflow_path_claim`, `outcome_assertions`,
 `forbidden_effect_assertions`), and optional `caveats`. The fresh
 implementation prompt, the follow-up prompt, the post-authentication correction
-prompt, and repair all show the same key list and complete example row. Before
+prompt, and every re-ask show the same key list and complete example row. Before
 authentication, a claim whose semantic facts are missing, `null`, or empty
 (including a blank `workflow_path_claim`) is accepted rather than rejecting the
 whole envelope, so an otherwise valid pushed PR still reaches authentication and
@@ -2997,35 +2995,33 @@ A wrongly shaped `test_observations` field is fixed before anything is dropped
   the earlier drop record and never become fatal.
 
 Catalog collisions and non-passing or non-authoritative in-catalog selectors
-are not repairable by reformatting, so they skip the structured repair pass
-and its model fallback chain entirely. The run reports `Failure category:
-semantic-evidence-rejection` with the selector named, rather than a repair
-timeout (#990). If such a rejection is exposed only after a structured repair
-reshapes an envelope that normalization could not fix, the repair chain stops on
-that candidate, no fallback model runs, and the run is classified the same way
-(or takes the single opted-in coder re-ask), whatever the repair transport
-outcome was, including an Antigravity timeout or nonzero exit (#999).
+cannot be fixed by reformatting. They go back to the same coder through the
+shared same-agent re-ask budget (#2066): a non-passing selector, missing launch
+integrity or an outside-checkout receipt command gets the fresh-evidence
+re-ask, which asks the coder to rerun the covering test through the wrapper,
+and any other cause gets the resend-only re-ask. The same applies when the
+rejection appears only after envelope normalization. No other model runs. When
+both re-asks are spent, the run reports `Failure category:
+semantic-evidence-rejection` with the selector named (#990, #999).
 
 A PR review that leaves a carried prior item without a disposition is missing a
-judgement, not a format, so repair cannot supply it. The same reviewer is
-re-asked once within the same worker, with the same frozen prompt and session
+judgement, not a format, so only the reviewer can supply it. The same reviewer
+is re-asked within the same worker, with the same frozen prompt and session
 plus a short note naming the omitted item IDs, under the existing round
-publication barrier. The re-ask uses neither the retry budget nor the Antigravity
-model fallback, and never goes to repair. A second omission stops as before
-(#1167).
+publication barrier. The re-ask uses the shared same-agent re-ask budget (at
+most two per turn, #2066), neither the retry budget nor the Antigravity model
+fallback. An omission that survives both re-asks stops as before (#1167).
 
 The same re-ask covers a required reviewer judgement field. When a fresh
 `plan_review` or `pr_review` has an absent, null, blank, non-string, or
 out-of-enum `architecture_impact.status` and that is the only defect in the
 assessment, the same reviewer is re-asked once with the frozen prompt and
 session plus a note naming the field and its allowed values
-(`changed | unchanged`). It shares the single re-ask slot with the omission
-re-ask above, so one invocation never re-asks twice. After the slot is used the
-turn ends as a reviewer failure and repair is skipped: reformatting cannot
-supply the reviewer's decision, and repair preservation rejects any
-`architecture_impact.status` the source did not decide. Malformed structure
-still goes to repair, and near-miss aliases still normalize or degrade as
-before (#1185).
+(`changed | unchanged`). It shares the same two-re-ask budget with every
+other validation failure of the turn. After the budget is spent the turn ends
+as a reviewer failure: no model other than the reviewer supplies the
+reviewer's decision. Malformed structure is re-asked the same way, and
+near-miss aliases still normalize or degrade as before (#1185).
 
 #### Risk-matrix coverage map (#1290)
 
@@ -3042,9 +3038,8 @@ top-level `risk_test_matrix_coverage_gaps` array of `{row_id, reason,
 proposed_correction}` objects for a row that genuinely cannot be tested as
 specified. Malformed, unknown-row, and duplicate gap entries are dropped with
 parse-degradation records, never rejecting the envelope. Neither field is
-persisted as authority, and repair may carry both only verbatim (repair
-instructions describe `test_level` as optional preserve-only and list the gaps
-field among the preserved fields).
+persisted as authority, and a re-ask must resend both unchanged unless the
+validator message requires a change.
 
 `risk_coverage_map.py` is a pure completeness check, distinct from canonical
 evidence. The required level is classified from the row's free-text
@@ -3062,15 +3057,14 @@ row: it guarantees completeness and well-formedness only, and that semantic
 accuracy stays with the reviewer.
 
 The gate runs once, after `run_validated_agent` has accepted the implementation
-response through any acceptance path (normal, envelope normalization, repair,
-an authoritative artifact, completion recovery) and after the reported PR has
+response through any acceptance path (normal, envelope normalization, a same-agent
+re-ask, an authoritative artifact, completion recovery) and after the reported PR has
 passed every read-only identity, managed-CI authorization, issue-reference, and
 closing-contract guard, but before any publication. It assesses the PR's pushed
 head, so a locally committed but unpushed test is a deficiency. On deficiencies
 the coder is re-asked exactly once in the same session, with the frozen prompt
 plus a section naming the deficient rows and codes. This re-ask is separate from
-the evidence re-ask, never routes through repair, and does not consume
-`agent_max_retries`. A same-PR response is adopted; a null-PR, clarification,
+the same-agent re-ask budget and does not consume `agent_max_retries`. A same-PR response is adopted; a null-PR, clarification,
 different-PR, or recoverably failed re-ask is discarded and the first response is
 kept. After the re-ask returns, the PR is refreshed and its read-only guards
 re-run before authorization and handoff records are published, so no record binds
@@ -3507,7 +3501,7 @@ Claude reviewer overrides. Models and efforts are selected independently:
   after plan approval. Reviewer options never change the coder's selection.
 
 Reviewer options also apply to discussion participants, but not the discussion
-analyzer or repair backend. They do not change workdir or permission policy.
+analyzer. They do not change workdir or permission policy.
 Without reviewer overrides, behavior is unchanged: an implementation model
 switch also becomes that provider's default reviewer model during the handoff.
 Effort-only overrides do not switch models, and model-only overrides do not
@@ -3610,7 +3604,7 @@ are accepted only while resuming: old `needs-human` questions map to
 `human-decision`, while old asserted-answer questions map conservatively to
 `blocker`. New live responses must use `unresolved_items`.
 Analyzer observations remain non-authoritative and cited research remains a
-separate sourced-facts section. Repair and resume preserve the selected mode;
+separate sourced-facts section. Re-asks and resume preserve the selected mode;
 transcripts cannot mix answer and triage responses.
 
 Answer-mode presentation is intentionally executive-first. When a configured
@@ -3936,8 +3930,7 @@ Guardrails — the analyzer is never authoritative:
   fails validation, the observations are omitted while the answer/vote table
   and mechanical outcome remain available. For a partial round, any retained
   observations are grounded only in its successful final-round responses.
-- If the analyzer invocation fails even after the malformed-response repair
-  pass, the orchestrator logs a warning and falls back to the plain mechanical
+- If the analyzer invocation fails even after the same-agent re-asks, the orchestrator logs a warning and falls back to the plain mechanical
   agenda for that round (and full prior positions in the next debate prompt)
   instead of aborting the run.
 
@@ -3979,7 +3972,7 @@ research.
   `discuss_review` must include a `research` object; its `status` must be
   `sourced`, `unavailable`, or `inconclusive` (`not-needed` is rejected), and a
   `sourced` status requires non-empty `sourced_facts` of `{"fact", "source"}`
-  pairs. Validation enforces this (with the malformed-response repair pass as
+  pairs. Validation enforces this (with the same-agent re-asks as
   fallback), so the user can force research instead of relying on automatic
   detection.
 - `auto`: debaters self-decide using conservative triggers — current
@@ -4055,7 +4048,7 @@ file, and the line number must fall within its current line count, or the
 loop raises and fails the turn/resume/recovery outright. This is a bounded,
 structural guarantee only — it confirms the referenced line exists, not that
 it actually supports the claimed fact. The check always runs against
-whatever is on disk in the assigned checkout *right now*, at live, repair,
+whatever is on disk in the assigned checkout *right now*, at live, re-ask,
 resume, and legacy split-proposal-recovery time alike; there is no persisted
 historical snapshot to compare against, so a claim can stop resolving later
 if the checkout's contents have since changed. A default (tool-managed)
@@ -4275,7 +4268,7 @@ Execution model:
   instead of re-invoking them. When every launched reviewer failed, there is
   nothing to withhold and the round settles as before.
 - Existing per-reviewer policies are unchanged and isolated per turn: retry,
-  structured repair, the unavailable-reviewer / incomplete-review
+  same-agent re-asks, the unavailable-reviewer / incomplete-review
   distinction, and the PR flow's single-reviewer-fatal rule. One reviewer's
   failure never cancels a healthy concurrent reviewer's turn.
 - For PR review, a reviewer's pre-launch `sync_reviewer_pr_before_review` is
@@ -5332,8 +5325,8 @@ boundary (exit code 4) before the next coder turn.
 finding whose sole demand is admissible citation evidence for those approved
 risk-matrix rows. The tag is accepted only on `blocking_items` and only when the
 approved plan has an applicable matrix; row IDs must be unique and name enforceable
-approved rows. Unknown IDs, duplicates, or a tag without a matrix are rejected through
-the bounded format repair, which keeps each valid tag verbatim and never adds one. The
+approved rows. Unknown IDs, duplicates, or a tag without a matrix are rejected and re-asked
+to the same reviewer, whose corrected response keeps each valid tag verbatim. The
 tag is fixed when the orchestrator mints the item and stays on that stable item
 through ordinary `unresolved` dispositions (no re-declaration, no duplicate item); a
 reviewer who raises a new blocking item gives it its own tag. It is persisted on the
@@ -5496,7 +5489,7 @@ grant. This is conservative: the run stops at the limit as it would without
 the exception.
 When the stop fires and the last follow-up's `test_observations` were dropped
 as a non-array, the stop message adds: `The coder's test_observations were not
-a JSON array (format repair attempted: yes|no); N run-tests receipt(s) from
+a JSON array (same-agent re-asks attempted: yes|no); N run-tests receipt(s) from
 that turn went uncited, so the blocker may be a tool format problem rather than
 a code defect.`
 
@@ -6203,7 +6196,7 @@ agent-loop issue 123 --repo OWNER/REPO --triage --triage-model gpt-5.5
 - **Answer.** A strict JSON object: `route`, `unsure`, and 1 to 8 reasons that
   each name a listed signal. `unsure: true` or an unrecognized route is
   reported as plan-first.
-- **Failures.** A backend failure, an answer that stays invalid after repair,
+- **Failures.** A backend failure, an answer that stays invalid after its re-asks,
   or a failed comment post is logged; the run continues unchanged and no
   recommendation is posted.
 - **Record.** The comment carries a tool-owned triage record (recommended
@@ -6593,10 +6586,10 @@ It grants no receipt or matrix authority. Strict citations, freeform reports,
 and failure reconciliation retain their existing checkout requirements.
 
 On PR follow-ups, structured partition and strict citation workdir refusals run
-inside validated acquisition and share the existing single semantic-evidence
-coder re-ask with re-askable selector refusals. This allowance is independent of
-ordinary retries and shared across direct, normalized and repair-surfaced
-responses. Repair stops when it exposes a semantic refusal. Correction resumes
+inside validated acquisition and go back to the same coder through the shared
+same-agent re-ask budget (at most two per turn) with re-askable selector
+refusals. The budget is independent of ordinary retries and shared across
+direct and normalized responses. Correction resumes
 the rejected acquisition's session when available, keeps the original task and
 bounded sanitized feedback, and validates against its own closed catalog before
 publication or finding settlement. A scratch-input receipt remains inadmissible;
@@ -6861,7 +6854,7 @@ full-suite paths.
 
 While a managed draft waits for review, its skipped or neutral
 `pull_request`/`synchronize` check is the expected approval-gated state. Coder
-and format-repair turns on that PR therefore cannot dispatch ordinary CI to get
+turns and their same-agent re-asks on that PR therefore cannot dispatch ordinary CI to get
 a green check:
 
 - **Prompt.** Every coder prompt says that a skipped check is expected, that
@@ -6881,14 +6874,14 @@ a green check:
   `gh run view`, and GET `gh api`, is executed unchanged by the configured `gh`
   (`--gh-cmd`).
 - **Post-turn audit.** After a guarded turn's last coder continuation
-  (format repair or the semantic-evidence correction) the orchestrator lists
+  (a same-agent re-ask or the semantic-evidence correction) the orchestrator lists
   `workflow_dispatch` runs on the PR branch created since the turn started, and
   every known head. This also covers the direct-issue first turn, once the
   created PR is authenticated. A non-managed run found there, for example one
   started through an absolute `gh` path, `curl`, or the web UI, is prepended to
   the coder's round comment as a non-authoritative diagnostic. It is never
   qualification and never cancelled. If the turn is rejected (for example,
-  format repair fails, a report is invalid, or the checkout fails during
+  the re-asks fail, a report is invalid, or the checkout fails during
   semantic correction), the same audit still runs and posts its note as a
   separate orchestrator comment before the rejection is raised. In issue and
   approved-plan implementation this applies once the created managed draft is
@@ -6907,10 +6900,10 @@ The guard and the prompt text share one invocation-scoped decision. In the PR
 loop that decision is the live managed-CI state for the turn: explicit managed
 CI, or implicit `--auto-merge` with an activated contract. Activation fallback
 and a revalidation drop turn it off. In issue and approved-plan implementation
-the decision is the managed creation intent. Validated-agent retries, format
-repair, and the semantic-evidence correction that resumes that coder session
+the decision is the managed creation intent. Validated-agent retries, same-agent
+re-asks, and the semantic-evidence correction that resumes that coder session
 inherit the decision, prompt guidance included. Reviewer, planner, and
-step-back launches, and their repairs, never carry it. Orchestrator-owned
+step-back launches, and their re-asks, never carry it. Orchestrator-owned
 GitHub calls, including the post-approval managed dispatch, never pass through
 the guard.
 
@@ -7643,7 +7636,7 @@ handoff or approval, while the same authorized head remains resumable.
 
 Initial and coverage-reask implementation reports receive one shared semantic
 correction allowance for report-workdir and selector refusals, including
-normalized or repaired candidates. Correction resumes the rejected session when
+normalized candidates. Correction resumes the rejected session when
 available and must use correction-turn observations. A second refusal exhausts
 acquisition; it does not start another coverage re-ask.
 
@@ -8937,7 +8930,7 @@ its role (implemented in `agent_permissions.py`):
   so failed-exit salvage reads it as usual. It has no network.
 - A committing Codex coder (issue implementation, plan-first `auto` or
   implementation modes, `pr`, `managed-pr`, `task`), any Gemini or Antigravity
-  selection (including the default repair and semantic-followup backends), and
+  selection (including the default semantic-followup backend), and
   every `--<agent>-arg` are rejected before any agent runs;
   `run_agent_result` refuses an unsupported agent as a runtime backstop.
   Antigravity stays refused because `agy` offers no per-invocation,
@@ -9333,7 +9326,7 @@ emit a finding object using only the keys `title`, `text`, `issue`, `finding`,
 labels `item_id`/`id` (#957). The parser flattens such an object mechanically,
 in that fixed key order, into one finding string that keeps every prose value
 verbatim (labelled values such as `Evidence:` and `Required change:` keep their
-label); the local labels are dropped. No repair model runs for this shape, so a
+label); the local labels are dropped. No re-ask is needed for this shape, so a
 container-type mismatch can no longer discard a well-grounded review.
 Non-string values of these keys are still rejected; unknown keys follow the
 fold rule below.
@@ -9366,7 +9359,7 @@ finding parser and the PR-review finding parser (`blocking_items`,
 value is a non-empty string or a non-empty array of non-empty strings into the
 finding text as a labelled part such as `evidence_refs: row-1, row-7`, in the
 reviewer's own key order, and log one warning that names the folded keys (never
-their values). No repair model runs. On a plan finding the folded parts follow
+their values). No re-ask is needed. On a plan finding the folded parts follow
 the text fields and reference lines and precede `Sub-items:`; on a PR finding
 they are appended to `text`. Folded parts never count as a text field, so an
 object with only extras is still rejected with `no text field`.
@@ -9396,10 +9389,9 @@ The fold is deliberately narrow:
   at most 32 array entries, and at most 2000 characters per string or entry.
   Exceeding any bound rejects the finding; nothing is truncated.
 
-Repair-side handling of folded extras is unchanged and tracked in #1337: a PR
-repair can drop a folded extra without rejection, and a plan repair can drop a
-folded extra named like finding metadata (for example `severity`, `category`,
-`verdict`), whose value the preservation check skips.
+The former repair-side handling of folded extras tracked in #1337 no longer
+applies: no repair model rewrites a review any more (#2066), so a folded extra
+is kept or rejected only by the rules above.
 
 When a structured response is recognized but fails schema validation, the
 terminal error leads with the validation reason and reports `Failure category:
@@ -9419,7 +9411,7 @@ the code or plan content behind it, the reviewer says so in that entry's text
 and in `summary`, naming what could not be evaluated, so the coder knows
 another round is expected; masking must not be claimed merely to stop early.
 The rule changes no response schema: masking is conveyed through the existing
-finding text and `summary`. Coder, discuss, repair, and decomposition prompts
+finding text and `summary`. Coder, discuss, and decomposition prompts
 do not carry it. Its effect on rounds per run is measured with the
 [review contract comparison](#review-contract-comparison).
 
@@ -9686,150 +9678,38 @@ the agent's own response says about retrying. A genuine, non-recovery no-PR
 issue, matching how a successful PR-creating implementation is already posted.
 
 For structured plan reviews, plan revisions, PR reviews, and coder follow-ups,
-a present but malformed structured response may get a repair pass before the
-local failure is raised. By default the repair pass calls Antigravity through
-the existing PTY backend with the default repair chain `Gemini 3.8 Flash (Medium)` →
-`Claude Opus 5.5 (Medium)`; explicit repair models replace that chain and are
-followed by the configured coder/reviewer chain. Models missing from `agy models`
-are skipped. When `agy` reports a transient `model-access validation errors`
-failure on its own output channel (stdout with no response artifact and no
-structured JSON response), that repair model is retried once and the chain then
-continues with the next model; a valid response is always accepted, and
-model-authored text quoting the phrase is still treated as invalid output. A
-chain that ends in that transient failure is reported as a resumable
-`repair-provider-failure` with a re-run suggestion rather than a deterministic
-plan-validation failure. It uses a fresh temporary
-workdir, empty tool permissions, and repair-only instructions forbidding file
-inspection, tests, mutation, background work, and subagents. The format-repair
-prompt asks it to preserve the agent's intent while emitting
-only the required JSON object, matching footer marker, and standalone
-signature. Repaired output is accepted only after it passes the same schema,
-state, footer, follow-up, prior-item, and human-requirement validation as an
-original response. If the repair CLI fails, returns empty output, or produces
-invalid output, the original validation failure remains local and nothing is
-posted to GitHub.
+a present but malformed structured response is re-asked to the same agent under
+the same-agent re-ask rule described under [Logs](#logs); no second model
+reformats it (#2066). If the re-asks still fail, the original validation
+failure remains local and nothing is posted to GitHub.
 
-Reviewer repair is refused before any backend call when the source carries no
-review substance. A `plan_review` or `pr_review` source is admitted only when a
-JSON object is mechanically recoverable from it and that object either declares
-the expected reviewer kind or, when it carries no `kind`, carries a field unique
-to that review schema (`blocking_plan_issues`, `same_plan_followups`, or
-`prior_plan_item_dispositions` for a plan review; `blocking_items`,
-`same_pr_followups`, or `prior_item_dispositions` for a PR review). The
-kind-unique-field fallback applies only to a source that carries no `kind` key at
-all: a `kind` that is present but is not exactly the expected reviewer kind —
-including an empty string, a null, or any non-string value — is refused, and the
-grounding check below fails closed on the same rule rather than on a string-only
-comparison. Fields shared
-with other schemas — `summary`, `state`, `schema_version`, `future_followups`,
-`human_requirement_dispositions`, `architecture_impact` — are never admission
-evidence, so narration, tool-use diagnostics, a bare protocol state footer, an
-explicitly different kind, and a kindless object carrying only a generic state
-and summary are all refused. A refusal is classified as a reviewer
-unavailability (`agent-unavailable`) with a bounded retry inside the configured
-retry policy, never as a deterministic blocking verdict: no reviewer comment is
-posted and no carried ledger item is numbered for that reviewer. An empty
-reviewer response keeps its existing `empty-response` path and never reaches
-repair, and a transient repair-backend provider failure keeps its resumable
-`repair-provider-failure` classification. A reviewer output whose own
-diagnostics already name a definitive provider condition — an auth, billing, or
-credit failure, an unsupported model or effort, an exhausted resource, or an
-indeterminate containment result — keeps that classification and its operator
-suggestion: refusing to repair such a turn says nothing about reviewer
-availability, and a rerun cannot fix it.
+A reviewer response that, after its re-asks, still carries no review substance
+is a reviewer availability failure, never a verdict (#2029). A `plan_review` or
+`pr_review` response carries substance only when a JSON object is mechanically
+recoverable from it and that object either declares the expected reviewer kind
+with more than envelope keys or, when it carries no `kind` at all, carries a
+field unique to that review schema (`blocking_plan_issues`,
+`same_plan_followups`, or `prior_plan_item_dispositions` for a plan review;
+`blocking_items`, `same_pr_followups`, or `prior_item_dispositions` for a PR
+review). A `kind` that is present but is not exactly the expected reviewer kind
+carries no substance. Fields shared with other schemas (`summary`, `state`,
+`schema_version`, `future_followups`, `human_requirement_dispositions`,
+`architecture_impact`) are never substance, so narration, tool-use
+diagnostics, a bare protocol state footer and a kindless object carrying only a
+generic state and summary all qualify. Such a turn is classified
+`agent-unavailable` with the ordinary retry and Antigravity format fallback: no
+reviewer comment is posted and no carried ledger item is numbered for that
+reviewer. An empty reviewer response keeps its existing `empty-response` path.
+A reviewer output whose own diagnostics already name a definitive provider
+condition (an auth, billing, or credit failure, an unsupported model or effort,
+an exhausted resource, or an indeterminate containment result) keeps that
+classification and its operator suggestion.
 
-Whenever a repaired response's own kind is `plan_review` or `pr_review`, a
-grounding check requires every repaired finding, summary, and carried
-disposition to be supported by the reviewer's own source text; it fails closed
-when the source payload is absent or declares a different kind. Support is token
-coverage — not contiguous containment, so the documented title-plus-detail
-concatenation stays legal — of the candidate against the whole normalized
-source, after removing four exempt sets: a pinned closed stop list, the review
-schema's own vocabulary, carried `item-<n>` identifiers, and the reserved-marker
-neutralization labels derived from the marker registry. Findings in all three
-buckets are matched injectively to source findings from any bucket, so a
-promotion out of `future_followups` remains legal while the repaired finding
-count may never exceed the number of source candidates. When the source payload
-declares no finding in any bucket, the candidates come only from freeform prose
-that sits *outside* the recovered JSON object: the object's own fields are
-structured data, and `summary` in particular is not a finding, so splitting the
-serialized payload into prose segments would let an approved source's summary be
-copied into a current-scope finding and then ground an inverted blocking verdict.
-Those freeform candidates are non-overlapping — a paragraph contributes either its
-list items or its joined prose, never both, a wrapped bullet's continuation
-lines join the item they belong to, and a lead-in line before the first bullet is
-list structure that is dropped rather than a concern of its own, so it can neither
-raise the ceiling nor let a repaired finding match on the heading alone — so
-one trailing reviewer statement cannot be matched twice and raise the ceiling,
-and protocol footer and signature lines are structural records rather than
-candidates. A declared source finding that carries
-no prose is a candidate only when it really was nothing but a reserved marker, and
-then it corresponds solely to its own authorized neutralization: the target must
-represent the COMPLETE source marker multiset, each occurrence either kept
-verbatim or replaced by that occurrence's own safe label, compared by marker
-identity and occurrence count over the registry's historical replacement spans —
-the same occurrence set the stripping pass uses, so a malformed name-bearing-line
-fallback cannot hide a second reserved token on its line — rather than by the
-empty string that stripping any marker leaves behind, so an unrelated family, a dropped occurrence, a duplicated
-one, and leftover prose are all refused. Every other exempt-only target is refused,
-whichever candidate it is matched against: schema vocabulary, the stop list and
-every registry safe label are exempt, so `blocking`, an unrelated marker or its
-label, or stop-word-only prose has an empty content-token set that is trivially a
-subset of any candidate and vacuously covered by the whole source, and a target
-matched to a substantive candidate must therefore retain substantive content of
-its own. A modifier-only candidate is bounded instead by the modifier-count
-equality rule below, which forces the target to carry the same modifiers. A genuinely empty entry such as `{}` is dropped, so it can neither become
-a wildcard for an exempt-token-only finding nor raise the ceiling.
-Whole-source coverage alone cannot tell
-a finding apart from the summary or any other global prose, so without that
-restriction a source summary could be promoted into a fabricated finding and
-ground a blocking verdict. Each matched finding pair — including one matched
-against a freeform trailing-prose candidate — and each matched disposition note
-pair, must carry equal per-modifier occurrence counts over a pinned set of
-negations and limiting qualifiers, compared after a pinned
-contraction normalization that runs before punctuation stripping over both
-apostrophe forms — so deleting, adding, or substituting `not`, `isn't`, or
-`only` is rejected even though subset coverage alone would accept it. The
-verdict is grounded against the source rather than against what survives into
-the target: a repaired `blocking` needs an unambiguous source blocking state, a
-preserved source finding, or a carried disposition that is active in the source
-*and* preserved as active in the target — a disposition completed from the repair
-context's allowed IDs, or one re-stated out of a source `future`, is supplied by
-the orchestrator or by the target's own state and can never be that state's own
-support; a repaired
-`approved` needs an unambiguous approved source state *and* a source that itself
-carries no current-scope finding and no active disposition, so demoting a
-current-scope finding into `future_followups` can never manufacture an approval.
-Carried dispositions are matched by `item_id`, and only bounded normalizations
-are authorized: the repair prompt's own enum aliases (`still blocking` →
-`blocking` and its siblings); an active-to-`resolved` change only when the
-source note satisfies a negation-safe coverage predicate (a pinned coverage
-phrase that no pinned negation marker precedes inside its own sentence, with the
-still-open phrase list generated from the coverage list so every phrase carries
-its negated counterparts); re-stating a source `future` disposition as the
-kind's non-resolving active value in a blocking review; and completing an ID
-supplied in the repair context as that same non-resolving active value.
-Deterministic removal of unknown IDs is unaffected. The check is a bounded
-support check, not a certification that a genuine reviewer finding is correct.
-
-Repair is lossless formatting, not summarization: findings must retain their full
-evidence, code references, and requested tests; summaries and test reports must
-retain failures, timeouts, skips, and partial-coverage caveats. Object-to-string
-conversion must carry the complete substantive text. Reviewer item IDs must never
-be invented as signed human requirements.
-
-For parseable JSON in review, planning, and coder/implementation responses, a
-local preservation guard additionally rejects dropped/rewritten summaries,
-test-command entries, plan steps, coder evidence notes, and current-scope finding
-text. A rejected candidate follows the existing repair-model fallback chain; it
-is not posted as a successful repair. Whitespace, finding order, and allowed
-current-scope bucket moves are tolerated. Schema-mandated removal of invalid
-fields, forbidden future items, and reserved protocol syntax remains allowed.
-This is a bounded loss check, not semantic-equivalence certification: malformed
-JSON, unsupported response kinds, and individual strings containing reserved
-protocol grammar are not compared by this guard. Those paths still rely on the
-lossless prompt and the ordinary schema/context validators. No repair can certify
-that an agent's underlying code or test claims are true.
+Earlier releases instead sent a malformed response to a separate repair model
+and checked its output with a content-preservation guard and a reviewer
+grounding check. Those passes no longer run; historical failure categories such
+as `repair-provider-failure` still parse on resume. No re-ask can certify that
+an agent's underlying code or test claims are true.
 
 Known transient agent/model failures are retried before local failure. A
 structurally recognized response rejected by schema, item-classification,
@@ -9837,7 +9717,7 @@ acknowledgement, footer, or content validation is classified from that trusted
 validation context, not from vocabulary inside the response's prose. Thus a
 rejected response that happens to mention authentication, credit, billing, or a
 dirty tree remains a deterministic protocol failure without credential or
-billing advice. A repair timeout or invalid repair remains secondary to that
+billing advice. A failed same-agent re-ask remains secondary to that
 originating validation category; genuine provider and command diagnostics keep
 their normal classifications. The
 default is two retries with bounded backoff; tune this with
@@ -9998,7 +9878,7 @@ can approach the generic bound) and 30 seconds for the other backends; an
 explicit value always wins, whichever backend is selected.
 
 The Antigravity classification turn (`semantic-dedupe` role) runs in an
-isolated empty temporary directory, like format repair. It gets a minimal
+isolated empty temporary directory. It gets a minimal
 no-tools `GEMINI.md`, the strict empty-allowlist settings injection for the
 turn, a GEMINI lock beside the temporary directory, and no checkout snapshot.
 Its prompt carries no response-file, protocol-marker or footer contract: agy
@@ -10113,8 +9993,8 @@ The CLI coder follow-up also includes the latest available reviewer summaries
 as separate, attributed review-level context, including on resumed rounds and
 when compact PR review prompts are used. Summaries do not receive item IDs,
 replace original claims, or become another reviewer's item-specific evidence.
-Repair may copy clearly attributed explanations from the original response,
-but must not invent missing rationale or discard the original summary.
+A re-ask resends the reviewer's own response: it may not invent missing
+rationale or discard the original summary.
 
 In the other direction, CLI reviewers receive the latest structured coder
 summary, reported tests (including caveats), addressed/remaining item notes,
@@ -10530,7 +10410,6 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
   CLI installs its SIGTERM handler for the duration of the command and restores
   the previous handler afterwards. A SIGTERM that arrives when no wait is active
   keeps its previous behaviour, as does every other interrupt.
-- Format-repair turns never wait.
 
 Each top-level run also writes `<run-id>-usage-summary.json` in the same
 directory. That sidecar aggregates usage by call, by agent, and for the full
@@ -10700,9 +10579,8 @@ journal row.
   operator value of either is kept, the maximum is never below the default,
   and `AGENT_LOOP_SHELL_CAP_MS` is the effective default. The coder prompt
   tells a Claude coder to omit the Bash timeout parameter or pass at least the
-  budget, never a smaller value. Reviewers, planners and the `repair` role are
-  read-only and keep both variables unchanged; formatting repair is
-  tool-disabled and never reaches the Claude backend. The `run-tests`
+  budget, never a smaller value. Reviewers and planners are
+  read-only and keep both variables unchanged. The `run-tests`
   watchdog ceiling itself is unchanged, and admission wait is never counted
   against the target.
 
@@ -10951,11 +10829,11 @@ Historical and already-started legacy rounds remain pinned to their original
 form. Matrix-less history does not acquire fabricated matrix obligations, and
 old records are never backfilled with sidecars. Missing, partial, conflicting,
 or identity-mismatched hydration fails closed before prompting, assembly, or
-publication. Repair is limited to envelope presentation before assembly and
+publication. Normalization is limited to envelope presentation before assembly and
 must preserve the semantic patch, rationale, operation ordering, and base
 binding exactly.
 
-One planner-response shape needs no repair at all: a fresh plan or a
+One planner-response shape needs no normalization at all: a fresh plan or a
 `replace` operation on `execution_recommendation` whose object copies a
 tool-owned key the rendered plan prints next to the recommendation
 (`topology_source`, `recommendation_digest`, or
@@ -11070,7 +10948,7 @@ issue-created/source-managed suppression and adopted-label release are unchanged
 Before publication, fresh plans, full revisions, and assembled semantic revisions
 validate matrix owners against their own execution recommendation. Invalid owners
 return to the planner through bounded deterministic correction, without publication
-or envelope repair changing the topology. Exhaustion identifies ownership validation
+or envelope normalization changing the topology. Exhaustion identifies ownership validation
 and preserves the diagnostic for the next invocation.
 
 Published unapproved plans are checked before review as well. An ownership failure
@@ -11136,7 +11014,7 @@ as for text review today. This does not weaken independent actual-request image
 proof: clean final text or an acknowledgement alone cannot establish delivery.
 
 All image acceptance, including timeout/nonzero completion and deterministic text
-envelope repair, requires original immutable proof. Repair receives only generated
+envelope normalization, requires original immutable proof. Normalization receives only generated
 text and retains the original frozen proof out of band; it cannot reassess images.
 No semantic re-ask, completion resume, provider fallback or post-submission replay
 is supported. Uncertain completion remains unsuccessful. Text-only calls retain
@@ -11308,7 +11186,7 @@ repeating image or dedicated acquisitions. Retain the cache when resuming on the
 same host. No automatic garbage collection is performed. Cross-host execution
 retains the existing single-writer constraint and cannot assume local availability.
 Publication uncertainty permits original-outcome publication recovery only.
-Repair preserves the presence and complete decoded values of both typed fields,
+Normalization preserves the presence and complete decoded values of both typed fields,
 including list order, and cannot invent acceptance. Dedicated output is a strict
 versioned decision set with no code verdicts, findings or requests.
 
@@ -11365,7 +11243,7 @@ with the exact target printed by the freeze notice):
 Converted rows use `target_kind: "converted-row"`, the row ID as `target_id`,
 and the exact approved `matrix_identity`. Signed requirements use
 `target_kind: "signed-requirement"` and their full requirement ID and text.
-Reviewers and response repair cannot manufacture operator authority. A comment
+Reviewers and response normalization cannot manufacture operator authority. A comment
 saying “the operator approved this” is rejected as authority, as are unverified
 signatures, duplicate keys or targets, multiple scheduling blocks, unknown
 fields, stale identities, mismatched full text, and missing or ineligible
