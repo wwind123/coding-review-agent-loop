@@ -3798,6 +3798,48 @@ metadata 52120 characters; residual encoded round metadata 9544 characters;
 largest unspilled metadata fields (encoded characters): architecture_impact=891, ...
 ```
 
+**Bounded coder follow-up comments.** A PR-loop coder follow-up whose
+ordinary comment would not fit is posted in bounded form instead of ending the
+run (the coder's commit is already pushed, so a failed post would lose its
+round record). A comment that fits is posted byte-for-byte as before. Otherwise
+the loop re-renders the visible body at increasing bound levels and posts the
+first one that fits, measured with the same transport preparation that posts
+it:
+
+1. Item labels, per-item notes, test commands and human-requirement evidence
+   are cut to short excerpts, and the summary is capped.
+2. Repeated native human-only exact-head evidence requests (the same request
+   identity, repeated across reviewers or heads) also collapse into one line
+   that lists every item ID. The line reuses the item's own display label, so
+   a deferred request's text is still published only by the freeze notice.
+   Row-converted obligations, screenshot requests, code findings and a request
+   that appears only once keep their own lines.
+3. Item notes are dropped (each item keeps its ID under its disposition
+   heading). Tests run, out-of-checkout runs, test citations, sub-item progress
+   and matrix evidence become one count line each, the risk-matrix coverage map
+   uses a compact one-line-per-row form, and the parse-degradation sections
+   become one indicator line per kind under `### Parse degradations (bounded)`.
+4. The count lines are dropped too, the coverage map uses a minimal form
+   (per-kind row counts and the non-claim row IDs), and the summary is capped
+   to a short length.
+
+Every level keeps the `## Coder follow-up` heading, a `Head:` line, a note that
+the comment was shortened, every addressed, remaining and disputed item ID
+under its heading, and the signature. The compact and minimal coverage maps keep
+the heading and the verbatim status line, so resume still extracts them. The
+complete structured response, test evidence, matrix evidence and every parse
+degradation record stay in round metadata and its sidecars, as usual. For a
+free-form coder response the loop keeps whole leading lines (cutting the first
+line at a character boundary when even that line is too long), adds an
+omission note and the signature, and stores the complete original text in the
+round metadata, so resume reads it as the coder output. Reviewer and other
+round comments keep the transport behaviour described above.
+
+If even the most compact coder comment cannot fit (the round metadata, or a
+ledger whose item IDs alone exceed the budget), nothing is posted and the
+overflow error ends with the recovery command, for example `the coder's commit
+<sha> is pushed; recover with: agent-loop pr 2310 --review-unrecorded-head`.
+
 When the round-metadata marker alone, with its framing and an empty visible
 body, would exceed the budget, the message says so instead: `the derived round
 metadata alone needs N characters, so shortening the visible response cannot
@@ -9098,7 +9140,8 @@ only under the existing bound (`max_rounds` to `max_rounds + 2`); a restored
 used-extension flag blocks a second watcher extension. After
 `MAX_REJECTED_DISPATCH_ATTEMPTS` (2) consecutive rejected or interrupted
 attempts the run stops, listing the recorded reasons and pointing to
-`--review-unrecorded-head`.
+`--review-unrecorded-head`. With `--review-unrecorded-head`, coder recovery
+never runs: the handoff becomes a head-review recovery at any attempt (below).
 
 **Head-review recovery.** Head-review recovery is an ordinary review round of
 the current head. It carries only the recorded item ledger, the bounded round
@@ -9123,15 +9166,28 @@ Two sources use it:
    resumes at the checkpoint's own round (never rewound) with its active items
    and only its bounded budget. The anchor must be authored by the authenticated
    actor. An anchor with no active items gets a full fresh review.
-2. **`agent-loop pr N --review-unrecorded-head`.** The sanctioned operator
-   recovery for any refused history (the unrecorded-head refusal, the attempt
-   limit, or a malformed recovery record). It never force-pushes and never posts
-   a coder-role record. The budget comes from the latest admitted valid
+2. **`agent-loop pr N --review-unrecorded-head`.** Takes effect whenever it is
+   given. At any dispatch attempt, it turns a coder-recovery handoff, or any
+   unrecorded head advance, into a head-review recovery round of the current
+   head, with no coder turn first. That includes an advance after an evidence
+   conversion, freeze or release: the boundary's reconstructed ledger, reopened
+   requests and boundary fields are kept, and after a release an unrecorded
+   push still skips release-baseline revalidation, exactly as without the flag.
+   It also skips a pending coder retry recorded on the current head (a
+   coder-recovery handoff whose coder did not push), so the reviewers review
+   that head again. A coder that runs after the head review starts a fresh
+   attempt sequence at attempt 1. A head that has its own round records resumes
+   normally. It is still the sanctioned operator recovery for any refused
+   history (the unrecorded-head refusal, the attempt limit, or a malformed
+   recovery record). It never force-pushes and never posts a coder-role
+   record. The budget comes from the latest admitted valid
    budget-carrying record (dispatch, rejected-follow-up, head-review or
    checkpoint); a malformed record is never a budget source, every candidate must be authored by the authenticated actor (a forged checkpoint or an ordinary-phase record never supplies a budget), and without any
    source the defaults apply, so a round above `--max-rounds` is refused rather
-   than granted. Without the flag the refusal remains and its message names the
-   flag instead of suggesting a hand-written coder follow-up.
+   than granted. A recovery handoff's own admitted budget is used first. Without
+   the flag every path behaves as before: coder recovery runs for attempt 1, the
+   refusal remains, and its message names the flag instead of suggesting a
+   hand-written coder follow-up.
 
 Reviewer responses should use structured JSON first. A PR review starts with:
 

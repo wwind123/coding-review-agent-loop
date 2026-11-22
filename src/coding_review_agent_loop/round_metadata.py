@@ -912,6 +912,15 @@ class ResumedReviewRound:
     # a later decision that needs fresh reviewer turns opens the next round,
     # with the ledger settled from this record.
     reconciliation_record: PostedRoundRecord | None = None
+    # Set when ``--review-unrecorded-head`` turned an unrecorded head advance
+    # into an operator head review (#2059).  The coder routing no longer sees
+    # an unrecorded advance, but evidence-boundary decisions still must.
+    head_advanced_past_boundary: bool = False
+
+    @property
+    def head_advanced_without_record(self) -> bool:
+        """Whether the head moved past the anchor without a record of its own."""
+        return self.unrecorded_head_advance or self.head_advanced_past_boundary
 
 
 PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
@@ -3196,7 +3205,37 @@ def reset_plan_board_stamp(token: "contextvars.Token") -> None:
     _PLAN_BOARD_STAMP.reset(token)
 
 
-def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
+DegradationProjection = Literal["full", "compact"]
+COMPACT_DEGRADATIONS_HEADING = "### Parse degradations (bounded)"
+
+
+def render_compact_degradation_indicators(metadata: PostedRoundMetadata) -> str | None:
+    """One indicator line per present degradation kind (#2059).
+
+    The bounded coder comment uses this in place of the full sections; the
+    records themselves stay complete in the round metadata, so a degraded round
+    still never reads as fully assessed.
+    """
+    lines = [
+        f"- {label}: {len(records)} element(s) degraded (records in round metadata)"
+        for label, records in (
+            ("Architecture-impact parse degradations", metadata.architecture_impact_degradations),
+            ("Test-observation citation degradations", metadata.test_observation_degradations),
+            ("Sub-item parse degradations", metadata.sub_item_degradations),
+        )
+        if records
+    ]
+    if not lines:
+        return None
+    return "\n".join((COMPACT_DEGRADATIONS_HEADING, "", *lines))
+
+
+def _attach_round_metadata(
+    body: str,
+    metadata: PostedRoundMetadata,
+    *,
+    degradation_projection: DegradationProjection = "full",
+) -> str:
     stamp = _PR_BOARD_STAMP.get()
     if stamp is not None and metadata.flow == "pr":
         metadata = stamp.apply(metadata)  # type: ignore[attr-defined]
@@ -3204,21 +3243,28 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     if plan_stamp is not None and metadata.flow == "plan":
         metadata = plan_stamp.apply(metadata)  # type: ignore[attr-defined]
     marker = f"<!-- AGENT_LOOP_META: {_encode_round_metadata(metadata)} -->"
-    degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
-    if degradations is not None and degradations not in str(body):
-        # Surface degraded elements in the round summary so a degraded round
-        # never reads as fully assessed.
-        body = _insert_before_trailing_markers(str(body), degradations)
-    citation_degradations = render_test_observation_degradations_section(
-        metadata.test_observation_degradations
-    )
-    if citation_degradations is not None and citation_degradations not in str(body):
-        body = _insert_before_trailing_markers(str(body), citation_degradations)
-    sub_item_records = render_parse_degradations_section(
-        metadata.sub_item_degradations, heading="### Sub-item parse degradations"
-    )
-    if sub_item_records is not None and sub_item_records not in str(body):
-        body = _insert_before_trailing_markers(str(body), sub_item_records)
+    if degradation_projection == "compact":
+        # Every section the attachment adds counts against the bounded coder
+        # comment's budget, so the bound level decides its projection (#2059).
+        indicators = render_compact_degradation_indicators(metadata)
+        if indicators is not None and indicators not in str(body):
+            body = _insert_before_trailing_markers(str(body), indicators)
+    else:
+        degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
+        if degradations is not None and degradations not in str(body):
+            # Surface degraded elements in the round summary so a degraded round
+            # never reads as fully assessed.
+            body = _insert_before_trailing_markers(str(body), degradations)
+        citation_degradations = render_test_observation_degradations_section(
+            metadata.test_observation_degradations
+        )
+        if citation_degradations is not None and citation_degradations not in str(body):
+            body = _insert_before_trailing_markers(str(body), citation_degradations)
+        sub_item_records = render_parse_degradations_section(
+            metadata.sub_item_degradations, heading="### Sub-item parse degradations"
+        )
+        if sub_item_records is not None and sub_item_records not in str(body):
+            body = _insert_before_trailing_markers(str(body), sub_item_records)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():

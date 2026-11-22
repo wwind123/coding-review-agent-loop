@@ -1731,65 +1731,107 @@ def _render_public_coder_followup_comment(
     coverage_assessment: CoverageAssessment | None = None,
     coverage_reask_used: bool = False,
     coverage_discard_note: str | None = None,
+    bound_level: int = 0,
+    head_sha: str | None = None,
+    evidence_heads: Sequence[str] = (),
 ) -> str:
+    """Render the coder follow-up comment.
+
+    ``bound_level`` 0 is the ordinary rendering.  Levels 1-4 are the bounded
+    projections the coder-comment budget steps through when the full comment
+    cannot fit GitHub's body limit (#2059); each keeps the head, the summary
+    (capped) and every item ID under its disposition, and the complete
+    response stays in round metadata.
+    """
+    if bound_level < 0 or bound_level > MAX_CODER_BOUND_LEVEL:
+        raise AgentLoopError(f"unknown coder comment bound level: {bound_level}")
+    bounded = bound_level > 0
     item_by_id = {item.item_id: item for item in prior_items}
 
     def render_item(item_id: str, *, note_label: str, note: str | None, placeholder: str | None) -> list[str]:
         item = item_by_id.get(item_id)
+        if bound_level >= 3:
+            return [f"- {item_id}"]
         if item is None:
             lines = [f"- {item_id}: Item context unavailable in current round metadata."]
         else:
-            lines = [f"- {item_id}: {_format_unresolved_item_label(item, config)}"]
+            label = _format_unresolved_item_label(item, config)
+            lines = [f"- {item_id}: {_bounded_excerpt(label, _BOUNDED_LABEL_CHARS) if bounded else label}"]
         if note:
-            lines.append(f"  - {note_label}: {note}")
+            lines.append(f"  - {note_label}: {_bounded_excerpt(note, _BOUNDED_NOTE_CHARS) if bounded else note}")
         elif placeholder:
             lines.append(f"  - {note_label}: {placeholder}")
         return lines
 
-    addressed_items: list[str] = []
-    for item_id in parsed_followup.addressed_items:
-        addressed_items.extend(
-            render_item(
-                item_id,
-                note_label="Coder claim" if head_unchanged_sha else "Resolution",
-                note=parsed_followup.addressed_item_notes.get(item_id),
-                placeholder=None,
+    evidence_groups = (
+        _native_evidence_groups(prior_items, evidence_heads) if bound_level >= 2 else {}
+    )
+
+    def render_disposition(
+        item_ids: Sequence[str],
+        *,
+        note_label: str,
+        notes: Mapping[str, str],
+        placeholder: str | None,
+    ) -> list[str]:
+        lines: list[str] = []
+        emitted: set[tuple[object, ...]] = set()
+        for item_id in item_ids:
+            key = evidence_groups.get(item_id)
+            if key is not None:
+                members = [other for other in item_ids if evidence_groups.get(other) == key]
+                if len(members) > 1:
+                    if key not in emitted:
+                        emitted.add(key)
+                        # The first member's own display label, never the raw
+                        # request: a deferred request stays unpublished (#1068).
+                        label = _format_unresolved_item_label(item_by_id[item_id], config)
+                        lines.append(
+                            "- Human-only exact-head evidence, one request repeated: "
+                            + ", ".join(members)
+                            + f" ({_bounded_excerpt(label, _BOUNDED_LABEL_CHARS)})"
+                        )
+                    continue
+            lines.extend(
+                render_item(item_id, note_label=note_label, note=notes.get(item_id), placeholder=placeholder)
             )
-        )
+        return lines
+
+    addressed_items = render_disposition(
+        parsed_followup.addressed_items,
+        note_label="Coder claim" if head_unchanged_sha else "Resolution",
+        notes=parsed_followup.addressed_item_notes,
+        placeholder=None,
+    )
     if not addressed_items:
         addressed_items = ["- None."]
-
-    remaining_items: list[str] = []
-    for item_id in parsed_followup.remaining_items:
-        remaining_items.extend(
-            render_item(
-                item_id,
-                note_label="Reason",
-                note=parsed_followup.remaining_item_notes.get(item_id),
-                placeholder="No reason provided by coder.",
-            )
-        )
+    remaining_items = render_disposition(
+        parsed_followup.remaining_items,
+        note_label="Reason",
+        notes=parsed_followup.remaining_item_notes,
+        placeholder="No reason provided by coder.",
+    )
     if not remaining_items:
         remaining_items = ["- None."]
+    disputed_items = render_disposition(
+        parsed_followup.disputed_items,
+        note_label="Counter-evidence",
+        notes=parsed_followup.dispute_evidence,
+        placeholder="No evidence provided by coder.",
+    )
 
-    disputed_items: list[str] = []
-    for item_id in parsed_followup.disputed_items:
-        disputed_items.extend(
-            render_item(
-                item_id,
-                note_label="Counter-evidence",
-                note=parsed_followup.dispute_evidence.get(item_id),
-                placeholder="No evidence provided by coder.",
-            )
+    summary = parsed_followup.summary.strip()
+    if bounded:
+        summary = _bounded_prose(
+            summary, _BOUNDED_SUMMARY_SHORT_CHARS if bound_level >= 4 else _BOUNDED_SUMMARY_CHARS
         )
-
     if head_unchanged_sha:
         # The PR head did not move, so the coder's statements are claims about
         # the existing head, not changes attributed to this turn (#1034).
         sections = [
             "## Coder follow-up",
             coder_followup_head_unchanged_notice(head_unchanged_sha),
-            f"Coder summary (claim, unverified): {parsed_followup.summary.strip()}",
+            f"Coder summary (claim, unverified): {summary}",
             "\n".join(
                 [
                     f"### Claimed already present at `{head_unchanged_sha}` (PR head unchanged)",
@@ -1801,71 +1843,184 @@ def _render_public_coder_followup_comment(
     else:
         sections = [
             "## Coder follow-up",
-            parsed_followup.summary.strip(),
+            summary,
             "\n".join(["### Addressed items", *addressed_items]),
             "\n".join(["### Remaining items", *remaining_items]),
         ]
+    if bounded:
+        # The fixed core of a bounded comment: the head it reports on and a note
+        # that the visible projection is shortened, never the record (#2059).
+        if head_sha and not head_unchanged_sha:
+            sections.insert(1, f"Head: `{head_sha}`")
+        sections.insert(
+            1,
+            f"> Orchestrator note: this coder follow-up was shortened (bound level {bound_level}) "
+            "to fit GitHub's comment size limit. Every item ID keeps its disposition below; the "
+            "complete coder response, tests and evidence are in the round metadata.",
+        )
     if disputed_items:
         sections.append("\n".join(["### Disputed items", *disputed_items]))
+    count_lines = bound_level == 3
     sub_item_section = _render_coder_sub_item_progress(parsed_followup, prior_items)
-    if sub_item_section:
+    if sub_item_section and bound_level < 3:
         sections.append(sub_item_section)
+    elif sub_item_section and count_lines:
+        carried = sum(1 for item in prior_items if item.sub_items)
+        sections.append(f"Sub-item progress: {carried} item(s) with sub-items (details in round metadata)")
     if parsed_followup.tests_run:
-        sections.append(
-            "\n".join(
-                ["### Tests run", *[
-                    f"- {test}"
-                    for test in _render_test_commands_for_comment(
-                        parsed_followup.tests_run, config=config
-                    )
-                ]]
+        commands = _render_test_commands_for_comment(parsed_followup.tests_run, config=config)
+        if bound_level < 3:
+            sections.append(
+                "\n".join(
+                    ["### Tests run", *[
+                        f"- {_bounded_excerpt(test, _BOUNDED_ENTRY_CHARS) if bounded else test}"
+                        for test in commands
+                    ]]
+                )
             )
-        )
+        elif count_lines:
+            sections.append(f"Tests run: {len(commands)} command(s) (full list in round metadata)")
     out_of_checkout_section = _render_out_of_checkout_tests(
         parsed_followup.out_of_checkout_tests_run, config=config
     )
-    if out_of_checkout_section:
+    if out_of_checkout_section and bound_level < 3:
         sections.append(out_of_checkout_section)
+    elif out_of_checkout_section and count_lines:
+        sections.append(
+            f"Out-of-checkout context runs (not evidence): "
+            f"{len(parsed_followup.out_of_checkout_tests_run)} (full list in round metadata)"
+        )
     if parsed_followup.test_observations or local_test_evidence:
-        sections.append(_render_test_observation_citations(
-            parsed_followup.test_observations,
-            local_test_evidence=local_test_evidence,
-            current_test_turn_id=current_test_turn_id,
-        ))
+        if bound_level < 3:
+            sections.append(_render_test_observation_citations(
+                parsed_followup.test_observations,
+                local_test_evidence=local_test_evidence,
+                current_test_turn_id=current_test_turn_id,
+            ))
+        elif count_lines:
+            sections.append(
+                f"Test-observation citations: {len(parsed_followup.test_observations)} "
+                "(citations and test evidence in round metadata)"
+            )
+    # From level 3 the round-metadata attachment adds a compact degradation
+    # indicator instead of the full section.
     citation_degradations = render_test_observation_degradations_section(
         parsed_followup.test_observation_degradations
     )
-    if citation_degradations:
+    if citation_degradations and bound_level < 3:
         sections.append(citation_degradations)
     matrix_evidence = _render_risk_test_matrix_evidence(
         parsed_followup.risk_test_matrix_evidence,
         render_decision=matrix_evidence_render_decision,
         diagnostics=parsed_followup.risk_test_matrix_diagnostics,
     )
-    if matrix_evidence:
+    if matrix_evidence and bound_level < 3:
         sections.append(matrix_evidence)
+    elif matrix_evidence and count_lines:
+        evidence = parsed_followup.risk_test_matrix_evidence
+        rows = len(evidence.rows) if evidence is not None else 0
+        sections.append(f"Risk-matrix evidence: {rows} row(s) (full evidence in round metadata)")
     coverage_map = render_coverage_map(
         coverage_assessment,
         reask_used=coverage_reask_used,
         discard_note=coverage_discard_note,
+        compact="full" if bound_level < 3 else ("compact" if bound_level == 3 else "minimal"),
     )
     if coverage_map:
         sections.append(coverage_map)
     if parsed_followup.human_requirement_dispositions:
-        sections.append(
-            "\n".join(
-                [
-                    "### Human requirements",
-                    *[
-                        f"- {disposition.requirement_id}: {disposition.disposition} — {disposition.evidence}"
-                        for disposition in parsed_followup.human_requirement_dispositions
-                    ],
-                ]
+        dispositions = parsed_followup.human_requirement_dispositions
+        if bound_level < 3:
+            sections.append(
+                "\n".join(
+                    [
+                        "### Human requirements",
+                        *[
+                            f"- {disposition.requirement_id}: {disposition.disposition} — "
+                            + (
+                                _bounded_excerpt(disposition.evidence, _BOUNDED_NOTE_CHARS)
+                                if bounded
+                                else disposition.evidence
+                            )
+                            for disposition in dispositions
+                        ],
+                    ]
+                )
             )
-        )
+        elif count_lines:
+            sections.append(
+                "\n".join(
+                    [
+                        "### Human requirements",
+                        *[f"- {d.requirement_id}: {d.disposition}" for d in dispositions],
+                    ]
+                )
+            )
     sections.append(f"<!-- AGENT_STATE: {parsed_followup.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return _join_sections_protecting_coverage_map(sections, coverage_map)
+
+
+MAX_CODER_BOUND_LEVEL = 4
+_BOUNDED_LABEL_CHARS = 160
+_BOUNDED_NOTE_CHARS = 200
+_BOUNDED_ENTRY_CHARS = 200
+_BOUNDED_SUMMARY_CHARS = 2000
+_BOUNDED_SUMMARY_SHORT_CHARS = 300
+
+
+def _bounded_excerpt(text: object, limit: int) -> str:
+    """One-line excerpt of at most ``limit`` characters, ellipsized when cut."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return _drop_unclosed_comment(flat[: max(limit - 1, 0)]).rstrip() + "…"
+
+
+def _bounded_prose(text: str, limit: int) -> str:
+    """Multi-line prose cut to ``limit`` characters at a character boundary."""
+    if len(text) <= limit:
+        return text
+    return _drop_unclosed_comment(text[: max(limit - 1, 0)]).rstrip() + "…"
+
+
+def _drop_unclosed_comment(text: str) -> str:
+    """Never leave a cut HTML comment opener that could swallow later markup."""
+    opener = text.rfind("<!--")
+    if opener != -1 and text.rfind("-->") < opener:
+        return text[:opener]
+    return text
+
+
+def _native_evidence_groups(
+    prior_items: Sequence[UnresolvedReviewItem], heads: Sequence[str]
+) -> dict[str, tuple[object, ...]]:
+    """Map each native exact-head evidence request to its request identity.
+
+    Only typed native evidence obligations (``native_evidence.native``) are
+    grouped; reviewer ownership, row-converted obligations, screenshot
+    requests and code findings never are.  An item whose key cannot be
+    computed is left out, so it keeps its own line.
+    """
+    from .native_evidence import native, request_key
+
+    known_heads = tuple(
+        dict.fromkeys(
+            head
+            for head in (*heads, *(item.candidate_head_sha for item in prior_items))
+            if isinstance(head, str) and head
+        )
+    )
+    groups: dict[str, tuple[object, ...]] = {}
+    for item in prior_items:
+        if not native(item):
+            continue
+        try:
+            key = request_key(item.text, known_heads)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        groups[item.item_id] = key
+    return groups
 
 
 def _render_coder_sub_item_progress(
@@ -2543,6 +2698,9 @@ def render_public_agent_comment(
     coverage_assessment: CoverageAssessment | None = None,
     coverage_reask_used: bool = False,
     coverage_discard_note: str | None = None,
+    bound_level: int = 0,
+    head_sha: str | None = None,
+    evidence_heads: Sequence[str] = (),
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -2590,6 +2748,9 @@ def render_public_agent_comment(
             coverage_assessment=coverage_assessment,
             coverage_reask_used=coverage_reask_used,
             coverage_discard_note=coverage_discard_note,
+            bound_level=bound_level,
+            head_sha=head_sha,
+            evidence_heads=evidence_heads,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):

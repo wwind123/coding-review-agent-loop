@@ -435,6 +435,33 @@ is an ordinary review round of the current head: it carries only the ledger, the
 bounded budget and a `head-review-recovery` handoff that supersedes earlier
 checkpoints, and never overrides review scheduling or merge-conflict routing.
 Nothing force-pushes or writes a coder-role record on the operator's behalf.
+`--review-unrecorded-head` takes effect whenever it is given (#2059): resume
+first builds its result as without the flag, including any evidence-boundary
+ledger reconstruction. Every outcome routed through coder recovery (a coder
+handoff at any attempt, or any unrecorded head advance) then passes through one
+conversion point, `_as_operator_head_review`, which turns it into an operator
+head review. The conversion keeps the ledger, round, item numbering and
+evidence-boundary fields and clears coder output, the attempt lineage and the
+qualification checkpoint, so a later coder starts at attempt 1. The budget is
+the handoff's own admitted budget, or else the shared authenticated search.
+The moved-head fact is kept in `head_advanced_past_boundary`, and the
+evidence-boundary predicates read `head_advanced_without_record`, so a moved
+head after a release still skips release-baseline revalidation. Without the
+flag every resume result is unchanged.
+
+The PR-loop coder follow-up comment is size-bounded at its posting seam
+(`coder_comment_budget.py`, #2059). A comment that fits the transport is posted
+unchanged. Otherwise the renderer steps through bound levels 1-4. They keep a
+fixed core: the head, the capped summary, every item ID under its disposition,
+and the signature. Excerpts, the grouping of repeated native evidence requests,
+count lines, compact and minimal coverage maps, and compact degradation
+indicators shrink everything else, including the sections that
+`_attach_round_metadata` inserts (its `degradation_projection`). Each trial is
+measured with the exact preparation that posts it. Round metadata keeps the
+complete response, and for free-form output the original text, so resume never
+reads the bounded projection as the coder output. The transport overflow error
+remains the last resort and then names `agent-loop pr N --review-unrecorded-head`.
+Reviewer and other round comments are not bounded.
 
 A PR round closed by its reconciliation summary is final. It receives no new
 scheduling or reviewer record; its only possible later record is the
