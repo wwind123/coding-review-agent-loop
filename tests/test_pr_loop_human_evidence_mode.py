@@ -779,3 +779,137 @@ def test_converted_row_freeze_advisory_freeze_round_trip_keeps_provenance_and_cl
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
     cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
     assert cleared and [ref.row_id for ref in cleared[-1].metadata.signed_evidence_references] == ["row-a"]
+
+
+# --- review round 2 fixes ------------------------------------------------------------------
+
+
+def test_multi_owner_converted_row_round_trip_keeps_owner_voting_and_clears_after_all_owners(
+    tmp_path, monkeypatch
+):
+    """Item-5.s3: a two-owner converted row survives freeze -> advisory -> freeze and needs both owners."""
+    from test_pr_loop_evidence_conversion import (
+        _evidence_items as row_items, _plan_context, _review, _stalled_two_reviewer_runner)
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_two_reviewer_runner(tmp_path, monkeypatch, context)
+    runner.codex_outputs.append(_review(kept=["item-2", "item-3"], state="blocking"))
+    runner.gemini_outputs.append(_review(kept=["item-2", "item-3"], state="blocking", reviewer="Google Gemini"))
+    head = "525753a4b04bd57d874211ba1fade250c3ff6d82"
+    with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {head}"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context,
+                    config=dataclasses.replace(config, pr_convert_evidence_rows=("row-a", "row-b")))
+    [original] = row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-b")
+    assert original.resolution_owners == ("Codex", "Gemini")
+
+    # advisory: the freeze is released and both rows move to the list.
+    assert run_pr_loop(runner, pr_number=77, approved_plan_context=context,
+                       config=dataclasses.replace(config, pr_human_evidence="advisory")) == 0
+    release = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "advisory-mode"][-1]
+    listed = {HumanCheck.from_mapping(e).origin_item.converted_row_id for e in release.metadata.human_checks}
+    assert listed == {"row-a", "row-b"}
+
+    # freeze again: the two-owner row is restored once with its provenance.
+    with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {head}"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config)
+    [restored] = row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-b")
+    assert len(row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-a")) == 1
+    assert (restored.item_id, restored.obligation_identity, restored.converted_matrix_identity,
+            restored.resolution_owners, restored.owner_states) == (
+        original.item_id, original.obligation_identity, original.converted_matrix_identity,
+        original.resolution_owners, original.owner_states)
+    row_a = row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-a")[0]
+
+    # Only Codex accepts: row-b stays frozen while Gemini has not accepted.
+    runner.pr_payload["comments"].append(_signed(f"Ran rows a and b at {head}: all checks passed.", 5))
+    both = [row_a.item_id, restored.item_id]
+    runner.codex_outputs.append(_review(resolved=both, hr=True))
+    runner.gemini_outputs.append(_review(resolved=[row_a.item_id], kept=[restored.item_id],
+                                         state="blocking", hr=True, reviewer="Google Gemini"))
+    with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {head}"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config)
+    [pending] = [i for i in row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-b")
+                 if i.lifecycle == "evidence_frozen"]
+    assert pending.item_id == restored.item_id
+    assert dict(pending.owner_states).get("Gemini") != "resolved"
+
+    # Gemini accepts too: the row clears through its real clearance and the freeze releases.
+    runner.pr_payload["comments"].append(_signed(f"Gemini's row-b scenario at {head} also passed.", 6))
+    runner.codex_outputs.append(_review(resolved=[restored.item_id], hr=True))
+    runner.gemini_outputs.append(_review(resolved=[restored.item_id], hr=True, reviewer="Google Gemini"))
+    assert run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config) == 0
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert cleared and "row-b" in {ref.row_id for ref in cleared[-1].metadata.signed_evidence_references}
+
+
+def _varied_requests(round_number, count=40):
+    import hashlib
+
+    return [
+        f"Round {round_number} live scenario {n}: "
+        + "".join(hashlib.sha256(f"{round_number}-{n}-{k}".encode()).hexdigest() for k in range(6))
+        for n in range(count)
+    ]
+
+
+def test_accumulated_advisory_list_overflows_into_lossless_sidecars(tmp_path, monkeypatch):
+    """Item-6: a list too large for one comment spills, survives restart and restores in freeze."""
+    from coding_review_agent_loop import round_transport
+
+    requests = [_varied_requests(r) for r in (1, 2, 3)]
+    runner = FakeRunner(
+        codex_outputs=[
+            _evidence_review(state="blocking", blocking=["Fix retry bound one."], evidence=requests[0]),
+            _evidence_review(state="blocking", blocking=["Fix retry bound two."], evidence=requests[1],
+                             dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]),
+            _evidence_review(evidence=requests[2],
+                             dispositions=[{"item_id": "item-42", "disposition": "resolved", "note": "Fixed."}]),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"]),
+                        structured_coder_followup(addressed_items=["item-42"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, max_rounds=4)) == 0
+    spilled = [key for c in runner.pr_payload["comments"] for key in round_transport.attachment_keys(c["body"])
+               if key[1] == "human_checks"]
+    assert spilled, "the accumulated list must use sidecar transport"
+    expected = sorted(text for batch in requests for text in batch)
+    [record] = _check_records(runner)
+    assert sorted(HumanCheck.from_mapping(e).text for e in record.metadata.human_checks) == expected
+    # Restart: rebuilt from the hydrated record, not reposted.
+    runner.codex_outputs.append(_evidence_review())
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, max_rounds=6)) == 0
+    assert len(_check_comments(runner)) == 1
+    # Freeze: every check comes back as its obligation.  Today's freeze notice
+    # lists every request in its visible body, a pre-existing size limit
+    # outside this change, so the notice is shortened; the ledger is not.
+    monkeypatch.setattr(pr_loop_support, "_render_evidence_freeze_notice",
+                        lambda **kwargs: "## Exact-head evidence freeze")
+    runner.codex_outputs.append(_evidence_review())
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, max_rounds=8, pr_human_evidence="freeze"))
+    [freeze] = _freeze_records(runner)
+    assert sorted(i.text for i in _evidence_items(freeze.metadata.prior_items)) == expected
+
+
+@pytest.mark.parametrize("sidecars", ["present", "missing"])
+def test_spilled_human_checks_hydrate_or_decode_empty_when_a_sidecar_is_lost(sidecars):
+    """Item-6: the spilled list hydrates losslessly; a lost sidecar never fails the record."""
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_state import _decode_round_metadata_records
+    from coding_review_agent_loop.round_transport import attachment_keys, prepare_round_comment
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+
+    checks = []
+    for n, text in enumerate(_varied_requests(9, count=320), start=1):
+        items, _ = _upsert_evidence_obligation([], item_number=n, reviewer="Codex", text=text,
+                                               source_round=1, current_head_sha=HEAD)
+        checks.append(HumanCheck("Codex", text, 1, HEAD, "native", items[0]).as_dict())
+    body = _attach_round_metadata("Human checks.", PostedRoundMetadata(
+        flow=HUMAN_CHECKS_FLOW, role="summary", agent="Orchestrator", round_number=1,
+        subject=HEAD, human_checks=tuple(checks)))
+    bodies = [str(part) for part in prepare_round_comment(body)]
+    assert any(key[1] == "human_checks" for b in bodies for key in attachment_keys(b))
+    anchor = next(b for b in bodies if "AGENT_LOOP_META" in b)
+    kept = bodies if sidecars == "present" else [anchor]
+    [record] = _decode_round_metadata_records([SimpleNamespace(body=b) for b in kept], flow=HUMAN_CHECKS_FLOW)
+    assert record.metadata.human_checks == (tuple(checks) if sidecars == "present" else ())

@@ -113,7 +113,9 @@ def _decode_round_metadata_records(comments, *, flow):
             if flow == "discuss"
             else set()
         )
-        required_missing = missing - discuss_optional_missing
+        # The advisory human-checks list (#2063) never fails a record: a lost
+        # sidecar decodes as an empty list, like any malformed entry.
+        required_missing = missing - discuss_optional_missing - {"human_checks"}
         if required_missing:
             raise AgentLoopError(
                 "Incomplete round metadata: "
