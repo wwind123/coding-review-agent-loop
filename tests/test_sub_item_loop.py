@@ -235,7 +235,8 @@ def test_zero_progress_publishes_the_stall_before_the_budget_error(tmp_path):
     assert "review round 3" in notice
 
 
-def test_stall_check_can_be_disabled(tmp_path):
+def test_stall_window_follows_the_no_progress_rounds(tmp_path):
+    """#2097: --sub-item-stall-rounds is retired; the window is --no-progress-rounds."""
     runner = FakeRunner(
         authenticated_actor=ACTOR,
         codex_outputs=[
@@ -245,7 +246,7 @@ def test_stall_check_can_be_disabled(tmp_path):
         ],
         claude_outputs=[_coder(), _coder()],
     )
-    config = make_config(tmp_path, max_rounds=3, sub_item_stall_rounds=0)
+    config = make_config(tmp_path, max_rounds=3, no_progress_rounds=4)
 
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)

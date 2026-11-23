@@ -89,14 +89,12 @@ DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
 DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
 # Plan sweep trigger (#1505): K consecutive new-finding primary blocks; 0 disables.
 DEFAULT_PLAN_SWEEP_ROUNDS = 2
-# PR fix-loop step-back (#1251): K clustered new-finding blocks, and the line window.
-DEFAULT_PR_STEP_BACK_ROUNDS = 3
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
 # Evidence conversion (#1325): N consecutive capture-limited coder attempts.
 DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS = 2
-DEFAULT_PR_STEP_BACK_LINE_WINDOW = 40
-DEFAULT_PR_NON_CONVERGENCE_ROUNDS = 3
-DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
+# The single PR no-progress detector (#2097): K completed rounds with the same
+# head and blocking IDs stop for a human decision.  Minimum 1.
+DEFAULT_NO_PROGRESS_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
@@ -322,13 +320,13 @@ class AgentLoopConfig:
     # baseline payload (diff, compact diff or full previous plan) a later plan
     # review prompt may carry.  0 disables the baseline.
     plan_provenance_baseline_max_chars: int = DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
-    pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
     pr_evidence_stall_rounds: int = DEFAULT_PR_EVIDENCE_STALL_ROUNDS
     pr_evidence_capture_attempts: int = DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
     # One-shot operator conversion (#1325), applied before any agent runs.
     pr_convert_evidence_rows: tuple[str, ...] = ()
-    pr_step_back_line_window: int = DEFAULT_PR_STEP_BACK_LINE_WINDOW
-    pr_non_convergence_rounds: int = DEFAULT_PR_NON_CONVERGENCE_ROUNDS
+    # The PR no-progress window (#2097); it also paces the advisory sub-item
+    # stall report that ``--sub-item-stall-rounds`` used to set.
+    no_progress_rounds: int = DEFAULT_NO_PROGRESS_ROUNDS
     # One-shot operator retirement of the stall streak (#1112): the run's first
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
@@ -354,8 +352,6 @@ class AgentLoopConfig:
     plan_growth_max_revisions: int = 6
     plan_growth_max_scope_items: int = 12
     plan_growth_max_matrix_rows: int = 18
-    # Advisory stall window for conjunctive findings' sub-items (#958); 0 disables.
-    sub_item_stall_rounds: int = DEFAULT_SUB_ITEM_STALL_ROUNDS
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Per-run worktrees (#1162): the shared store behind each auto agent's
     # per-run worktree, and the token naming this run's worktrees.  Empty for
@@ -970,41 +966,26 @@ class AgentLoopConfig:
                     f"{flag} requires --plan-review-policy primary-then-panel."
                 )
         for flag, value in (
-            ("--pr-step-back-rounds", self.pr_step_back_rounds),
-            ("--pr-step-back-line-window", self.pr_step_back_line_window),
             ("--pr-evidence-stall-rounds", self.pr_evidence_stall_rounds),
             ("--pr-evidence-capture-attempts", self.pr_evidence_capture_attempts),
-            ("--pr-non-convergence-rounds", self.pr_non_convergence_rounds),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise AgentLoopError(
-                    f"{flag} must be a non-negative integer"
-                    + (
-                        " (0 disables it)."
-                        if flag
-                        in {
-                            "--pr-step-back-rounds",
-                            "--pr-evidence-stall-rounds",
-                            "--pr-evidence-capture-attempts",
-                            "--pr-non-convergence-rounds",
-                        }
-                        else "."
-                    )
-                )
+                raise AgentLoopError(f"{flag} must be a non-negative integer (0 disables it).")
+        if (
+            isinstance(self.no_progress_rounds, bool)
+            or not isinstance(self.no_progress_rounds, int)
+            or self.no_progress_rounds < 1
+        ):
+            raise AgentLoopError(
+                "--no-progress-rounds must be an integer of at least 1; the detector cannot "
+                "be turned off, and --max-rounds remains the outer bound."
+            )
         rows = self.pr_convert_evidence_rows
         if not isinstance(rows, tuple) or any(
             not isinstance(row, str) or not row.strip() for row in rows
         ) or len(set(rows)) != len(rows):
             raise AgentLoopError(
                 "--pr-convert-evidence-rows must be a list of distinct non-empty row IDs."
-            )
-        if (
-            isinstance(self.sub_item_stall_rounds, bool)
-            or not isinstance(self.sub_item_stall_rounds, int)
-            or self.sub_item_stall_rounds < 0
-        ):
-            raise AgentLoopError(
-                "--sub-item-stall-rounds must be zero or greater (0 disables it)."
             )
         if self.plan_growth_gate not in {"enforce", "off"}:
             raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
@@ -2231,6 +2212,39 @@ def warn_deprecated_repair_flags(args: argparse.Namespace) -> str | None:
     return notice
 
 
+# PR convergence-stop thresholds retired by the single no-progress detector
+# (#2097): accepted and ignored for one release, with a one-line notice.
+DEPRECATED_CONVERGENCE_FLAG_DESTS = (
+    ("pr_step_back_rounds", "--pr-step-back-rounds"),
+    ("pr_step_back_line_window", "--pr-step-back-line-window"),
+    ("pr_non_convergence_rounds", "--pr-non-convergence-rounds"),
+    ("sub_item_stall_rounds", "--sub-item-stall-rounds"),
+)
+
+
+def deprecated_convergence_flags(args: argparse.Namespace) -> tuple[str, ...]:
+    """The retired PR convergence flags an invocation passed, in table order."""
+    return tuple(
+        flag for dest, flag in DEPRECATED_CONVERGENCE_FLAG_DESTS
+        if getattr(args, dest, None) is not None
+    )
+
+
+def warn_deprecated_convergence_flags(args: argparse.Namespace) -> str | None:
+    """Print one deprecation notice when any retired flag was passed; return it."""
+    flags = deprecated_convergence_flags(args)
+    if not flags:
+        return None
+    notice = (
+        "agent-loop: deprecated flag(s) ignored: " + ", ".join(flags)
+        + ". One no-progress detector (--no-progress-rounds) replaces the PR step-back, "
+        "non-convergence and unchanged-head stops; these flags will be removed in a later "
+        "release."
+    )
+    print(notice, file=sys.stderr)
+    return notice
+
+
 def preflight_agent_commands(
     args: argparse.Namespace,
     runner: Runner,
@@ -2462,6 +2476,7 @@ def config_from_args(
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
     validate_sandboxed_args(args, configured_reviewers, named_seats=named_seats)
     warn_deprecated_repair_flags(args)
+    warn_deprecated_convergence_flags(args)
     if not getattr(args, "reconcile_post_merge_obligations", False):
         preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
 
@@ -2574,8 +2589,6 @@ def config_from_args(
     test_command = _split_command(args.test_command)
     if args.max_rounds <= 0:
         raise AgentLoopError("--max-rounds must be greater than zero.")
-    if getattr(args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS) < 0:
-        raise AgentLoopError("--sub-item-stall-rounds must be zero or greater (0 disables it).")
     if args.ci_timeout_seconds <= 0:
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
     if args.ci_poll_interval_seconds <= 0:
@@ -2845,12 +2858,6 @@ def config_from_args(
         plan_provenance_baseline_max_chars=_arg_or_default(
             args, "plan_provenance_baseline_max_chars", DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
         ),
-        pr_step_back_rounds=_arg_or_default(
-            args, "pr_step_back_rounds", DEFAULT_PR_STEP_BACK_ROUNDS
-        ),
-        pr_step_back_line_window=_arg_or_default(
-            args, "pr_step_back_line_window", DEFAULT_PR_STEP_BACK_LINE_WINDOW
-        ),
         pr_evidence_stall_rounds=_arg_or_default(
             args, "pr_evidence_stall_rounds", DEFAULT_PR_EVIDENCE_STALL_ROUNDS
         ),
@@ -2858,8 +2865,8 @@ def config_from_args(
             args, "pr_evidence_capture_attempts", DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
         ),
         pr_convert_evidence_rows=tuple(getattr(args, "pr_convert_evidence_rows", None) or ()),
-        pr_non_convergence_rounds=_arg_or_default(
-            args, "pr_non_convergence_rounds", DEFAULT_PR_NON_CONVERGENCE_ROUNDS
+        no_progress_rounds=_arg_or_default(
+            args, "no_progress_rounds", DEFAULT_NO_PROGRESS_ROUNDS
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
         plan_resume_keep_on_issue_edit=bool(
@@ -2875,9 +2882,6 @@ def config_from_args(
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),
         plan_growth_max_scope_items=_arg_or_default(args, "plan_growth_max_scope_items", 12),
         plan_growth_max_matrix_rows=_arg_or_default(args, "plan_growth_max_matrix_rows", 18),
-        sub_item_stall_rounds=_arg_or_default(
-            args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS
-        ),
         auto_agent_dirs=(*auto_agent_dirs, *(seat.seat_id for seat in named_seats if seat.workdir is None)),
         default_checkout_stores=default_checkout_stores,
         run_token=run_token if default_checkout_stores else None,

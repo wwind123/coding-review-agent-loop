@@ -54,6 +54,7 @@ from .review_rounds import (
     INCOMPLETE_PR_REVIEW_MISSING_LINE,
 )
 from .protocol import PROVENANCE_PRE_EXISTING, PROVENANCE_REVISION_INTRODUCED
+from .no_progress import NO_PROGRESS_PREFIX_TEXT
 from .review_step_back import (
     BASELINE_FORM_COMPACT_DIFF,
     BASELINE_FORM_DIFF,
@@ -314,9 +315,14 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
                 return RecognizedDiagnostic(
                     KIND_HUMAN_DECISION_STOP, reason, round_number, terminal=True
                 )
-        # The PR approach-alternative (#1628), step-back sibling and
-        # non-convergence (#1640) stops are rendered after a ``PR #N: `` prefix.
+        # The PR no-progress stop (#2097) and the retired approach-alternative
+        # (#1628), step-back sibling and non-convergence (#1640) stops are
+        # rendered after a ``PR #N: `` prefix; old comments keep their labels.
         pr_message = _PR_NUMBER_PREFIX_RE.sub("", message, count=1)
+        if pr_message.startswith(NO_PROGRESS_PREFIX_TEXT):
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "pr-no-progress", round_number, terminal=True
+            )
         if pr_message.startswith(PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT):
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "pr-step-back-approach-alternative", round_number,

@@ -379,23 +379,11 @@ def _stall_items():
 def _renderer_fixtures():
     from coding_review_agent_loop import review_step_back as sb
 
-    entry = sb.PrStepBackEntry(
-        reviewer="OpenAI Codex", trigger_round=2, trigger_head="b" * 40, path="src/x.py",
-        start=1, end=9, coder_round=3, resulting_head="c" * 40, record_index=1,
-    )
-    non_convergence = sb.PrNonConvergence(
-        reviewer="OpenAI Codex", k=3, trigger_round=4, first_round=1,
-        first_head="d" * 40, current_head="e" * 40,
-        items=(sb.PersistingItem("item-1", "still broken", 3),), coder_rounds=(2, 3, 4),
-    )
     return {
-        ("review_step_back", "render_pr_non_convergence_decision"): (
-            (77, non_convergence), {"diff_growth": "g", "pr_size": "s"},
-            "PR #77: human decision required: ",
-        ),
-        ("review_step_back", "render_pr_step_back_approach_alternative_decision"): (
-            (77, sb.PrApproachAlternative(3, "c" * 40, (entry,), "drop it")), {},
-            "PR #77: " + sb.PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT,
+        ("no_progress", "render_no_progress_message"): (
+            (), {"lead": "PR #77: ", "subject_label": "head", "subject": "e" * 40, "k": 3,
+                 "rounds": (2, 3, 4), "item_lines": ("- [item-1] still broken",)},
+            "PR #77: human decision required: no progress across ",
         ),
         ("review_step_back", "render_step_back_human_decision"): (
             (), {"phase": "plan", "measurements": "m.", "step_back_round": 2, "blocks": 3,

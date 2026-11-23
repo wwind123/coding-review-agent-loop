@@ -292,7 +292,7 @@ def supersede_for_signed_growth(
         raise AgentLoopError(_round_limit_diagnostic(
             pr_number=pr_number, round_number=allowed_rounds, items=tuple(unresolved_items),
             current_head_sha=head_sha,
-            sub_item_stall_rounds=getattr(config, "sub_item_stall_rounds", None),
+            sub_item_stall_rounds=getattr(config, "no_progress_rounds", None),
         ))
     high_water = max(int(getattr(current_resume, "next_unresolved_item_number", 1)) - 1, 0)
     payload = decode_supersession_payload({

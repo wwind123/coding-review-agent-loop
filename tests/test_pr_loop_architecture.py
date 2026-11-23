@@ -351,7 +351,7 @@ def test_selective_converted_freeze_empty_push_uses_real_acquisition(tmp_path, m
     config, repo, h1 = _set_pr_repo(
         tmp_path, {"ARCHITECTURE.md": _SET_ROOT, "docs/architecture/billing.md": "# Billing\n"},
         coder="claude", reviewer="codex", pr_review_policy="selective-intermediate",
-        pr_convert_evidence_rows=("row-a",), pr_non_convergence_rounds=0,
+        pr_convert_evidence_rows=("row-a",),
     )
     runner = _SetHybridRunner(
         pr_payload={"headRefOid": h1, "comments": [_implementation_record(

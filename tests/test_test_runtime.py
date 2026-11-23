@@ -4119,32 +4119,6 @@ def test_missing_pytest_is_non_evidence_through_the_unmocked_cli_fallback(tmp_pa
     assert calls == []
 
 
-def test_unchanged_head_stop_message_keeps_route_suffix_and_is_byte_identical_without_receipts():
-    from coding_review_agent_loop.local_test_evidence import (
-        EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
-        bounded_evidence_for_round, reconcile_test_observations,
-    )
-    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
-
-    registry = EnvironmentIdentityRegistry()
-    failure = LocalTestObservation(
-        command=("python3", "-m", "pytest", "tests/x.py"), outcome="failed", provenance="parent-observed",
-        scope=EvidenceScope("unknown", ()), receipt_id="r", turn_id="t", cwd="/checkout", returncode=4,
-        attribution=TreeAttribution(state="current-head", head="h", stable=True),
-        environment_identity=registry.capture({"PATH": "/usr/bin"}),
-    )
-    evidence = bounded_evidence_for_round(reconcile_test_observations([failure], registry=registry))
-    route = " If the blocking finding requires re-planning the child plan, post the record."
-    arguments = dict(pr=7, coder_name="claude", previous_head="abc", turns=2, round_number=2, route=route)
-    legacy = (
-        "PR #7: claude left head abc unchanged in 2 consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round 3; "
-        "human review required." + route
-    )
-    assert unchanged_head_stop_message(evidence=None, **arguments) == legacy
-    with_receipts = unchanged_head_stop_message(evidence=evidence, **arguments)
-    assert with_receipts.startswith(legacy.removesuffix(route))
-    assert with_receipts.endswith(route) and "unsuperseded failure receipts" in with_receipts
 
 
 @pytest.mark.parametrize("entry", ["run_optional_tests", "run_pre_review_tests"])

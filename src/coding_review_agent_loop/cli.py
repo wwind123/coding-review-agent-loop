@@ -31,7 +31,7 @@ from .workdir_claims import claim_agent_workdirs, workdir_claim_scope
 from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
-    DEFAULT_SUB_ITEM_STALL_ROUNDS,
+    DEFAULT_NO_PROGRESS_ROUNDS,
     DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
@@ -157,6 +157,23 @@ def _evidence_row_list(value: str) -> tuple[str, ...]:
     if any(re.search(r"\s", row) for row in rows):
         raise argparse.ArgumentTypeError("risk-matrix row IDs cannot contain whitespace")
     return tuple(rows)
+
+
+def _deprecated_ignored_option(
+    parser: argparse.ArgumentParser, flag: str, replacement: str
+) -> None:
+    """A retired integer option kept for one release (#2097).
+
+    Any integer, including 0, parses; the value is never stored on the config,
+    and ``config_from_args`` logs one notice naming ``replacement``.
+    """
+    parser.add_argument(
+        flag,
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Deprecated and ignored for one release; see {replacement}.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -376,16 +393,20 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"Maximum review/revision rounds (default: {DEFAULT_MAX_ROUNDS}).",
         )
         subparser.add_argument(
-            "--sub-item-stall-rounds",
+            "--no-progress-rounds",
             type=int,
-            default=DEFAULT_SUB_ITEM_STALL_ROUNDS,
-            metavar="ROUNDS",
+            default=None,
+            metavar="K",
             help=(
-                "Warn when no sub-item of a conjunctive review finding closes for this "
-                "many rounds; advisory only, the round budget never changes "
-                f"(default: {DEFAULT_SUB_ITEM_STALL_ROUNDS}; 0 disables)."
+                "Stop for a human decision (exit 4) once K consecutive completed PR "
+                "review rounds ended with the same head and the same non-empty set of "
+                "blocking item IDs; the message names the unchanged items. It also paces "
+                "the advisory sub-item stall report "
+                f"(default: {DEFAULT_NO_PROGRESS_ROUNDS}; minimum 1, so --max-rounds stays "
+                "the outer bound)."
             ),
         )
+        _deprecated_ignored_option(subparser, "--sub-item-stall-rounds", "--no-progress-rounds")
         subparser.add_argument(
             "--flat-child-limit",
             type=int,
@@ -1258,31 +1279,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "before --plan-primary-stall-rounds."
             ),
         )
-        subparser.add_argument(
-            "--pr-step-back-rounds",
-            type=int,
-            default=None,
-            metavar="K",
-            help=(
-                "In the PR fix loop, once a tracked reviewer has blocked K consecutive "
-                "rounds with new mandatory findings whose file:line references cluster on "
-                "one file span, make the next coder turn generalize the class with one "
-                "rule and ask that reviewer to sweep for every remaining instance "
-                "(default: 3; 0 disables). A further clustered sibling afterwards stops "
-                "for a human decision."
-            ),
-        )
-        subparser.add_argument(
-            "--pr-step-back-line-window",
-            type=int,
-            default=None,
-            metavar="N",
-            help=(
-                "Maximum line gap for PR step-back findings to count as one cluster, and "
-                "the window around a step-back anchor that counts as a sibling "
-                "(default: 40; minimum 0)."
-            ),
-        )
+        _deprecated_ignored_option(subparser, "--pr-step-back-rounds", "--no-progress-rounds")
+        _deprecated_ignored_option(subparser, "--pr-step-back-line-window", "--no-progress-rounds")
         subparser.add_argument(
             "--pr-evidence-stall-rounds",
             type=int,
@@ -1310,18 +1308,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "wrong-tree evidence, never converts (default: 2; 0 disables)."
             ),
         )
-        subparser.add_argument(
-            "--pr-non-convergence-rounds",
-            type=int,
-            default=None,
-            metavar="K",
-            help=(
-                "In the PR fix loop, stop for a human decision (exit 4) before the next "
-                "coder turn once the same tracked-reviewer items stayed blocking across K "
-                "consecutive coder turns that each changed the head, wherever the findings "
-                "are (default: 3; 0 disables). Independent of --pr-step-back-rounds."
-            ),
-        )
+        _deprecated_ignored_option(subparser, "--pr-non-convergence-rounds", "--no-progress-rounds")
         subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",

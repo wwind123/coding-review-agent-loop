@@ -932,7 +932,82 @@ def test_cluster_trigger_maps_older_locations_to_the_newest_head():
     assert trigger is not None and (trigger.cluster.start, trigger.cluster.end) == (110, 111)
 
 
+def _clustered_history(rounds, *, heads=None):
+    return _trigger_records(
+        [f"gap src/spool.py:{100 + 2 * n}" for n in range(rounds)], heads=heads
+    )
+
+
+@pytest.mark.parametrize("legacy", ["absent", "valid", "invalid"])
+def test_derived_triggers_fire_at_k_and_2k_only_whatever_the_legacy_entries(legacy):
+    """`pr-step-back-trigger-derived`: non-overlapping windows from review records.
+
+    A recorded step-back entry (valid or malformed) never moves the floor or
+    suppresses a trigger: the same rounds trigger with or without it.
+    """
+    records = list(_clustered_history(6))
+    if legacy == "valid":
+        records.append(_pr_coder(13, 4, HEAD_A, entries=[_pr_entry()]))
+    elif legacy == "invalid":
+        records.append(
+            PostedRoundRecord(
+                index=13,
+                metadata=PostedRoundMetadata(
+                    flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_A,
+                    step_back_status="invalid",
+                ),
+                body="",
+            )
+        )
+    derived = sb.derived_pr_trigger_rounds(
+        records, PR_REVIEWER, k=3, window=40, mapper=_identity_mapper
+    )
+    assert sorted(derived) == [3, 6]
+    for current in range(1, 7):
+        trigger = sb.find_pr_cluster_trigger(
+            [r for r in records if r.metadata.round_number <= current or r.metadata.role == "coder"],
+            PR_REVIEWER, k=3, window=40, current_round=current, mapper=_identity_mapper,
+        )
+        assert (trigger is not None) == (current in {3, 6}), current
+
+
+def test_derived_trigger_maps_to_the_recorded_dispatch_head():
+    """A historical window maps to its coder follow-up's dispatch head, so a live
+    run and a resumed run agree after an operator push past the newest review."""
+    def deleted_on_b(from_head, to_head, path, start, end):
+        if to_head == HEAD_B:
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "deleted")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    records = list(_clustered_history(3))
+    assert 3 in sb.derived_pr_trigger_rounds(
+        records, PR_REVIEWER, k=3, window=40, mapper=deleted_on_b
+    )
+    pushed = PostedRoundRecord(
+        index=40,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_C,
+            followup_dispatch_head=HEAD_B,
+        ),
+        body="",
+    )
+    assert sb.pr_dispatch_heads([*records, pushed]) == {3: HEAD_B}
+    assert sb.derived_pr_trigger_rounds(
+        [*records, pushed], PR_REVIEWER, k=3, window=40, mapper=deleted_on_b
+    ) == {}
+
+
+def test_a_trigger_on_a_non_sha_head_is_not_a_trigger_and_keeps_the_floor():
+    records = list(_clustered_history(4))
+    derived = sb.derived_pr_trigger_rounds(
+        records, PR_REVIEWER, k=3, window=40, mapper=_identity_mapper,
+        head_ok=lambda head: False,
+    )
+    assert derived == {}
+
+
 def test_cluster_trigger_rearms_only_from_reviews_after_a_step_back():
+    """After the derived trigger at round 3, round 4 alone cannot re-trigger."""
     records = [
         *_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]),
         _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
@@ -941,130 +1016,6 @@ def test_cluster_trigger_rearms_only_from_reviews_after_a_step_back():
     assert sb.find_pr_cluster_trigger(
         records, PR_REVIEWER, k=3, window=40, current_round=4, mapper=_identity_mapper
     ) is None
-
-
-def test_malformed_pr_step_back_entries_suppress_trigger_and_episode():
-    bad = PostedRoundRecord(
-        index=45,
-        metadata=PostedRoundMetadata(
-            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_B,
-            step_back_status="invalid",
-        ),
-        body="",
-    )
-    records = [*_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]), bad]
-    assert sb.find_pr_cluster_trigger(
-        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
-    ) is None
-    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper).entry is None
-
-
-def _episode(*extra, window=40):
-    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *extra]
-    return sb.derive_pr_episode(records, PR_REVIEWER, window=window, mapper=_identity_mapper)
-
-
-def test_sweep_sibling_in_the_cluster_escalates_even_when_located_only_in_a_sub_item():
-    sibling = _pr_item(
-        "item-12",
-        "Another spool branch is misclassified",
-        round_number=4,
-        sub_items=(
-            ReviewSubItem("sub-1", "branch at src/spool.py:130 treats it as absent"),
-            ReviewSubItem("sub-2", "elsewhere at src/other.py:5"),
-        ),
-    )
-    result = _episode(_pr_review(60, 4, HEAD_B, new=[sibling]))
-    assert result.entry is not None and result.sibling_round == 4
-    assert [(loc.item_id, loc.sub_item_id) for loc in result.siblings] == [("item-12", "sub-1")]
-
-
-def test_carried_item_does_not_escalate_but_keeps_the_episode_open():
-    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
-    result = _episode(
-        _pr_review(
-            60, 4, HEAD_B, prior=[carried],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        )
-    )
-    assert result.entry is not None and not result.siblings
-
-
-def test_findings_outside_the_cluster_neither_escalate_nor_close_the_episode():
-    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
-    unrelated = _pr_item("item-12", "unrelated src/other.py:5", round_number=4)
-    result = _episode(
-        _pr_review(
-            60, 4, HEAD_B, new=[unrelated], prior=[carried],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        )
-    )
-    assert result.entry is not None and not result.siblings
-
-
-def test_clearance_and_escalation_share_the_window_membership_rule():
-    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
-    keep_open = _pr_review(
-        60, 4, HEAD_B, prior=[carried],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-    )
-    sibling = _pr_review(
-        70, 5, HEAD_B,
-        new=[_pr_item("item-13", "src/spool.py:135", round_number=5)],
-        prior=[carried],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-    )
-    live = _episode(keep_open, sibling)
-    assert live.entry is not None and live.sibling_round == 5
-    # A resume replays the same records and reaches the same decision.
-    assert _episode(keep_open, sibling).sibling_round == 5
-    # Once the carried in-window item is resolved the episode closes, so a later
-    # sibling is an ordinary finding that can re-arm the trigger.
-    resolved = _pr_review(
-        61, 4, HEAD_B, prior=[carried],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "resolved")],
-    )
-    later = _pr_review(
-        71, 5, HEAD_B, new=[_pr_item("item-13", "src/spool.py:135", round_number=5)]
-    )
-    assert _episode(resolved, later).entry is None
-
-
-def test_approval_closes_the_pr_episode():
-    assert _episode(_pr_review(60, 4, HEAD_B, state="approved")).entry is None
-
-
-def test_unmappable_anchor_escalates_on_any_same_path_finding():
-    def lost(from_head, to_head, path, start, end):
-        return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
-
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
-        _pr_review(60, 4, HEAD_B, new=[_pr_item("item-12", "src/spool.py:900", round_number=4)]),
-    ]
-    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=lost)
-    assert result.siblings and not result.mapping.mappable
-    message = sb.render_pr_step_back_human_decision(
-        reviewer=PR_REVIEWER, entry=result.entry, mapping=result.mapping,
-        siblings=result.siblings, window=40, generalization=None, sibling_round=4,
-    )
-    assert "UNMAPPABLE" in message and "--pr-step-back-rounds 0" in message
-
-
-def test_sweep_entries_bind_to_the_resulting_head_and_round_only():
-    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])]
-    assert set(sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_B)) == {PR_REVIEWER}
-    assert sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_C) == {}
-    assert sb.pr_sweep_entries(records, round_number=5, head_sha=HEAD_B) == {}
-    assert sb.pr_sweep_entries(records, round_number=4, head_sha=None) == {}
-
-
-def test_generalization_is_reconstructed_from_the_stored_structured_response():
-    raw = json.dumps({"kind": "coder_followup", "summary": "Generalization: any malformed record"})
-    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=raw)]
-    entry = sb.pr_step_back_history(records, PR_REVIEWER)[0][0]
-    assert sb.step_back_generalization(records, entry) == "Generalization: any malformed record"
-    assert sb.step_back_generalization([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])], entry) is None
 
 
 def test_pr_step_back_entry_round_trips_through_round_metadata():
@@ -1077,44 +1028,6 @@ def test_pr_step_back_entry_round_trips_through_round_metadata():
 # --- review round 1 fixes (#1265) -------------------------------------------
 
 
-def test_clearance_applies_the_reviews_own_sub_item_dispositions():
-    sub_items = (
-        ReviewSubItem("sub-1", "in cluster at src/spool.py:130"),
-        ReviewSubItem("sub-2", "distant at src/spool.py:900"),
-    )
-    parent = _pr_item("item-3", "conjunctive gap", round_number=3, sub_items=sub_items)
-
-    def episode(outcomes):
-        review = _pr_review(
-            60, 4, HEAD_B, prior=[parent],
-            dispositions=[
-                ReviewItemDisposition("item-3", PR_REVIEWER, "blocking", sub_item_dispositions=outcomes)
-            ],
-        )
-        return _episode(review)
-
-    # Resolving the in-cluster sub-item while the distant one stays open clears the episode.
-    assert episode((("sub-1", "resolved"), ("sub-2", "unresolved"))).entry is None
-    # Reopening an in-cluster sub-item (previously resolved) keeps it open.
-    closed_first = _pr_item(
-        "item-3", "conjunctive gap", round_number=3,
-        sub_items=(
-            ReviewSubItem("sub-1", "in cluster at src/spool.py:130", status="resolved"),
-            ReviewSubItem("sub-2", "distant at src/spool.py:900"),
-        ),
-    )
-    review = _pr_review(
-        60, 4, HEAD_B, prior=[closed_first],
-        dispositions=[
-            ReviewItemDisposition(
-                "item-3", PR_REVIEWER, "blocking",
-                sub_item_dispositions=(("sub-1", "unresolved"), ("sub-2", "resolved")),
-            )
-        ],
-    )
-    assert _episode(review).entry is not None
-
-
 def _shifting_mapper(from_head, to_head, path, start, end):
     # The coder inserted 100 lines between the anchor (100-105) and later code.
     if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 110:
@@ -1122,43 +1035,6 @@ def _shifting_mapper(from_head, to_head, path, start, end):
     if (from_head, to_head) == (HEAD_B, HEAD_A) and start >= 210:
         return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 100, end - 100)
     return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
-
-
-def test_clearance_maps_carried_locations_into_the_current_heads_coordinates():
-    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
-    records = [
-        _pr_review(40, 3, HEAD_A, new=[carried]),
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
-        _pr_review(
-            60, 4, HEAD_B, prior=[carried],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        ),
-    ]
-    # Line 130 moved to 230, outside 100-105 +/- 40: no member remains.
-    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_shifting_mapper)
-    assert result.entry is None
-    # Without the shift the carried item is still a member (control).
-    kept = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper)
-    assert kept.entry is not None
-
-
-def test_a_formerly_distant_carried_item_that_moves_into_the_window_keeps_the_episode_open():
-    carried = _pr_item("item-3", "old gap src/spool.py:300", round_number=3)
-
-    def pulled_in(from_head, to_head, path, start, end):
-        if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 290:
-            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 190, end - 190)
-        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
-
-    records = [
-        _pr_review(40, 3, HEAD_A, new=[carried]),
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
-        _pr_review(
-            60, 4, HEAD_B, prior=[carried],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        ),
-    ]
-    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=pulled_in).entry is not None
 
 
 def test_find_cluster_ignores_a_distant_finding_on_the_same_path():
@@ -1226,49 +1102,6 @@ def test_urls_absolute_paths_and_plain_words_do_not_project(text):
 # --- review round 2 fixes (#1265) -------------------------------------------
 
 
-def test_a_parent_whose_sub_items_are_all_completed_no_longer_keeps_the_episode_open():
-    parent = _pr_item(
-        "item-3", "spool gap at src/spool.py:130", round_number=3,
-        sub_items=(ReviewSubItem("sub-1", "a"), ReviewSubItem("sub-2", "b")),
-    )
-    completing = _pr_review(
-        60, 4, HEAD_B, prior=[parent],
-        dispositions=[
-            ReviewItemDisposition(
-                "item-3", PR_REVIEWER, "blocking",
-                sub_item_dispositions=(("sub-1", "resolved"), ("sub-2", "resolved")),
-            )
-        ],
-    )
-    later = _pr_review(
-        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)]
-    )
-    # The completing entry derives to resolved: the episode closed, so the later
-    # in-window finding is an ordinary finding rather than a sibling.
-    assert _episode(completing, later).entry is None
-
-
-def test_a_future_item_promoted_by_the_sweep_keeps_the_episode_open_and_a_sibling_escalates():
-    future = _pr_item("item-3", "retained gap src/spool.py:130", status="future", round_number=3)
-    promoted = _pr_review(
-        60, 4, HEAD_B, prior=[future],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-    )
-    sibling = _pr_review(
-        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)],
-        prior=[future],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-    )
-    assert _episode(promoted).entry is not None
-    assert _episode(promoted, sibling).sibling_round == 5
-    # A still-future item stays out of clearance.
-    still_future = _pr_review(
-        60, 4, HEAD_B, prior=[future],
-        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "future")],
-    )
-    assert _episode(still_future).entry is None
-
-
 def test_nul_delimited_name_status_and_non_ascii_paths_map_through_the_runner(tmp_path):
     from coding_review_agent_loop.pr_loop_support import _git_anchor_mapper as _git_anchor_mapper_
     from coding_review_agent_loop.runner import CommandResult
@@ -1314,60 +1147,6 @@ def test_a_changed_file_whose_diff_section_is_missing_is_unmappable_not_unchange
     assert (other.outcome, other.start) == (sb.OUTCOME_SHIFTED, 100)
 
 
-def test_a_sibling_from_an_earlier_round_does_not_escalate_again_but_keeps_the_episode_open():
-    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
-    stale = _pr_review(60, 4, HEAD_B, new=[sibling])
-    later = _pr_review(
-        70, 5, HEAD_C,
-        new=[_pr_item("item-13", "unrelated src/other.py:5", round_number=5)],
-        prior=[sibling],
-        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
-    )
-    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), stale, later]
-    # Dispatching round 5: the round-4 sibling already stopped the run once.
-    result = sb.derive_pr_episode(
-        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
-    )
-    assert result.entry is not None and not result.siblings
-    # Dispatching round 4 itself still escalates, as does an unscoped replay.
-    assert sb.derive_pr_episode(
-        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=4
-    ).sibling_round == 4
-    assert sb.derive_pr_episode(
-        records, PR_REVIEWER, window=40, mapper=_identity_mapper
-    ).sibling_round == 4
-    # A new sibling introduced by the dispatched round's own review escalates.
-    newer = _pr_review(
-        70, 5, HEAD_C, new=[_pr_item("item-13", "another src/spool.py:136", round_number=5)],
-        prior=[sibling],
-        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
-    )
-    assert sb.derive_pr_episode(
-        [records[0], stale, newer], PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
-    ).sibling_round == 5
-
-
-def test_a_sibling_reviewed_on_a_head_the_code_has_moved_past_does_not_escalate_again():
-    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
-        _pr_review(60, 4, HEAD_B, new=[sibling]),
-    ]
-    same = sb.derive_pr_episode(
-        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
-        current_round=4, current_head=HEAD_B,
-    )
-    assert same.sibling_round == 4  # an unchanged rerun stops again
-    pushed = sb.derive_pr_episode(
-        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
-        current_round=4, current_head=HEAD_C,
-    )
-    assert pushed.entry is not None and not pushed.siblings
-
-
-# --- review round 6 fixes (#1265) -------------------------------------------
-
-
 def test_trigger_locations_are_mapped_to_the_dispatch_head_not_the_newest_reviews_head():
     records = _trigger_records(["src/a.py:124", "src/a.py:130", "src/a.py:136"], heads=[HEAD_A] * 3)
 
@@ -1396,97 +1175,6 @@ def test_trigger_locations_are_mapped_to_the_dispatch_head_not_the_newest_review
     )
     assert trigger.trigger_head == HEAD_B
     assert (trigger.cluster.start, trigger.cluster.end) == (224, 236)
-
-
-def test_a_moved_distant_carried_item_does_not_keep_a_mappable_anchors_episode_open():
-    near = _pr_item("item-3", "gap src/spool.py:130", round_number=3)
-    far = _pr_item("item-6", "elsewhere src/spool.py:900", round_number=3)
-
-    def mapper(from_head, to_head, path, start, end):
-        if start >= 900:  # that code moved away: it cannot be placed on the new head
-            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
-        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
-
-    sweep = _pr_review(
-        60, 4, HEAD_B, prior=[near, far],
-        dispositions=[
-            ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
-            ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
-        ],
-    )
-    later = _pr_review(
-        70, 5, HEAD_B, new=[_pr_item("item-9", "ordinary src/spool.py:135", round_number=5)],
-        prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
-    )
-    # Round 3's review (on HEAD_A) is the carried items' source head.
-    source = _pr_review(40, 3, HEAD_A, new=[near, far])
-    records = [source, _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]), sweep, later]
-    # The only in-window item was resolved, so the episode closed at the sweep; the
-    # later in-window finding is ordinary.  Replaying the same records (a resume) agrees.
-    for _ in range(2):
-        result = sb.derive_pr_episode(
-            records, PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_B
-        )
-        assert result.entry is None and not result.siblings
-    # An unmappable ANCHOR still uses the same-path fallback for a carried item.
-    lost = lambda *a: sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, a[2], a[2], a[3], a[4], "moved")
-    kept = sb.derive_pr_episode(
-        records[:3], PR_REVIEWER, window=40, mapper=lost, current_round=4, current_head=HEAD_B
-    )
-    assert kept.entry is not None
-
-
-# --- review round 7 fix (#1265) ---------------------------------------------
-
-
-def test_a_carried_locations_known_rename_destination_keeps_an_unmappable_anchors_episode_open():
-    near = _pr_item("item-3", "gap src/a.py:130", round_number=3)
-    far = _pr_item("item-6", "elsewhere src/b.py:900", round_number=4)
-
-    def mapper(from_head, to_head, path, start, end):
-        if (from_head, to_head) == (HEAD_A, HEAD_B) and path == "src/a.py":
-            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, "src/b.py", start, end)
-        if (from_head, to_head) == (HEAD_A, HEAD_C) and path == "src/a.py":
-            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "rewritten")
-        if (from_head, to_head) == (HEAD_B, HEAD_C) and path == "src/b.py":
-            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "moved")
-        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
-
-    records = [
-        _pr_review(40, 3, HEAD_A, new=[near]),
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A, path="src/a.py")]),
-        _pr_review(
-            60, 4, HEAD_B, new=[far], prior=[near],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        ),
-        # The near item is resolved; the distant one is carried onto a head where both
-        # files were renamed to src/c.py and the anchored code was rewritten.
-        _pr_review(
-            70, 5, HEAD_C, prior=[near, far],
-            dispositions=[
-                ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
-                ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
-            ],
-        ),
-        _pr_review(
-            80, 6, HEAD_C, new=[_pr_item("item-9", "sibling src/c.py:50", round_number=6)],
-            prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
-        ),
-    ]
-    for _ in range(2):  # live, then a replay as a resume would see it
-        result = sb.derive_pr_episode(
-            records, PR_REVIEWER, window=40, mapper=mapper, current_round=6, current_head=HEAD_C
-        )
-        assert result.entry is not None and result.sibling_round == 6
-    # Before the sibling arrives the episode is still open (the rename destination counts).
-    assert sb.derive_pr_episode(
-        records[:4], PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_C
-    ).entry is not None
-
-
-# ---------------------------------------------------------------------------
-# --review-parallel: publication reviewer records resolve via reconciliation (#1271)
-# ---------------------------------------------------------------------------
 
 
 def _publication(index, round_number, *, state="blocking", agent=PRIMARY, flow="plan",
@@ -1626,67 +1314,6 @@ def test_pr_cluster_trigger_fires_on_parallel_publication_plus_reconciliation_ro
     assert sb.find_pr_cluster_trigger(
         records[:-1], PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
     ) is None
-
-
-def test_pr_episode_detects_a_sibling_found_only_on_the_reconciliation():
-    sibling = _pr_item("item-12", "spool branch src/spool.py:130", round_number=4)
-    result = _episode(_pr_publication(60, 4, HEAD_B), _pr_recon(61, 4, HEAD_B, [sibling]))
-    assert result.entry is not None and result.sibling_round == 4
-
-
-def test_pr_unresolved_post_entry_review_neither_escalates_nor_closes_the_episode():
-    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
-    result = _episode(
-        _pr_review(
-            55, 4, HEAD_B, prior=[carried],
-            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
-        ),
-        _pr_publication(60, 5, HEAD_B),
-    )
-    assert result.entry is not None and not result.siblings
-    only = _episode(_pr_publication(60, 4, HEAD_B))
-    assert only.entry is not None and not only.siblings
-
-
-def test_pr_approved_publication_closes_the_episode():
-    assert _episode(_pr_publication(60, 4, HEAD_B, state="approved")).entry is None
-
-
-def test_pr_reconciliation_member_item_keeps_the_episode_open_until_resolved():
-    member = _pr_item("item-12", "spool branch src/spool.py:130", round_number=4)
-
-    def replay(*extra):
-        records = [
-            _pr_publication(60, 4, HEAD_B),
-            _pr_recon(61, 4, HEAD_B, [member]),
-            *extra,
-        ]
-        # current_round=5: round 4's sibling is stale, so escalation is suppressed
-        # and the open member is evaluated through _remaining_mandatory_items.
-        return sb.derive_pr_episode(
-            [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *records],
-            PR_REVIEWER, window=40, mapper=_identity_mapper,
-            current_round=5, current_head=HEAD_B,
-        )
-
-    kept = replay()
-    assert kept.entry is not None and not kept.siblings
-    still_open = replay(
-        _pr_publication(
-            70, 5, HEAD_B, prior=[member],
-            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
-        ),
-        _pr_recon(71, 5, HEAD_B, []),
-    )
-    assert still_open.entry is not None and not still_open.siblings
-    closed = replay(
-        _pr_publication(
-            70, 5, HEAD_B, prior=[member],
-            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "resolved")],
-        ),
-        _pr_recon(71, 5, HEAD_B, []),
-    )
-    assert closed.entry is None
 
 
 # --- stall-stop disposition (#1275) -----------------------------------------
@@ -2016,395 +1643,6 @@ def test_declaration_must_start_the_line(line):
 )
 def test_declaration_accepts_presentation_prefixes(line):
     assert declared_dissolution_reversals({"summary": f"intro\n{line}"}) == (("a", "why"),)
-
-
-# ---------------------------------------------------------------------------
-# PR fix-loop non-convergence (#1372)
-# ---------------------------------------------------------------------------
-
-import dataclasses  # noqa: E402
-
-from coding_review_agent_loop.pr_loop_support import (  # noqa: E402
-    _pr_step_back_records_may_matter,
-)
-
-OTHER_REVIEWER = "Google Antigravity"
-NC_A = "race: a same-UID attacker swaps the config at src/secure_git.py:10"
-NC_B = "race: the worktree path is reused at src/run_worktrees.py:900"
-
-
-def _nc_head(n):
-    return f"{n:040x}"
-
-
-def _nc_open(item_id, text, *, round_number=1, **kwargs):
-    return _pr_item(item_id, text, round_number=round_number, **kwargs)
-
-
-def _nc_history(reviews, *, coder_offset=1, coder_heads=None, review_heads=None, publication=False):
-    """Production numbering: review r on head r, then coder record r+1 whose subject
-    is the head reviewed at round r+1.
-
-    ``reviews`` maps each round to ``(new, prior, dispositions)``.
-    """
-    records = []
-    index = 0
-    rounds = sorted(reviews)
-    for position, n in enumerate(rounds):
-        new, prior, dispositions = reviews[n]
-        head = (review_heads or {}).get(n, _nc_head(n))
-        if publication:
-            records.append(
-                _pr_publication(index, n, head, prior=prior, dispositions=dispositions)
-            )
-            index += 1
-            if new is not None:
-                records.append(_pr_recon(index, n, head, new))
-                index += 1
-        else:
-            records.append(
-                _pr_review(index, n, head, new=new, prior=prior, dispositions=dispositions)
-            )
-            index += 1
-        if position + 1 < len(rounds):
-            subject = (coder_heads or {}).get(n + 1, _nc_head(n + 1))
-            records.append(_pr_coder(index, n + coder_offset, subject))
-            index += 1
-    return records
-
-
-def _nc_persisting_reviews(rounds=4, *, items=(("item-1", NC_A), ("item-2", NC_B))):
-    opened = [_nc_open(item_id, text) for item_id, text in items]
-    reviews = {1: (opened, (), ())}
-    for n in range(2, rounds + 1):
-        reviews[n] = ((), opened, ())
-    return reviews
-
-
-def _nc_find(records, *, k=3, current_round=4, current_head=None):
-    return sb.find_pr_non_convergence(
-        records, PR_REVIEWER, k=k, current_round=current_round,
-        current_head=current_head or _nc_head(current_round),
-    )
-
-
-def test_non_convergence_fires_on_items_persisting_across_files():
-    """`nc-persist-spread`: same two IDs blocking, findings in different files."""
-    records = _nc_history(_nc_persisting_reviews())
-    result = _nc_find(records)
-    assert result is not None
-    assert [(i.item_id, i.attempts) for i in result.items] == [("item-1", 3), ("item-2", 3)]
-    assert result.first_round == 1 and result.trigger_round == 4
-    assert result.first_head == _nc_head(1) and result.current_head == _nc_head(4)
-    assert result.coder_rounds == (2, 3, 4)
-    assert result.items[0].first_line == NC_A
-    # The clustered rule does not see it: the reviews after the first are repeat-only.
-    assert sb.find_pr_cluster_trigger(
-        records, PR_REVIEWER, k=3, window=40, current_round=4, mapper=_identity_mapper
-    ) is None
-
-
-def test_non_convergence_attempts_extend_past_k_and_growth_starts_at_the_first_attempt():
-    records = _nc_history(_nc_persisting_reviews(rounds=6))
-    result = _nc_find(records, current_round=6)
-    assert result is not None and {i.attempts for i in result.items} == {5}
-    # The baseline is the earliest counted review, not the start of the K window.
-    assert result.first_round == 1 and result.first_head == _nc_head(1)
-    text = sb.render_pr_non_convergence_decision(77, result, diff_growth="g", pr_size="s")
-    assert "reviews at rounds 1-6" in text
-    assert f"(`{_nc_head(1)[:12]}` to `{_nc_head(6)[:12]}`)" in text
-    # Different streak lengths: the baseline follows the longest one.
-    reviews = _nc_persisting_reviews(rounds=6, items=(("item-1", NC_A),))
-    late = _nc_open("item-2", NC_B, round_number=3)
-    reviews[3] = ([late], reviews[3][1], ())
-    for n in (4, 5, 6):
-        reviews[n] = ((), [*reviews[n][1], late], ())
-    mixed = _nc_find(_nc_history(reviews), current_round=6)
-    assert {(i.item_id, i.attempts) for i in mixed.items} == {("item-1", 5), ("item-2", 3)}
-    assert mixed.first_round == 1
-
-
-def test_non_convergence_joins_review_r_to_coder_record_r_plus_one_only():
-    """`nc-production-numbering`: same-numbered coder records never qualify."""
-    assert _nc_find(_nc_history(_nc_persisting_reviews())) is not None
-    assert _nc_find(_nc_history(_nc_persisting_reviews(), coder_offset=0)) is None
-
-
-def test_resolved_items_replaced_by_new_findings_do_not_trigger():
-    """`nc-churn-no-trigger`."""
-    reviews = {}
-    previous = None
-    for n in range(1, 5):
-        new = [_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)]
-        prior = [previous] if previous else []
-        dispositions = (
-            [ReviewItemDisposition(previous.item_id, PR_REVIEWER, "resolved")] if previous else []
-        )
-        reviews[n] = (new, prior, dispositions)
-        previous = new[0]
-    assert _nc_find(_nc_history(reviews)) is None
-
-
-def test_one_persisting_item_among_churn_still_triggers_and_lists_only_it():
-    persistent = _nc_open("item-1", NC_A)
-    reviews = {1: ([persistent], (), ())}
-    for n in range(2, 5):
-        reviews[n] = ([_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)],
-                      [persistent], ())
-    result = _nc_find(_nc_history(reviews))
-    assert result is not None and [i.item_id for i in result.items] == ["item-1"]
-
-
-@pytest.mark.parametrize("case", ["no-op", "external-push", "missing-coder"])
-def test_a_no_op_turn_external_push_or_missing_coder_record_breaks_the_chain(case):
-    """`nc-chain-break`."""
-    reviews = _nc_persisting_reviews()
-    if case == "no-op":
-        # Coder record 3 left the head where review 2 saw it; review 3 is on that head.
-        records = _nc_history(
-            reviews, coder_heads={3: _nc_head(2)}, review_heads={3: _nc_head(2)}
-        )
-    elif case == "external-push":
-        records = _nc_history(reviews, review_heads={3: _nc_head(9)})
-    else:
-        records = [
-            r for r in _nc_history(reviews)
-            if not (r.metadata.role == "coder" and r.metadata.round_number == 3)
-        ]
-    assert _nc_find(records) is None
-
-
-def test_a_dispatch_head_past_the_newest_review_breaks_the_chain():
-    records = _nc_history(_nc_persisting_reviews())
-    assert _nc_find(records, current_head=_nc_head(9)) is None
-
-
-def test_machine_and_evidence_obligations_do_not_count():
-    """`nc-obligations-excluded`."""
-    machine = UnresolvedReviewItem(
-        item_id="ci-1", reviewer=PR_REVIEWER, source_round=1, text="checks failing",
-        status="blocking", authority="machine", obligation_kind="alembic-migration",
-        lifecycle="awaiting_current_head_review",
-    )
-    evidence = UnresolvedReviewItem(
-        item_id="evidence-1", reviewer=PR_REVIEWER, source_round=1,
-        text="a real Windows SSH fetch", status="blocking", authority="machine",
-        obligation_kind="human-exact-head-evidence", lifecycle="evidence_deferred",
-        obligation_identity="evidence-identity-1",
-    )
-    tagged = UnresolvedReviewItem(
-        item_id="item-7", reviewer=PR_REVIEWER, source_round=1,
-        text="cite a passing test for row-a", status="blocking", evidence_row_ids=("row-a",),
-    )
-    reviews = {1: ([tagged], [machine, evidence], ())}
-    for n in range(2, 5):
-        reviews[n] = ((), [machine, evidence, tagged], ())
-    records = _nc_history(reviews)
-    # The tagged finding persists like any finding; the obligations never count.
-    result = _nc_find(records)
-    assert result is not None and [i.item_id for i in result.items] == ["item-7"]
-    # Its rows are unsatisfied, so the evidence stall decides first at the dispatch.
-    assert sb.defers_to_evidence_stall(result, frozenset({"row-a"}))
-    obligations_only = {n: ((), [machine, evidence], ()) for n in range(1, 5)}
-    assert _nc_find(_nc_history(obligations_only)) is None
-
-
-def _nc_tagged(item_id="item-7", rows=("row-a",)):
-    return UnresolvedReviewItem(
-        item_id=item_id, reviewer=PR_REVIEWER, source_round=1,
-        text="cite a passing test for the row", status="blocking", evidence_row_ids=tuple(rows),
-    )
-
-
-@pytest.mark.parametrize(
-    "case, unsatisfied, mixed, defers",
-    [
-        ("evidence-only, unsatisfied rows", {"row-a"}, False, True),
-        ("evidence-only, tag names a satisfied row", {"row-b"}, False, False),
-        ("evidence-only, no usable row set", None, False, False),
-        ("tagged item persisting among churning code findings", {"row-a"}, True, True),
-    ],
-)
-def test_tagged_findings_always_persist_and_defer_only_when_the_stall_may_own_them(
-    case, unsatisfied, mixed, defers
-):
-    """Generalization: tagged findings count like any finding; the stop defers to
-    the evidence stall's own decision only when every persisting item is tagged
-    with rows unsatisfied at the head.  The stall then judges the combined ledger
-    (where a churning untagged finding disqualifies it) and its window history."""
-    tagged = _nc_tagged()
-    reviews = {}
-    previous = None
-    for n in range(1, 5):
-        new = [tagged] if n == 1 else []
-        prior = [tagged] if n > 1 else []
-        dispositions = []
-        if mixed:
-            code = _nc_open(f"item-{20 + n}", f"gap at src/f{n}.py:10", round_number=n)
-            new = [*new, code]
-            if previous is not None:
-                prior = [*prior, previous]
-                dispositions = [ReviewItemDisposition(previous.item_id, PR_REVIEWER, "resolved")]
-            previous = code
-        reviews[n] = (new, prior, dispositions)
-    result = _nc_find(_nc_history(reviews))
-    assert result is not None and [i.item_id for i in result.items] == ["item-7"]
-    assert result.items[0].asks_for_evidence and result.items[0].evidence_row_ids == ("row-a",)
-    rows = None if unsatisfied is None else frozenset(unsatisfied)
-    assert sb.defers_to_evidence_stall(result, rows) is defers
-
-
-def test_an_untagged_persisting_item_never_defers_to_the_evidence_stall():
-    tagged = _nc_tagged()
-    plain = _nc_open("item-1", NC_A)
-    reviews = {1: ([tagged, plain], (), ())}
-    for n in range(2, 5):
-        reviews[n] = ((), [tagged, plain], ())
-    result = _nc_find(_nc_history(reviews))
-    assert {i.item_id for i in result.items} == {"item-1", "item-7"}
-    assert not sb.defers_to_evidence_stall(result, frozenset({"row-a"}))
-
-
-def test_completing_sub_item_disposition_clears_persistence():
-    """`nc-subitem-completion`."""
-    parent = _nc_open(
-        "item-1", NC_A,
-        sub_items=(ReviewSubItem("sub-1", "a at src/a.py:1"), ReviewSubItem("sub-2", "b at src/b.py:2")),
-    )
-    reviews = {1: ([parent], (), ())}
-    for n in range(2, 5):
-        churn = [_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)]
-        dispositions = ()
-        if n == 4:
-            dispositions = [
-                ReviewItemDisposition(
-                    "item-1", PR_REVIEWER, "blocking",
-                    sub_item_dispositions=(("sub-1", "resolved"), ("sub-2", "resolved")),
-                )
-            ]
-        reviews[n] = (churn, [parent], dispositions)
-    records = _nc_history(reviews)
-    assert _nc_find(records) is None
-    # Without the completing disposition the parent persists.
-    reviews[4] = (reviews[4][0], [parent], ())
-    assert _nc_find(_nc_history(reviews)) is not None
-
-
-def test_another_reviewers_blocking_vote_does_not_extend_the_streak():
-    """`nc-parallel-conflicting-dispositions`."""
-    reviews = _nc_persisting_reviews(items=(("item-1", NC_A),))
-    opened = reviews[2][1]
-    # The tracked reviewer resolves item-1 at round 4; another reviewer's blocking
-    # disposition for the same item, listed later, must not count for it.
-    reviews[4] = (
-        [_nc_open("item-9", "unrelated at src/z.py:1", round_number=4)],
-        opened,
-        [
-            ReviewItemDisposition("item-1", PR_REVIEWER, "resolved"),
-            ReviewItemDisposition("item-1", OTHER_REVIEWER, "blocking"),
-        ],
-    )
-    assert _nc_find(_nc_history(reviews)) is None
-    assert _nc_find(_nc_history(reviews, publication=True)) is None
-
-
-def test_parallel_publication_records_resolve_through_reconciliation():
-    """`nc-review-parallel`."""
-    reviews = _nc_persisting_reviews()
-    # Repeat-only publication rounds still need a reconciliation to be resolvable.
-    reviews = {n: (new if new else [], prior, d) for n, (new, prior, d) in reviews.items()}
-    records = _nc_history(reviews, publication=True)
-    result = _nc_find(records)
-    assert result is not None and [i.item_id for i in result.items] == ["item-1", "item-2"]
-    # A publication with no later reconciliation is unresolvable and breaks the chain.
-    unresolved = [
-        r for r in records
-        if not (r.metadata.phase == "reconciliation" and r.metadata.round_number == 3)
-    ]
-    assert _nc_find(unresolved) is None
-
-
-def test_k_zero_or_too_few_rounds_disables_non_convergence():
-    records = _nc_history(_nc_persisting_reviews())
-    assert _nc_find(records, k=0) is None
-    assert _nc_find(records, k=4) is None
-
-
-def test_snapshot_pre_check_needs_only_the_preceding_contiguous_blocking_reviews():
-    """`nc-live-snapshot`: the live snapshot lacks coder record N (and review N)."""
-    records = _nc_history(_nc_persisting_reviews())
-    live = [
-        r for r in records
-        if not (r.metadata.round_number == 4)  # drops coder record 4 and review 4
-    ]
-    assert not any(r.metadata.role == "coder" and r.metadata.round_number == 4 for r in live)
-    for snapshot in (live, records, [r for r in live if r.metadata.role == "reviewer"]):
-        assert _pr_step_back_records_may_matter(
-            snapshot, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
-        )
-    # An approval or a gap in the preceding reviews skips the fresh read.
-    approved_records = [
-        PostedRoundRecord(
-            index=r.index, body=r.body,
-            metadata=dataclasses.replace(r.metadata, state="approved")
-            if r.metadata.role == "reviewer" and r.metadata.round_number == 2
-            else r.metadata,
-        )
-        for r in live
-    ]
-    assert not _pr_step_back_records_may_matter(
-        approved_records, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
-    )
-    gap = [r for r in live if not (r.metadata.role == "reviewer" and r.metadata.round_number == 2)]
-    assert not _pr_step_back_records_may_matter(
-        gap, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
-    )
-    # Disabled non-convergence keeps the pre-check to the step-back rules.
-    assert not _pr_step_back_records_may_matter(
-        live, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=0
-    )
-
-
-def test_non_convergence_decision_text_lists_items_measurements_and_options():
-    evidence_text = "needs a real Windows SSH fetch: no `runner` exists"
-    reviews = _nc_persisting_reviews(items=(("item-1", NC_A), ("item-2", evidence_text)))
-    result = _nc_find(_nc_history(reviews))
-    text = sb.render_pr_non_convergence_decision(
-        77, result, diff_growth="3 files changed, 120 insertions(+)", pr_size="9 files changed"
-    )
-    assert "PR #77: human decision required" in text
-    assert f"[item-1] (attempts: 3) {NC_A}" in text
-    assert "[item-2] (attempts: 3) needs a real Windows SSH fetch: no 'runner' exists" in text
-    assert "3 files changed, 120 insertions(+)" in text and "9 files changed" in text
-    assert "Possibly human-only evidence" in text and "[item-2]" in text.split("Possibly", 1)[1]
-    assert "`--pr-non-convergence-rounds 0` (or a larger K)" in text
-    assert "signed human decision" in text
-    assert "push a change yourself" in text
-    assert "exact-head evidence request" in text
-    unavailable = sb.render_pr_non_convergence_decision(77, result, diff_growth=None, pr_size=None)
-    assert unavailable.count("unavailable") == 2
-    assert "AGENT_" not in text and "<!--" not in text
-
-
-def test_resolving_one_sub_item_per_turn_is_progress_not_non_convergence():
-    """A parent that loses an open sub-item each round is converging."""
-    subs = tuple(ReviewSubItem(f"item-1.s{n}", f"writer {n} at src/w{n}.py:1") for n in range(1, 5))
-    parent = _nc_open("item-1", "Four writer paths are unwired.", sub_items=subs)
-    reviews = {1: ([parent], (), ())}
-    resolved = []
-    for n in range(2, 5):
-        resolved.append((f"item-1.s{n - 1}", "resolved"))
-        reviews[n] = (
-            (), [parent],
-            [ReviewItemDisposition("item-1", PR_REVIEWER, "blocking",
-                                   sub_item_dispositions=tuple(resolved))],
-        )
-    assert _nc_find(_nc_history(reviews)) is None
-    # A turn that resolves nothing (the same open count) keeps the item persisting.
-    stuck = {n: ((), [parent], ()) for n in range(2, 5)}
-    stuck[1] = reviews[1]
-    result = _nc_find(_nc_history(stuck))
-    assert result is not None and [i.item_id for i in result.items] == ["item-1"]
 
 
 # --- Plan sweep trigger and finding provenance (#1505) -----------------------
@@ -3337,109 +2575,3 @@ def test_pr_step_back_guidance_offers_both_choices_and_keeps_the_cluster_block()
     assert "[item-1] (round 3) gap one" in guidance
 
 
-def test_approach_alternative_matches_a_valid_step_back_record_at_the_same_head():
-    records = [
-        _pr_coder(
-            50, 4, HEAD_B, entries=[_pr_entry()],
-            raw=_alt_raw("  Approach alternative: drop the predecessor check."),
-        )
-    ]
-    alt = sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B)
-    assert alt is not None
-    assert alt.excerpt == "drop the predecessor check."
-    assert alt.coder_round == 4 and alt.head == HEAD_B
-    assert alt.reviewers == (PR_REVIEWER,)
-    assert alt.entries[0].path == "src/spool.py"
-
-
-@pytest.mark.parametrize(
-    "records, head",
-    [
-        # Generalization keeps today's behavior.
-        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Generalization: one rule"))], HEAD_B),
-        # A non-step-back coder record never stops, even with the prefix.
-        ([_pr_coder(50, 4, HEAD_B, raw=_alt_raw("Approach alternative: x"))], HEAD_B),
-        # Unreadable or missing raw response.
-        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw="not json")], HEAD_B),
-        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=None)], HEAD_B),
-        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=json.dumps(["x"]))], HEAD_B),
-        # No head.
-        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x"))], None),
-    ],
-)
-def test_approach_alternative_fails_open_to_todays_behavior(records, head):
-    """`approach-alt-malformed`."""
-    assert sb.pr_step_back_approach_alternative(records, head_sha=head) is None
-
-
-def test_approach_alternative_ignores_an_invalid_step_back_record():
-    """`approach-alt-malformed`: an invalid step-back status carries no entries."""
-    invalid = PostedRoundRecord(
-        index=50,
-        metadata=PostedRoundMetadata(
-            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_B,
-            step_back_status="invalid",
-            raw_structured_coder_response=_alt_raw("Approach alternative: x"),
-        ),
-        body="",
-    )
-    assert sb.pr_step_back_approach_alternative([invalid], head_sha=HEAD_B) is None
-
-
-def test_approach_alternative_does_not_stop_on_a_moved_head():
-    """`approach-alt-head-moved`."""
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x"))
-    ]
-    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_C) is None
-
-
-def test_approach_alternative_does_not_stop_after_that_head_was_reviewed():
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x")),
-        _pr_review(60, 4, HEAD_B, state="approved"),
-    ]
-    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B) is None
-
-
-def test_only_the_newest_step_back_record_counts():
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x")),
-        _pr_coder(70, 6, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Generalization: y")),
-    ]
-    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B) is None
-
-
-def test_approach_alternative_decision_quotes_truncates_and_lists_three_choices():
-    long_text = "drop the check " * 400
-    records = [
-        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: " + long_text))
-    ]
-    alt = sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B)
-    message = sb.render_pr_step_back_approach_alternative_decision(77, alt)
-    assert message.startswith("PR #77: " + sb.PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT)
-    assert "drop the check" in message and "…" in message
-    assert len(message) < sb.ALTERNATIVE_EXCERPT_LIMIT + 1200
-    assert "rerun with the scope change approved" in message
-    assert "accept a stated limitation" in message
-    assert "--pr-step-back-rounds 0" in message
-    assert "No review or coder turn was run on it" in message
-    assert "src/spool.py` lines 100-105" in message
-
-
-def test_sibling_escalation_offers_the_reachable_scope_change_route():
-    """`generalization-unchanged`: prefix and existing choices kept."""
-    entry = sb.pr_step_back_history(
-        [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])], PR_REVIEWER
-    )[0][0]
-    message = sb.render_pr_step_back_human_decision(
-        reviewer=PR_REVIEWER, entry=entry, mapping=None, siblings=(), window=40,
-        generalization="Generalization: x", sibling_round=5,
-    )
-    assert message.startswith(
-        "human decision required: the coder generalized a class of findings at round "
-    )
-    assert "--pr-step-back-rounds 0" in message and "accept a stated limitation" in message
-    assert "redesign the affected code" in message
-    assert "approve a scope change (re-plan or amend the issue), push the replacement and rerun" in message
-    assert "re-offer" not in message and "step-back offers" not in message

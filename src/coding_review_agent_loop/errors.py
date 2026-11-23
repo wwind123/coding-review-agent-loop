@@ -159,8 +159,7 @@ def reraise_human_decision(exc: BaseException, context: str) -> None:
 # tests/test_human_decision_stops.py enforces both the provenance rule and the
 # shape of every renderer listed here.
 HUMAN_DECISION_RENDERERS: tuple[tuple[str, str], ...] = (
-    ("review_step_back", "render_pr_non_convergence_decision"),
-    ("review_step_back", "render_pr_step_back_approach_alternative_decision"),
+    ("no_progress", "render_no_progress_message"),
     ("review_step_back", "render_step_back_human_decision"),
     ("panel_evidence", "plan_primary_stall_message"),
     ("pr_loop_support", "render_evidence_stall_decision"),

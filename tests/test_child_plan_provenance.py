@@ -4851,14 +4851,27 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     assert sum(1 for r in posted if r.metadata.step_back_entries) == 1
 
 
-@pytest.mark.parametrize("with_receipt", [False, True])
-def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
-    tmp_path, monkeypatch, with_receipt
+_RECEIPT_SCENARIOS = {
+    "no-receipt": ({}, 0),
+    "one-receipt": ({2: ["receipt-2"]}, 1),
+    # 40 acquisition receipts exceed the 32-row bounded evidence cap; a later
+    # turn's receipt (a different test turn) is not part of the acquisition.
+    "beyond-cap-and-later-turn": ({2: [f"r-{n}" for n in range(40)], 4: ["late"]}, 40),
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_RECEIPT_SCENARIOS))
+def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
+    tmp_path, monkeypatch, scenario
 ):
-    """Issue #1182: the receipt sentence sits before the child-plan route suffix."""
+    """#985, #1182, #1626 via #2097 (`pr-planning-child-route`): the single
+    no-progress stop keeps the child-plan supersession route, the receipt
+    sentence and the citation diagnosis of the stops it replaced."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
     from coding_review_agent_loop.local_test_evidence import (
         EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
     )
+    from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT
 
     parent_plan = fresh_staged_plan(first_disposition="requires-child-planning")
     child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
@@ -4871,63 +4884,100 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     blocking = structured_pr_review(
         state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
     )
-    runner = FakeRunner(
+    carried = structured_pr_review(
+        state="blocking", summary="Still needs a re-plan.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+        ],
+    )
+    # The second coder turn answers with a non-array test_observations every
+    # time, so the real validator re-asks twice and then drops the citations.
+    plain = structured_coder_followup(remaining_items=["item-1"], addressed_items=[])
+    payload, end = json.JSONDecoder().raw_decode(plain)
+    non_array = json.dumps({**payload, "test_observations": "pytest passed locally"}) + plain[end:]
+    registry = EnvironmentIdentityRegistry()
+    receipts_by_invocation, expected_uncited = _RECEIPT_SCENARIOS[scenario]
+    with_receipt = scenario == "one-receipt"
+
+    class _ReceiptRunner(FakeRunner):
+        coder_turns = 0
+
+        def run_with_log(self, args, **kwargs):
+            if str(args[0]) == "claude":
+                self.coder_turns += 1
+                turn = f"coder-turn-{self.coder_turns}"
+                self._latest_test_turn_id = turn
+                for receipt_id in receipts_by_invocation.get(self.coder_turns, ()):
+                    self._local_test_observations.append(LocalTestObservation(
+                        command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
+                        outcome="failed", provenance="parent-observed",
+                        scope=EvidenceScope("unknown", ()),
+                        receipt_id=receipt_id, turn_id=turn, cwd=str(tmp_path),
+                        normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
+                        attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
+                        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+                    ))
+            return super().run_with_log(args, **kwargs)
+
+    runner = _ReceiptRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
-        codex_outputs=[
-            blocking,
-            structured_pr_review(
-                state="blocking", summary="Still needs a re-plan.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
-                ],
-            ),
-            structured_pr_review(state="approved"),
-        ],
-        claude_outputs=[
-            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
-            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
-        ],
+        codex_outputs=[blocking, carried, carried],
+        claude_outputs=[plain, non_array, non_array, non_array],
         advance_pr_head_on_coder_followup=False,
     )
-    if with_receipt:
-        registry = EnvironmentIdentityRegistry()
-        runner._environment_registry = registry
-        runner._local_test_observations.append(LocalTestObservation(
-            command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
-            outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
-            receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
-            normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
-            attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
-            environment_identity=registry.capture({"PATH": "/usr/bin"}),
-        ))
+    runner._environment_registry = registry
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
-    with pytest.raises(AgentLoopError) as raised:
+    with pytest.raises(HumanDecisionRequiredError) as raised:
         pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     message = str(raised.value)
     from coding_review_agent_loop.pr_loop import _child_resume_hint
 
     hint = _child_resume_hint(56, execution_policy.EXECUTION_DISPOSITION_PLANNING)
     route = (
-        " If the blocking finding requires re-planning the child plan, post the signed "
+        "If the blocking finding requires re-planning the child plan, post the signed "
         f"child-plan supersession record on child issue #56 and rerun `{hint}`."
     )
-    legacy = (
-        "PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round 3; "
-        "human review required."
+    assert message.startswith(
+        f"PR #77: {NO_PROGRESS_PREFIX_TEXT}3 consecutive completed round(s): rounds 1-3 "
+        "ended with the same head `6367c48dd193d56ea7b0baad25b19455e529f5ee`"
     )
+    assert "- [item-1] Re-plan first." in message
+    assert "\n" + route + "\n" in message
+    assert (
+        "The coder's test_observations were not a JSON array (same-agent re-asks "
+        f"attempted: yes); {expected_uncited} run-tests receipt(s) from that turn "
+        "went uncited"
+    ) in message
     if with_receipt:
-        sentence = (
-            " The latest local test evidence still holds unsuperseded failure receipts: "
-            "receipt `receipt-open` `python3 -m pytest tests/test_x.py -q -n 0` (failed). "
-            "A live failure is cleared only by an identical passing rerun at the current head "
-            "via `run-tests --rerun <receipt>`; other selections never supersede it. This stop may be evidence "
-            "bookkeeping rather than a missing code change; an operator can verify the command "
-            "and decide whether the receipts are still meaningful."
-        )
-        assert message == legacy + sentence + route
-    else:
-        assert message == legacy + route
+        assert (
+            "Latest coder turn evidence: The latest local test evidence still holds "
+            "unsuperseded failure receipts: receipt `receipt-2` "
+            "`python3 -m pytest tests/test_x.py -q -n 0` (failed)."
+        ) in message
+        # The receipt sentence precedes the route, as the retired stop ordered it.
+        assert message.index("unsuperseded failure receipts") < message.index(route)
+    elif scenario == "no-receipt":
+        assert "Latest coder turn evidence" not in message
+    # The count is persisted from the frozen acquisition catalog, not inferred
+    # from the bounded evidence, so it survives eviction and ignores other turns.
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from coding_review_agent_loop.github import get_pr_review_context
+
+    coder = [
+        r.metadata for r in _extract_round_metadata_records(
+            get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+        ) if r.metadata.role == "coder"
+    ]
+    assert coder[0].uncited_acquisition_receipts is None  # no drop on the first turn
+    assert coder[-1].uncited_acquisition_receipts == expected_uncited
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 3
+    # A resumed run stops at round start, before any agent turn, with the same
+    # route, receipts and citation diagnosis read back from the durable records.
+    agent_calls = len([cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["claude"])])
+    with pytest.raises(HumanDecisionRequiredError) as resumed:
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+    assert str(resumed.value) == message
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["claude"])]) == agent_calls
 
 
 # --- #1333: a tool-owned recommendation key in a patch does not route to replan ---

@@ -861,7 +861,7 @@ def test_converted_tombstone_and_requester_coverage_finalize_in_one_invocation(v
     from coding_review_agent_loop.pr_loop import run_pr_loop
     from test_pr_loop_evidence_conversion import (_plan_context, _frozen_after_auto_conversion, _signed)
     config, images, _ = visual_setup
-    config = replace(config, max_rounds=8, pr_non_convergence_rounds=0)
+    config = replace(config, max_rounds=8)
     context = _plan_context('row-a', 'row-b')
     runner, config = _frozen_after_auto_conversion(config.codex_dir.parent, monkeypatch, context, config=config)
     runner.pr_payload['comments'].append(_signed('Verified row-a at the frozen head.', 1))

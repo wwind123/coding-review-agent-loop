@@ -16755,20 +16755,17 @@ def _approach_alternative_coder_comment(comment_id, *, subject, round_number):
     }
 
 
-@pytest.mark.parametrize("step_back_rounds", [3, 0], ids=["step-back-on", "step-back-off"])
 def test_managed_resume_after_approach_alternative_uses_real_continuity_authorization(
-    tmp_path, monkeypatch, step_back_rounds,
+    tmp_path, monkeypatch,
 ):
     """`approach-alt-managed-continuity`: real publication and real activation.
 
     The step-back coder record at the new head is the round record the real
     continuity grant correlates; a resume authenticates that grant through the
-    real ``activate_managed_ci``.  With step-back on it stops before any review
-    or dispatch; with ``--pr-step-back-rounds 0`` it continues to the review of
-    that head.  Neither path publishes a competing grant or label.
+    real ``activate_managed_ci``.  The proposal no longer stops the run (#2097),
+    so the resume continues to the review of that head, publishing no competing
+    grant or label.
     """
-    from coding_review_agent_loop.errors import HumanDecisionRequiredError
-
     runner = _workflow_runner_for_issue_authorization(None, labeled=True)
     runner.codex_outputs = [
         structured_pr_review(
@@ -16822,19 +16819,16 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
-        pr_step_back_rounds=step_back_rounds,
         invocation_argv=(
             "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
             "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
             "--allow-unprotected-managed-ci",
-            "--pr-step-back-rounds", str(step_back_rounds),
         ),
     )
     captured = {}
     _stop_after_real_reviewer(monkeypatch, captured)
 
-    expected = HumanDecisionRequiredError if step_back_rounds else _ReviewReached
-    with pytest.raises(expected) as excinfo:
+    with pytest.raises(_ReviewReached):
         pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     # Real activation accepted the live head through the continuity grant.
@@ -16856,15 +16850,8 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
     reviewer_commands = [
         command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]
     ]
-    if step_back_rounds:
-        message = str(excinfo.value)
-        assert "the coder proposes replacing the approved approach" in message
-        assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in message
-        assert reviewer_commands == []
-        assert not any("Review verdict" in comment for comment in runner.comments)
-    else:
-        assert len(reviewer_commands) == 1
-        assert "e9bff449de155dd0be5fd76276214538b0dfd315" in " ".join(reviewer_commands[0])
+    assert len(reviewer_commands) == 1
+    assert "e9bff449de155dd0be5fd76276214538b0dfd315" in " ".join(reviewer_commands[0])
 
 
 @pytest.mark.parametrize('payload,reason', [

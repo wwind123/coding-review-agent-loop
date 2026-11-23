@@ -5214,35 +5214,10 @@ def test_nested_run_pr_loop_calls_pass_the_outer_usage_context():
         assert any(keyword.arg == "usage_context" for keyword in call.keywords), call.lineno
 
 
-def _sub_item_stall_args(tmp_path, *extra):
-    return build_parser().parse_args([
-        "pr",
-        "77",
-        "--repo",
-        "OWNER/REPO",
-        *extra,
-        "--claude-dir",
-        str(tmp_path / "claude"),
-        "--codex-dir",
-        str(tmp_path / "codex"),
-    ])
 
 
-def test_sub_item_stall_rounds_defaults_to_three_and_zero_disables(tmp_path):
-    from coding_review_agent_loop.config import DEFAULT_SUB_ITEM_STALL_ROUNDS
-
-    omitted = _sub_item_stall_args(tmp_path)
-    assert omitted.sub_item_stall_rounds == DEFAULT_SUB_ITEM_STALL_ROUNDS == 3
-    assert config_from_args(omitted, FakeRunner()).sub_item_stall_rounds == 3
-    disabled = _sub_item_stall_args(tmp_path, "--sub-item-stall-rounds", "0")
-    assert config_from_args(disabled, FakeRunner()).sub_item_stall_rounds == 0
-    assert config_from_args(disabled, FakeRunner()).max_rounds == omitted.max_rounds
 
 
-def test_sub_item_stall_rounds_rejects_negative_values(tmp_path):
-    args = _sub_item_stall_args(tmp_path, "--sub-item-stall-rounds", "-1")
-    with pytest.raises(AgentLoopError, match="--sub-item-stall-rounds must be zero or greater"):
-        config_from_args(args, FakeRunner())
 
 
 def _preflight_args(monkeypatch, extra, missing=("agy",)):

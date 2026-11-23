@@ -1745,14 +1745,6 @@
     {
       "module": "pr_loop",
       "function": "run_pr_loop",
-      "call": "_extract_round_metadata_records(pr_comments, flow='pr')",
-      "family": "rounds",
-      "provenance": "pr_loop.run_pr_loop: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects.",
-      "occurrence": 6
-    },
-    {
-      "module": "pr_loop",
-      "function": "run_pr_loop",
       "call": "_extract_round_metadata_records(pr_fresh_comments, flow='pr')",
       "family": "rounds",
       "provenance": "pr_loop.run_pr_loop: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects.",
@@ -1960,18 +1952,18 @@
     },
     {
       "module": "pr_loop_support",
-      "function": "_pr_step_back_decision",
+      "function": "_pr_dispatch_convergence",
       "call": "_extract_round_metadata_records(fresh_context.comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop_support._pr_step_back_decision: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
+      "provenance": "pr_loop_support._pr_dispatch_convergence: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
       "occurrence": 1
     },
     {
       "module": "pr_loop_support",
-      "function": "_pr_step_back_decision",
+      "function": "_pr_dispatch_convergence",
       "call": "_extract_round_metadata_records(snapshot_comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop_support._pr_step_back_decision: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
+      "provenance": "pr_loop_support._pr_dispatch_convergence: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
       "occurrence": 1
     },
     {
@@ -1980,6 +1972,14 @@
       "call": "_extract_round_metadata_records(comments, flow='pr')",
       "family": "rounds",
       "provenance": "pr_loop_support._pr_step_back_sweep_contexts: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
+      "occurrence": 1
+    },
+    {
+      "module": "pr_loop_support",
+      "function": "_pr_round_start_no_progress",
+      "call": "_extract_round_metadata_records(comments, flow='pr')",
+      "family": "rounds",
+      "provenance": "pr_loop_support._pr_round_start_no_progress: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
       "occurrence": 1
     },
     {

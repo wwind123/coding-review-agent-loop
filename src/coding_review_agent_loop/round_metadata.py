@@ -314,6 +314,11 @@ class PostedRoundMetadata:
     # on PR coder follow-up records and omitted from the encoding when None,
     # so historical records decode unchanged and re-encode byte-identically.
     followup_dispatch_head: str | None = None
+    # Tool-owned uncited-receipt count of a PR coder follow-up whose
+    # test_observations were dropped as a non-array (#1626, #2097), computed
+    # from the frozen original acquisition catalog before evidence bounding.
+    # Omitted when None, so historical records decode and re-encode unchanged.
+    uncited_acquisition_receipts: int | None = None
     # Orchestrator-owned coder record provenance (#2086): ``degraded`` (invalid
     # fields dropped) or ``synthesized`` (built from git); the bounded notes
     # name what was dropped, and ``human_requirements_degraded`` keeps the
@@ -2414,6 +2419,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.followup_dispatch_head is not None:
         payload["followup_dispatch_head"] = metadata.followup_dispatch_head
+    if metadata.uncited_acquisition_receipts is not None:
+        payload["uncited_acquisition_receipts"] = metadata.uncited_acquisition_receipts
     if metadata.coder_record_source is not None:
         payload["coder_record_source"] = metadata.coder_record_source
     if metadata.coder_record_degradations:
@@ -2660,6 +2667,15 @@ def _decode_conversion_fields_strict(payload: Mapping[str, object]) -> dict[str,
                     references.append(reference)
         fields["signed_evidence_references"] = tuple(references)
     return fields
+
+
+def _decode_uncited_acquisition_receipts(payload: Mapping[str, object]) -> int | None:
+    # Advisory diagnostic input only: a malformed value decodes as unknown
+    # rather than failing the record.
+    value = payload.get("uncited_acquisition_receipts")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _is_followup_dispatch_head(value: object) -> bool:
@@ -3184,6 +3200,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_board_identity=_decode_board_object(payload, "plan_board_identity"),
             plan_board_binding_init=_decode_board_object(payload, "plan_board_binding_init"),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            uncited_acquisition_receipts=_decode_uncited_acquisition_receipts(payload),
             **_decode_coder_record_provenance(payload),
             evidence_stall=_decode_evidence_stall(payload),
             **_decode_conversion_fields(payload),

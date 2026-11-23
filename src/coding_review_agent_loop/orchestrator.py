@@ -1157,8 +1157,6 @@ from .pr_loop_support import (
     _print_unprotected_managed_ci_warning,
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
-    MAX_UNCHANGED_HEAD_CODER_TURNS,
-    _UnchangedHeadTracker,
     _coder_followup_head_log,
     _coder_followup_review_context,
     _reviewer_summary_context,

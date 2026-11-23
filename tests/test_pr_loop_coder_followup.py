@@ -75,24 +75,24 @@ from pr_loop_test_helpers import (
 )
 
 
-def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
-    from coding_review_agent_loop.errors import AgentLoopError
+def _carried_review(note="Re-plan first."):
+    return structured_pr_review(
+        state="blocking", summary="Still needs a re-plan.",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": note}],
+    )
+
+
+def test_m985_unchanged_head_follow_ups_stop_at_the_no_progress_window(tmp_path):
+    """#985 via #2097: two unchanged-head follow-ups no longer stop by themselves;
+    the third identical completed round stops with exit 4 before a third turn."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT
 
     blocking = structured_pr_review(
         state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
     )
     runner = FakeRunner(
-        codex_outputs=[
-            blocking,
-            structured_pr_review(
-                state="blocking",
-                summary="Still needs a re-plan.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
-                ],
-            ),
-            structured_pr_review(state="approved"),
-        ],
+        codex_outputs=[blocking, _carried_review(), _carried_review()],
         claude_outputs=[
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
@@ -100,31 +100,12 @@ def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
         advance_pr_head_on_coder_followup=False,
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
-    assert isinstance(excinfo.value, AgentLoopError)
-    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
-    # The identical head is not reviewed a third time.
-    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
-
-
-def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
-    from coding_review_agent_loop.pr_loop_support import (
-        MAX_UNCHANGED_HEAD_CODER_TURNS,
-        _UnchangedHeadTracker,
-    )
-
-    tracker = _UnchangedHeadTracker()
-    # The coder leaves A unchanged once; another actor then pushes B.
-    assert tracker.observe("A", "A") == 1
-    # B has had only one no-progress follow-up, so the loop must not stop.
-    assert tracker.observe("B", "B") == 1 < MAX_UNCHANGED_HEAD_CODER_TURNS
-    assert tracker.observe("B", "B") == MAX_UNCHANGED_HEAD_CODER_TURNS
-    # A follow-up that moves the head clears the count.
-    assert tracker.observe("B", "C") == 0
-    assert tracker.observe("C", "C") == 1
-    # An unknown reviewed head never counts.
-    assert tracker.observe(None, None) == 0
+    assert NO_PROGRESS_PREFIX_TEXT in str(excinfo.value)
+    assert "- [item-1] Re-plan first." in str(excinfo.value)
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 3
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 2
 
 
 # --- #1034: head-aware PR coder follow-up reporting -------------------------
@@ -154,14 +135,14 @@ def _m1034_reviewer_prompts(runner):
 def test_m1034_followup_head_log_wording():
     from coding_review_agent_loop.pr_loop_support import _coder_followup_head_log
 
-    advanced = _coder_followup_head_log(3, "Claude", "a" * 40, "b" * 40, 0)
+    advanced = _coder_followup_head_log(3, "Claude", "a" * 40, "b" * 40)
     assert advanced == (
         f"Round 3: PR head advanced {'a' * 12}..{'b' * 12} during Claude follow-up; re-reviewing"
     )
-    unchanged = _coder_followup_head_log(3, "Codex", "c" * 40, "c" * 40, 1)
-    assert unchanged == f"Round 3: Codex follow-up left PR head {'c' * 12} unchanged (1/2); re-reviewing"
+    unchanged = _coder_followup_head_log(3, "Codex", "c" * 40, "c" * 40)
+    assert unchanged == f"Round 3: Codex follow-up left PR head {'c' * 12} unchanged; re-reviewing"
     for dispatch, observed in ((None, "d" * 40), ("d" * 40, None), (None, None)):
-        unknown = _coder_followup_head_log(3, "Claude", dispatch, observed, 0)
+        unknown = _coder_followup_head_log(3, "Claude", dispatch, observed)
         assert unknown == "Round 3: Claude follow-up complete; PR head change could not be determined"
     for message in (advanced, unchanged, unknown):
         assert "pushed" not in message
@@ -345,7 +326,7 @@ def test_m1034_unchanged_head_follow_up_is_logged_and_recorded_as_claims(tmp_pat
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     err = capsys.readouterr().err
-    assert "Round 1: Claude follow-up left PR head 6367c48dd193 unchanged (1/2); re-reviewing" in err
+    assert "Round 1: Claude follow-up left PR head 6367c48dd193 unchanged; re-reviewing" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
     assert "> Orchestrator note: the PR head was unchanged at `6367c48dd193d56ea7b0baad25b19455e529f5ee`" in coder_comment
@@ -405,22 +386,14 @@ def test_m1034_advanced_head_follow_up_keeps_legacy_framing(tmp_path, capsys):
     assert _M1034_VERIFY_INSTRUCTION not in second_review
 
 
-def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsys):
+def test_m1034_unchanged_head_window_stops_without_push_log(tmp_path, capsys):
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
     blocking = structured_pr_review(
         state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
     )
     runner = FakeRunner(
-        codex_outputs=[
-            blocking,
-            structured_pr_review(
-                state="blocking",
-                summary="Still needs a re-plan.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
-                ],
-            ),
-            structured_pr_review(state="approved"),
-        ],
+        codex_outputs=[blocking, _carried_review(), _carried_review()],
         claude_outputs=[
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
@@ -428,14 +401,13 @@ def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsy
         advance_pr_head_on_coder_followup=False,
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6, quiet=False)
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
-    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
-    assert len(_m1034_reviewer_prompts(runner)) == 2
+    assert "no progress across 3 consecutive completed round(s)" in str(excinfo.value)
+    assert len(_m1034_reviewer_prompts(runner)) == 3
     err = capsys.readouterr().err
     assert "pushed updates for re-review" not in err
-    assert "left PR head 6367c48dd193 unchanged (1/2)" in err
-    assert "unchanged (2/2)" not in err
+    assert "left PR head 6367c48dd193 unchanged; re-reviewing" in err
     coder_comments = _m1034_coder_comments(runner)
     assert len(coder_comments) == 2
     for comment in coder_comments:
@@ -507,7 +479,7 @@ def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
         runner.commands, ["codex", "exec"]
     )
     err = capsys.readouterr().err
-    assert "Claude follow-up left PR head 1c8c4b99308a unchanged (1/2)" in err
+    assert "Claude follow-up left PR head 1c8c4b99308a unchanged; re-reviewing" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
     assert "> Orchestrator note: the PR head was unchanged at `1c8c4b99308a327bd47c96b4e086e7804c18649b`" in coder_comment
@@ -2145,7 +2117,12 @@ def _unchanged_head_runner(*, with_failure_receipt, tmp_path):
                     {"item_id": "item-1", "disposition": "blocking", "note": "Fix it."}
                 ],
             ),
-            structured_pr_review(state="approved"),
+            structured_pr_review(
+                state="blocking", summary="Still needs work.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Fix it."}
+                ],
+            ),
         ],
         claude_outputs=[
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
@@ -2168,28 +2145,25 @@ def _unchanged_head_runner(*, with_failure_receipt, tmp_path):
 
 
 def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
+    """#1182 via #2097: the no-progress stop keeps the receipt sentence."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
     runner = _unchanged_head_runner(with_failure_receipt=True, tmp_path=tmp_path)
-    with pytest.raises(AgentLoopError) as with_receipts:
+    with pytest.raises(HumanDecisionRequiredError) as with_receipts:
         run_pr_loop(runner, pr_number=77, config=config)
     message = str(with_receipts.value)
-    assert "unchanged in 2 consecutive follow-up rounds" in message
-    assert "human review required." in message
+    assert "no progress across 3 consecutive completed round(s)" in message
+    assert "Latest coder turn evidence: The latest local test evidence still holds" in message
     assert "unsuperseded failure receipts" in message and "-n 0" in message
     assert "evidence bookkeeping" in message
 
-    runner = _unchanged_head_runner(with_failure_receipt=False, tmp_path=tmp_path)
-    with pytest.raises(AgentLoopError) as without:
-        run_pr_loop(runner, pr_number=77, config=config)
-    import re as _re
-
-    found = _re.fullmatch(
-        r"PR #77: Claude left head (\S+) unchanged in 2 consecutive follow-up rounds, so another "
-        r"review of the same diff cannot change the verdict\. Stopping before round (\d+); "
-        r"human review required\.",
-        str(without.value),
-    )
-    assert found is not None, str(without.value)
+    runner = _unchanged_head_runner(with_failure_receipt=False, tmp_path=tmp_path / "plain")
+    with pytest.raises(HumanDecisionRequiredError) as without:
+        run_pr_loop(runner, pr_number=77, config=make_config(
+            tmp_path / "plain", coder="claude", reviewer="codex", max_rounds=6))
+    assert "no progress across 3 consecutive completed round(s)" in str(without.value)
+    assert "Latest coder turn evidence" not in str(without.value)
 
 
 # --- #1626: dropped test_observations, repair-first, and evidence progress ---
@@ -2333,57 +2307,33 @@ def _reviews_run_1626(runner):
     return len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]])
 
 
-def test_uncited_supersession_or_no_supersession_still_stops_1626(tmp_path, monkeypatch):
-    """Matrix rows `unchanged-head-no-progress` and `stop-message-unchanged`."""
+def test_uncited_supersession_or_no_supersession_stops_at_the_window_1626(tmp_path, monkeypatch):
+    """#1626 via #2097: no per-head grant; the unchanged item stops at K rounds."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
     # (a) Supersession by this turn's pass, but no surviving citation cites it.
     outcome, runner, _launches = _run_evidence_loop_1626(
         tmp_path / "uncited", monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([])],
         turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
-        reviews=_evidence_reviews_1626(1, final=None),
+        reviews=_evidence_reviews_1626(2, final=None),
     )
-    assert isinstance(outcome, AgentLoopError), outcome
-    assert re.fullmatch(
-        r"PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
-        r"review of the same diff cannot change the verdict\. Stopping before round \d+; "
-        r"human review required\.",
-        str(outcome),
-    ), str(outcome)
+    assert isinstance(outcome, HumanDecisionRequiredError), outcome
+    assert "no progress across 3 consecutive completed round(s)" in str(outcome)
     live = runner.last_reconciled_local_test_evidence
     assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by == "pass-2"
-    # (b) Nothing superseded by a coder-turn receipt; a cited model claim
-    # naming a receipt that superseded nothing earns nothing either.
+    # (b) Nothing superseded by a coder-turn receipt.
     outcome, runner, _launches = _run_evidence_loop_1626(
         tmp_path / "none", monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("fail-1")])],
         turn_receipts=[(), ()],
-        reviews=_evidence_reviews_1626(1, final=None),
+        reviews=_evidence_reviews_1626(2, final=None),
     )
-    assert isinstance(outcome, AgentLoopError), outcome
+    assert isinstance(outcome, HumanDecisionRequiredError), outcome
     message = str(outcome)
-    assert "unchanged in 2 consecutive follow-up rounds" in message
     assert "unsuperseded failure receipts" in message
     assert "not a JSON array" not in message
-    assert _reviews_run_1626(runner) == 2
-
-
-def test_unchanged_head_tracker_grants_once_per_head_1626():
-    """Matrix row `unchanged-head-second-grant` (tracker unit)."""
-    tracker = pr_loop_support._UnchangedHeadTracker()
-    assert tracker.grant_evidence_progress() is False  # no tracked head yet
-    tracker.observe("H", "H")
-    tracker.observe("H", "H")
-    assert tracker.grant_evidence_progress() is True
-    tracker.observe("H", "H")
-    assert tracker.count == 3
-    assert tracker.grant_evidence_progress() is False
-    # A different head resets the grant.
-    tracker.observe("J", "J")
-    assert tracker.grant_evidence_progress() is True
-    # A follow-up that moves the head clears the count and the grant.
-    tracker.observe("J", "K")
-    tracker.observe("K", "K")
-    assert tracker.evidence_progress_granted is False
+    assert _reviews_run_1626(runner) == 3
 
 
 def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypatch):
@@ -2416,34 +2366,7 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
     assert _reviews_run_1626(runner) == 2
 
 
-def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
-    """Matrix row `stop-message-unchanged` (message unit)."""
-    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
-    from coding_review_agent_loop.pr_loop_support import FollowupCitationDiagnosis
-
-    base = dict(
-        pr=77, coder_name="Claude", previous_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", turns=2, round_number=3,
-        evidence=None, route=" ROUTE",
-    )
-    expected = (
-        "PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round 4; "
-        "human review required. ROUTE"
-    )
-    assert unchanged_head_stop_message(**base) == expected
-    assert unchanged_head_stop_message(
-        **base, citation_diagnosis=FollowupCitationDiagnosis(False, False, 4)
-    ) == expected
-    with_drop = unchanged_head_stop_message(
-        **base, citation_diagnosis=FollowupCitationDiagnosis(True, False, 2)
-    )
-    assert "(same-agent re-asks attempted: no); 2 run-tests receipt(s)" in with_drop
-    assert with_drop.endswith(" ROUTE")
-
-
 # --------------------------------------------- run-tests tool identity (#1632)
-
-
 def _tool_flagged_evidence_1632(*, status_client_commit="42340e7"):
     from coding_review_agent_loop.local_test_evidence import (
         TOOL_COMMIT_ENV,
@@ -2514,23 +2437,6 @@ def test_followup_receipts_section_shows_the_tool_mismatch_1632():
     assert expected in uncited and "uncited authoritative" in uncited
     # GitHub-bound text never carries raw local package paths.
     assert "/tmp/stale-clone" not in cited + uncited and "/opt/release" not in cited + uncited
-
-
-def test_unchanged_head_stop_names_the_tool_mismatch_1632():
-    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
-
-    encoded = _tool_flagged_evidence_1632()
-    message = unchanged_head_stop_message(
-        pr=77, coder_name="Claude", previous_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", turns=2, round_number=3,
-        evidence=encoded, route=" ROUTE",
-    )
-    assert "unsuperseded failure receipts" in message
-    assert (
-        "Run-tests tool identity: run-tests-tool-mismatch: receipt produced by agent-loop "
-        "42340e7, orchestrator is bc60cc2"
-    ) in message
-    assert message.endswith(" ROUTE")
-    assert "/tmp/stale-clone" not in message
 
 
 def test_evidence_stall_decision_names_the_tool_mismatch_1632():
@@ -2604,7 +2510,7 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
         tmp_path, monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("pass-2")])],
         turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin" if compatible else "/changed"})]],
-        reviews=_evidence_reviews_1626(1, final="approved" if compatible else None),
+        reviews=_evidence_reviews_1626(1 if compatible else 2, final="approved" if compatible else None),
     )
     live = runner.last_reconciled_local_test_evidence
     failure = next(row for row in live.observations if row.receipt_id == "fail-1")
@@ -2618,7 +2524,8 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
         assert live.authoritative_failures == ()
     else:
         assert isinstance(outcome, AgentLoopError), outcome
-        assert _reviews_run_1626(runner) == 2
+        assert "no progress across" in str(outcome)
+        assert _reviews_run_1626(runner) == 3
         assert failure.superseded_by is None
         assert "fail-1" in live.authoritative_failures
 
@@ -2752,8 +2659,9 @@ def test_saturated_canonical_receipt_only_handoff_1758(tmp_path, monkeypatch, mo
         head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True))
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop),
                   "_read_assigned_workdir_head", lambda *_a, **_k: head)
-    if mode in {"repeat", "non-evidence", "mismatched-citation", "conflicting-citation"}:
-        with pytest.raises(AgentLoopError, match="unchanged in .* consecutive"):
+    if mode == "repeat":
+        # #2097: the same item at the same head for K rounds stops with exit 4.
+        with pytest.raises(AgentLoopError, match="no progress across 3 consecutive"):
             run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan)
     else:
         assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan) == 0
@@ -2770,7 +2678,9 @@ def test_saturated_canonical_receipt_only_handoff_1758(tmp_path, monkeypatch, mo
                for row in persisted.observations)
     bodies = [item["body"] for item in runner.pr_payload["comments"] if isinstance(item, dict)]
     if mode in {"mismatched-citation", "conflicting-citation"}:
-        assert _reviews_run_1626(runner) == 2
+        # #2097: no evidence-progress grant decides the extra review any more;
+        # the unchanged head is re-reviewed (and approved) like any other.
+        assert _reviews_run_1626(runner) == 3
         assert any("unverified:" in body for body in bodies)
         return
     assert any("verified against the parent journal" in body for body in bodies)
@@ -2850,11 +2760,11 @@ def test_post_coder_branch_observation_precedes_publication(tmp_path, monkeypatc
         return original_run(args, **kwargs)
     runner.run = run
     observations = []
-    original_observe = pr_loop._UnchangedHeadTracker.observe
-    def track(self, *args, **kwargs):
-        observations.append(kwargs)
-        return original_observe(self, *args, **kwargs)
-    monkeypatch.setattr(pr_loop._UnchangedHeadTracker, 'observe', track)
+    original_head_log = pr_loop._coder_followup_head_log
+    def track(*args, **kwargs):
+        observations.append(args)
+        return original_head_log(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, '_coder_followup_head_log', track)
     config = make_config(tmp_path)
     if status == 'ahead':
         with pytest.raises(PrHeadObservationError, match='desync'):
@@ -3375,37 +3285,6 @@ def test_disputed_response_forced_into_synthesis_carries_no_dispute_in_loop_or_r
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     for metadata in _records_1292(runner):
         assert not any(_is_disputed_item(item) for item in metadata.prior_items)
-
-
-@pytest.mark.parametrize("synthesized", [False, True], ids=["posted-structured", "forced-synthesis"])
-def test_discarded_citation_never_grants_the_unchanged_head_allowance_2086(
-    tmp_path, monkeypatch, capsys, synthesized
-):
-    """#2086 item-4: cited progress counts only when the posted record keeps the citation."""
-    import coding_review_agent_loop.coder_comment_budget as budget
-
-    if synthesized:
-        real_fits = budget.round_comment_fits
-        monkeypatch.setattr(
-            budget, "round_comment_fits",
-            lambda body: "## Orchestrator-synthesized coder record" in str(body) and real_fits(body),
-        )
-    cited = _followup_1626([_citation_1626("pass-2")], summary="Re-ran the evidence command.")
-    outcome, runner, _launches = _run_evidence_loop_1626(
-        tmp_path, monkeypatch,
-        coder_outputs=[_followup_1626(), cited],
-        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
-        reviews=_evidence_reviews_1626(1),
-    )
-    err = capsys.readouterr().err
-    if not synthesized:  # control: the same citation grants the allowance when it is posted
-        assert outcome == 0, outcome
-        assert "granting one review round" in err
-        assert _reviews_run_1626(runner) == 3
-        return
-    assert isinstance(outcome, AgentLoopError)
-    assert "granting one review round" not in err
-    assert _reviews_run_1626(runner) == 2  # no extra review round on the unchanged head
 
 
 def test_discarded_fix_summary_never_reaches_the_next_coder_prompt_2086(tmp_path, monkeypatch):
