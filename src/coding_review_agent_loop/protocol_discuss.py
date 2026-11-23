@@ -50,7 +50,9 @@ from .protocol_common import (
     _expect_non_empty_string,
     _expect_object,
     _expect_optional_string_list,
+    _expect_strict_string,
     _expect_string_list,
+    fold_enum_value,
     _extract_json_object_prefix,
     _require_supported_schema_version,
     normalize_response_file_structured_text,
@@ -117,7 +119,10 @@ def _parse_discuss_research(
         required={"status"},
         optional={"sourced_facts", "target", "questions"},
     )
-    status = _expect_non_empty_string(payload["status"], context="discuss_review.research.status")  # shape-check: fatal:no-conservative-reading
+    status = fold_enum_value(
+        _expect_non_empty_string(payload["status"], context="discuss_review.research.status"),  # shape-check: fatal:no-conservative-reading
+        DISCUSS_RESEARCH_STATUS_VALUES, context="discuss_review.research.status",
+    )
     if status not in DISCUSS_RESEARCH_STATUS_VALUES:
         rendered = ", ".join(sorted(DISCUSS_RESEARCH_STATUS_VALUES))
         raise AgentLoopError(f"discuss_review.research.status must be one of: {rendered}")  # shape-check: fatal:no-conservative-reading
@@ -154,7 +159,10 @@ def _parse_discuss_research(
     target: str | None = None
     questions: tuple[str, ...] = ()
     if has_target:
-        target = _expect_non_empty_string(payload["target"], context="discuss_review.research.target")  # shape-check: fatal:no-conservative-reading
+        target = fold_enum_value(
+            _expect_non_empty_string(payload["target"], context="discuss_review.research.target"),  # shape-check: fatal:no-conservative-reading
+            DISCUSS_RESEARCH_TARGET_VALUES, context="discuss_review.research.target",
+        )
         if target not in DISCUSS_RESEARCH_TARGET_VALUES:
             rendered = ", ".join(sorted(DISCUSS_RESEARCH_TARGET_VALUES))
             raise AgentLoopError(f"discuss_review.research.target must be one of: {rendered}")  # shape-check: fatal:no-conservative-reading
@@ -226,7 +234,7 @@ def _parse_discuss_evidence(
             raise AgentLoopError("evidence replacement_claim_index must reference a claim in the same response.")  # shape-check: fatal:no-conservative-reading
         updates.append(DiscussEvidenceUpdate(
             action=action,
-            target_observation_id=_expect_non_empty_string(update["target_observation_id"], context=f"{context}.target_observation_id"),  # shape-check: fatal:no-conservative-reading
+            target_observation_id=_expect_strict_string(update["target_observation_id"], context=f"{context}.target_observation_id"),  # shape-check: fatal:no-conservative-reading
             reason=_expect_non_empty_string(update["reason"], context=f"{context}.reason"),  # shape-check: fatal:no-conservative-reading
             replacement_claim_index=replacement,
         ))
@@ -250,7 +258,10 @@ def parse_structured_discuss_review(
         required={"schema_version", "kind", "outcome", "rationale"},
         optional={"split_proposals", "rebuttal", "analyzer_framing", "framing_note", "research", "evidence"},
     )
-    outcome = _expect_non_empty_string(payload["outcome"], context="discuss_review.outcome")  # shape-check: fatal:no-conservative-reading
+    outcome = fold_enum_value(
+        _expect_non_empty_string(payload["outcome"], context="discuss_review.outcome"),  # shape-check: fatal:no-conservative-reading
+        DISCUSS_OUTCOME_VALUES, context="discuss_review.outcome",
+    )
     if outcome not in DISCUSS_OUTCOME_VALUES:
         rendered = ", ".join(sorted(DISCUSS_OUTCOME_VALUES))
         raise AgentLoopError(f"discuss_review.outcome must be one of: {rendered}")  # shape-check: fatal:no-conservative-reading
@@ -272,8 +283,11 @@ def parse_structured_discuss_review(
         raise AgentLoopError("discuss_review.rebuttal is required for debate rounds.")  # shape-check: fatal:no-conservative-reading
     analyzer_framing = None
     if "analyzer_framing" in payload:
-        analyzer_framing = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
-            payload["analyzer_framing"], context="discuss_review.analyzer_framing"
+        analyzer_framing = fold_enum_value(
+            _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
+                payload["analyzer_framing"], context="discuss_review.analyzer_framing"
+            ),
+            DISCUSS_ANALYZER_FRAMING_VALUES, context="discuss_review.analyzer_framing",
         )
         if analyzer_framing not in DISCUSS_ANALYZER_FRAMING_VALUES:
             rendered = ", ".join(sorted(DISCUSS_ANALYZER_FRAMING_VALUES))
@@ -372,7 +386,10 @@ def _parse_discuss_unresolved_items(value: object, *, context: str) -> tuple[Dis
         if not isinstance(item, dict):
             raise AgentLoopError(f"{item_context} must be an object.")  # shape-check: fatal:no-conservative-reading
         _expect_exact_keys(item, context=item_context, required={"status", "text"})  # shape-check: fatal:no-conservative-reading
-        status = _expect_non_empty_string(item["status"], context=f"{item_context}.status")  # shape-check: fatal:no-conservative-reading
+        status = fold_enum_value(
+            _expect_non_empty_string(item["status"], context=f"{item_context}.status"),  # shape-check: fatal:no-conservative-reading
+            DISCUSS_UNRESOLVED_ITEM_STATUS_VALUES, context=f"{item_context}.status",
+        )
         if status not in DISCUSS_UNRESOLVED_ITEM_STATUS_VALUES:
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 f"{item_context}.status must be one of: blocker, human-decision, follow-up."
@@ -402,11 +419,17 @@ def _parse_structured_discuss_answer(
         required={"schema_version", "kind", "position", "rationale", "confidence", item_key},
         optional={"answer", "rebuttal", "analyzer_framing", "framing_note", "research", "evidence"},
     )
-    position = _expect_non_empty_string(payload["position"], context="discuss_answer.position")  # shape-check: fatal:no-conservative-reading
+    position = fold_enum_value(
+        _expect_non_empty_string(payload["position"], context="discuss_answer.position"),  # shape-check: fatal:no-conservative-reading
+        DISCUSS_ANSWER_POSITION_VALUES, context="discuss_answer.position",
+    )
     if position not in DISCUSS_ANSWER_POSITION_VALUES:
         raise AgentLoopError("discuss_answer.position must be `answer` or `needs-human`.")  # shape-check: fatal:no-conservative-reading
     rationale = _expect_non_empty_string(payload["rationale"], context="discuss_answer.rationale")  # shape-check: fatal:no-conservative-reading
-    confidence = _expect_non_empty_string(payload["confidence"], context="discuss_answer.confidence")  # shape-check: fatal:no-conservative-reading
+    confidence = fold_enum_value(
+        _expect_non_empty_string(payload["confidence"], context="discuss_answer.confidence"),  # shape-check: fatal:no-conservative-reading
+        DISCUSS_ANSWER_CONFIDENCE_VALUES, context="discuss_answer.confidence",
+    )
     if confidence not in DISCUSS_ANSWER_CONFIDENCE_VALUES:
         raise AgentLoopError("discuss_answer.confidence must be one of: low, medium, high.")  # shape-check: fatal:no-conservative-reading
     if allow_legacy_open_questions:
@@ -442,7 +465,10 @@ def _parse_structured_discuss_answer(
         raise AgentLoopError("discuss_answer.rebuttal is required for debate rounds.")  # shape-check: fatal:no-conservative-reading
     analyzer_framing = payload.get("analyzer_framing")
     if analyzer_framing is not None:
-        analyzer_framing = _expect_non_empty_string(analyzer_framing, context="discuss_answer.analyzer_framing")  # shape-check: fatal:no-conservative-reading
+        analyzer_framing = fold_enum_value(
+            _expect_non_empty_string(analyzer_framing, context="discuss_answer.analyzer_framing"),  # shape-check: fatal:no-conservative-reading
+            DISCUSS_ANALYZER_FRAMING_VALUES, context="discuss_answer.analyzer_framing",
+        )
         if analyzer_framing not in DISCUSS_ANALYZER_FRAMING_VALUES:
             raise AgentLoopError("discuss_answer.analyzer_framing must be `accurate` or `misframed`.")  # shape-check: fatal:no-conservative-reading
     framing_note = payload.get("framing_note")
@@ -519,7 +545,10 @@ def validate_structured_discuss_semantic_comparison(
         required={"schema_version", "kind", "classification", "shared_recommendation", "remaining_decisions", "evidence"})
     if payload.get("kind") != "discuss_semantic_comparison":
         raise AgentLoopError("Structured response kind mismatch: expected `discuss_semantic_comparison`.")  # shape-check: fatal:unparseable-envelope
-    classification = _expect_non_empty_string(payload["classification"], context="discuss_semantic_comparison.classification")  # shape-check: fatal:no-conservative-reading
+    classification = fold_enum_value(
+        _expect_non_empty_string(payload["classification"], context="discuss_semantic_comparison.classification"),  # shape-check: fatal:no-conservative-reading
+        DISCUSS_SEMANTIC_CLASSIFICATIONS, context="discuss_semantic_comparison.classification",
+    )
     if classification not in DISCUSS_SEMANTIC_CLASSIFICATIONS:
         raise AgentLoopError("Unsupported semantic comparison classification.")  # shape-check: fatal:no-conservative-reading
     shared = _expect_non_empty_string(payload["shared_recommendation"], context="discuss_semantic_comparison.shared_recommendation")  # shape-check: fatal:no-conservative-reading
@@ -538,7 +567,7 @@ def validate_structured_discuss_semantic_comparison(
         item_payload = _expect_object(item, context=f"discuss_semantic_comparison.evidence[{index}]")  # shape-check: fatal:no-conservative-reading
         _expect_exact_keys(item_payload, context=f"discuss_semantic_comparison.evidence[{index}]", required={"reviewer", "supports"})  # shape-check: fatal:no-conservative-reading
         evidence.append(DiscussSemanticEvidence(
-            reviewer=_expect_non_empty_string(item_payload["reviewer"], context="semantic evidence reviewer"),  # shape-check: fatal:no-conservative-reading
+            reviewer=_expect_strict_string(item_payload["reviewer"], context="semantic evidence reviewer"),  # shape-check: fatal:no-conservative-reading
             supports=_expect_non_empty_string(item_payload["supports"], context="semantic evidence supports"),  # shape-check: fatal:no-conservative-reading
         ))
     expected = set(reviewers)
@@ -556,10 +585,13 @@ def validate_structured_discuss_answer_confirmation(text: str, *, reviewer: str)
         required={"schema_version", "kind", "decision", "rationale", "reviewer"}, optional={"answer"})
     if payload.get("kind") != "discuss_answer_confirmation":
         raise AgentLoopError("Structured response kind mismatch: expected `discuss_answer_confirmation`.")  # shape-check: fatal:unparseable-envelope
-    response_reviewer = _expect_non_empty_string(payload["reviewer"], context="discuss_answer_confirmation.reviewer")  # shape-check: fatal:no-conservative-reading
+    response_reviewer = _expect_strict_string(payload["reviewer"], context="discuss_answer_confirmation.reviewer")  # shape-check: fatal:no-conservative-reading
     if response_reviewer != reviewer:
         raise AgentLoopError("Answer confirmation reviewer does not match the debater.")  # shape-check: fatal:no-conservative-reading
-    decision = _expect_non_empty_string(payload["decision"], context="discuss_answer_confirmation.decision")  # shape-check: fatal:no-conservative-reading
+    decision = fold_enum_value(
+        _expect_non_empty_string(payload["decision"], context="discuss_answer_confirmation.decision"),  # shape-check: fatal:no-conservative-reading
+        {"confirm", "refine"}, context="discuss_answer_confirmation.decision",
+    )
     if decision not in {"confirm", "refine"}:
         raise AgentLoopError("Answer confirmation decision must be `confirm` or `refine`.")  # shape-check: fatal:no-conservative-reading
     answer = payload.get("answer")
@@ -584,7 +616,7 @@ def _parse_discuss_agenda_disagreement(
         raise AgentLoopError(f"{context}.positions must not be empty.")  # shape-check: fatal:no-conservative-reading
     positions = tuple(
         (
-            _expect_non_empty_string(name, context=f"{context}.positions key"),  # shape-check: fatal:no-conservative-reading
+            _expect_strict_string(name, context=f"{context}.positions key"),  # shape-check: fatal:no-conservative-reading
             _expect_non_empty_string(position, context=f"{context}.positions[{name!r}]"),  # shape-check: fatal:no-conservative-reading
         )
         for name, position in positions_payload.items()
@@ -598,8 +630,14 @@ def _parse_discuss_agenda_disagreement(
         ),
     )
 
-def _bounded_discuss_synthesis_text(value: object, *, context: str) -> str:
-    text = _expect_non_empty_string(value, context=context)  # shape-check: fatal:no-conservative-reading
+def _bounded_discuss_synthesis_text(value: object, *, context: str, strict: bool = False) -> str:
+    # ``strict`` keeps reviewer identifiers and ``kind`` exact (#2109): no
+    # singleton-list unwrap, so a wrapped identifier still rejects.
+    text = (
+        _expect_strict_string(value, context=context)  # shape-check: fatal:no-conservative-reading
+        if strict
+        else _expect_non_empty_string(value, context=context)  # shape-check: fatal:no-conservative-reading
+    )
     if len(text.encode("utf-8")) > DISCUSS_SYNTHESIS_MAX_TEXT_BYTES:
         raise AgentLoopError(  # shape-check: fatal:payload-bound
             f"{context} exceeds {DISCUSS_SYNTHESIS_MAX_TEXT_BYTES} UTF-8 bytes."
@@ -612,8 +650,9 @@ def _bounded_discuss_synthesis_list(
     context: str,
     item_context: str,
     maximum: int = DISCUSS_SYNTHESIS_MAX_ENTRIES,
+    strict_shape: bool = False,
 ) -> tuple[str, ...]:
-    values = _expect_string_list(value, context=context, item_context=item_context)  # shape-check: fatal:no-conservative-reading
+    values = _expect_string_list(value, context=context, item_context=item_context, strict_shape=strict_shape)  # shape-check: fatal:no-conservative-reading
     if len(values) > maximum:
         raise AgentLoopError(f"{context} may contain at most {maximum} item(s).")  # shape-check: fatal:payload-bound
     bounded = tuple(
@@ -630,7 +669,7 @@ def _parse_discuss_synthesis_reference(
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
     _expect_exact_keys(payload, context=context, required={"reviewer", "round"})  # shape-check: fatal:no-conservative-reading
     reviewer = _bounded_discuss_synthesis_text(  # shape-check: fatal:no-conservative-reading
-        payload["reviewer"], context=f"{context}.reviewer"
+        payload["reviewer"], context=f"{context}.reviewer", strict=True
     )
     round_number = _expect_int(payload["round"], context=f"{context}.round")  # shape-check: fatal:no-conservative-reading
     if round_number < 1:
@@ -679,6 +718,7 @@ def _parse_discuss_synthesis_position(
         context=f"{context}.reviewers",
         item_context=f"{context}.reviewers",
         maximum=DISCUSS_SYNTHESIS_MAX_ENTRIES,
+        strict_shape=True,
     )
     return DiscussSynthesisPosition(
         reviewers=reviewers,
@@ -725,7 +765,7 @@ def _parse_discuss_synthesis_change(
     _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
         payload, context=context, required={"kind", "topic", "text", "references"}
     )
-    kind = _bounded_discuss_synthesis_text(payload["kind"], context=f"{context}.kind")  # shape-check: fatal:no-conservative-reading
+    kind = _bounded_discuss_synthesis_text(payload["kind"], context=f"{context}.kind", strict=True)  # shape-check: fatal:no-conservative-reading
     if kind not in DISCUSS_SYNTHESIS_CHANGE_KINDS:
         raise AgentLoopError(  # shape-check: fatal:kind-or-version-mismatch
             f"{context}.kind must be one of: "
@@ -787,7 +827,8 @@ def _parse_round_synthesis_payload(
         maximum=DISCUSS_SYNTHESIS_MAX_NEXT_ROUND_FOCUS,
     )
     responding_reviewers = _bounded_discuss_synthesis_list(  # shape-check: fatal:no-conservative-reading
-        payload["responding_reviewers"], context=f"{context}.responding_reviewers", item_context=f"{context}.responding_reviewers"
+        payload["responding_reviewers"], context=f"{context}.responding_reviewers", item_context=f"{context}.responding_reviewers",
+        strict_shape=True,
     )
     return ParsedDiscussRoundSynthesis(
         consensus=consensus, disagreements=disagreements, changes=changes,
@@ -820,8 +861,11 @@ def _parse_final_synthesis_payload(
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             "Structured response kind mismatch: expected `discuss_final_synthesis`."
         )
-    classification = _bounded_discuss_synthesis_text(  # shape-check: fatal:no-conservative-reading
-        payload["classification"], context=f"{context}.classification"
+    classification = fold_enum_value(
+        _bounded_discuss_synthesis_text(  # shape-check: fatal:no-conservative-reading
+            payload["classification"], context=f"{context}.classification"
+        ),
+        DISCUSS_SYNTHESIS_CLASSIFICATIONS, context=f"{context}.classification",
     )
     if classification not in DISCUSS_SYNTHESIS_CLASSIFICATIONS:
         raise AgentLoopError(f"{context}.classification is not supported.")  # shape-check: fatal:no-conservative-reading
@@ -1036,6 +1080,13 @@ def parse_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda | None:
         "research_question_targets",
         context="discuss_agenda.research_question_targets",
         item_context="discuss_agenda.research_question_targets",
+    )
+    research_question_targets = tuple(
+        fold_enum_value(
+            target, DISCUSS_RESEARCH_TARGET_VALUES,
+            context=f"discuss_agenda.research_question_targets at index {index}",
+        )
+        for index, target in enumerate(research_question_targets)
     )
     for target in research_question_targets:
         if target not in DISCUSS_RESEARCH_TARGET_VALUES:

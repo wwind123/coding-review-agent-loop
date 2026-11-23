@@ -78,7 +78,9 @@ an issue reference; `docs/local_agent_loop.md` gives the entry shape.
 
 Semantic-claim validation degrades the narrowest offending element instead of
 rejecting the whole response. The architecture-impact parser has three explicit
-modes. `strict` is the default and accepts only `changed` and `unchanged`.
+modes. `strict` is the default and accepts only `changed` and `unchanged`
+(after the shared case/separator fold described under lossless shape
+normalization, so `Unchanged` reads as `unchanged` in every mode).
 `legacy` is the synonym normalization, selected explicitly only where
 stored or historical text is decoded: plan re-authentication, both topology
 checkpoint decodes, and re-parses of posted or resumed records. `degradable`
@@ -114,6 +116,60 @@ satisfy the contract. The validators return it without raising, and
 applies to a primary response, a response-file artifact from a timeout or
 nonzero exit, and a completion-recovery response. The refused response is
 kept on the final error.
+
+### Lossless shape normalization (#2109)
+
+Mechanical slips whose meaning is unambiguous are normalized inside the
+parsers, on the parsed value only, each with a warning log line; the stored
+response text and semantic-patch bytes are never rewritten, so a re-parse of
+the same text yields the same dataclass. The classes, all in
+`protocol_common.py` or at the named parser site, are:
+
+- `_expect_non_empty_string` unwraps a one-element list of a string;
+  multi-element, empty and nested lists, objects, numbers and null still
+  reject.
+- `_expect_string_list` turns a lone non-empty string into a one-item list
+  and `null` into `[]` when no minimum length applies; list items are checked
+  strictly, so `["a", ["b"]]` still rejects.
+- `fold_closed_enum` is the one closed-enum fold (strip, lowercase, `[\s_]+`
+  to `-`, matched only against the allowed tokens, no synonym tables). It is
+  applied to every closed enum, including the payload `state` before the
+  footer comparison and the ordinary discussion enums (research status and
+  target, outcome, analyzer framing, answer position and confidence,
+  unresolved-item status, confirmation decision, semantic and final-synthesis
+  classifications, agenda research targets); `normalize_staging_feasibility`
+  is rebuilt on it and keeps its audited safe-alias set. Discussion evidence
+  claim status, verification basis and update action stay exact. The architecture status near-miss classifier
+  treats a fold of a declared status as no near miss, so `Unchanged` reaches
+  normal parsing and an optional review assessment is no longer removed;
+  real synonyms (`modified`, `no-change`, `none`, ...) keep the degrade and
+  patch-reject handling above.
+- `architecture_impact` list fields accept `null` or a lone string, an empty
+  `canonical_document_path` is `null`, and a `null` action is `no-change`.
+  The documented `no-change` action token is folded (`NO_CHANGE`); other
+  actions are open text and kept as written.
+- A `none` allocation (or a `null` one) gets its empty lists; a `required`
+  allocation is never defaulted. A `null` `one_shot_delivery` on a staged
+  recommendation is dropped.
+- `_expect_int_like` accepts `^\s*#?\d+\s*$` strings for stage `position`
+  and `issue_implementation`/`task_result` `pr_number`; `_expect_int` stays
+  strict elsewhere.
+- Review finding lists accept `null` or a lone string, and a PR finding
+  object without `text` takes exactly one of `description`/`issue` as its
+  text and wraps a lone-string `fix_scope`. This runs once on the parsed
+  payload copy, before every reader of those lists; collision checks are
+  unchanged.
+
+The strict boundary is `_expect_strict_string` and the `strict_shape`
+list option: item, stage, scope, constraint and risk-row IDs, signed
+requirement labels, risk-matrix text and evidence citations, semantic-patch
+`op`/`field`/`base_state_identity`, the `agent_unavailable` envelope, the
+payload `state` (an envelope field compared with the footer, so a list never
+bypasses that comparison), discussion reviewer and observation IDs, synthesis
+reviewer references and reviewer lists, and synthesis change `kind` stay
+exact. The only identifier-list
+outer-shape exception is the opt-in `normalize_outer_shape` for
+`depends_on_stage_ids`; each element is still a strict ID.
 
 ### The same-agent re-ask rule (#2066)
 

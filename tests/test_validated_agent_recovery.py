@@ -120,7 +120,8 @@ def test_gemini_response_file_repair_ignores_raw_stdout_transient_diagnostics(tm
                 # finding that repair would have to drop to keep the approval.
                 "summary": "Response file review passed after repair.",
                 "blocking_items": [],
-                "same_pr_followups": "not-a-list",
+                # #2109: a lone string is now one finding; an object still rejects.
+                "same_pr_followups": {"not": "a list"},
                 "future_followups": [],
                 "prior_item_dispositions": [],
             }
@@ -588,7 +589,8 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
                     "diagnostics as domain text."
                 ),
                 "blocking_items": [],
-                "same_pr_followups": "not-a-list",
+                # #2109: a lone string is now one finding; an object still rejects.
+                "same_pr_followups": {"not": "a list"},
                 "future_followups": [],
                 "prior_item_dispositions": [],
             }

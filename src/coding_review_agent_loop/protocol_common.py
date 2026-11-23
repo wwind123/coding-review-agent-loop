@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from .errors import AgentLoopError
 from .protocol_markers import sanitize_historical_text
@@ -289,18 +289,58 @@ def _expect_int(value: object, *, context: str) -> int:
         raise AgentLoopError(f"{context} must be an integer.")  # shape-check: delegated
     return value
 
+_INT_LIKE_STRING_RE = re.compile(r"^\s*#?(\d+)\s*$")
+
+
+def _expect_int_like(value: object, *, context: str) -> int:
+    """An integer, or a lossless digit string such as ``"77"`` or ``"#77"`` (#2109).
+
+    Booleans, signs, decimals and any other text still raise the integer
+    error; range rules (positive, non-null) stay with the caller.
+    """
+    if isinstance(value, str):
+        match = _INT_LIKE_STRING_RE.fullmatch(value)
+        if match is not None:
+            converted = int(match.group(1))
+            _logger.warning("%s: converted digit string to integer %d", context, converted)
+            return converted
+    return _expect_int(value, context=context)  # shape-check: delegated
+
 def _expect_bool(value: object, *, context: str) -> bool:
     if not isinstance(value, bool):
         raise AgentLoopError(f"{context} must be a boolean.")  # shape-check: delegated
     return value
 
-def _expect_non_empty_string(value: object, *, context: str) -> str:
+def _expect_strict_string(value: object, *, context: str) -> str:
+    """Exact non-empty string: identifiers, signed labels and envelope fields.
+
+    No shape normalization, so a list-wrapped ID never becomes an ID (#2109).
+    """
     if not isinstance(value, str):
         raise AgentLoopError(f"{context} must be a string.")  # shape-check: delegated
     normalized = value.strip()
     if not normalized:
         raise AgentLoopError(f"{context} must be a non-empty string.")  # shape-check: delegated
     return normalized
+
+
+def _expect_non_empty_string(value: object, *, context: str) -> str:
+    """Non-empty text; a one-element list of a string is unwrapped (#2109).
+
+    Multi-element, empty and nested lists stay ambiguous and still raise, as do
+    objects, numbers, booleans and null.  The unwrap happens on the parsed
+    value only, never on stored response text.
+    """
+    if isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], str):
+            _logger.warning("%s: unwrapped single-element list to string", context)
+            value = value[0]
+        else:
+            raise AgentLoopError(  # shape-check: delegated
+                f"{context} must be a string; a one-element list of a string is "
+                f"accepted, got a list of {len(value)} element(s)."
+            )
+    return _expect_strict_string(value, context=context)  # shape-check: delegated
 
 def _flat_object_defect(value: Mapping[object, object]) -> tuple[str, str] | None:
     """Return `(key, description)` for the first value that cannot render losslessly.
@@ -367,7 +407,16 @@ def _expect_string_list(
     item_context: str,
     min_length: int = 0,
     flatten_object_items: bool = False,
+    strict_shape: bool = False,
 ) -> tuple[str, ...]:
+    if not strict_shape:
+        # #2109: lossless outer-shape normalization on the parsed value only.
+        if value is None and min_length == 0:
+            _logger.warning("%s: normalized null to an empty list", context)
+            value = []
+        elif isinstance(value, str) and value.strip():
+            _logger.warning("%s: wrapped a lone string as a one-item list", context)
+            value = [value]
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: delegated
     items: list[object] = []
@@ -384,7 +433,7 @@ def _expect_string_list(
             )
         items.append(item)
     rendered = tuple(
-        _expect_non_empty_string(item, context=f"{item_context} at index {index}")  # shape-check: delegated
+        _expect_strict_string(item, context=f"{item_context} at index {index}")  # shape-check: delegated
         for index, item in enumerate(items)
     )
     if len(rendered) < min_length:
@@ -494,7 +543,9 @@ def _consume_structured_footer_and_signature(
     footer_state = state_match.group(1).lower()
     payload_state = payload.get("state")
     if isinstance(payload_state, str) and payload_state.strip():
-        if payload_state.strip() != footer_state:
+        # Compare the closed-enum fold, so `Blocking` matches a blocking
+        # footer; the footer grammar itself is unchanged (#2109).
+        if closed_enum_fold_key(payload_state) != footer_state:
             raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
                 f"{context_label} footer {state_marker_name} must match the payload state."
             )
@@ -527,11 +578,49 @@ def normalize_staging_feasibility(value: object) -> tuple[object, bool]:
     Any other value, including a non-string, comes back unchanged with
     ``matched`` false so the caller keeps rejecting it.
     """
-    if not isinstance(value, str):
-        return value, False
-    folded = re.sub(r"[\s_]+", "-", value.strip().lower())
-    if folded in STAGING_FEASIBILITY_VALUES:
-        return folded, True
-    if folded in STAGING_FEASIBILITY_SAFE_ALIASES:
+    canonical, matched = fold_closed_enum(value, STAGING_FEASIBILITY_VALUES)
+    if matched:
+        return canonical, True
+    if isinstance(value, str) and closed_enum_fold_key(value) in STAGING_FEASIBILITY_SAFE_ALIASES:
         return "safe", True
     return value, False
+
+
+def closed_enum_fold_key(value: str) -> str:
+    """The shared closed-enum fold: strip, lowercase, ``[\\s_]+`` to ``-`` (#2109)."""
+    return re.sub(r"[\s_]+", "-", value.strip().lower())
+
+
+def fold_closed_enum(value: object, allowed: Collection[str]) -> tuple[object, bool]:
+    """Return ``(canonical, matched)`` for a raw closed-enum value (#2109).
+
+    A value matches an allowed token when both fold to the same key, so
+    underscore-canonical tokens such as ``opened_pr`` match too.  There are no
+    synonym tables: anything else, including a non-string, comes back
+    unchanged with ``matched`` false so the caller keeps its own error.  Pure
+    and non-raising.
+    """
+    if not isinstance(value, str):
+        return value, False
+    if value in allowed:
+        return value, True
+    key = closed_enum_fold_key(value)
+    for token in sorted(allowed):
+        if closed_enum_fold_key(token) == key:
+            return token, True
+    return value, False
+
+
+def fold_enum_value(value: str, allowed: Collection[str], *, context: str) -> str:
+    """Fold ``value`` onto its canonical allowed token, logging any change.
+
+    An unmatched value is returned as given so the caller's existing enum
+    error (and its echo of the value) fires unchanged.
+    """
+    canonical, matched = fold_closed_enum(value, allowed)
+    if matched and canonical != value:
+        _logger.warning(
+            "%s: folded enum value %r to %r before validation", context, value[:40], canonical
+        )
+        return str(canonical)
+    return value

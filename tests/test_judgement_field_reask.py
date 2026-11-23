@@ -58,7 +58,7 @@ def test_absent_status_is_typed_when_sole_defect():
         {"unknown_key": 1},
         {"rationale": ""},
         {"dependencies": 123},
-        {"canonical_document_path": ""},
+        {"canonical_document_path": 7},
     ],
 )
 @pytest.mark.parametrize("status", ["update", None, "ABSENT"])
@@ -328,7 +328,7 @@ def test_real_validator_reasks_out_of_enum_status_once(tmp_path):
     [
         {"rationale": ""},
         {"dependencies": 123},
-        {"canonical_document_path": ""},
+        {"canonical_document_path": 7},
         {"unknown_key": 1},
     ],
 )
