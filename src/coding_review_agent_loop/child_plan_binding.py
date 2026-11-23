@@ -1637,7 +1637,11 @@ def _assemble_structured_plan_round_body(
         f"Planning issue #{issue_number}: full plan comment exceeds the comment budget; "
         "posting the bounded visible digest (complete plan stays in authenticated round metadata)",
     )
-    compact_body = _attach_round_metadata(compact_comment, metadata)
+    # The bounded digest uses the compact degradation projection (#2059,
+    # #2100): count indicators only; the records stay complete in metadata.
+    compact_body = _attach_round_metadata(
+        compact_comment, metadata, degradation_projection="compact"
+    )
     # Final fit check (#886): a digest that still cannot be carried is
     # refused here with the transport's own overflow error, before posting.
     prepare_round_comment(compact_body)

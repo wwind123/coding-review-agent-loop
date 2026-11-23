@@ -1429,7 +1429,7 @@ def test_resolved_history_excludes_future_machine_other_flow_and_carried_items()
     ) == frozenset()
 
 
-def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomplete_ledger(
+def test_staged_secondary_audit_drops_resolved_primary_disposition_under_incomplete_ledger(
     tmp_path, monkeypatch
 ):
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
@@ -1483,15 +1483,12 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
     ]
     # The secondary-audit round is exactly the incomplete-ledger state.
     assert ledger_flags[-1] is True
-    assert any(
-        "removed canonically resolved historical prior-item disposition ID(s) item-1 "
-        "despite incomplete ledger" in message
-        for message in logged
-    )
+    # #2100: the validator drops the non-carried ID; no strip path runs.
+    assert not any("despite incomplete ledger" in message for message in logged)
     assert not any(
         "deterministically removed unknown prior-item" in message for message in logged
     )
-    # The stripped response keeps its approval and posts no disposition.
+    # The response keeps its approval, posts no disposition and records the ID.
     gemini_record = next(
         record
         for record in architecture_contract._extract_round_metadata_records(
@@ -1503,3 +1500,4 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
     assert gemini_record.metadata.state == "approved"
     assert gemini_record.metadata.dispositions == ()
     assert gemini_record.metadata.new_items == ()
+    assert gemini_record.metadata.ignored_prior_disposition_ids == ("item-1",)

@@ -49,7 +49,8 @@ def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, promp
             parsed = response_validator(text)
         proof.require(binding)
         candidate = _accept_candidate(text, parsed, strict_revalidate=strict_revalidate,
-                                      runner=runner, acquisition=result)
+                                      runner=runner, acquisition=result,
+                                      fallback_revalidate=validate)
         audit["outcome"] = "succeeded" if result.returncode == 0 else "nonzero_exit"
         return ValidatedAgentResponse(
             text=candidate.text, marker_value=candidate.marker_value,

@@ -34,6 +34,7 @@ from .protocol_risk import (
 from .protocol import (
     ParsedPlanReview,
     ParsedReview,
+    PlanRevisionPatch,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     StructuredPlanState,
@@ -51,6 +52,7 @@ from .protocol_common import (
 from .response_normalization import (
     canonicalize_architecture_near_miss_text,
     recover_payload,
+    remove_prior_item_dispositions,
 )
 from .runner import Runner
 from .workdirs import active_workdir
@@ -488,21 +490,84 @@ def _architecture_and_test_observation_mode_validators(
     }
 
 
+# Parsed result types that record dispositions dropped for non-carried IDs
+# (#2100), mapped to their wire kind.  The reviewer types have no ``kind``
+# field, so the wire kind always comes from this fixed table.
+_IGNORED_ID_CARRIER_KINDS: dict[type, str] = {
+    ParsedReview: "pr_review",
+    ParsedPlanReview: "plan_review",
+    StructuredPlanRevision: "plan_revision",
+    PlanRevisionPatch: "plan_revision_patch",
+}
+_IGNORED_ID_CARRIERS = tuple(_IGNORED_ID_CARRIER_KINDS)
+
+
+def _ignored_ids_payload(result: object) -> object | None:
+    """The payload carrying ``ignored_prior_disposition_ids``, inside any wrapper.
+
+    Unlike ``_carrier_payload`` this assumes no architecture or record fields,
+    so a ``PlanRevisionPatch`` is recognized.
+    """
+    payload = result.parsed if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS) else result
+    return payload if isinstance(payload, _IGNORED_ID_CARRIERS) else None
+
+
+def ignored_prior_disposition_ids(result: object) -> tuple[str, ...]:
+    """The non-carried disposition IDs live validation dropped from ``result``."""
+    payload = _ignored_ids_payload(result)
+    return tuple(payload.ignored_prior_disposition_ids) if payload is not None else ()
+
+
+def ignored_disposition_metadata_fields(result: object) -> dict[str, object]:
+    """Round-metadata fields recording dropped non-carried IDs (#2100).
+
+    Empty when nothing was dropped, so the record encodes byte-identically.
+    """
+    ignored = ignored_prior_disposition_ids(result)
+    return {"ignored_prior_disposition_ids": ignored} if ignored else {}
+
+
+def reattach_ignored_prior_disposition_ids(
+    result: object, ignored: Sequence[str]
+) -> object:
+    """Set the recorded ignored IDs back on ``result``'s payload, inside any wrapper."""
+    payload = _ignored_ids_payload(result)
+    if payload is None:
+        if ignored:
+            raise _AcceptedTextCanonicalizationError(
+                "Accepted-text canonicalization failed: the result cannot carry ignored "
+                "prior-item disposition IDs."
+            )
+        return result
+    updated = dataclasses_replace(payload, ignored_prior_disposition_ids=tuple(ignored))
+    if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS):
+        return dataclasses_replace(result, parsed=updated)
+    return updated
+
+
 def _canonical_comparison_projection(result: object) -> object:
     """Project a result for the degradable-versus-strict equality check.
 
-    Records are cleared, an `undetermined` assessment maps to absence, and raw
-    source-text echo fields are ignored; every other field is compared.
+    Records are cleared, an `undetermined` assessment maps to absence, raw
+    source-text echo fields are ignored, and the recorded ignored-ID list
+    (#2100) is cleared; every other field is compared.  A ``PlanRevisionPatch``
+    has no architecture fields, so only its ignored-ID field is touched.
     """
     payload = _carrier_payload(result)
     if payload is None:
-        return result
+        ignored_payload = _ignored_ids_payload(result)
+        if ignored_payload is None:
+            return result
+        projected = dataclasses_replace(ignored_payload, ignored_prior_disposition_ids=())
+        return (type(result).__name__, getattr(result, "state", None), projected)
     changes: dict[str, object] = {"architecture_impact_degradations": ()}
     impact = payload.architecture_impact
     if impact is not None and impact.status == ARCHITECTURE_IMPACT_UNDETERMINED:
         changes["architecture_impact"] = None
     if hasattr(payload, "raw_dispositions_text"):
         changes["raw_dispositions_text"] = ""
+    if isinstance(payload, _IGNORED_ID_CARRIERS):
+        changes["ignored_prior_disposition_ids"] = ()
     projected = dataclasses_replace(payload, **changes)
     return (type(result).__name__, getattr(result, "state", None), projected)
 
@@ -549,27 +614,56 @@ def _accept_candidate(
     strict_revalidate: Callable[[str], object] | None,
     runner: Runner,
     acquisition: AgentResult | None,
+    fallback_revalidate: Callable[[str], object] | None = None,
 ) -> _AcceptedCandidate:
     """The single acceptance boundary for a validated candidate (#925).
 
-    A record-free candidate passes through byte-identical.  Otherwise the text
-    is rewritten to its wire-valid form, re-parsed strictly by the
-    invocation's own validate chain under the candidate's own acquisition,
-    checked against the degradable result under the comparison projection,
-    and the records are reattached inside any terminal wrapper.
+    A record-free, ignore-free candidate passes through byte-identical.
+    Otherwise the text is rewritten to its wire-valid form -- near-miss
+    architecture text canonicalized when records exist, and dispositions that
+    live validation dropped for non-carried IDs removed (#2100) -- re-parsed
+    strictly by the invocation's own validate chain under the candidate's own
+    acquisition, checked against the degradable result under the comparison
+    projection, and the records and ignored IDs are reattached inside any
+    terminal wrapper.  ``fallback_revalidate`` (the invocation's own validate)
+    re-parses an ignore-only candidate when no strict re-parse was supplied.
     """
     payload = _carrier_payload(marker_value)
     records = tuple(payload.architecture_impact_degradations) if payload is not None else ()
-    if not records:
+    ignored_payload = _ignored_ids_payload(marker_value)
+    ignored = (
+        tuple(ignored_payload.ignored_prior_disposition_ids)
+        if ignored_payload is not None
+        else ()
+    )
+    if not records and not ignored:
         return _AcceptedCandidate(text, marker_value)
-    if strict_revalidate is None:
+    revalidate = strict_revalidate
+    if revalidate is None and not records:
+        revalidate = fallback_revalidate
+    if revalidate is None:
         raise _AcceptedTextCanonicalizationError(
             "Accepted-text canonicalization failed: no strict re-parse was supplied."
         )
-    rewritten = canonicalize_architecture_near_miss_text(text)
+    rewritten = canonicalize_architecture_near_miss_text(text) if records else text
+    if ignored:
+        expected_kind = _IGNORED_ID_CARRIER_KINDS.get(type(ignored_payload))
+        if expected_kind is None:
+            raise _AcceptedTextCanonicalizationError(
+                "Accepted-text canonicalization failed: no wire kind is mapped for "
+                f"{type(ignored_payload).__name__}."
+            )
+        try:
+            rewritten = remove_prior_item_dispositions(
+                rewritten, drop_ids=ignored, expected_kind=expected_kind
+            )
+        except AgentLoopError as exc:
+            raise _AcceptedTextCanonicalizationError(
+                f"Accepted-text canonicalization failed: dropped dispositions could not be removed ({exc})."
+            ) from exc
     try:
         reparsed = _with_validation_context(
-            strict_revalidate, runner=runner, acquisition=acquisition
+            revalidate, runner=runner, acquisition=acquisition
         )(rewritten)
     except AgentLoopError as exc:
         raise _AcceptedTextCanonicalizationError(
@@ -579,18 +673,19 @@ def _accept_candidate(
         raise _AcceptedTextCanonicalizationError(
             "Accepted-text canonicalization failed: the strict re-parse differs from the accepted result."
         )
-    reparsed_payload = _carrier_payload(reparsed)
-    if reparsed_payload is None:
-        raise _AcceptedTextCanonicalizationError(
-            "Accepted-text canonicalization failed: the strict re-parse carries no structured payload."
-        )
-    return _AcceptedCandidate(
-        rewritten,
-        _with_carrier_payload(
+    if records:
+        reparsed_payload = _carrier_payload(reparsed)
+        if reparsed_payload is None:
+            raise _AcceptedTextCanonicalizationError(
+                "Accepted-text canonicalization failed: the strict re-parse carries no structured payload."
+            )
+        reparsed = _with_carrier_payload(
             reparsed,
             dataclasses_replace(reparsed_payload, architecture_impact_degradations=records),
-        ),
-    )
+        )
+    if ignored:
+        reparsed = reattach_ignored_prior_disposition_ids(reparsed, ignored)
+    return _AcceptedCandidate(rewritten, reparsed)
 
 
 def _accepted_validated_response(
@@ -598,8 +693,23 @@ def _accepted_validated_response(
 ) -> ValidatedAgentResponse:
     """The only constructor of an accepted response; text comes from the boundary."""
     _log_accepted_ack_item_strip(candidate.marker_value)
+    _log_accepted_ignored_dispositions(candidate.marker_value)
     return ValidatedAgentResponse(
         text=candidate.text, marker_value=candidate.marker_value, **fields
+    )
+
+
+def _log_accepted_ignored_dispositions(marker_value: object) -> None:
+    """Log one bounded line when an accepted response named non-carried IDs (#2100)."""
+    ignored = ignored_prior_disposition_ids(marker_value)
+    if not ignored:
+        return
+    shown = ", ".join(ignored[:20])
+    more = f" (+{len(ignored) - 20} more)" if len(ignored) > 20 else ""
+    _logger.warning(
+        "ignored dispositions for non-carried IDs: %s%s",
+        sanitize_historical_text(shown)[:2000],
+        more,
     )
 
 

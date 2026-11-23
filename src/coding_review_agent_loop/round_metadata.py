@@ -418,6 +418,11 @@ class PostedRoundMetadata:
     # records while the advisory list is non-empty and on the human-checks
     # comment; omitted when empty so historical records stay byte-stable.
     human_checks: tuple[dict, ...] = ()
+    # Well-formed prior-item disposition IDs outside the carried set that live
+    # validation dropped (#2100).  Complete and untruncated (the transport
+    # spills it losslessly); omitted when empty so other records stay
+    # byte-stable.  Only the orchestrator writes it.
+    ignored_prior_disposition_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -2499,6 +2504,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["evidence_requests"] = list(metadata.evidence_requests)
     if metadata.human_checks:
         payload["human_checks"] = [dict(entry) for entry in metadata.human_checks]
+    if metadata.ignored_prior_disposition_ids:
+        payload["ignored_prior_disposition_ids"] = list(metadata.ignored_prior_disposition_ids)
     if metadata.evidence_freeze is not None:
         payload["evidence_freeze"] = metadata.evidence_freeze.as_dict()
     if metadata.evidence_release is not None:
@@ -2848,6 +2855,20 @@ def _decode_provenance_baseline(payload: Mapping[str, object]) -> dict[str, obje
     return {}
 
 
+def decode_ignored_prior_disposition_ids(value: object) -> tuple[str, ...]:
+    """Decode the #2100 ignored-ID list, failing closed on any malformed entry.
+
+    No count or length cap applies: the list is the complete published record.
+    """
+    from .protocol_common import ITEM_ID_RE
+
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not ITEM_ID_RE.fullmatch(item) for item in value
+    ):
+        raise ValueError("ignored_prior_disposition_ids must be a list of item IDs")
+    return tuple(value)
+
+
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the optional #1068 evidence fields; absent is legacy.
 
@@ -2871,6 +2892,10 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
         # without failing the record.
         from .human_evidence_mode import decode_human_check_entries
         fields["human_checks"] = decode_human_check_entries(payload["human_checks"])
+    if "ignored_prior_disposition_ids" in payload:
+        fields["ignored_prior_disposition_ids"] = decode_ignored_prior_disposition_ids(
+            payload["ignored_prior_disposition_ids"]
+        )
     if "evidence_freeze" in payload:
         fields["evidence_freeze"] = EvidenceFreezeRecord.from_mapping(payload["evidence_freeze"])
     if "evidence_release" in payload:
@@ -3352,9 +3377,48 @@ def render_compact_degradation_indicators(metadata: PostedRoundMetadata) -> str 
         )
         if records
     ]
+    if metadata.ignored_prior_disposition_ids:
+        lines.append(
+            "- Ignored dispositions for non-carried IDs: "
+            f"{len(metadata.ignored_prior_disposition_ids)} (complete list in round metadata)"
+        )
     if not lines:
         return None
     return "\n".join((COMPACT_DEGRADATIONS_HEADING, "", *lines))
+
+
+IGNORED_DISPOSITIONS_HEADING = "### Ignored prior-item dispositions"
+IGNORED_DISPOSITIONS_NOTE_PREFIX = "Ignored dispositions for non-carried IDs: "
+IGNORED_DISPOSITIONS_LINE_BUDGET = 4_000
+
+
+def render_ignored_dispositions_section(ids: Sequence[str]) -> str | None:
+    """The visible #2100 note naming every dropped non-carried disposition ID.
+
+    IDs match ``ITEM_ID_RE`` (no backticks or markup).  Every ID is listed
+    while the rendered line fits its display budget; beyond it the note shows
+    the count, the leading IDs that fit, and a pointer to the round metadata,
+    which always holds the complete list.
+    """
+    if not ids:
+        return None
+    full = IGNORED_DISPOSITIONS_NOTE_PREFIX + ", ".join(f"`{item}`" for item in ids)
+    if len(full) <= IGNORED_DISPOSITIONS_LINE_BUDGET:
+        return "\n".join((IGNORED_DISPOSITIONS_HEADING, "", full))
+    suffix_template = " … ({shown} of {total} shown; complete list in round metadata)"
+    reserve = len(suffix_template.format(shown=len(ids), total=len(ids)))
+    prefix = f"{IGNORED_DISPOSITIONS_NOTE_PREFIX}{len(ids)} ID(s): "
+    shown: list[str] = []
+    used = len(prefix)
+    for item in ids:
+        piece = f"`{item}`"
+        extra = len(piece) + (2 if shown else 0)
+        if used + extra + reserve > IGNORED_DISPOSITIONS_LINE_BUDGET:
+            break
+        shown.append(piece)
+        used += extra
+    line = prefix + ", ".join(shown) + suffix_template.format(shown=len(shown), total=len(ids))
+    return "\n".join((IGNORED_DISPOSITIONS_HEADING, "", line))
 
 
 def _attach_round_metadata(
@@ -3396,6 +3460,9 @@ def _attach_round_metadata(
         )
         if sub_item_records is not None and sub_item_records not in str(body):
             body = _insert_before_trailing_markers(str(body), sub_item_records)
+        ignored_note = render_ignored_dispositions_section(metadata.ignored_prior_disposition_ids)
+        if ignored_note is not None and ignored_note not in str(body):
+            body = _insert_before_trailing_markers(str(body), ignored_note)
     coder_record_notes = render_coder_record_degradations_section(metadata)
     if coder_record_notes is not None and coder_record_notes not in str(body):
         body = _insert_before_trailing_markers(str(body), coder_record_notes)

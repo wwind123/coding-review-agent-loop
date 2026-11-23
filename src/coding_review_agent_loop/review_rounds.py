@@ -57,10 +57,14 @@ from .review_spool import (
 )
 from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
+    _AcceptedCandidate,
     _with_validation_context,
     _accept_candidate,
     _accepted_validated_response,
+    ignored_prior_disposition_ids,
+    reattach_ignored_prior_disposition_ids,
 )
+from .protocol_common import ITEM_ID_RE
 from .panel_evidence import (
     _board_amendment_template, _PR_AMENDMENT_RERUN_CLAUSE, pr_amendment_template_round,
 )
@@ -847,6 +851,14 @@ def _replay_spooled_review(
     validate = validators["validate"]
     strict_revalidate = validators.get("strict_revalidate")
     assert isinstance(text, str) and callable(validate)
+    spooled_ignored = _spooled_ignored_disposition_ids(fields.get("ignored_prior_disposition_ids"))
+    if spooled_ignored is None:
+        log(
+            config,
+            f"{reviewer_name}: withheld same-round review has a malformed ignored-ID record; "
+            "invoking a fresh review turn instead",
+        )
+        return None
     try:
         marker_value = _with_validation_context(validate, runner=runner, acquisition=None)(text)
         candidate = _accept_candidate(
@@ -855,7 +867,18 @@ def _replay_spooled_review(
             strict_revalidate=strict_revalidate,  # type: ignore[arg-type]
             runner=runner,
             acquisition=None,
+            fallback_revalidate=validate,  # type: ignore[arg-type]
         )
+        if spooled_ignored:
+            # The spooled text is already canonical, so its re-parse drops
+            # nothing; restore the original turn's ignored-ID record (#2100).
+            merged = tuple(sorted(
+                set(spooled_ignored) | set(ignored_prior_disposition_ids(candidate.marker_value))
+            ))
+            candidate = _AcceptedCandidate(
+                candidate.text,
+                reattach_ignored_prior_disposition_ids(candidate.marker_value, merged),
+            )
     except AgentLoopError as exc:
         log(
             config,
@@ -977,8 +1000,22 @@ def _preflight_spooled_publications(
             post_frozen(plan)
 
 
+def _spooled_ignored_disposition_ids(value: object) -> tuple[str, ...] | None:
+    """Decode a spooled ignored-ID list; absent is empty, malformed is None (#2100)."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not ITEM_ID_RE.fullmatch(item) for item in value
+    ):
+        return None
+    return tuple(value)
+
+
 def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, object]:
+    ignored = ignored_prior_disposition_ids(response.marker_value)
     return {
+        # Omitted when empty, so existing spool records are unchanged (#2100).
+        **({"ignored_prior_disposition_ids": list(ignored)} if ignored else {}),
         "text": response.text,
         "session_id": response.session_id,
         "model_used": response.model_used,

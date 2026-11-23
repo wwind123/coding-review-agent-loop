@@ -220,6 +220,7 @@ from .agent_failure import (
 )
 from .architecture_contract import (
     _architecture_metadata_fields,
+    ignored_disposition_metadata_fields,
     _architecture_mode_validators,
     _resumed_review_architecture,
 )
@@ -3034,6 +3035,7 @@ def _run_plan_first_loop_body(
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=acquisition_returncode,
                         **_architecture_metadata_fields(config, result=parsed),
+                        **ignored_disposition_metadata_fields(parsed),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                         plan_sweep=_plan_sweep_requested(reviewer_name),
                         **_baseline_metadata_fields(_plan_rendered_baseline(reviewer_name)),
@@ -3309,6 +3311,7 @@ def _run_plan_first_loop_body(
                     dispositions=resumed_record.metadata.dispositions,
                     architecture_impact=resumed_impact,
                     architecture_impact_degradations=resumed_records,
+                    ignored_prior_disposition_ids=resumed_record.metadata.ignored_prior_disposition_ids,
                 )
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")
@@ -4623,6 +4626,9 @@ def _run_plan_first_loop_body(
                     **_architecture_metadata_fields(
                         config, result=metadata_plan
                     ),
+                    # From the accepted candidate itself, never the reparsed
+                    # assembled plan, so the record survives assembly (#2100).
+                    **ignored_disposition_metadata_fields(plan_response.marker_value),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                     # Every coder round of a signed re-plan carries the

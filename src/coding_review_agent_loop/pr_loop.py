@@ -367,6 +367,7 @@ from .agent_failure import (
 from .architecture_contract import (
     _freeze_prompt_architecture,
     _architecture_metadata_fields,
+    ignored_disposition_metadata_fields,
     _test_observation_degradation_fields,
     _latest_pr_architecture_observation,
     _architecture_and_test_observation_mode_validators,
@@ -4955,6 +4956,7 @@ def run_pr_loop(
                             prior_items=prior_unresolved_items, dispositions=publication_dispositions(parsed, review_output, reviewer_name, prior_unresolved_items, parse_requirement_evidence=human_evidence.freeze),
                             new_items=new_items, state=parsed.state, model_used=model_used,
                             sub_item_degradations=tuple(parsed.sub_item_degradations),
+                            **ignored_disposition_metadata_fields(parsed),
                             **(_metadata_identity_fields(identity) if identity is not None else {}),
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
@@ -5603,6 +5605,7 @@ def run_pr_loop(
                         screenshot_requests=resumed_record.metadata.screenshot_requests, screenshot_coverage_acceptances=resumed_record.metadata.screenshot_coverage_acceptances,
                         post_merge_obligations=tuple(parse_post_merge_request(r) for r in resumed_record.metadata.post_merge_requests),
                         sub_item_degradations=resumed_record.metadata.sub_item_degradations,
+                        ignored_prior_disposition_ids=resumed_record.metadata.ignored_prior_disposition_ids,
                     )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)

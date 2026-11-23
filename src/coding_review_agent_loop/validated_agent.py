@@ -1017,13 +1017,15 @@ def _run_validated_agent_in_scope(
         # The acquisition is captured when the candidate is accepted, never
         # read later from the mutable closure, so a repair turn cannot change
         # the catalog the strict re-parse sees.
-        return _accept_candidate(
+        candidate = _accept_candidate(
             text,
             marker_value,
             strict_revalidate=strict_revalidate,
             runner=runner,
             acquisition=acquisition if acquisition is not None else validation_acquisition,
+            fallback_revalidate=response_validator,
         )
+        return candidate
 
     def accept_test_observations_fallback(
         text: str, *, source_records: tuple[ParseDegradation, ...] = ()

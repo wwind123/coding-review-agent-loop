@@ -174,12 +174,39 @@ retry and Antigravity format-fallback policy, never a verdict.
 
 Purely mechanical normalization stays in code and runs for every turn with
 no model call (`response_normalization.py`): envelope trimming, the
-lone-string risk-matrix list fields, the semantic-patch `rationale` alias, and
-the unknown prior-item disposition strip when the IDs are proven resolved
-history (an incomplete ledger without that proof is re-asked, never
-stripped). Image turns use the same envelope normalization. Architecture
+lone-string risk-matrix list fields and the semantic-patch `rationale` alias.
+Image turns use the same envelope normalization. Architecture
 near-miss canonicalization (`canonicalize_architecture_near_miss_text`) also
-lives there and runs at the shared acceptance boundary. The
+lives there and runs at the shared acceptance boundary.
+
+Prior-item dispositions for IDs outside the live carried set (or its PR-review
+aliases) are dropped, never rejected (#2100). The plan semantic patch (payload
+and full validators), the legacy full-state plan revision, the plan review and
+the PR review all pass the carried set to the parser, and
+`partition_raw_dispositions` (`protocol_common.py`) removes those entries from
+the raw array before it is parsed. Per-entry parser records such as sub-item
+degradations therefore exist only for kept entries, with indices into the
+filtered array. The verdict-consistency check sees only kept entries, so an
+approval whose only active disposition names a non-carried ID is accepted.
+There is no count or length bound, so non-carried IDs alone never cause a
+rejection, re-ask or bounded replan. Duplicate carried IDs are still rejected.
+Missing dispositions keep their semantics: reviewers still fail on a missing
+carried disposition, and plan candidates, which never had a completeness check,
+gain none. The dropped IDs travel on the parsed result
+(`ignored_prior_disposition_ids`, never part of a payload, canonical plan or
+sidecar identity). The acceptance boundary (`_accept_candidate`) removes the
+dropped entries from the accepted text with `remove_prior_item_dispositions`,
+strictly re-parses it, compares under a projection that clears the ignored IDs,
+and reattaches them. Publication, canonical reviewer responses and resume
+parsers that read the text without a carried set therefore agree with live
+validation. The wire kind comes from a fixed type map, because the reviewer
+result types have no `kind` field. Spool records persist the IDs (only when
+present), and replay reattaches them. The optional round-metadata field
+`ignored_prior_disposition_ids` is in the lossless sidecar spill set. It renders
+as an `### Ignored prior-item dispositions` note that lists every ID up to a
+display budget and then a count. The compact projection, which the overflow plan
+digest now uses, shows a count indicator instead. The response-normalization
+strip helpers stay but are unreachable for live turns. The
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
 `--repair-timeout-seconds` and `--containment-repair-*` flags are deprecated
 no-ops: they still parse, print one deprecation notice, are never validated

@@ -1632,12 +1632,13 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 
-def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomplete_ledger(
+def test_issue_loop_plan_review_drops_resolved_history_disposition_under_incomplete_ledger(
     tmp_path, monkeypatch
 ):
     # #862 plan-flow analog: an earlier plan subject raised and resolved
     # item-1, the carried set is empty, and the reviewer repeats item-1 as
-    # resolved.  The no-op entry is stripped instead of failing the run.
+    # resolved.  The non-carried entry is dropped and recorded (#2100) instead
+    # of failing the run.
     # This is the compatibility-default policy, so the resolved-only history
     # must still read as an incomplete ledger and still select full context:
     # staged planning's durable cleared-item proof does not apply here (#905).
@@ -1712,11 +1713,13 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
 
     repair_mock.assert_not_called()
     assert ledger_flags and ledger_flags[0] is True
+    # #2100: the validator drops the non-carried ID itself and the published
+    # review names it; the history-proven strip no longer runs.
+    published = [str(c["body"]) for c in runner.issue_comments]
     assert any(
-        "removed canonically resolved historical prior-item disposition ID(s) item-1 "
-        "despite incomplete ledger" in message
-        for message in logged
+        "Ignored dispositions for non-carried IDs: `item-1`" in body for body in published
     )
+    assert not any("despite incomplete ledger" in message for message in logged)
     # The default path still takes the conservative full-context branch it
     # took before staged planning existed.
     assert any("(context mode: full (ledger incomplete))" in message for message in logged)
