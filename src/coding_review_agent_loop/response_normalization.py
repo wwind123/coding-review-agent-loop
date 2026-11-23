@@ -124,6 +124,51 @@ def strip_unknown_prior_item_dispositions(
     return json_str + tail
 
 
+PRIOR_DISPOSITION_FIELD_BY_KIND = {
+    "pr_review": "prior_item_dispositions",
+    "plan_review": "prior_plan_item_dispositions",
+    "plan_revision": "prior_plan_item_dispositions",
+    "plan_revision_patch": "prior_plan_item_dispositions",
+}
+
+
+def remove_prior_item_dispositions(
+    raw: str,
+    *,
+    drop_ids: Sequence[str],
+    expected_kind: str,
+) -> str:
+    """Remove exactly the disposition entries live validation dropped (#2100).
+
+    Uses the parser partition's item_id normalization, so it removes the same
+    entries the parser dropped, and leaves every other field, the footer and
+    the signature untouched.  Raises when the text has no recoverable payload
+    of ``expected_kind``; the acceptance boundary treats that as an internal
+    canonicalization failure.
+    """
+    from .protocol_common import normalized_disposition_item_id
+
+    disposition_field = PRIOR_DISPOSITION_FIELD_BY_KIND.get(expected_kind)
+    if disposition_field is None:
+        raise AgentLoopError(f"No prior-item disposition field for kind {expected_kind!r}.")
+    payload, trailing = _payload_and_trailing(raw)
+    if not isinstance(payload, dict) or payload.get("kind") != expected_kind:
+        raise AgentLoopError(
+            f"Accepted text carries no recoverable `{expected_kind}` payload."
+        )
+    entries = payload.get(disposition_field)
+    if not isinstance(entries, list):
+        raise AgentLoopError(f"Accepted text has no `{disposition_field}` array.")
+    drop = frozenset(drop_ids)
+    filtered = [
+        entry for entry in entries if normalized_disposition_item_id(entry) not in drop
+    ]
+    rewritten = {**payload, disposition_field: filtered}
+    return json.dumps(rewritten, ensure_ascii=False) + (
+        trailing if trailing.startswith(("\n", "\r")) else "\n" + trailing.lstrip()
+    )
+
+
 def unknown_dispositions_are_resolved_history(
     raw: str,
     *,

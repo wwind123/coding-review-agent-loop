@@ -1782,10 +1782,9 @@ def test_run_validated_agent_strip_path_ack_recovery(tmp_path, monkeypatch):
 
     repair_mock.assert_not_called()
     assert response.text == recovered_text
-    # Recovery was called once for the stripped variant (no unknown disposition)
+    # #2100: the validator drops the unknown disposition itself, so the
+    # recovery runs once on the original turn rather than a stripped variant.
     assert len(recovery_calls) == 1
-    assert recovery_calls[0] is not None
-    assert "unknown-prior-item-1" not in recovery_calls[0]
 
 def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypatch):
     raw_text = "non-structured plan revision text"
@@ -2700,10 +2699,10 @@ def test_run_validated_agent_deterministic_strip_logs_removed_and_allowed_ids(tm
         ledger_incomplete=False,
     )
 
+    # #2100: the validator drops the ID itself, so no strip runs; the
+    # accepted result records it instead.
     output = capsys.readouterr().err
-    assert "deterministically removed unknown prior-item disposition ID(s)" in output
-    assert "item-1" in output
-    assert "(none)" in output
+    assert "deterministically removed unknown prior-item disposition ID(s)" not in output
 
 def test_run_validated_agent_real_264_shape_approved_plan_review_same_round_item1_future_followups(tmp_path):
     malformed_review = structured_plan_review(
@@ -2742,7 +2741,7 @@ def test_run_validated_agent_real_264_shape_approved_plan_review_same_round_item
     assert parsed["future_followups"] == ["Consider adding retries."]
     assert parsed["summary"] == "Plan is sound."
 
-def test_run_validated_agent_deterministic_strip_skipped_when_ledger_incomplete(tmp_path):
+def test_run_validated_agent_unknown_plan_review_id_dropped_when_ledger_incomplete(tmp_path):
     malformed_review = structured_plan_review(
         state="approved",
         summary="Plan approved.",
@@ -2753,26 +2752,25 @@ def test_run_validated_agent_deterministic_strip_skipped_when_ledger_incomplete(
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
     with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        with pytest.raises(AgentLoopError) as exc_info:
-            _run_validated_agent(
-                runner,
-                agent="gemini",
-                config=config,
-                prompt="Review the plan.",
-                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=lambda text: _validate_plan_review_response(
-                    text,
-                    reviewer="Google Gemini",
-                    unresolved_items=(), architecture_status_mode="legacy",
-                ),
-                use_repair=True,
-                repair_expected_kind="plan_review",
-                repair_allowed_prior_item_ids=(),
-                ledger_incomplete=True,
-            )
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=lambda text: _validate_plan_review_response(
+                text,
+                reviewer="Google Gemini",
+                unresolved_items=(), architecture_status_mode="legacy",
+            ),
+            use_repair=True,
+            repair_expected_kind="plan_review",
+            repair_allowed_prior_item_ids=(),
+            ledger_incomplete=True,
+        )
 
     repair_mock.assert_not_called()
-    assert "item-1" in str(exc_info.value)
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-1",)
 
 # #862: incomplete-ledger strip is allowed only for proven resolved history.
 
@@ -2859,31 +2857,32 @@ def test_run_validated_agent_strips_resolved_history_despite_incomplete_ledger(t
     assert payload["summary"] == "LGTM."
 
 
-def test_run_validated_agent_incomplete_ledger_unknown_id_absent_from_history_fails_closed(tmp_path):
+def test_run_validated_agent_incomplete_ledger_unknown_id_absent_from_history_is_dropped(tmp_path):
     review = _pr_review_with_dispositions([{"item_id": "item-9", "disposition": "resolved"}])
-    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \[.*'item-9'\]"):
-        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    response = _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-9",)
 
 
 @pytest.mark.parametrize("active", ["blocking", "same-pr"])
-def test_run_validated_agent_incomplete_ledger_active_history_disposition_fails_closed(tmp_path, active):
+def test_run_validated_agent_incomplete_ledger_active_history_disposition_is_dropped(tmp_path, active):
     review = structured_pr_review(
         state="blocking",
         summary="Still broken.",
         prior_item_dispositions=[{"item_id": "item-1", "disposition": active, "note": "still broken"}],
         reviewer="Google Gemini",
     )
-    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-1'\]"):
-        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    response = _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-1",)
+    assert response.marker_value.dispositions == ()
 
 
-def test_run_validated_agent_incomplete_ledger_mixed_history_and_unknown_fails_closed(tmp_path):
+def test_run_validated_agent_incomplete_ledger_mixed_history_and_unknown_are_dropped(tmp_path):
     review = _pr_review_with_dispositions([
         {"item_id": "item-1", "disposition": "resolved"},
         {"item_id": "item-9", "disposition": "resolved"},
     ])
-    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \[.*'item-9'\]"):
-        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    response = _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-1", "item-9")
 
 
 def test_run_validated_agent_recovers_plan_revision_human_ack_from_message_text(tmp_path):
@@ -3233,7 +3232,9 @@ def test_run_validated_agent_repairs_unknown_prior_item_disposition_when_ledger_
     assert parsed_response["state"] == "approved"
     assert parsed_response["summary"] == "LGTM."
 
-def test_run_validated_agent_skips_unknown_prior_item_repair_when_ledger_incomplete(tmp_path):
+def test_run_validated_agent_drops_unknown_prior_item_when_ledger_incomplete(tmp_path):
+    # #2100: an incomplete ledger no longer fails closed; the non-carried
+    # disposition is dropped from the accepted text and recorded.
     malformed_review = structured_pr_review(
         state="approved",
         summary="LGTM.",
@@ -3244,26 +3245,27 @@ def test_run_validated_agent_skips_unknown_prior_item_repair_when_ledger_incompl
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
     with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        with pytest.raises(AgentLoopError) as exc_info:
-            _run_validated_agent(
-                runner,
-                agent="gemini",
-                config=config,
-                prompt="Review the PR.",
-                marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                validate=lambda text: _validate_review_response(
-                    text,
-                    reviewer="Google Gemini",
-                    unresolved_items=(), architecture_status_mode="legacy",
-                ),
-                use_repair=True,
-                repair_expected_kind="pr_review",
-                repair_allowed_prior_item_ids=(),
-                ledger_incomplete=True,
-            )
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text,
+                reviewer="Google Gemini",
+                unresolved_items=(), architecture_status_mode="legacy",
+            ),
+            use_repair=True,
+            repair_expected_kind="pr_review",
+            repair_allowed_prior_item_ids=(),
+            ledger_incomplete=True,
+        )
 
     repair_mock.assert_not_called()
-    assert "item-1" in str(exc_info.value)
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-1",)
+    payload, _ = json.JSONDecoder().raw_decode(response.text)
+    assert payload["prior_item_dispositions"] == []
 
 def test_envelope_normalization_coder_followup_duplicate_state_footer():
     """attempt_envelope_normalization handles coder_followup with a duplicate AGENT_STATE footer."""
@@ -3495,7 +3497,7 @@ def test_run_validated_agent_repairs_unknown_plan_revision_prior_disposition(tmp
     parsed_response = json.loads(response.text.split("\n")[0])
     assert parsed_response["prior_plan_item_dispositions"] == []
 
-def test_run_validated_agent_plan_revision_unknown_prior_disposition_fails_when_ledger_incomplete(tmp_path):
+def test_run_validated_agent_plan_revision_unknown_prior_disposition_dropped_when_ledger_incomplete(tmp_path):
     active_item = UnresolvedReviewItem(
         item_id="item-12",
         reviewer="Google Gemini",
@@ -3513,26 +3515,27 @@ def test_run_validated_agent_plan_revision_unknown_prior_disposition_fails_when_
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
     with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        with pytest.raises(AgentLoopError) as exc_info:
-            _run_validated_agent(
-                runner,
-                agent="claude",
-                config=config,
-                prompt="Revise the plan.",
-                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=lambda text: _validate_plan_revision_response(
-                    text,
-                    unresolved_items=(active_item,), architecture_status_mode="legacy",
-                ),
-                use_repair=True,
-                repair_expected_kind="plan_revision",
-                repair_allowed_prior_item_ids=("item-12",),
-                ledger_incomplete=True,
-            )
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=lambda text: _validate_plan_revision_response(
+                text,
+                unresolved_items=(active_item,), architecture_status_mode="legacy",
+            ),
+            use_repair=True,
+            repair_expected_kind="plan_revision",
+            repair_allowed_prior_item_ids=("item-12",),
+            ledger_incomplete=True,
+        )
 
     repair_mock.assert_not_called()
-    assert "item-15" in str(exc_info.value)
-    assert "item-18" in str(exc_info.value)
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-15", "item-18")
+    assert response.marker_value.prior_plan_item_dispositions == ()
+    payload, _ = json.JSONDecoder().raw_decode(response.text)
+    assert payload["prior_plan_item_dispositions"] == []
 
 
 # --- discuss_agenda repair support tests (#467) ---
@@ -3745,11 +3748,10 @@ def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path, 
 
 
 @pytest.mark.parametrize("ledger_incomplete", [False, True])
-def test_run_validated_agent_semantic_patch_unknown_id_absent_from_history_fails_closed(
+def test_run_validated_agent_semantic_patch_unknown_id_absent_from_history_is_dropped(
     tmp_path, ledger_incomplete
 ):
-    # A fabricated ID has no resolved history, so the strip must not fire even
-    # when the ledger is complete (#872 follow-up).
+    # #2100: a non-carried ID is dropped whatever the ledger or history says.
     patch_text = _semantic_patch_text([
         {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
         {"item_id": "item-9", "disposition": "resolved"},
@@ -3758,35 +3760,33 @@ def test_run_validated_agent_semantic_patch_unknown_id_absent_from_history_fails
     with patch(
         "coding_review_agent_loop.validated_agent.attempt_repair", return_value=None
     ) as repair_mock:
-        with pytest.raises(
-            AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-9'\]"
-        ):
-            _run_semantic_patch_revision(
-                tmp_path,
-                patch_text,
-                history_ids=("item-2",),
-                ledger_incomplete=ledger_incomplete,
-            )
-        if ledger_incomplete:
-            repair_mock.assert_not_called()
+        response = _run_semantic_patch_revision(
+            tmp_path,
+            patch_text,
+            history_ids=("item-2",),
+            ledger_incomplete=ledger_incomplete,
+        )
+    repair_mock.assert_not_called()
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-9",)
+    assert [d.item_id for d in response.marker_value.prior_plan_item_dispositions] == ["item-1"]
+    payload, _ = json.JSONDecoder().raw_decode(response.text)
+    assert [d["item_id"] for d in payload["prior_plan_item_dispositions"]] == ["item-1"]
 
 
 @pytest.mark.parametrize("active", ["blocking", "same-plan"])
-def test_run_validated_agent_semantic_patch_active_disposition_fails_closed(tmp_path, active):
-    # An active disposition of a non-carried item is a real signal, never a
-    # no-op echo, so a complete ledger must keep it fatal.
+def test_run_validated_agent_semantic_patch_active_disposition_is_dropped(tmp_path, active):
+    # #2100: a disposition for a non-carried item has nothing to apply to, so
+    # even an active one is dropped and recorded rather than fatal.
     patch_text = _semantic_patch_text([
         {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
         {"item_id": "item-3", "disposition": active, "note": "still broken"},
     ])
 
     with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
-        with pytest.raises(
-            AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-3'\]"
-        ):
-            _run_semantic_patch_revision(
-                tmp_path, patch_text, history_ids=("item-2", "item-3")
-            )
+        response = _run_semantic_patch_revision(
+            tmp_path, patch_text, history_ids=("item-2", "item-3")
+        )
+    assert response.marker_value.ignored_prior_disposition_ids == ("item-3",)
 
 
 def _plan_history_comments_with_resolved_items():

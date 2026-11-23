@@ -953,9 +953,18 @@ def _validate_review_response(
     if not include_visual:
         from .review_images import ordinary_items
         unresolved_items = ordinary_items(unresolved_items)
+    # Dispositions for IDs outside the carried set (or its aliases) are dropped
+    # before parsing and recorded on the result instead of rejecting the
+    # response (#2100); the verdict-consistency check then sees only kept ones.
     parsed = parse_pr_review(
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode,
         parse_requirement_evidence=parse_requirement_evidence,
+        carried_item_ids=(
+            frozenset(item.item_id for item in unresolved_items),
+            frozenset(
+                alias for item in unresolved_items for alias in getattr(item, "alias_item_ids", ())
+            ),
+        ),
     )
     _validate_evidence_row_tags(parsed, approved_matrix_row_ids)
 
@@ -974,14 +983,6 @@ def _validate_review_response(
             "Review listed prior unresolved items more than once: " + ", ".join(duplicates)
         )
     aliases = {alias: item for item in unresolved_items for alias in getattr(item, "alias_item_ids", ())}
-    unknown = sorted(set(disposition_ids) - set(unresolved_by_id) - set(aliases))
-    if unknown:
-        _raise_unknown_prior_item_disposition(
-            unknown,
-            allowed_ids=tuple(unresolved_by_id),
-            current_round_items=current_round_items,
-            field="prior_item_dispositions",
-        )
     if unresolved_items:
         covered = {aliases[i].item_id if i in aliases else i for i in disposition_ids}
         missing = sorted(set(unresolved_by_id) - covered - set(optional_item_ids))
@@ -2169,6 +2170,8 @@ def _validate_plan_review_response(
         reviewer=reviewer,
         architecture_status_mode=architecture_status_mode,
         surfaced_requirement_ids=surfaced_requirement_ids,
+        # Non-carried dispositions are dropped and recorded (#2100).
+        carried_item_ids=(frozenset(item.item_id for item in unresolved_items), frozenset()),
     )
     validate_human_requirement_dispositions(
         parsed.human_requirement_dispositions,
@@ -2190,13 +2193,6 @@ def _validate_plan_review_response(
         raise AgentLoopError(
             "Plan review listed prior unresolved plan items more than once: "
             + ", ".join(duplicates)
-        )
-    unknown = sorted(set(disposition_ids) - set(unresolved_by_id))
-    if unknown:
-        _raise_unknown_prior_item_disposition(
-            unknown,
-            allowed_ids=tuple(unresolved_by_id),
-            current_round_items=current_round_items,
         )
     if unresolved_items:
         missing = sorted(set(unresolved_by_id) - set(disposition_ids))

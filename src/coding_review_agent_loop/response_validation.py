@@ -1370,21 +1370,14 @@ def _validate_plan_revision_response(
         require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
         require_child_dispositions=bool(require_execution_strategy_contract),
+        # Non-carried dispositions are dropped and recorded, never rejected (#2100).
+        carried_item_ids=_plan_carried_item_ids(unresolved_items),
     )
     if parsed is not None:
-        allowed_ids = {item.item_id for item in unresolved_items}
-        unknown = {
-            disposition.item_id
-            for disposition in parsed.prior_plan_item_dispositions
-        } - allowed_ids
-        if unknown:
-            raise UnknownPriorItemDispositionError(
-                unknown_ids=tuple(sorted(unknown)),
-                allowed_ids=tuple(sorted(allowed_ids)),
-                same_round_description=prior_item_disposition_guidance(
-                    tuple(sorted(unknown)), tuple(sorted(allowed_ids))
-                ),
-            )
+        _reject_duplicate_carried_dispositions(
+            parsed.prior_plan_item_dispositions,
+            context="plan_revision.prior_plan_item_dispositions",
+        )
         return parsed
     raise AgentLoopError("Plan revision did not use the required structured format.")
 
@@ -1397,7 +1390,9 @@ def _validate_plan_revision_patch_response(
     inherited_human_requirement_dispositions: Sequence[object] | None = None,
 ) -> object:
     """Validate a semantic patch and its carried review-item ledger."""
-    parsed = validate_structured_plan_revision_patch(text)
+    parsed = validate_structured_plan_revision_patch(
+        text, carried_item_ids=_plan_carried_item_ids(unresolved_items)
+    )
     if parsed is None:
         raise AgentLoopError("Semantic plan revision did not use the required structured patch format.")
     _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
@@ -1440,7 +1435,9 @@ def _validate_plan_revision_patch_payload(
             "Structured response kind mismatch: expected `plan_revision_patch`."
         )
     try:
-        parsed = parse_plan_revision_patch(payload)
+        parsed = parse_plan_revision_patch(
+            payload, carried_item_ids=_plan_carried_item_ids(unresolved_items)
+        )
     except AgentLoopError as exc:
         raise SemanticPatchPayloadRejection(str(exc)) from exc
     _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
@@ -1462,18 +1459,66 @@ def _check_plan_revision_patch_ledger(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> None:
-    allowed_ids = {item.item_id for item in unresolved_items}
-    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
-    if unknown:
-        # Payload-level: repair must preserve the patch payload exactly, so
-        # only the deterministic strip or a bounded replan can fix it (#979).
-        raise SemanticPatchUnknownPriorItemDispositionError(
-            unknown_ids=tuple(sorted(unknown)),
-            allowed_ids=tuple(sorted(allowed_ids)),
-            same_round_description=prior_item_disposition_guidance(
-                tuple(sorted(unknown)), tuple(sorted(allowed_ids))
-            ),
+    """Internal invariant: a live-parsed patch holds only carried dispositions.
+
+    Since #2100 the parser drops non-carried dispositions before parsing, so
+    this never rejects agent output; a surviving non-carried ID is an
+    orchestrator defect, not a replan diagnostic.
+    """
+    # A carried ID disposed twice is ambiguous; repair must keep the payload,
+    # so this is a payload rejection (bounded replan), never a re-ask (#2100).
+    _reject_duplicate_carried_dispositions(
+        parsed.prior_plan_item_dispositions,
+        context="plan_revision_patch.prior_plan_item_dispositions",
+        error=SemanticPatchPayloadRejection,
+    )
+    carried, aliases = _plan_carried_item_ids(unresolved_items)
+    surviving = sorted(
+        {item.item_id for item in parsed.prior_plan_item_dispositions} - carried - aliases
+    )
+    if surviving:
+        raise AgentLoopError(
+            "Internal error: a live semantic patch kept dispositions for non-carried IDs: "
+            + ", ".join(surviving)
         )
+
+
+def _reject_duplicate_carried_dispositions(
+    dispositions: Sequence[ReviewItemDisposition],
+    *,
+    context: str,
+    error: type[AgentLoopError] = AgentLoopError,
+) -> None:
+    """Reject a carried ID disposed more than once (#2100).
+
+    Runs on the kept (carried) dispositions after the pre-parse partition, so
+    a repeated non-carried ID has already been dropped once and never
+    rejects.  The reviewer validators apply the same rule.
+    """
+    ids = [item.item_id for item in dispositions]
+    duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+    if duplicates:
+        raise error(
+            f"{context} lists carried prior items more than once: " + ", ".join(duplicates)
+        )
+
+
+def _plan_carried_item_ids(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """The live carried set a plan candidate's dispositions are partitioned by (#2100).
+
+    Dispositions for well-formed IDs outside it are dropped before parsing and
+    recorded on the result; they never reject the candidate, re-ask the agent
+    or trigger a bounded replan.  Plan candidates have no carried-completeness
+    check, and none is added.
+    """
+    return (
+        frozenset(item.item_id for item in unresolved_items),
+        frozenset(
+            alias for item in unresolved_items for alias in getattr(item, "alias_item_ids", ())
+        ),
+    )
 
 
 def _check_plan_revision_patch_human_requirement_dispositions(

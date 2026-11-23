@@ -3588,6 +3588,12 @@
     },
     {
       "module": "round_metadata",
+      "function": "_section_insertion_index",
+      "classification": "presentation",
+      "admission": "round_metadata._section_insertion_index only chooses where the orchestrator inserts its own attached section into a body it is composing (#2100); it reads no durable history and selects no round, approval or protocol authority."
+    },
+    {
+      "module": "round_metadata",
       "function": "decode_plan_validation_diagnostic_body",
       "classification": "reader",
       "admission": "round_metadata diagnostic body codecs are offline; live recovery receives admitted plan history and applies record_body before matching success/diagnostic boundaries."

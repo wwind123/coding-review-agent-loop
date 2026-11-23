@@ -2380,7 +2380,9 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
     """#979: repair pins the patch payload, so a payload rejection replans instead."""
     patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
-    rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
+    # A strict patch-schema failure is a payload rejection (#979); since #2100
+    # a non-carried disposition no longer is.
+    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
     corrected = _m976_patch(fresh, summary="Corrected revision.")
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh, rejected, corrected],
@@ -2400,7 +2402,7 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
     assert len(planner_prompts) == 3
     assert "Trusted orchestration correction record" not in planner_prompts[1]
     assert "Trusted orchestration correction record" in planner_prompts[2]
-    assert "Unknown prior-item disposition ID(s) ['item-43']" in planner_prompts[2]
+    assert "operations must be a non-empty JSON array" in planner_prompts[2]
     # Same authenticated base binding on the replan turn.
     binding_line = re.search(r"- base_state_identity: (\S+)", planner_prompts[1]).group(0)
     assert binding_line in planner_prompts[2]
@@ -2412,10 +2414,167 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
     assert all(WEAK_SUMMARY not in prompt for prompt in review_prompts)
 
 
+def test_m2100_patch_with_non_carried_dispositions_is_accepted_without_replan(tmp_path, monkeypatch):
+    """#2100: extras are dropped, published as a note, and never replan or repair."""
+    from coding_review_agent_loop.round_metadata import _decode_round_metadata
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    with_extras = json.loads(_m976_patch(fresh, summary="Revision with extras.").split("\n<!--", 1)[0])
+    with_extras["prior_plan_item_dispositions"] = [
+        {"item_id": "item-1", "disposition": "resolved", "note": "Covered."},
+        {"item_id": "item-13", "disposition": "resolved", "note": "Same-round."},
+        {"item_id": "item-43", "disposition": "blocking", "note": "Not carried."},
+    ]
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, json.dumps(with_extras) + PLAN_FOOTER],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert issue_loop.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 2
+    assert all("Trusted orchestration correction record" not in prompt for prompt in planner_prompts)
+    revision_bodies = [
+        str(item["body"]) for item in runner.issue_comments
+        if "Revision with extras." in str(item["body"])
+    ]
+    assert revision_bodies
+    body = revision_bodies[0]
+    assert "### Ignored prior-item dispositions" in body
+    assert "Ignored dispositions for non-carried IDs: `item-13`, `item-43`" in body
+    encoded = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", body).group(1)
+    metadata = _decode_round_metadata(encoded)
+    assert metadata.ignored_prior_disposition_ids == ("item-13", "item-43")
+    raw = json.loads(metadata.raw_structured_coder_response.split("\n<!--", 1)[0])
+    assert [entry["item_id"] for entry in raw["prior_plan_item_dispositions"]] == ["item-1"]
+    raw_patch = metadata.raw_patch_provenance
+    assert "item-43" not in json.dumps(raw_patch) and "item-13" not in json.dumps(raw_patch)
+    # Resume reads the authenticated sidecar: it decodes, its identity matches
+    # the round record, and no dropped ID reappears in its dispositions.
+    from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
+
+    sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    assert sidecar.aggregate_identity == metadata.aggregate_plan_identity
+    canonical = json.dumps(sidecar.canonical_json)
+    assert "item-43" not in canonical and "item-13" not in canonical
+    assert "item-1" in canonical
+    assert sidecar.raw_patch == raw_patch
+    assert runner.diagnostic_posts == []
+
+
+def _m2100_patch_with_extras(fresh, summary):
+    patch = json.loads(_m976_patch(fresh, summary=summary).split("\n<!--", 1)[0])
+    patch["prior_plan_item_dispositions"] = [
+        {"item_id": "item-1", "disposition": "resolved", "note": "Covered."},
+        {"item_id": "item-13", "disposition": "resolved", "note": "Same-round."},
+        {"item_id": "item-43", "disposition": "blocking", "note": "Not carried."},
+    ]
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def _m2100_revision_record(runner, marker):
+    from coding_review_agent_loop.round_metadata import _decode_round_metadata
+
+    bodies = [str(item["body"]) for item in runner.issue_comments]
+    anchors = [body for body in bodies if marker in body and "AGENT_LOOP_META" in body]
+    assert len(anchors) == 1
+    match = list(_m948_transport.ROUND_RESUME_MARKER_RE.finditer(anchors[0]))[-1]
+    hydrated, missing = _m948_transport.hydrate_mapping(
+        _m948_transport.decode_mapping(match.group("payload")), bodies
+    )
+    assert missing == set()
+    return anchors[0], hydrated, _decode_round_metadata(_m948_transport.encode_mapping(hydrated))
+
+
+def test_m2100_resume_from_a_published_dropped_id_revision(tmp_path, monkeypatch):
+    """resume-sidecar-stable: a rerun resumes from the published revision."""
+    from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, _m2100_patch_with_extras(fresh, "Revision with extras.")],
+        # The second review is missing, so the first run stops after the
+        # revision is published.
+        codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
+    )
+    config = _plan_config(tmp_path, plan_growth_gate="off")
+    with pytest.raises(AgentInvocationError, match="exhausted"):
+        issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _anchor, _hydrated, published = _m2100_revision_record(runner, "Revision with extras.")
+    assert published.ignored_prior_disposition_ids == ("item-13", "item-43")
+
+    runner.codex_outputs.append(structured_plan_review(
+        state="approved",
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    ))
+    comments_before = len(runner.issue_comments)
+    assert issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # No new planner turn: the rerun resumed the published revision.
+    assert len(_agent_prompts(runner, "claude")) == 2
+    review_prompt = _agent_prompts(runner, "codex")[-1]
+    assert "Revision with extras." in review_prompt
+    assert "item-43" not in review_prompt and "item-13" not in review_prompt
+    new_bodies = [str(item["body"]) for item in runner.issue_comments[comments_before:]]
+    assert not any("Revision with extras." in body and "AGENT_LOOP_META" in body for body in new_bodies)
+    # The record the rerun read still decodes and verifies.
+    _anchor, _hydrated, record = _m2100_revision_record(runner, "Revision with extras.")
+    assert record.ignored_prior_disposition_ids == ("item-13", "item-43")
+    sidecar = decode_assembled_plan_sidecar(record.assembled_plan_sidecar)
+    assert sidecar.aggregate_identity == record.aggregate_plan_identity
+    canonical = json.dumps(sidecar.canonical_json)
+    assert "item-43" not in canonical and "item-13" not in canonical
+    assert record.subject == published.subject
+    assert runner.diagnostic_posts == []
+
+
+def test_m2100_semantic_patch_overflow_digest_keeps_ignored_ids(tmp_path, monkeypatch):
+    """compact-overflow-note on the semantic-patch publication path."""
+    from issue_loop_test_helpers import _m948_noise
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    payload = json.loads(_m976_full_plan_state().split("\n<!--", 1)[0])
+    payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    fresh = json.dumps(payload) + PLAN_FOOTER
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, _m2100_patch_with_extras(fresh, "Oversized revision with extras.")],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert issue_loop.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
+    ) == 0
+    anchor, hydrated, record = _m2100_revision_record(runner, "Oversized revision with extras.")
+    from coding_review_agent_loop.comment_rendering import COMPACT_PLAN_DIGEST_NOTICE
+
+    assert COMPACT_PLAN_DIGEST_NOTICE in anchor
+    assert "Ignored dispositions for non-carried IDs: 2 (complete list in round metadata)" in anchor
+    assert "### Ignored prior-item dispositions" not in anchor
+    assert hydrated["ignored_prior_disposition_ids"] == ["item-13", "item-43"]
+    assert record.ignored_prior_disposition_ids == ("item-13", "item-43")
+    raw = json.loads(record.raw_structured_coder_response.split("\n<!--", 1)[0])
+    assert [entry["item_id"] for entry in raw["prior_plan_item_dispositions"]] == ["item-1"]
+
+
 def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
     patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
-    rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
+    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh] + [rejected] * 3,
         codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
@@ -2429,7 +2588,7 @@ def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path
     assert error.value.failure_category == "deterministic"
     exhaustion = error.value.plan_validation_exhaustion
     assert exhaustion is not None and exhaustion.candidate_kind == "plan_revision"
-    assert "item-43" in exhaustion.diagnostic
+    assert "operations" in exhaustion.diagnostic
     assert len(_agent_prompts(runner, "claude")) == child_plan_binding.MAX_INHERITED_MATRIX_REPLANS + 2
     assert WEAK_SUMMARY not in _published(runner)
 
@@ -2438,7 +2597,7 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     """No rejection class both invokes patch repair and is guaranteed to fail preservation."""
     fresh = _m976_full_plan_state()
     good = _m976_patch(fresh, summary="Good.")
-    unknown = _m979_patch_with_unknown_disposition(fresh, summary="Bad.")
+    unknown = _m979_patch_with(fresh, operations=[], summary="Bad.")
     carried = (_m979_carried_item(),)
 
     def validate(text):
@@ -2458,9 +2617,12 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
             ),
         )
 
-    # Payload-level: the unknown disposition sits inside the pinned payload.
+    # #2100: a non-carried disposition is dropped, never a rejection.
+    accepted = validate(_m979_patch_with_unknown_disposition(fresh, summary="Bad."))
+    assert accepted.ignored_prior_disposition_ids == ("item-43",)
+    # Payload-level: the schema defect sits inside the pinned payload.
     candidate, diagnostic = classify(unknown)
-    assert candidate == unknown and "item-43" in diagnostic
+    assert candidate == unknown and "operations" in diagnostic
     # Envelope-only: a missing footer is exactly what repair may change.
     assert classify(good.split("\n<!--", 1)[0]) is None
     # An envelope defect hiding a payload defect is still unsatisfiable once
@@ -2471,7 +2633,7 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     )
     assert normalized is not None
     candidate, diagnostic = classify(prose_wrapped, normalized)
-    assert candidate == normalized and "item-43" in diagnostic
+    assert candidate == normalized and "operations" in diagnostic
     # The classifier agrees with the preservation check: any repair that
     # clears the payload rejection must change the payload, which is vetoed.
     from coding_review_agent_loop.repair_preservation import validate_repair_preservation
@@ -5629,7 +5791,6 @@ def test_parent_direct_resume_keeps_managed_child_authority(tmp_path, monkeypatc
 
 # --- #2009: staging_feasibility alias in a patch, actionable replan feedback ---
 
-from coding_review_agent_loop.errors import SemanticPatchUnknownPriorItemDispositionError  # noqa: E402
 
 
 def test_m2009_patch_with_separable_validates_as_safe_without_replan_routing(caplog):
@@ -5693,8 +5854,8 @@ def test_m2009_unknown_staging_feasibility_replan_feedback_lists_allowed_values(
     assert "Corrected revision." in _published(runner)
 
 
-def test_m2009_same_round_ids_dispositioned_as_carried_name_the_fix():
-    """#2009: the ledger rejection lists unknown IDs, the carried ID and the rule."""
+def test_m2100_same_round_ids_dispositioned_as_carried_are_dropped():
+    """#2100 (supersedes the #2009 rejection): non-carried IDs are dropped and recorded."""
     fresh = _m976_full_plan_state()
     carried = (dataclasses.replace(_m979_carried_item(), item_id="item-8"),)
     patch = json.loads(_m976_patch(fresh, summary="Patch.").split("\n<!--", 1)[0])
@@ -5702,25 +5863,14 @@ def test_m2009_same_round_ids_dispositioned_as_carried_name_the_fix():
         {"item_id": f"item-{index}", "disposition": "resolved", "note": "Handled."}
         for index in range(1, 9)
     ]
-    rejected = json.dumps(patch) + PLAN_FOOTER
-    with pytest.raises(SemanticPatchUnknownPriorItemDispositionError) as error:
-        response_validation._validate_plan_revision_patch_response(
-            rejected, unresolved_items=carried
-        )
-    # The strip path still reads the structured attributes unchanged.
-    assert error.value.unknown_ids == tuple(f"item-{index}" for index in range(1, 8))
-    assert error.value.allowed_ids == ("item-8",)
-    message = str(error.value)
-    assert "Same-round findings are informational only and take no disposition" in message
-    assert "Remove ID(s) item-1, item-2, item-3, item-4, item-5, item-6, item-7" in message
-    assert "Only these carried prior IDs may take a disposition: item-8." in message
-    rejection = validated_agent._semantic_patch_payload_rejection(
-        error.value,
-        text=rejected,
-        normalized=None,
-        payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
-            payload, unresolved_items=carried
-        ),
+    text = json.dumps(patch) + PLAN_FOOTER
+    parsed = response_validation._validate_plan_revision_patch_response(
+        text, unresolved_items=carried
     )
-    assert rejection is not None
-    assert "Only these carried prior IDs may take a disposition: item-8." in rejection[1]
+    assert parsed.ignored_prior_disposition_ids == tuple(f"item-{index}" for index in range(1, 8))
+    assert [d.item_id for d in parsed.prior_plan_item_dispositions] == ["item-8"]
+    payload_parsed = response_validation._validate_plan_revision_patch_payload(
+        json.loads(text.split("\n<!--", 1)[0]), unresolved_items=carried
+    )
+    assert payload_parsed.ignored_prior_disposition_ids == parsed.ignored_prior_disposition_ids
+    assert [d["item_id"] for d in payload_parsed.to_payload()["prior_plan_item_dispositions"]] == ["item-8"]

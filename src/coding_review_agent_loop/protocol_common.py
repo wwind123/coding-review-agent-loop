@@ -54,6 +54,61 @@ BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>.+?)\s*$")
 
 HUMAN_REQUIREMENT_STABLE_ID_RE = re.compile(r"^hr-[0-9a-f]{64}$", re.I)
 
+# Ledger item IDs (owned here so the disposition partition shares the parser's rule).
+ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Optional keyword shape for live validation: (carried IDs, carried alias IDs).
+CarriedItemIds = tuple[frozenset[str], frozenset[str]]
+
+
+def normalized_disposition_item_id(entry: object) -> str | None:
+    """The item ID a disposition parser would read from ``entry``, else None.
+
+    Mirrors ``_expect_item_id``: a JSON object whose ``item_id`` is a string
+    that, stripped, is non-empty and matches ``ITEM_ID_RE``.  Any other shape
+    yields None so the caller keeps the entry and the parser's own shape error
+    fires exactly as before (#2100).
+    """
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("item_id")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or not ITEM_ID_RE.fullmatch(normalized):
+        return None
+    return normalized
+
+
+def partition_raw_dispositions(
+    raw_entries: object,
+    carried_ids: frozenset[str] | set[str],
+    alias_ids: frozenset[str] | set[str] = frozenset(),
+) -> tuple[object, tuple[str, ...]]:
+    """Split a raw disposition array into kept entries and dropped IDs (#2100).
+
+    Runs on the raw JSON array before ``_expect_disposition_list``, so every
+    parser-derived per-entry record (and its array index) is produced only for
+    kept entries.  An entry is dropped only when its normalized ``item_id`` is
+    well formed and is neither a carried ID nor a carried alias.  Malformed
+    entries and non-arrays are kept for the parser to reject as today.  There
+    is no count or length bound, and this never raises.  Dropped IDs are
+    deduplicated and sorted.
+    """
+    if not isinstance(raw_entries, list):
+        return raw_entries, ()
+    allowed = set(carried_ids) | set(alias_ids)
+    kept: list[object] = []
+    dropped: set[str] = set()
+    for entry in raw_entries:
+        item_id = normalized_disposition_item_id(entry)
+        if item_id is not None and item_id not in allowed:
+            dropped.add(item_id)
+            continue
+        kept.append(entry)
+    return kept, tuple(sorted(dropped))
+
+
 PARSE_DEGRADATION_FIELD_CHARS = 200
 
 PARSE_DEGRADATION_PREVIEW_CHARS = 120

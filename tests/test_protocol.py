@@ -1135,14 +1135,15 @@ def test_validate_plan_review_response_rejects_duplicate_item_ids():
         )
 
 
-def test_validate_plan_review_response_rejects_unknown_item_ids():
+def test_validate_plan_review_response_unknown_item_cannot_satisfy_a_carried_item():
+    # #2100: item-9 is dropped, so carried item-1 is still missing.
     review = structured_plan_review(
         state="approved",
         summary="Looks good now.",
         prior_plan_item_dispositions=[{"item_id": "item-9", "disposition": "resolved"}],
     )
 
-    with pytest.raises(UnknownPriorItemDispositionError, match="item-9"):
+    with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved plan items: item-1"):
         _validate_plan_review_response(
             review,
             reviewer="OpenAI Codex",
@@ -1158,23 +1159,21 @@ def test_validate_plan_review_response_rejects_unknown_item_ids():
         )
 
 
-def test_validate_plan_review_response_rejects_unknown_item_with_empty_prior_ledger():
+def test_validate_plan_review_response_drops_unknown_item_with_empty_prior_ledger():
     review = structured_plan_review(
         state="approved",
         summary="Looks good now.",
         prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
     )
 
-    with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_plan_review_response(
-            review,
-            reviewer="OpenAI Codex",
-            unresolved_items=(), architecture_status_mode="legacy",
-        )
+    parsed = _validate_plan_review_response(
+        review,
+        reviewer="OpenAI Codex",
+        unresolved_items=(), architecture_status_mode="legacy",
+    )
 
-    assert exc_info.value.unknown_ids == ("item-1",)
-    assert exc_info.value.allowed_ids == ()
-    assert "Same-round findings are informational only" in exc_info.value.same_round_description
+    assert parsed.dispositions == ()
+    assert parsed.ignored_prior_disposition_ids == ("item-1",)
 
 
 def test_unknown_prior_item_disposition_error_message_includes_ids():
@@ -1190,7 +1189,7 @@ def test_unknown_prior_item_disposition_error_message_includes_ids():
     assert "item-17" in message
 
 
-def test_validate_plan_review_response_describes_same_round_unknown_item():
+def test_validate_plan_review_response_drops_same_round_unknown_item():
     review = structured_plan_review(
         state="approved",
         summary="Looks good now.",
@@ -1204,15 +1203,16 @@ def test_validate_plan_review_response_describes_same_round_unknown_item():
         status="same-plan",
     )
 
-    with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_plan_review_response(
-            review,
-            reviewer="OpenAI Codex",
-            unresolved_items=(),
-            current_round_items=(current_round_item,), architecture_status_mode="legacy",
-        )
+    parsed = _validate_plan_review_response(
+        review,
+        reviewer="OpenAI Codex",
+        unresolved_items=(),
+        current_round_items=(current_round_item,), architecture_status_mode="legacy",
+    )
 
-    assert "item-2" in exc_info.value.same_round_description
+    # A same-round ID is not carried, so its disposition is dropped (#2100).
+    assert parsed.dispositions == ()
+    assert parsed.ignored_prior_disposition_ids == ("item-2",)
 
 
 def test_validate_plan_review_response_accepts_structured_resolved_dispositions():
@@ -1450,23 +1450,22 @@ def test_validate_review_response_accepts_structured_resolved_dispositions():
     ]
 
 
-def test_validate_review_response_rejects_unknown_item_with_empty_prior_ledger():
+def test_validate_review_response_drops_unknown_item_with_empty_prior_ledger():
+    # #2100: a non-carried disposition is dropped and recorded, not rejected.
     review = structured_pr_review(
         state="approved",
         summary="LGTM.",
         prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
     )
 
-    with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_review_response(
-            review,
-            reviewer="OpenAI Codex",
-            unresolved_items=(), architecture_status_mode="legacy",
-        )
+    parsed = _validate_review_response(
+        review,
+        reviewer="OpenAI Codex",
+        unresolved_items=(), architecture_status_mode="legacy",
+    )
 
-    assert exc_info.value.unknown_ids == ("item-1",)
-    assert exc_info.value.allowed_ids == ()
-    assert "Same-round findings are informational only" in exc_info.value.same_round_description
+    assert parsed.dispositions == ()
+    assert parsed.ignored_prior_disposition_ids == ("item-1",)
 
 
 def test_validate_review_response_rejects_ambiguous_blanket_prose():
@@ -4432,7 +4431,7 @@ def test_validate_plan_revision_response_rejects_marker_only_markdown():
         )
 
 
-def test_validate_plan_revision_response_rejects_unknown_prior_disposition():
+def test_validate_plan_revision_response_drops_unknown_prior_disposition():
     revision = structured_plan_revision(
         prior_plan_item_dispositions=[
             {"item_id": "item-15", "disposition": "resolved"},
@@ -4446,11 +4445,13 @@ def test_validate_plan_revision_response_rejects_unknown_prior_disposition():
         status="blocking",
     )
 
-    with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_plan_revision_response(revision, unresolved_items=(active_item,), architecture_status_mode="legacy")
+    parsed = _validate_plan_revision_response(
+        revision, unresolved_items=(active_item,), architecture_status_mode="legacy"
+    )
 
-    assert exc_info.value.unknown_ids == ("item-15",)
-    assert exc_info.value.allowed_ids == ("item-12",)
+    # #2100: dropped and recorded; plan candidates gain no completeness check.
+    assert parsed.prior_plan_item_dispositions == ()
+    assert parsed.ignored_prior_disposition_ids == ("item-15",)
 
 
 def test_render_canonical_plan_revision_rejects_unknown_prior_disposition_without_keyerror():

@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,22 @@ SPOOLED_RESPONSE_FIELDS: tuple[str, ...] = (
     "acquisition_returncode",
     "seat_binding",
 )
+
+# Optional response fields persisted only when present, so records without
+# them stay byte-identical: the #2100 ignored non-carried disposition IDs.
+OPTIONAL_SPOOLED_RESPONSE_FIELDS: tuple[str, ...] = ("ignored_prior_disposition_ids",)
+
+
+def _spooled_response(fields: Mapping[str, object]) -> dict[str, object]:
+    return {
+        **{name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS},
+        **{
+            name: fields[name]
+            for name in OPTIONAL_SPOOLED_RESPONSE_FIELDS
+            if fields.get(name) is not None
+        },
+    }
+
 
 _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -138,7 +155,7 @@ class ReviewRoundSpool:
             reviewer_name,
             {
                 "carrier_protocol": CARRIER_PROTOCOL,
-                "response": {name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS},
+                "response": _spooled_response(fields),
             },
         )
 
@@ -276,7 +293,7 @@ class ReviewRoundSpool:
         response = payload.get("response")
         if not isinstance(response, dict) or not isinstance(response.get("text"), str):
             return None
-        return {name: response.get(name) for name in SPOOLED_RESPONSE_FIELDS}
+        return _spooled_response(response)
 
     def record_exists(self, reviewer_name: str) -> bool:
         return self._path(reviewer_name).exists()

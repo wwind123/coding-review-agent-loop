@@ -182,8 +182,11 @@ def test_visual_dispositions_are_explicit_and_scope_isolated():
         visual.validate_visual(clean, reviewer='OpenAI Codex', items=(item,))
     resolved = structured_pr_review(prior_item_dispositions=[{'item_id':'item-1','disposition':'resolved'}])
     assert visual.validate_visual(resolved, reviewer='OpenAI Codex', items=(item,)).state == 'approved'
-    with pytest.raises(AgentLoopError):
-        _validate_review_response(resolved, reviewer='OpenAI Codex', unresolved_items=(item,), architecture_status_mode='strict')
+    # An ordinary review cannot dispose a visual item: since #2100 the entry is
+    # dropped and recorded rather than rejected, and it is never applied.
+    ordinary = _validate_review_response(resolved, reviewer='OpenAI Codex', unresolved_items=(item,), architecture_status_mode='strict')
+    assert ordinary.dispositions == ()
+    assert ordinary.ignored_prior_disposition_ids == ('item-1',)
     assert _validate_review_response(clean, reviewer='OpenAI Codex', unresolved_items=(item,), architecture_status_mode='strict').state == 'approved'
 
 

@@ -78,6 +78,8 @@ _SPILL_FIELDS = (
     "risk_test_matrix_marker",
     # Advisory human-checks list (#2063): unbounded, lossless via sidecars.
     "human_checks",
+    # Dropped non-carried disposition IDs (#2100): unbounded, lossless via sidecars.
+    "ignored_prior_disposition_ids",
     # Review-state growth fields go last (#953).  They grow with review
     # history and matrix size rather than with the change under review, so a
     # long review would otherwise become unpostable.  The loop stops as soon

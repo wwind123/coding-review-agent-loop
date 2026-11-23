@@ -3067,6 +3067,8 @@ plus a short note naming the omitted item IDs, under the existing round
 publication barrier. The re-ask uses the shared same-agent re-ask budget (at
 most two per turn, #2066), neither the retry budget nor the Antigravity model
 fallback. An omission that survives both re-asks stops as before (#1167).
+A disposition for an ID that is not carried never counts toward a carried
+item: it is dropped (#2100), so the carried item is still reported missing.
 
 The same re-ask covers a required reviewer judgement field. When a fresh
 `plan_review` or `pr_review` has an absent, null, blank, non-string, or
@@ -10368,9 +10370,19 @@ forbidden. Only that kind of re-ask can bring new run-tests receipts into the
 turn; every other re-ask keeps the receipts of the turn that ran the tests.
 
 Purely mechanical fixes never call a model: envelope trimming (fences,
-reversed footer and signature), lone-string risk-matrix list fields, the
-semantic-patch `rationale` alias and stripping unknown prior-item dispositions
-proven to be resolved history.
+reversed footer and signature), lone-string risk-matrix list fields and the
+semantic-patch `rationale` alias.
+
+A plan revision (semantic patch or full state), plan review or PR review that
+gives dispositions to item IDs that are not carried is not rejected. Those
+entries are dropped, the rest of the response is accepted, and no re-ask or
+replan follows (#2100). The published comment names the dropped IDs in an
+`### Ignored prior-item dispositions` note, for example `Ignored dispositions
+for non-carried IDs: item-1, item-2`. When the list is too long for the note,
+it shows a count and points to the round metadata, which always holds the
+complete list. The bounded plan digest shows only the count. The dropped
+entries are also removed from the stored response text, so resume and
+publication see the same dispositions as live validation.
 
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
 `--repair-timeout-seconds` and `--containment-repair-*` are deprecated no-ops

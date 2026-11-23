@@ -29,6 +29,9 @@ from .review_scheduling import normalize_fix_scope
 from .protocol_common import (
     ANY_HEADING_RE,
     BULLET_RE,
+    CarriedItemIds,
+    ITEM_ID_RE,
+    partition_raw_dispositions,
     HTML_COMMENT_RE,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -125,7 +128,6 @@ PRIOR_UNRESOLVED_PLAN_ITEM_DISPOSITIONS_HEADING_RE = _followup_heading_re(
 )
 HEADING_LEVEL_RE = re.compile(r"^\s*(#{1,6})\s+\S")
 THEMATIC_BREAK_RE = re.compile(r"^\s*(?:([-*_])\s*){3,}\s*$")
-ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 def _empty_placeholder_re(*phrases: str) -> re.Pattern[str]:
     joined = "|".join(phrases)
@@ -419,6 +421,9 @@ class ParsedReview:
     post_merge_obligations: tuple[ObligationRequest, ...] = ()
     # Parser-derived: a coder-only top-level field was dropped (#2026).
     dropped_human_requirement_dispositions: bool = False
+    # Parser-derived (#2100): well-formed disposition IDs outside the live
+    # carried set, dropped before parsing.  Never part of any payload encoding.
+    ignored_prior_disposition_ids: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -457,6 +462,9 @@ class ParsedPlanReview:
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
     # Finding provenance tags that degraded to untagged (#1505).
     provenance_degradations: tuple[ParseDegradation, ...] = ()
+    # Parser-derived (#2100): well-formed disposition IDs outside the live
+    # carried set, dropped before parsing.  Never part of any payload encoding.
+    ignored_prior_disposition_ids: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1327,6 +1335,9 @@ class StructuredPlanRevision:
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
     # Absent unless the planner justified keeping a grown plan one-shot (#886).
     one_shot_growth_justification: OneShotGrowthJustification | None = None
+    # Parser-derived (#2100): well-formed disposition IDs outside the live
+    # carried set, dropped before parsing.  Never part of any payload encoding.
+    ignored_prior_disposition_ids: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -3152,6 +3163,16 @@ def _degradable_sub_item_dispositions(
     return tuple(pairs)
 
 
+def _partition_live_dispositions(
+    raw_entries: object, carried_item_ids: CarriedItemIds | None
+) -> tuple[object, tuple[str, ...]]:
+    """Apply the #2100 pre-parse partition only for live validation."""
+    if carried_item_ids is None:
+        return raw_entries, ()
+    carried, aliases = carried_item_ids
+    return partition_raw_dispositions(raw_entries, carried, aliases)
+
+
 def _expect_disposition_list(
     value: object,
     *,
@@ -3345,6 +3366,7 @@ PR_REVIEW_DISPOSITIONS_DROP_MESSAGE = (
 def parse_structured_pr_review(
     text: str, *, reviewer: str, architecture_status_mode: str = "strict",
     parse_requirement_evidence: bool = True,
+    carried_item_ids: CarriedItemIds | None = None,
 ) -> ParsedReview | None:
     """Parse a structured PR review.
 
@@ -3400,8 +3422,11 @@ def parse_structured_pr_review(
         payload, "future_followups", context="pr_review.future_followups", reviewer=reviewer,
         degradations=sub_item_degradations, allow_sub_items=False,
     )
+    raw_dispositions, ignored_ids = _partition_live_dispositions(
+        payload["prior_item_dispositions"], carried_item_ids
+    )
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
-        payload["prior_item_dispositions"],
+        raw_dispositions,
         context="pr_review.prior_item_dispositions",
         reviewer=reviewer,
         allowed_same_status="same-pr",
@@ -3450,7 +3475,8 @@ def parse_structured_pr_review(
     return dataclasses.replace(parsed, requirement_evidence=associations, exact_head_evidence_requests=evidence_requests,
                                screenshot_requests=typed, screenshot_coverage_acceptances=votes,
                                post_merge_obligations=obligations,
-                               dropped_human_requirement_dispositions=dropped_dispositions)
+                               dropped_human_requirement_dispositions=dropped_dispositions,
+                               ignored_prior_disposition_ids=ignored_ids)
 
 
 def _expect_evidence_request_list(
@@ -3521,6 +3547,7 @@ def parse_structured_plan_review(
     reviewer: str,
     architecture_status_mode: str = "strict",
     surfaced_requirement_ids: Sequence[str] | None = None,
+    carried_item_ids: CarriedItemIds | None = None,
 ) -> ParsedPlanReview | None:
     payload = _extract_structured_plan_review_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -3560,8 +3587,11 @@ def parse_structured_plan_review(
         "future_followups",
         context="plan_review.future_followups",
     )
+    raw_dispositions, ignored_ids = _partition_live_dispositions(
+        payload["prior_plan_item_dispositions"], carried_item_ids
+    )
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
-        payload["prior_plan_item_dispositions"],
+        raw_dispositions,
         context="plan_review.prior_plan_item_dispositions",
         reviewer=reviewer,
         allowed_same_status="same-plan",
@@ -3618,6 +3648,8 @@ def parse_structured_plan_review(
         parsed = dataclasses.replace(
             parsed, provenance_degradations=tuple(provenance_degradations)
         )
+    if ignored_ids:
+        parsed = dataclasses.replace(parsed, ignored_prior_disposition_ids=ignored_ids)
     return parsed
 
 
@@ -4171,6 +4203,7 @@ def validate_structured_plan_revision(
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     require_child_dispositions: bool = False,
     architecture_status_mode: str = "strict",
+    carried_item_ids: CarriedItemIds | None = None,
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -4223,8 +4256,11 @@ def validate_structured_plan_revision(
     if state != "blocking":
         raise AgentLoopError("plan_revision.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
     summary = _expect_non_empty_string(payload["summary"], context="plan_revision.summary")  # shape-check: fatal:no-conservative-reading
+    raw_dispositions, ignored_ids = _partition_live_dispositions(
+        payload["prior_plan_item_dispositions"], carried_item_ids
+    )
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
-        payload["prior_plan_item_dispositions"],
+        raw_dispositions,
         context="plan_revision.prior_plan_item_dispositions",
         reviewer="coder",
         allowed_same_status="same-plan",
@@ -4275,6 +4311,7 @@ def validate_structured_plan_revision(
         one_shot_growth_justification=_expect_optional_growth_justification(  # shape-check: fatal:no-conservative-reading
             payload, context="plan_revision"
         ),
+        ignored_prior_disposition_ids=ignored_ids,
     )
 
 
@@ -4770,10 +4807,12 @@ def parse_review(text: str, *, reviewer: str) -> ParsedReview:
 def parse_pr_review(
     text: str, *, reviewer: str, architecture_status_mode: str = "strict",
     parse_requirement_evidence: bool = True,
+    carried_item_ids: CarriedItemIds | None = None,
 ) -> ParsedReview:
     parsed = parse_structured_pr_review(  # shape-check: fatal:unparseable-envelope
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode,
         parse_requirement_evidence=parse_requirement_evidence,
+        carried_item_ids=carried_item_ids,
     )
     if parsed is not None:
         return parsed
@@ -4786,6 +4825,7 @@ def parse_plan_review(
     reviewer: str,
     architecture_status_mode: str = "strict",
     surfaced_requirement_ids: Sequence[str] | None = None,
+    carried_item_ids: CarriedItemIds | None = None,
 ) -> ParsedPlanReview:
     """Parse a plan review, including state, structured plan items, and dispositions."""
     parsed = parse_structured_plan_review(  # shape-check: fatal:unparseable-envelope
@@ -4793,6 +4833,7 @@ def parse_plan_review(
         reviewer=reviewer,
         architecture_status_mode=architecture_status_mode,
         surfaced_requirement_ids=surfaced_requirement_ids,
+        carried_item_ids=carried_item_ids,
     )
     if parsed is not None:
         return parsed
@@ -4934,6 +4975,9 @@ class PlanRevisionPatch:
     base_round_number: int
     base_state_identity: str
     operations: tuple[PlanRevisionPatchOperation, ...]
+    # Parser-derived (#2100): well-formed disposition IDs outside the live
+    # carried set, dropped before parsing.  Never part of any payload encoding.
+    ignored_prior_disposition_ids: tuple[str, ...] = field(default=(), compare=False)
 
     def to_payload(self) -> dict[str, object]:
         return _json_array_mapping({
@@ -5146,8 +5190,18 @@ def _parse_plan_revision_patch_operation(value: object, *, context: str) -> Plan
     )
 
 
-def parse_plan_revision_patch(value: object, *, context: str = "plan_revision_patch") -> PlanRevisionPatch:
-    """Strictly parse a revision-only semantic patch contract v1."""
+def parse_plan_revision_patch(
+    value: object,
+    *,
+    context: str = "plan_revision_patch",
+    carried_item_ids: CarriedItemIds | None = None,
+) -> PlanRevisionPatch:
+    """Strictly parse a revision-only semantic patch contract v1.
+
+    ``carried_item_ids`` (live validation only, #2100) drops dispositions for
+    well-formed IDs outside the carried set before parsing and records them on
+    the result; historical and sidecar decoding pass None and are unchanged.
+    """
     if isinstance(value, PlanRevisionPatch):
         return value
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
@@ -5175,8 +5229,11 @@ def parse_plan_revision_patch(value: object, *, context: str = "plan_revision_pa
     if state != "blocking":
         raise AgentLoopError(f"{context}.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
     summary = _expect_non_empty_string(payload["summary"], context=f"{context}.summary")  # shape-check: fatal:no-conservative-reading
+    raw_dispositions, ignored_ids = _partition_live_dispositions(
+        payload["prior_plan_item_dispositions"], carried_item_ids
+    )
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
-        payload["prior_plan_item_dispositions"],
+        raw_dispositions,
         context=f"{context}.prior_plan_item_dispositions",
         reviewer="coder",
         allowed_same_status="same-plan",
@@ -5207,10 +5264,13 @@ def parse_plan_revision_patch(value: object, *, context: str = "plan_revision_pa
         base_round_number=round_number,
         base_state_identity=identity,
         operations=operations,
+        ignored_prior_disposition_ids=ignored_ids,
     )
 
 
-def validate_structured_plan_revision_patch(text: str) -> PlanRevisionPatch | None:
+def validate_structured_plan_revision_patch(
+    text: str, *, carried_item_ids: CarriedItemIds | None = None
+) -> PlanRevisionPatch | None:
     """Validate a patch response with the normal plan-state footer."""
     payload = _extract_structured_plan_revision_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -5219,4 +5279,6 @@ def validate_structured_plan_revision_patch(text: str) -> PlanRevisionPatch | No
         raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
             f"Structured response kind mismatch: expected `{PLAN_REVISION_PATCH_KIND}`."
         )
-    return parse_plan_revision_patch(payload)  # shape-check: fatal:no-conservative-reading
+    return parse_plan_revision_patch(  # shape-check: fatal:no-conservative-reading
+        payload, carried_item_ids=carried_item_ids
+    )
