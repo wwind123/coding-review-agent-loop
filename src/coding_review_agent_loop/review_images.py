@@ -46,7 +46,8 @@ def mask_visual_protocol_bodies(bodies, config):
     undecodable payload is not identifiable and stays on the strict path.
     """
     bodies = tuple(bodies)
-    if visual_review_requested(config):
+    # Without a config the caller's opt-in is unknown: keep today's strict view.
+    if config is None or visual_review_requested(config):
         return bodies, (0,) * len(bodies)
     from .round_metadata import _strip_round_metadata
     from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
@@ -82,7 +83,8 @@ def _item_number_high_water(payload):
                 continue
             aliases = item.get('alias_item_ids')
             for item_id in (item.get('item_id'), *(aliases if isinstance(aliases, list) else ())):
-                if isinstance(item_id, str) and (found := re.fullmatch(r'item-(\d+)', item_id)):
+                # Bounded digits: reservation must never raise on a masked record.
+                if isinstance(item_id, str) and (found := re.fullmatch(r'item-([0-9]{1,18})', item_id)):
                     numbers.append(int(found.group(1)))
     return max(numbers)
 

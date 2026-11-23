@@ -143,17 +143,19 @@ def refresh_repair_reference(runner, *, config, pr_number, metadata, contract, c
         return checkpoint
 
 
-def resolve_legacy_reference(page, contract, checkpoint):
+def resolve_legacy_reference(page, contract, checkpoint, config=None):
     """Require a unique completed intent inside the authenticated failure round."""
     from .round_state import _extract_round_metadata_records
     from .pr_round_ingestion import owned_rest_protocol_bodies
     # Prove candidate identities before the narrower contract-author projection.
-    owned_rest_protocol_bodies(page, actor_id=contract.trusted_actor_id)
+    owned = owned_rest_protocol_bodies(page, actor_id=contract.trusted_actor_id, config=config)
     # GitHub user objects carry extra fields; compare only the authenticated pair.
-    trusted = [c for c in page if isinstance(c, dict) and isinstance(c.get('user'), dict)
-               and c['user'].get('login') == contract.trusted_actor_login
-               and c['user'].get('id') == contract.trusted_actor_id]
-    records = _extract_round_metadata_records([SimpleNamespace(body=c.get('body')) for c in trusted], flow='pr')
+    pairs = [(c, body) for c, body in zip(page, owned) if isinstance(c, dict) and isinstance(c.get('user'), dict)
+             and c['user'].get('login') == contract.trusted_actor_login
+             and c['user'].get('id') == contract.trusted_actor_id]
+    trusted = [c for c, _ in pairs]
+    # A no-option run decodes the masked bodies, so visual records stay inert (#2070).
+    records = _extract_round_metadata_records([SimpleNamespace(body=body) for _, body in pairs], flow='pr')
     anchors = [(trusted[r.index], r.metadata) for r in records
                if r.metadata.qualification_checkpoint is not None
                and r.metadata.qualification_checkpoint.obligation_identity == checkpoint.obligation_identity
@@ -204,7 +206,7 @@ def observe_repair_result(runner, *, config, pr_number, metadata, contract, chec
     try:
         page = ci._read_intent_comment_page(runner, config, pr_number)
         ref = checkpoint.failed_managed_run or resolve_legacy_reference(
-            page, replace(contract, repository=config.repo, pr_number=pr_number), checkpoint)
+            page, replace(contract, repository=config.repo, pr_number=pr_number), checkpoint, config)
         if ref is None:
             return None
         if (ref.repository, ref.pr_number, ref.head_sha, ref.base_ref, ref.obligation_identity) != (
@@ -301,7 +303,7 @@ def reconcile_repair_checkpoint(runner, *, config, pr_number, metadata, contract
         try:
             page = ci._read_intent_comment_page(runner, config, pr_number)
             reference = resolve_legacy_reference(
-                page, replace(contract, repository=config.repo, pr_number=pr_number), checkpoint)
+                page, replace(contract, repository=config.repo, pr_number=pr_number), checkpoint, config)
             if reference is not None:
                 checkpoint = replace(checkpoint, failed_managed_run=reference)
         except (AgentLoopError, KeyError, TypeError, ValueError):

@@ -1575,21 +1575,25 @@ def _append_undecodable_visual(runner, kind):
     """An owned visual record that today's strict codec cannot decode at all."""
     import base64
     from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE, decode_mapping
-    if kind == 'malformed-coverage-with-items':
+    if kind in {'malformed-coverage-with-items', 'oversized-item-id'}:
         _append_visual_review(runner, (_visual_item(7, 'Undecodable visual blocker'),))
     else:
         _append_lifecycle(runner, value={'version': 1, 'kind': 'result'})
     comment = runner.pr_payload['comments'][-1]
     match = ROUND_RESUME_MARKER_RE.search(comment['body'])
     payload = decode_mapping(match.group('payload'))
-    payload['screenshot_coverage'] = (
-        {'$round_transport_spill': 'gone', 'parts': 1, 'sha256': '0' * 64, 'spill': '0' * 64}
-        if kind == 'missing-coverage-sidecar' else {'version': 99})
+    if kind == 'oversized-item-id':
+        # Item reservation must never raise, even past Python's int-string limit.
+        payload['new_items'][0]['item_id'] = 'item-' + '9' * 4301
+    else:
+        payload['screenshot_coverage'] = (
+            {'$round_transport_spill': 'gone', 'parts': 1, 'sha256': '0' * 64, 'spill': '0' * 64}
+            if kind == 'missing-coverage-sidecar' else {'version': 99})
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     comment['body'] = comment['body'][:match.start('payload')] + encoded + comment['body'][match.end('payload'):]
 
 
-@pytest.mark.parametrize('kind', UNDECODABLE_KINDS)
+@pytest.mark.parametrize('kind', [*UNDECODABLE_KINDS, 'oversized-item-id'])
 def test_no_visual_flags_ignores_undecodable_visual_record(visual_setup, monkeypatch, kind):
     config, calls, _ = visual_setup
     runner = FakeRunner(

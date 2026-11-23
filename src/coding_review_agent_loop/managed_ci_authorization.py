@@ -664,7 +664,7 @@ def find_actor_round_metadata_comment_ids(
                 "Managed-CI continuity could not inspect PR round metadata comments.", reason
             )
         )
-    by_index = _continuity_round_records(comments, actor_id=actor_id)
+    by_index = _continuity_round_records(comments, actor_id=actor_id, config=config)
     reviewers: list[int] = []
     coders: list[int] = []
     conflict_coders: list[int] = []
@@ -745,7 +745,7 @@ def find_actor_round_metadata_comment_ids(
 
 
 def _continuity_round_records(
-    comments: list[dict[str, object]], *, actor_id: int | None = None,
+    comments: list[dict[str, object]], *, actor_id: int | None = None, config: object = None,
 ) -> dict[int, dict[str, object]]:
     """Decode continuity fields after partitioning live REST input by actor."""
     bodies = tuple(
@@ -754,7 +754,7 @@ def _continuity_round_records(
     )
     if actor_id is not None:
         from .pr_round_ingestion import owned_rest_protocol_bodies
-        bodies = owned_rest_protocol_bodies(comments, actor_id=actor_id)
+        bodies = owned_rest_protocol_bodies(comments, actor_id=actor_id, config=config)
     result: dict[int, dict[str, object]] = {}
     for index, body in enumerate(bodies):
         matches = tuple(ROUND_RESUME_MARKER_RE.finditer(body))
@@ -909,7 +909,7 @@ def _ordinary_continuity_round_metadata_is_valid(
     if authorization.kind != "continuity" or not authorization.round_comment_ids:
         return False
     try:
-        by_index = _continuity_round_records(comments, actor_id=authorization.actor_id)
+        by_index = _continuity_round_records(comments, actor_id=authorization.actor_id, config=config)
     except AgentLoopError:
         return False
     selected: list[tuple[int, dict[str, object]]] = []
@@ -1660,7 +1660,7 @@ def _recovery_continuity_is_valid(
     ):
         return False
     try:
-        by_index = _continuity_round_records(comments, actor_id=context.actor_id)
+        by_index = _continuity_round_records(comments, actor_id=context.actor_id, config=context.config)
     except AgentLoopError:
         return False
     wanted = set(authorization.round_comment_ids)

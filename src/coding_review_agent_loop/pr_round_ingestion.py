@@ -279,7 +279,7 @@ def extract_admitted_round_records(
 
 
 def owned_rest_protocol_bodies(
-    comments: Sequence[dict[str, object]], *, actor_id: int,
+    comments: Sequence[dict[str, object]], *, actor_id: int, config: object = None,
 ) -> tuple[str, ...]:
     """Mask a complete REST-only codec input without changing its index joins.
 
@@ -303,7 +303,9 @@ def owned_rest_protocol_bodies(
         owned_body = body if author_id == actor_id and isinstance(body, str) else ""
         validate_owned_round_envelope(owned_body, index=index, comment_id=comment_id)
         bodies.append(owned_body)
-    return tuple(bodies)
+    # A no-option run masks owned visual records here too (#2070).
+    from .review_images import mask_visual_protocol_bodies
+    return mask_visual_protocol_bodies(bodies, config)[0]
 
 
 def synthetic_dry_run_observation(runner: Runner, config: AgentLoopConfig) -> bool:
