@@ -2458,6 +2458,16 @@ def test_m2100_patch_with_non_carried_dispositions_is_accepted_without_replan(tm
     assert [entry["item_id"] for entry in raw["prior_plan_item_dispositions"]] == ["item-1"]
     raw_patch = metadata.raw_patch_provenance
     assert "item-43" not in json.dumps(raw_patch) and "item-13" not in json.dumps(raw_patch)
+    # Resume reads the authenticated sidecar: it decodes, its identity matches
+    # the round record, and no dropped ID reappears in its dispositions.
+    from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
+
+    sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    assert sidecar.aggregate_identity == metadata.aggregate_plan_identity
+    canonical = json.dumps(sidecar.canonical_json)
+    assert "item-43" not in canonical and "item-13" not in canonical
+    assert "item-1" in canonical
+    assert sidecar.raw_patch == raw_patch
     assert runner.diagnostic_posts == []
 
 
