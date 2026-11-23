@@ -7828,11 +7828,11 @@ def _parse_plan_1328(item):
 
 def test_plan_review_unknown_string_list_key_folds_1328(caplog):
     with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
-        parsed = _parse_plan_1328({"finding": "Gap.", "evidence_row_ids": ["row-1"]})
-    assert [item.text for item in parsed.items.blocking] == ["Gap. evidence_row_ids: row-1"]
+        parsed = _parse_plan_1328({"finding": "Gap.", "related_rows": ["row-1"]})
+    assert [item.text for item in parsed.items.blocking] == ["Gap. related_rows: row-1"]
     warnings = _fold_warnings_1328(caplog)
     assert len(warnings) == 1
-    assert "evidence_row_ids" in warnings[0] and "row-1" not in warnings[0]
+    assert "related_rows" in warnings[0] and "row-1" not in warnings[0]
 
 
 def test_plan_review_folded_keys_order_1328(caplog):

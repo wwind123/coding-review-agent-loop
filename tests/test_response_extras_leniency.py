@@ -910,3 +910,30 @@ def test_claim_correction_reader_keeps_claims_beside_unsurfaced_blocked_disposit
     assert [claim.row_id for claim in corrected.risk_test_matrix_claims.claims] == ["row-1"]
     # Every other coder-owned fact comes from the authenticated response.
     assert corrected.human_requirement_dispositions == original.human_requirement_dispositions
+
+
+# --- PR-only authority tags on plan findings (review item-8) ------------------
+#
+# Generalization: PR-only finding fields reaching a plan finding are never
+# folded into prose. That holds whether they arrive directly or through the
+# blocking_items / same_pr_followups aliases. The scheduler hint fix_scope is
+# dropped with a warning, and the authority tag evidence_row_ids rejects.
+
+
+@pytest.mark.parametrize("list_key", ["blocking_items", "same_pr_followups", "blocking_plan_issues"])
+def test_plan_finding_evidence_row_ids_rejects_directly_and_through_aliases(list_key):
+    def edit(payload):
+        payload.pop("blocking_plan_issues")
+        payload.pop("same_plan_followups")
+        payload[list_key] = [{"text": "Gap.", "evidence_row_ids": ["row-1"]}]
+
+    with pytest.raises(AgentLoopError, match="evidence_row_ids collides"):
+        parse_structured_plan_review(_edit(structured_plan_review(state="blocking"), edit), reviewer="Codex")
+
+
+def test_pr_review_blocking_items_still_accept_evidence_row_ids():
+    parsed = parse_structured_pr_review(
+        _with(structured_pr_review(state="blocking"), blocking_items=[{"text": "Gap.", "evidence_row_ids": ["row-1"]}]),
+        reviewer="Codex",
+    )
+    assert parsed.blocking_items[0].evidence_row_ids == ("row-1",)

@@ -210,7 +210,9 @@ raw agent JSON.
 - A plan-review disposition loses `sub_item_dispositions` with a
   `ParseDegradation` record (`ParsedPlanReview.disposition_degradations`), and
   the parent disposition stays authoritative. A plan finding drops a string or
-  string-list `fix_scope`.
+  string-list `fix_scope`, the PR scheduler hint. The PR-only authority tag
+  `evidence_row_ids` is a reserved collision on any plan finding, including
+  one renamed from `blocking_items`, so it is rejected and never folded.
 - Human requirements: a surplus `checked_discussion_directly: true` is a
   warning. When dispositions are present, `addressed_ids` is derived from the
   surfaced `addressed` dispositions. Live parsers carry the derived tuple,

@@ -1928,6 +1928,10 @@ REVIEW_FINDING_RESERVED_KEYS: frozenset[str] = frozenset(
     }
     | {"disposition", "note", "sub_item_dispositions", "requirement_id", "requirement_label"}
     | {"fix_scope"}
+    # PR-only authority tag (#1324): accepted by the PR finding parser before
+    # this check, and a collision on a plan finding, including one renamed
+    # from `blocking_items` (#2114), never folded into prose.
+    | {"evidence_row_ids"}
     | set(PLAN_REVIEW_FINDING_KEY_ALIASES)
     | PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS
 )
