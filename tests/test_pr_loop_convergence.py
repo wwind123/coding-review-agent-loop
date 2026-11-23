@@ -174,73 +174,6 @@ def test_unrelated_blocks_do_not_trigger_a_step_back(tmp_path):
     assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner))
 
 
-def test_disabling_the_pr_step_back_restores_the_ordinary_prompt(tmp_path):
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
-    )
-    config = _sb_config(tmp_path, pr_step_back_rounds=0)
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert all("STEP-BACK TURN" not in prompt for prompt in _sb_coder_prompts(runner))
-    assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner))
-
-
-def _run_to_sibling(tmp_path, sibling, *, config=None, **runner_kwargs):
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review([sibling], resolved=["item-3"])],
-        **runner_kwargs,
-    )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=config or _sb_config(tmp_path))
-    return runner, str(excinfo.value)
-
-
-def test_a_sibling_in_the_sweep_review_stops_for_a_human_decision_before_another_coder_turn(tmp_path):
-    """`pr-sibling-escalation`."""
-    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
-    assert "human decision required" in message
-    assert "Generalization: any spool record that fails a validation step is malformed." in message
-    assert "--pr-step-back-rounds 0" in message and "accept a stated limitation" in message
-    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the sweep
-    assert len(_sb_codex_prompts(runner)) == 4
-
-
-def test_the_cli_maps_a_sibling_escalation_to_the_human_decision_exit_code(tmp_path, capsys):
-    """`sibling-cli-exit-code`: the live sibling stop exits 4, not the generic 1."""
-    import coding_review_agent_loop.cli as cli_module
-
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
-        codex_outputs=[
-            *_three_clustered_blocks(),
-            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
-        ],
-    )
-    config = _sb_config(tmp_path)
-
-    def drive_the_fixture(*_args, **_kwargs):
-        return run_pr_loop(runner, pr_number=77, config=config)
-
-    with patch.object(cli_module, "run_pr_loop", side_effect=drive_the_fixture):
-        assert cli_module.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
-    stderr = capsys.readouterr().err
-    assert "HUMAN DECISION REQUIRED" in stderr
-    assert "--pr-step-back-rounds 0" in stderr
-    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the sweep
-
-
-def test_a_sweep_sibling_located_only_in_a_sub_item_escalates(tmp_path):
-    """`pr-sweep-sub-item-location`."""
-    sibling = {
-        "text": "More spool validation branches are misclassified",
-        "sub_items": ["branch at src/spool.py:130 treats it as absent", "branch at src/other.py:9"],
-    }
-    runner, message = _run_to_sibling(tmp_path, sibling)
-    assert "human decision required" in message and "src/spool.py:130-130" in message
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
 def test_a_sweep_finding_outside_the_cluster_does_not_escalate(tmp_path):
     runner = _StepBackRunner(
         claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-4"])],
@@ -269,16 +202,6 @@ def test_a_carried_item_does_not_escalate_and_no_second_step_back_is_issued(tmp_
     assert len(prompts) == 4 and "STEP-BACK TURN" not in prompts[3]
 
 
-def test_a_step_back_that_shifts_lines_by_one_hundred_still_escalates_a_true_sibling(tmp_path):
-    """`pr-head-coordinate-mapping` through the orchestrator."""
-    hunks = "@@ -10,0 +11,100 @@\n"
-    _runner, message = _run_to_sibling(
-        tmp_path, "another branch at src/spool.py:230", hunks=hunks
-    )
-    assert "human decision required" in message and "SHIFTED" in message
-    assert "src/spool.py` lines 224-240" in message
-
-
 def test_unrelated_code_shifted_into_the_old_coordinates_does_not_escalate(tmp_path):
     hunks = "@@ -10,0 +11,100 @@\n"
     runner = _StepBackRunner(
@@ -291,14 +214,6 @@ def test_unrelated_code_shifted_into_the_old_coordinates_does_not_escalate(tmp_p
         hunks=hunks,
     )
     assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
-
-
-def test_an_unmappable_anchor_falls_back_to_any_finding_on_the_path(tmp_path):
-    hunks = "@@ -124,17 +123,0 @@\n"
-    _runner, message = _run_to_sibling(
-        tmp_path, "another branch at src/spool.py:900", hunks=hunks
-    )
-    assert "UNMAPPABLE" in message and "human decision required" in message
 
 
 def test_resume_after_the_step_back_record_rebuilds_the_sweep_without_a_second_step_back(tmp_path):
@@ -415,38 +330,6 @@ def test_resume_after_one_sweep_review_is_published_requests_only_the_missing_sw
     assert len([p for p in _sb_coder_prompts(runner) if "STEP-BACK TURN" in p]) == 1
 
 
-def test_a_carried_in_window_item_keeps_the_episode_open_and_a_later_sibling_escalates(tmp_path):
-    """`pr-clearance-window-membership`: live; the unit tests replay the same records."""
-    runner = _StepBackRunner(
-        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
-        codex_outputs=[
-            *_three_clustered_blocks(),
-            _sb_review(carried=["item-3"]),
-            _sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]),
-        ],
-    )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    assert "human decision required" in str(excinfo.value)
-    assert len(_sb_coder_prompts(runner)) == 4  # no fifth coder turn
-
-
-# --- review round 1 fixes (#1265) -------------------------------------------
-
-
-def test_a_sweep_sibling_arriving_exactly_at_the_round_limit_still_stops_for_a_human_decision(tmp_path):
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(["sibling at src/spool.py:134"], resolved=["item-3"])],
-    )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=4))
-    message = str(excinfo.value)
-    assert "human decision required" in message and "Reached max rounds" not in message
-    assert "Generalization:" in message
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
 def test_primary_then_panel_step_back_sweeps_only_the_primary_before_any_secondary(tmp_path):
     runner = _StepBackRunner(
         claude_outputs=_step_back_coders(),
@@ -466,26 +349,6 @@ def test_primary_then_panel_step_back_sweeps_only_the_primary_before_any_seconda
     assert all("Enumerate ALL remaining instances" not in p for p in _sb_gemini_prompts(runner))
 
 
-def test_resume_after_a_carried_in_window_sweep_review_keeps_the_episode_and_stops_on_a_sibling(tmp_path):
-    runner = _StepBackRunner(
-        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(carried=["item-3"])],
-    )
-    config = _sb_config(tmp_path)
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        # Round 4's sweep review (carrying the in-window item) and the ordinary fourth
-        # coder turn are published; the run is interrupted before round 5's review.
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_sb_coder_prompts(runner)) == 4
-    runner.codex_outputs.append(_sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]))
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=config)
-    message = str(excinfo.value)
-    assert "human decision required" in message
-    assert "Generalization: any spool record that fails a validation step is malformed." in message
-    assert len(_sb_coder_prompts(runner)) == 4  # no coder turn after the sibling
-
-
 def test_resume_after_the_kth_review_is_published_still_issues_the_step_back_turn(tmp_path):
     """Interrupted between the K-th clustered review and its coder dispatch."""
     runner = _StepBackRunner(
@@ -502,61 +365,6 @@ def test_resume_after_the_kth_review_is_published_still_issues_the_step_back_tur
     assert "STEP-BACK TURN" in prompts[-1]  # the resumed dispatch, not an ordinary follow-up
     assert len([p for p in prompts[:2] if "STEP-BACK TURN" in p]) == 0
     assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[-1]
-
-
-def test_a_rerun_after_a_sibling_stop_does_not_repeat_the_stop_for_the_old_sibling(tmp_path):
-    """The operator pushes a redesign or a documented limitation; the next review
-    blocks on something outside the cluster. The stale sibling must not stop the run."""
-    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
-    assert "human decision required" in message
-    assert len(_sb_coder_prompts(runner)) == 3
-    runner._move_head(f"{9:040x}", cwd=None)  # the operator's push
-    runner.pr_payload["headRefOid"] = f"{9:040x}"
-    # The pushed head is recovered as an unrecorded advance: the coder checks the
-    # stopped round's item, then the reviewer blocks on something outside the cluster.
-    runner.claude_outputs.extend(
-        [
-            structured_coder_followup(addressed_items=["item-4"]),
-            structured_coder_followup(addressed_items=["item-5"]),
-        ]
-    )
-    runner.codex_outputs.extend(
-        [
-            _sb_review(["unrelated at src/other.py:5"], resolved=["item-4"]),
-            _sb_review(resolved=["item-5"]),
-        ]
-    )
-    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
-    assert len(_sb_coder_prompts(runner)) == 5  # three before the stop, two after the push
-    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner)[3:])
-
-
-def test_malformed_step_back_history_suppresses_the_sibling_stop(tmp_path, monkeypatch, capsys):
-    """`sibling-no-stop-paths`: a decode failure logs and suppresses, never stops."""
-    import coding_review_agent_loop.pr_loop_support as support
-    from coding_review_agent_loop import review_step_back
-
-    real_history = review_step_back.pr_step_back_history
-
-    def degraded_once_recorded(records, reviewer):
-        entries, degraded = real_history(records, reviewer)
-        # Once the step-back entry is recorded, report its history as malformed.
-        return entries, degraded or bool(entries)
-
-    monkeypatch.setattr(support._step_back, "pr_step_back_history", degraded_once_recorded)
-    runner = _StepBackRunner(
-        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-4"])],
-        codex_outputs=[
-            *_three_clustered_blocks(),
-            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
-            _sb_review(resolved=["item-4"]),
-        ],
-    )
-    config = _sb_config(tmp_path, pr_non_convergence_rounds=0, quiet=False)
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    prompts = _sb_coder_prompts(runner)
-    assert len(prompts) == 4 and "STEP-BACK TURN" not in prompts[3]
-    assert "PR step-back suppressed for Codex: malformed step-back history" in capsys.readouterr().err
 
 
 def _external_push_after_the_kth_review(tmp_path, hunks):
@@ -607,7 +415,7 @@ def _history_runner(coder_outputs):
 def test_coder_prompts_show_prior_findings_and_fixes_when_a_sibling_arrives(tmp_path):
     """`fix-cutoff-sibling`, `pr-followup-and-same-pr`: no step-back involved."""
     runner = _history_runner(_step_back_coders())
-    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0)) == 0
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
     prompts = _sb_coder_prompts(runner)
     assert all("Proactive generalization" in prompt for prompt in prompts)
     assert all("Generalization: this generalizes the fix for" in prompt for prompt in prompts)
@@ -644,7 +452,7 @@ def test_undeclared_generalization_logs_nothing_and_proactive_tag_without_step_b
         structured_coder_followup(addressed_items=["item-3"]),
     ]
     runner = _history_runner(coders)
-    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0, quiet=False)) == 0
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, quiet=False)) == 0
     err = capsys.readouterr().err
     assert err.count("declared a generalization") == 1
     assert "(proactive)" in err
@@ -661,7 +469,7 @@ def test_an_advisory_history_failure_keeps_guidance_and_the_run_continues(
 
     monkeypatch.setattr(finding_history, "project_finding", boom)
     runner = _history_runner(_step_back_coders())
-    config = _sb_config(tmp_path, pr_step_back_rounds=0, quiet=False)
+    config = _sb_config(tmp_path, quiet=False)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     prompts = _sb_coder_prompts(runner)
     assert all("Proactive generalization" in prompt for prompt in prompts)
@@ -1511,56 +1319,73 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
         assert "53b2c9f83ff0" not in text
         assert "GitHub PR checks are failing" not in text
 
-
 # ---------------------------------------------------------------------------
-# PR fix-loop non-convergence stop (#1372)
+# One PR no-progress detector (#2097): the step-back sibling, non-convergence,
+# approach-alternative and unchanged-head stops are retired.
 # ---------------------------------------------------------------------------
 
-NC_A_TEXT = "race: a same-UID attacker swaps the config at src/secure_git.py:10"
-NC_B_TEXT = "race: the worktree path is reused at src/run_worktrees.py:900"
-NC_MERGE_BASE = "e" * 40
+from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT  # noqa: E402
+
+NP_A_TEXT = "race: a same-UID attacker swaps the config at src/secure_git.py:10"
+NP_B_TEXT = "race: the worktree path is reused at src/run_worktrees.py:900"
+NP_MERGE_BASE = "e" * 40
+NP_SHORTSTAT = " 3 files changed, 120 insertions(+), 4 deletions(-)\n"
 
 
-class _NonConvergenceRunner(_StepBackRunner):
-    """Step-back runner with scripted ``git diff --shortstat`` and ``git merge-base``."""
+class _NoProgressRunner(_StepBackRunner):
+    """Step-back runner whose coder pushes only on the listed follow-up turns.
+
+    ``git diff --shortstat`` and the ``origin/main`` merge-base lookup are
+    scripted so the PR-size diagnostic is measurable (or fails on demand).
+    """
 
     def __init__(
-        self, *, shortstat=" 3 files changed, 120 insertions(+), 4 deletions(-)\n",
-        git_returncode=0, git_error=None, **kwargs,
+        self, *, push_turns=(), shortstat=NP_SHORTSTAT, git_returncode=0, git_error=None,
+        **kwargs,
     ):
         super().__init__(**kwargs)
+        self.push_turns = set(push_turns)
+        self.followup_turns = 0
         self.shortstat = shortstat
         self.git_returncode = git_returncode
         self.git_error = git_error
         self.measurement_calls = []
 
+    def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
+        if '"kind": "coder_followup"' not in "\n".join(cmd):
+            return
+        self.followup_turns += 1
+        if self.followup_turns in self.push_turns:
+            super()._maybe_advance_pr_head_for_coder_followup(cmd)
+
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(arg) for arg in args]
         shortstat = cmd[:3] == ["git", "diff", "--shortstat"]
-        # Only the measurement's ``origin/<base>`` lookup is scripted; the plain-base
-        # fallback and unrelated merge-base calls keep the fake's empty default.
         merge_base = cmd[:2] == ["git", "merge-base"] and cmd[2:3] == ["origin/main"]
         if shortstat or merge_base:
             self.measurement_calls.append(cmd)
             if self.git_error is not None:
                 raise self.git_error
             cmd, cwd_path = self._record_command(cmd, cwd)
-            stdout = self.shortstat if shortstat else f"{NC_MERGE_BASE}\n"
+            stdout = self.shortstat if shortstat else f"{NP_MERGE_BASE}\n"
             return CommandResult(cmd, cwd_path, stdout, "", self.git_returncode)
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
 
-def _nc_reviews(rounds=4, *, review=_sb_review):
-    return [review([NC_A_TEXT, NC_B_TEXT])] + [
-        review(carried=["item-1", "item-2"]) for _ in range(rounds - 1)
+def _np_reviews(rounds=3):
+    return [_sb_review([NP_A_TEXT, NP_B_TEXT])] + [
+        _sb_review(carried=["item-1", "item-2"]) for _ in range(rounds - 1)
     ]
 
 
-def _nc_coders(count=3):
-    return [structured_coder_followup(addressed_items=["item-1", "item-2"]) for _ in range(count)]
+def _np_coders(count=2, items=("item-1", "item-2")):
+    return [
+        structured_coder_followup(remaining_items=list(items), addressed_items=[])
+        for _ in range(count)
+    ]
 
 
-def _nc_records(runner, config):
+def _np_records(runner, config):
     from coding_review_agent_loop.github import get_pr_review_context
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
@@ -1569,247 +1394,194 @@ def _nc_records(runner, config):
     )
 
 
-def _nc_stop(runner, config):
+def _np_stop(runner, config):
     with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     return str(excinfo.value)
 
 
-def test_items_persisting_across_files_stop_before_a_fourth_coder_turn(tmp_path):
-    """`nc-persist-spread`, `nc-production-numbering`."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    config = _sb_config(tmp_path)
-    message = _nc_stop(runner, config)
-    assert "human decision required: Codex kept the same item(s) blocking across 3" in message
-    assert "not converging" in message and "No further coder turn was invoked" in message
-    assert f"[item-1] (attempts: 3) {NC_A_TEXT}" in message
-    assert f"[item-2] (attempts: 3) {NC_B_TEXT}" in message
-    assert "reviews at rounds 1-4" in message
-    assert "3 files changed, 120 insertions(+), 4 deletions(-)" in message
-    assert "unavailable" not in message
-    assert "`--pr-non-convergence-rounds 0`" in message
-    assert len(_sb_coder_prompts(runner)) == 3  # no fourth coder turn
-    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner))
-    records = _nc_records(runner, config)
-    assert [r.metadata.round_number for r in records if r.metadata.role == "reviewer"] == [1, 2, 3, 4]
-    coder_records = [r for r in records if r.metadata.role == "coder"]
-    # Production numbering: review r is followed by coder record r+1.
-    assert [r.metadata.round_number for r in coder_records] == [2, 3, 4]
-    assert not any(r.metadata.step_back_entries for r in coder_records)
-    # The growth is measured from the first reviewed head, the size from the merge base.
-    diffs = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]]
-    assert diffs[0][3] == SB_HEAD and diffs[-1][3] == NC_MERGE_BASE
-
-
-def test_the_live_dispatch_snapshot_lacks_the_newest_coder_record_and_still_stops(
-    tmp_path, monkeypatch
-):
-    """`nc-live-snapshot`: the pre-check passes on the snapshot's reviews alone."""
-    import coding_review_agent_loop.pr_loop_support as support
-
-    seen = []
-    original = support._pr_step_back_records_may_matter
-
-    def spy(records, tracked, **kwargs):
-        result = original(records, tracked, **kwargs)
-        seen.append(
-            (
-                kwargs["round_number"],
-                sorted(r.metadata.round_number for r in records if r.metadata.role == "coder"),
-                result,
-            )
-        )
-        return result
-
-    monkeypatch.setattr(support, "_pr_step_back_records_may_matter", spy)
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    _nc_stop(runner, _sb_config(tmp_path, pr_step_back_rounds=0))
-    round_four = [entry for entry in seen if entry[0] == 4]
-    assert round_four and round_four[-1][2] is True
-    assert 4 not in round_four[-1][1]  # coder record 4 was posted after the snapshot
+def _interrupted_after_three_unchanged_rounds(tmp_path):
+    """K=4 lets rounds 1-3 and their coder records land; round 4's review is missing."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(3), codex_outputs=_np_reviews(3))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, no_progress_rounds=4))
     assert len(_sb_coder_prompts(runner)) == 3
+    return runner
 
 
-def test_a_rerun_after_the_stop_stops_again_with_identical_text_and_no_new_state(tmp_path):
-    """`nc-resume`."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+def test_k_unchanged_rounds_stop_with_exit_4_naming_the_items_head_and_k(tmp_path):
+    """`pr-k-unchanged`, `pr-sequential-default-observations` (fresh)."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
     config = _sb_config(tmp_path)
-    first = _nc_stop(runner, config)
-    comments_before = len(_nc_records(runner, config))
-    second = _nc_stop(runner, config)
-    assert second == first
-    assert len(_nc_records(runner, config)) == comments_before
+    message = _np_stop(runner, config)
+    assert message.startswith(
+        f"PR #77: {NO_PROGRESS_PREFIX_TEXT}3 consecutive completed round(s): rounds 1-3 "
+        f"ended with the same head `{SB_HEAD}`"
+    )
+    assert "(--no-progress-rounds 3)" in message
+    assert f"- [item-1] {NP_A_TEXT}" in message
+    assert f"- [item-2] {NP_B_TEXT}" in message
+    assert "No further coder or reviewer turn was invoked." in message
+    assert f"direction): {NP_SHORTSTAT.strip()}" in message
+    assert "Diff growth" not in message and "unavailable" not in message
+    assert "Step-back approach alternative" not in message
+    assert "child-plan supersession" not in message
+    assert parse_human_decision(message) is not None
+    # Stopped at the round-3 dispatch: no third coder turn, no fourth review.
+    assert len(_sb_coder_prompts(runner)) == 2
+    assert len(_sb_codex_prompts(runner)) == 3
+    records = _np_records(runner, config)
+    assert [
+        (r.metadata.role, r.metadata.round_number) for r in records
+        if r.metadata.role in {"reviewer", "coder"}
+    ] == [("reviewer", 1), ("coder", 2), ("reviewer", 2), ("coder", 3), ("reviewer", 3)]
+    # The stop wrote no round metadata: nothing is numbered past round 3.
+    assert max(r.metadata.round_number for r in records) == 3
+    # The sequential default mode writes no reconciliation summary; the coder
+    # records carry the settled ledgers and dispatch heads the detector reads.
+    assert all(r.metadata.followup_dispatch_head == SB_HEAD for r in records if r.metadata.role == "coder")
+
+
+def test_the_cli_maps_the_no_progress_stop_to_exit_code_4(tmp_path, capsys):
+    """`pr-k-unchanged`: exit 4 through the CLI."""
+    import coding_review_agent_loop.cli as cli_module
+
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
+    config = _sb_config(tmp_path)
+
+    def drive_the_fixture(*_args, **_kwargs):
+        return run_pr_loop(runner, pr_number=77, config=config)
+
+    with patch.object(cli_module, "run_pr_loop", side_effect=drive_the_fixture):
+        assert cli_module.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+    stderr = capsys.readouterr().err
+    assert "HUMAN DECISION REQUIRED" in stderr and NO_PROGRESS_PREFIX_TEXT in stderr
+
+
+def test_round_start_stops_a_resume_after_k_completed_rounds_before_any_review(tmp_path):
+    """`pr-k-unchanged` (round-start site), `pr-sequential-default-observations` (resume)."""
+    runner = _interrupted_after_three_unchanged_rounds(tmp_path)
+    reviews_before = len(_sb_codex_prompts(runner))
+    records_before = len(_np_records(runner, _sb_config(tmp_path)))
+    message = _np_stop(runner, _sb_config(tmp_path))
+    assert "rounds 1-3 ended with the same head" in message
+    assert "[item-1]" in message and "[item-2]" in message
+    assert len(_sb_codex_prompts(runner)) == reviews_before  # no reviewer prompted
     assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_np_records(runner, _sb_config(tmp_path))) == records_before  # no metadata
+    _assert_one_hd_diagnostic(runner, message, label="round 4", reason="pr-no-progress")
 
 
-def test_resume_after_an_interrupted_kth_review_reaches_the_same_stop(tmp_path):
-    """`nc-resume`: the run is interrupted before the K-th review, then rerun."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews(3))
+def test_a_resume_inside_the_window_stops_at_the_same_round_as_a_live_run(tmp_path):
+    """`pr-resume-mid-window`: K-1 rounds persisted, interrupted, resumed."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews(2))
     config = _sb_config(tmp_path)
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_sb_coder_prompts(runner)) == 3
-    runner.codex_outputs.extend(_nc_reviews(4)[3:])
-    resumed = _nc_stop(runner, config)
-    live_runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    live = _nc_stop(live_runner, _sb_config(tmp_path / "live"))
+    assert len(_sb_coder_prompts(runner)) == 2
+    runner.codex_outputs.extend(_np_reviews(3)[2:])
+    resumed = _np_stop(runner, config)
+    live_runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
+    live = _np_stop(live_runner, _sb_config(tmp_path / "live"))
     assert resumed == live
-    assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_sb_coder_prompts(runner)) == 2
 
 
-def test_disabling_step_back_keeps_the_non_convergence_stop(tmp_path):
-    """`nc-flag-independence`."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    message = _nc_stop(runner, _sb_config(tmp_path, pr_step_back_rounds=0))
-    assert "not converging" in message
-    assert len(_sb_coder_prompts(runner)) == 3
+def test_a_moved_head_after_k_unchanged_rounds_is_reviewed_first_on_resume(tmp_path):
+    """`pr-head-moves` (resume): an external advance to H2 goes to review."""
+    runner = _interrupted_after_three_unchanged_rounds(tmp_path)
+    pushed = f"{9:040x}"
+    runner._move_head(pushed, cwd=None)
+    runner.pr_payload["headRefOid"] = pushed
+    runner.codex_outputs.append(_sb_review(resolved=["item-1", "item-2"]))
+    runner.claude_outputs.extend(_np_coders(1))
+    reviews_before = len(_sb_codex_prompts(runner))
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert len(_sb_codex_prompts(runner)) == reviews_before + 1
 
 
-def test_disabling_non_convergence_restores_the_prior_behaviour(tmp_path):
-    """`nc-flag-independence`: the loop keeps dispatching the coder."""
-    runner = _NonConvergenceRunner(
-        claude_outputs=_nc_coders(4),
-        codex_outputs=[*_nc_reviews(), _sb_review(resolved=["item-1", "item-2"])],
+def test_a_coder_push_restarts_the_window_and_the_new_head_is_reviewed(tmp_path):
+    """`pr-head-moves` (fresh): H2 is reviewed; the window restarts at H2."""
+    runner = _NoProgressRunner(
+        push_turns={2}, claude_outputs=_np_coders(4), codex_outputs=_np_reviews(5),
     )
-    config = _sb_config(tmp_path, pr_non_convergence_rounds=0)
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    message = _np_stop(runner, _sb_config(tmp_path))
+    pushed = f"{1:040x}"
+    assert f"rounds 3-5 ended with the same head `{pushed}`" in message
+    assert len(_sb_codex_prompts(runner)) == 5
     assert len(_sb_coder_prompts(runner)) == 4
-    assert not runner.measurement_calls
 
 
-def test_non_convergence_stops_under_review_parallel(tmp_path):
-    """`nc-review-parallel`: publication records resolve through reconciliation."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    config = _sb_config(tmp_path, review_parallel=True)
-    message = _nc_stop(runner, config)
-    assert "[item-1] (attempts: 3)" in message and "[item-2] (attempts: 3)" in message
-    assert any(
-        r.metadata.phase == "publication" for r in _nc_records(runner, config)
-        if r.metadata.role == "reviewer"
-    )
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
-def test_primary_then_panel_tracks_only_the_primary(tmp_path):
-    """`nc-primary-then-panel`: the paused panel is not needed to trigger."""
-    runner = _NonConvergenceRunner(
-        claude_outputs=_nc_coders(),
-        codex_outputs=_nc_reviews(),
-        gemini_outputs=[_gemini_review(resolved=["item-1", "item-2"])],
-    )
-    config = make_config(
-        tmp_path, reviewer=("codex", "gemini"), max_rounds=8,
-        pr_review_policy="primary-then-panel", primary_reviewer="codex",
-    )
-    message = _nc_stop(runner, config)
-    assert "Codex kept the same item(s) blocking" in message
-    assert not _sb_gemini_prompts(runner)
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
-def test_non_convergence_wins_over_a_fresh_clustered_step_back(tmp_path):
-    """`nc-precedence`: both qualify at round 3; no step-back entry is recorded."""
-    runner = _NonConvergenceRunner(
+def test_two_unchanged_head_followups_with_changing_items_do_not_stop(tmp_path):
+    """`pr-unchanged-head-two-turns`: the retired counter stopped after two."""
+    runner = _NoProgressRunner(
         claude_outputs=[
-            structured_coder_followup(addressed_items=["item-1"]),
-            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+            structured_coder_followup(remaining_items=[item], addressed_items=[])
+            for item in ("item-1", "item-2", "item-3")
         ],
         codex_outputs=[
-            _sb_review(["gap one at src/spool.py:124-131"]),
-            _sb_review(["gap two at src/spool.py:131-136"], carried=["item-1"]),
-            _sb_review(["gap three at src/spool.py:140"], carried=["item-1", "item-2"]),
+            _sb_review(["gap at src/a.py:10"]),
+            _sb_review(["gap at src/b.py:10"], resolved=["item-1"]),
+            _sb_review(["gap at src/c.py:10"], resolved=["item-2"]),
+            _sb_review(resolved=["item-3"]),
         ],
     )
-    config = _sb_config(tmp_path, pr_non_convergence_rounds=2)
-    message = _nc_stop(runner, config)
-    assert "[item-1] (attempts: 2)" in message and "item-3" not in message
-    assert len(_sb_coder_prompts(runner)) == 2
-    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner))
-    assert not any(
-        r.metadata.step_back_entries for r in _nc_records(runner, config)
-        if r.metadata.role == "coder"
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_sb_codex_prompts(runner)) == 4
+
+
+def test_the_round_limit_is_reached_first_without_a_no_progress_message(tmp_path):
+    """`max-rounds-bound`: progress every round, so the round-limit exit applies."""
+    runner = _NoProgressRunner(
+        push_turns={1, 2, 3},
+        claude_outputs=[
+            structured_coder_followup(addressed_items=[item]) for item in ("item-1", "item-2")
+        ],
+        codex_outputs=[
+            _sb_review(["gap at src/a.py:10"]),
+            _sb_review(["gap at src/b.py:10"], resolved=["item-1"]),
+            _sb_review(["gap at src/c.py:10"], resolved=["item-2"]),
+        ],
     )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=3))
+    assert not isinstance(excinfo.value, HumanDecisionRequiredError)
+    assert NO_PROGRESS_PREFIX_TEXT not in str(excinfo.value)
+    assert _hd_diagnostics(runner) == []
 
 
-def test_a_clustered_sibling_escalation_stops_before_non_convergence(tmp_path):
-    """`nc-precedence`: a pending sibling escalation is reported first."""
-    runner = _NonConvergenceRunner(
-        claude_outputs=_step_back_coders(),
+def test_the_round_limit_still_wins_when_the_window_is_not_full(tmp_path):
+    """`max-rounds-bound`: unchanged items with fewer than K rounds hit the cap."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(1), codex_outputs=_np_reviews(2))
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=2))
+    assert not isinstance(excinfo.value, HumanDecisionRequiredError)
+    assert NO_PROGRESS_PREFIX_TEXT not in str(excinfo.value)
+
+
+def test_a_step_back_revision_with_new_same_cluster_findings_continues_to_review(tmp_path):
+    """`pr-step-back-continues`: the retired sibling stop would have fired here."""
+    runner = _StepBackRunner(
+        claude_outputs=[
+            *_step_back_coders(), structured_coder_followup(addressed_items=["item-4"]),
+        ],
         codex_outputs=[
             *_three_clustered_blocks(),
-            _sb_review(["another branch at src/spool.py:134"], carried=["item-3"]),
+            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
+            _sb_review(resolved=["item-4"]),
         ],
     )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=1))
-    message = str(excinfo.value)
-    assert "still raised a new sibling finding" in message
-    assert "not converging" not in message
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
-@pytest.mark.parametrize(
-    "runner_kwargs",
-    [
-        {"git_returncode": 128},
-        {"shortstat": "fatal: bad revision\n"},
-        {"git_error": OSError("git is missing")},
-        {"git_error": AgentLoopError("runner refused")},
-    ],
-    ids=["non-zero", "unparseable", "oserror", "agent-loop-error"],
-)
-def test_diff_measurement_failures_render_unavailable_and_still_stop(tmp_path, runner_kwargs):
-    """`nc-diff-failure`: the runner glue never raises a non-decision error."""
-    runner = _NonConvergenceRunner(
-        claude_outputs=_nc_coders(), codex_outputs=_nc_reviews(), **runner_kwargs
-    )
-    message = _nc_stop(runner, _sb_config(tmp_path))
-    assert "Diff growth since the first attempt" in message
-    growth = message.split("Diff growth since the first attempt", 1)[1].splitlines()[0]
-    size = message.split("Total PR size", 1)[1].splitlines()[0]
-    assert growth.endswith("unavailable") and size.endswith("unavailable")
-    assert runner.measurement_calls
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
-def test_diff_measurement_failure_through_the_dispatch_decision_directly(tmp_path):
-    """`nc-diff-failure`: drive ``_pr_step_back_decision`` with a failing runner."""
-    import coding_review_agent_loop.pr_loop_support as support
-    from coding_review_agent_loop.github import get_pr_review_context
-
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    config = _sb_config(tmp_path)
-    _nc_stop(runner, config)
-    comments = get_pr_review_context(runner, config=config, pr_number=77).comments
-    head = runner.pr_payload["headRefOid"]
-    for failure in ({"git_returncode": 1}, {"git_error": OSError("boom")}):
-        runner.git_returncode = failure.get("git_returncode", 0)
-        runner.git_error = failure.get("git_error")
-        with pytest.raises(HumanDecisionRequiredError) as excinfo:
-            support._pr_step_back_decision(
-                runner, config, pr_number=77, round_number=4, snapshot_comments=comments,
-                tracked=("Codex",), head_sha=head, base_branch="main",
-            )
-        assert str(excinfo.value).count("unavailable") == 2
-    assert len(_sb_coder_prompts(runner)) == 3
-
-
-def test_enabling_the_gate_on_longer_history_measures_growth_from_the_first_attempt(tmp_path):
-    """The attempt scan reaches past K, and the growth baseline follows it."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(4), codex_outputs=_nc_reviews(5))
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=0))
-    assert len(_sb_coder_prompts(runner)) == 5  # the fifth dispatch ran out of script
-    runner.measurement_calls.clear()
-    message = _nc_stop(runner, _sb_config(tmp_path, pr_non_convergence_rounds=3))
-    assert "[item-1] (attempts: 4)" in message and "reviews at rounds 1-5" in message
-    assert f"(`{SB_HEAD[:12]}` to" in message
-    growth = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]][0]
-    assert growth[3] == SB_HEAD and growth[4] == runner.pr_payload["headRefOid"]
-    assert len(_sb_coder_prompts(runner)) == 5
-
-
-# --- PR step-back approach alternative (#1628) -------------------------------
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    coder_prompts = _sb_coder_prompts(runner)
+    assert len(coder_prompts) == 4
+    assert "STEP-BACK TURN" in coder_prompts[2]
+    assert "STEP-BACK TURN" not in coder_prompts[3]
+    review_prompts = _sb_codex_prompts(runner)
+    assert len(review_prompts) == 5
+    assert "Enumerate ALL remaining instances" in review_prompts[3]
+    assert "Enumerate ALL remaining instances" not in review_prompts[4]
+    assert _hd_diagnostics(runner) == []
 
 
 def _approach_alternative_coders():
@@ -1823,75 +1595,143 @@ def _approach_alternative_coders():
     ]
 
 
-def test_an_approach_alternative_step_back_stops_live_for_a_human_decision(tmp_path):
-    """`approach-alt-live-stop`."""
+def test_an_approach_alternative_proposal_is_reviewed_and_does_not_stop(tmp_path):
+    """`pr-approach-alternative-no-stop`: the proposal head gets an ordinary review."""
     runner = _StepBackRunner(
         claude_outputs=_approach_alternative_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
-    )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    message = str(excinfo.value)
-    assert "the coder proposes replacing the approved approach" in message
-    assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in message
-    assert "rerun with the scope change approved" in message
-    assert "accept a stated limitation" in message and "--pr-step-back-rounds 0" in message
-    assert len(_sb_coder_prompts(runner)) == 3  # no further coder turn
-    assert len(_sb_codex_prompts(runner)) == 3  # no sweep review of the proposal head
-    assert not any("gh workflow run" in " ".join(cmd) for cmd, _cwd in runner.commands)
-    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
-
-
-def test_a_resumed_run_stops_before_reviewing_the_approach_alternative_head(tmp_path):
-    """`approach-alt-resume-stop`: the record was posted, the live stop never ran."""
-    runner = _StepBackRunner(
-        claude_outputs=_approach_alternative_coders(),
-        codex_outputs=_three_clustered_blocks(),
-    )
-    with patch.object(pr_loop, "_pr_step_back_approach_alternative_stop"):
-        with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-            run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    assert len(_sb_coder_prompts(runner)) == 3
-    reviews_before = len(_sb_codex_prompts(runner))  # includes the failed sweep attempt
-    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in str(excinfo.value)
-    assert len(_sb_coder_prompts(runner)) == 3
-    assert len(_sb_codex_prompts(runner)) == reviews_before  # no review of that head
-    # Continuing to generalize disables the stop and reviews the head.
-    assert run_pr_loop(
-        runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0)
-    ) == 0
-    assert len(_sb_codex_prompts(runner)) == reviews_before + 1
-
-
-def test_a_generalization_step_back_still_runs_the_sweep_review(tmp_path):
-    """`generalization-unchanged`."""
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
         codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
     )
     assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
-    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+    assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_sb_codex_prompts(runner)) == 4  # the proposal head was reviewed
+    assert _hd_diagnostics(runner) == []
 
 
-def test_a_sibling_escalation_lists_the_scope_change_route(tmp_path):
-    """`generalization-unchanged`: the sibling stop keeps its prefix and adds the route."""
-    _runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
-    assert "human decision required: the coder generalized a class of findings" in message
-    assert "approve a scope change (re-plan or amend the issue)" in message
-    assert "re-offer" not in message
-
-
-def test_disabled_step_back_never_stops_on_an_approach_alternative_summary(tmp_path):
-    """`approach-alt-malformed`: step-back rounds 0 never stops."""
-    runner = _StepBackRunner(
-        claude_outputs=_approach_alternative_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+def test_the_no_progress_stop_shows_the_approach_alternative_after_k_reviews_of_its_head(tmp_path):
+    """`pr-approach-alternative-no-stop`: the excerpt survives later reviews of its head."""
+    runner = _NoProgressRunner(
+        push_turns={1, 2, 3},
+        claude_outputs=[*_approach_alternative_coders(), *_np_coders(2, items=("item-3",))],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            *[_sb_review(carried=["item-3"]) for _ in range(3)],
+        ],
     )
-    config = _sb_config(tmp_path, pr_step_back_rounds=0)
+    message = _np_stop(runner, _sb_config(tmp_path))
+    proposal_head = f"{3:040x}"
+    assert f"rounds 4-6 ended with the same head `{proposal_head}`" in message
+    assert (
+        "Step-back approach alternative proposed at round 4 (excerpt): drop the "
+        "aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier."
+    ) in message
+    assert len(_sb_codex_prompts(runner)) == 6
+    assert len(_sb_coder_prompts(runner)) == 5
+
+
+def _closed_incomplete_round(round_number, subject):
+    from coding_review_agent_loop.round_closure import (
+        ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
+    )
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
+
+    payload = build_round_closure_payload(
+        flow="pr", round_number=round_number, subject=subject,
+        published=[("Codex", None)],
+        unreplayable=[("Codex", "published review could not be replayed")],
+        item_number_high_water=2,
+    )
+    assert payload is not None
+    metadata = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
+        subject=subject, prior_items=(), new_items=(), phase=ROUND_CLOSED_INCOMPLETE_PHASE,
+        round_closure=payload,
+    )
+    return _attach_round_metadata(f"Review round {round_number} closed, incomplete.", metadata)
+
+
+def test_a_closed_incomplete_round_breaks_the_window_on_resume(tmp_path):
+    """`pr-incomplete-round-breaks-window`: control is the round-start stop above."""
+    from pr_loop_test_helpers import _append_orchestrator_record
+
+    runner = _interrupted_after_three_unchanged_rounds(tmp_path)
+    _append_orchestrator_record(runner, _closed_incomplete_round(3, SB_HEAD))
+    reviews_before = len(_sb_codex_prompts(runner))
+    runner.codex_outputs.append(_sb_review(resolved=["item-1", "item-2"]))
+    runner.claude_outputs.extend(_np_coders(1))
+    try:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    except HumanDecisionRequiredError as exc:  # pragma: no cover - the failure mode
+        pytest.fail(f"a closed-incomplete round counted toward the window: {exc}")
+    except AgentLoopError:
+        pass  # later resume handling may still stop; the window never fires
+    assert len(_sb_codex_prompts(runner)) > reviews_before  # a reviewer was prompted
+    assert not any(NO_PROGRESS_PREFIX_TEXT in body for body in _hd_diagnostics(runner))
+
+
+def _with_legacy_step_back_entries(runner, entries):
+    """Rewrite coder record 3 to carry ``entries`` (a list, or a malformed value)."""
+    from pr_loop_test_helpers import _rewrite_pr_metadata
+
+    def transform(payload):
+        if payload.get("role") != "coder" or payload.get("round_number") != 3:
+            return None
+        return {**payload, "step_back_entries": entries}
+
+    _rewrite_pr_metadata(runner, transform)
+    return runner
+
+
+LEGACY_ENTRY = {
+    "phase": "pr", "reviewer": "Codex", "trigger_round": 2, "trigger_head": SB_HEAD,
+    "anchor": {"path": "src/secure_git.py", "start": 1, "end": 20},
+}
+
+
+@pytest.mark.parametrize(
+    "entries", [None, [LEGACY_ENTRY], "not-a-list"], ids=["absent", "valid", "malformed"],
+)
+def test_legacy_step_back_entries_on_history_do_not_change_the_stop(tmp_path, entries):
+    """`pr-resume-legacy`: absent, valid and malformed entries resume identically."""
+    reference = _np_stop(
+        _interrupted_after_three_unchanged_rounds(tmp_path / "reference"),
+        _sb_config(tmp_path / "reference"),
+    )
+    runner = _interrupted_after_three_unchanged_rounds(tmp_path / "variant")
+    if entries is not None:
+        _with_legacy_step_back_entries(runner, entries)
+        coder = next(
+            r.metadata for r in _np_records(runner, _sb_config(tmp_path / "variant"))
+            if r.metadata.role == "coder" and r.metadata.round_number == 3
+        )
+        assert coder.step_back_status == ("valid" if isinstance(entries, list) else "invalid")
+    reviews_before = len(_sb_codex_prompts(runner))
+    assert _np_stop(runner, _sb_config(tmp_path / "variant")) == reference
+    assert len(_sb_codex_prompts(runner)) == reviews_before  # no review, no legacy replay
+
+
+@pytest.mark.parametrize(
+    "entries", [None, [LEGACY_ENTRY], "not-a-list"], ids=["absent", "valid", "malformed"],
+)
+def test_legacy_step_back_entries_do_not_change_step_back_routing(tmp_path, entries):
+    """`pr-resume-legacy`, `pr-step-back-trigger-derived`: prompt routing on resume."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders()[:2], codex_outputs=_three_clustered_blocks(),
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    if entries is not None:
+        _with_legacy_step_back_entries(runner, entries)
+    runner.claude_outputs.append(_step_back_coders()[2])
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    coder_prompts = _sb_coder_prompts(runner)
+    # The interrupted dispatch and its resumed retry are both step-back turns.
+    assert "STEP-BACK TURN" in coder_prompts[2] and "STEP-BACK TURN" in coder_prompts[-1]
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[-1]
 
 
 # --- Durable PR human-decision diagnostics (#1640) ---------------------------
@@ -1925,63 +1765,37 @@ def _assert_one_hd_diagnostic(runner, message, *, label, reason):
     return diagnostics[0]
 
 
-def test_a_sibling_escalation_posts_one_bounded_scheduling_diagnostic(tmp_path):
-    """`sibling-stop-posts`."""
-    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
-    _assert_one_hd_diagnostic(runner, message, label="round 4", reason="pr-step-back-sibling")
-    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the stop
-
-
-def test_an_immediate_non_convergence_stop_posts_one_scheduling_diagnostic(tmp_path):
-    """`nonconv-immediate-posts`."""
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+def test_the_no_progress_stop_posts_one_scheduling_diagnostic(tmp_path):
+    """`pr-k-unchanged`: only the plain best-effort diagnostic comment is posted."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
     config = _sb_config(tmp_path)
-    message = _nc_stop(runner, config)
-    _assert_one_hd_diagnostic(runner, message, label="round 4", reason="pr-non-convergence")
-    assert len(_sb_coder_prompts(runner)) == 3
+    message = _np_stop(runner, config)
+    _assert_one_hd_diagnostic(runner, message, label="round 3", reason="pr-no-progress")
     # The plain diagnostic never breaks round-record decoding on a rerun.
-    assert _nc_stop(runner, config) == message
+    assert _np_stop(runner, config) == message
     assert len(_hd_diagnostics(runner)) == 2  # one per invocation stop
+    assert len(_sb_coder_prompts(runner)) == 2
 
 
-def test_a_live_approach_alternative_stop_posts_one_scheduling_diagnostic(tmp_path):
-    """`approach-live-order` (non-managed path)."""
-    runner = _StepBackRunner(
-        claude_outputs=_approach_alternative_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+@pytest.mark.parametrize(
+    "runner_kwargs",
+    [
+        {"git_returncode": 1},
+        {"shortstat": "not a shortstat\n"},
+        {"git_error": OSError("git is gone")},
+        {"git_error": AgentLoopError("runner refused")},
+    ],
+    ids=["non-zero", "unparseable", "oserror", "agent-loop-error"],
+)
+def test_a_failed_size_measurement_omits_the_line_and_still_stops(tmp_path, runner_kwargs):
+    """`pr-size-diagnostic`: no placeholder, no exception, still exit 4."""
+    runner = _NoProgressRunner(
+        claude_outputs=_np_coders(), codex_outputs=_np_reviews(), **runner_kwargs
     )
-    with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    _assert_one_hd_diagnostic(
-        runner, str(excinfo.value), label="round 3",
-        reason="pr-step-back-approach-alternative",
-    )
-    assert len(_sb_codex_prompts(runner)) == 3
-
-
-def test_a_resumed_approach_alternative_stop_posts_a_new_diagnostic_from_round_records(tmp_path):
-    """`approach-resume-posts`: an earlier diagnostic is on the thread; the rerun
-    re-derives the stop from round records and posts one more."""
-    from coding_review_agent_loop.history_export import recognize_diagnostic
-
-    runner = _StepBackRunner(
-        claude_outputs=_approach_alternative_coders(),
-        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
-    )
-    config = _sb_config(tmp_path)
-    with pytest.raises(HumanDecisionRequiredError) as live:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_hd_diagnostics(runner)) == 1
-    reviews_before = len(_sb_codex_prompts(runner))
-    with pytest.raises(HumanDecisionRequiredError) as resumed:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert str(resumed.value) == str(live.value)
-    diagnostics = _hd_diagnostics(runner)
-    assert len(diagnostics) == 2
-    assert recognize_diagnostic(diagnostics[1]).reason == "pr-step-back-approach-alternative"
-    assert len(_sb_codex_prompts(runner)) == reviews_before  # no reviewer invocation
-    assert len(_sb_coder_prompts(runner)) == 3
-    assert _nc_records(runner, config)  # records still decode around the diagnostics
+    message = _np_stop(runner, _sb_config(tmp_path))
+    assert "Total PR size" not in message and "unavailable" not in message
+    assert "[item-1]" in message
+    assert runner.measurement_calls  # the measurement was attempted
 
 
 class _ProxyTempfile:
@@ -2027,9 +1841,9 @@ def _failing_diagnostic_post(error):
     return post
 
 
-def _capture_step_back_decision_error(monkeypatch):
+def _capture_dispatch_decision_error(monkeypatch):
     raised = []
-    original = pr_loop._pr_step_back_decision
+    original = pr_loop._pr_dispatch_convergence
 
     def spy(*args, **kwargs):
         try:
@@ -2038,7 +1852,7 @@ def _capture_step_back_decision_error(monkeypatch):
             raised.append(exc)
             raise
 
-    monkeypatch.setattr(pr_loop, "_pr_step_back_decision", spy)
+    monkeypatch.setattr(pr_loop, "_pr_dispatch_convergence", spy)
     return raised
 
 
@@ -2052,10 +1866,9 @@ def test_a_failed_diagnostic_post_keeps_the_original_human_decision_stop(
     import coding_review_agent_loop.github as github_module
     from coding_review_agent_loop.round_transport import RoundCommentOverflowError
 
-    reference_runner, reference = _run_to_sibling(
-        tmp_path / "reference", "another branch at src/spool.py:134"
-    )
-    raised = _capture_step_back_decision_error(monkeypatch)
+    reference_runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
+    reference = _np_stop(reference_runner, _sb_config(tmp_path / "reference"))
+    raised = _capture_dispatch_decision_error(monkeypatch)
     if failure == "temp-file":
         monkeypatch.setattr(
             github_module, "tempfile", _ProxyTempfile(tempfile, fail_on=_DIAGNOSTIC_LEAD)
@@ -2067,32 +1880,23 @@ def test_a_failed_diagnostic_post_keeps_the_original_human_decision_stop(
             else RoundCommentOverflowError("GitHub comment body exceeds 60000 characters")
         )
         monkeypatch.setattr(pr_loop, "post_pr_comment", _failing_diagnostic_post(error))
-    runner, message = _run_to_sibling(
-        tmp_path / "failing", "another branch at src/spool.py:134",
-        config=_sb_config(tmp_path / "failing", quiet=False),
-    )
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
+    message = _np_stop(runner, _sb_config(tmp_path / "failing", quiet=False))
     assert message == reference
     assert raised and isinstance(raised[-1], HumanDecisionRequiredError)
     assert len(_hd_diagnostics(runner)) == 0
-    assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_sb_coder_prompts(runner)) == 2
     assert "could not post the human-decision diagnostic" in capsys.readouterr().err
     assert len(_hd_diagnostics(reference_runner)) == 1
 
 
 def test_a_failed_post_reraises_the_same_exception_object(tmp_path, monkeypatch):
     """`post-failure-exit4`: identity, not only an equal message."""
-    raised = _capture_step_back_decision_error(monkeypatch)
-
+    raised = _capture_dispatch_decision_error(monkeypatch)
     monkeypatch.setattr(
         pr_loop, "post_pr_comment", _failing_diagnostic_post(OSError(5, "Input/output error"))
     )
-    runner = _StepBackRunner(
-        claude_outputs=_step_back_coders(),
-        codex_outputs=[
-            *_three_clustered_blocks(),
-            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
-        ],
-    )
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
     with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
     assert excinfo.value is raised[-1]
@@ -2106,7 +1910,7 @@ def test_the_cli_keeps_exit_four_when_the_diagnostic_post_fails(tmp_path, monkey
         pr_loop, "post_pr_comment",
         _failing_diagnostic_post(AgentLoopError("gh pr comment failed: HTTP 502")),
     )
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
     config = _sb_config(tmp_path)
 
     def drive_the_fixture(*_args, **_kwargs):
@@ -2115,60 +1919,39 @@ def test_the_cli_keeps_exit_four_when_the_diagnostic_post_fails(tmp_path, monkey
     with patch.object(cli_module, "run_pr_loop", side_effect=drive_the_fixture):
         assert cli_module.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
     stderr = capsys.readouterr().err
-    assert "HUMAN DECISION REQUIRED" in stderr
-    assert "not converging" in stderr and "--pr-non-convergence-rounds 0" in stderr
+    assert "HUMAN DECISION REQUIRED" in stderr and "--no-progress-rounds" in stderr
 
 
-def test_an_oversized_non_convergence_stop_posts_a_bounded_diagnostic(tmp_path, monkeypatch):
+def test_an_oversized_no_progress_stop_posts_a_bounded_diagnostic(tmp_path, monkeypatch):
     """`oversize-diagnostic-bounded`: through the real post and transport path."""
-    import coding_review_agent_loop.review_step_back as step_back_module
+    import coding_review_agent_loop.pr_loop_support as support
     from coding_review_agent_loop.history_export import recognize_diagnostic
     from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
 
-    real_render = step_back_module.render_pr_non_convergence_decision
-    extra = "\n".join(
-        f"- [item-{n}] (attempts: 3) " + "persisting detail " * 12 for n in range(3, 400)
-    )
+    real_lines = support.render_no_progress_item_lines
 
-    def many_items(*args, **kwargs):
-        rendered = real_render(*args, **kwargs)
-        head, sep, tail = rendered.partition("\nDiff growth")
-        return head + "\n" + extra + sep + tail
+    def many_items(item_ids, texts=None):
+        return tuple(real_lines(item_ids, texts)) + tuple(
+            f"- [item-{n}] " + "persisting detail " * 12 for n in range(3, 400)
+        )
 
-    monkeypatch.setattr(step_back_module, "render_pr_non_convergence_decision", many_items)
-    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
-    message = _nc_stop(runner, _sb_config(tmp_path))
-    assert len(pr_loop.render_pr_scheduling_diagnostic("round 4", message)) > MAX_GITHUB_BODY_CHARS
-    # The exception text is never bounded and keeps the three-part shape (#2069).
+    monkeypatch.setattr(support, "render_no_progress_item_lines", many_items)
+    runner = _NoProgressRunner(claude_outputs=_np_coders(), codex_outputs=_np_reviews())
+    message = _np_stop(runner, _sb_config(tmp_path))
+    assert len(pr_loop.render_pr_scheduling_diagnostic("round 3", message)) > MAX_GITHUB_BODY_CHARS
     parts = parse_human_decision(message)
-    assert parts is not None and parts.what.endswith("blocking finding.")
+    assert parts is not None and parts.what.endswith("starts a new window.")
     (posted,) = _hd_diagnostics(runner)
-    assert posted == pr_loop.render_pr_human_decision_diagnostic("round 4", message)
+    assert posted == pr_loop.render_pr_human_decision_diagnostic("round 3", message)
     assert len(posted) <= pr_loop.PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
-    first_line = message.split("\n", 1)[0]
-    assert posted.startswith(pr_loop.render_pr_scheduling_diagnostic("round 4", first_line + "\n"))
-    clear_line, automate_line = message.split("\n")[-2:]
-    assert posted.endswith(
-        "the full text is in the CLI output of this run)\n" + clear_line + "\n" + automate_line
-    )
-    assert recognize_diagnostic(posted).reason == "pr-non-convergence"
+    assert recognize_diagnostic(posted).reason == "pr-no-progress"
 
 
-def test_disabled_gates_post_no_human_decision_diagnostic(tmp_path):
-    """`gate-disabled-silent`."""
-    runner = _NonConvergenceRunner(
-        claude_outputs=_nc_coders(4),
-        codex_outputs=[*_nc_reviews(), _sb_review(resolved=["item-1", "item-2"])],
-    )
-    assert run_pr_loop(
-        runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=0)
-    ) == 0
-    assert _hd_diagnostics(runner) == []
+def test_a_converging_run_posts_no_human_decision_diagnostic(tmp_path):
+    """`gate-disabled-silent`: no stop, no diagnostic."""
     runner = _StepBackRunner(
         claude_outputs=_approach_alternative_coders(),
         codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
     )
-    assert run_pr_loop(
-        runner, pr_number=77, config=_sb_config(tmp_path / "sb", pr_step_back_rounds=0)
-    ) == 0
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
     assert _hd_diagnostics(runner) == []

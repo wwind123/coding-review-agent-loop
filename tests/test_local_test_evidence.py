@@ -6032,7 +6032,6 @@ def test_repair_citing_an_unknown_receipt_cannot_supersede_or_verify_1626():
     """Matrix row `unknown-receipt-cited`."""
     from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
     from coding_review_agent_loop.local_test_evidence import superseded_by_current_turn
-    from coding_review_agent_loop.pr_loop_support import cited_evidence_progress
     from coding_review_agent_loop.protocol import validate_structured_coder_followup
 
     registry = EnvironmentIdentityRegistry()
@@ -6063,7 +6062,6 @@ def test_repair_citing_an_unknown_receipt_cannot_supersede_or_verify_1626():
     # The coder acquisition's frozen catalog never contains the invented ID.
     catalog = frozenset({"fail-1"})
     assert superseded_by_current_turn(live, catalog) == frozenset()
-    assert cited_evidence_progress(parsed, superseded_by_current_turn(live, catalog)) == frozenset()
     public = _render_test_observation_citations(
         parsed.test_observations, local_test_evidence=rendered, current_test_turn_id="coder-turn",
     )

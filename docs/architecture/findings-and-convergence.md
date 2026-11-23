@@ -1,8 +1,8 @@
 # Findings and convergence
 
-How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
+How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the single PR no-progress stop, the PR step-back prompt and sweep, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/no_progress.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_no_progress.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -218,135 +218,142 @@ items and newly stalled findings and carries an `AGENT_SUB_ITEM_PROGRESS`
 audit record keyed by PR, round and digest; only records in comments written by
 the authenticated actor suppress a repost, which keeps it exactly-once across
 resume. A pure helper classifies each item as `new`, `converging`, `stalled`,
-`complete` or `cleared` from persisted rounds. `--sub-item-stall-rounds`
-(default 3, 0 disables) sets the stall window, and the max-rounds diagnostics
+`complete` or `cleared` from persisted rounds. `--no-progress-rounds`
+(default 3, minimum 1) sets the stall window (the retired
+`--sub-item-stall-rounds` is ignored), and the max-rounds diagnostics
 add a per-item progress block. The signal is advisory: it never changes
 `--max-rounds`, `allowed_rounds` or a checkpoint bound.
 
-**PR step-back, reviewer sweep, and sibling escalation** (`--pr-step-back-rounds` K, default 3, `0` disables; `--pr-step-back-line-window`,
-default 40). The PR fix loop reuses the plan-phase classification
-(`classify_review(..., phase="pr")`: `blocking` and `same-pr` items the reviewer
-owns are mandatory, future follow-ups never count). Each reviewer is tracked
-independently, or only the primary under `primary-then-panel`. Findings carry
-`path:start[-end]` references; `project_finding_locations` reads them from the
-parent text, the `fix_scope` entries, and every open sub-item statement (the
-sub-items are stored apart from the parent) while keeping the parent identity,
-and every location is bound to the head its review was taken on. Locations are
-compared across heads by `map_anchor`, which pairs renames with
+**PR no-progress stop** (`--no-progress-rounds` K, default 3, minimum 1; #2097,
+stage 1 of #2067). One pure, record-derived detector in `no_progress.py`
+replaces the PR step-back sibling escalation, the non-convergence stop, the
+approach-alternative stop and the in-memory unchanged-head coder counter.
+`no_progress_decision(observations, live_subject=..., live_blocking_ids=...,
+k=..., through_round=...)` fires only when the last K observations have
+contiguous round numbers ending at `through_round`, the same non-empty subject
+and the same non-empty blocking ID set, and the live candidate equals that
+repeated observation; the live candidate is compared, never appended, so an
+unreviewed head never counts as a completed round. `pr_no_progress_observations`
+derives one observation per completed round N from the newest PR coder record
+numbered N+1, which every review mode (including the default sequential
+all-reviewers mode, which writes no reconciliation summary) already persists:
+subject = its `followup_dispatch_head`, or for a historical record without one
+the single subject of round N's complete reviewer records; IDs = its
+`prior_items` filtered by `is_blocking_ledger_item` (`blocking` and `same-pr`
+findings; never future items, inert converted records or tombstones, or machine
+and human exact-head obligations). Round N is no observation, and breaks the
+window, when it has a closure boundary or an unvalidated closure summary
+(`is_round_closure_boundary` / `is_unvalidated_closure_summary`, covering
+closed-incomplete records and legacy signed-input supersession boundaries),
+when `closed_round_reviewer_indexes` leaves it no complete review, when no coder
+record N+1 exists, or when that record's dispatch head differs from the reviewed
+head. No producer change to round metadata was needed.
+
+The PR loop checks it at two sites with the same functions. At the coder
+dispatch, `pr_loop_support._pr_dispatch_convergence` reads fresh history (the
+live snapshot predates coder record N; a cheap snapshot pre-check needs only
+complete reviews for the previous K-1 rounds) and adds the just-settled round
+from the in-memory ledger as `current`; the live subject is the freshly
+observed PR head. This runs before the round-limit exit and any coder
+invocation. At round start, `_pr_round_start_no_progress` uses durable
+observations only, through the previous round, against the observed head and
+the in-memory ledger, before any checkpoint, architecture refresh or reviewer
+prompt, so a resume after K completed rounds stops before another review while
+a moved head is reviewed first. A stop raises `HumanDecisionRequiredError`
+(exit 4) through `stop_for_human_decision` and writes no round metadata. When
+`no_progress.defers_to_evidence_stall` holds (every repeated item is tagged with
+rows unsatisfied at the dispatch head, read by `_evidence_owned_rows` from the
+head-bound coder record as the stall reads them, and `--pr-evidence-stall-rounds`
+is enabled), the dispatch returns the built error as
+`PrStepBackDecision.deferred_stop`: the loop raises it right after
+`_pr_evidence_stall_decision` when the stall did not stop, or before the
+round-limit exit on the final or a merge-conflict round. Round start leaves such
+windows to the dispatch.
+
+`render_no_progress_message` (registered in `HUMAN_DECISION_RENDERERS`) opens
+with `NO_PROGRESS_PREFIX_TEXT` after the `PR #N: ` lead and lists the sorted IDs
+(first 20, then `and N more`) with each item's first line. Every operator
+route or diagnostic of a retired stop is kept as an optional section, emitted
+only when present: the PR size from `_pr_size_measurement` (merge-base
+`git diff --shortstat`, never raising; omitted when unavailable), the newest
+PR coder record's `unsuperseded_receipts_sentence` and `tool_identity_clause`,
+the in-memory non-array citation diagnosis of the last accepted follow-up, the
+newest `Approach alternative:` excerpt at the stop head
+(`review_step_back.pr_approach_alternative_at_head`, selected even after later
+reviews of that head), and the child-plan supersession route for a PR bound to
+a planning child (formerly appended by the unchanged-head stop, #985). The
+retired non-convergence diff-growth line is dropped on purpose: every window
+round has the same head, so growth across it is always "no change". The
+per-head evidence-progress grant (#1626) is retired with the counter: evidence
+progress that makes a reviewer resolve an item changes the ID set and restarts
+the window.
+
+**Legacy step-back fields are inert.** `round_metadata` still decodes
+`step_back_entries` and `step_back_status` (absent, valid or invalid) without
+error, and PR coder records keep writing `step_back_entries` purely as an audit
+record that history export's `step_backs` metric counts. No PR decision reads
+them: not the detector, the step-back trigger or its suppression, the sweep, the
+approach-alternative excerpt, or any degraded-history log. A static AST guard in
+`tests/test_no_progress.py` forbids attribute loads of those fields and the
+retired entry readers in `pr_loop.py`, `pr_loop_support.py` and
+`no_progress.py` while allowing the writer keyword. The retired flags
+`--pr-step-back-rounds`, `--pr-step-back-line-window`,
+`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` are accepted and
+ignored for one release (`config.warn_deprecated_convergence_flags` logs one
+notice); their config fields and cross-validation are removed.
+
+**PR step-back turn and reviewer sweep** (a prompt technique only). The PR fix
+loop reuses the plan-phase classification (`classify_review(..., phase="pr")`:
+`blocking` and `same-pr` items the reviewer owns are mandatory, future
+follow-ups never count). Each reviewer is tracked independently, or only the
+primary under `primary-then-panel`. Findings carry `path:start[-end]`
+references; `project_finding_locations` reads them from the parent text, the
+`fix_scope` entries, and every open sub-item statement while keeping the parent
+identity, and every location is bound to the head its review was taken on.
+Locations are compared across heads by `map_anchor`, which pairs renames with
 `git diff --name-status -M` and no pathspec, then reads `git diff -U0` hunks for
 the old and new paths through the runner. It returns exactly one of three
-outcomes: `SHIFTED` (the range lies in unchanged lines and moves by the
-cumulative hunk offset), `REWRITTEN` (changed hunks overlap it, their old side
-stays within the anchor +/- the window, and the replacement span is the new
-position; ranges are never widened to a whole hunk), or `UNMAPPABLE` (a deleted
-file with no rename pair, a rewrite that spills beyond the window, a pure
-deletion or move, or a failed diff). At the coder dispatch, after the round's
-review is read back from fresh history, a tracked reviewer with K consecutive
-`new-finding` reviews (and no active episode) forms a cluster when one path has a
-mapped finding in every one of those K reviews and the mapped ranges connect with
-gaps no larger than the window; unrelated paths, repeat-only reviews, findings
-without a line reference, and `UNMAPPABLE` locations never contribute. All
-reviewers that trigger at the same dispatch share one step-back coder turn
-(`step_back_context` replaces the same-PR small-cleanup framing and offers two
-choices: a single rule, a parametrized test, and a summary beginning
-`Generalization:`; or, when the approved approach itself generates the class, a
-summary beginning `Approach alternative:` that names a materially smaller
-alternative without redesigning beyond the plan; the existing `coder_followup`
-JSON carries it, no new section), and the
-orchestrator records one reviewer-owned `step_back_entries` entry per reviewer
-(`phase: "pr"`, `trigger_round`, `trigger_head`, `anchor`) on the coder record. The
-sweep binds to that record's entry reviewers and its resulting head only: the
-review of that head receives `sweep_context` (full and compact prompts), asking
-for every remaining instance, in the existing sub-item shape (none, one plain
-finding, one finding with 2-12 sub-items, or several findings of at most 12). A
-live run carries the entries across the iteration; a resumed run rebuilds them
-from the durable record and never re-requests a published sweep review. One
-predicate, `in_cluster`, decides membership for clustering, escalation, and
-clearance: for a mappable anchor, the mapped path within the mapped span +/- the
-window; for an `UNMAPPABLE` anchor, the logged conservative fallback of any
-finding on the original or rename-destination path. If the sweep review, or any
-later review in the active episode, introduces a new mandatory finding that is a
-member (located in the parent text or only in a sub-item), the loop raises
-`HumanDecisionRequiredError` (exit code 4) before any further coder invocation, naming the cluster, the
-mapping outcome, the siblings, and the coder's `Generalization:` excerpt rebuilt
-from the stored structured response. A carried item is not a sibling; it keeps the
-episode open while it is a member. The episode closes on the reviewer's approval
-or when no unresolved mandatory item of theirs is a member. A malformed entry
-suppresses the trigger and the stop with a log line.
+outcomes: `SHIFTED` (unchanged lines moved by the cumulative hunk offset),
+`REWRITTEN` (changed hunks overlap the range within the window; the replacement
+span is the new position, never a whole hunk), or `UNMAPPABLE` (a deleted file
+with no rename pair, a rewrite that spills beyond the window, a pure deletion
+or move, or a failed diff). `derived_pr_trigger_rounds` scans a reviewer's
+per-head review records in round order: a trigger at round r needs
+`PR_STEP_BACK_ROUNDS` (3) contiguous `new-finding` reviews after the previous
+trigger, whose mapped locations cluster on one path with gaps no larger than
+`PR_STEP_BACK_LINE_WINDOW` (40) under the `in_cluster`/`find_cluster` rules;
+locations map to the head the coder follow-up was dispatched from
+(`pr_dispatch_heads`, or the dispatch head for the current round), so a live
+and a resumed run agree, and unmappable locations never contribute. A step-back
+turn is requested at round r exactly when r is a derived trigger round; all
+reviewers triggering at one dispatch share one coder turn (`step_back_context`
+offers a `Generalization:` rule with a parametrized test, or an
+`Approach alternative:` proposal that goes to review like any revision). The
+review of the head that follows a trigger, and only it, receives
+`sweep_context` for the triggering reviewer
+(`_pr_step_back_sweep_contexts`, rebuilt from the trigger cluster; within a run
+the previous dispatch head is carried because the round snapshot can predate
+the newest coder record). A step-back never stops the run.
 
-An `Approach alternative:` answer (#1628) stops instead of continuing:
-`pr_step_back_approach_alternative` reads the newest valid step-back coder record
-and matches only when its decoded summary opens with that prefix, its resulting
-head equals the live head, and no review of that head was recorded after it. The
-live check runs after the coder record is posted and after the issue-created
-managed-CI continuity grant for the new head, so a resume activates managed CI
-before stopping; the same check runs at every round start before any review, so
-a resumed run stops before reviewing the proposal head. The loop raises
-`HumanDecisionRequiredError` (exit code 4) quoting the alternative and offering a
-scope change, a stated limitation, or continued generalization with
-`--pr-step-back-rounds 0`, which also disables this stop; history export classifies the
-message as a human-decision stop. A pushed head, a
-`Generalization:` answer, or an unreadable record never stops. The sibling
-escalation message also names the scope-change route (approve the scope change,
-push the replacement and rerun).
-
-**PR non-convergence stop** (`--pr-non-convergence-rounds` K, default 3,
-`0` disables, independent of `--pr-step-back-rounds`). The clustered trigger counts
-only new findings near one file span, so items that persist across files never
-fire it. `review_step_back.find_pr_non_convergence` therefore joins a tracked
-reviewer's reviews at rounds N-K..N with the coder records between them using the
-loop's numbering (review r, then coder record r+1 whose subject is the head
-reviewed at r+1). Every join must have moved the head and the next review must be
-on that head, so a no-op turn, a missing record, or an external push breaks the
-chain. Each review's blocking set is `_remaining_mandatory_items` with only the
-reviewer's own dispositions, which drops machine and human exact-head evidence
-obligations and items whose last sub-item a completing disposition resolved;
-tagged findings count like any finding; an unresolvable
-`--review-parallel` publication breaks the chain. An item persists when it is in
-all K+1 blocking sets and its open sub-item count never drops between two of them
-(resolving a sub-item is progress). Any persisting item raises `HumanDecisionRequiredError` (exit 4) inside
-`_pr_step_back_decision`, after a clustered-sibling escalation and before a fresh
-clustered step-back turn, the round-limit exit, and any coder invocation. When
-`defers_to_evidence_stall` holds (every persisting item is tagged with rows
-unsatisfied at the dispatch head, read from the head-bound coder record as the
-stall reads them), the decision is returned as `deferred_stop` instead: the PR
-loop raises it right after `_pr_evidence_stall_decision`, so a stall that
-qualifies on the combined ledger and its window history wins, and otherwise the
-non-convergence stop fires before the coder; on the final round or a
-merge-conflict round, where the stall is not evaluated, it is raised before the
-round-limit exit. The
-snapshot pre-check only needs the reviews N-K..N-1 to be contiguous blocks, because
-the live snapshot predates coder record N; the joins are verified on the fresh
-read. The decision text lists each item with its attempt count and first line, the
-`git diff --shortstat` growth since the head of the earliest counted attempt (the
-attempt scan may reach past the K window) and the PR size from the merge
-base (each `unavailable` when Git fails), flags items asking for evidence, and
-offers the override options. No state is persisted (the posted diagnostic below
-is audit text only), so a resumed run stops with the same text.
-
-**Durable human-decision diagnostics** (#1640). The sibling escalation, the
-non-convergence stop (immediate inside `_pr_step_back_decision`, or deferred where
-the PR loop raises it on the final or merge-conflict round or after
-`_pr_evidence_stall_decision`), and the approach-alternative stop (at round start
-or live) each go through `pr_loop`'s `stop_for_human_decision` closure. It posts
-one plain `PR review scheduling diagnostic (round N): ...` comment and re-raises
-the original exception object. The diagnostic is posted after the stop's existing
-writes (for the live approach alternative, after the coder record and the
-managed-CI continuity grant) and only where a stop actually raises, so a deferred
-stop that the evidence stall owns posts nothing. It carries no round metadata and
+**Durable human-decision diagnostics** (#1640). The no-progress stop (at round
+start, at the dispatch, or deferred) goes through `pr_loop`'s
+`stop_for_human_decision` closure, which posts one plain
+`PR review scheduling diagnostic (round N): ...` comment and re-raises the
+original exception object, only where a stop actually raises, so a deferred stop
+that the evidence stall owns posts nothing. It carries no round metadata and
 resume never reads it; a rerun that stops again posts one more. The body is
 `render_pr_human_decision_diagnostic`: the unchanged message within
-`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` (40,000 characters, under the transport's
-plain-body limit), otherwise the template, the first line and as many following
-whole lines as fit, then an omission note; the exception and CLI text stay
-complete. The post is best-effort: an `AgentLoopError` (GitHub, transport
-overflow) or `OSError` (local temp file) is logged as a warning and never changes
-the stop or exit 4. History export classifies the three stops as human-decision
-stops (`pr-step-back-sibling`, `pr-non-convergence`,
-`pr-step-back-approach-alternative`) from shared `review_step_back` message
-constants; the non-convergence match reads only the first line, so item text
-further down cannot change the classification. Evidence-stall and evidence-freeze
-coverage is described below; disputed-items and finalization stops are unchanged.
+`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` (40,000 characters), otherwise the
+template, the first line and as many following whole lines as fit, then an
+omission note; the exception and CLI text stay complete. The post is
+best-effort: an `AgentLoopError` or `OSError` is logged as a warning and never
+changes the stop or exit 4. History export classifies the stop as
+`pr-no-progress` and still recognizes the retired stops' recorded comments
+(`pr-step-back-sibling`, `pr-non-convergence`,
+`pr-step-back-approach-alternative`) from the prefix constants kept in
+`review_step_back`; the legacy non-convergence match reads only the first line.
+Evidence-stall and evidence-freeze coverage is described below;
+disputed-items and finalization stops are unchanged.
 
 **Uniform human-decision stops** (#2069). Every human-decision stop raises
 `HumanDecisionRequiredError` (exit 4); a plain `AgentLoopError` never carries
@@ -359,7 +366,7 @@ registered full-message renderer listed in `HUMAN_DECISION_RENDERERS`, directly
 or through a same-function local. Each renderer keeps the leading prefix that
 history export and triage recognize. A stop that crosses functions carries the
 built error object: `PrStepBackDecision.deferred_stop` holds the deferred
-non-convergence error, and the plan step-back and primary-stall stops build a
+no-progress error, and the plan step-back and primary-stall stops build a
 `PlanPrePanelHumanDecisionError` (both `PlanPrePanelSafetyError` and
 `HumanDecisionRequiredError`) that `stop_plan_pre_panel_decision` posts once
 and re-raises. Post-merge context is added with `exc.with_context`, which keeps
@@ -548,7 +555,7 @@ Eligible captures select the primary or per-row active requesters using the
 [post-capture assignment and scope contract](review-scheduling.md#post-capture-evidence-acceptance).
 Evidence-only records grant capture authority only and are excluded from
 complete-review accounting at every consumer, including code-round completion,
-panel/sweep qualification and step-back/non-convergence streaks. Scoped findings
+panel/sweep qualification, step-back triggers and no-progress observations. Scoped findings
 remain actionable, but dispositions are restricted to assigned reviewer-owned
 evidence findings. Machine supersession alone supplies no semantic acceptance.
 Replacement evidence reopens acceptance, while identical claims and citations

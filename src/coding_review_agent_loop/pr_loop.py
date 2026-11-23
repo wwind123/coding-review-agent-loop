@@ -263,7 +263,6 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .local_test_evidence import (
-    superseded_by_current_turn,
     tool_identity_clause,
     unsuperseded_receipts_sentence,
 )
@@ -458,21 +457,15 @@ from .pr_loop_support import (
     _pr_human_decision_omission_note,
     _stop_for_human_decision,
     _managed_v1_dispatch_records,
-    unchanged_head_stop_message,
     ExactHeadCiProof,
-    _pr_step_back_approach_alternative_stop,
-    _pr_step_back_carried_entries,
-    _pr_step_back_decision,
+    _pr_dispatch_convergence,
+    _pr_round_start_no_progress,
     _pr_step_back_sweep_contexts,
     _pr_step_back_tracked_reviewers,
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
-    MAX_UNCHANGED_HEAD_CODER_TURNS,
     FollowupCitationDiagnosis,
-    _UnchangedHeadTracker,
-    cited_evidence_progress,
     render_followup_local_test_evidence,
-    canonical_receipt_progress,
     local_test_failure_context as _local_test_failure_context,
     followup_citation_diagnosis,
     _coder_followup_head_log,
@@ -740,7 +733,6 @@ def run_pr_loop(
             stopped="no approval or merge was attempted",
         )
 
-    unchanged_head_tracker = _UnchangedHeadTracker()
     pr_board_stamp_token = None
     telemetry_token = _begin_run_telemetry(
         runner, config, usage_context, owned_usage_context, pr_number=pr_number
@@ -3078,8 +3070,25 @@ def run_pr_loop(
                 "gate; no freeze was published and the new head needs review",
             )
 
-        # Step-back entries recorded by the previous iteration's coder turn (#1251).
-        pending_step_back_sweeps: dict = {}
+        # The newest accepted coder follow-up's citation diagnosis (#1626), an
+        # in-memory input to the no-progress message only.
+        latest_followup_citations: FollowupCitationDiagnosis | None = None
+        # The head this process last dispatched a coder follow-up from; the
+        # next round's snapshot may predate that coder record.
+        last_dispatch_head: str | None = None
+
+        def no_progress_route() -> str:
+            # A finding a PR-mode coder turn cannot satisfy (such as a required
+            # re-plan) must stop with a route (#985).
+            if planning_child_binding is None:
+                return ""
+            return (
+                "If the blocking finding requires re-planning the child plan, post the "
+                "signed child-plan supersession record on child issue "
+                f"#{planning_child_binding.child_issue} and rerun "
+                f"`{_child_resume_hint(planning_child_binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`."
+            )
+
         visual_history = admitted_visual_history(runner, config, pr_number, initial_pr_context.comments)
         visual_ledger = recover_visual_findings(visual_history, reconciliation_mode=pr_reconciliation_mode)
         unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
@@ -3116,7 +3125,7 @@ def run_pr_loop(
                             if prefetched_pr_context is not None
                             else initial_pr_context.metadata.head_sha
                         ),
-                        sub_item_stall_rounds=config.sub_item_stall_rounds,
+                        sub_item_stall_rounds=config.no_progress_rounds,
                     )
                 )
             coder_name = agent_display_name(config.coder)
@@ -3191,20 +3200,25 @@ def run_pr_loop(
             if parent_issue_context is not None:
                 parent_issue_context_refreshed = True
             pr_comments = pr_context.comments
-            # A durable step-back record proposing an approach change at this
-            # exact head stops before any review of it, so a resumed run agrees
-            # with the live stop below (#1628).
-            if config.pr_step_back_rounds > 0:
-                approach_records = _extract_round_metadata_records(pr_comments, flow="pr")
-                try:
-                    _pr_step_back_approach_alternative_stop(
-                        config,
-                        pr_number=pr_number,
-                        records=approach_records,
-                        head_sha=pr_metadata.head_sha,
-                    )
-                except HumanDecisionRequiredError as exc:
-                    stop_for_human_decision(exc, round_number=round_number)
+            # No progress (#2097): K durable completed rounds at this exact head
+            # with the same blocking items stop before any review of it, so a
+            # resumed run stops where a live run would.  A moved head is
+            # reviewed first.
+            try:
+                _pr_round_start_no_progress(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    round_number=round_number,
+                    comments=pr_comments,
+                    head_sha=pr_metadata.head_sha,
+                    open_items=unresolved_items,
+                    route=no_progress_route(),
+                    citation_diagnosis=latest_followup_citations,
+                    base_branch=pr_metadata.base_branch or config.base,
+                )
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
             pr_posted_checkpoint: PostedRoundMetadata | None = None
             # A review round is a fresh acquisition boundary. Rebind the
             # candidate/base pair before constructing any reviewer prompt so
@@ -3502,7 +3516,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
-                            sub_item_stall_rounds=config.sub_item_stall_rounds,
+                            sub_item_stall_rounds=config.no_progress_rounds,
                         )
                     )
                 freeze_payload = live_evidence_boundary.evidence_freeze
@@ -3741,16 +3755,17 @@ def run_pr_loop(
                 prior_unresolved_items, response_head=evidence_response_head
             ) + capture_review_context(capture_records,
                                        head=pr_metadata.head_sha, plan=approved_plan_context)
-            # Step-back sweeps (#1251) bind to the step-back coder record's
-            # resulting head and this round only; rebuilt from durable records.
+            # Step-back sweeps (#1251) bind to the review of the head that follows
+            # a derived trigger, this round only; derived from review records.
             pr_step_back_sweeps = _pr_step_back_sweep_contexts(
+                runner,
                 config,
                 pr_comments,
                 round_number=round_number,
                 head_sha=pr_metadata.head_sha,
-                carried=pending_step_back_sweeps,
+                tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
+                dispatch_head=last_dispatch_head,
             )
-            pending_step_back_sweeps = {}
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
             surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
@@ -7345,7 +7360,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
-                            sub_item_stall_rounds=config.sub_item_stall_rounds,
+                            sub_item_stall_rounds=config.no_progress_rounds,
                             config=config,
                         )
                         if config.auto_merge:
@@ -8276,7 +8291,7 @@ def run_pr_loop(
                                     round_number=round_number,
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
-                                    sub_item_stall_rounds=config.sub_item_stall_rounds,
+                                    sub_item_stall_rounds=config.no_progress_rounds,
                                     config=config,
                                 )
                                 if config.auto_merge:
@@ -8663,7 +8678,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
-                            sub_item_stall_rounds=config.sub_item_stall_rounds,
+                            sub_item_stall_rounds=config.no_progress_rounds,
                             observations=finalization_observations,
                             config=config,
                         )
@@ -8674,12 +8689,13 @@ def run_pr_loop(
                             + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
-            # A clustered sibling after a step-back, or the same items blocking across
-            # K code-changing coder turns (#1372), stops for a human decision
-            # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
-            # turn this follow-up into one generalize-the-class step-back turn.
+            # No progress (#2097): the same blocking items at the same head for K
+            # completed rounds, this one included, stop for a human decision here,
+            # before the round-limit exit and any coder invocation; K clustered
+            # blocks otherwise turn this follow-up into one step-back turn, which
+            # never stops the run by itself.
             try:
-                step_back_decision = _pr_step_back_decision(
+                step_back_decision = _pr_dispatch_convergence(
                     runner,
                     config,
                     pr_number=pr_number,
@@ -8689,12 +8705,15 @@ def run_pr_loop(
                     head_sha=pr_metadata.head_sha,
                     base_branch=pr_metadata.base_branch or config.base,
                     approved_plan_context=approved_plan_context,
+                    open_items=unresolved_items,
+                    route=no_progress_route(),
+                    citation_diagnosis=latest_followup_citations,
                 )
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
-            # A deferred non-convergence stop (#1372) waits for the evidence-stall
-            # decision below; on paths where that decision is not evaluated (the
-            # final allowed round, a merge-conflict round) it stops here instead.
+            # A deferred no-progress stop waits for the evidence-stall decision
+            # below; on paths where that decision is not evaluated (the final
+            # allowed round, a merge-conflict round) it stops here instead.
             deferred_non_convergence = step_back_decision.deferred_stop
             if deferred_non_convergence is not None and (
                 round_number == allowed_rounds
@@ -8708,7 +8727,7 @@ def run_pr_loop(
                         round_number=round_number,
                         items=unresolved_items,
                         current_head_sha=pr_metadata.head_sha,
-                        sub_item_stall_rounds=config.sub_item_stall_rounds,
+                        sub_item_stall_rounds=config.no_progress_rounds,
                     )
                 )
 
@@ -8852,7 +8871,7 @@ def run_pr_loop(
                 continue
             if deferred_non_convergence is not None:
                 # The evidence stall did not stop at this dispatch, so it cannot own
-                # the window: the non-convergence stop fires before any coder turn.
+                # the window: the no-progress stop fires before any coder turn.
                 stop_for_human_decision(deferred_non_convergence, round_number=round_number)
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
@@ -9173,11 +9192,10 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
-            # Tool-owned state for the unchanged-head gate (#1626), frozen at
-            # the coder acquisition; a repair launch cannot repoint it.
+            # Tool-owned citation state (#1626), frozen at the coder
+            # acquisition; a repair launch cannot repoint it.
             coder_turn_receipt_ids: frozenset[str] = frozenset()
             followup_citations: FollowupCitationDiagnosis | None = None
-            evidence_progress_receipts: frozenset[str] = frozenset()
             _followup_derived_risk_evidence = None
             _validate_coder_followup_response_by_mode = lambda mode, observations_mode, degraded_unacknowledged=False: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
@@ -9358,17 +9376,6 @@ def run_pr_loop(
                 # the bounded round projection stays display-only (#1626).
                 followup_citations = followup_citation_diagnosis(
                     coder_response.marker_value, coder_turn_receipt_ids
-                )
-                evidence_progress_receipts = cited_evidence_progress(
-                    coder_response.marker_value,
-                    superseded_by_current_turn(
-                        getattr(runner, "last_reconciled_local_test_evidence", None),
-                        coder_turn_receipt_ids,
-                    ),
-                )
-                evidence_progress_receipts |= canonical_receipt_progress(
-                    coder_response, _followup_derived_risk_evidence, latest_coder_metadata,
-                    approved_plan_context, updated_pr_context.metadata.head_sha, unresolved_items,
                 )
                 # The coder metadata record posted below is numbered one past the
                 # loop round; the matrix-evidence anchor must use that number.
@@ -9629,7 +9636,7 @@ def run_pr_loop(
             coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
             latest_coder_metadata, latest_coder_output, unresolved_items, coder_response_discarded = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
             if coder_response_discarded:  # a claim-free synthesized record: none of its claims count (#2086)
-                evidence_progress_receipts, followup_citations, latest_coder_coverage_map = frozenset(), None, None
+                followup_citations, latest_coder_coverage_map = None, None
             elif isinstance(coder_response.marker_value, StructuredCoderFollowup):  # fix history only for the posted record
                 pr_finding_history.record_fix(coder_response.marker_value, published_round=coder_record_round, agent=coder_name)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
@@ -9670,73 +9677,9 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
-            if step_back_entries:
-                # After the coder record and the managed-CI continuity grant, so
-                # a resume activates managed CI for this head before its
-                # round-start stop (#1628).
-                try:
-                    _pr_step_back_approach_alternative_stop(
-                        config,
-                        pr_number=pr_number,
-                        records=(
-                            PostedRoundRecord(index=0, metadata=latest_coder_metadata, body=""),
-                        ),
-                        head_sha=updated_pr_context.metadata.head_sha,
-                    )
-                except HumanDecisionRequiredError as exc:
-                    stop_for_human_decision(exc, round_number=round_number)
-            pending_step_back_sweeps = _pr_step_back_carried_entries(
-                step_back_entries,
-                coder_round=coder_record_round,
-                head_sha=updated_pr_context.metadata.head_sha,
-            )
+            latest_followup_citations = followup_citations
             previous_head = pr_metadata.head_sha
-            unchanged_head_coder_turns = unchanged_head_tracker.observe(
-                previous_head, updated_pr_context.metadata.head_sha
-            )
-            if (
-                unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS
-                and evidence_progress_receipts
-                and unchanged_head_tracker.grant_evidence_progress()
-            ):
-                # A cited acquisition receipt superseded an authoritative
-                # failure or newly verified a canonical receipt-only row:
-                # reviewers get one round to see it, once per head.
-                log(
-                    config,
-                    f"Round {round_number}: unchanged head but authoritative cited evidence "
-                    "progress; granting one review round (receipt(s) "
-                    f"{', '.join(sorted(evidence_progress_receipts))})",
-                )
-            elif unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
-                # Re-reviewing an identical diff reaches the same verdict every
-                # round; a finding a PR-mode coder turn cannot satisfy (such as
-                # a required re-plan) must stop with a route, not consume the
-                # round budget (#985).
-                route = (
-                    " If the blocking finding requires re-planning the child plan, post the "
-                    "signed child-plan supersession record on child issue "
-                    f"#{planning_child_binding.child_issue} and rerun "
-                    f"`{_child_resume_hint(planning_child_binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`."
-                    if planning_child_binding is not None
-                    else ""
-                )
-                raise AgentLoopError(
-                    unchanged_head_stop_message(
-                        pr=pr_number,
-                        coder_name=coder_name,
-                        previous_head=previous_head,
-                        turns=unchanged_head_coder_turns,
-                        round_number=round_number,
-                        evidence=(
-                            latest_coder_metadata.local_test_evidence
-                            if latest_coder_metadata is not None
-                            else None
-                        ),
-                        route=route,
-                        citation_diagnosis=followup_citations,
-                    )
-                )
+            last_dispatch_head = previous_head
             log(
                 config,
                 _coder_followup_head_log(
@@ -9744,7 +9687,6 @@ def run_pr_loop(
                     coder_name,
                     previous_head,
                     updated_pr_context.metadata.head_sha,
-                    unchanged_head_coder_turns,
                 ),
             )
             pre_review_test_pending = True
@@ -9770,7 +9712,7 @@ def run_pr_loop(
             + _sub_item_progress_block(
                 unresolved_items,
                 round_number=config.max_rounds,
-                window=config.sub_item_stall_rounds,
+                window=config.no_progress_rounds,
             )
         )
     finally:

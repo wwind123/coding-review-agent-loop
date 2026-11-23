@@ -1064,14 +1064,16 @@ def test_operator_docs_document_the_pr_step_back_mechanism():
     readme = (root / "README.md").read_text()
     architecture = _architecture_set_text()
 
+    # #2097: the step-back flags are retired (accepted and ignored).
     for flag in ("--pr-step-back-rounds", "--pr-step-back-line-window"):
         assert flag in text and flag in readme and flag in architecture
-    assert "#### PR step-back, reviewer sweep, and sibling escalation" in text
+    assert "#### PR step-back turn and reviewer sweep" in text
+    assert "never stops the run" in text and "never stops the run" in readme
     for outcome in ("SHIFTED", "REWRITTEN", "UNMAPPABLE"):
         assert outcome in text and outcome in architecture
-    assert "without a pathspec" in text and "no pathspec" in architecture
+    assert "no pathspec" in architecture
     assert "`Generalization:`" in text and "`in_cluster`" in architecture
-    assert "sweep" in text and "human-decision" in architecture
+    assert "sweep" in text and "derived_pr_trigger_rounds" in architecture
 
 
 def test_operator_docs_document_the_pr_evidence_stall_stop():
@@ -1446,7 +1448,8 @@ def test_transport_smoke_workflow_is_optional_read_only_and_pinned():
     assert "transport" not in (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
 
-def test_operator_docs_document_the_pr_non_convergence_stop():
+def test_operator_docs_document_the_pr_no_progress_stop():
+    """#2097: one detector, its flag, the retired flags and its message."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parent.parent
@@ -1454,15 +1457,19 @@ def test_operator_docs_document_the_pr_non_convergence_stop():
     readme = (root / "README.md").read_text()
     architecture = _architecture_set_text()
 
-    assert "#### PR non-convergence stop" in text
+    assert "#### PR no-progress stop" in text
     for document in (text, readme, architecture):
-        assert "--pr-non-convergence-rounds" in document
+        assert "--no-progress-rounds" in document
         assert "default 3" in document
-    for term in ("**Precedence.**", "**Stop message.**", "**Unattainable evidence.**",
-                 "`exact_head_evidence_requests`", "or a larger K", "signed"):
+        for retired in ("--pr-non-convergence-rounds", "--sub-item-stall-rounds"):
+            assert retired in document
+    for term in ("**Stop message.**", "**Retired flags.**", "**Unattainable evidence.**",
+                 "`exact_head_evidence_requests`", "`pr-no-progress`", "child-plan supersession"):
         assert term in text
     assert "`exact_head_evidence_requests`" in readme
-    assert "find_pr_non_convergence" in architecture
+    for term in ("no_progress_decision", "pr_no_progress_observations",
+                 "render_no_progress_message", "step_back_entries"):
+        assert term in architecture
 
 
 FIXTURE_HEADING_TEXT = "Multi-process fixtures (`run-tests --fixture`)"

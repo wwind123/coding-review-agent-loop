@@ -30,8 +30,7 @@ from dataclasses import (
 )
 from pathlib import Path
 from typing import Literal, NoReturn
-from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
-from .test_runtime import parse_rerun_citation
+from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .review_scope import is_complete_code_review, is_visual_item, is_visual_review, visual_candidate, authority_records
@@ -117,18 +116,27 @@ from .protocol import (
     parse_historical_structured_issue_implementation,
 )
 from .protocol_risk import (
-    DerivedRiskEvidenceResult,
     CITATION_DROPPED_OUTCOME,
     TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
     TEST_OBSERVATIONS_NOT_ARRAY_RULES,
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
-    EVIDENCE_SOURCE_TOOL_CAPTURED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
     parse_risk_test_matrix_evidence,
 )
 from .runner import Runner
 from . import review_step_back as _step_back
+from .no_progress import (
+    NoProgressDecision,
+    NoProgressObservation,
+    blocking_item_ids,
+    citation_diagnosis_sentence,
+    defers_to_evidence_stall,
+    no_progress_decision,
+    pr_no_progress_observations,
+    render_no_progress_item_lines,
+    render_no_progress_message,
+)
 from .usage import RunUsageContext
 from .workdirs import active_workdir
 from .workdir_guard import (
@@ -334,50 +342,6 @@ def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str 
     return probe.value if probe.available else None
 
 
-# Consecutive PR follow-up coder turns allowed to leave the head unchanged
-# before the loop stops instead of re-reviewing an identical diff (#985).
-MAX_UNCHANGED_HEAD_CODER_TURNS = 2
-
-
-class _UnchangedHeadTracker:
-    """Count consecutive coder follow-ups that left one PR head unchanged (#985).
-
-    The count belongs to a single head: a follow-up on any other head,
-    including one advanced externally between rounds, starts a fresh count,
-    and a follow-up that moves the head clears it.
-
-    Each tracked head also has one evidence-progress grant (#1626): one extra
-    review round when the follow-up at the limit made cited, authoritative
-    evidence progress.  The grant resets whenever the tracked head changes,
-    so the extra rounds are bounded at one per head.  Like the count, it is
-    in-memory only.
-    """
-
-    def __init__(self) -> None:
-        self.head_sha: str | None = None
-        self.count = 0
-        self.evidence_progress_granted = False
-
-    def observe(self, reviewed_head: str | None, head_after_followup: str | None) -> int:
-        previous_head = self.head_sha
-        if not reviewed_head or head_after_followup != reviewed_head:
-            self.head_sha, self.count = None, 0
-        elif reviewed_head == self.head_sha:
-            self.count += 1
-        else:
-            self.head_sha, self.count = reviewed_head, 1
-        if self.head_sha != previous_head:
-            self.evidence_progress_granted = False
-        return self.count
-
-    def grant_evidence_progress(self) -> bool:
-        """Spend this head's one evidence-progress grant; False once it is used."""
-        if self.head_sha is None or self.evidence_progress_granted:
-            return False
-        self.evidence_progress_granted = True
-        return True
-
-
 @dataclass(frozen=True)
 class FollowupCitationDiagnosis:
     """What happened to one accepted follow-up's test_observations (#1626).
@@ -431,92 +395,11 @@ def render_followup_local_test_evidence(
     )
 
 
-def canonical_receipt_progress(
-    response: ValidatedAgentResponse, derived: DerivedRiskEvidenceResult | None,
-    previous: PostedRoundMetadata | None, plan: ApprovedPlanContext | None,
-    head: str | None, items: Sequence[UnresolvedReviewItem],
-) -> frozenset[str]:
-    """New tool-verified rows for receipt-only blockers, at the same matrix/head.
-
-    Called only with the live post-authentication derivation. Neither the
-    transported projection nor fresh agent declarations grant this allowance.
-    """
-    if (derived is None or previous is None or plan is None or not head
-        or previous.subject != head or derived.bound_head_sha != head
-        or derived.evidence.matrix_identity != plan.risk_test_matrix_identity
-        or previous.risk_test_matrix_evidence is None
-        or not items or any(not item.evidence_row_ids for item in items)):
-        return frozenset()
-    try:
-        prior = parse_risk_test_matrix_evidence(
-            previous.risk_test_matrix_evidence,
-            expected_identity=plan.risk_test_matrix_identity,
-            expected_row_ids=tuple(plan.risk_test_matrix_expected_row_ids or ()),
-        )
-    except AgentLoopError:
-        return frozenset()
-    old_verified = {row.row_id for row in prior.rows if row.status == "verified"}
-    requested = {row_id for item in items for row_id in item.evidence_row_ids}
-    parsed = response.marker_value
-    if not isinstance(parsed, StructuredCoderFollowup):
-        return frozenset()
-    live_rows = {
-        row.receipt_id: row for row in response.acquisition_test_observations
-        if getattr(row, "turn_id", None) == response.acquisition_test_turn_id
-        and getattr(row, "provenance", None) == "parent-observed"
-        and not getattr(row, "restored", True)
-    }
-    live = set(live_rows)
-
-    def citation_command(command: str, receipt_id: str) -> str:
-        # Issue #1999: a matched ``--rerun`` citation stands for the
-        # replayed row's redacted command; any other spelling is unchanged.
-        target = parse_rerun_citation(command)
-        replay = live_rows.get(receipt_id)
-        if target is not None and replay is not None and getattr(replay, "rerun_of", None) == target:
-            return redact_test_command(getattr(replay, "command", ()))[0]
-        return redact_test_command(command)[0]
-
-    accepted: dict[str, set[tuple[str, str]]] = {}
-    for citation in parsed.test_observations:
-        accepted.setdefault(citation.receipt_id, set()).add(
-            (citation_command(citation.command, citation.receipt_id), citation.claim)
-        )
-    return frozenset(
-        citation.receipt_id for row in derived.evidence.rows
-        if row.row_id in requested - old_verified and row.status == "verified"
-        and row.evidence_source == EVIDENCE_SOURCE_TOOL_CAPTURED
-        for citation in row.evidence_citations
-        if citation.receipt_id in live
-        and accepted.get(citation.receipt_id) in (
-            {(citation.command, citation.claim)},
-            {(citation_command(citation.command, citation.receipt_id), citation.claim)},
-        )
-    )
-
-
-def cited_evidence_progress(
-    parsed: object,
-    superseding_receipts: Iterable[str],
-) -> frozenset[str]:
-    """Superseding current-turn receipts that a surviving citation also cites (#1626).
-
-    Live reconciliation supersedes a failure from any compatible pass, cited
-    or not; the grant also requires that the pass was presented to
-    reviewers, so a failed repair (citations dropped) never earns it.
-    """
-    if not isinstance(parsed, StructuredCoderFollowup):
-        return frozenset()
-    cited = {citation.receipt_id for citation in parsed.test_observations}
-    return frozenset(superseding_receipts) & cited
-
-
 def _coder_followup_head_log(
     round_number: int,
     coder_name: str,
     dispatch_head: str | None,
     observed_head: str | None,
-    unchanged_count: int,
 ) -> str:
     """Describe a PR coder follow-up by its observed head change (#1034).
 
@@ -535,7 +418,7 @@ def _coder_followup_head_log(
         )
     return (
         f"Round {round_number}: {coder_name} follow-up left PR head {observed_head[:12]} "
-        f"unchanged ({unchanged_count}/{MAX_UNCHANGED_HEAD_CODER_TURNS}); re-reviewing"
+        "unchanged; re-reviewing"
     )
 
 
@@ -1517,7 +1400,7 @@ def _publish_sub_item_progress(
     """
     for note in notes:
         log(config, f"Round {round_number}: sub-item note: {note}")
-    window = config.sub_item_stall_rounds
+    window = config.no_progress_rounds
     for entry in sub_item_progress(items, (), current_round=round_number, window=window):
         if entry.classification == "stalled":
             log(
@@ -4261,14 +4144,20 @@ def _recover_managed_ci_approved_plan(
 # ---------------------------------------------------------------------------
 
 
+# Step-back stays a prompt technique only (#2097): its repeat-cluster trigger
+# uses these internal constants (the retired flags' old defaults).
+PR_STEP_BACK_ROUNDS = 3
+PR_STEP_BACK_LINE_WINDOW = 40
+
+
 @dataclass(frozen=True)
 class PrStepBackDecision:
     """Clusters that open a step-back turn at this coder dispatch."""
 
     triggers: tuple[_step_back.PrClusterTrigger, ...] = ()
-    # A non-convergence stop held back so the evidence-stall stop can decide
-    # first at this dispatch (#1372); raised before any coder invocation.
-    # Built from the registered renderer and carried, never rebuilt (#2069).
+    # A no-progress stop held back so the evidence-stall stop can decide
+    # first at this dispatch (#1372, #2097); raised before any coder
+    # invocation.  Built from the registered renderer and carried (#2069).
     deferred_stop: HumanDecisionRequiredError | None = None
 
     def coder_guidance(self) -> str:
@@ -4277,6 +4166,7 @@ class PrStepBackDecision:
         return _step_back.render_pr_step_back_coder_guidance(self.triggers)
 
     def entry_payloads(self) -> tuple[Mapping[str, object], ...]:
+        """Audit-only entries for the coder record; no decision reads them back."""
         return tuple(_step_back.pr_step_back_entry_payload(t) for t in self.triggers)
 
 
@@ -4350,27 +4240,15 @@ def _pr_step_back_records_may_matter(
     *,
     k: int,
     round_number: int,
-    non_convergence_k: int = 0,
 ) -> bool:
     """Cheap pre-check on the round-start snapshot: could this dispatch step back?
 
-    The snapshot lacks at most the current round's review, so a trigger needs the
-    previous K-1 reviews to already be consecutive new findings, and an episode
-    needs a recorded entry.  A non-convergence window needs the previous
-    ``non_convergence_k`` reviews to be contiguous blocks; its coder joins are
-    checked only on the fresh read, because a live snapshot predates the newest
-    coder record.  Anything else skips the fresh read entirely.
+    The snapshot lacks at most the current round's review, so a trigger needs
+    the previous K-1 reviews to already be consecutive new findings.
     """
+    if k <= 0:
+        return False
     for reviewer in tracked:
-        if _step_back.pr_non_convergence_may_matter(
-            records, reviewer, k=non_convergence_k, round_number=round_number
-        ):
-            return True
-        if k <= 0:
-            continue
-        entries, degraded = _step_back.pr_step_back_history(records, reviewer)
-        if degraded or entries:
-            return True
         if k <= 1:
             return True
         # The snapshot may or may not already hold the current round's review (a
@@ -4389,23 +4267,42 @@ def _pr_step_back_records_may_matter(
     return False
 
 
+def _no_progress_records_may_matter(
+    records: Sequence[PostedRoundRecord], *, k: int, round_number: int
+) -> bool:
+    """Snapshot pre-check: each of the previous K-1 rounds has a complete review.
+
+    The live snapshot predates the newest coder record, so the coder ledgers
+    are read only on the fresh history.
+    """
+    if k <= 1:
+        return True
+    reviewed = {
+        record.metadata.round_number
+        for record in records
+        if record.metadata.flow == "pr" and is_complete_code_review(record.metadata)
+    }
+    return all(number in reviewed for number in range(round_number - k + 1, round_number))
+
+
 _SHORTSTAT_RE = re.compile(r"^\s*\d+ files? changed")
 
 
-def _pr_non_convergence_measurements(
+def _pr_size_measurement(
     runner: Runner,
     config: AgentLoopConfig,
     *,
-    first_head: str,
     current_head: str,
     base_branch: str | None,
-) -> tuple[str | None, str | None]:
-    """``(diff growth since first_head, total PR size)``; ``None`` when unavailable.
+) -> str | None:
+    """Total PR size from the merge base, or ``None`` when unavailable.
 
     Each Git call is wrapped like the anchor mapper's: a non-zero exit,
-    unparseable output or a runner error makes that measurement unavailable and
+    unparseable output or a runner error makes the measurement unavailable and
     never raises.
     """
+    if not base_branch or not current_head:
+        return None
     checkout = active_workdir(config)
 
     def run_git(args: Sequence[str]) -> str | None:
@@ -4417,28 +4314,84 @@ def _pr_non_convergence_measurements(
             return None
         return result.stdout
 
-    def shortstat(from_rev: str) -> str | None:
-        output = run_git(["diff", "--shortstat", from_rev, current_head])
-        if output is None:
-            return None
-        text = output.strip()
-        if not text:
-            return "no change"
-        return text if _SHORTSTAT_RE.match(text) else None
-
-    growth = shortstat(first_head)
-    size = None
-    if base_branch:
-        for base_ref in (f"origin/{base_branch}", base_branch):
-            merge_base = run_git(["merge-base", base_ref, current_head])
-            merge_base = (merge_base or "").strip()
-            if merge_base and _is_followup_dispatch_head(merge_base):
-                size = shortstat(merge_base)
-                break
-    return growth, size
+    for base_ref in (f"origin/{base_branch}", base_branch):
+        merge_base = (run_git(["merge-base", base_ref, current_head]) or "").strip()
+        if merge_base and _is_followup_dispatch_head(merge_base):
+            output = run_git(["diff", "--shortstat", merge_base, current_head])
+            if output is None:
+                return None
+            text = output.strip()
+            if not text:
+                return "no change"
+            return text if _SHORTSTAT_RE.match(text) else None
+    return None
 
 
-def _pr_step_back_decision(
+def _latest_pr_coder_metadata(records: Sequence[PostedRoundRecord]) -> PostedRoundMetadata | None:
+    coders = [
+        record for record in records
+        if record.metadata.flow == "pr" and record.metadata.role == "coder"
+    ]
+    return max(coders, key=lambda record: record.index).metadata if coders else None
+
+
+def _pr_no_progress_error(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    decision: NoProgressDecision,
+    records: Sequence[PostedRoundRecord],
+    items: Sequence[UnresolvedReviewItem],
+    route: str = "",
+    citation_diagnosis: FollowupCitationDiagnosis | None = None,
+    base_branch: str | None = None,
+) -> HumanDecisionRequiredError:
+    """The single PR no-progress stop, carrying every retired stop's diagnostics.
+
+    The child-plan supersession route (#985), the newest coder record's
+    unsuperseded receipts and tool identity (#1182, #1632), the non-array
+    citation diagnosis (#1626), the newest approach-alternative proposal at
+    the head (#1628) and the total PR size each appear only when available.
+    """
+    texts = {item.item_id: str(item.text) for item in items}
+    latest = _latest_pr_coder_metadata(records)
+    evidence_value = latest.local_test_evidence if latest is not None else None
+    evidence = (
+        unsuperseded_receipts_sentence(evidence_value) + tool_identity_clause(evidence_value)
+        if evidence_value
+        else ""
+    )
+    message = render_no_progress_message(
+        lead=f"PR #{pr_number}: ",
+        subject_label="head",
+        subject=decision.subject,
+        k=decision.k,
+        rounds=decision.rounds,
+        item_lines=render_no_progress_item_lines(decision.blocking_ids, texts),
+        route=route,
+        evidence=evidence,
+        citation_diagnosis=citation_diagnosis_sentence(citation_diagnosis),
+        approach_alternative=_step_back.pr_approach_alternative_at_head(
+            records, head_sha=decision.subject
+        ),
+        pr_size=_pr_size_measurement(
+            runner, config, current_head=decision.subject, base_branch=base_branch
+        ),
+    )
+    return HumanDecisionRequiredError(message)
+
+
+def _log_no_progress(config: AgentLoopConfig, round_number: int, decision: NoProgressDecision) -> None:
+    log(
+        config,
+        f"Round {round_number}: blocking item(s) {', '.join(sorted(decision.blocking_ids))} and "
+        f"head {decision.subject[:12]} were unchanged across {decision.k} completed round(s); "
+        "stopping for a human decision",
+    )
+
+
+def _pr_dispatch_convergence(
     runner: Runner,
     config: AgentLoopConfig,
     *,
@@ -4449,40 +4402,45 @@ def _pr_step_back_decision(
     head_sha: str | None,
     base_branch: str | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    open_items: Sequence[UnresolvedReviewItem] = (),
+    route: str = "",
+    citation_diagnosis: FollowupCitationDiagnosis | None = None,
 ) -> PrStepBackDecision:
-    """Escalate on a clustered sibling or non-convergence, else name the clusters.
+    """The no-progress stop, else the step-back clusters, at a coder dispatch.
 
-    Evaluated at the coder dispatch from freshly read history so a live run and
-    a resumed run agree.  Raises ``HumanDecisionRequiredError`` (exit 4) before
-    any coder invocation for either stop: when a reviewer's step-back still
-    produced a clustered sibling (#1408), and when a tracked reviewer kept the
-    same items blocking across ``--pr-non-convergence-rounds`` code-changing
-    coder turns (#1372).  Each gate keeps its own K, so disabling one never
-    disables the other.
+    Evaluated from freshly read history so a live run and a resumed run agree.
+    Raises ``HumanDecisionRequiredError`` (exit 4) before any coder invocation
+    when the K most recent completed rounds, the just-settled one included,
+    share the live head and the same non-empty blocking IDs.  When every
+    repeated item is evidence the evidence stall may own, the stop is
+    deferred so the evidence-stall stop decides first (#1372).  Step-back
+    never stops the run (#2097).
     """
-    k = config.pr_step_back_rounds
-    non_convergence_k = config.pr_non_convergence_rounds
-    window = config.pr_step_back_line_window
-    if (k <= 0 and non_convergence_k <= 0) or not tracked or not head_sha:
+    if not head_sha:
         return PrStepBackDecision()
+    k = config.no_progress_rounds
+    current_ids = blocking_item_ids(open_items)
     try:
         snapshot = _extract_round_metadata_records(snapshot_comments, flow="pr")
     except PrRoundHistoryError:
         raise
     except AgentLoopError:
-        log(config, "PR step-back suppressed: round history could not be decoded")
+        log(config, "PR convergence checks suppressed: round history could not be decoded")
         return PrStepBackDecision()
-    if not _pr_step_back_records_may_matter(
-        snapshot, tracked, k=k, round_number=round_number,
-        non_convergence_k=non_convergence_k,
-    ):
+    check_no_progress = bool(current_ids) and _no_progress_records_may_matter(
+        snapshot, k=k, round_number=round_number
+    )
+    check_step_back = bool(tracked) and _pr_step_back_records_may_matter(
+        snapshot, tracked, k=PR_STEP_BACK_ROUNDS, round_number=round_number
+    )
+    if not (check_no_progress or check_step_back):
         return PrStepBackDecision()
     try:
         fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     except PrRoundHistoryError:
         raise
     except AgentLoopError as exc:
-        log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
+        log(config, f"PR convergence checks suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
     fresh_context = observe_pr_head(runner, config=config, pr_number=pr_number, context=fresh_context)
     try:
@@ -4490,197 +4448,180 @@ def _pr_step_back_decision(
     except PrRoundHistoryError:
         raise
     except AgentLoopError as exc:
-        log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
+        log(config, f"PR convergence checks suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
-    mapper = _git_anchor_mapper(runner, config, checkout=active_workdir(config), window=window)
-    # (1) A clustered sibling after a step-back escalates first.
-    trigger_candidates: list[str] = []
-    for reviewer in tracked if k > 0 else ():
-        _entries, degraded = _step_back.pr_step_back_history(fresh, reviewer)
-        if degraded:
-            log(config, f"PR step-back suppressed for {reviewer}: malformed step-back history")
-            continue
-        episode = _step_back.derive_pr_episode(
-            fresh, reviewer, window=window, mapper=mapper,
-            current_round=round_number, current_head=head_sha,
+    if check_no_progress:
+        decision = no_progress_decision(
+            pr_no_progress_observations(
+                fresh, current=NoProgressObservation(round_number, head_sha, current_ids)
+            ),
+            live_subject=fresh_context.metadata.head_sha,
+            live_blocking_ids=current_ids,
+            k=k,
+            through_round=round_number,
         )
-        if episode.siblings and episode.entry is not None:
-            mapping = episode.mapping
-            if mapping is not None and not mapping.mappable:
+        if decision is not None:
+            _log_no_progress(config, round_number, decision)
+            error = _pr_no_progress_error(
+                runner, config, pr_number=pr_number, decision=decision, records=fresh,
+                items=open_items, route=route, citation_diagnosis=citation_diagnosis,
+                base_branch=base_branch,
+            )
+            unsatisfied_rows = (
+                _evidence_owned_rows(fresh, head_sha, approved_plan_context)
+                if config.pr_evidence_stall_rounds > 0
+                else None
+            )
+            item_rows = {
+                item.item_id: tuple(item.evidence_row_ids or ())
+                for item in open_items
+                if item.item_id in decision.blocking_ids
+            }
+            if defers_to_evidence_stall(item_rows, unsatisfied_rows):
                 log(
                     config,
-                    f"PR step-back: escalating {reviewer} on the unmappable-anchor same-path "
-                    "fallback",
+                    f"Round {round_number}: the unchanged items are all evidence the "
+                    "evidence-stall stop may own; it decides first at this dispatch",
                 )
-            raise HumanDecisionRequiredError.decision(
-                what=f"PR #{pr_number}: "
-                + _step_back.render_pr_step_back_human_decision(
-                    reviewer=reviewer,
-                    entry=episode.entry,
-                    mapping=mapping,
-                    siblings=episode.siblings,
-                    window=window,
-                    generalization=_step_back.step_back_generalization(fresh, episode.entry),
-                    sibling_round=episode.sibling_round,
-                ),
-                clear="Accept a stated limitation: document it, resolve or defer the sibling, "
-                f"push the commit and rerun `agent-loop pr {pr_number}`; the other options "
-                "are listed above.",
-                safe_to_automate=False,
-                automation_note="choosing between continuing, accepting a limitation and "
-                "redesigning is a human judgement.",
-            )
-        if episode.entry is None:
-            trigger_candidates.append(reviewer)
-    # (2) Non-convergence wins over a fresh clustered step-back turn.  When every
-    # persisting item is evidence the stall could own, the stop is deferred so the
-    # evidence-stall stop decides first at this dispatch.
-    unsatisfied_rows = (
-        _non_convergence_evidence_owned_rows(fresh, head_sha, approved_plan_context)
-        if non_convergence_k > 0 and config.pr_evidence_stall_rounds > 0
-        else None
+                return PrStepBackDecision(deferred_stop=error)
+            raise error
+    if not check_step_back:
+        return PrStepBackDecision()
+    mapper = _git_anchor_mapper(
+        runner, config, checkout=active_workdir(config), window=PR_STEP_BACK_LINE_WINDOW
     )
-    deferred: HumanDecisionRequiredError | None = None
-    for reviewer in tracked if non_convergence_k > 0 else ():
-        stalled = _step_back.find_pr_non_convergence(
-            fresh, reviewer, k=non_convergence_k, current_round=round_number,
-            current_head=head_sha,
-        )
-        if stalled is None:
-            continue
-        if deferred is not None and _step_back.defers_to_evidence_stall(
-            stalled, unsatisfied_rows
-        ):
-            continue
-        log(
-            config,
-            f"Round {round_number}: {reviewer} kept "
-            f"{', '.join(item.item_id for item in stalled.items)} blocking across "
-            f"{non_convergence_k} code-changing coder turns; stopping for a human decision",
-        )
-        diff_growth, pr_size = _pr_non_convergence_measurements(
-            runner, config, first_head=stalled.first_head, current_head=stalled.current_head,
-            base_branch=base_branch,
-        )
-        message = _step_back.render_pr_non_convergence_decision(
-            pr_number, stalled, diff_growth=diff_growth, pr_size=pr_size
-        )
-        if _step_back.defers_to_evidence_stall(stalled, unsatisfied_rows):
-            log(
-                config,
-                f"Round {round_number}: {reviewer}'s persisting items are all evidence the "
-                "evidence-stall stop may own; it decides first at this dispatch",
-            )
-            deferred = HumanDecisionRequiredError(message)
-            continue
-        raise HumanDecisionRequiredError(message)
-    if deferred is not None:
-        return PrStepBackDecision(deferred_stop=deferred)
-    # (3) The clustered trigger opens a step-back turn.
     triggers: list[_step_back.PrClusterTrigger] = []
-    for reviewer in trigger_candidates:
+    for reviewer in tracked:
         trigger = _step_back.find_pr_cluster_trigger(
-            fresh, reviewer, k=k, window=window, current_round=round_number, mapper=mapper,
-            current_head=head_sha,
+            fresh, reviewer, k=PR_STEP_BACK_ROUNDS, window=PR_STEP_BACK_LINE_WINDOW,
+            current_round=round_number, mapper=mapper, current_head=head_sha,
+            head_ok=_is_followup_dispatch_head,
         )
-        if trigger is not None and not _is_followup_dispatch_head(trigger.trigger_head):
-            log(
-                config,
-                f"PR step-back suppressed for {reviewer}: head {trigger.trigger_head!r} is not "
-                "a Git commit SHA, so it cannot be recorded",
-            )
-        elif trigger is not None:
+        if trigger is not None:
             triggers.append(trigger)
             log(
                 config,
-                f"Round {round_number}: {reviewer} blocked {k} consecutive rounds with new "
-                f"findings clustered in {trigger.cluster.path}:{trigger.cluster.start}-"
-                f"{trigger.cluster.end}; the coder follow-up is a step-back turn",
+                f"Round {round_number}: {reviewer} blocked {PR_STEP_BACK_ROUNDS} consecutive "
+                f"rounds with new findings clustered in {trigger.cluster.path}:"
+                f"{trigger.cluster.start}-{trigger.cluster.end}; the coder follow-up is a "
+                "step-back turn",
             )
     return PrStepBackDecision(tuple(triggers))
 
 
+def _pr_round_start_no_progress(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    round_number: int,
+    comments: Sequence[object],
+    head_sha: str | None,
+    open_items: Sequence[UnresolvedReviewItem],
+    route: str = "",
+    citation_diagnosis: FollowupCitationDiagnosis | None = None,
+    base_branch: str | None = None,
+) -> None:
+    """The no-progress stop at round start, before any reviewer is prompted.
+
+    Uses durable observations only, through the previous round, against the
+    observed head: it catches a resume after K completed rounds, while a moved
+    head never matches, so a new head is always reviewed first.  Windows the
+    evidence stall may own are left to the dispatch site.
+    """
+    current_ids = blocking_item_ids(open_items)
+    if not head_sha or not current_ids or round_number < 2:
+        return
+    try:
+        records = _extract_round_metadata_records(comments, flow="pr")
+    except PrRoundHistoryError:
+        raise
+    except AgentLoopError:
+        return
+    decision = no_progress_decision(
+        pr_no_progress_observations(records),
+        live_subject=head_sha,
+        live_blocking_ids=current_ids,
+        k=config.no_progress_rounds,
+        through_round=round_number - 1,
+    )
+    if decision is None:
+        return
+    if config.pr_evidence_stall_rounds > 0 and all(
+        item.evidence_row_ids for item in open_items if item.item_id in decision.blocking_ids
+    ):
+        log(
+            config,
+            f"Round {round_number}: the unchanged items all carry evidence rows; the "
+            "dispatch decides between the evidence stall and the no-progress stop",
+        )
+        return
+    _log_no_progress(config, round_number, decision)
+    raise _pr_no_progress_error(
+        runner, config, pr_number=pr_number, decision=decision, records=records,
+        items=open_items, route=route, citation_diagnosis=citation_diagnosis,
+        base_branch=base_branch,
+    )
+
+
 def _pr_step_back_sweep_contexts(
+    runner: Runner,
     config: AgentLoopConfig,
     comments: Sequence[object],
     *,
     round_number: int,
     head_sha: str | None,
-    carried: Mapping[str, "_step_back.PrStepBackEntry"] | None = None,
+    tracked: Sequence[str],
+    dispatch_head: str | None = None,
 ) -> dict[str, str]:
-    """Sweep prompt text per entry reviewer, for the step-back head's review only."""
-    if config.pr_step_back_rounds <= 0 or not head_sha or round_number < 2:
+    """Sweep prompt text per reviewer owed one on this round's review.
+
+    A reviewer is owed a sweep when its review history derives a step-back
+    trigger at the previous round and the head under review differs from that
+    trigger's head.  Derived from review records only, never from recorded
+    step-back entries, so a live run and a resumed run route identically.
+    The previous round's trigger maps to the head its coder follow-up was
+    dispatched from: the recorded dispatch head, or ``dispatch_head`` (this
+    process's own last dispatch) when the snapshot predates that coder record.
+    """
+    if not head_sha or round_number < 2 or not tracked:
         return {}
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
     except PrRoundHistoryError:
         raise
     except AgentLoopError:
-        records = ()
-    bound = _step_back.pr_sweep_entries(records, round_number=round_number, head_sha=head_sha)
-    for reviewer, entry in (carried or {}).items():
-        if entry.coder_round == round_number and entry.resulting_head == head_sha:
-            bound.setdefault(reviewer, entry)
-    return {
-        reviewer: _step_back.render_pr_sweep_guidance(entry) for reviewer, entry in bound.items()
-    }
-
-
-def _pr_step_back_approach_alternative_stop(
-    config: AgentLoopConfig,
-    *,
-    pr_number: int,
-    records: Sequence[PostedRoundRecord],
-    head_sha: str | None,
-) -> None:
-    """Stop for a human decision when a step-back turn proposed an approach change.
-
-    Shared by the live call (the just-posted coder record) and the round-start
-    resume call (durable history), so both agree (#1628).  Disabled with
-    ``--pr-step-back-rounds 0``; anything unreadable keeps today's behavior.
-    """
-    if config.pr_step_back_rounds <= 0:
-        return
-    alternative = _step_back.pr_step_back_approach_alternative(records, head_sha=head_sha)
-    if alternative is None:
-        return
-    log(
-        config,
-        f"PR step-back: the coder proposed an approach alternative at round "
-        f"{alternative.coder_round} (head {alternative.head}); stopping for a human decision",
-    )
-    raise HumanDecisionRequiredError(
-        _step_back.render_pr_step_back_approach_alternative_decision(pr_number, alternative)
-    )
-
-
-def _pr_step_back_carried_entries(
-    entries: Sequence[Mapping[str, object]], *, coder_round: int, head_sha: str | None
-) -> dict[str, "_step_back.PrStepBackEntry"]:
-    """The entries just recorded, kept in memory for the very next review.
-
-    The next round's comment snapshot is read before the coder record is posted,
-    so a live run carries the entries across the iteration; a resumed run
-    rebuilds the same bindings from the durable record.
-    """
-    if not head_sha:
         return {}
-    carried: dict[str, _step_back.PrStepBackEntry] = {}
-    for entry in entries:
-        anchor = entry["anchor"]
-        reviewer = str(entry["reviewer"])
-        carried[reviewer] = _step_back.PrStepBackEntry(
-            reviewer=reviewer,
-            trigger_round=int(entry["trigger_round"]),
-            trigger_head=str(entry["trigger_head"]),
-            path=str(anchor["path"]),
-            start=int(anchor["start"]),
-            end=int(anchor["end"]),
-            coder_round=coder_round,
-            resulting_head=str(head_sha),
-            record_index=-1,
+    previous = round_number - 1
+    mapper: _step_back.AnchorMapper | None = None
+    contexts: dict[str, str] = {}
+    for reviewer in tracked:
+        streak = [
+            review for review in _step_back.pr_reviews_for(records, reviewer)
+            if previous - PR_STEP_BACK_ROUNDS < review.round_number <= previous
+        ]
+        if len(streak) != PR_STEP_BACK_ROUNDS or any(
+            review.classification != _step_back.CLASS_NEW_FINDING for review in streak
+        ):
+            continue
+        if mapper is None:
+            mapper = _git_anchor_mapper(
+                runner, config, checkout=active_workdir(config), window=PR_STEP_BACK_LINE_WINDOW
+            )
+        trigger = _step_back.derived_pr_trigger_rounds(
+            records, reviewer, k=PR_STEP_BACK_ROUNDS, window=PR_STEP_BACK_LINE_WINDOW,
+            mapper=mapper, current_round=previous,
+            current_head=_step_back.pr_dispatch_heads(records).get(previous) or dispatch_head,
+            head_ok=_is_followup_dispatch_head,
+        ).get(previous)
+        if trigger is None or trigger.trigger_head == head_sha:
+            continue
+        contexts[reviewer] = _step_back.render_pr_sweep_guidance(
+            _step_back.pr_trigger_sweep_entry(
+                trigger, coder_round=round_number, resulting_head=head_sha
+            )
         )
-    return carried
+    return contexts
 
 
 _EVIDENCE_STALL_EXPLANATION_LIMIT = 240
@@ -4803,7 +4744,7 @@ def _head_bound_unsatisfied_rows(
     )
 
 
-def _non_convergence_evidence_owned_rows(
+def _evidence_owned_rows(
     records: Sequence[PostedRoundRecord],
     head_sha: str,
     approved_plan_context: ApprovedPlanContext | None,
@@ -5858,37 +5799,6 @@ def _managed_v1_dispatch_records(managed_ci) -> tuple:
     if managed_ci is None or managed_ci.protocol_version != 1:
         return ()
     return tuple(managed_ci.v1_dispatch_records)
-
-
-def unchanged_head_stop_message(
-    *, pr, coder_name, previous_head, turns, round_number, evidence, route,
-    citation_diagnosis: FollowupCitationDiagnosis | None = None,
-) -> str:
-    """The unchanged-head stop text; receipts (issue #1182) go before the route.
-
-    When the last follow-up's test_observations were dropped as a non-array
-    (#1626), the message names that and the uncited receipt count, so an
-    operator can see the blocker may be a tool format problem.
-    """
-    citation_sentence = ""
-    if citation_diagnosis is not None and citation_diagnosis.non_array_drop:
-        citation_sentence = (
-            " The coder's test_observations were not a JSON array (same-agent re-asks "
-            f"attempted: {'yes' if citation_diagnosis.repair_attempted else 'no'}); "
-            f"{citation_diagnosis.uncited_receipts} run-tests receipt(s) from that turn "
-            "went uncited, so the blocker may be a tool format problem rather than a "
-            "code defect."
-        )
-    return (
-        f"PR #{pr}: {coder_name} left head {previous_head} unchanged in "
-        f"{turns} consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round "
-        f"{round_number + 1}; human review required."
-        f"{unsuperseded_receipts_sentence(evidence)}"
-        f"{tool_identity_clause(evidence)}"
-        f"{citation_sentence}"
-        f"{route}"
-    )
 
 
 def _reconciliation_dispositions_by_item(

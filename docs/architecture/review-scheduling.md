@@ -33,7 +33,7 @@ decoded records and raw recovery mappings: only a reviewer record with absent
 scope carries complete-review authority. Explicit null, malformed and unknown
 scopes remain present through decoding and re-serialization and fail closed.
 Scoped turns are excluded from complete approvals, panel/sweep derivation,
-complete-round reconciliation, step-back/non-convergence history, legacy board
+complete-round reconciliation, step-back triggers and no-progress observations, legacy board
 participation inference, architecture approval and managed-CI recovery authority.
 They still undergo effective-seat and board-integrity validation. Bound scoped
 findings and their permitted dispositions use the capture reconciliation path.

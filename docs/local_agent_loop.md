@@ -916,8 +916,9 @@ keeps the item open defers that completion, and the item notes explain why.
 Progress is reported as counts (`item-1: 3/4 sub-items resolved`) in reviewer
 and coder prompts, the coder follow-up comment, and one orchestrator
 `### Sub-item progress` comment per round that cleared or newly stalled a
-finding. `--sub-item-stall-rounds N` (default 3, `0` disables) warns when no
-sub-item of a finding closes for `N` rounds, and the max-rounds message
+finding. The report warns when no sub-item of a finding closes for
+`--no-progress-rounds` rounds (default 3; the retired `--sub-item-stall-rounds`
+is accepted and ignored), and the max-rounds message
 includes a converging/stalled summary per finding. The signal is advisory: it
 never changes `--max-rounds`.
 
@@ -2311,7 +2312,7 @@ restores them from their fixed shapes, so publication re-canonicalization
 treats them the same way, and the encoder keeps them only when strict
 re-canonicalization reproduces the same rows, references and authoritative
 failures. Near the cap they shrink or disappear; the coder prompt still gets
-every latest reason from live state. The unchanged-head stop sentence names
+every latest reason from live state. The no-progress stop's receipt sentence names
 each listed failure by receipt id and latest reason and points to
 `run-tests --rerun <receipt>`.
 
@@ -2405,7 +2406,7 @@ reconcile clears an earlier tree-change label (genuine receipt supersession is
 kept), and the default decode of bounded round evidence drops labels. Bounded
 round evidence carries `superseded_by` so that retention evicts superseded and
 historical rows before unresolved failures, and only display consumers (PR
-comment rendering, the unchanged-head stop sentence and canonicalization)
+comment rendering, the no-progress stop's receipt sentence and canonicalization)
 restore it.
 
 #### Failures restored across a restart
@@ -2570,7 +2571,7 @@ A `mismatch` renders `run-tests-tool-mismatch: receipt produced by agent-loop
 `run-tests-tool-unidentified: run-tests client did not report its agent-loop
 identity (likely an older install)`. The diagnostic appears beside the
 affected receipt in the coder follow-up's receipts section, in the
-unchanged-head stop and in the evidence-stall decision. Raw package paths
+no-progress stop and in the evidence-stall decision. Raw package paths
 appear only in the orchestrator's own log.
 
 The policy is flag, not reject. The broker, not the client, executes the
@@ -5178,130 +5179,123 @@ prompt says it is unavailable and the guidance stays. A response that declares a
 generalization is logged as `declared a generalization (proactive|step-back-directed)`;
 nothing is persisted and the step-back trigger is unchanged.
 
-#### PR step-back, reviewer sweep, and sibling escalation
+#### PR no-progress stop
 
-The same pattern appears in the PR fix loop: a reviewer raises one new sibling of
-the previous finding in the same function every round, and the coder patches one
-branch per round. Two flags, valid under every PR review policy, make the loop act
-earlier.
+One detector replaces the PR step-back sibling, non-convergence,
+approach-alternative and unchanged-head stops (#2097, stage 1 of #2067).
+`--no-progress-rounds K` (default 3, minimum 1; `0` or a negative value is
+rejected, so the detector cannot be turned off and `--max-rounds` stays the
+outer bound) stops the PR fix loop at the human-decision boundary (exit code 4)
+when the K most recent completed rounds ended with the same head SHA and the
+same non-empty set of blocking item IDs, and the live candidate (the current PR
+head and the current blocking IDs) still equals that repeated observation.
 
-- `--pr-step-back-rounds K` (default 3, `0` disables). When a tracked reviewer
-  (each configured reviewer, or only the primary under `primary-then-panel`) has
-  blocked K consecutive rounds with **new** mandatory findings, and those findings'
-  `path:line-range` references cluster on one file span, the next coder turn is a
-  step-back: do not patch only the newest finding, and choose one of two answers.
-  Either name the common root, fix the whole class with one rule, add a
-  parametrized test covering every branch, and begin the `summary` with
-  `Generalization:` and the rule; or, when the approved approach itself generates
-  this class, begin the `summary` with `Approach alternative:` and name a
-  materially smaller alternative (for example removing or relaxing an existing
-  check) without redesigning beyond the plan. An `Approach alternative:` answer
-  stops the run at the human-decision boundary (exit code 4) before any review of
-  that head, quoting the alternative: rerun with the scope change approved
-  (re-plan or amend the issue, push the replacement), accept a stated limitation,
-  or continue generalizing with `--pr-step-back-rounds 0`. A resumed run stops
-  again only while the PR head still equals the proposal head. Repeats of an unresolved
-  finding, future follow-ups, findings without a line reference, and blocks on
-  unrelated files do not count. Reviewers that omit line references never trigger
-  it. Several reviewers triggering at once share one coder turn.
-- `--pr-step-back-line-window N` (default 40, minimum 0). Findings join one cluster
-  when the gap between their mapped ranges is at most N lines, and a later finding
-  is a sibling when it lies within N lines of the mapped cluster.
+- **Observations.** Round N is observed through the newest PR coder record
+  numbered N+1, which already carries the settled round-end ledger and the head
+  the follow-up was dispatched from; a historical record without a dispatch
+  head falls back to the round's single reviewed head. This works in every
+  review mode, including the default sequential all-reviewers mode, which
+  writes no reconciliation summary. A round is not an observation, and breaks
+  the window, when it has a closure boundary (closed-incomplete or a legacy
+  signed-input supersession) or an unvalidated closure summary, has no
+  complete review, has no follow-up coder record, or was dispatched from a
+  different head. Round numbers in the window must be contiguous.
+- **Blocking IDs.** Blocking and same-PR findings count. Future items, inert
+  converted findings and tombstones, and machine or human exact-head
+  obligations (CI failures, evidence requests) do not. An empty set never
+  stops.
+- **Where it runs.** At the coder dispatch, after the round's reconciliation
+  and before the round-limit exit, using the durable history plus the
+  just-settled round; and at round start, before any reviewer is prompted,
+  using durable history only. The second site catches a resume after K
+  completed rounds. A head that moved after the last review (a coder push, an
+  external push or a rebase) never matches the window, so the new head is
+  always reviewed first. The stop writes no round metadata; a fresh run and a
+  resumed run reach the same decision for the same history.
+- **Evidence-stall precedence.** When every unchanged item is a finding tagged
+  with risk-matrix rows still unsatisfied at the dispatch head, the stop is
+  deferred so the [evidence-only stall](#pr-evidence-only-stall-stop) decides
+  first at the same dispatch. If the evidence stall stops, it wins and no
+  no-progress message is posted; otherwise the deferred stop fires before any
+  coder turn (or before the round-limit exit and merge-conflict handling,
+  where that decision is not evaluated). Round start leaves such windows to
+  the dispatch.
 
-References are projected from the finding text, its `fix_scope`, and every
-sub-item statement, and are compared across heads through `git diff` hunks, so the
-coder's own pushes do not hide or invent siblings. A location is `SHIFTED`
-(unchanged lines, moved by the cumulative offset), `REWRITTEN` (replaced within the
-window), or `UNMAPPABLE` (the file was deleted with no rename pair, the rewrite
-spilled beyond the window, the code was deleted or moved elsewhere, or the diff
-could not be read). Renames are paired without a pathspec. An unmappable anchor
-falls back, with a log line and a note in the stop message, to treating any finding
-on the same path as a sibling.
+**Stop message.** One message names the head, K, the round range and the
+sorted unchanged item IDs with each item's first line (the first 20, then
+`and N more`). Optional sections appear only when available: the total PR size
+from the merge base with the base branch (a scope-growth signal), the newest
+coder record's unsuperseded run-tests receipts and run-tests tool identity,
+the non-array `test_observations` citation diagnosis of the last accepted
+follow-up (`The coder's test_observations were not a JSON array (same-agent
+re-asks attempted: yes|no); N run-tests receipt(s) from that turn went
+uncited, so the blocker may be a tool format problem rather than a code
+defect.`), the newest step-back `Approach alternative:` excerpt at that head,
+and, for a PR bound to a planning child issue, the child-plan supersession
+route (post the signed supersession record on the child issue and rerun the
+child resume command). It offers: (1) continue with a larger
+`--no-progress-rounds`, bounded by `--max-rounds`; (2) accept a stated
+limitation or narrow the scope with a signed human decision that resolves or
+defers the items, then rerun; (3) redesign or push a change and rerun (a new
+head starts a new window).
 
-The review of the step-back head, and only that review, asks each triggering
-reviewer for a **sweep**: enumerate every remaining instance of the pattern with a
-`path:line` reference, as no finding (none left), a plain finding (one), one finding
-with sub-items (2-12), or several findings of at most 12 sub-items each (more). The
-general reviewer contract is unchanged in every other round.
+**Posted diagnostic.** The stop also posts one plain
+`PR review scheduling diagnostic (round N): ...` comment, so it is visible in PR
+history and in the [outcome history export](#outcome-history-export) as
+`pr-no-progress`. A message over 40,000 characters is cut to its first line and
+as many following whole lines as fit, then an omission note, while the CLI
+output keeps the full text. It is audit text only: resume re-derives the stop
+from round records, and a rerun that stops again posts one more. Posting is
+best-effort: a failure is logged as a warning and the run still stops with
+exit code 4 and the same message.
 
-If the sweep review, or any later review while the episode is active, introduces a
-new mandatory finding in the cluster, the run stops at the human-decision boundary
-(exit code 4) before any further coder turn: continue (rerun with `--pr-step-back-rounds 0`),
-accept a stated limitation, or redesign (if the approved approach itself generates the class, approve a scope change first by re-planning or amending the issue; for the last two, push the commit and rerun: only a sibling introduced by the review of the round being dispatched stops the run, so a sibling that already stopped it does not stop it again). The message names the cluster, the mapping
-outcome, the sibling findings, and the coder's `Generalization:` excerpt. A carried
-item is not a sibling and keeps the episode open while it is in the cluster; the
-episode closes when the reviewer approves or no unresolved mandatory item of theirs
-remains in the cluster. The orchestrator records the step-back as reviewer-owned
-`step_back_entries` on the coder record (never from agent output), so a resumed run
-rebuilds the sweep for any reviewer whose review of that head is unpublished and
-never re-requests a published one.
+**Retired flags.** `--pr-step-back-rounds`, `--pr-step-back-line-window`,
+`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` are accepted for one
+release and ignored: any integer, including `0`, parses, changes nothing, and
+logs one deprecation notice naming `--no-progress-rounds`. The advisory
+sub-item stall report now uses the `--no-progress-rounds` window. Legacy
+`step_back_entries` and stall fields in old round records still decode and are
+ignored by every stop and routing decision; new coder records keep writing
+`step_back_entries` only as an audit record that the history export's
+`step_backs` metric counts.
 
-**Posted diagnostic.** The sibling escalation, the non-convergence stop below, and
-the `Approach alternative:` stop each also post one plain
-`PR review scheduling diagnostic (round N): ...` comment to the PR, after the
-stop's existing writes (for the approach alternative, after the coder record and
-any managed-CI continuity grant), so the stop is visible in PR history and in the
-[outcome history export](#outcome-history-export). The comment repeats the stop
-message; a message over 40,000 characters is cut to its first line and as many
-following whole lines as fit, then an omission note, while the CLI output keeps
-the full text. It is audit text only: resume re-derives every stop from round
-records, and a rerun that stops again posts one more. Posting is best-effort: a
-GitHub, transport or local temp-file failure is logged as a warning, and the run
-still stops with exit code 4 and the same message. Disabled gates
-(`--pr-step-back-rounds 0`, `--pr-non-convergence-rounds 0`) post nothing.
+#### PR step-back turn and reviewer sweep
 
-#### PR non-convergence stop
+Step-back stays a prompt technique and never stops the run by itself. When a
+tracked reviewer (each configured reviewer, or only the primary under
+`primary-then-panel`) has blocked 3 consecutive rounds with **new** mandatory
+findings whose `path:line-range` references cluster on one file span (gaps of
+at most 40 lines), the next coder turn is a step-back: do not patch only the
+newest finding, and choose one of two answers. Either name the common root,
+fix the whole class with one rule, add a parametrized test covering every
+branch, and begin the `summary` with `Generalization:` and the rule; or, when
+the approved approach itself generates this class, begin the `summary` with
+`Approach alternative:` and name a materially smaller alternative (for example
+removing or relaxing an existing check) without redesigning beyond the plan.
+Either revision goes to review like any other; an `Approach alternative:`
+proposal is reviewed normally and is quoted in a later no-progress message if
+one fires at that head. Repeats of an unresolved finding, future follow-ups,
+findings without a line reference, and blocks on unrelated files do not count.
+Several reviewers triggering at once share one coder turn.
 
-The clustered step-back counts only **new** findings near one file span, so a
-reviewer who keeps the same items blocking round after round, with findings spread
-across files, never triggers it. `--pr-non-convergence-rounds K` (default 3, `0`
-disables; a negative or boolean value is rejected like `--pr-step-back-rounds`)
-stops the PR fix loop at the human-decision boundary (exit code 4) before any
-further coder turn when the same item IDs of a tracked reviewer (each configured
-reviewer, or only the primary under `primary-then-panel`) stayed blocking across K
-consecutive coder turns that each changed the head. File spread and
-`--pr-step-back-line-window` do not matter. The two flags are independent:
-`--pr-step-back-rounds 0` keeps this stop, and `--pr-non-convergence-rounds 0`
-keeps the step-back.
+The trigger is derived only from the reviewer's per-head review records, never
+from recorded step-back entries, so a live run and a resumed run route
+identically. Windows do not overlap: after a trigger at round t, the next one
+needs 3 fresh qualifying reviews after t. References are projected from the
+finding text, its `fix_scope`, and every sub-item statement, and are mapped to
+the head the coder follow-up was dispatched from through `git diff` hunks, so
+the coder's own pushes do not hide or invent members. A location is `SHIFTED`,
+`REWRITTEN` (replaced within the window), or `UNMAPPABLE` (deleted, moved, a
+rewrite that spilled beyond the window, or an unreadable diff); unmappable
+locations never contribute.
 
-A coder turn counts only when it moved the head and the next review was taken on
-that head, so a no-op turn or an external push breaks the chain. An item whose
-reviewer resolved at least one of its open sub-items in a review made progress, so
-that item's chain restarts (`--sub-item-stall-rounds` governs sub-item pacing). Machine
-obligations and human exact-head evidence requests do not count (the evidence freeze
-governs them). Findings tagged with risk-matrix rows count like any other finding.
-When every persisting item is tagged with rows still unsatisfied at the dispatch
-head, the stop is deferred so the evidence-stall stop decides first at the same
-dispatch, judging the combined ledger of all reviewers, the check board and its
-own window history. If the evidence stall stops, it wins; if it does not (another
-reviewer's untagged finding, a failing check or obligation, a reset or changing
-row set, or `--pr-evidence-stall-rounds 0`), this stop fires before any coder
-turn. A tag naming a satisfied row, no usable row set, or any untagged persisting
-item never defers. Under `--review-parallel` the reviewer's blocking set is resolved
-through the round's reconciliation, and only the reviewer's own dispositions apply.
-The stop is derived from posted round records only and persists no state (the
-plain diagnostic described under the step-back above is audit text), so a
-resumed run reaches the same decision with the same text. A deferred stop that
-the evidence stall owns posts no non-convergence diagnostic.
-
-**Precedence.** A clustered-sibling escalation stops first; otherwise this stop
-wins over a fresh clustered step-back turn, and both run before the round-limit
-exit. A deferred stop (above) is raised right after the evidence-stall decision,
-or before the round-limit exit and merge-conflict handling, where that decision is
-not evaluated.
-
-**Stop message.** It names the reviewer, K, the round range and the current head,
-lists each persisting item with its attempt count and first line, and reports the
-diff growth since the first counted attempt (which may predate the K-turn window)
-and the total PR size from the merge base with
-the base branch (a scope-growth signal; either reads `unavailable` when Git cannot
-measure it). Items that are tagged or whose text asks for evidence are listed separately as possibly
-human-only. It then offers: (1) continue (rerun with `--pr-non-convergence-rounds 0`
-or a larger K); (2) accept a stated limitation or narrow the scope with a signed
-human decision that resolves or defers the items, then rerun; (3) redesign or push
-a change yourself and rerun (the push breaks the chain); (4) convert evidence the
-environment cannot produce to the evidence freeze by having the reviewer re-file it
-as an exact-head evidence request.
+The review of the head that follows a trigger, and only that review, asks each
+triggering reviewer for a **sweep**: enumerate every remaining instance of the
+pattern with a `path:line` reference, as no finding (none left), a plain
+finding (one), one finding with sub-items (2-12), or several findings of at
+most 12 sub-items each (more). A new finding in the same cluster after the
+step-back is reviewed and fixed like any other; persistent lack of progress is
+the no-progress stop's concern.
 
 **Unattainable evidence.** Both PR review prompts tell reviewers that evidence no
 available agent session or configured CI runner can produce (for example a run on a
@@ -5317,7 +5311,7 @@ observations. When the coder cannot capture admissible evidence (repeated
 `capture_incomplete`, a launcher the probe does not recognise), a PR can spend many
 rounds on evidence bookkeeping while CI is green and the diff is clean. The flag
 `--pr-evidence-stall-rounds K` (default 2, `0` disables; a negative value is
-rejected like `--pr-step-back-rounds`) stops that loop at the human-decision
+rejected like `--pr-evidence-capture-attempts`) stops that loop at the human-decision
 boundary (exit code 4) before the next coder turn.
 
 **Tag.** A `pr_review` `blocking_items` entry may be an object with an optional
@@ -5451,8 +5445,8 @@ unauthenticated record keeps its ordinary content but grants no conversion,
 restoration, operator-signed status or counted attempt, and a foreign conversion
 record is not used as a resume handoff. In dry-run, history grants no such authority.
 
-**Precedence.** The existing evidence freeze, approval and finalization, step-back
-escalation, round limit, and merge-conflict handling run first and unchanged; the stall
+**Precedence.** The existing evidence freeze, approval and finalization, round limit,
+and merge-conflict handling run first and unchanged; the stall
 decision runs only on the ordinary path to a coder dispatch, makes no check API call of
 its own, and is not evaluated on a merge-conflict round. On the final allowed round the
 round-limit exit wins. The tag is reviewer-declared: the orchestrator verifies that the
@@ -5468,30 +5462,12 @@ commits as `checkout-head-mismatch`; the tracked tree is clean, which rejects un
 edits; the tree digest matches; the execution selector is in the current turn catalog;
 and the receipt is attributed to the current head, which rejects a receipt from an older
 head as `head-mismatch`. Whether test evidence alone answers a code finding is the
-reviewer's decision in the next round, and the unchanged-head coder-turn limit still
-applies unchanged.
-
-The unchanged-head limit has one bounded exception (#1626). The follow-up that
-reaches the limit gets one more review round for that head when a run-tests
-receipt from its own turn meets both conditions:
-
-- It superseded a parent-observed failure receipt in the live evidence
-  reconciliation.
-- A surviving `test_observations` citation in the accepted follow-up cites it.
-
-The run logs `unchanged head but authoritative cited evidence progress;
-granting one review round` with the receipt IDs. A later unchanged follow-up at
-the same head stops as before, and the grant is not persisted across a resume.
-After a resume the live reconciliation sees earlier rounds only through the
-previous round's bounded evidence projection, so a parent-observed failure
-evicted from that projection cannot be seen as superseded and cannot earn the
-grant. This is conservative: the run stops at the limit as it would without
-the exception.
-When the stop fires and the last follow-up's `test_observations` were dropped
-as a non-array, the stop message adds: `The coder's test_observations were not
-a JSON array (same-agent re-asks attempted: yes|no); N run-tests receipt(s) from
-that turn went uncited, so the blocker may be a tool format problem rather than
-a code defect.`
+reviewer's decision in the next round. An unchanged head is re-reviewed like
+any other; the [no-progress stop](#pr-no-progress-stop) fires only once K
+completed rounds end with the same head and the same blocking items. Evidence
+progress that makes a reviewer resolve an item changes the item set and so
+restarts that window; the per-head evidence-progress grant of the retired
+unchanged-head limit (#1626) no longer exists.
 
 #### Qualified panel evidence
 
@@ -6113,10 +6089,11 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   seat that never posted is still expected.
 - Human-decision stops are the planning scheduling diagnostics that carry the
   step-back or primary-stall human-decision text, and the PR scheduling
-  diagnostics that carry the PR step-back sibling (`pr-step-back-sibling`),
-  non-convergence (`pr-non-convergence`), evidence-stall (`pr-evidence-stall`),
-  evidence-freeze (`pr-evidence-freeze`) or
-  approach-alternative (`pr-step-back-approach-alternative`) text; step-back
+  diagnostics that carry the PR no-progress (`pr-no-progress`), evidence-stall
+  (`pr-evidence-stall`) or evidence-freeze (`pr-evidence-freeze`) text, plus the
+  retired PR step-back sibling (`pr-step-back-sibling`), non-convergence
+  (`pr-non-convergence`) and approach-alternative
+  (`pr-step-back-approach-alternative`) text that older comments carry; step-back
   entries alone never count as stops. A rerun that stops again at the same head
   posts another diagnostic, so the count is per invocation. Recognition is anchored
   to the first message line. Audit comments never authorize work or restore freeze

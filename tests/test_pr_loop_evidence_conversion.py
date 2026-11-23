@@ -243,7 +243,6 @@ def _signed(body: str, index: int) -> dict:
 
 def _config(tmp_path, **overrides):
     overrides.setdefault("max_rounds", 8)
-    overrides.setdefault("pr_non_convergence_rounds", 0)
     overrides.setdefault("reviewer", "codex")
     return make_config(tmp_path, coder="claude", **overrides)
 
@@ -1896,31 +1895,37 @@ def test_a_primary_only_publication_then_auto_conversion_reruns_the_gated_panel_
 # --- Durable PR human-decision diagnostics (#1640) ---------------------------
 
 
-def test_an_evidence_conversion_that_owns_a_deferred_non_convergence_window_posts_nothing(
+def test_an_evidence_conversion_that_owns_a_deferred_no_progress_window_posts_nothing(
     tmp_path, monkeypatch
 ):
-    """`nonconv-superseded-silent`: conversion wins at the dispatch where a real
-    non-convergence window was deferred, so no non-convergence diagnostic is
-    posted and no coder turn intervenes before the same-head review."""
-    import coding_review_agent_loop.review_step_back as step_back_module
+    """`pr-evidence-owned`: conversion wins at the dispatch where a real
+    no-progress window was deferred, so no no-progress diagnostic is posted and
+    no coder turn intervenes before the same-head review."""
+    import coding_review_agent_loop.pr_loop_support as support_module
+    from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT
 
     deferrals = []
-    real_defers = step_back_module.defers_to_evidence_stall
+    real_defers = support_module.defers_to_evidence_stall
 
-    def spy(result, rows):
-        decision = real_defers(result, rows)
+    def spy(item_rows, rows):
+        decision = real_defers(item_rows, rows)
         deferrals.append(decision)
         return decision
 
-    monkeypatch.setattr(step_back_module, "defers_to_evidence_stall", spy)
+    monkeypatch.setattr(support_module, "defers_to_evidence_stall", spy)
     context = _plan_context("row-a", "row-b")
-    runner = _auto_converted_runner(tmp_path, monkeypatch, context)
-    config = _config(tmp_path, pr_non_convergence_rounds=1)
+    # The coder leaves the head unchanged, so rounds 1-2 fill a K=2 window at
+    # the dispatch where the conversion happens.
+    runner = _auto_converted_runner(
+        tmp_path, monkeypatch, context, advance_pr_head_on_coder_followup=False,
+    )
+    config = _config(tmp_path, no_progress_rounds=2)
     with pytest.raises(HumanDecisionRequiredError) as stopped:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     message = str(stopped.value)
-    assert True in deferrals  # a qualifying non-convergence window was deferred
-    assert "frozen at head 525753a4b04bd57d874211ba1fade250c3ff6d82" in message and "not converging" not in message
+    assert True in deferrals  # a qualifying no-progress window was deferred
+    assert " is frozen at head " in message
+    assert NO_PROGRESS_PREFIX_TEXT not in message
     assert _agent_count(runner, "claude") == 1  # no coder turn after the conversion
     records = _records(runner)
     phases = [(r.metadata.role, r.metadata.phase, r.metadata.round_number) for r in records]
@@ -1932,11 +1937,7 @@ def test_an_evidence_conversion_that_owns_a_deferred_non_convergence_window_post
     assert any(role == "reviewer" and number == 2 for role, _phase, number in after[1:-1])
     assert not any(role == "coder" for role, _phase, _number in after)
     bodies = [comment["body"] for comment in runner.pr_payload["comments"]]
-    assert not any("kept the same item(s) blocking" in body for body in bodies)
-    assert not any(
-        body.startswith("PR review scheduling diagnostic (") and "not converging" in body
-        for body in bodies
-    )
+    assert not any(NO_PROGRESS_PREFIX_TEXT in body for body in bodies)
 
 
 # Fresh configured workdirs must not be needed by read-only preflight.
@@ -2577,7 +2578,7 @@ def test_optional_visibility_refresh_separates_read_fallback_from_observation(
         runner, config = FakeRunner(), make_config(tmp_path)
         if site == "step-back":
             monkeypatch.setattr(support, "_pr_step_back_records_may_matter", lambda *a, **k: True)
-            invoke = lambda: support._pr_step_back_decision(
+            invoke = lambda: support._pr_dispatch_convergence(
                 runner, config, pr_number=77, round_number=3, snapshot_comments=(),
                 tracked=("Codex",), head_sha=START_HEAD,
             )

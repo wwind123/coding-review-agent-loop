@@ -4852,13 +4852,18 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
 
 
 @pytest.mark.parametrize("with_receipt", [False, True])
-def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
+def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
     tmp_path, monkeypatch, with_receipt
 ):
-    """Issue #1182: the receipt sentence sits before the child-plan route suffix."""
+    """#985, #1182, #1626 via #2097 (`pr-planning-child-route`): the single
+    no-progress stop keeps the child-plan supersession route, the receipt
+    sentence and the citation diagnosis of the stops it replaced."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
     from coding_review_agent_loop.local_test_evidence import (
         EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
     )
+    from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT
+    from coding_review_agent_loop.pr_loop_support import FollowupCitationDiagnosis
 
     parent_plan = fresh_staged_plan(first_disposition="requires-child-planning")
     child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
@@ -4868,21 +4873,24 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: serve_authenticated_issue_context(_runner, config, child if issue_number == 56 else parent),
     )
+    # The non-array drop itself is unit-tested with the validator; here the
+    # loop must carry the accepted turn's diagnosis into the stop message.
+    monkeypatch.setattr(
+        pr_loop, "followup_citation_diagnosis",
+        lambda _parsed, _ids: FollowupCitationDiagnosis(True, True, 2),
+    )
     blocking = structured_pr_review(
         state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
     )
+    carried = structured_pr_review(
+        state="blocking", summary="Still needs a re-plan.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+        ],
+    )
     runner = FakeRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
-        codex_outputs=[
-            blocking,
-            structured_pr_review(
-                state="blocking", summary="Still needs a re-plan.",
-                prior_item_dispositions=[
-                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
-                ],
-            ),
-            structured_pr_review(state="approved"),
-        ],
+        codex_outputs=[blocking, carried, carried],
         claude_outputs=[
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
             structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
@@ -4901,33 +4909,37 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
             environment_identity=registry.capture({"PATH": "/usr/bin"}),
         ))
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
-    with pytest.raises(AgentLoopError) as raised:
+    with pytest.raises(HumanDecisionRequiredError) as raised:
         pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     message = str(raised.value)
     from coding_review_agent_loop.pr_loop import _child_resume_hint
 
     hint = _child_resume_hint(56, execution_policy.EXECUTION_DISPOSITION_PLANNING)
     route = (
-        " If the blocking finding requires re-planning the child plan, post the signed "
+        "If the blocking finding requires re-planning the child plan, post the signed "
         f"child-plan supersession record on child issue #56 and rerun `{hint}`."
     )
-    legacy = (
-        "PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round 3; "
-        "human review required."
+    assert message.startswith(
+        f"PR #77: {NO_PROGRESS_PREFIX_TEXT}3 consecutive completed round(s): rounds 1-3 "
+        "ended with the same head `6367c48dd193d56ea7b0baad25b19455e529f5ee`"
     )
+    assert "- [item-1] Re-plan first." in message
+    assert "\n" + route + "\n" in message
+    assert (
+        "The coder's test_observations were not a JSON array (same-agent re-asks "
+        "attempted: yes); 2 run-tests receipt(s) from that turn went uncited"
+    ) in message
     if with_receipt:
-        sentence = (
-            " The latest local test evidence still holds unsuperseded failure receipts: "
-            "receipt `receipt-open` `python3 -m pytest tests/test_x.py -q -n 0` (failed). "
-            "A live failure is cleared only by an identical passing rerun at the current head "
-            "via `run-tests --rerun <receipt>`; other selections never supersede it. This stop may be evidence "
-            "bookkeeping rather than a missing code change; an operator can verify the command "
-            "and decide whether the receipts are still meaningful."
-        )
-        assert message == legacy + sentence + route
+        assert (
+            "Latest coder turn evidence: The latest local test evidence still holds "
+            "unsuperseded failure receipts: receipt `receipt-open` "
+            "`python3 -m pytest tests/test_x.py -q -n 0` (failed)."
+        ) in message
+        # The receipt sentence precedes the route, as the retired stop ordered it.
+        assert message.index("unsuperseded failure receipts") < message.index(route)
     else:
-        assert message == legacy + route
+        assert "Latest coder turn evidence" not in message
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 3
 
 
 # --- #1333: a tool-owned recommendation key in a patch does not route to replan ---

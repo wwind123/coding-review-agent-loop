@@ -20,7 +20,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--coder", "--reviewer", "--reviewer-seat", "--seat-model", "--seat-effort", "--seat-dir",
     "--primary-reviewer-seat", "--primary-plan-reviewer-seat",
     "--min-reviewers", "--min-distinct-providers",
-    "--max-rounds", "--sub-item-stall-rounds", "--managed-ci-trusted-actor", "--managed-ci-issue",
+    "--max-rounds", "--sub-item-stall-rounds", "--no-progress-rounds", "--managed-ci-trusted-actor", "--managed-ci-issue",
     "--human-reviewer-trusted-actor",
     "--managed-ci-issue-number",
     "--implementation-coder", "--implementation-coder-model",

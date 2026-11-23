@@ -427,11 +427,11 @@ def test_refresh_identity_failure_stops_without_later_agent_launches(tmp_path, p
 
 
 def test_advisory_step_back_reader_cannot_suppress_failed_admission(tmp_path, monkeypatch):
-    runner, config, context = observation(tmp_path, [raw(anchor())], pr_step_back_rounds=1)
+    runner, config, context = observation(tmp_path, [raw(anchor())])
     monkeypatch.setattr(support, '_pr_step_back_records_may_matter', lambda *a, **kw: True)
     runner.serve_rest_issue_comments = False
     with pytest.raises(AgentLoopError, match='cannot be authenticated'):
-        support._pr_step_back_decision(runner, config, pr_number=77, round_number=4,
+        support._pr_dispatch_convergence(runner, config, pr_number=77, round_number=4,
             snapshot_comments=context.comments, tracked=('Codex',), head_sha=HEAD)
     assert not runner.comments
 

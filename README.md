@@ -967,9 +967,10 @@ obligations into an ordered `sub_items` list, and the loop reports partial
 progress as counts (`item-1: 3/4 sub-items resolved`) instead of a bare
 addressed/remaining split. Single-obligation findings are unchanged. Reviewers
 disposition individual sub-items, coder claims are advisory, and an item is
-resolved when all of its sub-items are. `--sub-item-stall-rounds N` (default 3,
-`0` disables) warns when no sub-item of a finding closes for `N` rounds; it is
-advisory and never changes `--max-rounds`. See
+resolved when all of its sub-items are. The loop warns when no sub-item of a
+finding closes for `--no-progress-rounds` rounds (default 3); it is advisory and
+never changes `--max-rounds`. The retired `--sub-item-stall-rounds` is accepted
+and ignored for one release. See
 [docs/local_agent_loop.md](docs/local_agent_loop.md#sub-items-for-conjunctive-review-findings).
 
 ### Advisory architecture context
@@ -1771,11 +1772,20 @@ counts and the baseline forms; see
 An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
-full-board. In the PR fix loop, `--pr-step-back-rounds K` (default 3, `0` disables) and
-`--pr-step-back-line-window N` (default 40) apply the same idea: once a reviewer has blocked K
-consecutive rounds with new findings clustered on one file span, the next coder turn must fix
-the whole class with one rule and a parametrized test, that reviewer sweeps the resulting head
-for every remaining instance, and a further clustered sibling stops for a human decision. `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. `--pr-evidence-capture-attempts N` (default 2, `0` disables) first converts a row whose evidence was only capture-limited (incomplete capture, unverified launch, unknown selectors; never an authoritative failure) for N consecutive coder attempts into an exact-head human evidence obligation answered at the final evidence freeze, and `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]` converts named unsatisfied rows on demand before any agent runs. `--pr-non-convergence-rounds K` (default 3, `0` disables, independent of `--pr-step-back-rounds`) stops for a human decision (exit 4) before the next coder turn when the same tracked-reviewer items stayed blocking across K consecutive coder turns that each changed the head, wherever the findings are; the message lists each item with its attempts, the diff growth and the PR size, and the override options (`0` or a larger K, a signed decision, a pushed change, or re-filing unattainable evidence as an exact-head evidence request). A clustered-sibling escalation stops first, and this stop wins over a fresh step-back turn. Evidence no agent session or runner can produce belongs only in `exact_head_evidence_requests`. A child-planning cycle inherits `--plan-review-policy`,
+full-board. In the PR fix loop the step-back is a prompt only: once a reviewer has blocked 3
+consecutive rounds with new findings clustered on one file span (within 40 lines), the next
+coder turn must fix the whole class with one rule and a parametrized test (or propose a
+materially smaller approach), that reviewer sweeps the next head for every remaining instance,
+and the revision is reviewed like any other; the step-back never stops the run. One
+no-progress detector bounds the PR loop instead: `--no-progress-rounds K` (default 3, minimum
+1) stops for a human decision (exit 4) when K consecutive completed rounds ended with the same
+head and the same non-empty set of blocking item IDs, and the live head and items still match.
+The message names the unchanged items, the head and K, and keeps the child-plan supersession
+route, the coder's unsuperseded receipts, the citation diagnosis, the approach-alternative
+excerpt and the PR size when they apply. The retired `--pr-step-back-rounds`,
+`--pr-step-back-line-window`, `--pr-non-convergence-rounds` and `--sub-item-stall-rounds`
+are accepted and ignored for one release with a deprecation notice. See
+[PR no-progress stop](docs/local_agent_loop.md#pr-no-progress-stop). `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. `--pr-evidence-capture-attempts N` (default 2, `0` disables) first converts a row whose evidence was only capture-limited (incomplete capture, unverified launch, unknown selectors; never an authoritative failure) for N consecutive coder attempts into an exact-head human evidence obligation answered at the final evidence freeze, and `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]` converts named unsatisfied rows on demand before any agent runs. When every unchanged item is evidence the evidence stall may own, the no-progress stop defers so the evidence stall decides first. Evidence no agent session or runner can produce belongs only in `exact_head_evidence_requests`. A child-planning cycle inherits `--plan-review-policy`,
 `--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`, `--plan-sweep-rounds`, `--plan-sweep-reasoning-effort`, and `--plan-provenance-baseline-max-chars` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board

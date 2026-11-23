@@ -2091,39 +2091,6 @@ def pr_reviews_for(
     return tuple(result)
 
 
-def pr_step_back_history(
-    records: Sequence["PostedRoundRecord"], reviewer: str
-) -> tuple[tuple[PrStepBackEntry, ...], bool]:
-    """``(entries for the reviewer in record order, degraded)``."""
-    degraded = False
-    entries: list[PrStepBackEntry] = []
-    for record in sorted(records, key=lambda item: item.index):
-        metadata = record.metadata
-        if metadata.flow != "pr" or metadata.role != "coder":
-            continue
-        if metadata.step_back_status == "invalid":
-            degraded = True
-            continue
-        for entry in metadata.step_back_entries:
-            if entry.get("phase") != PHASE_PR or entry.get("reviewer") != reviewer:
-                continue
-            anchor = entry["anchor"]
-            entries.append(
-                PrStepBackEntry(
-                    reviewer=reviewer,
-                    trigger_round=int(entry["trigger_round"]),
-                    trigger_head=str(entry["trigger_head"]),
-                    path=str(anchor["path"]),
-                    start=int(anchor["start"]),
-                    end=int(anchor["end"]),
-                    coder_round=metadata.round_number,
-                    resulting_head=str(metadata.subject),
-                    record_index=record.index,
-                )
-            )
-    return tuple(entries), degraded
-
-
 # ``mapper(from_head, to_head, path, start, end)`` maps a range between heads.
 AnchorMapper = Callable[[str, str, str, int, int], AnchorMapping]
 
@@ -2145,188 +2112,6 @@ def _mandatory_owned_new_items(review: PrReviewRecord) -> list:
     ]
 
 
-def _remaining_mandatory_items(review: PrReviewRecord) -> list:
-    """The reviewer's mandatory items still open after this review's own record."""
-    metadata = review.metadata
-    mandatory = _MANDATORY_STATUSES[PHASE_PR]
-    closed = {
-        d.item_id
-        for d in metadata.dispositions
-        if d.disposition not in mandatory
-    }
-    dispositions = {d.item_id: d for d in metadata.dispositions}
-    remaining = []
-    for item in metadata.prior_items:
-        if item.reviewer != metadata.agent or getattr(item, "authority", None) is not None:
-            continue
-        disposition = dispositions.get(item.item_id)
-        # The review's own disposition decides the effective status, so a future
-        # item promoted to blocking/same-pr counts and a resolved one does not.
-        effective = disposition.disposition if disposition is not None else item.status
-        if effective not in mandatory:
-            continue
-        updated = _with_effective_sub_items(item, disposition)
-        if (
-            disposition is not None
-            and disposition.sub_item_dispositions
-            and updated.sub_items
-            and all(sub.status == "resolved" for sub in updated.sub_items)
-        ):
-            # A completing entry derives to resolved (the ledger's own semantics).
-            continue
-        if updated.status != effective:
-            updated = dataclasses.replace(updated, status=effective)
-        remaining.append(updated)
-    seen = {item.item_id for item in remaining}
-    remaining.extend(
-        item for item in _mandatory_owned_new_items(review) if item.item_id not in seen
-    )
-    return remaining
-
-
-def _with_effective_sub_items(item, disposition):
-    """The item with this review's own sub-item dispositions applied.
-
-    ``resolved`` closes a sub-item and ``unresolved`` reopens one, so location
-    projection sees the post-review state rather than the prior ledger's.
-    """
-    if disposition is None or not disposition.sub_item_dispositions or not item.sub_items:
-        return item
-    outcomes = dict(disposition.sub_item_dispositions)
-    updated = tuple(
-        dataclasses.replace(
-            sub,
-            status={"resolved": "resolved", "unresolved": "open"}.get(
-                outcomes.get(sub.sub_item_id, ""), sub.status
-            ),
-        )
-        for sub in item.sub_items
-    )
-    return dataclasses.replace(item, sub_items=updated)
-
-
-def _location_is_member(
-    location: FindingLocation,
-    source_head: str,
-    head: str,
-    mapping: AnchorMapping,
-    window: int,
-    mapper: AnchorMapper,
-) -> bool:
-    """Membership of a carried location, with anchor and location in ``head``'s coordinates.
-
-    The anchor ``mapping`` is already in ``head``'s coordinates; the location is
-    mapped forward from the head its review was taken on.  A location that cannot
-    be mapped falls back to same-path membership against the anchor's paths.
-    """
-    moved = map_between_heads(
-        mapper, source_head, head, location.path, location.start, location.end
-    )
-    if moved.mappable:
-        location = dataclasses.replace(
-            location, path=moved.path, start=moved.start, end=moved.end
-        )
-        return in_cluster(location, mapping, window)
-    # The path-wide fallback belongs to an UNMAPPABLE anchor only.  A mappable anchor
-    # requires the mapped window, so a location that cannot be placed (moved or
-    # deleted code, a failed diff) is not declared a member by path alone.
-    # Under that policy the location's known rename destination takes part too, so a
-    # chain of renames still meets the anchor's original or destination path.
-    return not mapping.mappable and bool(
-        {location.path, moved.path} & {mapping.original_path, mapping.path}
-    )
-
-
-@dataclass(frozen=True)
-class PrEpisodeResult:
-    """Outcome of replaying the history after a PR step-back turn."""
-
-    entry: PrStepBackEntry | None
-    siblings: tuple[FindingLocation, ...] = ()
-    sibling_round: int | None = None
-    mapping: AnchorMapping | None = None
-
-
-def derive_pr_episode(
-    records: Sequence["PostedRoundRecord"],
-    reviewer: str,
-    *,
-    window: int,
-    mapper: AnchorMapper,
-    current_round: int | None = None,
-    current_head: str | None = None,
-) -> PrEpisodeResult:
-    """Replay the reviewer's reviews after its newest step-back turn.
-
-    ``current_round`` is the round being dispatched: only a sibling introduced by
-    that round's review of ``current_head`` escalates.  A sibling from an earlier
-    round, or from a head the code has since moved past (an operator's pushed
-    redesign or documented limitation), already stopped the run once and must not
-    stop it again; it stays an open member item, which keeps the episode open until
-    it is resolved.
-
-    The episode stays active until the reviewer approves or no unresolved
-    mandatory item of theirs has a location that is a member of the cluster
-    (the same :func:`in_cluster` predicate escalation uses).  The first review
-    that introduces a new mandatory member while the episode is active is a
-    sibling and is returned for escalation.
-    """
-    entries, degraded = pr_step_back_history(records, reviewer)
-    if degraded or not entries:
-        return PrEpisodeResult(entry=None)
-    entry = entries[-1]
-    reviews = pr_reviews_for(records, reviewer)
-    heads = {review.round_number: review.head for review in reviews}
-    cache: dict[tuple[str, str, str, int, int], AnchorMapping] = {}
-
-    def mapping_to(head: str) -> AnchorMapping:
-        key = (entry.trigger_head, head, entry.path, entry.start, entry.end)
-        if key not in cache:
-            cache[key] = map_between_heads(
-                mapper, entry.trigger_head, head, entry.path, entry.start, entry.end
-            )
-        return cache[key]
-
-    last_mapping: AnchorMapping | None = None
-    for review in reviews:
-        if review.index <= entry.record_index:
-            continue
-        if review.classification == CLASS_APPROVED:
-            return PrEpisodeResult(entry=None)
-        if review.classification == CLASS_BLOCKING_UNRESOLVED:
-            # Its new items are unknowable without a reconciliation: it can
-            # neither escalate nor decide the episode's membership.
-            continue
-        mapping = mapping_to(review.head)
-        last_mapping = mapping
-        siblings = tuple(
-            location
-            for item in _mandatory_owned_new_items(review)
-            for location in project_finding_locations(item)
-            if in_cluster(location, mapping, window)
-        )
-        if (
-            siblings
-            and (current_round is None or review.round_number >= current_round)
-            and (current_head is None or review.head == current_head)
-        ):
-            return PrEpisodeResult(entry, siblings, review.round_number, mapping)
-        member_open = False
-        for item in _remaining_mandatory_items(review):
-            source_head = heads.get(item.source_round, review.head)
-            if any(
-                _location_is_member(
-                    location, source_head, review.head, mapping, window, mapper
-                )
-                for location in project_finding_locations(item)
-            ):
-                member_open = True
-                break
-        if not member_open:
-            return PrEpisodeResult(entry=None)
-    return PrEpisodeResult(entry=entry, mapping=last_mapping)
-
-
 @dataclass(frozen=True)
 class PrClusterTrigger:
     """A tracked reviewer's K-round cluster that opens a PR step-back."""
@@ -2338,35 +2123,27 @@ class PrClusterTrigger:
     findings: tuple[str, ...]
 
 
-def find_pr_cluster_trigger(
-    records: Sequence["PostedRoundRecord"],
-    reviewer: str,
+def _pr_cluster_at(
+    reviews: Sequence[PrReviewRecord],
+    end: int,
     *,
+    reviewer: str,
     k: int,
     window: int,
-    current_round: int,
     mapper: AnchorMapper,
-    current_head: str | None = None,
+    head: str | None,
+    floor_round: int,
 ) -> PrClusterTrigger | None:
-    """The reviewer's cluster after K consecutive new-finding blocks, if any.
+    """The cluster of the K reviews ending at ``reviews[end]``, if they qualify.
 
-    Only reviews recorded after the reviewer's newest step-back turn count, so a
-    closed episode re-arms from fresh blocks.  Locations that cannot be mapped to
-    the newest head never contribute.
+    The K reviews must all be after ``floor_round``, contiguous, and all
+    new-finding blocks; locations are mapped to ``head`` (the dispatch head,
+    or the newest review's head) and unmappable ones never contribute.
     """
-    if k <= 0:
+    if end + 1 < k:
         return None
-    entries, degraded = pr_step_back_history(records, reviewer)
-    if degraded:
-        return None
-    floor = entries[-1].record_index if entries else -1
-    reviews = [
-        review for review in pr_reviews_for(records, reviewer) if review.index > floor
-    ]
-    if len(reviews) < k:
-        return None
-    tail = reviews[-k:]
-    if tail[-1].round_number != current_round:
+    tail = reviews[end + 1 - k:end + 1]
+    if tail[0].round_number <= floor_round:
         return None
     if any(review.classification != CLASS_NEW_FINDING for review in tail):
         return None
@@ -2375,16 +2152,14 @@ def find_pr_cluster_trigger(
         for earlier, later in zip(tail, tail[1:])
     ):
         return None
-    # Locations are mapped to the head being dispatched, which an operator may have
-    # pushed past the newest review; unmappable ones never contribute.
-    head = current_head or tail[-1].head
+    target = head or tail[-1].head
     per_review: list[list[MappedLocation]] = []
     for review in tail:
         mapped: list[MappedLocation] = []
         for item in _mandatory_owned_new_items(review):
             for location in project_finding_locations(item):
                 mapping = map_between_heads(
-                    mapper, review.head, head, location.path, location.start, location.end
+                    mapper, review.head, target, location.path, location.start, location.end
                 )
                 if mapping.mappable:
                     mapped.append(
@@ -2403,11 +2178,99 @@ def find_pr_cluster_trigger(
                     (part.strip() for part in item.text.splitlines() if part.strip()), ""
                 )
                 first_lines.append(f"[{item.item_id}] (round {review.round_number}) {line[:240]}")
-    return PrClusterTrigger(reviewer, current_round, head, cluster, tuple(first_lines))
+    return PrClusterTrigger(reviewer, tail[-1].round_number, target, cluster, tuple(first_lines))
+
+
+def pr_dispatch_heads(records: Sequence["PostedRoundRecord"]) -> dict[int, str]:
+    """``{review round: head its coder follow-up was dispatched from}``.
+
+    Read from the newest PR coder record numbered one past the review round, so
+    a historical window maps to the same head its live dispatch used (an
+    operator may have pushed past the newest review before that dispatch).
+    """
+    heads: dict[int, str] = {}
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if metadata.flow == "pr" and metadata.role == "coder":
+            head = getattr(metadata, "followup_dispatch_head", None)
+            if head:
+                heads[metadata.round_number - 1] = str(head)
+            else:
+                heads.pop(metadata.round_number - 1, None)
+    return heads
+
+
+def derived_pr_trigger_rounds(
+    records: Sequence["PostedRoundRecord"],
+    reviewer: str,
+    *,
+    k: int,
+    window: int,
+    mapper: AnchorMapper,
+    current_round: int | None = None,
+    current_head: str | None = None,
+    head_ok: Callable[[str], bool] = lambda head: True,
+) -> dict[int, PrClusterTrigger]:
+    """Every round at which the reviewer's review history opens a step-back.
+
+    Derived from the reviewer's per-head review records alone, never from
+    recorded step-back entries (#2097).  Windows do not overlap: after a
+    trigger at round t, the next one needs K fresh qualifying reviews after t.
+    ``current_head`` is the dispatch head used for ``current_round``'s window
+    (an operator may have pushed past the newest review); earlier windows map
+    to their recorded dispatch head, else their newest review's head.  A trigger whose head ``head_ok``
+    rejects is not a trigger and does not advance the floor.
+    """
+    if k <= 0:
+        return {}
+    reviews = pr_reviews_for(records, reviewer)
+    dispatch_heads = pr_dispatch_heads(records)
+    triggers: dict[int, PrClusterTrigger] = {}
+    floor_round = 0
+    for end, review in enumerate(reviews):
+        if current_round is not None and review.round_number > current_round:
+            break
+        head = (
+            current_head
+            if review.round_number == current_round and current_head
+            else dispatch_heads.get(review.round_number)
+        )
+        trigger = _pr_cluster_at(
+            reviews, end, reviewer=reviewer, k=k, window=window, mapper=mapper,
+            head=head, floor_round=floor_round,
+        )
+        if trigger is None or not head_ok(trigger.trigger_head):
+            continue
+        triggers[review.round_number] = trigger
+        floor_round = review.round_number
+    return triggers
+
+
+def find_pr_cluster_trigger(
+    records: Sequence["PostedRoundRecord"],
+    reviewer: str,
+    *,
+    k: int,
+    window: int,
+    current_round: int,
+    mapper: AnchorMapper,
+    current_head: str | None = None,
+    head_ok: Callable[[str], bool] = lambda head: True,
+) -> PrClusterTrigger | None:
+    """The reviewer's cluster after K consecutive new-finding blocks ending now.
+
+    A trigger is requested at ``current_round`` exactly when it is a derived
+    trigger round (:func:`derived_pr_trigger_rounds`), so a live run and a
+    resumed run agree and a recorded step-back entry never changes it.
+    """
+    return derived_pr_trigger_rounds(
+        records, reviewer, k=k, window=window, mapper=mapper,
+        current_round=current_round, current_head=current_head, head_ok=head_ok,
+    ).get(current_round)
 
 
 def pr_step_back_entry_payload(trigger: PrClusterTrigger) -> Mapping[str, object]:
-    """The durable reviewer-owned PR entry the orchestrator records."""
+    """The durable reviewer-owned PR entry the orchestrator records (audit only)."""
     return {
         "phase": PHASE_PR,
         "reviewer": trigger.reviewer,
@@ -2421,53 +2284,21 @@ def pr_step_back_entry_payload(trigger: PrClusterTrigger) -> Mapping[str, object
     }
 
 
-def pr_sweep_entries(
-    records: Sequence["PostedRoundRecord"], *, round_number: int, head_sha: str | None
-) -> dict[str, PrStepBackEntry]:
-    """Reviewers owed a sweep on ``head_sha``: entries of the step-back coder record
-    whose resulting head is exactly this head and whose round is this round."""
-    if not head_sha:
-        return {}
-    bound: dict[str, PrStepBackEntry] = {}
-    for record in sorted(records, key=lambda item: item.index):
-        metadata = record.metadata
-        if (
-            metadata.flow != "pr"
-            or metadata.role != "coder"
-            or metadata.step_back_status != "valid"
-            or metadata.round_number != round_number
-            or metadata.subject != head_sha
-        ):
-            continue
-        for entry in metadata.step_back_entries:
-            if entry.get("phase") != PHASE_PR:
-                continue
-            anchor = entry["anchor"]
-            reviewer = str(entry["reviewer"])
-            bound[reviewer] = PrStepBackEntry(
-                reviewer=reviewer,
-                trigger_round=int(entry["trigger_round"]),
-                trigger_head=str(entry["trigger_head"]),
-                path=str(anchor["path"]),
-                start=int(anchor["start"]),
-                end=int(anchor["end"]),
-                coder_round=metadata.round_number,
-                resulting_head=str(metadata.subject),
-                record_index=record.index,
-            )
-    return bound
-
-
-def step_back_generalization(
-    records: Sequence["PostedRoundRecord"], entry: PrStepBackEntry
-) -> str | None:
-    """The coder's structured ``summary`` on the step-back record, if readable."""
-    for record in records:
-        metadata = record.metadata
-        if record.index != entry.record_index or metadata.role != "coder":
-            continue
-        return _decode_coder_summary(metadata.raw_structured_coder_response)
-    return None
+def pr_trigger_sweep_entry(
+    trigger: PrClusterTrigger, *, coder_round: int, resulting_head: str
+) -> PrStepBackEntry:
+    """The sweep binding a derived trigger owes the next review."""
+    return PrStepBackEntry(
+        reviewer=trigger.reviewer,
+        trigger_round=trigger.trigger_round,
+        trigger_head=trigger.trigger_head,
+        path=trigger.cluster.path,
+        start=trigger.cluster.start,
+        end=trigger.cluster.end,
+        coder_round=coder_round,
+        resulting_head=resulting_head,
+        record_index=-1,
+    )
 
 
 # Leading bytes of the two step-back coder choices' ``summary`` (#1628).
@@ -2499,24 +2330,11 @@ def render_pr_step_back_coder_guidance(triggers: Sequence[PrClusterTrigger]) -> 
         "finding. Begin the `summary` with "
         f"`{PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX}`, then name the materially smaller "
         "alternative (which may be removing or relaxing an existing check or guard) and say "
-        "which of these findings it dissolves. The run then stops for a human decision on "
-        "that alternative; no review runs on it first.\n"
+        "which of these findings it dissolves. The proposal goes to the reviewers like any "
+        "other revision, and it is shown to the operator if the run later stops for lack "
+        "of progress; it does not stop the run by itself.\n"
         "Clusters:\n" + "\n".join(blocks) + "\n"
     )
-
-
-@dataclass(frozen=True)
-class PrApproachAlternative:
-    """A step-back coder turn that proposed replacing the approved approach."""
-
-    coder_round: int
-    head: str
-    entries: tuple[PrStepBackEntry, ...]
-    excerpt: str
-
-    @property
-    def reviewers(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(entry.reviewer for entry in self.entries))
 
 
 def _decode_coder_summary(raw: str | None) -> str | None:
@@ -2540,103 +2358,36 @@ def approach_alternative_excerpt(summary: str | None) -> str | None:
     return text[len(PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX):].strip()
 
 
-def pr_step_back_approach_alternative(
+def pr_approach_alternative_at_head(
     records: Sequence["PostedRoundRecord"], *, head_sha: str | None
-) -> PrApproachAlternative | None:
-    """The newest valid step-back coder record's alternative, bound to ``head_sha``.
+) -> tuple[int, str] | None:
+    """``(coder round, excerpt)`` of the newest PR coder proposal at ``head_sha``.
 
-    Returns ``None`` (today's behavior, never an approval) unless the newest PR
-    coder record carrying a valid step-back entry has a summary opening with
-    :data:`PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX`, its resulting head is
-    exactly ``head_sha``, and no PR review of that head was recorded after it.
-    A moved head means a human pushed past the proposal.
+    The newest PR coder record whose resulting head is ``head_sha`` and whose
+    decoded summary opens with :data:`PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX`.
+    It is selected even when later reviews of that head exist, because the
+    no-progress message that shows it fires only after K completed reviews.
+    Recorded step-back entries are never consulted.
     """
     if not head_sha:
         return None
-    ordered = sorted(records, key=lambda item: item.index)
-    latest: "PostedRoundRecord | None" = None
-    for record in ordered:
+    for record in sorted(records, key=lambda item: item.index, reverse=True):
         metadata = record.metadata
-        if (
-            metadata.flow == "pr"
-            and metadata.role == "coder"
-            and metadata.step_back_status == "valid"
-            and any(entry.get("phase") == PHASE_PR for entry in metadata.step_back_entries)
-        ):
-            latest = record
-    if latest is None or latest.metadata.subject != head_sha:
-        return None
-    if any(
-        record.index > latest.index
-        and record.metadata.flow == "pr"
-        and is_complete_code_review(record.metadata)
-        and record.metadata.subject == head_sha
-        for record in ordered
-    ):
-        return None
-    excerpt = approach_alternative_excerpt(
-        _decode_coder_summary(latest.metadata.raw_structured_coder_response)
-    )
-    if excerpt is None:
-        return None
-    metadata = latest.metadata
-    entries = tuple(
-        PrStepBackEntry(
-            reviewer=str(entry["reviewer"]),
-            trigger_round=int(entry["trigger_round"]),
-            trigger_head=str(entry["trigger_head"]),
-            path=str(entry["anchor"]["path"]),
-            start=int(entry["anchor"]["start"]),
-            end=int(entry["anchor"]["end"]),
-            coder_round=metadata.round_number,
-            resulting_head=str(metadata.subject),
-            record_index=latest.index,
+        if metadata.flow != "pr" or metadata.role != "coder" or metadata.subject != head_sha:
+            continue
+        excerpt = approach_alternative_excerpt(
+            _decode_coder_summary(metadata.raw_structured_coder_response)
         )
-        for entry in metadata.step_back_entries
-        if entry.get("phase") == PHASE_PR
-    )
-    return PrApproachAlternative(metadata.round_number, head_sha, entries, excerpt)
+        if excerpt is not None:
+            return metadata.round_number, excerpt
+    return None
 
 
-# Leading bytes of the PR approach-alternative human-decision stop (#1628).
+# Leading bytes of the retired PR approach-alternative stop (#1628).  The stop
+# no longer exists (#2097); history export keeps recognizing old comments.
 PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT = (
     "human decision required: the coder proposes replacing the approved approach"
 )
-
-
-def render_pr_step_back_approach_alternative_decision(
-    pr_number: int, alternative: PrApproachAlternative
-) -> str:
-    """Human-decision diagnostic after a step-back turn proposed an approach change."""
-    excerpt = alternative.excerpt.strip()
-    if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
-        excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
-    clusters = "; ".join(
-        f"{entry.reviewer} on `{entry.path}` lines {entry.start}-{entry.end}"
-        for entry in alternative.entries
-    ) or "(no cluster recorded)"
-    what = (
-        f"PR #{pr_number}: "
-        + PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT
-        + f" (step-back turn at round {alternative.coder_round}, resulting head "
-        f"`{alternative.head}`, after consecutive blocks from {clusters}). No review or "
-        f"coder turn was run on it. Proposed alternative (excerpt): {excerpt or '(empty)'} "
-        "Decide one of: rerun with the scope change approved (re-plan or amend the issue, "
-        "push the replacement and rerun); accept a stated limitation (document it, resolve "
-        "or defer the findings, push the commit and rerun); or continue generalizing (rerun "
-        "with --pr-step-back-rounds 0). A pushed head no longer equals the recorded head, so "
-        "a rerun after a push does not stop again on this proposal."
-    )
-    return render_human_decision(
-        what=what,
-        clear=(
-            "Accept a stated limitation: document it, resolve or defer the findings, push "
-            f"the commit and rerun `agent-loop pr {pr_number}`; the other options are "
-            "listed above."
-        ),
-        safe_to_automate=False,
-        automation_note="approving or rejecting an approach change is a human judgement.",
-    )
 
 
 def render_pr_sweep_guidance(entry: PrStepBackEntry) -> str:
@@ -2655,380 +2406,14 @@ def render_pr_sweep_guidance(entry: PrStepBackEntry) -> str:
     )
 
 
-# Leading bytes of the PR step-back sibling human-decision stop (#1640).
+# Leading bytes of the retired PR step-back sibling stop (#1640, retired by
+# #2097); history export keeps recognizing old comments.
 PR_STEP_BACK_SIBLING_PREFIX_TEXT = (
     "human decision required: the coder generalized a class of findings at round "
 )
 
-
-def render_pr_step_back_human_decision(
-    *,
-    reviewer: str,
-    entry: PrStepBackEntry,
-    mapping: AnchorMapping | None,
-    siblings: Sequence[FindingLocation],
-    window: int,
-    generalization: str | None,
-    sibling_round: int | None,
-) -> str:
-    """Human-decision diagnostic after a step-back that still produced a sibling."""
-    excerpt = (generalization or "").strip()
-    if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
-        excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
-    if mapping is None:
-        mapped = "(not mapped)"
-    elif mapping.mappable:
-        mapped = (
-            f"{mapping.outcome} to `{mapping.path}` lines {mapping.start}-{mapping.end} "
-            f"(+/- {window})"
-        )
-    else:
-        mapped = (
-            f"{mapping.outcome} ({mapping.reason}); falling back to any finding on "
-            f"`{mapping.original_path}` or `{mapping.path}`"
-        )
-    sibling_text = "; ".join(
-        dict.fromkeys(
-            f"[{loc.item_id}{'/' + loc.sub_item_id if loc.sub_item_id else ''}] "
-            f"`{loc.path}:{loc.start}-{loc.end}`"
-            for loc in siblings
-        )
-    )
-    return (
-        PR_STEP_BACK_SIBLING_PREFIX_TEXT
-        + f"{entry.coder_round} (a step-back turn after {reviewer} blocked consecutive rounds "
-        f"on `{entry.path}` lines {entry.start}-{entry.end}), and {reviewer} still raised a "
-        f"new sibling finding in round {sibling_round}: {sibling_text}. Cluster mapping: "
-        f"{mapped}. No further coder turn was invoked. Coder generalization (excerpt): "
-        f"{excerpt or '(not recorded)'} Decide one of: continue (rerun with "
-        "--pr-step-back-rounds 0, which also disables step-back detection), accept a stated "
-        "limitation (document it, resolve or defer the sibling, push the commit and rerun), or "
-        "redesign the affected code (push the redesign and rerun). If the approved approach "
-        "itself generates this class of findings, approve a scope change (re-plan or amend "
-        "the issue), push the replacement and rerun. After a push, a rerun does "
-        "not stop again on this round's sibling; only a new sibling in a later review does."
-    )
-
-
-# ---------------------------------------------------------------------------
-# PR fix-loop non-convergence (#1372): the same tracked-reviewer items stay
-# blocking across K consecutive coder turns that each changed the head, wherever
-# the findings are.  Derived only from posted reviewer and coder records.
-# ---------------------------------------------------------------------------
-
-NON_CONVERGENCE_TEXT_LIMIT = 240
-_EVIDENCE_REQUEST_RE = re.compile(
-    r"\b(evidence|runner|real[- ]host|live run|hardware|platform)\b", re.IGNORECASE
-)
-
-
-@dataclass(frozen=True)
-class PersistingItem:
-    item_id: str
-    first_line: str
-    attempts: int
-    asks_for_evidence: bool = False
-    evidence_row_ids: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class PrNonConvergence:
-    """A tracked reviewer's window of K code-changing turns that cleared nothing."""
-
-    reviewer: str
-    k: int
-    trigger_round: int
-    first_round: int
-    first_head: str
-    current_head: str
-    items: tuple[PersistingItem, ...]
-    coder_rounds: tuple[int, ...]
-
-
-def _pr_blocking_set(review: PrReviewRecord) -> dict | None:
-    """``{item_id: item}`` the reviewer still holds blocking after this review.
-
-    Only the reviewer's own dispositions apply, so another reviewer's vote never
-    extends the tracked reviewer's streak.  Machine and human exact-head evidence
-    obligations are already excluded.  Findings tagged with risk-matrix rows count
-    like any other; precedence against the evidence-stall stop is decided at the
-    dispatch (see ``defers_to_evidence_stall``).  ``None`` when the review is not
-    a resolvable block (approved, other, or an unresolvable publication record).
-    """
-    if review.classification not in BLOCKING_CLASSES or review.new_items is None:
-        return None
-    if review.classification == CLASS_BLOCKING_UNRESOLVED:
-        return None
-    metadata = review.metadata
-    own = tuple(d for d in metadata.dispositions if d.reviewer == metadata.agent)
-    if len(own) != len(metadata.dispositions):
-        review = dataclasses.replace(
-            review, metadata=dataclasses.replace(metadata, dispositions=own)
-        )
-    return {item.item_id: item for item in _remaining_mandatory_items(review)}
-
-
-def _pr_coder_after(
-    records: Sequence["PostedRoundRecord"], round_number: int, after_index: int
-) -> "PostedRoundRecord | None":
-    """The latest PR coder record numbered ``round_number`` posted after ``after_index``."""
-    best = None
-    for record in records:
-        metadata = record.metadata
-        if (
-            metadata.flow == "pr"
-            and metadata.role == "coder"
-            and metadata.round_number == round_number
-            and record.index > after_index
-            and (best is None or record.index > best.index)
-        ):
-            best = record
-    return best
-
-
-def _pr_code_changing_join(
-    records: Sequence["PostedRoundRecord"],
-    review: PrReviewRecord,
-    next_review: PrReviewRecord,
-) -> "PostedRoundRecord | None":
-    """The coder record between two consecutive reviews, when it moved the head.
-
-    Production numbering: the loop posts review r and then the coder record
-    numbered r+1, whose subject is the head reviewed at round r+1.  A missing
-    record, an unchanged head (no-op turn) or a next-review head that differs
-    from the coder's subject (external push or rebase) yields ``None``.
-    """
-    if next_review.round_number != review.round_number + 1:
-        return None
-    coder = _pr_coder_after(records, review.round_number + 1, review.index)
-    if coder is None or coder.index > next_review.index:
-        return None
-    subject = str(coder.metadata.subject or "")
-    if not subject or subject == review.head or next_review.head != subject:
-        return None
-    return coder
-
-
-def _open_sub_items(item) -> int:
-    return sum(1 for sub in getattr(item, "sub_items", ()) if sub.status != "resolved")
-
-
-def _still_blocking_without_progress(earlier: dict, later: dict, item_id: str) -> bool:
-    """Whether the item stayed blocking from one review to the next with no progress.
-
-    Resolving at least one open sub-item is progress (the sub-item stall gate owns
-    sub-item pacing), so it breaks the item's chain.
-    """
-    if item_id not in earlier or item_id not in later:
-        return False
-    return _open_sub_items(later[item_id]) >= _open_sub_items(earlier[item_id])
-
-
-def _first_line(text: str) -> str:
-    return next((part.strip() for part in str(text).splitlines() if part.strip()), "")
-
-
-def find_pr_non_convergence(
-    records: Sequence["PostedRoundRecord"],
-    reviewer: str,
-    *,
-    k: int,
-    current_round: int,
-    current_head: str | None,
-) -> PrNonConvergence | None:
-    """The reviewer's persisting items after K code-changing coder turns, if any.
-
-    The window is the reviewer's reviews at rounds N-K..N (N = ``current_round``)
-    joined by the K coder records numbered N-K+1..N.  Every review must be a
-    resolvable block and every join must have moved the head with no external
-    push; the persisting items are the IDs blocking in all K+1 reviews whose
-    open sub-item count never dropped between two of them.  File spread and line
-    windows are ignored by design.  The reported
-    first head is the head of the earliest review any persisting item's attempt
-    scan reaches, so the measured growth covers every counted attempt.
-    """
-    if k <= 0 or current_round - k < 1:
-        return None
-    ordered = sorted(records, key=lambda item: item.index)
-    by_round = {review.round_number: review for review in pr_reviews_for(ordered, reviewer)}
-    window = [by_round.get(n) for n in range(current_round - k, current_round + 1)]
-    if any(review is None for review in window):
-        return None
-    if current_head and window[-1].head != current_head:
-        return None
-    blocking_sets = [_pr_blocking_set(review) for review in window]
-    if any(found is None for found in blocking_sets):
-        return None
-    coders = [
-        _pr_code_changing_join(ordered, earlier, later)
-        for earlier, later in zip(window, window[1:])
-    ]
-    if any(coder is None for coder in coders):
-        return None
-    persisting = {
-        item_id
-        for item_id in blocking_sets[0]
-        if all(
-            _still_blocking_without_progress(earlier, later, item_id)
-            for earlier, later in zip(blocking_sets, blocking_sets[1:])
-        )
-    }
-    if not persisting:
-        return None
-    items = []
-    first = window[0]
-    for item_id in sorted(persisting):
-        attempts = k
-        later, later_set = window[0], blocking_sets[0]
-        while True:
-            earlier = by_round.get(later.round_number - 1)
-            if earlier is None or _pr_code_changing_join(ordered, earlier, later) is None:
-                break
-            found = _pr_blocking_set(earlier)
-            if found is None or not _still_blocking_without_progress(found, later_set, item_id):
-                break
-            attempts += 1
-            later, later_set = earlier, found
-        if later.round_number < first.round_number:
-            first = later
-        item = blocking_sets[-1][item_id]
-        text = str(item.text)
-        items.append(
-            PersistingItem(
-                item_id=item_id,
-                first_line=_first_line(text),
-                attempts=attempts,
-                asks_for_evidence=bool(
-                    getattr(item, "evidence_row_ids", ()) or _EVIDENCE_REQUEST_RE.search(text)
-                ),
-                evidence_row_ids=tuple(getattr(item, "evidence_row_ids", ()) or ()),
-            )
-        )
-    return PrNonConvergence(
-        reviewer=reviewer,
-        k=k,
-        trigger_round=current_round,
-        first_round=first.round_number,
-        first_head=first.head,
-        current_head=current_head or window[-1].head,
-        items=tuple(items),
-        coder_rounds=tuple(coder.metadata.round_number for coder in coders),
-    )
-
-
-def defers_to_evidence_stall(
-    result: PrNonConvergence, unsatisfied_rows: frozenset[str] | None
-) -> bool:
-    """Whether the evidence-stall stop may own this window, so it decides first.
-
-    True only when every persisting item is a finding tagged with rows that are
-    all unsatisfied at the dispatch head.  The stall then evaluates the combined
-    ledger, the check board and its own window history at this dispatch; when it
-    does not stop, the non-convergence stop still fires before any coder turn.
-    Any untagged persisting item, a tag naming a satisfied row, or no usable row
-    set means the stall can never own the window.
-    """
-    if not unsatisfied_rows or not result.items:
-        return False
-    return all(
-        item.evidence_row_ids and set(item.evidence_row_ids) <= unsatisfied_rows
-        for item in result.items
-    )
-
-
-def pr_non_convergence_may_matter(
-    records: Sequence["PostedRoundRecord"], reviewer: str, *, k: int, round_number: int
-) -> bool:
-    """Snapshot pre-check: could a non-convergence window qualify at this round?
-
-    A live dispatch snapshot predates the newest coder record (and the current
-    review), so only the reviewer's reviews N-K..N-1 are checked: present,
-    contiguous and all blocking.  Coder joins are verified on the fresh read.
-    """
-    if k <= 0 or round_number - k < 1:
-        return False
-    rounds = {
-        review.round_number: review
-        for review in pr_reviews_for(records, reviewer)
-        if review.round_number < round_number
-    }
-    for number in range(round_number - k, round_number):
-        review = rounds.get(number)
-        if review is None or review.classification not in BLOCKING_CLASSES:
-            return False
-    return True
-
-
-def _clean_decision_text(text: str) -> str:
-    text = " ".join(str(text).split()).replace("`", "'")
-    if len(text) > NON_CONVERGENCE_TEXT_LIMIT:
-        text = text[: NON_CONVERGENCE_TEXT_LIMIT - 1].rstrip() + "…"
-    return text
-
-
-# First-line fragments of the PR non-convergence human-decision stop (#1640);
-# history export recognizes ``LEAD <reviewer> MARK <k> consecutive coder turns``.
+# First-line fragments of the retired PR non-convergence stop (#1640, retired
+# by #2097); history export recognizes ``LEAD <reviewer> MARK <k> consecutive
+# coder turns`` in old comments.
 PR_NON_CONVERGENCE_DECISION_LEAD = "human decision required: "
 PR_NON_CONVERGENCE_DECISION_MARK = " kept the same item(s) blocking across "
-
-
-def render_pr_non_convergence_decision(
-    pr_number: int,
-    result: PrNonConvergence,
-    *,
-    diff_growth: str | None,
-    pr_size: str | None,
-) -> str:
-    """Human-decision text for a non-converging PR fix loop (#1372)."""
-    item_lines = "\n".join(
-        f"- [{_clean_decision_text(item.item_id)}] (attempts: {item.attempts}) "
-        f"{_clean_decision_text(item.first_line) or '(no text recorded)'}"
-        for item in result.items
-    )
-    evidence = [item.item_id for item in result.items if item.asks_for_evidence]
-    evidence_note = (
-        "Possibly human-only evidence (these persisting items ask for evidence the "
-        "environment may be unable to produce; see option 4): "
-        + ", ".join(f"[{_clean_decision_text(item_id)}]" for item_id in evidence)
-        + "\n"
-        if evidence
-        else ""
-    )
-    what = (
-        f"PR #{pr_number}: "
-        + PR_NON_CONVERGENCE_DECISION_LEAD
-        + result.reviewer
-        + PR_NON_CONVERGENCE_DECISION_MARK
-        + f"{result.k} consecutive coder turns that each changed the "
-        f"head (reviews at rounds {result.first_round}-{result.trigger_round}, current head "
-        f"`{result.current_head}`), so the fix loop is not converging. No further coder "
-        "turn was invoked.\n"
-        f"Persisting items:\n{item_lines}\n"
-        f"Diff growth since the first attempt (`{result.first_head[:12]}` to "
-        f"`{result.current_head[:12]}`): {diff_growth or 'unavailable'}\n"
-        "Total PR size (a scope-growth signal; compare it with the issue's suggested "
-        f"direction): {pr_size or 'unavailable'}\n"
-        f"{evidence_note}"
-        "Decide how to proceed:\n"
-        "1. Continue: rerun with `--pr-non-convergence-rounds 0` (or a larger K).\n"
-        "2. Accept a stated limitation or narrow the scope with a signed human decision "
-        "through the existing signed-requirement path that resolves or defers these items, "
-        "then rerun the same command.\n"
-        "3. Redesign, or push a change yourself, and rerun: an external push breaks the "
-        "chain, so the rerun does not stop again on this window.\n"
-        "4. Convert evidence the environment cannot produce to the evidence freeze: have "
-        "the reviewer re-file that item as an exact-head evidence request instead of a "
-        "blocking finding."
-    )
-    return render_human_decision(
-        what=what,
-        clear=(
-            "Resolve or defer the persisting items with a signed human decision (option 2), "
-            "then rerun the same command; the other options are listed above."
-        ),
-        safe_to_automate=False,
-        automation_note=(
-            "deciding whether to continue, narrow or redesign a non-converging fix loop is "
-            "a human judgement."
-        ),
-    )
