@@ -1218,6 +1218,7 @@ def _coder_human_requirements_guidance(
         "Each bullet must explain how you addressed that item or why it could not be satisfied safely."
     ),
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
 ) -> str:
     has_requirements = bool(
         context.surfaced_requirement_ids or context.requires_direct_discussion_ack
@@ -1253,7 +1254,8 @@ def _coder_human_requirements_guidance(
             lines.extend([
                 "The detailed requirement entries were omitted to stay within prompt bounds. Set both JSON ledgers empty and set `checked_discussion_directly` true only after checking the GitHub discussion directly.",
             ])
-        lines.extend(_coder_reviewer_owned_requirements_notice(reviewer_owned_requirement_ids))
+        lines.extend(_coder_reviewer_owned_requirements_notice(
+            reviewer_owned_requirement_ids, superseded_requirement_ids))
         return "\n".join(lines) + "\n"
     if not context.surfaced_requirement_ids and not context.requires_direct_discussion_ack:
         lines.extend([
@@ -1336,48 +1338,88 @@ def _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids: Sequence[str]
     return tuple(result)
 
 
-def _coder_reviewer_owned_requirements_notice(reviewer_owned_requirement_ids: Sequence[str]) -> list[str]:
+def _split_superseded(
+    reviewer_owned_requirement_ids: Sequence[str], superseded_requirement_ids: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split reviewer-owned labels into evidence-bearing and inert superseded labels (#2101)."""
+    owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
+    superseded = set(_normalized_reviewer_owned_ids(superseded_requirement_ids))
+    return (tuple(item for item in owned if item not in superseded),
+            tuple(item for item in owned if item in superseded))
+
+
+def _superseded_inert_sentence(superseded: Sequence[str], *, audience: str) -> str:
+    listed = ", ".join(f"`{item}`" for item in superseded)
+    if audience == "coder":
+        return (
+            f"Superseded signed requirements (read-only, no action needed): {listed}. A newer signed "
+            "source from the same author replaced them; they are outside coder scope. Do not include them "
+            "in `human_requirement_dispositions` or `human_requirements.addressed_ids`."
+        )
+    return (
+        f"These signed requirements were superseded by a newer signed source from the same author and are "
+        f"inert: {listed}. Do not raise `exact_head_evidence_requests` for them, cite them in "
+        "`evidence_requirement_ids`, put them in `blocking_items`, or demand a coder disposition or "
+        "acknowledgement for them. "
+    )
+
+
+def _coder_reviewer_owned_requirements_notice(
+    reviewer_owned_requirement_ids: Sequence[str], superseded_requirement_ids: Sequence[str] = ()
+) -> list[str]:
     """Read-only notice for signed sources routed to reviewer-owned evidence (#2020).
 
     Lists bare IDs only (never signed body text) and never adds them to the
-    surfaced set the coder must dispose of.
+    surfaced set the coder must dispose of. Superseded IDs (#2101) render as a
+    separate no-action sentence.
     """
-    owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
-    if not owned:
-        return []
-    listed = ", ".join(f"`{item}`" for item in owned)
-    return [
-        "Reviewer-owned signed requirements (read-only): "
-        + listed
-        + ". These signed sources are routed to reviewer-owned exact-head evidence (evidence-only or human-only) "
-        "and are outside coder scope. Do not include them in `human_requirement_dispositions` or "
-        "`human_requirements.addressed_ids`. Any reviewer item demanding a coder disposition or acknowledgement "
-        "for these IDs is non-actionable for the coder; say so in `remaining_item_notes` or `dispute_evidence` "
-        "instead of disposing of the ID.",
-    ]
+    owned, superseded = _split_superseded(reviewer_owned_requirement_ids, superseded_requirement_ids)
+    lines = []
+    if owned:
+        listed = ", ".join(f"`{item}`" for item in owned)
+        lines.append(
+            "Reviewer-owned signed requirements (read-only): "
+            + listed
+            + ". These signed sources are routed to reviewer-owned exact-head evidence (evidence-only or human-only) "
+            "and are outside coder scope. Do not include them in `human_requirement_dispositions` or "
+            "`human_requirements.addressed_ids`. Any reviewer item demanding a coder disposition or acknowledgement "
+            "for these IDs is non-actionable for the coder; say so in `remaining_item_notes` or `dispute_evidence` "
+            "instead of disposing of the ID."
+        )
+    if superseded:
+        lines.append(_superseded_inert_sentence(superseded, audience="coder"))
+    return lines
 
 
 def _reviewer_owned_review_scope_line(
-    reviewer_owned_requirement_ids: Sequence[str], *, scoped_acknowledgement: bool = False
+    reviewer_owned_requirement_ids: Sequence[str], *, scoped_acknowledgement: bool = False,
+    superseded_requirement_ids: Sequence[str] = (),
 ) -> str:
-    owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
-    if not owned:
+    owned, superseded = _split_superseded(reviewer_owned_requirement_ids, superseded_requirement_ids)
+    if not owned and not superseded:
         return ""
-    listed = ", ".join(f"`{item}`" for item in owned)
-    return (
+    line = (
         "Coder disposition scope: coder `human_requirement_dispositions` cover only the coder-owned "
-        f"signed requirements. These signed requirements are reviewer-owned: {listed}. Do not demand a "
-        "coder disposition or acknowledgement for them; the coder schema rejects them. Accept them only "
-        "through your own exact-head evidence path: a pending one belongs in "
-        "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`, never in "
-        "`blocking_items`. "
-        + (
-            # Freeze-only scope (#2083): the marker attests the projected,
-            # non-reviewer-owned set the PR loop's acknowledgement gate checks.
-            "The approval marker below covers only the signed requirements outside this reviewer-owned list.\n"
-            if scoped_acknowledgement
-            else "The approval marker below still covers the whole signed set.\n"
+        "signed requirements. "
+    )
+    if owned:
+        listed = ", ".join(f"`{item}`" for item in owned)
+        line += (
+            f"These signed requirements are reviewer-owned: {listed}. Do not demand a "
+            "coder disposition or acknowledgement for them; the coder schema rejects them. Accept them only "
+            "through your own exact-head evidence path: a pending one belongs in "
+            "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`, never in "
+            "`blocking_items`. "
         )
+    if superseded:
+        line += _superseded_inert_sentence(superseded, audience="reviewer")
+    lists = "the reviewer-owned and superseded lists above" if superseded else "this reviewer-owned list"
+    return line + (
+        # Freeze-only scope (#2083): the marker attests the projected,
+        # non-reviewer-owned set the PR loop's acknowledgement gate checks.
+        f"The approval marker below covers only the signed requirements outside {lists}.\n"
+        if scoped_acknowledgement
+        else "The approval marker below still covers the whole signed set.\n"
     )
 
 
@@ -1391,11 +1433,11 @@ If any signed human requirement in this set is unresolved, return blocking.
 
 # `--pr-human-evidence freeze` only (#2083). The PR loop checks the marker
 # against `requirement_evidence.project(...)`, which drops sources reviewers
-# agree are human-only or evidence-only; this wording names the same set so a
-# pending human-only operator approval can never make reviewers withhold it.
+# agree are human-only, evidence-only or superseded; this wording names the same
+# set so a pending human-only operator approval can never make reviewers withhold it.
 _SCOPED_ACKNOWLEDGEMENT_GUIDANCE = """Acknowledgement scope: a surfaced signed requirement is in scope unless it is
-listed as reviewer-owned above or you classify it as human-only or evidence-only
-in your own `requirement_evidence`. A requirement you leave unclassified, or whose
+listed as reviewer-owned or superseded above or you classify it as human-only,
+evidence-only or superseded in your own `requirement_evidence`. A requirement you leave unclassified, or whose
 role is disputed, stays in scope. Verify each in-scope requirement, then include
 exactly:
 
@@ -1417,6 +1459,7 @@ def _human_requirements_review_guidance(
     require_plan_dispositions: bool = False,
     reviewer_owned_requirement_ids: Sequence[str] = (),
     scoped_acknowledgement: bool = False,
+    superseded_requirement_ids: Sequence[str] = (),
 ) -> str:
     if not human_requirements:
         return (
@@ -1441,7 +1484,8 @@ def _human_requirements_review_guidance(
             "are unsafe, impossible, or contradicted by a later signed human instruction.\n"
         )
     scope_line = _reviewer_owned_review_scope_line(
-        reviewer_owned_requirement_ids, scoped_acknowledgement=scoped_acknowledgement
+        reviewer_owned_requirement_ids, scoped_acknowledgement=scoped_acknowledgement,
+        superseded_requirement_ids=superseded_requirement_ids,
     )
     return authority + scope_line + (
         _SCOPED_ACKNOWLEDGEMENT_GUIDANCE if scoped_acknowledgement else _WHOLE_SET_ACKNOWLEDGEMENT_GUIDANCE

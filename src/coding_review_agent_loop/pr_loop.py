@@ -559,7 +559,7 @@ from .pr_board_entry import _enforce_pr_board_floor
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
-from .requirement_evidence import CLASSIFICATION_INVOKE_OPTIONS, historical_projection, classify_review, project, reviewer_owned_ids, validate_associations
+from .requirement_evidence import CLASSIFICATION_INVOKE_OPTIONS, historical_projection, historical_superseded_ids, classify_review, project, reviewer_owned_ids, superseded_ids, validate_associations
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -3351,10 +3351,11 @@ def run_pr_loop(
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
-                human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments)) if human_evidence.freeze else human_requirements),
+                human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, (resumed_history := native_history(runner, config, pr_number, pr_comments))) if human_evidence.freeze else human_requirements),
                 source_round=round_number, reviewer_owned_requirement_ids=(reviewer_owned_requirement_ids := reviewer_owned_ids(human_requirements, resumed_coder_requirements)),
                 human_requirements_degraded=bool(latest_coder_metadata is not None and latest_coder_metadata.human_requirements_degraded),
             )
+            superseded_requirement_ids = historical_superseded_ids(human_requirements, resumed_history) if human_evidence.freeze else ()  # Inert prompt rendering (#2101).
             # A CI obligation is bound to the head that failed.  Only a
             # strictly different live head may become a qualification
             # candidate; reviewer dispositions never perform this transition.
@@ -5357,7 +5358,7 @@ def run_pr_loop(
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
-                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, released_disputes=dispute_release.released,
+                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids, released_disputes=dispute_release.released,
                                 unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, agent_display_name(reviewer)),
                                 compact_context=(
                                     use_compact_pr_context
@@ -5738,7 +5739,7 @@ def run_pr_loop(
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
-                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, released_disputes=dispute_release.released,
+                                human_requirements=human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids, released_disputes=dispute_release.released,
                                 unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
                                 compact_context=reviewer_compact_context,
                                 compact_prior=(
@@ -6307,6 +6308,7 @@ def run_pr_loop(
                     + ", ".join(identity for identity, _head in round_evidence_clearances),
                 )
             reviewer_owned_requirement_ids = reviewer_owned_ids(human_requirements, coder_requirements := project(human_requirements, classified_review_carriers, prior_unresolved_items))
+            superseded_requirement_ids = superseded_ids(human_requirements, classified_review_carriers, prior_unresolved_items)
             if human_requirements and any(
                 item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
                 for item in unresolved_items
@@ -9027,7 +9029,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids,
                     base_branch=resolved_base_branch,
                     head_sha=resolved_head_sha,
                     merge_state_detail=merge_state_detail,
@@ -9053,7 +9055,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
@@ -9078,7 +9080,7 @@ def run_pr_loop(
                     coder_config,
                     memory,
                     issue_context=issue_context,
-                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+                    human_requirements=coder_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids,
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,

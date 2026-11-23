@@ -755,9 +755,29 @@ published pending evidence remain available for reviewer agreement or a human de
 cannot authorize acceptance: native requester citations and final live head/source
 reads retain that authority before and after freeze.
 
+A fifth role, `superseded` (#2101), routes a signed source that a later signed
+source from the same author replaces, such as an older exact-head approval or a
+note limiting it. Its fields are `request` `""`, `answered_item_ids` `[]` and
+`leftover_instructions` `""`. A nonblank superseded leftover is not normalized
+away; like any other nonblank field, it takes the bounded judgement re-ask.
+`validate_associations` accepts it only when another surfaced live source has the
+same author (`author_id` when both sides carry it, otherwise the normalized login)
+and a strictly later parsed `created_at`. A missing author or timestamp fails
+closed, so a reviewer cannot use the role to drop the newest requirement. An agreed superseded
+source leaves the projection like evidence-only: it is reviewer-owned, needs no coder
+disposition or acknowledgement, and creates no evidence request. Live and
+replayed rounds derive the inert subset through `superseded_ids` and
+`historical_superseded_ids`, and prompts render those IDs in a separate inert
+sentence rather than under the exact-head evidence-path instruction. Two
+reviewers who both pick `superseded` agree by role, while a split against another role
+still stops with the role-conflict message. When a reviewer emitted no
+`exact_head_evidence_requests` that turn, re-ask messages no longer offer
+`human-only`, which cannot validate without a linked request; they name
+superseded, evidence-only with the reviewer's own item IDs, or code.
+
 Coder-disposition scope (#2020) follows the same projection. A signed source is
 the coder's to dispose exactly when the projection keeps it; every other live
-signed source (evidence-only or human-only) is reviewer-owned and never
+signed source (evidence-only, human-only or superseded) is reviewer-owned and never
 coder-dispositioned. `requirement_evidence.reviewer_owned_ids` derives that set,
 and the PR loop threads it into the coder prompt (a read-only notice that lists
 the bare IDs and says reviewer demands for their dispositions are non-actionable),

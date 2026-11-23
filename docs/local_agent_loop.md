@@ -1032,6 +1032,16 @@ signed ID and one of that reviewer's evidence requests. The requirement remains
 pending at the evidence barrier; it does not require coder acknowledgement and
 cannot by itself dispatch a coder. Ordinary code requirements still do.
 
+A signed source that a later signed source from the same author replaces, such
+as an older exact-head approval or a note saying it does not cover later heads,
+is classified `superseded` (#2101), with `request` `""`, `answered_item_ids` `[]`
+and `leftover_instructions` `""`. The orchestrator accepts the role only when a
+strictly newer signed source from the same author is surfaced. A superseded
+source creates no coder work, no acknowledgement obligation and no evidence
+request, and prompts list its ID as inert. A reviewer that emitted no exact-head
+evidence requests that turn is never offered `human-only` in a re-ask; the
+message names superseded, evidence-only with its own item IDs, or code.
+
 For a signed answer, the requester records `evidence-only` or `mixed`, with its
 answered prior item IDs. Evidence-only sources create no coder acknowledgement
 obligation. A mixed source keeps its original signed ID. The coder receives the verbatim

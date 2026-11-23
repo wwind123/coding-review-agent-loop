@@ -1854,3 +1854,91 @@ def test_advisory_mode_keeps_whole_set_acknowledgement_obligation(tmp_path):
     assert _ack_item_ever_recorded(runner)
     review_prompt = next(cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex")
     assert _WHOLE_SET_RULE in review_prompt and _SCOPED_RULE not in review_prompt
+
+
+# --- #2101: a signed approval superseded by a newer same-author approval ---
+
+_OLD_APPROVAL = "Approved for head 13fd8b50."
+_LIMITING_NOTE = "The approval above does not cover later heads."
+_NEW_APPROVAL = "Approved for head 46ba82d9."
+
+
+def _superseded_scenario(runner):
+    """Old approval, limiting note and newer approval, all from one author (llm-dialectic #2310)."""
+    from pr_loop_test_helpers import _association, _signed
+    runner.pr_payload["comments"].extend([
+        _signed(_OLD_APPROVAL, 1), _signed(_LIMITING_NOTE, 2), _signed(_NEW_APPROVAL, 3)])
+    old, note, new = _parse_pr_human_requirements(runner.pr_payload)
+    entries = [_association(old.requirement_id, "superseded"), _association(note.requirement_id, "superseded"),
+               _association(new.requirement_id, "code")]
+    return (old, note, new), entries
+
+
+def _superseded_reviews(entries, **kwargs):
+    from pr_loop_test_helpers import _classified_review
+    return ([_classified_review(entries, hr=True, **kwargs)],
+            [_classified_review(entries, hr=True, reviewer="Google Gemini", **kwargs)])
+
+
+def test_superseded_signed_approval_with_all_reviewers_approving(tmp_path):
+    """Every reviewer approves and classifies the replaced sources superseded: no re-ask, coder or evidence (#2101)."""
+    from coding_review_agent_loop.requirement_evidence import historical_projection, historical_superseded_ids
+    from pr_loop_test_helpers import _freeze_records, _pr_records
+
+    runner = FakeRunner()
+    (old, note, new), entries = _superseded_scenario(runner)
+    runner.codex_outputs, runner.gemini_outputs = _superseded_reviews(entries)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # One review per reviewer: no classification continuation or re-ask ran.
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    assert not _freeze_records(runner)
+    assert not _ack_item_ever_recorded(runner)
+    records = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    assert sorted(r.metadata.agent for r in records) == ["Codex", "Gemini"]
+    assert all(not r.metadata.evidence_requests for r in records)
+    requirements = (old, note, new)
+    assert historical_projection(requirements, records) == (new,)
+    assert historical_superseded_ids(requirements, records) == (old.requirement_id, note.requirement_id)
+
+
+@pytest.mark.parametrize("rerun", ["unchanged", "added-source"])
+def test_resumed_superseded_classification_replays_from_admitted_records(tmp_path, rerun):
+    """Resume replays published superseded routing: no continuation, coder or acknowledgement (#2101)."""
+    from pr_loop_test_helpers import _association, _signed
+
+    runner = FakeRunner(pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]})
+    (old, note, new), entries = _superseded_scenario(runner)
+    runner.codex_outputs, runner.gemini_outputs = _superseded_reviews(entries)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    before = len(runner.commands)
+    runner.pr_check_runs_payload = {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]}
+    if rerun == "added-source":
+        # A new signed source forces a fresh review round whose prompt is
+        # built from the replayed (historical) superseded set.
+        runner.pr_payload["comments"].append(_signed("Keep the retry bound at three.", 4))
+        extra = _parse_pr_human_requirements(runner.pr_payload)[-1]
+        runner.codex_outputs, runner.gemini_outputs = _superseded_reviews(
+            [*entries, _association(extra.requirement_id, "code")])
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Exactly the supplied reviews ran: no classification continuation was dispatched.
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    agent_prompts = [cmd[-1] for cmd, _ in runner.commands[before:] if cmd[0] in ("codex", "gemini", "claude")]
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+    assert not _ack_item_ever_recorded(runner)
+    if rerun == "unchanged":
+        assert agent_prompts == []
+        return
+    assert len(agent_prompts) == 2
+    for prompt in agent_prompts:
+        scope = prompt[prompt.index("Coder disposition scope"):].split("\n", 1)[0]
+        assert ("These signed requirements were superseded by a newer signed source from the same author "
+                f"and are inert: `{old.requirement_id}`, `{note.requirement_id}`.") in scope
+        assert "Do not raise `exact_head_evidence_requests` for them" in scope
+        # Never under the exact-head evidence-path instruction.
+        assert "These signed requirements are reviewer-owned" not in scope
+        assert "a pending one belongs in" not in scope
+        assert new.requirement_id not in scope

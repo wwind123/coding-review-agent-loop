@@ -6813,7 +6813,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     the machine running it.  The worker estimate is pinned to the recorded
     budget so the worker-dependent guidance sentences stay comparable.
     The baseline includes intentional reviewer-guidance updates from #1954
-    and the remote-tracking review diff base from #1977.
+    and the remote-tracking review diff base from #1977, and the superseded
+    signed-source classification guidance from #2101.
     """
     import json as _golden_json
     import os as _golden_os
@@ -7447,3 +7448,94 @@ def test_2009_plan_prompts_state_the_staging_feasibility_enum_once(tmp_path):
     # Planner prompts show the enum next to their JSON example.
     for name in ("plan_state", "plan_revision", "plan_revision_compact"):
         assert '"staging_feasibility": "inseparable"' in prompts[name], name
+
+
+# --- #2101: superseded signed sources render as inert in reviewer and coder prompts ---
+
+_PRE_2101_SCOPE_LINE = (
+    "Coder disposition scope: coder `human_requirement_dispositions` cover only the coder-owned "
+    "signed requirements. These signed requirements are reviewer-owned: `hr-evidence`. Do not demand a "
+    "coder disposition or acknowledgement for them; the coder schema rejects them. Accept them only "
+    "through your own exact-head evidence path: a pending one belongs in "
+    "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`, never in "
+    "`blocking_items`. "
+)
+_PRE_2101_CODER_NOTICE = (
+    "Reviewer-owned signed requirements (read-only): `hr-evidence`. These signed sources are routed to "
+    "reviewer-owned exact-head evidence (evidence-only or human-only) and are outside coder scope. Do not "
+    "include them in `human_requirement_dispositions` or `human_requirements.addressed_ids`. Any reviewer item "
+    "demanding a coder disposition or acknowledgement for these IDs is non-actionable for the coder; say so in "
+    "`remaining_item_notes` or `dispute_evidence` instead of disposing of the ID."
+)
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_reviewer_scope_line_without_superseded_is_unchanged(scoped):
+    from coding_review_agent_loop import prompt_support
+    line = prompt_support._reviewer_owned_review_scope_line(("hr-evidence",), scoped_acknowledgement=scoped)
+    tail = ("The approval marker below covers only the signed requirements outside this reviewer-owned list.\n"
+            if scoped else "The approval marker below still covers the whole signed set.\n")
+    assert line == _PRE_2101_SCOPE_LINE + tail
+    assert prompt_support._coder_reviewer_owned_requirements_notice(("hr-evidence",)) == [_PRE_2101_CODER_NOTICE]
+    assert prompt_support._reviewer_owned_review_scope_line(()) == ""
+    assert prompt_support._coder_reviewer_owned_requirements_notice(()) == []
+
+
+def test_superseded_ids_render_inert_separately_from_evidence_ids():
+    """`prompt-guidance-text`: evidence path only for evidence IDs; superseded IDs are inert (#2101)."""
+    from coding_review_agent_loop import prompt_support
+    line = prompt_support._reviewer_owned_review_scope_line(
+        ("hr-evidence", "hr-old"), scoped_acknowledgement=True, superseded_requirement_ids=("HR-OLD",))
+    evidence_part, inert_part = line.split("These signed requirements were superseded", 1)
+    assert "reviewer-owned: `hr-evidence`." in evidence_part
+    assert "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`" in evidence_part
+    assert "hr-old" not in evidence_part
+    assert inert_part.startswith(" by a newer signed source from the same author and are inert: `hr-old`.")
+    assert "Do not raise `exact_head_evidence_requests` for them, cite them in `evidence_requirement_ids`" in inert_part
+    assert "put them in `blocking_items`, or demand a coder disposition" in inert_part
+    assert "outside the reviewer-owned and superseded lists above" in inert_part
+    only_superseded = prompt_support._reviewer_owned_review_scope_line(
+        ("hr-old",), superseded_requirement_ids=("hr-old",))
+    assert "reviewer-owned:" not in only_superseded and "a pending one belongs in" not in only_superseded
+    assert "are inert: `hr-old`." in only_superseded
+    notice = prompt_support._coder_reviewer_owned_requirements_notice(
+        ("hr-evidence", "hr-old"), ("hr-old",))
+    assert notice[0] == _PRE_2101_CODER_NOTICE
+    assert notice[1].startswith("Superseded signed requirements (read-only, no action needed): `hr-old`.")
+
+
+def test_superseded_guidance_and_acknowledgement_scope_wording():
+    from coding_review_agent_loop import prompt_support
+    from coding_review_agent_loop.protocol import _reviewer_owned_out_of_scope_message
+    guidance = prompts_module.PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE
+    assert "`mixed` (answered prior\nitem IDs plus explicit leftover code instruction text), or `superseded`" in guidance
+    assert "later signed source from the same author\nreplaces" in guidance
+    assert "valid only when a strictly newer signed\nsource from the same author is surfaced" in guidance
+    assert "Use `human-only` only when you emit its\nlinked exact_head_evidence_request" in guidance
+    scoped = prompt_support._SCOPED_ACKNOWLEDGEMENT_GUIDANCE
+    assert "listed as reviewer-owned or superseded above" in scoped
+    assert "human-only,\nevidence-only or superseded in your own `requirement_evidence`" in scoped
+    assert "superseded" in _reviewer_owned_out_of_scope_message("coder", ["hr-old"])
+
+
+def test_review_and_coder_prompts_thread_superseded_ids(tmp_path):
+    from coding_review_agent_loop.github import HumanReviewRequirement
+    requirement = HumanReviewRequirement("PR comment", "maintainer", None, "https://example.test/1", "Accept it.")
+    rid = requirement.requirement_id
+    config = make_config(tmp_path, pr_human_evidence="freeze")
+    review = prompts_module.build_review_prompt(
+        77, 1, config, reviewer="codex", human_requirements=[requirement],
+        reviewer_owned_requirement_ids=(rid,), superseded_requirement_ids=(rid,))
+    assert f"are inert: `{rid}`." in review
+    assert "These signed requirements are reviewer-owned" not in review
+    owned = dict(human_requirements=[requirement], reviewer_owned_requirement_ids=(rid,),
+                 superseded_requirement_ids=(rid,))
+    coder_prompts = [
+        build_followup_prompt(77, 1, "Needs tests.", config, **owned),
+        build_same_pr_followup_prompt(77, 1, "Tighten docs.", config, **owned),
+        build_merge_conflict_prompt(77, 2, "Fix it.", config, base_branch="main", head_sha="deadbeef",
+                                    merge_state_detail="mergeable=CONFLICTING", **owned),
+    ]
+    for prompt in coder_prompts:
+        assert f"Superseded signed requirements (read-only, no action needed): `{rid}`." in prompt
+        assert "Reviewer-owned signed requirements (read-only)" not in prompt
