@@ -1357,7 +1357,9 @@ def _coder_reviewer_owned_requirements_notice(reviewer_owned_requirement_ids: Se
     ]
 
 
-def _reviewer_owned_review_scope_line(reviewer_owned_requirement_ids: Sequence[str]) -> str:
+def _reviewer_owned_review_scope_line(
+    reviewer_owned_requirement_ids: Sequence[str], *, scoped_acknowledgement: bool = False
+) -> str:
     owned = _normalized_reviewer_owned_ids(reviewer_owned_requirement_ids)
     if not owned:
         return ""
@@ -1368,8 +1370,44 @@ def _reviewer_owned_review_scope_line(reviewer_owned_requirement_ids: Sequence[s
         "coder disposition or acknowledgement for them; the coder schema rejects them. Accept them only "
         "through your own exact-head evidence path: a pending one belongs in "
         "`exact_head_evidence_requests`, an adequate answer in `evidence_requirement_ids`, never in "
-        "`blocking_items`. The approval marker below still covers the whole signed set.\n"
+        "`blocking_items`. "
+        + (
+            # Freeze-only scope (#2083): the marker attests the projected,
+            # non-reviewer-owned set the PR loop's acknowledgement gate checks.
+            "The approval marker below covers only the signed requirements outside this reviewer-owned list.\n"
+            if scoped_acknowledgement
+            else "The approval marker below still covers the whole signed set.\n"
+        )
     )
+
+
+_WHOLE_SET_ACKNOWLEDGEMENT_GUIDANCE = """Verify each requirement in this set before approving. An approved review must
+include exactly:
+
+<!-- HUMAN_REQUIREMENTS_RESOLVED -->
+
+If any signed human requirement in this set is unresolved, return blocking.
+"""
+
+# `--pr-human-evidence freeze` only (#2083). The PR loop checks the marker
+# against `requirement_evidence.project(...)`, which drops sources reviewers
+# agree are human-only or evidence-only; this wording names the same set so a
+# pending human-only operator approval can never make reviewers withhold it.
+_SCOPED_ACKNOWLEDGEMENT_GUIDANCE = """Acknowledgement scope: a surfaced signed requirement is in scope unless it is
+listed as reviewer-owned above or you classify it as human-only or evidence-only
+in your own `requirement_evidence`. A requirement you leave unclassified, or whose
+role is disputed, stays in scope. Verify each in-scope requirement, then include
+exactly:
+
+<!-- HUMAN_REQUIREMENTS_RESOLVED -->
+
+when every in-scope signed requirement is resolved. Include it also when your
+review blocks only on human-only exact-head evidence, and when no surfaced
+requirement is in scope. Pending human-only requirements belong in
+`exact_head_evidence_requests`: they remain the deferred exact-head evidence
+barrier and are not a reason to withhold the marker or to return blocking.
+If any in-scope signed requirement is unresolved, return blocking without the marker.
+"""
 
 
 def _human_requirements_review_guidance(
@@ -1378,6 +1416,7 @@ def _human_requirements_review_guidance(
     requirement_label: str = "signed human reviewer requirements",
     require_plan_dispositions: bool = False,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    scoped_acknowledgement: bool = False,
 ) -> str:
     if not human_requirements:
         return (
@@ -1401,13 +1440,12 @@ def _human_requirements_review_guidance(
             f"{requirement_label.capitalize()} override AI reviewer preferences unless they\n"
             "are unsafe, impossible, or contradicted by a later signed human instruction.\n"
         )
-    return authority + _reviewer_owned_review_scope_line(reviewer_owned_requirement_ids) + """Verify each requirement in this set before approving. An approved review must
-include exactly:
-
-<!-- HUMAN_REQUIREMENTS_RESOLVED -->
-
-If any signed human requirement in this set is unresolved, return blocking.
-""" + ("""For every surfaced requirement, the JSON must include exactly one
+    scope_line = _reviewer_owned_review_scope_line(
+        reviewer_owned_requirement_ids, scoped_acknowledgement=scoped_acknowledgement
+    )
+    return authority + scope_line + (
+        _SCOPED_ACKNOWLEDGEMENT_GUIDANCE if scoped_acknowledgement else _WHOLE_SET_ACKNOWLEDGEMENT_GUIDANCE
+    ) + ("""For every surfaced requirement, the JSON must include exactly one
 `human_requirement_dispositions` object with its `requirement_id` (the exact surfaced
 requirement label), an `addressed`, `blocked`, or `not-applicable` disposition, and
 non-empty evidence. The key must be spelled `requirement_id`.

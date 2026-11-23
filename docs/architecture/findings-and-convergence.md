@@ -98,6 +98,14 @@ acknowledgement also clears it; partial acknowledgement and ordinary reviewer
 resolved dispositions do not. The fresh reviewer acknowledgement gate still
 runs before qualification: an approving reviewer missing acknowledgement
 re-creates the dedicated blocker even after valid coder clearance. Unrelated findings and machine gates retain their own lifecycle.
+The obligation is minted and kept only for the projected acknowledgement scope
+described under coder-disposition scope below (#2083): when that set is empty,
+for example under freeze with only human-only sources left, an approval without
+the marker mints nothing, a carried obligation is cleared in that round, and the
+human-only evidence stays the deferred final barrier. Although its lifecycle is
+`repair_required`, a new head never clears it, so its stop message names
+current-head reviewer acknowledgement or coder `human_requirement_dispositions`
+instead of asking for a strictly different head.
 A coder that lists the tool-owned acknowledgement record in its addressed,
 remaining or disputed items has it stripped by the coder follow-up parser, with
 one accepted-response log line; the listing never clears or blocks the
@@ -755,8 +763,12 @@ and the PR loop threads it into the coder prompt (a read-only notice that lists
 the bare IDs and says reviewer demands for their dispositions are non-actionable),
 coder follow-up validation, acknowledgement reconciliation, and reviewer guidance
 (a scope line telling reviewers to accept those IDs only through their own
-exact-head evidence path; the approval-marker rule still covers the whole signed
-set). A coder disposition or `addressed_ids` entry naming a reviewer-owned ID gets
+exact-head evidence path). The approval-marker rule is mode-scoped (#2083): under
+`--pr-human-evidence freeze` the marker covers only the projected, non-reviewer-owned
+set, so a reviewer emits it when every in-scope signed requirement is resolved,
+including when the review blocks only on human-only exact-head evidence or nothing
+is in scope; under `advisory` or `off` classification is discarded and the marker
+covers the whole signed set. A coder disposition or `addressed_ids` entry naming a reviewer-owned ID gets
 a distinct out-of-scope message, not "unknown requirement ID". The set is seeded each
 round, including the first resumed round, from the single `historical_projection`
 result used for reconciliation, and refreshed after each live projection, so live

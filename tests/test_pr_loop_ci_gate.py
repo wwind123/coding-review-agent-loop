@@ -3319,3 +3319,35 @@ def test_loop_failing_pull_request_check_creates_checks_blocking_item(tmp_path, 
 
     assert any(c.startswith("GitHub PR checks are failing for PR #77.") for c in runner.comments)
     assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def test_acknowledgement_stop_message_asks_for_no_new_head():
+    """The acknowledgement obligation names its real clearing inputs, never a new head (#2083)."""
+    from coding_review_agent_loop.unresolved_items import (
+        HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+        _upsert_human_requirements_ack_item,
+    )
+
+    head = "a" * 40
+    (ack,) = _upsert_human_requirements_ack_item([], source_round=3, text="Acknowledgement missing.")
+    assert ack.lifecycle == "repair_required"
+    alone = pr_loop_support._round_limit_blocker_message(
+        pr_number=77, round_number=3, items=[ack], current_head_sha=head
+    )
+    assert HUMAN_REQUIREMENTS_ACK_ITEM_ID in alone
+    assert "strictly different" not in alone and "new repair head" not in alone
+    assert "acknowledge the in-scope signed human requirements at the current head" in alone
+    assert "`human_requirement_dispositions`" in alone and "a new head is not required" in alone
+
+    ci = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub PR checks", source_round=3, text="Checks failed.",
+        status="blocking", authority="machine", obligation_kind="github-pr-checks",
+        lifecycle="repair_required", failed_head_sha=head,
+    )
+    both = pr_loop_support._round_limit_blocker_message(
+        pr_number=77, round_number=3, items=[ci, ack], current_head_sha=head
+    )
+    head_advice, ack_note = both.split("Signed human requirements acknowledgement pending", 1)
+    assert "github-pr-checks (item-1)" in head_advice and "strictly different corrected head" in head_advice
+    assert HUMAN_REQUIREMENTS_ACK_ITEM_ID not in head_advice
+    assert "strictly different" not in ack_note and "a new head is not required" in ack_note

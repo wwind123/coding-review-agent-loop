@@ -930,6 +930,12 @@ validation, merge conflicts, and human-requirement acknowledgement each have a
 stable authority kind. Repeated failures for one kind update the existing
 obligation, while authoritative success clears only obligations of that same
 kind.
+The human-requirement acknowledgement obligation is not cleared by a new head:
+its stop message asks for every required reviewer to acknowledge the in-scope
+signed requirements at the current head, or for valid coder
+`human_requirement_dispositions`. Under `--pr-human-evidence freeze`, human-only
+and evidence-only signed requirements are outside that scope and remain the
+deferred exact-head evidence barrier.
 
 After any CI failure, its exact failed head remains ineligible for
 requalification. The coder must produce a strictly different repair head.

@@ -1085,6 +1085,28 @@ HUMAN_REQUIREMENTS_DEGRADED_ACK_TEXT = (
 )
 
 
+def split_acknowledgement_obligations(
+    repair: Sequence[UnresolvedReviewItem],
+) -> tuple[list[UnresolvedReviewItem], str]:
+    """Split the acknowledgement obligation out of the new-head repair list (#2083).
+
+    It is minted ``repair_required``, but a new head never clears it: only
+    current-head reviewer acknowledgement or valid coder dispositions do. The
+    returned note (empty when absent) starts with a space so it can be appended.
+    """
+    acknowledgement = [item for item in repair if item.obligation_kind == HUMAN_REQUIREMENTS_OBLIGATION_KIND]
+    rest = [item for item in repair if item.obligation_kind != HUMAN_REQUIREMENTS_OBLIGATION_KIND]
+    if not acknowledgement:
+        return rest, ""
+    return rest, (
+        " Signed human requirements acknowledgement pending ("
+        + ", ".join(item.item_id for item in acknowledgement)
+        + "): every required reviewer must acknowledge the in-scope signed human "
+        "requirements at the current head, or the coder must supply valid "
+        "`human_requirement_dispositions`; a new head is not required."
+    )
+
+
 def _clear_human_requirements_ack_item(
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> list[UnresolvedReviewItem]:

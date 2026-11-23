@@ -315,6 +315,11 @@ def reviewer_owned_ids(requirements, projected):
     exact-head evidence and never coder-dispositioned. Mixed sources keep their
     original identity in the projection and therefore stay coder-owned, as do
     sources with conflicting or missing classifications.
+
+    The projection kept here is also the PR reviewer acknowledgement scope
+    (#2083): the PR loop's acknowledgement creation and clearing checks key on
+    it, and the freeze-mode reviewer prompt lists these complementary IDs as
+    outside the approval marker's scope.
     """
     kept = {str(r.requirement_id).strip().lower() for r in projected or ()}
     result = []

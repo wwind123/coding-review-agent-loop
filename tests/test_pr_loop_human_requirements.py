@@ -986,7 +986,7 @@ def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tm
     assert clears
     from types import SimpleNamespace
     records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr")
-    failures = [r for r in records if "repair remains blocked" in r.body]
+    failures = [r for r in records if "acknowledgement remains pending" in r.body]
     assert [r.metadata.round_number for r in failures] == [1, 2]
     for record in failures:
         assert [i.item_id for i in record.metadata.prior_items] == [ACK_ID]
@@ -1008,7 +1008,7 @@ def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_pat
     from types import SimpleNamespace
     failures = [r for r in _extract_round_metadata_records(
         [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
-    ) if "repair remains blocked" in r.body]
+    ) if "acknowledgement remains pending" in r.body]
     assert len(failures) == 1
     assert [i.item_id for i in failures[0].metadata.prior_items] == [ACK_ID]
 
@@ -1663,3 +1663,194 @@ def test_valid_ack_forced_into_synthesis_keeps_the_ack_open_in_loop_and_resume(t
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3))
     prompts = [cmd[-1] for cmd, _cwd in runner.commands[before:] if cmd[:1] == ["codex"]]
     assert prompts and ACK_ID in prompts[0]
+
+
+# --- #2083: acknowledgement scope excludes human-only/evidence-only sources ---
+
+_WHOLE_SET_RULE = "If any signed human requirement in this set is unresolved, return blocking."
+_SCOPED_RULE = "Acknowledgement scope:"
+_HUMAN_ONLY_TEXT = "A human must accept the policy at this exact head."
+
+
+@pytest.mark.parametrize("variant", ["human-only-alone", "with-acknowledged-code"])
+def test_unanimous_approval_with_only_human_only_open_mints_no_acknowledgement(tmp_path, variant):
+    """Freeze: only human-only sources outside scope remain, so no marker obligation (#2083)."""
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT, _freeze_records
+
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed(_HUMAN_ONLY_TEXT, 1))
+    entries = []
+    if variant == "with-acknowledged-code":
+        runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 2))
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    entries.append(_association(requirements[0].requirement_id, "human-only", request=_EVIDENCE_TEXT))
+    if variant == "with-acknowledged-code":
+        entries.append(_association(requirements[1].requirement_id, "code"))
+        # Blocks only on human-only exact-head evidence and acknowledges the in-scope code source.
+        review = _classified_review(entries, state="blocking", evidence=[_EVIDENCE_TEXT], hr=True)
+    else:
+        # Approves without the marker: nothing is in acknowledgement scope.
+        review = _classified_review(entries, state="approved", evidence=[_EVIDENCE_TEXT])
+    runner.codex_outputs = [review]
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=2))
+    assert not runner.codex_outputs
+    assert not _ack_item_ever_recorded(runner)
+    # The human-only evidence is the remaining barrier, never treated as satisfied.
+    freeze = _freeze_records(runner)[-1].metadata
+    assert [item.text for item in freeze.prior_items] == [_EVIDENCE_TEXT]
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+def test_carried_acknowledgement_item_clears_once_scope_is_empty(tmp_path):
+    """A carried acknowledgement obligation is dropped once its source is classified human-only (#2083)."""
+    from coding_review_agent_loop.native_evidence import _append_recorded_evidence_requests
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT, _freeze_records, _pr_records
+    from test_pr_loop_early_evidence import deferred, HEAD
+
+    runner, config = deferred(tmp_path, mode="full")
+    runner.pr_payload["comments"].append(_signed("Human acceptance is required.", 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    records = _pr_records(runner)
+    items = []
+    _append_recorded_evidence_requests(items, [r for r in records if r.metadata.role == "reviewer"], records=records)
+    pr_loop_support._record_failed_acknowledgement(runner, config=config, pr_number=77, items=items,
+        source_round=2, missing_reviewers=["Codex"], subject=HEAD,
+        bound_metadata=PostedRoundMetadata, post_comment=pr_loop_support.post_pr_comment)
+    assert _ack_item_ever_recorded(runner)
+    # The review carries no marker; it only evaluates the carried record.
+    runner.codex_outputs = [_classified_review([_association(rid, "human-only", request=_EVIDENCE_TEXT)],
+        state="blocking", evidence=[_EVIDENCE_TEXT],
+        dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "Human acceptance remains pending."},
+            {"item_id": HUMAN_REQUIREMENTS_ACK_ITEM_ID, "disposition": "resolved",
+             "note": "No signed requirement is in acknowledgement scope."}])]
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.codex_outputs
+    assert [i.item_id for i in _freeze_records(runner)[-1].metadata.prior_items] == ["item-1"]
+    assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("variant", ["code-only", "code-plus-human-only"])
+def test_unresolved_code_role_requirement_still_requires_marker(tmp_path, variant):
+    """Freeze: an in-scope code source keeps the marker gate, and the stop asks for no new head (#2083)."""
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT
+
+    runner = FakeRunner()
+    if variant == "code-plus-human-only":
+        runner.pr_payload["comments"].append(_signed(_HUMAN_ONLY_TEXT, 1))
+    runner.pr_payload["comments"].append(_signed("Fix the retry bound.", 2))
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    entries = [_association(requirements[-1].requirement_id, "code")]
+    evidence = []
+    if variant == "code-plus-human-only":
+        entries.insert(0, _association(requirements[0].requirement_id, "human-only", request=_EVIDENCE_TEXT))
+        evidence = [_EVIDENCE_TEXT]
+    runner.codex_outputs = [_classified_review(entries, state="approved", evidence=evidence)]
+    config = make_config(tmp_path, auto_merge=True, max_rounds=1)
+    with pytest.raises(AgentLoopError, match="blocking issues after round 1") as error:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(error.value)
+    assert HUMAN_REQUIREMENTS_ACK_ITEM_ID in message
+    assert "human_requirement_dispositions" in message and "current head" in message
+    assert "strictly different" not in message and "new repair head" not in message
+    assert _ack_item_ever_recorded(runner)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+
+
+def test_conflicting_or_missing_classification_stays_in_acknowledgement_scope():
+    """The shared projection keeps disputed and unclassified sources in scope (#2083)."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.requirement_evidence import project, reviewer_owned_ids
+    from pr_loop_test_helpers import _association, _signed, _EVIDENCE_TEXT
+
+    payload = FakeRunner().pr_payload
+    payload["comments"].extend([_signed(_HUMAN_ONLY_TEXT, 1), _signed("Accept or fix the retry policy.", 2)])
+    disputed, unclassified = _parse_pr_human_requirements(payload)
+    reviews = {
+        "Codex": SimpleNamespace(requirement_evidence=(
+            _association(disputed.requirement_id, "human-only", request=_EVIDENCE_TEXT),),
+            exact_head_evidence_requests=(_EVIDENCE_TEXT,)),
+        "Gemini": SimpleNamespace(requirement_evidence=(
+            _association(disputed.requirement_id, "code"),), exact_head_evidence_requests=()),
+    }
+    projected = project([disputed, unclassified], reviews, ())
+    assert {r.requirement_id for r in projected} == {disputed.requirement_id, unclassified.requirement_id}
+    assert reviewer_owned_ids([disputed, unclassified], projected) == ()
+
+
+def _requirement():
+    return HumanReviewRequirement("PR comment", "maintainer", None, "https://example.test/1", "Accept it.")
+
+
+def test_scoped_acknowledgement_guidance_text():
+    from coding_review_agent_loop import prompt_support
+    requirement = _requirement()
+    owned = (requirement.requirement_id,)
+    whole = prompt_support._human_requirements_review_guidance([requirement], reviewer_owned_requirement_ids=owned)
+    scoped = prompt_support._human_requirements_review_guidance(
+        [requirement], reviewer_owned_requirement_ids=owned, scoped_acknowledgement=True)
+    assert "still covers the whole signed set" in whole and _WHOLE_SET_RULE in whole
+    assert "still covers the whole signed set" not in scoped and _WHOLE_SET_RULE not in scoped
+    assert _SCOPED_RULE in scoped and "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in scoped
+    assert "blocks only on human-only exact-head evidence" in scoped
+    assert "not a reason to withhold the marker" in scoped
+    assert "unclassified, or whose\nrole is disputed, stays in scope" in scoped
+    assert "If any in-scope signed requirement is unresolved, return blocking without the marker." in scoped
+    assert "covers only the signed requirements outside this reviewer-owned list" in scoped
+    # The default (advisory/off/plan) wording is byte-for-byte unchanged.
+    assert prompt_support._human_requirements_review_guidance(
+        [requirement], reviewer_owned_requirement_ids=owned, scoped_acknowledgement=False) == whole
+    no_owned = prompt_support._human_requirements_review_guidance([requirement], scoped_acknowledgement=True)
+    assert _SCOPED_RULE in no_owned and "Coder disposition scope:" not in no_owned
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("mode", ["freeze", "advisory", "off"])
+def test_pr_review_prompt_selects_acknowledgement_scope_by_mode(tmp_path, compact, mode):
+    from coding_review_agent_loop.prompts import build_review_prompt
+    requirement = _requirement()
+    config = make_config(tmp_path, pr_human_evidence=mode)
+    prompt = build_review_prompt(77, 2, config, reviewer="codex", human_requirements=[requirement],
+        reviewer_owned_requirement_ids=(requirement.requirement_id,), compact_context=compact)
+    if mode == "freeze":
+        assert _SCOPED_RULE in prompt and _WHOLE_SET_RULE not in prompt
+        assert "still covers the whole signed set" not in prompt
+    else:
+        assert _SCOPED_RULE not in prompt and _WHOLE_SET_RULE in prompt
+        assert "still covers the whole signed set" in prompt
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_plan_review_acknowledgement_guidance_unchanged_under_freeze(tmp_path, monkeypatch, compact):
+    from coding_review_agent_loop import prompt_support
+    from coding_review_agent_loop.prompts import build_plan_review_prompt
+    config = make_config(tmp_path)
+    assert config.pr_human_evidence == "freeze"
+    calls = []
+    real = prompt_support._human_requirements_review_guidance
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(prompt_support, "_human_requirements_review_guidance", recording)
+    build_plan_review_prompt(2083, 2, "1. Do the thing.", config, reviewer="codex", compact_context=compact)
+    assert calls and all(not call.get("scoped_acknowledgement", False) for call in calls)
+
+
+def test_advisory_mode_keeps_whole_set_acknowledgement_obligation(tmp_path):
+    """Advisory discards classification, so a would-be human-only source still needs the marker (#2083)."""
+    from pr_loop_test_helpers import _classified_review, _association, _signed, _EVIDENCE_TEXT
+
+    runner = FakeRunner()
+    runner.pr_payload["comments"].append(_signed(_HUMAN_ONLY_TEXT, 1))
+    rid = _parse_pr_human_requirements(runner.pr_payload)[0].requirement_id
+    runner.codex_outputs = [_classified_review([_association(rid, "human-only", request=_EVIDENCE_TEXT)],
+        state="approved", evidence=[_EVIDENCE_TEXT])]
+    config = make_config(tmp_path, pr_human_evidence="advisory", max_rounds=1)
+    with pytest.raises(AgentLoopError, match="blocking issues after round 1"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _ack_item_ever_recorded(runner)
+    review_prompt = next(cmd[-1] for cmd, _ in runner.commands if cmd[0] == "codex")
+    assert _WHOLE_SET_RULE in review_prompt and _SCOPED_RULE not in review_prompt
