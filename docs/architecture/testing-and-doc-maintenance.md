@@ -223,10 +223,13 @@ raw agent JSON.
   tuple that `validate_human_requirement_dispositions` returns. Semantic-patch
   dispositions stay strict: assembly publishes them verbatim, so an unsurfaced
   ID there still rejects.
-- Context-dependent checks run only in live validators.
-  `parse_historical_structured_*` passes `historical_decode=True`, so an
-  accepted approved follow-up beside an unsurfaced blocked disposition, or an
-  implementation PR beside one, decodes with a warning.
+- Context-dependent checks run only in live validators. Every context-free
+  reader of an already-accepted response passes `historical_decode=True`:
+  `parse_historical_structured_*`, and the post-authentication
+  claim-correction reader (`_parse_fresh_correction_claims`), which takes only
+  the claim set. So an accepted approved follow-up beside an unsurfaced
+  blocked disposition, or an implementation PR beside one, decodes with a
+  warning.
 - Duplicates: entries that are equal on every parsed field collapse with a
   warning. This covers review dispositions (including
   `evidence_requirement_ids`), requirement dispositions, IDs repeated within

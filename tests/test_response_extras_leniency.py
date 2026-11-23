@@ -856,3 +856,57 @@ def test_strict_mode_is_scoped_to_the_patch_operations():
     with strict_response_keys():
         assert response_keys_strict()
     assert not response_keys_strict()
+
+
+# --- context-free readers never re-apply live checks (review item-7) ----------
+#
+# Generalization: the rule from plan step 8, applied to every context-free
+# reader. Any reader that keeps only part of an already-accepted response
+# (historical decoders and the post-authentication claim-correction reader)
+# decodes with historical_decode=True and skips the live blocked-state and
+# conflict checks.
+
+
+def _with_claim(text: str) -> str:
+    claim = {
+        "row_id": "row-1", "execution_refs": ["not-in-catalog"],
+        "test_identifiers": ["tests/test_x.py::test_y"], "test_locations": ["tests/test_x.py"],
+        "workflow_path_claim": "path", "outcome_assertions": ["ok"],
+        "forbidden_effect_assertions": ["none"], "caveats": [], "test_level": "unit",
+    }
+    return _with(text, risk_test_matrix_claims=[claim])
+
+
+_CORRECTION_CASES = {
+    "coder_followup": lambda: structured_coder_followup(
+        state="approved", addressed_items=["item-1", "item-2"],
+        human_requirement_dispositions=[_blocked(UNSURFACED_ID)],
+    ),
+    "issue_implementation": lambda: structured_issue_implementation(
+        human_requirement_dispositions=[_blocked(UNSURFACED_ID)],
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_CORRECTION_CASES))
+def test_claim_correction_reader_keeps_claims_beside_unsurfaced_blocked_disposition(kind):
+    from coding_review_agent_loop.response_validation import _parse_fresh_correction_claims
+
+    text = _CORRECTION_CASES[kind]()
+    if kind == "coder_followup":
+        original = _validate_coder_followup_response(
+            text, unresolved_items=ITEMS, human_requirements=(), architecture_status_mode="legacy",
+        )
+    else:
+        original = _validate_issue_implementation_response(
+            text, human_requirements=(), architecture_status_mode="legacy",
+        )
+    assert original.kind == kind  # accepted live: the unsurfaced entry was dropped
+    corrected = _parse_fresh_correction_claims(
+        _with_claim(text), original, row_ids=("row-1",), execution_catalog=(),
+    )
+    assert corrected is not None
+    assert corrected.risk_test_matrix_claims is not None
+    assert [claim.row_id for claim in corrected.risk_test_matrix_claims.claims] == ["row-1"]
+    # Every other coder-owned fact comes from the authenticated response.
+    assert corrected.human_requirement_dispositions == original.human_requirement_dispositions

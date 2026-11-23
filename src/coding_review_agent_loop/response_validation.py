@@ -368,12 +368,18 @@ def _parse_fresh_correction_claims(
     row_ids: Sequence[str],
     execution_catalog: Sequence[object],
 ) -> StructuredIssueImplementation | StructuredCoderFollowup | None:
+    # Only the claim set is taken from the candidate; the authenticated
+    # response already passed the live, context-dependent checks.  So this
+    # reader is context-free and never re-applies them (#2114): an approved
+    # follow-up or a PR beside an unsurfaced blocked disposition still yields
+    # its corrected claims.
     if isinstance(original, StructuredIssueImplementation):
         candidate = validate_structured_issue_implementation(
             text,
             architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
+            historical_decode=True,
         )
     else:
         candidate = validate_structured_coder_followup(
@@ -381,6 +387,7 @@ def _parse_fresh_correction_claims(
             architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
+            historical_decode=True,
         )
     if candidate is None or candidate.kind != original.kind:
         return None
