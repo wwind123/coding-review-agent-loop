@@ -2244,6 +2244,10 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         # These fixtures exercise historical unversioned plans.  Production
         # CLI configurations retain the generation-1 default.
         "execution_strategy_contract_required": False,
+        # Existing PR-loop fixtures exercise the blocking exact-head evidence
+        # freeze; production defaults to advisory (#2063), which its own tests
+        # select explicitly.
+        "pr_human_evidence": "freeze",
     }
     config.update(overrides)
     if create_dirs:

@@ -238,7 +238,7 @@ def restore_for_new_input(items, resume, requirements, records, next_number):
         for i in result if re.fullmatch(r"item-\d+", i.item_id)), default=1))
 
 
-def publication_dispositions(parsed, text, reviewer, items):
+def publication_dispositions(parsed, text, reviewer, items, *, parse_requirement_evidence=True):
     """Keep code approval normalized, but revoke conflicting alias attestations.
 
     Native blocking votes remain in the reconciled ledger's notes. They must
@@ -246,7 +246,8 @@ def publication_dispositions(parsed, text, reviewer, items):
     A conflicting resolved citation loses its authorization on publication.
     """
     from .protocol import parse_review, parse_structured_pr_review
-    carrier = parse_structured_pr_review(text, reviewer=reviewer, architecture_status_mode="legacy")
+    carrier = parse_structured_pr_review(text, reviewer=reviewer, architecture_status_mode="legacy",
+                                         parse_requirement_evidence=parse_requirement_evidence)
     raw = (carrier or parse_review(text, reviewer=reviewer)).dispositions
     conflicts = set()
     for item in items:

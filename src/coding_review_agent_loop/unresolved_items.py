@@ -942,6 +942,7 @@ def _validate_review_response(
     approved_matrix_row_ids: Sequence[str] | None = None,
     include_visual: bool = False,
     optional_item_ids: Sequence[str] = (),
+    parse_requirement_evidence: bool = True,
 ) -> ParsedReview:
     """Validate a PR review against the carried ledger.
 
@@ -953,7 +954,8 @@ def _validate_review_response(
         from .review_images import ordinary_items
         unresolved_items = ordinary_items(unresolved_items)
     parsed = parse_pr_review(
-        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode,
+        parse_requirement_evidence=parse_requirement_evidence,
     )
     _validate_evidence_row_tags(parsed, approved_matrix_row_ids)
 

@@ -1697,6 +1697,14 @@
     {
       "module": "pr_loop",
       "function": "run_pr_loop",
+      "call": "_extract_round_metadata_records(initial_pr_context.comments, flow=HUMAN_CHECKS_FLOW)",
+      "family": "rounds",
+      "provenance": "pr_loop.run_pr_loop (#2063): the same admitted startup comments as the flow='pr' extraction above, bound by admit_pr_comments; pr_round_ingestion.protocol_comments masks non-invocation records, so only the invocation actor's own advisory human-checks records seed the non-blocking list and its once-per-head posting key. The list carries no approval, CI or evidence authority.",
+      "occurrence": 1
+    },
+    {
+      "module": "pr_loop",
+      "function": "run_pr_loop",
       "call": "_extract_round_metadata_records(issue_context.comments, flow='plan')",
       "family": "rounds",
       "provenance": "pr_loop.run_pr_loop: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects.",

@@ -961,7 +961,56 @@ correction awaiting qualification, migration or mergeability validation, an
 unknown persisted obligation, or external infrastructure recovery. The loop
 does not describe a unanimous reviewer board as blocking when only CI remains.
 
+### Exact-head human evidence mode (`--pr-human-evidence`)
+
+`--pr-human-evidence freeze|advisory|off` (on `issue`, `task`, `pr` and the
+other run commands; default `advisory`) decides how the PR loop treats
+reviewers' `exact_head_evidence_requests`:
+
+- `advisory` (default): every request is collected into one non-blocking
+  **Human checks requested** list. There is no evidence freeze, no head binding
+  of evidence, no signed-source classification, no evidence stall and no
+  risk-matrix row conversion. When the reviewers approve, the run still does the
+  final live-head and signed-input reads and `_ensure_finalization_ready`, then
+  posts the list once per head (a resumed run at the same head does not repost
+  it). With `--auto-merge` and a non-empty list the PR is left approved and
+  **unmerged**, the run prints one notice line naming the list
+  (`PR #N approved but not merged: K human check(s) requested; see the 'Human
+  checks requested' comment ...`) and exits 0. Without `--auto-merge`, or with an
+  empty list, the usual approval and merge paths run unchanged.
+- `off`: requests are dropped with a log line (`dropped K exact-head evidence
+  request(s)`) and finalization proceeds as if there were none.
+- `freeze`: the blocking exact-head evidence freeze described below, unchanged.
+  Signed-source classification, the evidence-only stall and row conversion run
+  only in this mode, and `--pr-convert-evidence-rows` is refused unless
+  `--pr-human-evidence freeze` is set.
+
+In `advisory` and `off`, signed human requirements stay ordinary coder-owned
+requirements: reviewers are not asked for `requirement_evidence`, a stray or
+malformed one is ignored rather than re-asked, and persisted classifications do
+not route a signed source away from the coder. Signed-comment author
+verification (`--human-reviewer-trusted-actor`) is unchanged. Screenshot
+coverage requests are a separate channel: they keep their own gate and freeze in
+every mode and never move to the advisory list.
+
+The advisory list lives on the orchestrator's PR round records and on the human
+checks comment, each entry keeping the complete ledger item it replaced, so it
+survives restarts. The list is never truncated; the posted comment shows the first 50 checks and names how many more its round metadata holds. Under ordinary recovery the list is posted only after recovery CI passes with an authoritative check board. **Migration:** a PR whose latest evidence boundary is an
+evidence freeze, resumed in `advisory` or `off`, gets a release record with
+reason `advisory-mode` at the frozen head. Its native items move to the list (or
+are dropped), and the run continues from that release on the carried approvals
+without re-running reviewers. Signed input added after the freeze still triggers
+a same-head refresh before approval. A failing check or merge conflict at the
+frozen head still takes the machine-gate release, and a freeze that still holds
+screenshot obligations is not released by the mode change. Resuming in `freeze`
+after an advisory run restores each listed check as its original evidence
+obligation (a converted row keeps its row identity and owners), except one
+already cleared at the current head. Older tool versions do not recognize the
+`advisory-mode` release reason.
+
 ### Exact-head human evidence freeze
+
+This section describes `--pr-human-evidence freeze`.
 
 Some approved-plan contracts require evidence that no agent session can
 produce, such as an authenticated live-CLI run at the exact PR head. Reviewers

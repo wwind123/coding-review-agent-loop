@@ -481,7 +481,8 @@ def test_operator_flags_parse_validate_and_default(tmp_path):
     parsed = config_from_args(parser.parse_args(base), FakeRunner())
     assert parsed.pr_evidence_capture_attempts == 2 and parsed.pr_convert_evidence_rows == ()
     parsed = config_from_args(
-        parser.parse_args([*base, "--pr-convert-evidence-rows", "row-a,row-b", "--pr-evidence-capture-attempts", "0"]),
+        parser.parse_args([*base, "--pr-convert-evidence-rows", "row-a,row-b", "--pr-evidence-capture-attempts", "0",
+                           "--pr-human-evidence", "freeze"]),
         FakeRunner(),
     )
     assert parsed.pr_convert_evidence_rows == ("row-a", "row-b")

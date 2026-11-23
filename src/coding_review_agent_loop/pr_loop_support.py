@@ -609,8 +609,13 @@ def _finalize_ordinary_recovery_merge(
     config: AgentLoopConfig,
     pr_number: int,
     capability: OrdinaryRecoveryCapability,
+    hold: Callable[[], bool] | None = None,
 ) -> bool:
-    """Qualify, ready, and merge only the draft released by this invocation."""
+    """Qualify, ready, and merge only the draft released by this invocation.
+
+    ``hold`` (#2063) runs only after recovery CI passed with an authoritative
+    success-only board; True leaves the PR unmerged for advisory human checks.
+    """
     refreshed = refresh_ordinary_recovery_capability(
         runner, config=config, capability=capability,
     )
@@ -692,6 +697,8 @@ def _finalize_ordinary_recovery_merge(
             "did not produce an authoritative success-only current-head check board "
             f"({'; '.join(details)})."
         )
+        return False
+    if hold is not None and hold():
         return False
     if not validate_ordinary_recovery_capability(runner, config=config, capability=capability):
         raise AgentLoopError(
@@ -1883,6 +1890,11 @@ _EVIDENCE_RELEASE_MESSAGES = {
         "a same-head refresh for new signed input found no findings. The PR proceeds to "
         "final validation at the same head."
     ),
+    "advisory-mode": (
+        "this run uses `--pr-human-evidence advisory` (or `off`). The human evidence requests "
+        "moved to the non-blocking 'Human checks requested' list (dropped under `off`); the "
+        "PR proceeds to final validation at the same head without re-running reviewers."
+    ),
 }
 
 
@@ -1985,6 +1997,7 @@ def _publish_evidence_release(
     heading = {
         "evidence-cleared": "## Exact-head evidence accepted",
         "refresh-clean": "## Same-head refresh complete",
+        "advisory-mode": "## Exact-head evidence freeze released (advisory mode)",
     }.get(reason, "## Exact-head evidence freeze released")
     publisher = post_pr_comment
     if reason == 'screenshot-coverage':
@@ -2105,10 +2118,13 @@ def _evidence_freeze_gate(
     live_ids = tuple(collect_requirement_ids(fresh))
     if set(live_ids) - set(surfaced_requirement_ids or ()):
         return _EvidenceGateOutcome("refresh", fresh)
-    if any(_is_row_converted_obligation(item) for item in items):
+    from .human_evidence_mode import freeze_mode
+    if freeze_mode(config) and any(_is_row_converted_obligation(item) for item in items):
         # Defense in depth (#1325): a stale converted tombstone that survived
         # into finalization reopens here and freezes instead of proceeding.
         # Coverage and finalization must share this caller-owned ledger.
+        # Freeze only (#2063): elsewhere a reopened row would recreate a
+        # human evidence freeze the non-freeze modes never publish.
         items[:] = _reconcile_converted_evidence(
             runner,
             config,
@@ -2147,6 +2163,9 @@ def _evidence_freeze_gate(
                 signed_evidence_references=signed_evidence_references)
     if not _pending_evidence_obligations(items):
         return _EvidenceGateOutcome("coverage_satisfied" if transition.action == "coverage_satisfied" else "proceed", fresh)
+    if not freeze_mode(config) and any(not item.screenshot_request for item in _pending_evidence_obligations(items)):
+        raise AgentLoopError(f"PR #{pr_number}: native human evidence reached the freeze write outside "
+                             "--pr-human-evidence freeze; no freeze, approval or merge was attempted.")
     still_frozen = bool(_frozen_evidence_obligations(items))
     frozen = _publish_evidence_freeze(
         runner,
@@ -2272,8 +2291,13 @@ def _finalize_ordinary_recovery_checked(
     items: Sequence[UnresolvedReviewItem],
     current_head_sha: str | None,
     capability: OrdinaryRecoveryCapability,
+    hold: Callable[[], bool] | None = None,
 ) -> bool:
-    """Run ordinary recovery only after every unrelated obligation is clear."""
+    """Run ordinary recovery only after every unrelated obligation is clear.
+
+    ``hold`` (#2063) is forwarded to the merge step, which runs it only after
+    the authoritative recovery CI validation.
+    """
     _ensure_finalization_ready(
         pr_number=pr_number,
         round_number=round_number,
@@ -2287,6 +2311,7 @@ def _finalize_ordinary_recovery_checked(
         config=config,
         pr_number=pr_number,
         capability=capability,
+        hold=hold,
     )
 
 

@@ -3343,8 +3343,15 @@ PR_REVIEW_DISPOSITIONS_DROP_MESSAGE = (
 
 
 def parse_structured_pr_review(
-    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict",
+    parse_requirement_evidence: bool = True,
 ) -> ParsedReview | None:
+    """Parse a structured PR review.
+
+    ``parse_requirement_evidence=False`` (#2063, non-freeze human-evidence
+    modes) ignores ``requirement_evidence`` entirely, so a malformed or
+    inconsistent association can neither raise nor trigger a re-ask.
+    """
     payload = _extract_structured_pr_review_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
         return None
@@ -3436,7 +3443,10 @@ def parse_structured_pr_review(
     from .review_images_coverage import parse_fields
     typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
     from .requirement_evidence import parse_associations
-    associations = parse_associations(payload.get("requirement_evidence", []))
+    associations = (
+        parse_associations(payload.get("requirement_evidence", []))
+        if parse_requirement_evidence else ()
+    )
     return dataclasses.replace(parsed, requirement_evidence=associations, exact_head_evidence_requests=evidence_requests,
                                screenshot_requests=typed, screenshot_coverage_acceptances=votes,
                                post_merge_obligations=obligations,
@@ -4758,10 +4768,12 @@ def parse_review(text: str, *, reviewer: str) -> ParsedReview:
 
 
 def parse_pr_review(
-    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict",
+    parse_requirement_evidence: bool = True,
 ) -> ParsedReview:
     parsed = parse_structured_pr_review(  # shape-check: fatal:unparseable-envelope
-        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode,
+        parse_requirement_evidence=parse_requirement_evidence,
     )
     if parsed is not None:
         return parsed

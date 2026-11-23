@@ -55,16 +55,18 @@ def assigned_items(items, reviewer):
                  and reviewer in (item.resolution_owners or (item.reviewer,)))
 
 
-def validate_visual(text, *, reviewer, items):
+def validate_visual(text, *, reviewer, items, parse_requirement_evidence=True):
     from .unresolved_items import _validate_review_response
     from .protocol import parse_pr_review
     # Explicit dispositions are mandatory; prose inference is not proof.
-    raw = parse_pr_review(text, reviewer=reviewer, architecture_status_mode='strict')
+    raw = parse_pr_review(text, reviewer=reviewer, architecture_status_mode='strict',
+                          parse_requirement_evidence=parse_requirement_evidence)
     ids = [d.item_id for d in raw.dispositions]
     if len(ids) != len(set(ids)) or set(ids) != {item.item_id for item in items}:
         raise AgentLoopError('Visual dispositions must name exactly the assigned findings')
     parsed = _validate_review_response(text, reviewer=reviewer, unresolved_items=items,
-                                      architecture_status_mode='strict', include_visual=True)
+                                      architecture_status_mode='strict', include_visual=True,
+                                      parse_requirement_evidence=parse_requirement_evidence)
     if parsed.exact_head_evidence_requests or parsed.screenshot_requests or parsed.screenshot_coverage_acceptances or any(
             getattr(item, 'evidence_row_ids', ()) for item in
             (*parsed.blocking_items, *parsed.followups.same_pr, *parsed.followups.future)):
@@ -248,6 +250,7 @@ class VisualRun:
                 if current_head() != head:
                     return VisualOutcome(stale=True)
                 from .review_images_transport import acquire_images
+                from .human_evidence_mode import freeze_mode
                 with acquire_images(snapshots, capability, head_sha=head,
                                     config_digest=snapshots.config_digest,
                                     snapshot_digest=snapshots.digest, limits=settings_.limits) as images:
@@ -258,13 +261,13 @@ class VisualRun:
                     response = _run_validated_agent(runner, agent=selected, config=config,
                         prompt=prompt, role='reviewer', session_id=None, timeout_seconds=300,
                         label='visible-defects', image_inputs=images,
-                        validate=lambda text: validate_visual(text, reviewer=name, items=assigned),
+                        validate=lambda text: validate_visual(text, reviewer=name, items=assigned, parse_requirement_evidence=freeze_mode(config)),
                         use_repair=False, usage_context=usage_context)
                 if current_head() != head:
                     return VisualOutcome(stale=True)
                 if response.acquisition_outcome != 'success':
                     raise ValueError('visual reviewer acquisition did not succeed')
-                parsed = validate_visual(response.text, reviewer=name, items=assigned)
+                parsed = validate_visual(response.text, reviewer=name, items=assigned, parse_requirement_evidence=freeze_mode(config))
                 from .review_images_state import digest
                 binding.update(kind='result', intent_id=intent.comment_id,
                                proof=digest(asdict(response.image_delivery_proof)))

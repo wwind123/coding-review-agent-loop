@@ -92,6 +92,8 @@ DEFAULT_PLAN_SWEEP_ROUNDS = 2
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
 # Evidence conversion (#1325): N consecutive capture-limited coder attempts.
 DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS = 2
+# Exact-head human evidence modes (#2063); ``advisory`` is the default.
+PR_HUMAN_EVIDENCE_MODES = ("freeze", "advisory", "off")
 # The single PR no-progress detector (#2097): K completed rounds with the same
 # head and blocking IDs stop for a human decision.  Minimum 1.
 DEFAULT_NO_PROGRESS_ROUNDS = 3
@@ -324,6 +326,10 @@ class AgentLoopConfig:
     pr_evidence_capture_attempts: int = DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
     # One-shot operator conversion (#1325), applied before any agent runs.
     pr_convert_evidence_rows: tuple[str, ...] = ()
+    # Exact-head human evidence mode (#2063): ``advisory`` (default) collects
+    # reviewer evidence requests into a non-blocking human-checks list,
+    # ``off`` drops them, and ``freeze`` keeps the blocking evidence freeze.
+    pr_human_evidence: str = "advisory"
     # The PR no-progress window (#2097); it also paces the advisory sub-item
     # stall report that ``--sub-item-stall-rounds`` used to set.
     no_progress_rounds: int = DEFAULT_NO_PROGRESS_ROUNDS
@@ -986,6 +992,15 @@ class AgentLoopConfig:
         ) or len(set(rows)) != len(rows):
             raise AgentLoopError(
                 "--pr-convert-evidence-rows must be a list of distinct non-empty row IDs."
+            )
+        if self.pr_human_evidence not in PR_HUMAN_EVIDENCE_MODES:
+            raise AgentLoopError(
+                "--pr-human-evidence must be one of: " + ", ".join(PR_HUMAN_EVIDENCE_MODES) + "."
+            )
+        if rows and self.pr_human_evidence != "freeze":
+            raise AgentLoopError(
+                "--pr-convert-evidence-rows requires --pr-human-evidence freeze: operator row "
+                "conversion feeds the exact-head evidence freeze, which only freeze mode runs."
             )
         if self.plan_growth_gate not in {"enforce", "off"}:
             raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
@@ -2865,6 +2880,7 @@ def config_from_args(
             args, "pr_evidence_capture_attempts", DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
         ),
         pr_convert_evidence_rows=tuple(getattr(args, "pr_convert_evidence_rows", None) or ()),
+        pr_human_evidence=getattr(args, "pr_human_evidence", None) or "advisory",
         no_progress_rounds=_arg_or_default(
             args, "no_progress_rounds", DEFAULT_NO_PROGRESS_ROUNDS
         ),
