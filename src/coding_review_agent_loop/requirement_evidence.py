@@ -38,28 +38,39 @@ _LEFTOVER_RULE = ("mixed requires explicit leftover_instructions; if nothing is 
 _SUPERSEDED_LEFTOVER_RULE = ('superseded uses leftover_instructions ""; if leftover code work remains, '
                              "use mixed or code")
 # The valid choices for a reviewer that emitted no exact_head_evidence_requests
-# this turn (#2101): human-only cannot validate without a linked request.
+# this turn (#2101): human-only cannot validate without a linked request. Every
+# rejection carries it as its own re-ask value, kept within the re-ask
+# renderer's per-value bound so it always reaches the reviewer intact.
 VALID_CHOICES_WITHOUT_REQUESTS = (
-    "you emitted no exact_head_evidence_requests, so choose superseded if a newer signed source "
-    "from the same author replaces it, evidence-only with your own prior evidence item IDs, or code")
+    "no exact_head_evidence_requests emitted: use superseded if a newer signed source from the "
+    "same author replaces it, evidence-only with your own prior evidence item IDs, or code")
+# Rule variants that do not offer human-only when no request was emitted.
 _NO_REQUEST_RULES = {
-    "human-only": "this role needs a request linked to an emitted evidence request; " + VALID_CHOICES_WITHOUT_REQUESTS,
-    "request": 'request must be ""; ' + VALID_CHOICES_WITHOUT_REQUESTS,
-    "mixed": "mixed requires at least one answered_item_id; " + VALID_CHOICES_WITHOUT_REQUESTS,
-    "evidence-only": ("evidence-only requires at least one answered_item_id; "
-                      + VALID_CHOICES_WITHOUT_REQUESTS),
-    "human-only-answers": "answered_item_ids must be []; " + VALID_CHOICES_WITHOUT_REQUESTS,
+    "human-only": "this role needs a request linked to an emitted evidence request",
+    "request": 'request must be ""',
+    "mixed": "mixed requires at least one answered_item_id",
+    "evidence-only": "evidence-only requires at least one answered_item_id",
+    "human-only-answers": "answered_item_ids must be []",
 }
 _SUPERSEDED_PRECONDITION = ("superseded requires another surfaced signed source from the same author "
                             "with a strictly later created_at")
 
 
-def _inconsistent(index, entry, rule):
+def _reask_values(rule, no_requests):
+    """Re-ask values: the specific rule, plus the valid choices when no request was emitted."""
+    return (rule, VALID_CHOICES_WITHOUT_REQUESTS) if no_requests else (rule,)
+
+
+def _inconsistent(index, entry, rule, no_requests=False):
     """A role/field consistency violation, routed to the reviewer judgement re-ask."""
     rid = " ".join(str(entry["requirement_id"]).split())[:120]
-    message = f"requirement_evidence[{index}] (requirement_id {rid}, role {entry['role']}): {rule}."
+    message = f"requirement_evidence[{index}] (requirement_id {rid}, role {entry['role']}): {rule}"
+    if no_requests:
+        message += "; " + VALID_CHOICES_WITHOUT_REQUESTS
+    message += "."
     return MissingJudgementFieldError(message, field_path="requirement_evidence",
-                                      allowed_values=(rule,), observed_preview=message)
+                                      allowed_values=_reask_values(rule, no_requests),
+                                      observed_preview=message)
 
 
 def parse_associations(value, *, emitted_requests=None):
@@ -100,20 +111,20 @@ def parse_associations(value, *, emitted_requests=None):
                 rule = _NO_REQUEST_RULES["human-only" if role == "human-only" else "request"]
             else:
                 rule = _HUMAN_ONLY_RULE if role == "human-only" else _NON_HUMAN_REQUEST_RULE
-            raise _inconsistent(index, entry, rule)
+            raise _inconsistent(index, entry, rule, no_requests)
         if (role in {"mixed", "evidence-only"}) != bool(answers):
             rule = _ANSWER_RULES[role]
             if no_requests and role in {"mixed", "evidence-only"}:
                 rule = _NO_REQUEST_RULES[role]
             elif no_requests and role == "human-only":
                 rule = _NO_REQUEST_RULES["human-only-answers"]
-            raise _inconsistent(index, entry, rule)
+            raise _inconsistent(index, entry, rule, no_requests)
         if role == "superseded" and entry["leftover_instructions"]:
             # Never cleared by normalize_empty_text: a superseded source with
             # leftover code work would otherwise silently drop it (#2101).
-            raise _inconsistent(index, entry, _SUPERSEDED_LEFTOVER_RULE)
+            raise _inconsistent(index, entry, _SUPERSEDED_LEFTOVER_RULE, no_requests)
         if (role == "mixed") != bool(entry["leftover_instructions"].strip()):
-            raise _inconsistent(index, entry, _LEFTOVER_RULE)
+            raise _inconsistent(index, entry, _LEFTOVER_RULE, no_requests)
         if any(e["requirement_id"] == entry["requirement_id"] for e in result):
             raise AgentLoopError("Repeated requirement_evidence source")
         result.append(dict(entry))
@@ -166,12 +177,14 @@ def is_superseded(source, requirements):
 def validate_associations(parsed, requirements, items, reviewer):
     no_requests = not parsed.exact_head_evidence_requests
 
-    def invalid(message, *, choices=False):
+    def invalid(message):
         # Reuse the bounded semantic-judgement re-ask, never format repair.
-        if choices and no_requests:
+        # With no emitted request every rejection also names the valid choices.
+        if no_requests:
             message += "; " + VALID_CHOICES_WITHOUT_REQUESTS
         return MissingJudgementFieldError(message, field_path="requirement_evidence",
-            allowed_values=("surfaced sources with linked emitted requests and requester-owned native answers",),
+            allowed_values=_reask_values(
+                "surfaced sources with linked emitted requests and requester-owned native answers", no_requests),
             observed_preview=message)
 
     live = {r.requirement_id: r for r in requirements}
@@ -179,14 +192,13 @@ def validate_associations(parsed, requirements, items, reviewer):
         if entry["requirement_id"] not in live:
             raise invalid("Requirement/evidence association names an unsurfaced source")
         if entry["role"] == "human-only" and entry["request"] not in parsed.exact_head_evidence_requests:
-            raise invalid("Human-only association must name this requester's emitted evidence request",
-                          choices=True)
+            raise invalid("Human-only association must name this requester's emitted evidence request")
         if entry["role"] == "superseded" and not is_superseded(live[entry["requirement_id"]], requirements):
             message = (f"Superseded association for {entry['requirement_id']} is invalid: "
                        f"{_SUPERSEDED_PRECONDITION}")
             if not no_requests:
                 message += "; use code, evidence-only, or human-only with your linked emitted request"
-            raise invalid(message, choices=True)
+            raise invalid(message)
         for item_id in entry["answered_item_ids"]:
             targets = [i for i in items if item_id in (i.item_id, *i.alias_item_ids)]
             from .native_evidence import native

@@ -287,7 +287,7 @@ def test_identity_is_not_normalized(value):
 @pytest.mark.parametrize("role,field,message,live_message", [
     ("human-only", "request", "human-only must name its exact emitted evidence request",
      # A live review that emitted no request is offered only the valid choices (#2101).
-     "this role needs a request linked to an emitted evidence request; you emitted no exact_head_evidence_requests"),
+     "this role needs a request linked to an emitted evidence request; no exact_head_evidence_requests emitted"),
     ("mixed", "leftover_instructions", "mixed requires explicit leftover_instructions",
      "mixed requires explicit leftover_instructions")])
 def test_normalized_empty_text_retains_required_content(role, field, message, live_message, value):
@@ -756,34 +756,80 @@ def test_classification_prompt_explains_superseded_routing():
     assert '"created_at": "2026-11-22T05:00:00Z"' in prompt and '"author": "maintainer"' in prompt
 
 
-def _rule_text(error):
-    return error.value.allowed_values[0]
+def _rendered_reask(error):
+    """The judgement re-ask appendix the reviewer actually receives."""
+    from coding_review_agent_loop.architecture_contract import _missing_judgement_field_reask_prompt
+    exc = error.value
+    return _missing_judgement_field_reask_prompt("PROMPT", exc.field_path, exc.allowed_values,
+                                                 exc.observed_preview)
 
 
-@pytest.mark.parametrize("role,request_text,answers", [
-    ("evidence-only", "", []),
-    ("mixed", "", []),
-    ("human-only", "", []),
-    ("human-only", "", ["item-1"]),
-    ("code", "Run the suite", []),
-    ("superseded", "Run the suite", []),
-])
-def test_reask_without_emitted_requests_never_offers_human_only(role, request_text, answers):
-    """`reask-no-emitted-requests`: the re-ask names only choices that can validate (#2101)."""
-    leftover = "Fix retries." if role == "mixed" else ""
+_PARSE_BRANCHES = [
+    ("evidence-only", "", [], ""),
+    ("mixed", "", [], "Fix retries."),
+    ("mixed", "", ["item-1"], ""),
+    ("human-only", "", [], ""),
+    ("human-only", "", ["item-1"], ""),
+    ("code", "Run the suite", [], ""),
+    ("code", "", ["item-1"], ""),
+    ("superseded", "Run the suite", [], ""),
+    ("superseded", "", ["item-1"], ""),
+    ("superseded", "", [], "Also fix retries."),
+]
+
+
+def _validate_branch(branch, requests):
+    """Each validate_associations rejection: unsurfaced, unlinked, precondition, foreign answer."""
+    items, _, _, _ = setup_role("evidence-only")
+    if branch == "unsurfaced":
+        entry, requirements = _association("hr-unknown", "code"), SUPERSEDED_SET
+    elif branch == "unlinked-human-only":
+        entry, requirements = _association(OLD_APPROVAL.requirement_id, "human-only", request="Unemitted"), SUPERSEDED_SET
+    elif branch == "superseded-precondition":
+        entry, requirements = _association(NEW_APPROVAL.requirement_id, "superseded"), SUPERSEDED_SET
+    else:
+        items = [dataclasses.replace(items[0], reviewer="Gemini")]
+        entry, requirements = _association(SOURCE.requirement_id, "evidence-only", answers=["item-1"]), [SOURCE]
+    with pytest.raises(MissingJudgementFieldError) as error:
+        validate_associations(_carrier([entry], requests), requirements, items, "Codex")
+    return error
+
+
+@pytest.mark.parametrize("role,request_text,answers,leftover", _PARSE_BRANCHES)
+def test_reask_without_emitted_requests_never_offers_human_only(role, request_text, answers, leftover):
+    """`reask-no-emitted-requests`: every parse rejection names only choices that can validate (#2101)."""
     entry = _association("hr-x", role, request=request_text, answers=answers, leftover=leftover)
     with pytest.raises(MissingJudgementFieldError) as error:
         parse_associations([entry], emitted_requests=())
-    rule = _rule_text(error)
-    assert "human-only" not in rule
-    assert VALID_CHOICES_WITHOUT_REQUESTS in rule
-    for choice in ("superseded", "evidence-only with your own prior evidence item IDs", "code"):
-        assert choice in rule
+    assert error.value.allowed_values[1] == VALID_CHOICES_WITHOUT_REQUESTS
+    assert all("human-only" not in value for value in error.value.allowed_values)
+    rendered = _rendered_reask(error)
+    assert VALID_CHOICES_WITHOUT_REQUESTS in rendered
+    for choice in ("use superseded", "evidence-only with your own prior evidence item IDs", "or code"):
+        assert choice in rendered
     # With emitted requests, or in replay (unknown), the existing wording is unchanged.
     for emitted in (None, ("Run the suite",)):
         with pytest.raises(MissingJudgementFieldError) as legacy:
             parse_associations([entry], emitted_requests=emitted)
-        assert VALID_CHOICES_WITHOUT_REQUESTS not in _rule_text(legacy)
+        assert len(legacy.value.allowed_values) == 1
+        assert VALID_CHOICES_WITHOUT_REQUESTS not in str(legacy.value)
+
+
+@pytest.mark.parametrize("branch", ["unsurfaced", "unlinked-human-only", "superseded-precondition", "foreign-answer"])
+def test_validation_reask_without_emitted_requests_names_valid_choices(branch):
+    """`reask-no-emitted-requests`: every validation rejection names the choices intact (#2101)."""
+    error = _validate_branch(branch, ())
+    assert error.value.allowed_values[1] == VALID_CHOICES_WITHOUT_REQUESTS
+    rendered = _rendered_reask(error)
+    assert VALID_CHOICES_WITHOUT_REQUESTS in rendered
+    emitted = _validate_branch(branch, ("Other request",))
+    assert len(emitted.value.allowed_values) == 1
+    assert VALID_CHOICES_WITHOUT_REQUESTS not in str(emitted.value)
+
+
+def test_valid_choices_fit_the_rendered_reask_bound():
+    from coding_review_agent_loop.architecture_contract import _JUDGEMENT_REASK_MAX_CHARS
+    assert len(VALID_CHOICES_WITHOUT_REQUESTS) <= _JUDGEMENT_REASK_MAX_CHARS
 
 
 def test_live_review_without_requests_reasks_with_valid_choices():
@@ -791,7 +837,7 @@ def test_live_review_without_requests_reasks_with_valid_choices():
     with pytest.raises(MissingJudgementFieldError) as error:
         parse_structured_pr_review(_classified_review([entry]), reviewer="Codex", architecture_status_mode="legacy")
     assert "use code or human-only" not in str(error.value)
-    assert VALID_CHOICES_WITHOUT_REQUESTS in str(error.value)
+    assert VALID_CHOICES_WITHOUT_REQUESTS in _rendered_reask(error)
 
 
 def test_unlinked_human_only_validation_names_valid_choices_without_requests():
