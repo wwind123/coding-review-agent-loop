@@ -562,6 +562,9 @@ def _normalize_architecture_status(
 
 
 ARCHITECTURE_IMPACT_DECLARED_STATUSES = frozenset({"changed", "unchanged"})
+# The only documented canonical_document_action token; other actions are open
+# text.  Case/separator variants (`NO_CHANGE`) fold to it (#2109).
+ARCHITECTURE_DOCUMENT_ACTION_TOKENS = frozenset({"no-change"})
 # Parser-only status for a degraded assessment.  It has no wire form: the
 # response parsers reject it like any unknown status, strict decoders never
 # produce it, and approved-state writers refuse it.
@@ -616,7 +619,10 @@ def _near_miss_predicate_failure(payload: Mapping[str, object]) -> str | None:
         if not _non_blank_string_entries(payload.get(key)):
             return key
     action = payload.get("canonical_document_action")
-    if not isinstance(action, str) or not action.strip() or action.strip() == "no-change":
+    if (
+        not isinstance(action, str) or not action.strip()
+        or closed_enum_fold_key(action) in ARCHITECTURE_DOCUMENT_ACTION_TOKENS
+    ):
         return "canonical_document_action"
     path = payload.get("canonical_document_path")
     if not isinstance(path, str) or not path.strip():
@@ -810,9 +816,12 @@ def _parse_architecture_impact_payload(
     if raw_action is None:
         _logger.warning("%s.canonical_document_action: normalized null to `no-change`", context)
         raw_action = "no-change"
-    action = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
-        raw_action,
-        context=f"{context}.canonical_document_action",
+    action = fold_enum_value(
+        _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
+            raw_action,
+            context=f"{context}.canonical_document_action",
+        ),
+        ARCHITECTURE_DOCUMENT_ACTION_TOKENS, context=f"{context}.canonical_document_action",
     )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")  # shape-check: fatal:no-conservative-reading
     if status == "changed":
@@ -2877,8 +2886,10 @@ def parse_execution_recommendation_payload(
 
 
 def _expect_state(value: object, *, context: str) -> str:
+    # `state` is an envelope field checked against the footer, so it stays
+    # strictly string-shaped; only the case/separator fold applies (#2109).
     state = fold_enum_value(
-        _expect_non_empty_string(value, context=context),  # shape-check: fatal:no-conservative-reading
+        _expect_strict_string(value, context=context),  # shape-check: fatal:no-conservative-reading
         {"approved", "blocking"}, context=context,
     )
     if state not in {"approved", "blocking"}:
@@ -4132,7 +4143,7 @@ def validate_structured_issue_implementation(
         optional=optional_fields,
     )
     state = fold_enum_value(
-        _expect_non_empty_string(payload["state"], context="issue_implementation.state"),  # shape-check: fatal:no-conservative-reading
+        _expect_strict_string(payload["state"], context="issue_implementation.state"),  # shape-check: fatal:no-conservative-reading
         {"blocking"}, context="issue_implementation.state",
     )
     if state != "blocking":
@@ -4299,7 +4310,7 @@ def validate_structured_task_result(
         optional={"pr_number", "clarification", "architecture_impact"},
     )
     state = fold_enum_value(
-        _expect_non_empty_string(payload["state"], context="task_result.state"),  # shape-check: fatal:no-conservative-reading
+        _expect_strict_string(payload["state"], context="task_result.state"),  # shape-check: fatal:no-conservative-reading
         {"blocking"}, context="task_result.state",
     )
     if state != "blocking":
@@ -4397,7 +4408,7 @@ def validate_structured_plan_revision(
         reject_unsolicited=reject_unsolicited_risk_test_matrix_contract,
     )
     state = fold_enum_value(
-        _expect_non_empty_string(payload["state"], context="plan_revision.state"),  # shape-check: fatal:no-conservative-reading
+        _expect_strict_string(payload["state"], context="plan_revision.state"),  # shape-check: fatal:no-conservative-reading
         {"blocking"}, context="plan_revision.state",
     )
     if state != "blocking":
@@ -5375,7 +5386,7 @@ def parse_plan_revision_patch(
     if contract_version != SEMANTIC_PATCH_CONTRACT_VERSION:
         raise AgentLoopError(f"{context}.semantic_patch_contract_version must be 1.")  # shape-check: fatal:kind-or-version-mismatch
     state = fold_enum_value(
-        _expect_non_empty_string(payload["state"], context=f"{context}.state"),  # shape-check: fatal:no-conservative-reading
+        _expect_strict_string(payload["state"], context=f"{context}.state"),  # shape-check: fatal:no-conservative-reading
         {"blocking"}, context=f"{context}.state",
     )
     if state != "blocking":

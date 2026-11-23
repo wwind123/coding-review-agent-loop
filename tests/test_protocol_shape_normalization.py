@@ -977,3 +977,177 @@ def test_stored_text_with_non_canonical_shapes_reparses_identically():
     assert first.execution_recommendation.identity() == second.execution_recommendation.identity()
     assert first == _parse_plan(_plan_state())
     assert text == snapshot
+
+
+# ---------------------------------------------------------------------------
+# Round 2: envelope state stays string-shaped; action fold; discussion enums
+# and strict discussion identifiers.
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    architecture_impact_near_miss_corroborated,
+    validate_structured_coder_followup,
+)
+from coding_review_agent_loop.protocol_discuss import (  # noqa: E402
+    _parse_discuss_research,
+    _parse_discuss_synthesis_change,
+    _parse_discuss_synthesis_position,
+    _parse_discuss_synthesis_reference,
+    _parse_discuss_unresolved_items,
+    parse_structured_discuss_answer,
+    parse_structured_discuss_review,
+    validate_structured_discuss_answer_confirmation,
+    validate_structured_discuss_final_synthesis,
+    validate_structured_discuss_semantic_comparison,
+)
+
+
+def _coder_followup(state) -> str:
+    payload = {
+        "schema_version": 1, "kind": "coder_followup", "state": state, "summary": "Updated.",
+        "addressed_items": [], "remaining_items": [], "addressed_item_notes": {},
+        "remaining_item_notes": {},
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [], "architecture_impact": dict(ARCH),
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+
+
+def _contradictory_footer_texts():
+    plan = json.dumps(_plan_state(state=["blocking"])) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    pr = json.dumps({
+        "schema_version": 1, "kind": "pr_review", "state": ["approved"], "summary": "Done.",
+        "blocking_items": [], "same_pr_followups": [], "future_followups": [],
+        "prior_item_dispositions": [],
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    plan_review = json.dumps({
+        "schema_version": 1, "kind": "plan_review", "state": ["approved"], "summary": "Done.",
+        "blocking_plan_issues": [], "same_plan_followups": [], "future_followups": [],
+        "prior_plan_item_dispositions": [], "human_requirement_dispositions": [],
+    }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    impl = json.dumps(_issue_impl(state=["blocking"])) + STATE_FOOTER
+    return [
+        ("plan_state", lambda: validate_structured_plan_state(plan, require_execution_strategy_contract=1)),
+        ("pr_review", lambda: parse_structured_pr_review(pr, reviewer="OpenAI Codex")),
+        ("plan_review", lambda: parse_structured_plan_review(plan_review, reviewer="OpenAI Codex")),
+        ("coder_followup", lambda: validate_structured_coder_followup(_coder_followup(["blocking"]))),
+        ("issue_implementation", lambda: validate_structured_issue_implementation(impl)),
+        ("task_result", lambda: validate_structured_task_result(_task(state=["blocking"]))),
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,parse", _contradictory_footer_texts(), ids=[n for n, _ in _contradictory_footer_texts()]
+)
+def test_singleton_list_state_never_bypasses_the_footer(name, parse):
+    # The payload `state` is an envelope field compared with the footer: it
+    # stays strictly string-shaped, so a list never slips past the comparison.
+    with pytest.raises(AgentLoopError, match=r"state must be a string"):
+        parse()
+
+
+@pytest.mark.parametrize("spelling", ["NO_CHANGE", "No Change", "no_change", " no-change "])
+def test_canonical_document_action_folds_documented_token(spelling, caplog):
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        parsed = parse_architecture_impact(dict(ARCH, canonical_document_action=spelling))
+    assert parsed == parse_architecture_impact(dict(ARCH))
+    assert parsed.canonical_document_action == "no-change"
+
+
+def test_canonical_document_action_open_text_is_kept_and_not_corroborating():
+    assert parse_architecture_impact(dict(CORROBORATED_CHANGED)).canonical_document_action == "update"
+    # A folded no-change spelling is not a real document action for `modified`.
+    assert not architecture_impact_near_miss_corroborated(
+        dict(CORROBORATED_CHANGED, status="modified", canonical_document_action="NO_CHANGE")
+    )
+
+
+def _discuss_review(**extra) -> str:
+    payload = {"schema_version": 1, "kind": "discuss_review", "outcome": "implement", "rationale": "Do it."}
+    payload.update(extra)
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+
+def _discuss_answer(**extra) -> str:
+    payload = {
+        "schema_version": 1, "kind": "discuss_answer", "position": "answer",
+        "rationale": "Because.", "confidence": "high", "answer": "Yes.", "unresolved_items": [],
+    }
+    payload.update(extra)
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+
+def _confirmation(decision) -> str:
+    payload = {"schema_version": 1, "kind": "discuss_answer_confirmation", "decision": decision,
+               "rationale": "Still right.", "reviewer": "OpenAI Codex"}
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+
+def _semantic(classification) -> str:
+    payload = {"schema_version": 1, "kind": "discuss_semantic_comparison",
+               "classification": classification, "shared_recommendation": "Do it.",
+               "remaining_decisions": [], "evidence": [{"reviewer": "A", "supports": "Yes."}]}
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Orchestrator"
+
+
+def _final_synthesis(classification) -> str:
+    payload = {"schema_version": 1, "kind": "discuss_final_synthesis", "classification": classification,
+               "agreed_conclusions": [{"text": "Ship.", "references": [{"reviewer": "A", "round": 1}]}],
+               "remaining_disagreements": [], "next_action": "Ship it."}
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Orchestrator"
+
+
+DISCUSS_FOLDS = [
+    ("review-outcome", lambda v: parse_structured_discuss_review(_discuss_review(outcome=v), reviewer="X").outcome,
+     "Do Not Implement", "do-not-implement", "skip"),
+    ("review-framing", lambda v: parse_structured_discuss_review(
+        _discuss_review(analyzer_framing=v), reviewer="X").analyzer_framing, "Accurate", "accurate", "right"),
+    ("research-status", lambda v: _parse_discuss_research({"status": v})[0], "Not Needed", "not-needed", "skipped"),
+    ("research-target", lambda v: _parse_discuss_research(
+        {"status": "inconclusive", "target": v, "questions": ["Q?"]})[2],
+     "Solution Design", "solution-design", "design"),
+    ("answer-position", lambda v: parse_structured_discuss_answer(
+        _discuss_answer(position=v, answer=None) if v.lower().startswith("needs") else _discuss_answer(position=v),
+        reviewer="X").position, "Answer", "answer", "reply"),
+    ("answer-confidence", lambda v: parse_structured_discuss_answer(_discuss_answer(confidence=v), reviewer="X").confidence,
+     "High", "high", "certain"),
+    ("unresolved-status", lambda v: _parse_discuss_unresolved_items([{"status": v, "text": "Q?"}], context="ctx")[0].status,
+     "Human Decision", "human-decision", "question"),
+    ("confirmation-decision", lambda v: validate_structured_discuss_answer_confirmation(
+        _confirmation(v), reviewer="OpenAI Codex").decision, "Confirm", "confirm", "accept"),
+    ("semantic-classification", lambda v: validate_structured_discuss_semantic_comparison(
+        _semantic(v), reviewers=["A"]).classification, "Material Conflict", "material_conflict", "conflict"),
+    ("final-synthesis-classification", lambda v: validate_structured_discuss_final_synthesis(
+        _final_synthesis(v)).classification, " CONSENSUS ", "consensus", "agreement"),
+]
+
+
+@pytest.mark.parametrize("name,read,variant,canonical,synonym", DISCUSS_FOLDS, ids=[d[0] for d in DISCUSS_FOLDS])
+def test_discussion_closed_enums_fold_and_synonyms_reject(name, read, variant, canonical, synonym):
+    assert read(variant) == canonical
+    assert read(canonical) == canonical
+    with pytest.raises(AgentLoopError):
+        read(synonym)
+
+
+@pytest.mark.parametrize(
+    "parse",
+    [
+        lambda: _parse_discuss_synthesis_reference({"reviewer": ["Claude"], "round": 1}, context="ref"),
+        lambda: _parse_discuss_synthesis_change(
+            {"kind": ["introduced"], "topic": "T", "text": "X", "references": []}, context="change"),
+        lambda: _parse_discuss_synthesis_position({"reviewers": "Claude", "position": "P"}, context="pos"),
+        lambda: _parse_discuss_synthesis_position({"reviewers": [["Claude"]], "position": "P"}, context="pos"),
+    ],
+    ids=["reference-reviewer", "change-kind", "position-reviewers-lone", "position-reviewers-nested"],
+)
+def test_discussion_synthesis_identifiers_and_kinds_stay_strict(parse):
+    with pytest.raises(AgentLoopError):
+        parse()
+
+
+def test_discussion_synthesis_strict_fields_still_accept_canonical():
+    assert _parse_discuss_synthesis_reference({"reviewer": "Claude", "round": 1}, context="ref").reviewer == "Claude"
+    assert _parse_discuss_synthesis_position(
+        {"reviewers": ["Claude"], "position": ["P"]}, context="pos"
+    ).position == "P"

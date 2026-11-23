@@ -134,14 +134,20 @@ the same text yields the same dataclass. The classes, all in
 - `fold_closed_enum` is the one closed-enum fold (strip, lowercase, `[\s_]+`
   to `-`, matched only against the allowed tokens, no synonym tables). It is
   applied to every closed enum, including the payload `state` before the
-  footer comparison; `normalize_staging_feasibility` is rebuilt on it and keeps
-  its audited safe-alias set. The architecture status near-miss classifier
+  footer comparison and the ordinary discussion enums (research status and
+  target, outcome, analyzer framing, answer position and confidence,
+  unresolved-item status, confirmation decision, semantic and final-synthesis
+  classifications, agenda research targets); `normalize_staging_feasibility`
+  is rebuilt on it and keeps its audited safe-alias set. Discussion evidence
+  claim status, verification basis and update action stay exact. The architecture status near-miss classifier
   treats a fold of a declared status as no near miss, so `Unchanged` reaches
   normal parsing and an optional review assessment is no longer removed;
   real synonyms (`modified`, `no-change`, `none`, ...) keep the degrade and
   patch-reject handling above.
 - `architecture_impact` list fields accept `null` or a lone string, an empty
   `canonical_document_path` is `null`, and a `null` action is `no-change`.
+  The documented `no-change` action token is folded (`NO_CHANGE`); other
+  actions are open text and kept as written.
 - A `none` allocation (or a `null` one) gets its empty lists; a `required`
   allocation is never defaulted. A `null` `one_shot_delivery` on a staged
   recommendation is dropped.
@@ -157,8 +163,11 @@ the same text yields the same dataclass. The classes, all in
 The strict boundary is `_expect_strict_string` and the `strict_shape`
 list option: item, stage, scope, constraint and risk-row IDs, signed
 requirement labels, risk-matrix text and evidence citations, semantic-patch
-`op`/`field`/`base_state_identity`, the `agent_unavailable` envelope, and
-discussion reviewer and observation IDs stay exact. The only identifier-list
+`op`/`field`/`base_state_identity`, the `agent_unavailable` envelope, the
+payload `state` (an envelope field compared with the footer, so a list never
+bypasses that comparison), discussion reviewer and observation IDs, synthesis
+reviewer references and reviewer lists, and synthesis change `kind` stay
+exact. The only identifier-list
 outer-shape exception is the opt-in `normalize_outer_shape` for
 `depends_on_stage_ids`; each element is still a strict ID.
 
