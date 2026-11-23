@@ -464,10 +464,8 @@ from .pr_loop_support import (
     _pr_step_back_tracked_reviewers,
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
-    FollowupCitationDiagnosis,
     render_followup_local_test_evidence,
     local_test_failure_context as _local_test_failure_context,
-    followup_citation_diagnosis,
     _coder_followup_head_log,
     _coder_followup_review_context,
     _reviewer_summary_context,
@@ -3070,9 +3068,6 @@ def run_pr_loop(
                 "gate; no freeze was published and the new head needs review",
             )
 
-        # The newest accepted coder follow-up's citation diagnosis (#1626), an
-        # in-memory input to the no-progress message only.
-        latest_followup_citations: FollowupCitationDiagnosis | None = None
         # The head this process last dispatched a coder follow-up from; the
         # next round's snapshot may predate that coder record.
         last_dispatch_head: str | None = None
@@ -3214,8 +3209,8 @@ def run_pr_loop(
                     head_sha=pr_metadata.head_sha,
                     open_items=unresolved_items,
                     route=no_progress_route(),
-                    citation_diagnosis=latest_followup_citations,
                     base_branch=pr_metadata.base_branch or config.base,
+                    approved_plan_context=approved_plan_context,
                 )
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
@@ -8707,7 +8702,6 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     open_items=unresolved_items,
                     route=no_progress_route(),
-                    citation_diagnosis=latest_followup_citations,
                 )
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
@@ -9192,10 +9186,6 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
-            # Tool-owned citation state (#1626), frozen at the coder
-            # acquisition; a repair launch cannot repoint it.
-            coder_turn_receipt_ids: frozenset[str] = frozenset()
-            followup_citations: FollowupCitationDiagnosis | None = None
             _followup_derived_risk_evidence = None
             _validate_coder_followup_response_by_mode = lambda mode, observations_mode, degraded_unacknowledged=False: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
@@ -9264,15 +9254,6 @@ def run_pr_loop(
                 ))
                 coder_output = coder_response.text
                 coder_session_id = coder_response.session_id
-                # Frozen before any post-authentication correction, from the
-                # coder acquisition's own closed catalog -- never the
-                # runner's latest test turn, which a repair launch replaces.
-                coder_turn_receipt_ids = frozenset(
-                    observation.receipt_id
-                    for observation in coder_response.acquisition_test_observations
-                    if isinstance(getattr(observation, "receipt_id", None), str)
-                    and observation.receipt_id
-                )
                 latest_coder_output = coder_output
                 public_comment, coder_render_kwargs = coder_output, None
                 raw_structured_coder_response: str | None = None
@@ -9370,12 +9351,6 @@ def run_pr_loop(
                 local_test_evidence = render_followup_local_test_evidence(
                     runner, coder_response, latest_coder_metadata,
                     head=updated_pr_context.metadata.head_sha, cwd=active_workdir(config),
-                )
-                # Decided from the live, unbounded reconciliation and the
-                # surviving citations of the accepted (derived) follow-up;
-                # the bounded round projection stays display-only (#1626).
-                followup_citations = followup_citation_diagnosis(
-                    coder_response.marker_value, coder_turn_receipt_ids
                 )
                 # The coder metadata record posted below is numbered one past the
                 # loop round; the matrix-evidence anchor must use that number.
@@ -9636,7 +9611,7 @@ def run_pr_loop(
             coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
             latest_coder_metadata, latest_coder_output, unresolved_items, coder_response_discarded = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
             if coder_response_discarded:  # a claim-free synthesized record: none of its claims count (#2086)
-                followup_citations, latest_coder_coverage_map = None, None
+                latest_coder_coverage_map = None
             elif isinstance(coder_response.marker_value, StructuredCoderFollowup):  # fix history only for the posted record
                 pr_finding_history.record_fix(coder_response.marker_value, published_round=coder_record_round, agent=coder_name)
             if managed_ci is not None and managed_ci.origin == "source-managed" and managed_ci.protection_mode != "strict":
@@ -9677,7 +9652,6 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
-            latest_followup_citations = followup_citations
             previous_head = pr_metadata.head_sha
             last_dispatch_head = previous_head
             log(

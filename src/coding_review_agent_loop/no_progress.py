@@ -158,7 +158,8 @@ def pr_no_progress_observations(
     * a historical record without a dispatch head has no single reviewed head.
 
     ``current`` is the just-settled round at the coder-dispatch site, which has
-    no coder record yet; it replaces any durable observation of its round.
+    no coder record yet; it replaces any durable observation of its round
+    unless that round number carries a closure boundary.
     """
     ordered = sorted(
         (record for record in records if getattr(record.metadata, "flow", None) == "pr"),
@@ -204,7 +205,10 @@ def pr_no_progress_observations(
         observations[review_round] = NoProgressObservation(
             review_round, subject, blocking_item_ids(coder.metadata.prior_items)
         )
-    if current is not None:
+    if current is not None and current.round_number not in closed_rounds:
+        # A closure boundary excludes its round number at both sites, so a
+        # replacement review that reuses the number (a legacy supersession)
+        # counts neither live nor on resume.
         observations[current.round_number] = current
     return tuple(observations[number] for number in sorted(observations))
 

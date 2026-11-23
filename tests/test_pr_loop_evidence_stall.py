@@ -1535,3 +1535,69 @@ def test_a_deferred_no_progress_stop_raises_the_carried_error_object(tmp_path, m
 
     monkeypatch.setattr(cli_module, "run_pr_loop", raise_carried)
     assert main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+
+
+def _resumed_after_three_unchanged_tagged_rounds(tmp_path, monkeypatch, evidence_plan, **overrides):
+    """K=4 lets rounds 1-3 (one tagged item, unchanged head) and coder records 2-4
+    land; round 4's review is missing, so a rerun starts at round 4."""
+    if evidence_plan is not None:
+        _shape_evidence(monkeypatch, [evidence_plan] * 6)
+    runner = _unchanged_evidence_runner(3, 3)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(
+            runner, pr_number=77, config=_config(tmp_path, no_progress_rounds=4, **overrides),
+            approved_plan_context=_plan_context("row-a", "row-b"),
+        )
+    assert _coder_count(runner) == 3
+    return runner
+
+
+def _codex_count(runner):
+    return sum(1 for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+
+
+@pytest.mark.parametrize(
+    "evidence_plan",
+    [
+        {"row-a": ("verified", ()), "row-b": ("stale/unverified", ())},
+        "absent",
+    ],
+    ids=["tagged-row-already-verified", "matrix-evidence-absent"],
+)
+def test_round_start_applies_the_real_evidence_ownership_predicate(
+    tmp_path, monkeypatch, evidence_plan
+):
+    """`pr-evidence-owned` (round start): a tag alone never defers the stop.
+
+    The resumed run must stop before any agent turn when the tagged row is
+    already verified or no usable matrix evidence exists, exactly as the
+    dispatch site would decide.
+    """
+    runner = _resumed_after_three_unchanged_tagged_rounds(tmp_path, monkeypatch, evidence_plan)
+    reviews_before = _codex_count(runner)
+    with pytest.raises(HumanDecisionRequiredError) as stopped:
+        run_pr_loop(
+            runner, pr_number=77, config=_config(tmp_path),
+            approved_plan_context=_plan_context("row-a", "row-b"),
+        )
+    message = str(stopped.value)
+    assert NO_PROGRESS_PREFIX_TEXT in message and "rounds 1-3" in message
+    assert _codex_count(runner) == reviews_before  # no reviewer turn
+    assert _coder_count(runner) == 3
+
+
+def test_round_start_defers_only_when_every_tagged_row_is_unsatisfied(tmp_path, monkeypatch):
+    """`pr-evidence-owned` (round start control): the evidence stall may own the
+    window, so round start leaves it to the dispatch and the reviewer runs."""
+    runner = _resumed_after_three_unchanged_tagged_rounds(
+        tmp_path, monkeypatch, None, pr_evidence_stall_rounds=6,
+    )
+    reviews_before = _codex_count(runner)
+    with pytest.raises(AgentLoopError) as stopped:
+        run_pr_loop(
+            runner, pr_number=77, config=_config(tmp_path, pr_evidence_stall_rounds=6),
+            approved_plan_context=_plan_context("row-a", "row-b"),
+        )
+    assert NO_PROGRESS_PREFIX_TEXT not in str(stopped.value)
+    assert "scripted agent output exhausted" in str(stopped.value)
+    assert _codex_count(runner) == reviews_before + 1  # round 4 was reviewed

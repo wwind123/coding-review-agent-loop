@@ -5218,7 +5218,9 @@ head and the current blocking IDs) still equals that repeated observation.
   first at the same dispatch. If the evidence stall stops, it wins and no
   no-progress message is posted; otherwise the deferred stop fires before any
   coder turn (or before the round-limit exit and merge-conflict handling,
-  where that decision is not evaluated). Round start leaves such windows to
+  where that decision is not evaluated). Round start applies the same test,
+  so a tag naming an already verified row, or a head without usable matrix
+  evidence, still stops there; only such an evidence-owned window is left to
   the dispatch.
 
 **Stop message.** One message names the head, K, the round range and the
@@ -5226,8 +5228,8 @@ sorted unchanged item IDs with each item's first line (the first 20, then
 `and N more`). Optional sections appear only when available: the total PR size
 from the merge base with the base branch (a scope-growth signal), the newest
 coder record's unsuperseded run-tests receipts and run-tests tool identity,
-the non-array `test_observations` citation diagnosis of the last accepted
-follow-up (`The coder's test_observations were not a JSON array (same-agent
+the non-array `test_observations` citation diagnosis read back from that
+record, so a resumed stop shows it too (`The coder's test_observations were not a JSON array (same-agent
 re-asks attempted: yes|no); N run-tests receipt(s) from that turn went
 uncited, so the blocker may be a tool format problem rather than a code
 defect.`), the newest step-back `Approach alternative:` excerpt at that head,

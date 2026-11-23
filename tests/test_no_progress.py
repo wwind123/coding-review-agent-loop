@@ -563,3 +563,72 @@ def test_the_pr_error_carries_the_route_only_when_bound(tmp_path, route):
     message = str(error)
     assert "- [item-1] text of item-1" in message and "Total PR size" not in message
     assert ("child plan" in message) == bool(route)
+
+
+@pytest.mark.parametrize("closure", ["closed-incomplete", "legacy-supersession"])
+def test_the_dispatch_round_never_counts_when_its_number_is_closed(closure):
+    """A replacement review that reuses a closed round number counts neither
+    live (as ``current``) nor durably, so both sites agree."""
+    record = _closed_incomplete(32, 3) if closure == "closed-incomplete" else _legacy_supersession(32, 3)
+    records = sorted([*_history(2), _review(30, 3, H), record], key=lambda r: r.index)
+    observations = pr_no_progress_observations(records, current=Obs(3, H, IDS))
+    assert [o.round_number for o in observations] == [1, 2]
+    assert no_progress_decision(
+        observations, live_subject=H, live_blocking_ids=IDS, k=3, through_round=3,
+    ) is None
+
+
+# --- the citation diagnosis comes from the durable coder record (#1626) ---------
+
+
+def _bounded(*receipts):
+    from coding_review_agent_loop.local_test_evidence import (
+        EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
+        bounded_evidence_for_round, reconcile_test_observations,
+    )
+
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        LocalTestObservation(
+            command=("python3", "-m", "pytest", "tests/test_x.py"), outcome="failed",
+            provenance="parent-observed", scope=EvidenceScope("unknown", ()),
+            receipt_id=receipt, turn_id=turn, cwd="/checkout", returncode=4,
+            attribution=TreeAttribution(state="current-head", head=H, stable=True),
+            environment_identity=registry.capture({"PATH": "/usr/bin"}),
+        )
+        for receipt, turn in receipts
+    ]
+    return bounded_evidence_for_round(reconcile_test_observations(rows, registry=registry))
+
+
+def _degradation(rule):
+    from coding_review_agent_loop.protocol_common import ParseDegradation
+    from coding_review_agent_loop.protocol_risk import CITATION_DROPPED_OUTCOME
+
+    return ParseDegradation.build(
+        element_path="coder_followup.test_observations", rule=rule,
+        observed="not an array", outcome=CITATION_DROPPED_OUTCOME,
+    )
+
+
+@pytest.mark.parametrize("after_repair", [False, True])
+def test_the_citation_diagnosis_is_read_back_from_the_newest_coder_record(after_repair):
+    """`pr-planning-child-route` (unit): live and resumed stops read the same record."""
+    from coding_review_agent_loop.pr_loop_support import durable_citation_diagnosis
+    from coding_review_agent_loop.protocol_risk import (
+        TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+        TEST_OBSERVATIONS_NOT_ARRAY_RULE,
+    )
+
+    rule = TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE if after_repair else TEST_OBSERVATIONS_NOT_ARRAY_RULE
+    earlier = _coder(15, 2, H, local_test_evidence=_bounded(("old-1", "turn-1")))
+    latest = _coder(
+        25, 3, H, test_observation_degradations=(_degradation(rule),),
+        local_test_evidence=_bounded(("old-1", "turn-1"), ("new-1", "turn-2"), ("new-2", "turn-2")),
+    )
+    diagnosis = durable_citation_diagnosis([earlier, latest])
+    assert diagnosis is not None and diagnosis.non_array_drop
+    assert diagnosis.repair_attempted is after_repair
+    assert diagnosis.uncited_receipts == 2  # only the receipts this turn introduced
+    assert durable_citation_diagnosis([earlier]) is None
+    assert durable_citation_diagnosis([]) is None

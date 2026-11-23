@@ -4863,7 +4863,6 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
         EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
     )
     from coding_review_agent_loop.no_progress import NO_PROGRESS_PREFIX_TEXT
-    from coding_review_agent_loop.pr_loop_support import FollowupCitationDiagnosis
 
     parent_plan = fresh_staged_plan(first_disposition="requires-child-planning")
     child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
@@ -4872,12 +4871,6 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
     )
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context",
         lambda _runner, *, config, issue_number: serve_authenticated_issue_context(_runner, config, child if issue_number == 56 else parent),
-    )
-    # The non-array drop itself is unit-tested with the validator; here the
-    # loop must carry the accepted turn's diagnosis into the stop message.
-    monkeypatch.setattr(
-        pr_loop, "followup_citation_diagnosis",
-        lambda _parsed, _ids: FollowupCitationDiagnosis(True, True, 2),
     )
     blocking = structured_pr_review(
         state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
@@ -4888,26 +4881,40 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
             {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
         ],
     )
-    runner = FakeRunner(
+    # The second coder turn answers with a non-array test_observations every
+    # time, so the real validator re-asks twice and then drops the citations.
+    plain = structured_coder_followup(remaining_items=["item-1"], addressed_items=[])
+    payload, end = json.JSONDecoder().raw_decode(plain)
+    non_array = json.dumps({**payload, "test_observations": "pytest passed locally"}) + plain[end:]
+    registry = EnvironmentIdentityRegistry()
+
+    class _ReceiptRunner(FakeRunner):
+        coder_turns = 0
+
+        def run_with_log(self, args, **kwargs):
+            if str(args[0]) == "claude":
+                self.coder_turns += 1
+                turn = f"coder-turn-{self.coder_turns}"
+                self._latest_test_turn_id = turn
+                if with_receipt and self.coder_turns == 2:
+                    self._local_test_observations.append(LocalTestObservation(
+                        command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
+                        outcome="failed", provenance="parent-observed",
+                        scope=EvidenceScope("unknown", ()),
+                        receipt_id=f"receipt-{self.coder_turns}", turn_id=turn, cwd=str(tmp_path),
+                        normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
+                        attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
+                        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+                    ))
+            return super().run_with_log(args, **kwargs)
+
+    runner = _ReceiptRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
         codex_outputs=[blocking, carried, carried],
-        claude_outputs=[
-            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
-            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
-        ],
+        claude_outputs=[plain, non_array, non_array, non_array],
         advance_pr_head_on_coder_followup=False,
     )
-    if with_receipt:
-        registry = EnvironmentIdentityRegistry()
-        runner._environment_registry = registry
-        runner._local_test_observations.append(LocalTestObservation(
-            command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
-            outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
-            receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
-            normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
-            attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
-            environment_identity=registry.capture({"PATH": "/usr/bin"}),
-        ))
+    runner._environment_registry = registry
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
     with pytest.raises(HumanDecisionRequiredError) as raised:
         pr_loop.run_pr_loop(runner, pr_number=77, config=config)
@@ -4927,12 +4934,13 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
     assert "\n" + route + "\n" in message
     assert (
         "The coder's test_observations were not a JSON array (same-agent re-asks "
-        "attempted: yes); 2 run-tests receipt(s) from that turn went uncited"
+        f"attempted: yes); {1 if with_receipt else 0} run-tests receipt(s) from that turn "
+        "went uncited"
     ) in message
     if with_receipt:
         assert (
             "Latest coder turn evidence: The latest local test evidence still holds "
-            "unsuperseded failure receipts: receipt `receipt-open` "
+            "unsuperseded failure receipts: receipt `receipt-2` "
             "`python3 -m pytest tests/test_x.py -q -n 0` (failed)."
         ) in message
         # The receipt sentence precedes the route, as the retired stop ordered it.
@@ -4940,6 +4948,13 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
     else:
         assert "Latest coder turn evidence" not in message
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 3
+    # A resumed run stops at round start, before any agent turn, with the same
+    # route, receipts and citation diagnosis read back from the durable records.
+    agent_calls = len([cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["claude"])])
+    with pytest.raises(HumanDecisionRequiredError) as resumed:
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
+    assert str(resumed.value) == message
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["claude"])]) == agent_calls
 
 
 # --- #1333: a tool-owned recommendation key in a patch does not route to replan ---

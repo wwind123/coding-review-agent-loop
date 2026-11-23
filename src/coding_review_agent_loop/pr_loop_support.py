@@ -356,29 +356,6 @@ class FollowupCitationDiagnosis:
     uncited_receipts: int
 
 
-def followup_citation_diagnosis(
-    parsed: object, coder_turn_receipt_ids: Iterable[str]
-) -> FollowupCitationDiagnosis | None:
-    """Diagnose an accepted follow-up's citations against its frozen catalog."""
-    if not isinstance(parsed, StructuredCoderFollowup):
-        return None
-    non_array = [
-        record
-        for record in parsed.test_observation_degradations
-        if record.outcome == CITATION_DROPPED_OUTCOME
-        and record.rule in TEST_OBSERVATIONS_NOT_ARRAY_RULES
-        and record.element_path == "coder_followup.test_observations"
-    ]
-    cited = {citation.receipt_id for citation in parsed.test_observations}
-    return FollowupCitationDiagnosis(
-        non_array_drop=bool(non_array),
-        repair_attempted=any(
-            record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE for record in non_array
-        ),
-        uncited_receipts=len(frozenset(coder_turn_receipt_ids) - cited),
-    )
-
-
 def render_followup_local_test_evidence(
     runner: Runner, response: ValidatedAgentResponse,
     metadata: PostedRoundMetadata | None, *, head: str | None, cwd: Path,
@@ -4344,7 +4321,6 @@ def _pr_no_progress_error(
     records: Sequence[PostedRoundRecord],
     items: Sequence[UnresolvedReviewItem],
     route: str = "",
-    citation_diagnosis: FollowupCitationDiagnosis | None = None,
     base_branch: str | None = None,
 ) -> HumanDecisionRequiredError:
     """The single PR no-progress stop, carrying every retired stop's diagnostics.
@@ -4371,7 +4347,7 @@ def _pr_no_progress_error(
         item_lines=render_no_progress_item_lines(decision.blocking_ids, texts),
         route=route,
         evidence=evidence,
-        citation_diagnosis=citation_diagnosis_sentence(citation_diagnosis),
+        citation_diagnosis=citation_diagnosis_sentence(durable_citation_diagnosis(records)),
         approach_alternative=_step_back.pr_approach_alternative_at_head(
             records, head_sha=decision.subject
         ),
@@ -4380,6 +4356,105 @@ def _pr_no_progress_error(
         ),
     )
     return HumanDecisionRequiredError(message)
+
+
+def _no_progress_defers_to_evidence_stall(
+    config: AgentLoopConfig,
+    *,
+    records: Sequence[PostedRoundRecord],
+    head_sha: str,
+    approved_plan_context: ApprovedPlanContext | None,
+    items: Sequence[UnresolvedReviewItem],
+    decision: NoProgressDecision,
+) -> bool:
+    """The one evidence-ownership predicate both no-progress sites apply.
+
+    True only when the evidence stall is enabled, a usable approved matrix
+    yields unsatisfied rows at ``head_sha`` (read from the head-bound coder
+    record as the stall reads them), and every repeated item is tagged with
+    rows that are all among them.
+    """
+    if config.pr_evidence_stall_rounds <= 0:
+        return False
+    unsatisfied_rows = _evidence_owned_rows(records, head_sha, approved_plan_context)
+    item_rows = {
+        item.item_id: tuple(item.evidence_row_ids or ())
+        for item in items
+        if item.item_id in decision.blocking_ids
+    }
+    return defers_to_evidence_stall(item_rows, unsatisfied_rows)
+
+
+def _turn_receipt_ids(evidence_value: object, earlier_turns: frozenset[str]) -> frozenset[str]:
+    from .local_test_evidence import decode_bounded_evidence
+
+    evidence = (
+        decode_bounded_evidence(evidence_value, restore_classification=True)
+        if evidence_value else None
+    )
+    if evidence is None:
+        return frozenset()
+    return frozenset(
+        row.receipt_id for row in evidence.observations
+        if row.receipt_id and row.provenance == "parent-observed"
+        and (row.turn_id or "") not in earlier_turns
+    )
+
+
+def _evidence_turn_ids(evidence_value: object) -> frozenset[str]:
+    from .local_test_evidence import decode_bounded_evidence
+
+    evidence = (
+        decode_bounded_evidence(evidence_value, restore_classification=True)
+        if evidence_value else None
+    )
+    if evidence is None:
+        return frozenset()
+    return frozenset(row.turn_id or "" for row in evidence.observations)
+
+
+def durable_citation_diagnosis(
+    records: Sequence[PostedRoundRecord],
+) -> FollowupCitationDiagnosis | None:
+    """The newest PR coder record's non-array citation diagnosis (#1626), from records.
+
+    The drop and its re-ask come from the record's persisted
+    ``test_observation_degradations``.  A dropped non-array citation list
+    cites nothing, so every parent-observed receipt that record's bounded
+    evidence introduced (rows whose turn the previous coder record did not
+    carry) went uncited.  A live stop and a resumed stop read the same record,
+    so they render the same section.
+    """
+    coders = sorted(
+        (
+            record for record in records
+            if record.metadata.flow == "pr" and record.metadata.role == "coder"
+        ),
+        key=lambda record: record.index,
+    )
+    if not coders:
+        return None
+    latest = coders[-1].metadata
+    non_array = [
+        record
+        for record in latest.test_observation_degradations
+        if record.outcome == CITATION_DROPPED_OUTCOME
+        and record.rule in TEST_OBSERVATIONS_NOT_ARRAY_RULES
+        and record.element_path == "coder_followup.test_observations"
+    ]
+    if not non_array:
+        return None
+    earlier = (
+        _evidence_turn_ids(coders[-2].metadata.local_test_evidence)
+        if len(coders) > 1 else frozenset()
+    )
+    return FollowupCitationDiagnosis(
+        non_array_drop=True,
+        repair_attempted=any(
+            record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE for record in non_array
+        ),
+        uncited_receipts=len(_turn_receipt_ids(latest.local_test_evidence, earlier)),
+    )
 
 
 def _log_no_progress(config: AgentLoopConfig, round_number: int, decision: NoProgressDecision) -> None:
@@ -4404,7 +4479,6 @@ def _pr_dispatch_convergence(
     approved_plan_context: ApprovedPlanContext | None = None,
     open_items: Sequence[UnresolvedReviewItem] = (),
     route: str = "",
-    citation_diagnosis: FollowupCitationDiagnosis | None = None,
 ) -> PrStepBackDecision:
     """The no-progress stop, else the step-back clusters, at a coder dispatch.
 
@@ -4464,20 +4538,13 @@ def _pr_dispatch_convergence(
             _log_no_progress(config, round_number, decision)
             error = _pr_no_progress_error(
                 runner, config, pr_number=pr_number, decision=decision, records=fresh,
-                items=open_items, route=route, citation_diagnosis=citation_diagnosis,
-                base_branch=base_branch,
+                items=open_items, route=route, base_branch=base_branch,
             )
-            unsatisfied_rows = (
-                _evidence_owned_rows(fresh, head_sha, approved_plan_context)
-                if config.pr_evidence_stall_rounds > 0
-                else None
-            )
-            item_rows = {
-                item.item_id: tuple(item.evidence_row_ids or ())
-                for item in open_items
-                if item.item_id in decision.blocking_ids
-            }
-            if defers_to_evidence_stall(item_rows, unsatisfied_rows):
+            if _no_progress_defers_to_evidence_stall(
+                config, records=fresh, head_sha=head_sha,
+                approved_plan_context=approved_plan_context, items=open_items,
+                decision=decision,
+            ):
                 log(
                     config,
                     f"Round {round_number}: the unchanged items are all evidence the "
@@ -4519,8 +4586,8 @@ def _pr_round_start_no_progress(
     head_sha: str | None,
     open_items: Sequence[UnresolvedReviewItem],
     route: str = "",
-    citation_diagnosis: FollowupCitationDiagnosis | None = None,
     base_branch: str | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> None:
     """The no-progress stop at round start, before any reviewer is prompted.
 
@@ -4547,20 +4614,20 @@ def _pr_round_start_no_progress(
     )
     if decision is None:
         return
-    if config.pr_evidence_stall_rounds > 0 and all(
-        item.evidence_row_ids for item in open_items if item.item_id in decision.blocking_ids
+    if _no_progress_defers_to_evidence_stall(
+        config, records=records, head_sha=head_sha,
+        approved_plan_context=approved_plan_context, items=open_items, decision=decision,
     ):
         log(
             config,
-            f"Round {round_number}: the unchanged items all carry evidence rows; the "
-            "dispatch decides between the evidence stall and the no-progress stop",
+            f"Round {round_number}: the unchanged items are all evidence the evidence "
+            "stall may own; the dispatch decides between it and the no-progress stop",
         )
         return
     _log_no_progress(config, round_number, decision)
     raise _pr_no_progress_error(
         runner, config, pr_number=pr_number, decision=decision, records=records,
-        items=open_items, route=route, citation_diagnosis=citation_diagnosis,
-        base_branch=base_branch,
+        items=open_items, route=route, base_branch=base_branch,
     )
 
 

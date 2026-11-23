@@ -1442,6 +1442,35 @@ def test_k_unchanged_rounds_stop_with_exit_4_naming_the_items_head_and_k(tmp_pat
     assert all(r.metadata.followup_dispatch_head == SB_HEAD for r in records if r.metadata.role == "coder")
 
 
+def test_k_unchanged_rounds_stop_under_review_parallel_with_the_union_of_items(tmp_path):
+    """`pr-k-unchanged`, `pr-sequential-default-observations` (parallel case):
+    publication plus reconciliation rounds produce the same observations."""
+    runner = _NoProgressRunner(
+        claude_outputs=_np_coders(),
+        codex_outputs=[_sb_review([NP_A_TEXT])] + [
+            _sb_review(carried=["item-1", "item-2"]) for _ in range(2)
+        ],
+        gemini_outputs=[_gemini_review([NP_B_TEXT])] + [
+            _gemini_review(carried=["item-1", "item-2"]) for _ in range(2)
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=8, review_parallel=True,
+    )
+    message = _np_stop(runner, config)
+    assert f"rounds 1-3 ended with the same head `{SB_HEAD}`" in message
+    # The union of both reviewers' blocking items, each listed once.
+    assert message.count("- [item-") == 2
+    assert NP_A_TEXT in message and NP_B_TEXT in message
+    assert len(_sb_coder_prompts(runner)) == 2
+    assert len(_sb_codex_prompts(runner)) == 3 and len(_sb_gemini_prompts(runner)) == 3
+    records = _np_records(runner, config)
+    assert any(r.metadata.phase == "reconciliation" for r in records)
+    assert max(r.metadata.round_number for r in records) == 3
+    assert not [r for r in records if r.metadata.role == "coder" and r.metadata.round_number == 4]
+    _assert_one_hd_diagnostic(runner, message, label="round 3", reason="pr-no-progress")
+
+
 def test_the_cli_maps_the_no_progress_stop_to_exit_code_4(tmp_path, capsys):
     """`pr-k-unchanged`: exit 4 through the CLI."""
     import coding_review_agent_loop.cli as cli_module
@@ -1628,7 +1657,8 @@ def test_the_no_progress_stop_shows_the_approach_alternative_after_k_reviews_of_
     assert len(_sb_coder_prompts(runner)) == 5
 
 
-def _closed_incomplete_round(round_number, subject):
+def _closure_record(kind, round_number, subject, items):
+    """A tool-owned record closing ``round_number``: closed-incomplete or legacy supersession."""
     from coding_review_agent_loop.round_closure import (
         ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
     )
@@ -1636,39 +1666,85 @@ def _closed_incomplete_round(round_number, subject):
         PostedRoundMetadata,
         _attach_round_metadata,
     )
+    from coding_review_agent_loop.signed_input_record import SIGNED_INPUT_SUPERSESSION_PHASE
 
-    payload = build_round_closure_payload(
-        flow="pr", round_number=round_number, subject=subject,
-        published=[("Codex", None)],
-        unreplayable=[("Codex", "published review could not be replayed")],
-        item_number_high_water=2,
-    )
-    assert payload is not None
+    if kind == "closed-incomplete":
+        payload = build_round_closure_payload(
+            flow="pr", round_number=round_number, subject=subject,
+            published=[("Codex", None)],
+            unreplayable=[("Codex", "published review could not be replayed")],
+            item_number_high_water=len(items),
+        )
+        assert payload is not None
+        fields = {"phase": ROUND_CLOSED_INCOMPLETE_PHASE, "round_closure": payload}
+    else:
+        fields = {
+            "phase": SIGNED_INPUT_SUPERSESSION_PHASE,
+            "signed_input_supersession": {
+                "round": round_number, "head": subject,
+                "superseded": [{"agent": "Codex", "comment_id": None, "route": "re-review"}],
+                "previous_requirement_ids": [], "requirement_ids": [],
+                "item_number_high_water": len(items),
+            },
+        }
     metadata = PostedRoundMetadata(
         flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
-        subject=subject, prior_items=(), new_items=(), phase=ROUND_CLOSED_INCOMPLETE_PHASE,
-        round_closure=payload,
+        subject=subject, prior_items=tuple(items), new_items=(), **fields,
     )
-    return _attach_round_metadata(f"Review round {round_number} closed, incomplete.", metadata)
+    return _attach_round_metadata(f"Review round {round_number} closed.", metadata)
 
 
-def test_a_closed_incomplete_round_breaks_the_window_on_resume(tmp_path):
-    """`pr-incomplete-round-breaks-window`: control is the round-start stop above."""
+def _interrupted_after_round_three_review(tmp_path):
+    """K=4: rounds 1-3 are reviewed identically, coder records 2-3 land, and the
+    round-3 coder turn is interrupted, so round 3 has a published review only."""
+    runner = _NoProgressRunner(claude_outputs=_np_coders(2), codex_outputs=_np_reviews(3))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, no_progress_rounds=4))
+    assert len(_sb_coder_prompts(runner)) == 3 and len(_sb_codex_prompts(runner)) == 3
+    return runner
+
+
+def test_round_three_without_a_closure_still_stops_on_the_first_window(tmp_path):
+    """Control for the closure tests: resuming round 3 stops on rounds 1-3."""
+    runner = _interrupted_after_round_three_review(tmp_path)
+    message = _np_stop(runner, _sb_config(tmp_path))
+    assert "rounds 1-3 ended with the same head" in message
+    assert len(_sb_codex_prompts(runner)) == 3
+
+
+@pytest.mark.parametrize("kind", ["closed-incomplete", "legacy-supersession"])
+def test_a_closed_round_breaks_the_window_until_a_new_full_window(tmp_path, kind):
+    """`pr-incomplete-round-breaks-window` (resume): the closed round never counts,
+    its replacement review completes, and the stop waits for rounds 4-6."""
     from pr_loop_test_helpers import _append_orchestrator_record
 
-    runner = _interrupted_after_three_unchanged_rounds(tmp_path)
-    _append_orchestrator_record(runner, _closed_incomplete_round(3, SB_HEAD))
-    reviews_before = len(_sb_codex_prompts(runner))
-    runner.codex_outputs.append(_sb_review(resolved=["item-1", "item-2"]))
-    runner.claude_outputs.extend(_np_coders(1))
-    try:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    except HumanDecisionRequiredError as exc:  # pragma: no cover - the failure mode
-        pytest.fail(f"a closed-incomplete round counted toward the window: {exc}")
-    except AgentLoopError:
-        pass  # later resume handling may still stop; the window never fires
-    assert len(_sb_codex_prompts(runner)) > reviews_before  # a reviewer was prompted
-    assert not any(NO_PROGRESS_PREFIX_TEXT in body for body in _hd_diagnostics(runner))
+    runner = _interrupted_after_round_three_review(tmp_path)
+    config = _sb_config(tmp_path)
+    coder_three = next(
+        r.metadata for r in _np_records(runner, config)
+        if r.metadata.role == "coder" and r.metadata.round_number == 3
+    )
+    _append_orchestrator_record(
+        runner, _closure_record(kind, 3, SB_HEAD, coder_three.prior_items)
+    )
+    runner.codex_outputs.extend(_sb_review(carried=["item-1", "item-2"]) for _ in range(3))
+    runner.claude_outputs.extend(_np_coders(3))
+    message = _np_stop(runner, config)
+    # The closed round never counts, live or durable: the first window that can
+    # fill is rounds 4-6, after three completed replacement reviews.
+    assert f"rounds 4-6 ended with the same head `{SB_HEAD}`" in message
+    assert "[item-1]" in message and "[item-2]" in message
+    assert len(_sb_codex_prompts(runner)) == 6
+    # A closed-incomplete round rolls straight over to round 4; the legacy
+    # supersession boundary resumes round 3's interrupted coder turn first.
+    assert len(_sb_coder_prompts(runner)) == (5 if kind == "closed-incomplete" else 6)
+    records = _np_records(runner, config)
+    assert sorted(
+        r.metadata.round_number for r in records if r.metadata.role == "reviewer"
+    ) == [1, 2, 3, 4, 5, 6]
+    # No further review was posted into the closed round, and the stop wrote nothing.
+    assert max(r.metadata.round_number for r in records) == 6
+    assert not [r for r in records if r.metadata.role == "coder" and r.metadata.round_number == 7]
 
 
 def _with_legacy_step_back_entries(runner, entries):
@@ -1955,3 +2031,50 @@ def test_a_converging_run_posts_no_human_decision_diagnostic(tmp_path):
     )
     assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
     assert _hd_diagnostics(runner) == []
+
+
+# --- Second step-back window through the real loop (`pr-step-back-trigger-derived`) ---
+
+
+def _six_clustered_blocks():
+    """Six consecutive clustered new-finding blocks, then an approval."""
+    reviews = [_sb_review([f"gap one at src/spool.py:{100 + 4 * n}"],
+                          resolved=[f"item-{n}"] if n else []) for n in range(6)]
+    return [*reviews, _sb_review(resolved=["item-6"])]
+
+
+def _six_coders():
+    return [structured_coder_followup(addressed_items=[f"item-{n}"]) for n in range(1, 7)]
+
+
+def _step_back_flags(prompts, marker):
+    return [index for index, prompt in enumerate(prompts) if marker in prompt]
+
+
+def test_step_back_turns_fire_at_k_and_2k_with_sweeps_on_the_following_heads(tmp_path):
+    """Fresh: step-back prompts only at rounds 3 and 6; sweeps only on reviews 4 and 7."""
+    runner = _StepBackRunner(claude_outputs=_six_coders(), codex_outputs=_six_clustered_blocks())
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=10)) == 0
+    assert _step_back_flags(_sb_coder_prompts(runner), "STEP-BACK TURN") == [2, 5]
+    assert _step_back_flags(_sb_codex_prompts(runner), "Enumerate ALL remaining instances") == [3, 6]
+    assert _hd_diagnostics(runner) == []
+
+
+@pytest.mark.parametrize(
+    "entries", [None, [LEGACY_ENTRY], "not-a-list"], ids=["absent", "valid", "malformed"],
+)
+def test_resumed_second_step_back_window_routes_identically_with_legacy_entries(tmp_path, entries):
+    """Resume at the 2K dispatch: legacy entries never suppress or move the trigger."""
+    coders = _six_coders()
+    runner = _StepBackRunner(claude_outputs=coders[:5], codex_outputs=_six_clustered_blocks()[:6])
+    config = _sb_config(tmp_path, max_rounds=10)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    if entries is not None:
+        _with_legacy_step_back_entries(runner, entries)
+    runner.claude_outputs.append(coders[5])
+    runner.codex_outputs.append(_six_clustered_blocks()[6])
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Index 5 is the interrupted 2K dispatch, index 6 its resumed retry.
+    assert _step_back_flags(_sb_coder_prompts(runner), "STEP-BACK TURN") == [2, 5, 6]
+    assert _step_back_flags(_sb_codex_prompts(runner), "Enumerate ALL remaining instances") == [3, 6]

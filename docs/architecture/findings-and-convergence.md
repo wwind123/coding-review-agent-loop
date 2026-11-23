@@ -267,8 +267,12 @@ head-bound coder record as the stall reads them, and `--pr-evidence-stall-rounds
 is enabled), the dispatch returns the built error as
 `PrStepBackDecision.deferred_stop`: the loop raises it right after
 `_pr_evidence_stall_decision` when the stall did not stop, or before the
-round-limit exit on the final or a merge-conflict round. Round start leaves such
-windows to the dispatch.
+round-limit exit on the final or a merge-conflict round. Round start applies the
+same predicate (`_no_progress_defers_to_evidence_stall`) to its durable records,
+so a tag naming a satisfied row or a head without usable matrix evidence never
+defers; only an evidence-owned window is left to the dispatch. A closure boundary
+excludes its round number at both sites, including the just-settled `current`
+round, so a replacement review that reuses the number never counts.
 
 `render_no_progress_message` (registered in `HUMAN_DECISION_RENDERERS`) opens
 with `NO_PROGRESS_PREFIX_TEXT` after the `PR #N: ` lead and lists the sorted IDs
@@ -277,7 +281,10 @@ route or diagnostic of a retired stop is kept as an optional section, emitted
 only when present: the PR size from `_pr_size_measurement` (merge-base
 `git diff --shortstat`, never raising; omitted when unavailable), the newest
 PR coder record's `unsuperseded_receipts_sentence` and `tool_identity_clause`,
-the in-memory non-array citation diagnosis of the last accepted follow-up, the
+the non-array citation diagnosis read back from that record
+(`durable_citation_diagnosis`: its persisted `test_observation_degradations`,
+and the receipts its bounded evidence introduced, all uncited once the list was
+dropped), so a resumed stop renders the same section as the live one, the
 newest `Approach alternative:` excerpt at the stop head
 (`review_step_back.pr_approach_alternative_at_head`, selected even after later
 reviews of that head), and the child-plan supersession route for a PR bound to
