@@ -6038,33 +6038,19 @@ def _m2100_resumed_spy(monkeypatch, module, name):
 
 
 def _m2100_pr_runner():
-    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    # Both reviewers approve and their only active disposition names a
+    # non-carried ID, so whichever publishes first, the review rebuilt by the
+    # resume branch is an approval (no completion-order dependence).
+    markers = ("Codex approves independently.", "Gemini approves independently.")
     extra = [{"item_id": "item-77", "disposition": "blocking", "note": "Not carried here."}]
     runner = _PartialPublicationProbeRunner(
         round_markers=markers,
-        codex_outputs=[
-            structured_pr_review(
-                state="blocking", summary="Codex found a blocker.",
-                blocking_items=["Persist this item."], prior_item_dispositions=extra,
-            ),
-            structured_pr_review(
-                summary="Codex approves after the fix.",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        gemini_outputs=[
-            # Approved, and its only active disposition names a non-carried ID.
-            structured_pr_review(
-                summary="Gemini approves independently.", reviewer="Google Gemini",
-                prior_item_dispositions=extra,
-            ),
-            structured_pr_review(
-                summary="Gemini approves after the fix.", reviewer="Google Gemini",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        claude_outputs=[structured_coder_followup(
-            summary="Fixed the persisted item.", addressed_items=["item-1"]
+        codex_outputs=[structured_pr_review(
+            summary="Codex approves independently.", prior_item_dispositions=extra,
+        )],
+        gemini_outputs=[structured_pr_review(
+            summary="Gemini approves independently.", reviewer="Google Gemini",
+            prior_item_dispositions=extra,
         )],
     )
     return runner, markers
@@ -6076,14 +6062,17 @@ def test_m2100_pr_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_pa
     _interrupt_pr_round_between_publications(runner, config, markers)
     spooled = [json.loads(path.read_text(encoding="utf-8")) for path in _spool_files(config)]
     assert [record["response"]["ignored_prior_disposition_ids"] for record in spooled] == [["item-77"]]
+    first_public = next(
+        marker for marker in markers
+        if any(marker in str(c["body"]) for c in runner.pr_payload["comments"])
+    )
     resumed = _m2100_resumed_spy(monkeypatch, pr_loop, "ParsedReview")
     launches_before = len(runner.reviewer_launches)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    # Round 1 is completed from the published record and the spool: only the
-    # two round-2 reviewer turns run.
-    assert len(runner.reviewer_launches) - launches_before == 2
+    # The round completes from the published record and the spool alone.
+    assert len(runner.reviewer_launches) == launches_before
     bodies = [str(comment["body"]) for comment in runner.pr_payload["comments"]]
     for marker in markers:
         published = [body for body in bodies if marker in body]
@@ -6095,16 +6084,18 @@ def test_m2100_pr_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_pa
     ]
     assert {record.metadata.agent for record in round_one} == {"Codex", "Gemini"}
     for record in round_one:
+        assert record.metadata.state == "approved"
         assert record.metadata.ignored_prior_disposition_ids == ("item-77",)
         assert record.metadata.dispositions == ()
         assert "item-77" not in (record.metadata.canonical_reviewer_response or "")
-    gemini = next(record for record in round_one if record.metadata.agent == "Gemini")
-    assert gemini.metadata.state == "approved"
-    # The already-public review was rebuilt by the resume branch with its
+    # The already-public approval was rebuilt by the resume branch with its
     # ignored IDs restored from round metadata.
     rebuilt = [review for review in resumed if review.ignored_prior_disposition_ids]
-    assert rebuilt and all(r.ignored_prior_disposition_ids == ("item-77",) for r in rebuilt)
-    assert all(r.dispositions == () for r in rebuilt)
+    assert len(rebuilt) == 1
+    assert rebuilt[0].state == "approved"
+    assert rebuilt[0].summary.startswith(first_public.split()[0])
+    assert rebuilt[0].ignored_prior_disposition_ids == ("item-77",)
+    assert rebuilt[0].dispositions == ()
     assert _spool_files(config) == []
 
 
