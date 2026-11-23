@@ -1151,3 +1151,49 @@ def test_discussion_synthesis_strict_fields_still_accept_canonical():
     assert _parse_discuss_synthesis_position(
         {"reviewers": ["Claude"], "position": ["P"]}, context="pos"
     ).position == "P"
+
+
+
+@pytest.mark.parametrize(
+    "base,spelling",
+    [(ARCH, "Unchanged"), (ARCH, " UNCHANGED "), (ARCH, "unchanged"),
+     (CORROBORATED_CHANGED, "Changed"), (CORROBORATED_CHANGED, "CHANGED")],
+    ids=["unchanged-title", "unchanged-upper", "unchanged-canonical", "changed-title", "changed-upper"],
+)
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_declared_status_fold_is_identical_in_every_mode(base, spelling, mode):
+    # Legacy decoding (used to re-parse accepted planner text) folds declared
+    # tokens before its synonym table, so no normalization note is added and
+    # the canonical payload and plan identity equal the canonical spelling.
+    from coding_review_agent_loop.plan_assembly import _architecture_payload
+
+    variant = parse_architecture_impact(dict(base, status=spelling), architecture_status_mode=mode)
+    canonical = parse_architecture_impact(dict(base), architecture_status_mode=mode)
+    assert variant == canonical
+    assert variant.uncertainty == canonical.uncertainty == ()
+    assert _architecture_payload(variant) == _architecture_payload(canonical)
+
+
+def test_legacy_mode_keeps_synonym_note_for_real_synonyms():
+    parsed = parse_architecture_impact(dict(ARCH, status="no_change"), architecture_status_mode="legacy")
+    assert parsed.status == "unchanged"
+    assert any("synonym" in note for note in parsed.uncertainty)
+
+
+def test_legacy_plan_state_identity_matches_canonical_for_declared_case_variant():
+    from coding_review_agent_loop.plan_assembly import aggregate_plan_identity, _architecture_payload
+
+    def identity(status):
+        parsed = validate_structured_plan_state(
+            _plan_text(_plan_state(architecture_impact=dict(ARCH, status=status))),
+            require_execution_strategy_contract=1, architecture_status_mode="legacy",
+        )
+        return parsed, _architecture_payload(parsed.architecture_impact)
+
+    variant, variant_payload = identity("Unchanged")
+    canonical, canonical_payload = identity("unchanged")
+    assert variant == canonical
+    assert variant_payload == canonical_payload
+    assert aggregate_plan_identity({"architecture_impact": variant_payload}) == aggregate_plan_identity(
+        {"architecture_impact": canonical_payload}
+    )

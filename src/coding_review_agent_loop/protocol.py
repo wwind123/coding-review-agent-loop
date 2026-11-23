@@ -799,15 +799,19 @@ def _parse_architecture_impact_payload(
                     f"{context}.status {kind}", payload, context=context
                 )
         raw_status = _expect_non_empty_string(payload["status"], context=f"{context}.status")  # shape-check: fatal:no-conservative-reading
+        # #2109: fold a case/separator variant of a declared status first, in
+        # every mode, so legacy decoding leaves no synonym note for it and the
+        # assessment (and plan identity) equals the canonical spelling.
+        raw_status = fold_enum_value(
+            raw_status, ARCHITECTURE_IMPACT_DECLARED_STATUSES, context=f"{context}.status"
+        )
         if legacy:
             # Compatibility decode of text stored or posted before #925 (#916).
             status, normalization_note = _normalize_architecture_status(  # shape-check: fatal:no-conservative-reading
                 raw_status, payload, context=context
             )
         else:
-            status = fold_enum_value(
-                raw_status, ARCHITECTURE_IMPACT_DECLARED_STATUSES, context=f"{context}.status"
-            )
+            status = raw_status
             if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
                 raise _missing_status_error(  # shape-check: fatal:no-conservative-reading
                     f"{context}.status must be `changed` or `unchanged`.", payload, context=context
