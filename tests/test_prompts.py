@@ -2333,7 +2333,7 @@ def test_review_prompt_includes_signed_human_requirements(tmp_path):
     assert "Please use the absolute URL." in prompt
     assert "Signed human reviewer requirements were not author-verified" in prompt
     assert "override AI reviewer preferences" not in prompt
-    assert "Verify each requirement in this set before approving." in prompt
+    assert "Verify each in-scope requirement" in prompt  # freeze-scoped acknowledgement (#2083)
     assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in prompt
 
 def test_review_prompt_includes_failing_github_check_status(tmp_path):

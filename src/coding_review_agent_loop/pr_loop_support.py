@@ -208,7 +208,7 @@ from .review_scheduling import (
     classify_transition,
 )
 from .unresolved_items import (
-    ClearedItemProgress,
+    ClearedItemProgress, split_acknowledgement_obligations,
     newly_stalled_items,
     render_sub_item_progress_summary,
     sub_item_progress,
@@ -1477,6 +1477,7 @@ def _round_limit_blocker_message(
             "The named reviewer/owner must provide actionable resolution evidence."
             + evidence_suffix
         )
+    repair, acknowledgement_note = split_acknowledgement_obligations(repair)  # #2083
     if repair:
         details = ", ".join(
             f"{item.obligation_kind or 'unknown'} ({item.item_id})"
@@ -1487,8 +1488,10 @@ def _round_limit_blocker_message(
             "awaiting a new repair head: "
             f"{details}. Reviewer approval cannot clear them; push a strictly "
             "different corrected head."
-            + evidence_suffix
+            + acknowledgement_note + evidence_suffix
         )
+    if acknowledgement_note:
+        return f"PR #{pr_number} has blocking issues after round {round_number}:{acknowledgement_note}{evidence_suffix}"
     if candidates:
         details = ", ".join(
             f"{item.obligation_kind or 'unknown'} ({item.item_id})"
@@ -5952,8 +5955,10 @@ def _record_failed_acknowledgement(
         text=(
             f"Reviewer(s) {', '.join(missing_reviewers)} approved without "
             "acknowledging the signed human requirements. Coder must address the "
-            "coder-owned signed human requirements surfaced in its prompt; the "
-            "reviewer must explicitly resolve the whole signed set before approval. "
+            "coder-owned signed human requirements surfaced in its prompt; each "
+            "required reviewer must explicitly acknowledge the in-scope signed "
+            "requirements at the current head (under --pr-human-evidence freeze, those "
+            "not routed to human-only or evidence-only evidence; otherwise all of them). "
             "Reviewer-owned (evidence-only/human-only) signed requirements are not "
             "coder work and need no coder disposition."
         ),
@@ -5961,7 +5966,7 @@ def _record_failed_acknowledgement(
     post_comment(
         runner, config=config, pr_number=pr_number,
         body=_attach_round_metadata(
-            "Reviewer acknowledgement repair remains blocked.",
+            "Signed human requirements acknowledgement remains pending.",
             bound_metadata(
                 flow="pr", role="summary", agent="Orchestrator",
                 round_number=source_round, subject=subject, prior_items=tuple(items),

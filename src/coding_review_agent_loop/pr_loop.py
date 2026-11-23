@@ -6639,6 +6639,12 @@ def run_pr_loop(
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:
+                # Acknowledgement scope (#2083) is the projected set: under freeze it
+                # excludes agreed human-only/evidence-only sources, so an approval
+                # (including one normalized from an evidence-only block) without the
+                # marker mints nothing when only those remain; the clearing check
+                # above already dropped any carried item. Advisory/off keep the
+                # whole signed set because classification is discarded there.
                 if coder_requirements:
                     missing_acknowledgements = [
                         reviewer_name

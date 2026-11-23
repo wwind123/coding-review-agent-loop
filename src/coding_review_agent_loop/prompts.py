@@ -2931,7 +2931,8 @@ def _build_compact_pr_review_prompt(
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
     checks_block = f"{format_pr_checks(pr_checks)}\n" if pr_checks is not None else ""
     human_requirements_guidance = prompt_support._human_requirements_review_guidance(
-        human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids
+        human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+        scoped_acknowledgement=getattr(config, "pr_human_evidence", "advisory") == "freeze",
     )
     non_future_items = [item for item in unresolved_items if item.status != "future"]
     if non_future_items:
@@ -3456,7 +3457,8 @@ def build_review_prompt(
     url_line = f"- URL: {metadata.url}\n" if metadata.url else ""
     checks_block = f"{format_pr_checks(pr_checks)}\n" if pr_checks is not None else ""
     human_requirements_guidance = prompt_support._human_requirements_review_guidance(
-        human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids
+        human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+        scoped_acknowledgement=getattr(config, "pr_human_evidence", "advisory") == "freeze",
     )
     unresolved_items_block = _format_unresolved_review_items(unresolved_items, released_disputes)
     if unresolved_items:
