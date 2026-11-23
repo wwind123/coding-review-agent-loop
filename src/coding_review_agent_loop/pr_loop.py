@@ -86,7 +86,8 @@ from .round_state import (
     drop_inert_post_reconciliation_checkpoints,
     startup_force_full_latch,
 )
-from .round_metadata import reset_pr_board_stamp, set_pr_board_stamp
+from .round_metadata import reset_pr_board_stamp, set_pr_board_stamp, reset_human_checks_stamp, set_human_checks_stamp
+from .human_evidence_mode import HUMAN_CHECKS_FLOW, HumanEvidenceRun
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
@@ -2295,8 +2296,10 @@ def run_pr_loop(
 
         live_evidence_requirements = []
         unchanged_head_approvals = {}
+        human_evidence = HumanEvidenceRun(config, pr_number)  # --pr-human-evidence (#2063)
 
         def evidence_freeze_gate(*args, round_number: int, **kwargs):
+            kwargs["items"][:] = human_evidence.normalize(kwargs["items"], round_number=round_number, head_sha=kwargs.get("head_sha"), clearances=kwargs.get("clearances", ()))
             kwargs["live_requirements"] = live_evidence_requirements
             kwargs["configured_reviewers"] = tuple(agent_display_name(r) for r in configured_reviewers)
             kwargs["carried_reviews"] = tuple(unchanged_head_approvals.values())
@@ -2316,6 +2319,7 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        human_evidence.seed(startup_records, _extract_round_metadata_records(initial_pr_context.comments, flow=HUMAN_CHECKS_FLOW))
         # Advisory per-run finding history (#1273), seeded once from the records
         # just extracted through the authoritative path above.
         pr_finding_history = FindingHistoryLedger(
@@ -2492,6 +2496,7 @@ def run_pr_loop(
             pr_contract_lineage, configured=identity_from_config(config)
         )
         pr_board_stamp_token = set_pr_board_stamp(pr_board_stamp)
+        human_checks_token = set_human_checks_stamp(human_evidence)
         pr_amendment_digest = pr_contract_lineage.active_digest
         pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
         pr_qualification_board_check = qualification_board_check(
@@ -3337,7 +3342,7 @@ def run_pr_loop(
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
-                human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments))),
+                human_requirements=(resumed_coder_requirements := historical_projection(human_requirements, native_history(runner, config, pr_number, pr_comments)) if human_evidence.freeze else human_requirements),
                 source_round=round_number, reviewer_owned_requirement_ids=(reviewer_owned_requirement_ids := reviewer_owned_ids(human_requirements, resumed_coder_requirements)),
                 human_requirements_degraded=bool(latest_coder_metadata is not None and latest_coder_metadata.human_requirements_degraded),
             )
@@ -3348,6 +3353,7 @@ def run_pr_loop(
                 unresolved_items,
                 current_head_sha=pr_metadata.head_sha,
             )
+            unresolved_items = human_evidence.normalize(unresolved_items, round_number=round_number, head_sha=pr_metadata.head_sha, clearances=evidence_clearances)
             # Live-head reconciliation of converted evidence (#1325): after the
             # authoritative (resume) ledger assignment, so the replacement can
             # never discard what it reopens, and the last assignment before the
@@ -3376,7 +3382,7 @@ def run_pr_loop(
                     records=round_authority_records,
                     history_complete=round_authority_complete,
                     in_process_audits=conversion_audits_state,
-                )
+                ) if human_evidence.freeze else unresolved_items
             if operator_conversion_pending:
                 # Operator conversion takes effect before any reviewer or coder;
                 # an invalid row list fails closed before anything is posted.
@@ -3590,6 +3596,18 @@ def run_pr_loop(
                             f"{pr_metadata.head_sha}: {'; '.join(gate_reasons)}",
                         )
                         evidence_skip_reviewers = True
+                    elif human_evidence.releases_freeze(unresolved_items):
+                        # A non-freeze mode (#2063) releases the native freeze; its items
+                        # are already on the advisory list (or dropped under off).
+                        unresolved_items = _publish_evidence_release(
+                            runner, config=config, pr_number=pr_number, round_number=round_number,
+                            head_sha=str(pr_metadata.head_sha), items=unresolved_items, reason="advisory-mode",
+                            surfaced_requirement_ids=freeze_payload.signed_requirement_ids_at_freeze,
+                            allowed_rounds=allowed_rounds, watch_failure_extension_used=watch_failure_extension_used,
+                            watch_head_extension_used=watch_head_extension_used, clearances=evidence_clearances,
+                            signed_evidence_references=current_signed_references())
+                        evidence_skip_reviewers = evidence_revalidation_required = True
+                        evidence_surfaced_baseline = freeze_payload.signed_requirement_ids_at_freeze
                     else:
                         if evidence_budget_correction_pending:
                             # Only the budget was invalid: keep the frozen
@@ -3694,6 +3712,7 @@ def run_pr_loop(
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
             unresolved_items, next_unresolved_item_number = restore_for_new_input(unresolved_items, current_resume, human_requirements, native_history(runner, config, pr_number, pr_comments), next_unresolved_item_number)
+            unresolved_items = human_evidence.normalize(unresolved_items, round_number=round_number, head_sha=pr_metadata.head_sha, clearances=evidence_clearances)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
@@ -4144,7 +4163,7 @@ def run_pr_loop(
                         )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
-                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: validate_associations(_validate_review_response(
+                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: (validate_associations if human_evidence.freeze else lambda parsed, *_: parsed)(_validate_review_response(
                     text,
                     reviewer=reviewer_name,
                     unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
@@ -4155,6 +4174,7 @@ def run_pr_loop(
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
+                    parse_requirement_evidence=human_evidence.freeze,
                 ), human_requirements, prior_unresolved_items, reviewer_name), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
 
             def _pr_publication(reviewer_name: str):
@@ -4919,7 +4939,7 @@ def run_pr_loop(
                         bound_pr_metadata(
                             flow="pr", role="reviewer", agent=reviewer_name,
                             round_number=round_number, subject=current_pr_subject,
-                            prior_items=prior_unresolved_items, dispositions=publication_dispositions(parsed, review_output, reviewer_name, prior_unresolved_items),
+                            prior_items=prior_unresolved_items, dispositions=publication_dispositions(parsed, review_output, reviewer_name, prior_unresolved_items, parse_requirement_evidence=human_evidence.freeze),
                             new_items=new_items, state=parsed.state, model_used=model_used,
                             sub_item_degradations=tuple(parsed.sub_item_degradations),
                             **(_metadata_identity_fields(identity) if identity is not None else {}),
@@ -5342,7 +5362,7 @@ def run_pr_loop(
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                                 superseded_prepanel_review_context=_superseded_prepanel_review(
-                                    superseded_prepanel_reviews.get(agent_display_name(reviewer))
+                                    superseded_prepanel_reviews.get(agent_display_name(reviewer)), parse_requirement_evidence=human_evidence.freeze
                                 ),
                                 sweep_context=pr_step_back_sweeps.get(
                                     agent_display_name(reviewer), ""
@@ -5545,7 +5565,8 @@ def run_pr_loop(
                     review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                     review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
                     structured_review = (
-                        parse_structured_pr_review(review_output, reviewer=reviewer_name, architecture_status_mode="legacy")
+                        parse_structured_pr_review(review_output, reviewer=reviewer_name, architecture_status_mode="legacy",
+                                                   parse_requirement_evidence=human_evidence.freeze)
                         if canonical_review_output is not None
                         else None
                     )
@@ -5718,7 +5739,7 @@ def run_pr_loop(
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                                 superseded_prepanel_review_context=_superseded_prepanel_review(
-                                    superseded_prepanel_reviews.get(reviewer_name)
+                                    superseded_prepanel_reviews.get(reviewer_name), parse_requirement_evidence=human_evidence.freeze
                                 ),
                                 sweep_context=pr_step_back_sweeps.get(reviewer_name, ""),
                             ),
@@ -5783,7 +5804,10 @@ def run_pr_loop(
                     reviewer_new_unresolved_items = []
 
                 classification_input = review_output
-                parsed_review, review_output = classify_review(parsed_review, review_output,
+                # Signed-source classification is freeze-only (#2063): elsewhere every
+                # signed requirement stays an ordinary coder-owned requirement.
+                classify = classify_review if human_evidence.freeze else (lambda parsed, text, **_: (dataclasses_replace(parsed, requirement_evidence=()), text))
+                parsed_review, review_output = classify(parsed_review, review_output,
                     requirements=human_requirements, items=prior_unresolved_items, reviewer_name=reviewer_name, previous=classified_review_carriers,
                     **({"pinned_review": parsed_review, "force_continuation": classification_resume_kinds[reviewer_name] == "pending"} if resumed_record is not None and reviewer_name in classification_resume_kinds else {}),
                     invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config, prompt=prompt,
@@ -6256,6 +6280,7 @@ def run_pr_loop(
                 runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
             unresolved_items, post_merge_next = reviewer_requests(post_merge_run, accepted_review_carriers, items=unresolved_items, metadata=pr_metadata, round_number=round_number, board=tuple(agent_display_name(r) for r in configured_reviewers), next_number=next_unresolved_item_number)
             next_unresolved_item_number = max(next_unresolved_item_number, post_merge_next)
+            unresolved_items = human_evidence.normalize(unresolved_items, round_number=round_number, head_sha=pr_metadata.head_sha)
             if round_evidence_clearances:
                 evidence_revalidation_required = True
                 log(
@@ -6862,7 +6887,7 @@ def run_pr_loop(
                     # Exact-head evidence gate (#1068): the last reads before any
                     # finalization side effect; publishes the single freeze when evidence
                     # is pending, and otherwise revalidates head and signed input.
-                    if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                    if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                         gate_outcome = evidence_freeze_gate(
                             runner,
                             config=config,
@@ -6895,6 +6920,7 @@ def run_pr_loop(
                         items=unresolved_items,
                         current_head_sha=pr_metadata.head_sha,
                         capability=ordinary_recovery,
+                        hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
                     )
                     if merged:
                         print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
@@ -7326,7 +7352,7 @@ def run_pr_loop(
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
-                        if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                        if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                             gate_outcome = evidence_freeze_gate(
                                 runner,
                                 config=config,
@@ -7359,6 +7385,8 @@ def run_pr_loop(
                             sub_item_stall_rounds=config.no_progress_rounds,
                             config=config,
                         )
+                        if human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=config.auto_merge):
+                            return 0
                         if config.auto_merge:
                             if not watch_outcome.head_sha:
                                 raise AgentLoopError(
@@ -8007,7 +8035,7 @@ def run_pr_loop(
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
-                                if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                                if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                                     gate_outcome = evidence_freeze_gate(
                                         runner,
                                         config=config,
@@ -8040,6 +8068,7 @@ def run_pr_loop(
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
                                     capability=ordinary_recovery,
+                                    hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
                                 )
                                 if merged:
                                     print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
@@ -8257,7 +8286,7 @@ def run_pr_loop(
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
-                                if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                                if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                                     gate_outcome = evidence_freeze_gate(
                                         runner,
                                         config=config,
@@ -8290,6 +8319,8 @@ def run_pr_loop(
                                     sub_item_stall_rounds=config.no_progress_rounds,
                                     config=config,
                                 )
+                                if human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=config.auto_merge):
+                                    return 0
                                 if config.auto_merge:
                                     managed_ci_qualified = True
                                     prepare_v2_merge(
@@ -8580,7 +8611,7 @@ def run_pr_loop(
                             # Exact-head evidence gate (#1068): the last reads before any
                             # finalization side effect; publishes the single freeze when evidence
                             # is pending, and otherwise revalidates head and signed input.
-                            if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                            if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                                 gate_outcome = evidence_freeze_gate(
                                     runner,
                                     config=config,
@@ -8613,6 +8644,7 @@ def run_pr_loop(
                                 items=unresolved_items,
                                 current_head_sha=pr_metadata.head_sha,
                                 capability=ordinary_recovery,
+                                hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
                             )
                             if merged:
                                 print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
@@ -8644,7 +8676,7 @@ def run_pr_loop(
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
-                        if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
+                        if evidence_revalidation_required or human_evidence.gate_needed(unresolved_items):
                             gate_outcome = evidence_freeze_gate(
                                 runner,
                                 config=config,
@@ -8678,6 +8710,8 @@ def run_pr_loop(
                             observations=finalization_observations,
                             config=config,
                         )
+                        if human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=config.auto_merge):
+                            return 0
                         manual_pending(post_merge_run)
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
@@ -8830,7 +8864,7 @@ def run_pr_loop(
             try:
                 evidence_stall_outcome = (
                     None
-                    if has_merge_conflict_item
+                    if has_merge_conflict_item or not human_evidence.freeze
                     else _pr_evidence_stall_decision(
                         runner,
                         config,
@@ -9755,6 +9789,7 @@ def run_pr_loop(
                     log(config, message + diagnostic)
         finally:
             if pr_board_stamp_token is not None:
+                reset_human_checks_stamp(human_checks_token)
                 reset_pr_board_stamp(pr_board_stamp_token)
             _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:

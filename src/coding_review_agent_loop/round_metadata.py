@@ -413,6 +413,11 @@ class PostedRoundMetadata:
     visual_lifecycle: object = None
     visual_lifecycle_present: bool = False
     capture_review_binding: object = None
+    # Advisory human-checks list (#2063): serialized ``HumanCheck`` entries,
+    # each with its complete removed ledger item.  Written on orchestrator PR
+    # records while the advisory list is non-empty and on the human-checks
+    # comment; omitted when empty so historical records stay byte-stable.
+    human_checks: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -1404,7 +1409,9 @@ EVIDENCE_TERMINAL_PHASES = frozenset({EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PH
 # post-conversion ledger and the audit, and is written before any dispatch.
 EVIDENCE_CONVERSION_PHASE = "evidence-conversion"
 EVIDENCE_RELEASE_REASONS = frozenset(
-    {"evidence-cleared", "findings", "machine-gate", "refresh-clean", "screenshot-coverage", "post-merge-scheduled"}
+    {"evidence-cleared", "findings", "machine-gate", "refresh-clean", "screenshot-coverage", "post-merge-scheduled",
+     # #2063: a non-freeze --pr-human-evidence mode released a native freeze.
+     "advisory-mode"}
 )
 
 
@@ -2490,6 +2497,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["requirement_evidence"] = list(metadata.requirement_evidence)
     if metadata.evidence_requests:
         payload["evidence_requests"] = list(metadata.evidence_requests)
+    if metadata.human_checks:
+        payload["human_checks"] = [dict(entry) for entry in metadata.human_checks]
     if metadata.evidence_freeze is not None:
         payload["evidence_freeze"] = metadata.evidence_freeze.as_dict()
     if metadata.evidence_release is not None:
@@ -2857,6 +2866,11 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
         if requests is None:
             raise ValueError("evidence_requests must be a list of non-empty strings")
         fields["evidence_requests"] = requests
+    if "human_checks" in payload:
+        # Advisory and lenient (#2063): a malformed entry is dropped and logged
+        # without failing the record.
+        from .human_evidence_mode import decode_human_check_entries
+        fields["human_checks"] = decode_human_check_entries(payload["human_checks"])
     if "evidence_freeze" in payload:
         fields["evidence_freeze"] = EvidenceFreezeRecord.from_mapping(payload["evidence_freeze"])
     if "evidence_release" in payload:
@@ -3288,6 +3302,21 @@ def reset_pr_board_stamp(token: "contextvars.Token") -> None:
     _PR_BOARD_STAMP.reset(token)
 
 
+# The advisory human-checks list of the running PR loop (#2063), stamped on
+# orchestrator PR records at the same single encoder while it is non-empty.
+_HUMAN_CHECKS_STAMP: "contextvars.ContextVar[object | None]" = contextvars.ContextVar(
+    "human_checks_stamp", default=None
+)
+
+
+def set_human_checks_stamp(stamp: object | None) -> "contextvars.Token":
+    return _HUMAN_CHECKS_STAMP.set(stamp)
+
+
+def reset_human_checks_stamp(token: "contextvars.Token") -> None:
+    _HUMAN_CHECKS_STAMP.reset(token)
+
+
 # The plan board stamp of the running plan loop (#1377), applied only to
 # plan-flow records at the same single encoder.
 _PLAN_BOARD_STAMP: "contextvars.ContextVar[object | None]" = contextvars.ContextVar(
@@ -3337,6 +3366,10 @@ def _attach_round_metadata(
     stamp = _PR_BOARD_STAMP.get()
     if stamp is not None and metadata.flow == "pr":
         metadata = stamp.apply(metadata)  # type: ignore[attr-defined]
+    checks_stamp = _HUMAN_CHECKS_STAMP.get()
+    if checks_stamp is not None and metadata.flow == "pr" and metadata.agent == "Orchestrator" \
+            and not metadata.human_checks:
+        metadata = replace(metadata, human_checks=checks_stamp.stamp())  # type: ignore[attr-defined]
     plan_stamp = _PLAN_BOARD_STAMP.get()
     if plan_stamp is not None and metadata.flow == "plan":
         metadata = plan_stamp.apply(metadata)  # type: ignore[attr-defined]

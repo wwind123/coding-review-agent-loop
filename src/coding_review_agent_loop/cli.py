@@ -1291,7 +1291,20 @@ def build_parser() -> argparse.ArgumentParser:
                 "coder turn once K consecutive reviews have only evidence-only blockers "
                 "(findings tagged with approved risk-matrix rows that are still unverified "
                 "at the head), no failing check or other machine obligation, and an "
-                "unchanged set of unsatisfied rows (default: 2; 0 disables)."
+                "unchanged set of unsatisfied rows (default: 2; 0 disables). Only with "
+                "--pr-human-evidence freeze."
+            ),
+        )
+        subparser.add_argument(
+            "--pr-human-evidence",
+            choices=("freeze", "advisory", "off"),
+            default=None,
+            help=(
+                "How the PR fix loop treats reviewers' exact-head human evidence requests "
+                "(default: advisory). advisory collects them into one non-blocking 'Human "
+                "checks requested' list posted at approval; with --auto-merge and a non-empty "
+                "list the PR is left approved and unmerged and the run exits 0. off drops them "
+                "with a log line. freeze keeps the blocking exact-head evidence freeze."
             ),
         )
         subparser.add_argument(
@@ -1305,7 +1318,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "capture-limited evidence for it (incomplete capture, unverified launch, "
                 "unknown or cross-turn selectors) with no code finding or other machine "
                 "obligation open. An authoritative failed or timed-out test, or wrong-head or "
-                "wrong-tree evidence, never converts (default: 2; 0 disables)."
+                "wrong-tree evidence, never converts (default: 2; 0 disables). Only with "
+                "--pr-human-evidence freeze."
             ),
         )
         _deprecated_ignored_option(subparser, "--pr-non-convergence-rounds", "--no-progress-rounds")
@@ -1675,7 +1689,8 @@ def build_parser() -> argparse.ArgumentParser:
             "freeze before any agent runs. Every row must be currently unsatisfied at the "
             "live head; any other row fails the whole list before an agent runs or anything "
             "is posted. The rows are then answered by a signed `-- Human Reviewer` comment at "
-            "the final freeze. One-shot: rerun commands never replay it."
+            "the final freeze. One-shot: rerun commands never replay it. Only with "
+            "--pr-human-evidence freeze."
         ),
     )
     add_review_parallel(pr)

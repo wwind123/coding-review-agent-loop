@@ -1883,6 +1883,11 @@ _EVIDENCE_RELEASE_MESSAGES = {
         "a same-head refresh for new signed input found no findings. The PR proceeds to "
         "final validation at the same head."
     ),
+    "advisory-mode": (
+        "this run uses `--pr-human-evidence advisory` (or `off`). The human evidence requests "
+        "moved to the non-blocking 'Human checks requested' list (dropped under `off`); the "
+        "PR proceeds to final validation at the same head without re-running reviewers."
+    ),
 }
 
 
@@ -1985,6 +1990,7 @@ def _publish_evidence_release(
     heading = {
         "evidence-cleared": "## Exact-head evidence accepted",
         "refresh-clean": "## Same-head refresh complete",
+        "advisory-mode": "## Exact-head evidence freeze released (advisory mode)",
     }.get(reason, "## Exact-head evidence freeze released")
     publisher = post_pr_comment
     if reason == 'screenshot-coverage':
@@ -2272,8 +2278,13 @@ def _finalize_ordinary_recovery_checked(
     items: Sequence[UnresolvedReviewItem],
     current_head_sha: str | None,
     capability: OrdinaryRecoveryCapability,
+    hold: Callable[[], bool] | None = None,
 ) -> bool:
-    """Run ordinary recovery only after every unrelated obligation is clear."""
+    """Run ordinary recovery only after every unrelated obligation is clear.
+
+    ``hold`` (#2063) runs after the finalization check; True leaves the PR
+    approved and unmerged for advisory human checks.
+    """
     _ensure_finalization_ready(
         pr_number=pr_number,
         round_number=round_number,
@@ -2282,6 +2293,8 @@ def _finalize_ordinary_recovery_checked(
         ignored_machine_kinds=frozenset({"github-pr-checks"}),
         config=config,
     )
+    if hold is not None and hold():
+        return False
     return _finalize_ordinary_recovery_merge(
         runner,
         config=config,

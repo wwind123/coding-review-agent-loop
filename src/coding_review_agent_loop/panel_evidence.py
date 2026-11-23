@@ -212,7 +212,9 @@ def _describe_superseded_prepanel_review(record: PostedRoundRecord) -> str:
     )
 
 
-def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededPrepanelReview | None:
+def _superseded_prepanel_review(
+    record: PostedRoundRecord | None, *, parse_requirement_evidence: bool = True
+) -> SupersededPrepanelReview | None:
     """Build the non-authoritative prompt context for a superseded review."""
     if record is None:
         return None
@@ -224,7 +226,8 @@ def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededP
         parsed: ParsedReview | None = None
         try:
             if metadata.canonical_reviewer_response is not None:
-                parsed = parse_structured_pr_review(source_text, reviewer=reviewer, architecture_status_mode="legacy")
+                parsed = parse_structured_pr_review(source_text, reviewer=reviewer, architecture_status_mode="legacy",
+                                                    parse_requirement_evidence=parse_requirement_evidence)
             if parsed is None:
                 parsed = parse_review(source_text, reviewer=reviewer)
         except AgentLoopError:

@@ -59,7 +59,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--plan-sweep-rounds", "--plan-sweep-reasoning-effort",
     "--plan-provenance-baseline-max-chars",
     "--pr-step-back-rounds", "--pr-step-back-line-window", "--pr-evidence-stall-rounds",
-    "--pr-evidence-capture-attempts", "--pr-convert-evidence-rows",
+    "--pr-evidence-capture-attempts", "--pr-convert-evidence-rows", "--pr-human-evidence",
     "--pr-non-convergence-rounds",
     "--plan-growth-gate", "--plan-growth-max-chars", "--plan-growth-max-revisions",
     "--plan-growth-max-scope-items", "--plan-growth-max-matrix-rows",

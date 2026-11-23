@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the single PR no-progress stop, the PR step-back prompt and sweep, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/no_progress.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_no_progress.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/human_evidence_mode.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/no_progress.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_no_progress.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`, `tests/test_human_evidence_mode.py`, `tests/test_pr_loop_human_evidence_mode.py`.
 
 ## Findings, evidence and convergence
 
@@ -614,6 +614,41 @@ conditional issue-created fresh-authorization advice. Normal
 interruption cleanup still runs. The branch tip
 never replaces the PR-record head as authority for review, CI or merge. Reads
 cannot be atomic with later pushes; existing exact-head gates remain necessary.
+
+## Human evidence mode
+
+`--pr-human-evidence freeze|advisory|off` (default `advisory`, #2063) gates the
+whole native human-evidence channel; every branch keys off the configured mode,
+and persisted state only supplies the migration trigger and list contents.
+`human_evidence_mode.py` holds one normalization choke point. In `advisory` and
+`off` it removes every open native or converted `human-exact-head-evidence`
+obligation (never a screenshot obligation) from the ledger. It runs after each
+ledger-construction path: the round-start resume assignment, restore for new
+input, and the round's request ingestion. It runs once more inside the
+finalization gate wrapper, so no such obligation reaches partitioning, dispatch
+or finalization. `advisory` moves each removed item onto a deduplicated
+"Human checks requested" list and `off` drops it with a log line. The list is
+stamped, through a context-variable stamp at the single round-metadata encoder,
+on every orchestrator PR record while it is non-empty (`human_checks`; omitted
+when empty, decoded leniently). It is also written on the human-checks comment,
+whose record uses its own flow so PR round reconstruction never reads it. Each
+entry keeps the complete removed item, so a later `freeze` resume restores the
+original typed obligation (converted-row identity, owners and owner states)
+instead of re-creating it; identities cleared at the current head are skipped.
+
+Outside `freeze`, signed-source classification, association validation and
+parsing, historical association routing, the evidence-only stall and automatic
+conversion are skipped, and operator conversion is refused at config
+validation. Every reviewer-response parse site passes the mode explicitly, and
+a static guard test enforces this. The finalization gate still runs whenever the
+advisory list is non-empty, so the final head and signed-input reads, the
+screenshot final gate and `_ensure_finalization_ready` all precede approval. At
+approval the list is posted once per head and identity set. With `--auto-merge`
+and a non-empty list the merge and post-merge completion are skipped and the run
+exits 0 with a notice. A non-freeze resume of a native evidence freeze publishes
+a release with reason `advisory-mode` (unless screenshot obligations stay
+frozen), sets revalidation against the freeze's signed baseline, and continues
+without reviewers.
 
 ## Requester-owned screenshot obligations
 

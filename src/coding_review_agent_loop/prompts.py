@@ -167,6 +167,31 @@ note. When your only open items are evidence requests you keep, use
 as approving the code. Do not re-emit a request you just resolved."""
 
 
+PR_REVIEW_ADVISORY_EVIDENCE_GUIDANCE = """`exact_head_evidence_requests` is optional and only for checks that an agent
+session cannot perform but a human should, at the exact reviewed head (for example an
+authenticated live-CLI run). This run uses `--pr-human-evidence advisory`: these requests
+are non-blocking human checks. The orchestrator collects them into one "Human checks
+requested" list posted at approval; they never hold the PR open for a coder round. Never put
+a code defect in `exact_head_evidence_requests`, and never list a human check in
+`blocking_items`. Signed-source classification is not requested in this mode: omit
+`requirement_evidence` (it is ignored); signed human requirements are ordinary requirements
+for the coder. If your only remaining concerns are human checks, approve the code."""
+
+PR_REVIEW_OFF_EVIDENCE_GUIDANCE = """`exact_head_evidence_requests` is ignored in this run
+(`--pr-human-evidence off`): do not use it, and never list a human-only check in
+`blocking_items`. Signed-source classification is not requested: omit
+`requirement_evidence` (it is ignored); signed human requirements are ordinary requirements
+for the coder."""
+
+
+def pr_review_evidence_request_guidance(config: object) -> str:
+    """Mode-aware evidence-request wording (#2063); freeze is byte-identical to before."""
+    mode = getattr(config, "pr_human_evidence", "advisory")
+    if mode == "freeze":
+        return PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE
+    return PR_REVIEW_OFF_EVIDENCE_GUIDANCE if mode == "off" else PR_REVIEW_ADVISORY_EVIDENCE_GUIDANCE
+
+
 PR_REVIEW_EVIDENCE_ROW_TAG_GUIDANCE = """A `blocking_items` entry may be an object with an optional `evidence_row_ids`
 array: `{{"text": "...", "evidence_row_ids": ["row-id"]}}`. Use it only for a
 finding whose sole demand is admissible citation evidence (a passing,
@@ -2799,7 +2824,7 @@ POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
 {PR_REVIEW_SUB_ITEM_GUIDANCE}
 
-{PR_REVIEW_POST_MERGE_GUIDANCE}{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
+{PR_REVIEW_POST_MERGE_GUIDANCE}{pr_review_evidence_request_guidance(config)}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`
@@ -3572,7 +3597,7 @@ POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
 {PR_REVIEW_SUB_ITEM_GUIDANCE}
 
-{PR_REVIEW_POST_MERGE_GUIDANCE}{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
+{PR_REVIEW_POST_MERGE_GUIDANCE}{pr_review_evidence_request_guidance(config)}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`
