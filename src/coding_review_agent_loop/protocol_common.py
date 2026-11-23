@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import re
@@ -334,6 +336,28 @@ NOTE_KEY_RENAMES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# Semantic plan-patch operations write approved plan state verbatim, so every
+# parser they reach stays strict (#2114).  Set only by ``strict_response_keys``.
+_STRICT_RESPONSE_KEYS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "strict_response_keys", default=False
+)
+
+
+@contextlib.contextmanager
+def strict_response_keys():
+    """Disable every #2114 leniency for parsers called inside this block."""
+    token = _STRICT_RESPONSE_KEYS.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_RESPONSE_KEYS.reset(token)
+
+
+def response_keys_strict() -> bool:
+    """True inside ``strict_response_keys`` (semantic plan-patch operations)."""
+    return _STRICT_RESPONSE_KEYS.get()
+
+
 def is_protected_response_key(name: object) -> bool:
     """True when an unknown key must never be dropped silently (#2114)."""
     if not isinstance(name, str):
@@ -402,6 +426,10 @@ def _expect_known_keys_lenient(
     stored response text and digests of it are unaffected.
     """
     known = set(required) | set(optional)
+    if response_keys_strict():
+        # Inside a semantic plan-patch operation: no rename, no drop.
+        _expect_exact_keys(value, context=context, required=set(required), optional=set(optional))  # shape-check: delegated
+        return dict(value)
     result = _apply_key_renames(  # shape-check: delegated
         value,
         context=context,

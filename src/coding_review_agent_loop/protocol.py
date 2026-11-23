@@ -48,6 +48,8 @@ from .protocol_common import (
     _expect_bool,
     _expect_exact_keys,
     _expect_known_keys_lenient,
+    response_keys_strict,
+    strict_response_keys,
     _apply_key_renames,
     NOTE_KEY_RENAMES,
     RENAME_CONFLICT,
@@ -3037,7 +3039,7 @@ def _expect_human_requirement_dispositions(
             payload["evidence"], context=f"{item_context}.evidence"
         )
         entry = HumanRequirementDisposition(requirement_id, disposition, evidence)
-        if entry in result:
+        if entry in result and not response_keys_strict():
             # A byte-identical repeat asserts nothing new (#2114); a
             # conflicting repeat is still rejected by the validators.
             _logger.warning("%s: collapsed a duplicate of requirement %s", item_context, requirement_id)
@@ -5594,10 +5596,13 @@ def parse_plan_revision_patch(
         raise AgentLoopError(f"{context}.operations must be a non-empty JSON array.")  # shape-check: fatal:no-conservative-reading
     if len(operations_payload) > RISK_MATRIX_MAX_CHANGES * 2:
         raise AgentLoopError(f"{context}.operations exceeds the bounded operation limit.")  # shape-check: fatal:payload-bound
-    operations = tuple(
-        _parse_plan_revision_patch_operation(item, context=f"{context}.operations[{index}]")  # shape-check: fatal:no-conservative-reading
-        for index, item in enumerate(operations_payload)
-    )
+    # Semantic operations write approved plan state verbatim: every parser
+    # they reach stays strict, with no #2114 drop, rename or collapse.
+    with strict_response_keys():
+        operations = tuple(
+            _parse_plan_revision_patch_operation(item, context=f"{context}.operations[{index}]")  # shape-check: fatal:no-conservative-reading
+            for index, item in enumerate(operations_payload)
+        )
     return PlanRevisionPatch(
         schema_version=schema_version,
         kind=PLAN_REVISION_PATCH_KIND,

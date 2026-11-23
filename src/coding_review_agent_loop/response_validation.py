@@ -1550,8 +1550,16 @@ def _check_plan_revision_patch_human_requirement_dispositions(
             context="plan_revision_patch.human_requirement_dispositions",
         )
         # Semantic-patch operations stay strict (#2114): assembly publishes
-        # these dispositions verbatim, so an unsurfaced entry cannot be
-        # dropped here without diverging from the published state.
+        # these dispositions verbatim, so an unsurfaced entry or a repeated ID
+        # cannot be dropped or collapsed here without diverging from the
+        # published state.
+        ids = [item.requirement_id for item in dispositions]
+        repeated = sorted({item for item in ids if ids.count(item) > 1})
+        if repeated:
+            raise SemanticPatchPayloadRejection(
+                "plan_revision_patch.human_requirement_dispositions contains duplicate requirement ID(s): "
+                + ", ".join(repeated)
+            )
         unknown = sorted(
             {item.requirement_id for item in dispositions} - {item.requirement_id for item in kept}
         )

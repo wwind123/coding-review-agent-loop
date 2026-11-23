@@ -194,6 +194,9 @@ raw agent JSON.
   dispositions, human-requirement dispositions, execution child stages, and
   the complete risk-matrix envelope and rows.
 - These sites stay strict: `agent_unavailable`, semantic plan-patch operations
+  (parsed inside `strict_response_keys`, so every shared parser they reach,
+  such as replacement requirement dispositions or execution-recommendation
+  child stages, keeps exact keys with no drop, rename or duplicate collapse)
   and their matrix rows and metadata, `risk_test_matrix_changes`,
   `architecture_impact`, every authentication-or-forgery parser, and records
   the orchestrator writes.

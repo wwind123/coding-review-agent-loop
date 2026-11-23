@@ -763,3 +763,96 @@ def test_plan_revision_with_matrix_row_notes_is_accepted(caplog):
     assert _dropped(caplog, "notes")
     with pytest.raises(AgentLoopError, match="unknown field"):
         validate_structured_plan_revision(_plan_revision_with_matrix(["not", "text"]), architecture_status_mode="legacy")
+
+
+# --- semantic-patch operations stay strict (review item-5, item-6) ------------
+#
+# Generalization: every parser a semantic plan-patch operation reaches runs
+# inside strict_response_keys, so no #2114 drop, rename or collapse applies to
+# a replacement value, while the same nested extras stay lenient in complete
+# plan_state/plan_revision responses.
+
+
+def _staged_recommendation(stage_extra):
+    def stage(number, depends, extra):
+        return {
+            "stage_id": f"stage-{number}", "position": number, "title": f"Stage {number}",
+            "summary": f"Stage {number}.", "deliverables": ["A."], "non_goals": [],
+            "acceptance_criteria": ["Done."], "depends_on_stage_ids": depends,
+            "dependency_notes": "None.", "automation": "agent-pr", "rollout_risk": "low",
+            "compatibility_constraints": [], "covered_scope_item_ids": [f"scope-{number}"], **extra,
+        }
+
+    recommendation = copy.deepcopy(
+        json.JSONDecoder().raw_decode(structured_v1_plan_state())[0]["execution_recommendation"]
+    )
+    recommendation.update(
+        strategy="staged", staging_feasibility="safe",
+        scope_items=[
+            {"scope_item_id": "scope-1", "requirement": "First.", "acceptance_criteria": ["Done."]},
+            {"scope_item_id": "scope-2", "requirement": "Second.", "acceptance_criteria": ["Done."]},
+        ],
+        child_stages=[stage(1, [], stage_extra), stage(2, ["stage-1"], {})],
+    )
+    recommendation.pop("one_shot_delivery")
+    return recommendation
+
+
+def _patch(field, value):
+    return {
+        "schema_version": 1, "kind": "plan_revision_patch", "semantic_patch_contract_version": 1,
+        "state": "blocking", "summary": "Revise.", "prior_plan_item_dispositions": [],
+        "base_round_number": 2, "base_state_identity": "a" * 64,
+        "operations": [{"op": "replace", "field": field, "value": value}],
+    }
+
+
+_PATCH_CASES = {
+    "requirement-disposition-extra": (
+        "human_requirement_dispositions",
+        lambda extra: [{**_addressed(SURFACED_ID), **({"notes": "extra"} if extra else {})}],
+        "unknown field",
+    ),
+    "child-stage-extra": (
+        "execution_recommendation",
+        lambda extra: _staged_recommendation({"estimated_size": "small"} if extra else {}),
+        "unknown field",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_PATCH_CASES))
+def test_semantic_patch_replacement_values_stay_strict(case, caplog):
+    from coding_review_agent_loop.protocol import parse_plan_revision_patch
+
+    field, build, message = _PATCH_CASES[case]
+    parse_plan_revision_patch(_patch(field, build(False)))  # the clean value parses
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        with pytest.raises(AgentLoopError, match=message):
+            parse_plan_revision_patch(_patch(field, build(True)))
+    assert "dropped unknown field" not in caplog.text
+
+
+def test_semantic_patch_duplicate_requirement_dispositions_are_not_collapsed():
+    from coding_review_agent_loop.errors import SemanticPatchPayloadRejection
+    from coding_review_agent_loop.protocol import parse_plan_revision_patch
+    from coding_review_agent_loop.response_validation import (
+        _check_plan_revision_patch_human_requirement_dispositions,
+    )
+
+    patch = parse_plan_revision_patch(
+        _patch("human_requirement_dispositions", [_addressed(SURFACED_ID), _addressed(SURFACED_ID)])
+    )
+    assert len(patch.operations[0].value) == 2
+    with pytest.raises(SemanticPatchPayloadRejection, match="duplicate requirement ID"):
+        _check_plan_revision_patch_human_requirement_dispositions(
+            patch, surfaced_requirement_ids=(SURFACED_ID,), inherited_human_requirement_dispositions=(),
+        )
+
+
+def test_strict_mode_is_scoped_to_the_patch_operations():
+    from coding_review_agent_loop.protocol_common import response_keys_strict, strict_response_keys
+
+    with strict_response_keys():
+        assert response_keys_strict()
+    assert not response_keys_strict()
