@@ -6029,12 +6029,15 @@ def test_patch_replace_rejects_every_synonym_with_route_forward(spelling):
 
 
 @pytest.mark.parametrize(
-    "spelling", ["Unchanged", "Changed", "UNCHANGED", "no change", "no_change", " none ", "Same"]
+    "spelling", ["no change", "no_change", " none ", "Same"]
 )
 def test_case_and_separator_variants_degrade_instead_of_rejecting_the_envelope(spelling):
     # The legacy table looked statuses up after case and separator
     # normalization; degradable mode must degrade those variants, never
-    # reject the whole review envelope (#925 round 5).
+    # reject the whole review envelope (#925 round 5).  Case/separator
+    # variants of the declared tokens themselves (`Unchanged`) now fold to
+    # the canonical token instead (#2109; see
+    # tests/test_protocol_shape_normalization.py).
     from coding_review_agent_loop.protocol import parse_structured_plan_review
 
     payload = json.dumps({
@@ -6073,8 +6076,9 @@ def test_case_variant_of_modified_honors_the_alias_when_corroborated(spelling):
     assert record.outcome == "degraded-to-undetermined"
 
 
-def test_case_variant_required_contract_response_survives_as_unsatisfied():
-    text = _with_impact(_deg_plan_state(), dict(_CORROBORATED_IMPACT, status="Unchanged"))
+def test_synonym_required_contract_response_survives_as_unsatisfied():
+    # #2109: `Unchanged` now folds to `unchanged`; a real synonym still degrades.
+    text = _with_impact(_deg_plan_state(), dict(_CORROBORATED_IMPACT, status="no_change"))
     parsed = validate_structured_plan_state(
         text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
     )
@@ -7889,8 +7893,9 @@ def test_pr_review_fix_scope_keeps_typed_handling_1328(caplog):
     assert [item.text for item in parsed.blocking_items] == ["Gap."]
     assert parsed.blocking_items[0].fix_scope == ("src/a.py",)
     assert _fold_warnings_1328(caplog) == []
+    # #2109: a lone-string scope is wrapped; other non-array shapes still reject.
     with pytest.raises(AgentLoopError, match="fix_scope is invalid"):
-        _parse_pr_1328(blocking=[{"text": "Gap.", "fix_scope": "src/a.py"}])
+        _parse_pr_1328(blocking=[{"text": "Gap.", "fix_scope": 7}])
 
 
 _NON_FOLDABLE_1328 = [{"a": "b"}, 3, 1.5, True, None, "", "   ", [], [""], ["a", 3], [["a"]]]

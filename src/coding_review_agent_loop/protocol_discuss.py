@@ -50,6 +50,7 @@ from .protocol_common import (
     _expect_non_empty_string,
     _expect_object,
     _expect_optional_string_list,
+    _expect_strict_string,
     _expect_string_list,
     _extract_json_object_prefix,
     _require_supported_schema_version,
@@ -226,7 +227,7 @@ def _parse_discuss_evidence(
             raise AgentLoopError("evidence replacement_claim_index must reference a claim in the same response.")  # shape-check: fatal:no-conservative-reading
         updates.append(DiscussEvidenceUpdate(
             action=action,
-            target_observation_id=_expect_non_empty_string(update["target_observation_id"], context=f"{context}.target_observation_id"),  # shape-check: fatal:no-conservative-reading
+            target_observation_id=_expect_strict_string(update["target_observation_id"], context=f"{context}.target_observation_id"),  # shape-check: fatal:no-conservative-reading
             reason=_expect_non_empty_string(update["reason"], context=f"{context}.reason"),  # shape-check: fatal:no-conservative-reading
             replacement_claim_index=replacement,
         ))
@@ -538,7 +539,7 @@ def validate_structured_discuss_semantic_comparison(
         item_payload = _expect_object(item, context=f"discuss_semantic_comparison.evidence[{index}]")  # shape-check: fatal:no-conservative-reading
         _expect_exact_keys(item_payload, context=f"discuss_semantic_comparison.evidence[{index}]", required={"reviewer", "supports"})  # shape-check: fatal:no-conservative-reading
         evidence.append(DiscussSemanticEvidence(
-            reviewer=_expect_non_empty_string(item_payload["reviewer"], context="semantic evidence reviewer"),  # shape-check: fatal:no-conservative-reading
+            reviewer=_expect_strict_string(item_payload["reviewer"], context="semantic evidence reviewer"),  # shape-check: fatal:no-conservative-reading
             supports=_expect_non_empty_string(item_payload["supports"], context="semantic evidence supports"),  # shape-check: fatal:no-conservative-reading
         ))
     expected = set(reviewers)
@@ -556,7 +557,7 @@ def validate_structured_discuss_answer_confirmation(text: str, *, reviewer: str)
         required={"schema_version", "kind", "decision", "rationale", "reviewer"}, optional={"answer"})
     if payload.get("kind") != "discuss_answer_confirmation":
         raise AgentLoopError("Structured response kind mismatch: expected `discuss_answer_confirmation`.")  # shape-check: fatal:unparseable-envelope
-    response_reviewer = _expect_non_empty_string(payload["reviewer"], context="discuss_answer_confirmation.reviewer")  # shape-check: fatal:no-conservative-reading
+    response_reviewer = _expect_strict_string(payload["reviewer"], context="discuss_answer_confirmation.reviewer")  # shape-check: fatal:no-conservative-reading
     if response_reviewer != reviewer:
         raise AgentLoopError("Answer confirmation reviewer does not match the debater.")  # shape-check: fatal:no-conservative-reading
     decision = _expect_non_empty_string(payload["decision"], context="discuss_answer_confirmation.decision")  # shape-check: fatal:no-conservative-reading
@@ -584,7 +585,7 @@ def _parse_discuss_agenda_disagreement(
         raise AgentLoopError(f"{context}.positions must not be empty.")  # shape-check: fatal:no-conservative-reading
     positions = tuple(
         (
-            _expect_non_empty_string(name, context=f"{context}.positions key"),  # shape-check: fatal:no-conservative-reading
+            _expect_strict_string(name, context=f"{context}.positions key"),  # shape-check: fatal:no-conservative-reading
             _expect_non_empty_string(position, context=f"{context}.positions[{name!r}]"),  # shape-check: fatal:no-conservative-reading
         )
         for name, position in positions_payload.items()

@@ -27,10 +27,11 @@ from .protocol_common import (
     TestObservationCitation,
     _expect_exact_keys,
     _expect_int,
-    _expect_non_empty_string,
     _expect_object,
+    _expect_strict_string,
     _expect_string_list,
     _logger,
+    fold_enum_value,
 )
 
 # Each dropped follow-up citation keeps its own record, so the drop count is
@@ -408,7 +409,7 @@ _RISK_OWNER_STAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_MATRIX_MAX_FIELD_BYTES) -> str:
-    rendered = _expect_non_empty_string(value, context=context)  # shape-check: delegated
+    rendered = _expect_strict_string(value, context=context)  # shape-check: delegated
     if len(rendered.encode("utf-8")) > max_bytes:
         raise AgentLoopError(f"{context} exceeds the {max_bytes}-byte bound.")  # shape-check: delegated
     return rendered
@@ -421,7 +422,7 @@ def _risk_bounded_string_list(
     max_items: int = RISK_MATRIX_MAX_LIST_ITEMS,
     min_items: int = 0,
 ) -> tuple[str, ...]:
-    rendered = _expect_string_list(value, context=context, item_context=context)  # shape-check: delegated
+    rendered = _expect_string_list(value, context=context, item_context=context, strict_shape=True)  # shape-check: delegated
     if len(rendered) < min_items:
         raise AgentLoopError(f"{context} must contain at least {min_items} item(s).")  # shape-check: delegated
     if len(rendered) > max_items:
@@ -526,7 +527,10 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
         required=set(RISK_TEST_MATRIX_REQUIRED_KEYS),
         optional=set(RISK_TEST_MATRIX_OPTIONAL_KEYS),
     )
-    applicability = _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64)  # shape-check: fatal:no-conservative-reading
+    applicability = fold_enum_value(
+        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+        RISK_MATRIX_APPLICABILITY, context=f"{context}.applicability",
+    )
     if applicability not in RISK_MATRIX_APPLICABILITY:
         raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")  # shape-check: fatal:no-conservative-reading
     rows_payload = payload["rows"]
@@ -548,7 +552,10 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
         if row_id in seen:
             raise AgentLoopError(f"{context} contains duplicate row ID `{row_id}`.")  # shape-check: fatal:no-conservative-reading
         seen.add(row_id)
-        row_applicability = _risk_bounded_string(row["applicability"], context=f"{row_context}.applicability", max_bytes=64)  # shape-check: fatal:no-conservative-reading
+        row_applicability = fold_enum_value(
+            _risk_bounded_string(row["applicability"], context=f"{row_context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+            {"applicable", "required", "not-applicable"}, context=f"{row_context}.applicability",
+        )
         if row_applicability not in {"applicable", "required", "not-applicable"}:
             raise AgentLoopError(f"{row_context}.applicability is invalid.")  # shape-check: fatal:no-conservative-reading
         rows.append(
@@ -624,7 +631,10 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
         change_context = f"{context}[{index}]"
         change = _expect_object(raw_change, context=change_context)  # shape-check: fatal:no-conservative-reading
         _expect_exact_keys(change, context=change_context, required=set(RISK_TEST_MATRIX_CHANGE_KEYS))  # shape-check: fatal:no-conservative-reading
-        operation = _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32)  # shape-check: fatal:no-conservative-reading
+        operation = fold_enum_value(
+            _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32),  # shape-check: fatal:no-conservative-reading
+            RISK_MATRIX_CHANGE_OPERATIONS, context=f"{change_context}.operation",
+        )
         if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
             raise AgentLoopError(f"{change_context}.operation is invalid.")  # shape-check: fatal:no-conservative-reading
         row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(  # shape-check: fatal:no-conservative-reading
@@ -2667,15 +2677,15 @@ def _expect_test_observations(
             context=item_context,
             required={"command", "receipt_id", "claim"},
         )
-        claim = _expect_non_empty_string(payload["claim"], context=f"{item_context}.claim")  # shape-check: fatal:authentication-or-forgery
+        claim = _expect_strict_string(payload["claim"], context=f"{item_context}.claim")  # shape-check: fatal:authentication-or-forgery
         if claim not in {"current-result", "base-reproduction"}:
             raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
                 f"{item_context}.claim must be `current-result` or `base-reproduction`."
             )
         result.append(
             TestObservationCitation(
-                command=_expect_non_empty_string(payload["command"], context=f"{item_context}.command"),  # shape-check: fatal:authentication-or-forgery
-                receipt_id=_expect_non_empty_string(payload["receipt_id"], context=f"{item_context}.receipt_id"),  # shape-check: fatal:authentication-or-forgery
+                command=_expect_strict_string(payload["command"], context=f"{item_context}.command"),  # shape-check: fatal:authentication-or-forgery
+                receipt_id=_expect_strict_string(payload["receipt_id"], context=f"{item_context}.receipt_id"),  # shape-check: fatal:authentication-or-forgery
                 claim=claim,
             )
         )
@@ -3698,7 +3708,10 @@ def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMeta
         required={"applicability", "important_exclusions"},
         optional={"not_applicable_rationale"},
     )
-    applicability = _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64)  # shape-check: fatal:no-conservative-reading
+    applicability = fold_enum_value(
+        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+        RISK_MATRIX_APPLICABILITY, context=f"{context}.applicability",
+    )
     if applicability not in RISK_MATRIX_APPLICABILITY:
         raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")  # shape-check: fatal:no-conservative-reading
     rationale_value = payload.get("not_applicable_rationale")

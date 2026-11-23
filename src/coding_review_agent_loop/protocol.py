@@ -48,8 +48,10 @@ from .protocol_common import (
     _expect_bool,
     _expect_exact_keys,
     _expect_int,
+    _expect_int_like,
     _expect_non_empty_string,
     _expect_object,
+    _expect_strict_string,
     _expect_string_list,
     _extract_json_object_prefix,
     _flat_object_defect,
@@ -59,6 +61,8 @@ from .protocol_common import (
     _render_flat_object,
     _require_supported_schema_version,
     normalize_response_file_structured_text,
+    closed_enum_fold_key,
+    fold_enum_value,
     normalize_staging_feasibility,
     parse_human_requirements_acknowledgement,
 )
@@ -655,6 +659,10 @@ def classify_architecture_status_near_miss(
     status_value = impact.get("status")
     if not isinstance(status_value, str) or status_value in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
         return None
+    if architecture_status_near_miss_key(status_value) in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        # #2109: a case/separator variant of a declared token (`Unchanged`,
+        # ` CHANGED `) is lossless; the parser folds it to the canonical token.
+        return None
     # Look the table up exactly as the legacy normalization did, so a case or
     # separator variant (`Unchanged`, `Modified`, `no_change`) degrades one
     # field instead of rejecting the envelope.
@@ -670,8 +678,8 @@ def classify_architecture_status_near_miss(
             rule = f"{ARCHITECTURE_IMPACT_NEAR_MISS_RULE}; positive evidence missing: {failure}"
             outcome = "degraded-to-undetermined"
     elif key in _ARCHITECTURE_STATUS_SYNONYMS:
-        # Includes case variants of the declared values: only the exact
-        # spellings are declared, so `Unchanged` is never read as `unchanged`.
+        # Real synonyms only: case/separator variants of the declared values
+        # returned above and are folded by the parser (#2109).
         resolved = ARCHITECTURE_IMPACT_UNDETERMINED
         rule = ARCHITECTURE_IMPACT_CLOSED_ENUM_RULE
         outcome = "degraded-to-undetermined"
@@ -791,13 +799,19 @@ def _parse_architecture_impact_payload(
                 raw_status, payload, context=context
             )
         else:
-            status = raw_status
+            status = fold_enum_value(
+                raw_status, ARCHITECTURE_IMPACT_DECLARED_STATUSES, context=f"{context}.status"
+            )
             if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
                 raise _missing_status_error(  # shape-check: fatal:no-conservative-reading
                     f"{context}.status must be `changed` or `unchanged`.", payload, context=context
                 )
+    raw_action = payload.get("canonical_document_action", "no-change")
+    if raw_action is None:
+        _logger.warning("%s.canonical_document_action: normalized null to `no-change`", context)
+        raw_action = "no-change"
     action = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
-        payload.get("canonical_document_action", "no-change"),
+        raw_action,
         context=f"{context}.canonical_document_action",
     )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")  # shape-check: fatal:no-conservative-reading
@@ -808,6 +822,9 @@ def _parse_architecture_impact_payload(
                 f"{context} changed assessments must include: {', '.join(missing)}."
             )
     path_value = payload.get("canonical_document_path")
+    if isinstance(path_value, str) and not path_value.strip():
+        _logger.warning("%s.canonical_document_path: normalized an empty string to null", context)
+        path_value = None
     if path_value is not None and (not isinstance(path_value, str) or not path_value.strip()):
         raise AgentLoopError(f"{context}.canonical_document_path must be a non-empty string or null.")  # shape-check: fatal:no-conservative-reading
     combined = _expect_string_list(payload.get("execution_data_flows", []), context=f"{context}.execution_data_flows", item_context=context, flatten_object_items=True)  # shape-check: fatal:no-conservative-reading
@@ -2049,6 +2066,42 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     return " ".join(parts)
 
 
+def _normalize_review_finding_shapes(
+    payload: dict[str, object], field_names: Sequence[str], *, context: str, pr_findings: bool
+) -> dict[str, object]:
+    """Return a payload copy with lossless finding-list shapes made canonical (#2109).
+
+    Runs once on the parsed dict, before every consumer of the finding lists,
+    so the list parsers and the downstream field readers see the same value.
+    Absence already means no findings, so an explicit ``null`` is ``[]``; a
+    lone non-empty string is one finding.  For PR findings, ``description`` or
+    ``issue`` becomes ``text`` when ``text`` is absent and exactly one of them
+    is present, and a lone-string ``fix_scope`` becomes a one-path list.
+    Objects and numbers are left for the list parser's array error; per-item
+    flattening, provenance and collision checks still run unchanged.  The
+    response text is never touched.
+    """
+    normalized = dict(payload)
+    for field_name in field_names:
+        if field_name not in payload:
+            continue
+        field_context = f"{context}.{field_name}"
+        value = payload[field_name]
+        if value is None:
+            _logger.warning("%s: normalized null to an empty list", field_context)
+            value = []
+        elif isinstance(value, str) and value.strip():
+            _logger.warning("%s: wrapped a lone string as a one-item list", field_context)
+            value = [value]
+        if pr_findings and isinstance(value, list):
+            value = [
+                _normalize_pr_finding_item(item, item_context=f"{field_context} at index {index}")
+                for index, item in enumerate(value)
+            ]
+        normalized[field_name] = value
+    return normalized
+
+
 def _expect_plan_review_finding_list(
     payload: dict[str, object],
     field_name: str,
@@ -2131,6 +2184,25 @@ def _degradable_sub_items(
 
 
 REVIEW_FINDING_PR_ACCEPTED_KEYS = frozenset({"text", "fix_scope", "sub_items", "evidence_row_ids"})
+# #2109: text-key spellings aliased to `text` only when `text` is absent and
+# exactly one of them is present; both present stays ambiguous.
+REVIEW_FINDING_PR_TEXT_ALIASES = ("description", "issue")
+
+
+def _normalize_pr_finding_item(item: object, *, item_context: str) -> object:
+    if not isinstance(item, dict):
+        return item
+    if "text" not in item:
+        present = [key for key in REVIEW_FINDING_PR_TEXT_ALIASES if key in item]
+        if len(present) == 1:
+            alias = present[0]
+            _logger.warning("%s: aliased finding key `%s` to `text`", item_context, alias)
+            item = {("text" if key == alias else key): value for key, value in item.items()}
+    if isinstance(item.get("fix_scope"), str):
+        # One path given as a string is a one-path scope.
+        _logger.warning("%s.fix_scope: wrapped a lone string as a one-item list", item_context)
+        item = {**item, "fix_scope": [item["fix_scope"]]}
+    return item
 
 
 def _expect_review_finding_list(
@@ -2363,13 +2435,31 @@ def _expect_typed_plan_stages(payload: dict[str, object], *, context: str) -> Ty
 def _expect_execution_allocation(
     value: object, *, context: str
 ) -> ExecutionAllocation:
+    if value is None:
+        _logger.warning("%s: normalized null to an empty `none` allocation", context)
+        value = {"status": "none"}
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
+    allocation_lists = ("deliverables", "acceptance_criteria", "covered_scope_item_ids")
+    raw_status = payload.get("status")
+    if isinstance(raw_status, str) and closed_enum_fold_key(raw_status) == "none":
+        # #2109: a `none` allocation is empty by definition, so absent lists
+        # are lossless.  A `required` allocation is never defaulted.
+        missing_lists = [key for key in allocation_lists if key not in payload]
+        if missing_lists:
+            _logger.warning(
+                "%s: defaulted missing list(s) %s of a `none` allocation to []",
+                context, ", ".join(missing_lists),
+            )
+            payload = {**payload, **{key: [] for key in missing_lists}}
     _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
         payload,
         context=context,
-        required={"status", "deliverables", "acceptance_criteria", "covered_scope_item_ids"},
+        required={"status", *allocation_lists},
     )
-    status = _expect_non_empty_string(payload["status"], context=f"{context}.status")  # shape-check: fatal:no-conservative-reading
+    status = fold_enum_value(
+        _expect_non_empty_string(payload["status"], context=f"{context}.status"),  # shape-check: fatal:no-conservative-reading
+        {"none", "required"}, context=f"{context}.status",
+    )
     if status not in {"none", "required"}:
         raise AgentLoopError(f"{context}.status must be `none` or `required`.")  # shape-check: fatal:no-conservative-reading
     deliverables = _expect_string_list(  # shape-check: fatal:no-conservative-reading
@@ -2408,7 +2498,10 @@ def _expect_execution_disposition(
         context=context,
         required={"disposition", "rationale", "unresolved_design_decisions"},
     )
-    disposition = _expect_non_empty_string(payload["disposition"], context=f"{context}.disposition")  # shape-check: fatal:no-conservative-reading
+    disposition = fold_enum_value(
+        _expect_non_empty_string(payload["disposition"], context=f"{context}.disposition"),  # shape-check: fatal:no-conservative-reading
+        EXECUTION_DISPOSITION_VALUES, context=f"{context}.disposition",
+    )
     if disposition not in EXECUTION_DISPOSITION_VALUES:
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{context}.disposition must be one of: {', '.join(sorted(EXECUTION_DISPOSITION_VALUES))}."
@@ -2479,7 +2572,14 @@ def _expect_execution_recommendation(
         "final_integration_work", "caveats",
     }
     _expect_exact_keys(payload, context=context, required=required, optional={"one_shot_delivery"})  # shape-check: fatal:no-conservative-reading
-    strategy = _expect_non_empty_string(payload["strategy"], context=f"{context}.strategy")  # shape-check: fatal:no-conservative-reading
+    strategy = fold_enum_value(
+        _expect_non_empty_string(payload["strategy"], context=f"{context}.strategy"),  # shape-check: fatal:no-conservative-reading
+        {"one-shot", "staged"}, context=f"{context}.strategy",
+    )
+    if strategy == "staged" and "one_shot_delivery" in payload and payload["one_shot_delivery"] is None:
+        # #2109: a null delivery on a staged plan carries nothing; drop it.
+        payload = {key: item for key, item in payload.items() if key != "one_shot_delivery"}
+        _logger.warning("%s: dropped null one_shot_delivery from a staged recommendation", context)
     if strategy not in {"one-shot", "staged"}:
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{context}.strategy must be exactly `one-shot` (one implementation PR) or "
@@ -2581,17 +2681,23 @@ def _expect_execution_recommendation(
         stage_id = _expect_item_id(item["stage_id"], context=f"{item_context}.stage_id")  # shape-check: fatal:no-conservative-reading
         if stage_id in stage_ids:
             raise AgentLoopError(f"{context}.child_stages has duplicate stage ID `{stage_id}`.")  # shape-check: fatal:no-conservative-reading
-        position = _expect_int(item["position"], context=f"{item_context}.position")  # shape-check: fatal:no-conservative-reading
+        position = _expect_int_like(item["position"], context=f"{item_context}.position")  # shape-check: fatal:no-conservative-reading
         if position != index + 1:
             raise AgentLoopError(f"{item_context}.position must be contiguous and ordered starting at 1.")  # shape-check: fatal:no-conservative-reading
-        depends = _expect_item_id_list(item["depends_on_stage_ids"], context=f"{item_context}.depends_on_stage_ids")  # shape-check: fatal:no-conservative-reading
+        depends = _expect_item_id_list(  # shape-check: fatal:no-conservative-reading
+            item["depends_on_stage_ids"], context=f"{item_context}.depends_on_stage_ids",
+            normalize_outer_shape=True,
+        )
         unknown_dependencies = sorted(set(depends) - stage_ids)
         if unknown_dependencies:
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 f"{item_context}.depends_on_stage_ids must reference earlier stages; "
                 f"unknown/later IDs: {', '.join(unknown_dependencies)}."
             )
-        automation = _expect_non_empty_string(item["automation"], context=f"{item_context}.automation")  # shape-check: fatal:no-conservative-reading
+        automation = fold_enum_value(
+            _expect_non_empty_string(item["automation"], context=f"{item_context}.automation"),  # shape-check: fatal:no-conservative-reading
+            EXECUTION_AUTOMATION_CLASSES, context=f"{item_context}.automation",
+        )
         if automation not in EXECUTION_AUTOMATION_CLASSES:
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 f"{item_context}.automation must be one of: {', '.join(sorted(EXECUTION_AUTOMATION_CLASSES))}."
@@ -2771,14 +2877,17 @@ def parse_execution_recommendation_payload(
 
 
 def _expect_state(value: object, *, context: str) -> str:
-    state = _expect_non_empty_string(value, context=context)  # shape-check: fatal:no-conservative-reading
+    state = fold_enum_value(
+        _expect_non_empty_string(value, context=context),  # shape-check: fatal:no-conservative-reading
+        {"approved", "blocking"}, context=context,
+    )
     if state not in {"approved", "blocking"}:
         raise AgentLoopError(f"{context} must be `approved` or `blocking`.")  # shape-check: fatal:no-conservative-reading
     return state
 
 
 def _expect_item_id(value: object, *, context: str) -> str:
-    item_id = _expect_non_empty_string(value, context=context)  # shape-check: fatal:no-conservative-reading
+    item_id = _expect_strict_string(value, context=context)  # shape-check: fatal:no-conservative-reading
     if not ITEM_ID_RE.fullmatch(item_id):
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{context} must match `[A-Za-z0-9][A-Za-z0-9._-]*`."
@@ -2786,7 +2895,18 @@ def _expect_item_id(value: object, *, context: str) -> str:
     return item_id
 
 
-def _expect_item_id_list(value: object, *, context: str) -> tuple[str, ...]:
+def _expect_item_id_list(
+    value: object, *, context: str, normalize_outer_shape: bool = False
+) -> tuple[str, ...]:
+    if normalize_outer_shape:
+        # Opt-in (#2109, `depends_on_stage_ids` only): null means no IDs and a
+        # lone string is one ID.  Each element is still a strict ID.
+        if value is None:
+            _logger.warning("%s: normalized null to an empty list", context)
+            value = []
+        elif isinstance(value, str):
+            _logger.warning("%s: wrapped a lone string as a one-item list", context)
+            value = [value]
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:no-conservative-reading
     return tuple(
@@ -2817,7 +2937,7 @@ def _expect_requirement_id_list(value: object, *, context: str) -> tuple[str, ..
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:no-conservative-reading
     rendered: list[str] = []
     for index, item in enumerate(value):
-        label = _expect_non_empty_string(item, context=f"{context} item at index {index}")  # shape-check: fatal:no-conservative-reading
+        label = _expect_strict_string(item, context=f"{context} item at index {index}")  # shape-check: fatal:no-conservative-reading
         rendered.append(_normalize_requirement_label(label))  # shape-check: fatal:no-conservative-reading
     return tuple(rendered)
 
@@ -2861,10 +2981,13 @@ def _expect_human_requirement_dispositions(
             required={"requirement_id", "disposition", "evidence"},
         )
         requirement_id = _normalize_requirement_label(  # shape-check: fatal:no-conservative-reading
-            _expect_non_empty_string(payload["requirement_id"], context=f"{item_context}.requirement_id")  # shape-check: fatal:no-conservative-reading
+            _expect_strict_string(payload["requirement_id"], context=f"{item_context}.requirement_id")  # shape-check: fatal:no-conservative-reading
         )
-        disposition = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
-            payload["disposition"], context=f"{item_context}.disposition"
+        disposition = fold_enum_value(
+            _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
+                payload["disposition"], context=f"{item_context}.disposition"
+            ),
+            HUMAN_REQUIREMENT_DISPOSITION_VALUES, context=f"{item_context}.disposition",
         )
         if disposition not in HUMAN_REQUIREMENT_DISPOSITION_VALUES:
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
@@ -2955,7 +3078,7 @@ def parse_agent_unavailable(text: str) -> AgentUnavailable | None:
             "suggested_action",
         },
     )
-    category = _expect_non_empty_string(  # shape-check: fatal:unparseable-envelope
+    category = _expect_strict_string(  # shape-check: fatal:unparseable-envelope
         payload["category"], context="agent_unavailable.category"
     )
     if category not in AGENT_UNAVAILABLE_CATEGORIES:
@@ -2968,8 +3091,8 @@ def parse_agent_unavailable(text: str) -> AgentUnavailable | None:
         kind="agent_unavailable",
         retryable=_expect_bool(payload["retryable"], context="agent_unavailable.retryable"),  # shape-check: fatal:unparseable-envelope
         category=category,
-        summary=_expect_non_empty_string(payload["summary"], context="agent_unavailable.summary"),  # shape-check: fatal:unparseable-envelope
-        suggested_action=_expect_non_empty_string(  # shape-check: fatal:unparseable-envelope
+        summary=_expect_strict_string(payload["summary"], context="agent_unavailable.summary"),  # shape-check: fatal:unparseable-envelope
+        suggested_action=_expect_strict_string(  # shape-check: fatal:unparseable-envelope
             payload["suggested_action"], context="agent_unavailable.suggested_action"
         ),
     )
@@ -3097,8 +3220,11 @@ def _parse_review_item_disposition_payload(
         optional={"note"} if is_plan_review else {"note", "sub_item_dispositions", "evidence_requirement_ids"},
     )
     item_id = _expect_item_id(payload["item_id"], context=f"{field_name}.item_id")  # shape-check: fatal:no-conservative-reading
-    disposition = _expect_non_empty_string(payload["disposition"], context=f"{field_name}.disposition")  # shape-check: fatal:no-conservative-reading
     allowed_statuses = {"resolved", "blocking", allowed_same_status, "future"}
+    disposition = fold_enum_value(
+        _expect_non_empty_string(payload["disposition"], context=f"{field_name}.disposition"),  # shape-check: fatal:no-conservative-reading
+        allowed_statuses, context=f"{field_name}.disposition",
+    )
     if disposition not in allowed_statuses:
         rendered = ", ".join(sorted(allowed_statuses))
         raise AgentLoopError(f"{field_name}.disposition must be one of: {rendered}")  # shape-check: fatal:no-conservative-reading
@@ -3382,6 +3508,10 @@ def parse_structured_pr_review(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "pr_review":
         raise AgentLoopError("Structured response kind mismatch: expected `pr_review`.")  # shape-check: fatal:unparseable-envelope
+    payload = _normalize_review_finding_shapes(
+        payload, ("blocking_items", "same_pr_followups", "future_followups"),
+        context="pr_review", pr_findings=True,
+    )
     dropped_dispositions = HUMAN_REQUIREMENT_DISPOSITIONS_FIELD in payload
     if dropped_dispositions:
         # A coder-only field a reviewer copied from shared context (#2026).
@@ -3557,6 +3687,10 @@ def parse_structured_plan_review(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "plan_review":
         raise AgentLoopError("Structured response kind mismatch: expected `plan_review`.")  # shape-check: fatal:unparseable-envelope
+    payload = _normalize_review_finding_shapes(
+        payload, ("blocking_plan_issues", "same_plan_followups", "future_followups"),
+        context="plan_review", pr_findings=False,
+    )
     _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
         payload,
         context="plan_review",
@@ -3997,7 +4131,10 @@ def validate_structured_issue_implementation(
         },
         optional=optional_fields,
     )
-    state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")  # shape-check: fatal:no-conservative-reading
+    state = fold_enum_value(
+        _expect_non_empty_string(payload["state"], context="issue_implementation.state"),  # shape-check: fatal:no-conservative-reading
+        {"blocking"}, context="issue_implementation.state",
+    )
     if state != "blocking":
         raise AgentLoopError("issue_implementation.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
     summary = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
@@ -4007,7 +4144,7 @@ def validate_structured_issue_implementation(
     if pr_value is None:
         pr_number = None
     else:
-        pr_number = _expect_int(pr_value, context="issue_implementation.pr_number")  # shape-check: fatal:no-conservative-reading
+        pr_number = _expect_int_like(pr_value, context="issue_implementation.pr_number")  # shape-check: fatal:no-conservative-reading
         if pr_number <= 0:
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 "issue_implementation.pr_number must be a positive integer or null."
@@ -4161,14 +4298,20 @@ def validate_structured_task_result(
         required={"schema_version", "kind", "state", "outcome", "summary"},
         optional={"pr_number", "clarification", "architecture_impact"},
     )
-    state = _expect_non_empty_string(payload["state"], context="task_result.state")  # shape-check: fatal:no-conservative-reading
+    state = fold_enum_value(
+        _expect_non_empty_string(payload["state"], context="task_result.state"),  # shape-check: fatal:no-conservative-reading
+        {"blocking"}, context="task_result.state",
+    )
     if state != "blocking":
         raise AgentLoopError("task_result.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
-    outcome = _expect_non_empty_string(payload["outcome"], context="task_result.outcome")  # shape-check: fatal:no-conservative-reading
+    outcome = fold_enum_value(
+        _expect_non_empty_string(payload["outcome"], context="task_result.outcome"),  # shape-check: fatal:no-conservative-reading
+        {"opened_pr", "blocking", "clarification"}, context="task_result.outcome",
+    )
     if outcome not in {"opened_pr", "blocking", "clarification"}:
         raise AgentLoopError("task_result.outcome must be opened_pr, blocking, or clarification.")  # shape-check: fatal:no-conservative-reading
     pr_value = payload.get("pr_number")
-    pr_number = None if pr_value is None else _expect_int(pr_value, context="task_result.pr_number")  # shape-check: fatal:no-conservative-reading
+    pr_number = None if pr_value is None else _expect_int_like(pr_value, context="task_result.pr_number")  # shape-check: fatal:no-conservative-reading
     if outcome == "opened_pr" and (pr_number is None or pr_number <= 0):
         raise AgentLoopError("task_result.opened_pr requires a positive pr_number.")  # shape-check: fatal:no-conservative-reading
     if outcome != "opened_pr" and pr_number is not None:
@@ -4253,7 +4396,10 @@ def validate_structured_plan_revision(
         required=require_risk_test_matrix_contract == 1,
         reject_unsolicited=reject_unsolicited_risk_test_matrix_contract,
     )
-    state = _expect_non_empty_string(payload["state"], context="plan_revision.state")  # shape-check: fatal:no-conservative-reading
+    state = fold_enum_value(
+        _expect_non_empty_string(payload["state"], context="plan_revision.state"),  # shape-check: fatal:no-conservative-reading
+        {"blocking"}, context="plan_revision.state",
+    )
     if state != "blocking":
         raise AgentLoopError("plan_revision.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
     summary = _expect_non_empty_string(payload["summary"], context="plan_revision.summary")  # shape-check: fatal:no-conservative-reading
@@ -5059,6 +5205,8 @@ def _parse_plan_patch_field_value(field_name: str, value: object, *, context: st
         if (
             isinstance(status_value, str)
             and status_value not in ARCHITECTURE_IMPACT_DECLARED_STATUSES
+            # #2109: a case/separator variant of a declared token folds below.
+            and architecture_status_near_miss_key(status_value) not in ARCHITECTURE_IMPACT_DECLARED_STATUSES
             and architecture_status_near_miss_key(status_value) in _ARCHITECTURE_STATUS_SYNONYMS
         ):
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
@@ -5096,7 +5244,7 @@ def _ordered_patch_operation_keys() -> tuple[str, ...]:
 
 def _parse_plan_revision_patch_operation(value: object, *, context: str) -> PlanRevisionPatchOperation:
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
-    op = _expect_non_empty_string(payload.get("op"), context=f"{context}.op")  # shape-check: fatal:no-conservative-reading
+    op = _expect_strict_string(payload.get("op"), context=f"{context}.op")  # shape-check: fatal:no-conservative-reading
     if op not in PLAN_REVISION_PATCH_OPERATION_KEYS:
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{context}.op is unknown: {op!r}; valid operations are "
@@ -5104,7 +5252,7 @@ def _parse_plan_revision_patch_operation(value: object, *, context: str) -> Plan
         )
     if op == "replace":
         _expect_exact_keys(payload, context=context, required={"op", "field", "value"})  # shape-check: fatal:no-conservative-reading
-        field_name = _expect_non_empty_string(payload["field"], context=f"{context}.field")  # shape-check: fatal:no-conservative-reading
+        field_name = _expect_strict_string(payload["field"], context=f"{context}.field")  # shape-check: fatal:no-conservative-reading
         if field_name not in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
             dedicated = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS.get(field_name)
             if dedicated:
@@ -5226,7 +5374,10 @@ def parse_plan_revision_patch(
     )
     if contract_version != SEMANTIC_PATCH_CONTRACT_VERSION:
         raise AgentLoopError(f"{context}.semantic_patch_contract_version must be 1.")  # shape-check: fatal:kind-or-version-mismatch
-    state = _expect_non_empty_string(payload["state"], context=f"{context}.state")  # shape-check: fatal:no-conservative-reading
+    state = fold_enum_value(
+        _expect_non_empty_string(payload["state"], context=f"{context}.state"),  # shape-check: fatal:no-conservative-reading
+        {"blocking"}, context=f"{context}.state",
+    )
     if state != "blocking":
         raise AgentLoopError(f"{context}.state must be `blocking`.")  # shape-check: fatal:no-conservative-reading
     summary = _expect_non_empty_string(payload["summary"], context=f"{context}.summary")  # shape-check: fatal:no-conservative-reading
@@ -5243,7 +5394,7 @@ def parse_plan_revision_patch(
     round_number = _expect_int(payload["base_round_number"], context=f"{context}.base_round_number")  # shape-check: fatal:no-conservative-reading
     if round_number < 0:
         raise AgentLoopError(f"{context}.base_round_number must be non-negative.")  # shape-check: fatal:no-conservative-reading
-    identity = _expect_non_empty_string(payload["base_state_identity"], context=f"{context}.base_state_identity")  # shape-check: fatal:no-conservative-reading
+    identity = _expect_strict_string(payload["base_state_identity"], context=f"{context}.base_state_identity")  # shape-check: fatal:no-conservative-reading
     if not _PLAN_REVISION_PATCH_IDENTITY_RE.fullmatch(identity):
         raise AgentLoopError(f"{context}.base_state_identity must be a lowercase 64-hex identity.")  # shape-check: fatal:authentication-or-forgery
     operations_payload = payload["operations"]

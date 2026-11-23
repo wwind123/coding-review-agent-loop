@@ -572,6 +572,14 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "site."
         ),
     ),
+    "_expect_int_like": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Generic shape helper; the consequence is classified at each caller's annotated "
+            "site."
+        ),
+    ),
     "_expect_item_id": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),
@@ -754,6 +762,14 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "Fatal sites: no-conservative-reading: removing the element would weaken an "
             "obligation, finding, disposition, approved topology or discussion answer "
             "rather than a claim."
+        ),
+    ),
+    "_expect_strict_string": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Generic shape helper; the consequence is classified at each caller's annotated "
+            "site."
         ),
     ),
     "_expect_string_list": ShapeCheckClassification(

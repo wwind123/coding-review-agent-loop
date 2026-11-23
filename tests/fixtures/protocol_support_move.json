@@ -411,7 +411,7 @@
         "decorators": []
       },
       "_consume_structured_footer_and_signature": {
-        "sha256": "12013b845c729eef27c8e57275b3c8ebbbe1402d3cdb33db89691591c5ffabdd",
+        "sha256": "2164ce16e7ec8bfbd76c333838d97c6f7fa14aff660e1e8111c4126f5d8bd618",
         "original_lines": [
           6768,
           6815
@@ -462,7 +462,7 @@
         "decorators": []
       },
       "_expect_non_empty_string": {
-        "sha256": "2851b7d9380b46b1c049b71a7ffb17922d1a299d9ac6da9491e301207d7a9511",
+        "sha256": "0b72a855a91d4def87750378d1a6e3c9439a01a1e31ecc5ace0ba41b9fb0dfd1",
         "original_lines": [
           4526,
           4532
@@ -500,7 +500,7 @@
         "decorators": []
       },
       "_expect_string_list": {
-        "sha256": "5c05348fe2b86982f2d07544a6f99ad160d9d61567da2ce393914b6638586344",
+        "sha256": "7effe4ce0a8f9deb7c937e88214d3ea1e8dc11c548e790f7043bc37c97af057e",
         "original_lines": [
           4615,
           4644
@@ -913,7 +913,7 @@
         "decorators": []
       },
       "_parse_discuss_agenda_disagreement": {
-        "sha256": "bfaed962194794bf89a356b8b2c1a3aa793fa95c94cbc5d751c15b787862b849",
+        "sha256": "c2942106fbc67f4bab92080bdb17d3361278d105466127038cb884e4a2d1a5d8",
         "original_lines": [
           9201,
           9227
@@ -929,7 +929,7 @@
         "decorators": []
       },
       "_parse_discuss_evidence": {
-        "sha256": "70d6305a34961e100a3abd2b785bd315c1dcc9318edc420440315b26dc8289a9",
+        "sha256": "c151060751737385c61dcddb0934fcfe5d971473b41239e7b0502bae9b02f5df",
         "original_lines": [
           8788,
           8849
@@ -1528,7 +1528,7 @@
         "decorators": []
       },
       "validate_structured_discuss_answer_confirmation": {
-        "sha256": "99a595127f64896b7212cff4650875fd19daa94dbc34e304158041520c5d47d1",
+        "sha256": "1a472c59e5cb5e58e71a3251ec4045b0a4143f5510f4cb9be6f400b0d3ba1965",
         "original_lines": [
           9177,
           9198
@@ -1633,7 +1633,7 @@
         "decorators": []
       },
       "validate_structured_discuss_semantic_comparison": {
-        "sha256": "c313d7e56f1a78d2b4bc6a6d5d90505879a524d134ea7ef9913abdd79e89bb20",
+        "sha256": "5bc88a5364b39bccca5fe262fc2de099aeab066dedc0496b6fd428f0e47d85cd",
         "original_lines": [
           9137,
           9174
