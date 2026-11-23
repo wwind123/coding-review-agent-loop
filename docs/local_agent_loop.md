@@ -995,7 +995,7 @@ every mode and never move to the advisory list.
 
 The advisory list lives on the orchestrator's PR round records and on the human
 checks comment, each entry keeping the complete ledger item it replaced, so it
-survives restarts. **Migration:** a PR whose latest evidence boundary is an
+survives restarts. The list is never truncated; the posted comment shows the first 50 checks and names how many more its round metadata holds. Under ordinary recovery the list is posted only after recovery CI passes with an authoritative check board. **Migration:** a PR whose latest evidence boundary is an
 evidence freeze, resumed in `advisory` or `off`, gets a release record with
 reason `advisory-mode` at the frozen head. Its native items move to the list (or
 are dropped), and the run continues from that release on the carried approvals

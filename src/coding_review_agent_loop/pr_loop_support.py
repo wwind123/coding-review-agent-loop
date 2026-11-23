@@ -609,8 +609,13 @@ def _finalize_ordinary_recovery_merge(
     config: AgentLoopConfig,
     pr_number: int,
     capability: OrdinaryRecoveryCapability,
+    hold: Callable[[], bool] | None = None,
 ) -> bool:
-    """Qualify, ready, and merge only the draft released by this invocation."""
+    """Qualify, ready, and merge only the draft released by this invocation.
+
+    ``hold`` (#2063) runs only after recovery CI passed with an authoritative
+    success-only board; True leaves the PR unmerged for advisory human checks.
+    """
     refreshed = refresh_ordinary_recovery_capability(
         runner, config=config, capability=capability,
     )
@@ -692,6 +697,8 @@ def _finalize_ordinary_recovery_merge(
             "did not produce an authoritative success-only current-head check board "
             f"({'; '.join(details)})."
         )
+        return False
+    if hold is not None and hold():
         return False
     if not validate_ordinary_recovery_capability(runner, config=config, capability=capability):
         raise AgentLoopError(
@@ -2111,10 +2118,13 @@ def _evidence_freeze_gate(
     live_ids = tuple(collect_requirement_ids(fresh))
     if set(live_ids) - set(surfaced_requirement_ids or ()):
         return _EvidenceGateOutcome("refresh", fresh)
-    if any(_is_row_converted_obligation(item) for item in items):
+    from .human_evidence_mode import freeze_mode
+    if freeze_mode(config) and any(_is_row_converted_obligation(item) for item in items):
         # Defense in depth (#1325): a stale converted tombstone that survived
         # into finalization reopens here and freezes instead of proceeding.
         # Coverage and finalization must share this caller-owned ledger.
+        # Freeze only (#2063): elsewhere a reopened row would recreate a
+        # human evidence freeze the non-freeze modes never publish.
         items[:] = _reconcile_converted_evidence(
             runner,
             config,
@@ -2153,6 +2163,9 @@ def _evidence_freeze_gate(
                 signed_evidence_references=signed_evidence_references)
     if not _pending_evidence_obligations(items):
         return _EvidenceGateOutcome("coverage_satisfied" if transition.action == "coverage_satisfied" else "proceed", fresh)
+    if not freeze_mode(config) and any(not item.screenshot_request for item in _pending_evidence_obligations(items)):
+        raise AgentLoopError(f"PR #{pr_number}: native human evidence reached the freeze write outside "
+                             "--pr-human-evidence freeze; no freeze, approval or merge was attempted.")
     still_frozen = bool(_frozen_evidence_obligations(items))
     frozen = _publish_evidence_freeze(
         runner,
@@ -2282,8 +2295,8 @@ def _finalize_ordinary_recovery_checked(
 ) -> bool:
     """Run ordinary recovery only after every unrelated obligation is clear.
 
-    ``hold`` (#2063) runs after the finalization check; True leaves the PR
-    approved and unmerged for advisory human checks.
+    ``hold`` (#2063) is forwarded to the merge step, which runs it only after
+    the authoritative recovery CI validation.
     """
     _ensure_finalization_ready(
         pr_number=pr_number,
@@ -2293,13 +2306,12 @@ def _finalize_ordinary_recovery_checked(
         ignored_machine_kinds=frozenset({"github-pr-checks"}),
         config=config,
     )
-    if hold is not None and hold():
-        return False
     return _finalize_ordinary_recovery_merge(
         runner,
         config=config,
         pr_number=pr_number,
         capability=capability,
+        hold=hold,
     )
 
 

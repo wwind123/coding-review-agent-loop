@@ -486,3 +486,296 @@ def test_persisted_human_only_classification_does_not_route_the_source_away_in_a
     assert [r.metadata.evidence_release.reason for r in _release_records(runner)][:1] == ["advisory-mode"]
     assert seen and seen[0] == ((rid,), ())
     assert _merge_calls(runner) == []
+
+
+# --- review round 1 fixes ------------------------------------------------------------------
+
+
+def _recovery_capability():
+    from coding_review_agent_loop.managed_ci_types import OrdinaryRecoveryCapability
+
+    return OrdinaryRecoveryCapability(pr_number=77, repository="OWNER/REPO", base_ref="main",
+                                      expected_head_sha=HEAD, released_label_event_id=101, released_at=100)
+
+
+@pytest.mark.parametrize("outcome", ["pending", "failed", "not_started", "non_authoritative", "passed"])
+def test_ordinary_recovery_runs_the_advisory_hold_only_after_authoritative_recovery_ci(
+    tmp_path, monkeypatch, outcome
+):
+    """Item-1: the advisory hold never pre-empts ordinary-recovery CI validation."""
+    from coding_review_agent_loop.github import PullRequestCheck, PullRequestMetadata
+    from coding_review_agent_loop.managed_ci_types import ManagedCiOutcome
+    from pr_loop_test_helpers import _watch_check_board
+
+    capability = _recovery_capability()
+    board = (_watch_check_board("passing", passing=(PullRequestCheck(name="test", kind="check_run", status="neutral"),))
+             if outcome == "non_authoritative" else _watch_check_board("passing"))
+    status = "passed" if outcome in {"passed", "non_authoritative"} else outcome
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(pr_loop_support, "wait_for_ordinary_recovery",
+                        lambda *a, **k: ManagedCiOutcome(status=status, checks=board, head_sha=HEAD))
+    patch_attr_in(monkeypatch, _CONTEXT_MODULES, "get_observed_pr_review_context",
+                  lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
+                      number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+                      base_branch="main", head_sha=HEAD, url=None)))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: pytest.fail("advisory hold must not merge"))
+    holds = []
+    runner = FakeRunner()
+
+    def finalize():
+        return pr_loop_support._finalize_ordinary_recovery_checked(
+            runner, config=_config(tmp_path, auto_merge=True), pr_number=77, round_number=1, items=[],
+            current_head_sha=HEAD, capability=capability, hold=lambda: holds.append(True) or True)
+
+    if outcome in {"pending", "failed"}:
+        with pytest.raises(AgentLoopError, match="did not qualify the exact head"):
+            finalize()
+    else:
+        assert finalize() is False
+    assert holds == ([True] if outcome == "passed" else [])
+    assert not any(cmd[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["advisory", "off"])
+def test_finalization_gate_never_reopens_a_converted_tombstone_outside_freeze(tmp_path, mode):
+    """Item-2: a cleared converted row at an earlier head proceeds instead of freezing."""
+    from test_pr_loop_evidence_conversion import START_HEAD, _comment, _plan_context
+    from coding_review_agent_loop.evidence_conversion import ConversionAuditRow, EvidenceConversionAudit
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.unresolved_items import _upsert_converted_evidence_obligation
+
+    context = _plan_context("row-a")
+    _ledger, obligation, _ = _upsert_converted_evidence_obligation(
+        [], item_number=2, row_id="row-a", matrix_identity=context.risk_test_matrix_identity,
+        head_sha="old-head", owners=("Codex",), source_round=2, explanation="")
+    audit = EvidenceConversionAudit(
+        source="operator", matrix_identity=context.risk_test_matrix_identity, head="old-head",
+        rows=(ConversionAuditRow(row_id="row-a", obligation_identity=obligation.obligation_identity,
+                                 obligation_item_id="item-2", owners=("Codex",), converted_item_ids=(),
+                                 attempt_record_rounds=()),))
+    conversion = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="old-head",
+        prior_items=(obligation,), state="blocking", phase="evidence-conversion", evidence_conversion=audit)
+    runner = FakeRunner(pr_payload={"comments": [_comment(_attach_round_metadata("Converted.", conversion))]})
+    stale = dataclasses.replace(obligation, status="resolved", lifecycle="cleared", candidate_head_sha="old-head")
+    items = [stale]
+    outcome = pr_loop_support._evidence_freeze_gate(
+        runner, config=_config(tmp_path, pr_human_evidence=mode), pr_number=77, round_number=3,
+        head_sha=START_HEAD, items=items, surfaced_requirement_ids=(), collect_requirement_ids=lambda _ctx: (),
+        allowed_rounds=8, watch_failure_extension_used=False, watch_head_extension_used=False,
+        approved_plan_context=context)
+    assert outcome.action == "proceed" and items == [stale]
+    assert _freeze_records(runner) == []
+
+
+def test_native_evidence_reaching_the_freeze_write_outside_freeze_fails_closed(tmp_path):
+    """Item-2 generalization: no native human evidence freeze can be written outside freeze mode."""
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+
+    items, _ = _upsert_evidence_obligation([], item_number=1, reviewer="Codex", text=_EVIDENCE_TEXT,
+                                           source_round=1, current_head_sha=HEAD)
+    runner = FakeRunner()
+    with pytest.raises(AgentLoopError, match="outside --pr-human-evidence freeze"):
+        pr_loop_support._evidence_freeze_gate(
+            runner, config=_config(tmp_path), pr_number=77, round_number=1, head_sha=HEAD, items=items,
+            surfaced_requirement_ids=(), collect_requirement_ids=lambda _ctx: (), allowed_rounds=5,
+            watch_failure_extension_used=False, watch_head_extension_used=False)
+    assert _freeze_records(runner) == []
+
+
+def test_more_than_fifty_requests_survive_restart_and_restoration_losslessly(tmp_path):
+    """Item-3: the durable list is lossless; only the rendered comment is bounded."""
+    texts = [f"Run live scenario {n} against authenticated CLIs at this head." for n in range(60)]
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=texts)])
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path)) == 0
+    [record] = _check_records(runner)
+    assert sorted(HumanCheck.from_mapping(e).text for e in record.metadata.human_checks) == sorted(texts)
+    assert "and 10 more" in _check_comments(runner)[0]
+    runner.codex_outputs.append(_evidence_review())
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, pr_human_evidence="freeze"))
+    [freeze] = _freeze_records(runner)
+    assert sorted(i.text for i in _evidence_items(freeze.metadata.prior_items)) == sorted(texts)
+
+
+@pytest.mark.parametrize("bad_kind", [[], {}, 7, None])
+def test_malformed_kind_is_dropped_through_full_round_metadata_decoding(bad_kind):
+    """Item-4: a non-string kind drops only that entry, never the record."""
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata, _decode_round_metadata, _encode_round_metadata)
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+
+    items, _ = _upsert_evidence_obligation([], item_number=1, reviewer="Codex", text=_EVIDENCE_TEXT,
+                                           source_round=1, current_head_sha=HEAD)
+    good = HumanCheck("Codex", _EVIDENCE_TEXT, 1, HEAD, "native", items[0]).as_dict()
+    metadata = PostedRoundMetadata(flow="pr", role="summary", agent="Orchestrator", round_number=1,
+                                   subject=HEAD, human_checks=(good, {**good, "kind": bad_kind}))
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.human_checks == (good,)
+
+
+# --- item-5 workflow coverage -----------------------------------------------------------
+
+
+def _malformed_association_review(**kwargs):
+    import json
+
+    raw, footer = _evidence_review(**kwargs).split("\n<!--", 1)
+    payload = json.loads(raw)
+    payload["requirement_evidence"] = [{"requirement_id": "R1"}]  # malformed shape
+    return json.dumps(payload) + "\n<!--" + footer
+
+
+@pytest.mark.parametrize("mode", ["advisory", "off"])
+def test_published_malformed_association_is_reparsed_on_same_round_resume_without_reask(
+    tmp_path, monkeypatch, mode
+):
+    """Item-5.s1: same-round resume reparses the canonical response with associations ignored."""
+    from pr_loop_test_helpers import _InterruptedAfterReviews
+
+    runner = FakeRunner(
+        codex_outputs=[_malformed_association_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+    )
+    config = _config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, pr_human_evidence=mode)
+    real = pr_loop.post_pr_comment
+
+    def post(*args, **kwargs):
+        real(*args, **kwargs)
+        if len([r for r in _pr_records(runner) if r.metadata.role == "reviewer"]) == 2:
+            raise _InterruptedAfterReviews()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pr_loop, "post_pr_comment", post)
+        with pytest.raises(_InterruptedAfterReviews):
+            run_pr_loop(runner, pr_number=77, config=config)
+    codex_record = next(r for r in _pr_records(runner) if r.metadata.agent == "Codex")
+    assert '"requirement_id": "R1"' in codex_record.metadata.canonical_reviewer_response
+    reparsed = []
+    real_parse = pr_loop.parse_structured_pr_review
+
+    def spy(text, **kwargs):
+        result = real_parse(text, **kwargs)
+        reparsed.append((kwargs.get("parse_requirement_evidence"), result.requirement_evidence if result else None))
+        return result
+
+    monkeypatch.setattr(pr_loop, "parse_structured_pr_review", spy)
+    calls_before = len(_reviewer_calls(runner))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert reparsed and all(flag is False and evidence == () for flag, evidence in reparsed)
+    assert len(_reviewer_calls(runner)) == calls_before  # no re-ask or fresh review
+    assert _freeze_records(runner) == []
+    assert len(_check_comments(runner)) == (1 if mode == "advisory" else 0)
+
+
+@pytest.mark.parametrize("mode", ["advisory", "off"])
+def test_closed_incomplete_round_evidence_is_normalized_through_rollover(tmp_path, monkeypatch, mode):
+    """Item-5.s2: closure restoration and completed-review replay never reach dispatch or finalization."""
+    from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from pr_loop_test_helpers import _CLOSURE_HEAD, _append_orchestrator_record, _InterruptedAfterReviews
+
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+    )
+    config = _config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, pr_human_evidence=mode)
+    real = pr_loop.post_pr_comment
+
+    def post(*args, **kwargs):
+        real(*args, **kwargs)
+        if len([r for r in _pr_records(runner) if r.metadata.role == "reviewer"]) == 2:
+            raise _InterruptedAfterReviews()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pr_loop, "post_pr_comment", post)
+        with pytest.raises(_InterruptedAfterReviews):
+            run_pr_loop(runner, pr_number=77, config=config)
+    payload = build_round_closure_payload(
+        flow="pr", round_number=1, subject=_CLOSURE_HEAD,
+        published=[("Codex", None), ("Gemini", None)],
+        unreplayable=[("Gemini", "published review could not be replayed")],
+        evidence_obligations=[{"reviewer": "Codex", "source_round": 1, "head": _CLOSURE_HEAD,
+                               "text": _EVIDENCE_TEXT, "item_number": 1}],
+        item_number_high_water=1,
+    )
+    assert payload is not None
+    _append_orchestrator_record(runner, _attach_round_metadata("Review round 1 closed, incomplete.", PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=_CLOSURE_HEAD,
+        phase=ROUND_CLOSED_INCOMPLETE_PHASE, round_closure=payload)))
+    lines = _captured_log(monkeypatch)
+    seen = []
+    real_ready = pr_loop._ensure_finalization_ready
+
+    def ready(**kwargs):
+        seen.append(_evidence_items(kwargs["items"]))
+        return real_ready(**kwargs)
+
+    monkeypatch.setattr(pr_loop, "_ensure_finalization_ready", ready)
+    runner.codex_outputs.append(_evidence_review(evidence=[_EVIDENCE_TEXT]))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini"))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert seen and not any(seen) and _freeze_records(runner) == []
+    later = [r for r in _pr_records(runner) if r.metadata.round_number >= 2]
+    assert later and not any(_evidence_items(r.metadata.prior_items) for r in later)
+    bodies = _check_comments(runner)
+    if mode == "advisory":
+        assert len(bodies) == 1 and bodies[0].count(_EVIDENCE_TEXT) == 1
+    else:
+        assert bodies == [] and any("dropped" in line for line in lines)
+
+
+def test_carried_earlier_round_request_is_restored_in_freeze(tmp_path):
+    """Item-5.s3 (carried approval): an earlier-round advisory request returns as its obligation."""
+    code = "Guard the pre-spawn git status call."
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(state="blocking", blocking=[code], reviewer="Google Gemini")],
+    )
+    two = dict(reviewer=("codex", "gemini"))
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, max_rounds=1, **two))
+    fixed = {"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}
+    keep = {"item_id": "item-2", "disposition": "blocking", "note": "Human evidence still needed."}
+    runner.codex_outputs.extend([_evidence_review(state="blocking", dispositions=[fixed, keep])] * 2)
+    runner.gemini_outputs.extend([_evidence_review(reviewer="Google Gemini", dispositions=[
+        fixed, {**keep, "disposition": "resolved", "note": "Not my request."}])] * 2)
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, max_rounds=4, pr_human_evidence="freeze", **two))
+    [freeze] = _freeze_records(runner)
+    [item] = _evidence_items(freeze.metadata.prior_items)
+    assert item.text == _EVIDENCE_TEXT and item.reviewer == "Codex" and item.resolution_owners == ("Codex",)
+    assert item.source_round == 1
+
+
+def test_converted_row_freeze_advisory_freeze_round_trip_keeps_provenance_and_clears(tmp_path, monkeypatch):
+    """Item-5.s3 (converted row): restored once with its provenance, then cleared by its row clearance."""
+    from test_pr_loop_evidence_conversion import (
+        _evidence_items as row_items, _frozen_after_auto_conversion, _plan_context, _review)
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _frozen_after_auto_conversion(tmp_path, monkeypatch, context)
+    head = "525753a4b04bd57d874211ba1fade250c3ff6d82"
+    [original] = row_items(_freeze_records(runner)[0].metadata.prior_items, "row-a")
+    advisory = dataclasses.replace(config, pr_human_evidence="advisory")
+    assert run_pr_loop(runner, pr_number=77, config=advisory, approved_plan_context=context) == 0
+    [release] = _release_records(runner)
+    assert release.metadata.evidence_release.reason == "advisory-mode"
+    [check] = [HumanCheck.from_mapping(e) for e in release.metadata.human_checks]
+    assert check.kind == "converted" and "`row-a`" in _check_comments(runner)[-1]
+    # Back to freeze: the row is restored from its origin item and freezes again.
+    with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {head}"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    [restored] = row_items(_freeze_records(runner)[-1].metadata.prior_items, "row-a")
+    assert (restored.item_id, restored.obligation_identity, restored.converted_matrix_identity,
+            restored.resolution_owners, restored.reviewer) == (
+        original.item_id, original.obligation_identity, original.converted_matrix_identity,
+        original.resolution_owners, original.reviewer)
+    # Its existing row clearance resolves it.
+    runner.pr_payload["comments"].append(
+        _signed(f"Ran the row-a scenario at {head} against the live stack: all checks passed.", 1))
+    runner.codex_outputs.append(_review(resolved=[restored.item_id], hr=True))
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    cleared = [r for r in _release_records(runner) if r.metadata.evidence_release.reason == "evidence-cleared"]
+    assert cleared and [ref.row_id for ref in cleared[-1].metadata.signed_evidence_references] == ["row-a"]

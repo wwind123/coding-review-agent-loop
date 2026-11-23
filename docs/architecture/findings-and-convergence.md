@@ -639,7 +639,9 @@ instead of re-creating it; identities cleared at the current head are skipped.
 Outside `freeze`, signed-source classification, association validation and
 parsing, historical association routing, the evidence-only stall and automatic
 conversion are skipped, and operator conversion is refused at config
-validation. Every reviewer-response parse site passes the mode explicitly, and
+validation. The finalization gate reconciles converted rows only in `freeze`, and
+outside it a native evidence item reaching the freeze write fails closed
+instead of freezing. Every reviewer-response parse site passes the mode explicitly, and
 a static guard test enforces this. The finalization gate still runs whenever the
 advisory list is non-empty, so the final head and signed-input reads, the
 screenshot final gate and `_ensure_finalization_ready` all precede approval. At

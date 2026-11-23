@@ -28,8 +28,8 @@ DEFAULT_PR_HUMAN_EVIDENCE_MODE = "advisory"
 # reconstruction never treats it as a round record.
 HUMAN_CHECKS_FLOW = "pr-human-checks"
 HUMAN_CHECKS_HEADING = "## Human checks requested"
-# Bound on the durable list; older entries beyond it are not recorded.
-HUMAN_CHECKS_LIMIT = 50
+# Bound on the rendered comment only; the durable list is lossless.
+HUMAN_CHECKS_RENDER_LIMIT = 50
 _TEXT_LIMIT = 600
 _OPEN_STATUSES = frozenset({"blocking", "same-pr"})
 
@@ -86,7 +86,7 @@ class HumanCheck:
             or not isinstance(text, str) or not text
             or not isinstance(round_number, int) or isinstance(round_number, bool)
             or not (head is None or (isinstance(head, str) and head))
-            or kind not in {"native", "converted"}
+            or not isinstance(kind, str) or kind not in {"native", "converted"}
         ):
             return None
         try:
@@ -172,7 +172,7 @@ def normalize_human_evidence_ledger(
     added = 0
     for item in moved:
         identity = check_identity(item)
-        if identity in known or len(result) >= HUMAN_CHECKS_LIMIT:
+        if identity in known:
             continue
         known.add(identity)
         result.append(_check_from_item(item, head_sha))
@@ -239,13 +239,16 @@ def render_human_checks_comment(
         "human decides whether to check and merge.",
         "",
     ]
-    for check in checks:
+    for check in checks[:HUMAN_CHECKS_RENDER_LIMIT]:
         text = _normalize_item_summary(check.text, limit=_TEXT_LIMIT)
         if check.kind == "converted":
             label = f"risk-matrix row `{check.origin_item.converted_row_id}`"
         else:
             label = f"{_normalize_item_summary(check.reviewer, limit=80)} (round {check.source_round})"
         lines.append(f"- {label}: {text}")
+    if len(checks) > HUMAN_CHECKS_RENDER_LIMIT:
+        lines.append(f"- ... and {len(checks) - HUMAN_CHECKS_RENDER_LIMIT} more; every check is kept "
+                     "in this comment's round metadata.")
     lines.extend(["", "-- coding-review-agent-loop"])
     return "\n".join(lines)
 
