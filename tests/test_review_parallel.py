@@ -6004,3 +6004,186 @@ def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp
     assert sum(peer_marker in c["body"] for c in comments) == 1
     assert runner.reviewer_launches[launches_before:] == []
     assert _spool_files(config) == []
+
+
+# --- #2100: dropped non-carried dispositions through parallel publication ---
+
+_M2100_NOTE = "Ignored dispositions for non-carried IDs: "
+
+
+def _m2100_records(bodies, flow):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    return _extract_round_metadata_records([SimpleNamespace(body=body) for body in bodies], flow=flow)
+
+
+def _m2100_resumed_spy(monkeypatch, module, name):
+    """Record every review the loop rebuilds by constructor (the resume branch)."""
+    real = getattr(module, name)
+    built = []
+
+    class _Recording(type):
+        # Construction records; type checks still see the real class.
+        def __instancecheck__(cls, obj):
+            return isinstance(obj, real)
+
+        def __call__(cls, *args, **kwargs):
+            value = real(*args, **kwargs)
+            built.append(value)
+            return value
+
+    monkeypatch.setattr(module, name, _Recording(name, (), {}))
+    return built
+
+
+def _m2100_pr_runner():
+    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    extra = [{"item_id": "item-77", "disposition": "blocking", "note": "Not carried here."}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Codex found a blocker.",
+                blocking_items=["Persist this item."], prior_item_dispositions=extra,
+            ),
+            structured_pr_review(
+                summary="Codex approves after the fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            # Approved, and its only active disposition names a non-carried ID.
+            structured_pr_review(
+                summary="Gemini approves independently.", reviewer="Google Gemini",
+                prior_item_dispositions=extra,
+            ),
+            structured_pr_review(
+                summary="Gemini approves after the fix.", reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(
+            summary="Fixed the persisted item.", addressed_items=["item-1"]
+        )],
+    )
+    return runner, markers
+
+
+def test_m2100_pr_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_path, monkeypatch):
+    runner, markers = _m2100_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    spooled = [json.loads(path.read_text(encoding="utf-8")) for path in _spool_files(config)]
+    assert [record["response"]["ignored_prior_disposition_ids"] for record in spooled] == [["item-77"]]
+    resumed = _m2100_resumed_spy(monkeypatch, pr_loop, "ParsedReview")
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # Round 1 is completed from the published record and the spool: only the
+    # two round-2 reviewer turns run.
+    assert len(runner.reviewer_launches) - launches_before == 2
+    bodies = [str(comment["body"]) for comment in runner.pr_payload["comments"]]
+    for marker in markers:
+        published = [body for body in bodies if marker in body]
+        assert len(published) == 1
+        assert f"{_M2100_NOTE}`item-77`" in published[0]
+    round_one = [
+        record for record in _m2100_records(bodies, "pr")
+        if record.metadata.role == "reviewer" and record.metadata.round_number == 1
+    ]
+    assert {record.metadata.agent for record in round_one} == {"Codex", "Gemini"}
+    for record in round_one:
+        assert record.metadata.ignored_prior_disposition_ids == ("item-77",)
+        assert record.metadata.dispositions == ()
+        assert "item-77" not in (record.metadata.canonical_reviewer_response or "")
+    gemini = next(record for record in round_one if record.metadata.agent == "Gemini")
+    assert gemini.metadata.state == "approved"
+    # The already-public review was rebuilt by the resume branch with its
+    # ignored IDs restored from round metadata.
+    rebuilt = [review for review in resumed if review.ignored_prior_disposition_ids]
+    assert rebuilt and all(r.ignored_prior_disposition_ids == ("item-77",) for r in rebuilt)
+    assert all(r.dispositions == () for r in rebuilt)
+    assert _spool_files(config) == []
+
+
+def test_m2100_plan_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_path, monkeypatch):
+    markers = ("Codex plan approval with a unique note.", "Gemini independent plan approval.")
+    extra = [{"item_id": "item-77", "disposition": "same-plan", "note": "Not carried here."}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(
+            summary="Codex plan approval with a unique note.", prior_plan_item_dispositions=extra,
+        )],
+        gemini_outputs=[structured_plan_review(
+            summary="Gemini independent plan approval.", reviewer="Google Gemini",
+            prior_plan_item_dispositions=extra,
+        )],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    spooled = [json.loads(path.read_text(encoding="utf-8")) for path in _spool_files(config)]
+    assert [record["response"]["ignored_prior_disposition_ids"] for record in spooled] == [["item-77"]]
+    resumed = _m2100_resumed_spy(monkeypatch, plan_first_loop, "ParsedPlanReview")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # The withheld review was replayed, never re-run.
+    assert sorted(runner.reviewer_launches) == ["codex", "gemini"]
+    bodies = [str(comment["body"]) for comment in runner.issue_comments]
+    for marker in markers:
+        published = [body for body in bodies if marker in body]
+        assert len(published) == 1
+        assert f"{_M2100_NOTE}`item-77`" in published[0]
+    reviews = [
+        record for record in _m2100_records(bodies, "plan") if record.metadata.role == "reviewer"
+    ]
+    assert len(reviews) == 2
+    for record in reviews:
+        assert record.metadata.state == "approved"
+        assert record.metadata.ignored_prior_disposition_ids == ("item-77",)
+        assert record.metadata.dispositions == ()
+    rebuilt = [review for review in resumed if review.ignored_prior_disposition_ids]
+    assert rebuilt and all(r.ignored_prior_disposition_ids == ("item-77",) for r in rebuilt)
+    assert all(r.state == "approved" and r.dispositions == () for r in rebuilt)
+    assert _spool_files(config) == []
+
+
+def test_m2100_malformed_spooled_ignored_ids_fall_back_to_a_fresh_turn(tmp_path):
+    extra = [{"item_id": "item-77", "disposition": "resolved"}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Gemini approves the PR.",),
+        codex_outputs=[("codex exploded", 1)],
+        gemini_outputs=[structured_pr_review(
+            summary="Gemini approves the PR.", reviewer="Google Gemini", prior_item_dispositions=extra,
+        )],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
+    )
+    with pytest.raises(AgentLoopError, match="Codex"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert runner.comments == []
+    damaged = 0
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("response", {}).get("ignored_prior_disposition_ids"):
+            payload["response"]["ignored_prior_disposition_ids"] = ["bad id"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            damaged += 1
+    assert damaged == 1
+    runner.codex_outputs.append(structured_pr_review(summary="Codex approves after rerun."))
+    runner.gemini_outputs.append(structured_pr_review(
+        summary="Gemini approves on a fresh turn.", reviewer="Google Gemini", prior_item_dispositions=extra,
+    ))
+    launches_before = runner.reviewer_launches.count("gemini")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.reviewer_launches.count("gemini") == launches_before + 1
+    bodies = [str(comment["body"]) for comment in runner.pr_payload["comments"]]
+    assert not any("Gemini approves the PR." in body for body in bodies)
+    fresh = [body for body in bodies if "Gemini approves on a fresh turn." in body]
+    assert len(fresh) == 1 and f"{_M2100_NOTE}`item-77`" in fresh[0]

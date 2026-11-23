@@ -1374,6 +1374,10 @@ def _validate_plan_revision_response(
         carried_item_ids=_plan_carried_item_ids(unresolved_items),
     )
     if parsed is not None:
+        _reject_duplicate_carried_dispositions(
+            parsed.prior_plan_item_dispositions,
+            context="plan_revision.prior_plan_item_dispositions",
+        )
         return parsed
     raise AgentLoopError("Plan revision did not use the required structured format.")
 
@@ -1461,6 +1465,13 @@ def _check_plan_revision_patch_ledger(
     this never rejects agent output; a surviving non-carried ID is an
     orchestrator defect, not a replan diagnostic.
     """
+    # A carried ID disposed twice is ambiguous; repair must keep the payload,
+    # so this is a payload rejection (bounded replan), never a re-ask (#2100).
+    _reject_duplicate_carried_dispositions(
+        parsed.prior_plan_item_dispositions,
+        context="plan_revision_patch.prior_plan_item_dispositions",
+        error=SemanticPatchPayloadRejection,
+    )
     carried, aliases = _plan_carried_item_ids(unresolved_items)
     surviving = sorted(
         {item.item_id for item in parsed.prior_plan_item_dispositions} - carried - aliases
@@ -1469,6 +1480,26 @@ def _check_plan_revision_patch_ledger(
         raise AgentLoopError(
             "Internal error: a live semantic patch kept dispositions for non-carried IDs: "
             + ", ".join(surviving)
+        )
+
+
+def _reject_duplicate_carried_dispositions(
+    dispositions: Sequence[ReviewItemDisposition],
+    *,
+    context: str,
+    error: type[AgentLoopError] = AgentLoopError,
+) -> None:
+    """Reject a carried ID disposed more than once (#2100).
+
+    Runs on the kept (carried) dispositions after the pre-parse partition, so
+    a repeated non-carried ID has already been dropped once and never
+    rejects.  The reviewer validators apply the same rule.
+    """
+    ids = [item.item_id for item in dispositions]
+    duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+    if duplicates:
+        raise error(
+            f"{context} lists carried prior items more than once: " + ", ".join(duplicates)
         )
 
 

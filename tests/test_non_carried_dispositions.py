@@ -303,37 +303,44 @@ def test_approval_with_an_active_carried_disposition_is_still_rejected():
         )
 
 
-def test_duplicates_split_between_dropped_and_rejected():
-    carried = (_item("item-1"),)
-    pr = _validate_review_response(
-        structured_pr_review(state="blocking", prior_item_dispositions=_resolved("item-1", "item-9", "item-9")),
+_DUPLICATE_VALIDATORS = {
+    "pr_review": lambda prior, carried: _validate_review_response(
+        structured_pr_review(state="blocking", prior_item_dispositions=prior),
         reviewer="OpenAI Codex", unresolved_items=carried, architecture_status_mode="legacy",
-    )
-    assert pr.ignored_prior_disposition_ids == ("item-9",)
-    plan = _validate_plan_review_response(
-        structured_plan_review(state="blocking", prior_plan_item_dispositions=_resolved("item-1", "item-9", "item-9")),
+    ),
+    "plan_review": lambda prior, carried: _validate_plan_review_response(
+        structured_plan_review(state="blocking", prior_plan_item_dispositions=prior),
         reviewer="OpenAI Codex", unresolved_items=carried, architecture_status_mode="legacy",
-    )
-    assert plan.ignored_prior_disposition_ids == ("item-9",)
-    patch = _validate_plan_revision_patch_response(
-        _patch_text(_resolved("item-1", "item-9", "item-9")), unresolved_items=carried
-    )
-    assert patch.ignored_prior_disposition_ids == ("item-9",)
-    revision = _validate_plan_revision_response(
-        structured_plan_revision(prior_plan_item_dispositions=_resolved("item-1", "item-9", "item-9")),
+    ),
+    "plan_revision": lambda prior, carried: _validate_plan_revision_response(
+        structured_plan_revision(prior_plan_item_dispositions=prior),
         unresolved_items=carried, architecture_status_mode="legacy",
-    )
-    assert revision.ignored_prior_disposition_ids == ("item-9",)
+    ),
+    "plan_revision_patch": lambda prior, carried: _validate_plan_revision_patch_response(
+        _patch_text(prior), unresolved_items=carried
+    ),
+    "plan_revision_patch_payload": lambda prior, carried: _validate_plan_revision_patch_payload(
+        _payload(_patch_text(prior)), unresolved_items=carried
+    ),
+}
 
+
+@pytest.mark.parametrize("kind", sorted(_DUPLICATE_VALIDATORS))
+def test_duplicates_split_between_dropped_and_rejected(kind):
+    validate = _DUPLICATE_VALIDATORS[kind]
+    carried = (_item("item-1"),)
+    parsed = validate(_resolved("item-1", "item-9", "item-9"), carried)
+    assert parsed.ignored_prior_disposition_ids == ("item-9",)
     with pytest.raises(AgentLoopError, match="more than once: item-1"):
-        _validate_review_response(
-            structured_pr_review(state="blocking", prior_item_dispositions=_resolved("item-1", "item-1")),
-            reviewer="OpenAI Codex", unresolved_items=carried, architecture_status_mode="legacy",
-        )
-    with pytest.raises(AgentLoopError, match="more than once: item-1"):
-        _validate_plan_review_response(
-            structured_plan_review(state="blocking", prior_plan_item_dispositions=_resolved("item-1", "item-1")),
-            reviewer="OpenAI Codex", unresolved_items=carried, architecture_status_mode="legacy",
+        validate(_resolved("item-1", "item-1"), carried)
+
+
+def test_duplicate_carried_patch_disposition_is_a_payload_rejection():
+    from coding_review_agent_loop.errors import SemanticPatchPayloadRejection
+
+    with pytest.raises(SemanticPatchPayloadRejection, match="more than once: item-1"):
+        _validate_plan_revision_patch_payload(
+            _payload(_patch_text(_resolved("item-1", "item-1"))), unresolved_items=(_item("item-1"),)
         )
 
 
@@ -716,3 +723,91 @@ def test_overflow_digest_uses_compact_indicator_and_keeps_the_record(tmp_path, o
         assert f"{IGNORED_DISPOSITIONS_HEADING}\n\n{NOTE_PREFIX}`item-13`" in anchor
         assert "(complete list in round metadata)" not in anchor
     assert re.search(r"item-13", canonical_plan) is None
+
+
+def test_pr_loop_publishes_kept_sub_item_record_and_ignored_note(tmp_path):
+    """parser-records-across-drop through the real PR loop and publisher."""
+    from types import SimpleNamespace
+
+    from agent_loop_helpers import structured_coder_followup
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    payload = _payload(structured_pr_review(state="approved", summary="Codex approves after the fix."))
+    payload["prior_item_dispositions"] = [
+        {"item_id": "item-9", "disposition": "resolved", "sub_item_dispositions": []},
+        {"item_id": "item-1", "disposition": "resolved", "sub_item_dispositions": {"s1": "maybe"}},
+    ]
+    second = json.dumps(payload) + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Codex found a blocker.", blocking_items=["Fix it."]),
+            second,
+        ],
+        claude_outputs=[structured_coder_followup(summary="Fixed.", addressed_items=["item-1"])],
+    )
+    config = make_config(tmp_path, reviewer="codex")
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    bodies = [str(comment["body"]) for comment in runner.pr_payload["comments"]]
+    published = [body for body in bodies if "Codex approves after the fix." in body]
+    assert len(published) == 1
+    body = published[0]
+    assert f"{NOTE_PREFIX}`item-9`" in body
+    assert "### Sub-item parse degradations" in body
+    assert "pr_review.prior_item_dispositions[0].sub_item_dispositions.s1" in body
+    records = [
+        record for record in _extract_round_metadata_records(
+            [SimpleNamespace(body=b) for b in bodies], flow="pr"
+        )
+        if record.metadata.role == "reviewer" and record.metadata.round_number == 2
+    ]
+    assert len(records) == 1
+    metadata = records[0].metadata
+    assert metadata.ignored_prior_disposition_ids == ("item-9",)
+    assert [r.element_path for r in metadata.sub_item_degradations] == [
+        "pr_review.prior_item_dispositions[0].sub_item_dispositions.s1"
+    ]
+    assert [d.item_id for d in metadata.dispositions] == ["item-1"]
+
+
+_EXEC = [
+    "<!-- execution-recommendation-section: " + "a" * 64 + " -->",
+    "### Execution strategy recommendation (v1)",
+    "- `strategy`: `one-shot`",
+    "<!-- AGENT_EXECUTION_RECOMMENDATION: e30= -->",
+]
+_MATRIX = [
+    "<!-- risk-test-matrix-section: " + "b" * 64 + " -->",
+    "### Risk-based mode and transition test matrix",
+    "| row |",
+    "<!-- AGENT_RISK_TEST_MATRIX: e30= -->",
+]
+
+
+@pytest.mark.parametrize(
+    "trailing",
+    [[], _EXEC, _MATRIX, [*_MATRIX, "", *_EXEC]],
+    ids=["no-section", "execution", "matrix", "matrix-then-execution"],
+)
+@pytest.mark.parametrize("section", [
+    IGNORED_DISPOSITIONS_HEADING + "\n\nnote",
+    "### Parse degradations (bounded)\n\n- indicator",
+    "### Sub-item parse degradations\n\n- record",
+])
+def test_attached_sections_never_land_inside_a_trailing_reserved_section(trailing, section):
+    """Generalization: no attached section may sit inside a transport-replaceable section."""
+    from coding_review_agent_loop.round_metadata import _insert_before_trailing_markers
+
+    body = "\n".join([
+        "## Revised plan", "", "Body text.", "", *trailing, "",
+        "<!-- AGENT_PLAN_STATE: blocking -->", "", "-- Anthropic Claude",
+    ])
+    out = _insert_before_trailing_markers(body, section)
+    position = out.index(section)
+    assert out.index("Body text.") < position
+    for line in trailing:
+        if line.startswith("<!-- ") and "section:" in line:
+            assert position < out.index(line)
+    assert position < out.index("<!-- AGENT_PLAN_STATE")
+    assert out.replace(section + "\n\n", "").replace("\n\n\n", "\n\n").count("Body text.") == 1

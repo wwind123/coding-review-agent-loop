@@ -189,7 +189,8 @@ degradations therefore exist only for kept entries, with indices into the
 filtered array. The verdict-consistency check sees only kept entries, so an
 approval whose only active disposition names a non-carried ID is accepted.
 There is no count or length bound, so non-carried IDs alone never cause a
-rejection, re-ask or bounded replan. Duplicate carried IDs are still rejected.
+rejection, re-ask or bounded replan. Duplicate carried IDs are rejected by all
+four validators; for a semantic patch that is a payload rejection.
 Missing dispositions keep their semantics: reviewers still fail on a missing
 carried disposition, and plan candidates, which never had a completeness check,
 gain none. The dropped IDs travel on the parsed result
@@ -205,7 +206,10 @@ present), and replay reattaches them. The optional round-metadata field
 `ignored_prior_disposition_ids` is in the lossless sidecar spill set. It renders
 as an `### Ignored prior-item dispositions` note that lists every ID up to a
 display budget and then a count. The compact projection, which the overflow plan
-digest now uses, shows a count indicator instead. The response-normalization
+digest now uses, shows a count indicator instead. Every section the round
+metadata attaches is inserted above any trailing execution-recommendation or
+risk-matrix section, because the transport may replace those sections with a
+bounded summary. The response-normalization
 strip helpers stay but are unreachable for live turns. The
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
 `--repair-timeout-seconds` and `--containment-repair-*` flags are deprecated

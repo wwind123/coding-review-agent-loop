@@ -3491,15 +3491,55 @@ def _attach_round_metadata(
     return TrustedBody.canonical(rendered, expected_tokens=expected)
 
 
-def _insert_before_trailing_markers(body: str, section: str) -> str:
-    lines = body.splitlines()
-    index = len(lines)
+_SECTION_CLOSING_MARKER_RE = re.compile(
+    r"^\s*<!--\s*(?:AGENT_EXECUTION_RECOMMENDATION|AGENT_RISK_TEST_MATRIX):", re.I
+)
+_SECTION_BOUNDARY_RE = re.compile(
+    r"^\s*<!--\s*(?:execution-recommendation-section|risk-test-matrix-section):", re.I
+)
+
+
+def _skip_trailing_marker_lines(lines: list[str], index: int) -> int:
     while index > 0:
         candidate = lines[index - 1]
         if not candidate.strip() or HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate):
             index -= 1
             continue
         break
+    return index
+
+
+def _section_insertion_index(lines: list[str]) -> int:
+    """Where an attached section goes: before the trailing markers, outside sections.
+
+    A trailing execution-recommendation or risk-matrix marker closes a section
+    that starts at its boundary line, and the round transport may replace
+    that whole range with a bounded summary.  An attached section inserted
+    inside it would be silently lost, so insertion moves above the boundary of
+    every section still open at the insertion point (#2100).
+    """
+    index = _skip_trailing_marker_lines(lines, len(lines))
+    while True:
+        boundary = next(
+            (position for position in range(index - 1, -1, -1)
+             if _SECTION_BOUNDARY_RE.match(lines[position])),
+            None,
+        )
+        if boundary is None:
+            return index
+        closing = next(
+            (position for position in range(boundary + 1, len(lines))
+             if _SECTION_CLOSING_MARKER_RE.match(lines[position])),
+            None,
+        )
+        if closing is None or closing < index:
+            return index
+        index = _skip_trailing_marker_lines(lines, boundary)
+
+
+def _insert_before_trailing_markers(body: str, section: str) -> str:
+    lines = body.splitlines()
+    index = _section_insertion_index(lines)
     prefix = "\n".join(lines[:index]).rstrip("\n")
     suffix = "\n".join(lines[index:]).lstrip("\n")
     return "\n\n".join(part for part in (prefix, section, suffix) if part)

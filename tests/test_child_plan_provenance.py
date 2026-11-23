@@ -2471,6 +2471,106 @@ def test_m2100_patch_with_non_carried_dispositions_is_accepted_without_replan(tm
     assert runner.diagnostic_posts == []
 
 
+def _m2100_patch_with_extras(fresh, summary):
+    patch = json.loads(_m976_patch(fresh, summary=summary).split("\n<!--", 1)[0])
+    patch["prior_plan_item_dispositions"] = [
+        {"item_id": "item-1", "disposition": "resolved", "note": "Covered."},
+        {"item_id": "item-13", "disposition": "resolved", "note": "Same-round."},
+        {"item_id": "item-43", "disposition": "blocking", "note": "Not carried."},
+    ]
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def _m2100_revision_record(runner, marker):
+    from coding_review_agent_loop.round_metadata import _decode_round_metadata
+
+    bodies = [str(item["body"]) for item in runner.issue_comments]
+    anchors = [body for body in bodies if marker in body and "AGENT_LOOP_META" in body]
+    assert len(anchors) == 1
+    match = list(_m948_transport.ROUND_RESUME_MARKER_RE.finditer(anchors[0]))[-1]
+    hydrated, missing = _m948_transport.hydrate_mapping(
+        _m948_transport.decode_mapping(match.group("payload")), bodies
+    )
+    assert missing == set()
+    return anchors[0], hydrated, _decode_round_metadata(_m948_transport.encode_mapping(hydrated))
+
+
+def test_m2100_resume_from_a_published_dropped_id_revision(tmp_path, monkeypatch):
+    """resume-sidecar-stable: a rerun resumes from the published revision."""
+    from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, _m2100_patch_with_extras(fresh, "Revision with extras.")],
+        # The second review is missing, so the first run stops after the
+        # revision is published.
+        codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
+    )
+    config = _plan_config(tmp_path, plan_growth_gate="off")
+    with pytest.raises(AgentInvocationError, match="exhausted"):
+        issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _anchor, _hydrated, published = _m2100_revision_record(runner, "Revision with extras.")
+    assert published.ignored_prior_disposition_ids == ("item-13", "item-43")
+
+    runner.codex_outputs.append(structured_plan_review(
+        state="approved",
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    ))
+    comments_before = len(runner.issue_comments)
+    assert issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # No new planner turn: the rerun resumed the published revision.
+    assert len(_agent_prompts(runner, "claude")) == 2
+    review_prompt = _agent_prompts(runner, "codex")[-1]
+    assert "Revision with extras." in review_prompt
+    assert "item-43" not in review_prompt and "item-13" not in review_prompt
+    new_bodies = [str(item["body"]) for item in runner.issue_comments[comments_before:]]
+    assert not any("Revision with extras." in body and "AGENT_LOOP_META" in body for body in new_bodies)
+    # The record the rerun read still decodes and verifies.
+    _anchor, _hydrated, record = _m2100_revision_record(runner, "Revision with extras.")
+    assert record.ignored_prior_disposition_ids == ("item-13", "item-43")
+    sidecar = decode_assembled_plan_sidecar(record.assembled_plan_sidecar)
+    assert sidecar.aggregate_identity == record.aggregate_plan_identity
+    canonical = json.dumps(sidecar.canonical_json)
+    assert "item-43" not in canonical and "item-13" not in canonical
+    assert record.subject == published.subject
+    assert runner.diagnostic_posts == []
+
+
+def test_m2100_semantic_patch_overflow_digest_keeps_ignored_ids(tmp_path, monkeypatch):
+    """compact-overflow-note on the semantic-patch publication path."""
+    from issue_loop_test_helpers import _m948_noise
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    payload = json.loads(_m976_full_plan_state().split("\n<!--", 1)[0])
+    payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    fresh = json.dumps(payload) + PLAN_FOOTER
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, _m2100_patch_with_extras(fresh, "Oversized revision with extras.")],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert issue_loop.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
+    ) == 0
+    anchor, hydrated, record = _m2100_revision_record(runner, "Oversized revision with extras.")
+    from coding_review_agent_loop.comment_rendering import COMPACT_PLAN_DIGEST_NOTICE
+
+    assert COMPACT_PLAN_DIGEST_NOTICE in anchor
+    assert "Ignored dispositions for non-carried IDs: 2 (complete list in round metadata)" in anchor
+    assert "### Ignored prior-item dispositions" not in anchor
+    assert hydrated["ignored_prior_disposition_ids"] == ["item-13", "item-43"]
+    assert record.ignored_prior_disposition_ids == ("item-13", "item-43")
+    raw = json.loads(record.raw_structured_coder_response.split("\n<!--", 1)[0])
+    assert [entry["item_id"] for entry in raw["prior_plan_item_dispositions"]] == ["item-1"]
+
+
 def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
     patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
