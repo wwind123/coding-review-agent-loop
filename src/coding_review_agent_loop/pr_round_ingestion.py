@@ -56,6 +56,8 @@ class AdmittedPrComment(IssueComment):
 
     amendment_eligible: bool = False
     human_trust: tuple[object, ...] = ()
+    # Highest item number of a visual record masked in a no-option run (#2070).
+    visual_item_reserve: int = 0
 
     @property
     def amendment_body(self) -> str | None:
@@ -230,6 +232,13 @@ def admit_pr_comments(
     result.extend(project(c, c.body) for c in listing.comments
                   if c.comment_id not in used)
     result.sort(key=lambda c: (c.created_at or "", c.comment_id or 0))
+    from dataclasses import replace
+    from .review_images import mask_visual_protocol_bodies
+    owned = [c.admitted_protocol_body if c.author_id == actor[1] else None for c in result]
+    masked, reserves = mask_visual_protocol_bodies(owned, config)
+    result = [replace(c, admitted_protocol_body=body, visual_item_reserve=reserve)
+              if c.author_id == actor[1] and body != c.admitted_protocol_body else c
+              for c, body, reserve in zip(result, masked, reserves)]
     return tuple(result), actor
 
 

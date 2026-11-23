@@ -3503,6 +3503,18 @@
       "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
     },
     {
+      "module": "review_images",
+      "function": "mask_visual_protocol_bodies",
+      "classification": "acquisition",
+      "admission": "review_images.mask_visual_protocol_bodies runs inside pr_round_ingestion.admit_pr_comments on actor-owned protocol bodies only, after complete REST identity binding; in a no-option run it removes round metadata from visual-candidate bodies before any strict codec, and its lenient payload read only yields item numbers for ID reservation, never authority (#2070)."
+    },
+    {
+      "module": "review_images",
+      "function": "reserved_visual_item_number",
+      "classification": "reader",
+      "admission": "review_images.reserved_visual_item_number reads only admitted comments' visual_item_reserve and already admitted round records' item numbers; it reserves IDs and grants no authority (#2070)."
+    },
+    {
       "module": "review_images_coverage_history",
       "function": "records",
       "classification": "reader",

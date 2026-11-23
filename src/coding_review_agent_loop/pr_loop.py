@@ -297,7 +297,6 @@ from .round_metadata import (
 from .qualification_checkpoint import QualificationCheckpoint
 from .round_state import (
     _extract_round_metadata_records,
-    _max_unresolved_item_number_from_records,
     _prior_item_ledger_signature,
     _scheduler_item_ledger_signature,
     _resume_plan_round,
@@ -693,7 +692,7 @@ def run_pr_loop(
     initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
-    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history, visual_review_requested, drop_visual_records, drop_visual_items, visual_records
+    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history, visual_review_requested, drop_visual_records, drop_visual_items, reserved_visual_item_number
     from .workdirs import active_workdir
     from .post_merge_runtime import ObligationRun, round_start, reviewer_requests, manual_pending, resume_scheduled, complete_merge
     from .post_merge_obligations import parse_request as parse_post_merge_request
@@ -2321,7 +2320,8 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
-        reserved_visual_records, startup_records = visual_records(startup_records), drop_visual_records(startup_records, config)
+        reserved_visual_number = reserved_visual_item_number(initial_pr_context.comments, startup_records)
+        startup_records = drop_visual_records(startup_records, config)
         human_evidence.seed(startup_records, _extract_round_metadata_records(initial_pr_context.comments, flow=HUMAN_CHECKS_FLOW))
         # Advisory per-run finding history (#1273), seeded once from the records
         # just extracted through the authoritative path above.
@@ -3099,7 +3099,7 @@ def run_pr_loop(
             unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
         else:  # No option: ignore carried visual findings but never reuse their IDs.
             unresolved_items = drop_visual_items(unresolved_items, config)
-            next_unresolved_item_number = max(next_unresolved_item_number, _max_unresolved_item_number_from_records(reserved_visual_records) + 1)
+            next_unresolved_item_number = max(next_unresolved_item_number, reserved_visual_number + 1)
         if resumed_round is not None and tuple(unresolved_items) != resumed_round.prior_items:
             resumed_round = dataclasses_replace(resumed_round, prior_items=tuple(unresolved_items))
         if visual_enabled:

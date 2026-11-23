@@ -11084,8 +11084,8 @@ it does not launch a browser or select a different model automatically.
 supplies at least one of the eight `--review-images-*` options above. Any one
 option opts in, even at its default value (for example
 `--review-images-timeout 300`). With none of them, the PR loop runs no visual
-lifecycle code. It does not read, authenticate, validate or write visual
-lifecycle records. It leaves old visual records and carried visual findings out
+lifecycle code. Visual records become plain prose before decoding, so it does
+not read, authenticate, validate or write visual lifecycle records. It leaves old visual records and carried visual findings out
 of the ledger, deferred follow-ups and finding history, and never stops on
 malformed or unresolved visual metadata. Item IDs used by recorded visual
 findings stay reserved. Requester screenshot obligations stay authenticated and

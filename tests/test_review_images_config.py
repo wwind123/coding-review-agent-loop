@@ -245,3 +245,27 @@ def test_drop_visual_records_and_items_only_when_not_requested(tmp_path, opted_i
         subject='a' * 40, visual_lifecycle={'version': 99}), '')
     records = (plain, scoped, lifecycle)
     assert drop_visual_records(records, config) == (records if opted_in else (plain,))
+
+
+@pytest.mark.parametrize('opted_in', [False, True])
+def test_mask_visual_protocol_bodies_only_masks_visual_records(tmp_path, opted_in):
+    from dataclasses import replace
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.review_images import mask_visual_protocol_bodies
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    config = replace(make_config(tmp_path), review_images_requested=opted_in)
+    item = replace(_next_unresolved_item(item_number=5, reviewer='Codex', source_round=1, text='visual',
+                                         status='blocking'), origin_scope='visible-defects')
+    visual = _attach_round_metadata('Visual assessment.', PostedRoundMetadata(
+        flow='pr', role='reviewer', agent='Codex', round_number=1, subject='a' * 40, new_items=(item,),
+        review_scope={'version': 1, 'kind': 'visible-defects', 'head': 'a' * 40, 'seat': 'Codex'}))
+    ordinary = _attach_round_metadata('Ordinary review.', PostedRoundMetadata(
+        flow='pr', role='reviewer', agent='Codex', round_number=1, subject='a' * 40))
+    bodies = (visual, ordinary, 'plain prose', None, '<!-- AGENT_LOOP_META: !!!not-base64 -->')
+    masked, reserves = mask_visual_protocol_bodies(bodies, config)
+    if opted_in:
+        assert masked == bodies and reserves == (0,) * 5
+    else:
+        assert masked[0] == 'Visual assessment.' and masked[1:] == bodies[1:]
+        assert reserves == (5, 0, 0, 0, 0)

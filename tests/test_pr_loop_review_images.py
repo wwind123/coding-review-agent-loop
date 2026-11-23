@@ -1566,3 +1566,59 @@ def test_no_visual_flags_preserves_screenshot_obligation(visual_setup, monkeypat
         assert obligations and all(i.status != 'resolved' for i in obligations)
         assert not any(r.metadata.screenshot_receipt_refs for r in records(runner))
     assert spied == [] and calls == []
+
+
+UNDECODABLE_KINDS = ['malformed-coverage', 'missing-coverage-sidecar', 'malformed-coverage-with-items']
+
+
+def _append_undecodable_visual(runner, kind):
+    """An owned visual record that today's strict codec cannot decode at all."""
+    import base64
+    from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE, decode_mapping
+    if kind == 'malformed-coverage-with-items':
+        _append_visual_review(runner, (_visual_item(7, 'Undecodable visual blocker'),))
+    else:
+        _append_lifecycle(runner, value={'version': 1, 'kind': 'result'})
+    comment = runner.pr_payload['comments'][-1]
+    match = ROUND_RESUME_MARKER_RE.search(comment['body'])
+    payload = decode_mapping(match.group('payload'))
+    payload['screenshot_coverage'] = (
+        {'$round_transport_spill': 'gone', 'parts': 1, 'sha256': '0' * 64, 'spill': '0' * 64}
+        if kind == 'missing-coverage-sidecar' else {'version': 99})
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    comment['body'] = comment['body'][:match.start('payload')] + encoded + comment['body'][match.end('payload'):]
+
+
+@pytest.mark.parametrize('kind', UNDECODABLE_KINDS)
+def test_no_visual_flags_ignores_undecodable_visual_record(visual_setup, monkeypatch, kind):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Ordinary parser defect.']),
+                       structured_pr_review(prior_item_dispositions=[{'item_id': 'item-8', 'disposition': 'resolved'}])],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-8'],
+                                                  addressed_item_notes={'item-8': 'Fixed the parser.'})])
+    _append_undecodable_visual(runner, 'malformed-coverage-with-items')
+    if kind != 'malformed-coverage-with-items':
+        _append_undecodable_visual(runner, kind)
+    spied = _spy_visual_lifecycle(monkeypatch)
+    runner.simulate_new_process()
+    before = len(runner.pr_payload['comments'])
+    assert run_pr_loop(runner, pr_number=77, config=_no_option(config)) == 0
+    assert spied == [] and calls == []
+    posted = _extract_round_metadata_records([SimpleNamespace(body=c['body'])
+                                              for c in runner.pr_payload['comments'][before:]], flow='pr')
+    assert not any(visual_candidate(r.metadata) for r in posted)
+    ordinary = [r for r in posted if r.metadata.role == 'reviewer']
+    # The masked visual record still reserves item-7.
+    assert [item.item_id for item in ordinary[0].metadata.new_items] == ['item-8']
+    assert ordinary[-1].metadata.state == 'approved'
+
+
+@pytest.mark.parametrize('kind', UNDECODABLE_KINDS)
+def test_visual_flags_set_undecodable_visual_record_still_refuses(visual_setup, kind):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 3)
+    _append_undecodable_visual(runner, kind)
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(c[0] in {'capture', 'images'} for c in calls)
