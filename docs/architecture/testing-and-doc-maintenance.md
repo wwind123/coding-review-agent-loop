@@ -201,9 +201,9 @@ raw agent JSON.
   review are renamed to the plan keys before finding normalization, so the
   findings are kept; an alias next to its canonical key rejects. In review item
   dispositions, `reason` and then `rationale` become `note` when `note` is
-  absent. A string alias next to an existing `note` is dropped with a warning,
-  and a non-string one rejects. A `rationale` that is itself a known key is
-  never renamed.
+  absent. A string alias next to an existing `note` is dropped with a warning.
+  A non-string alias (null, a list, a number) always rejects, with or without
+  `note`. A `rationale` that is itself a known key is never renamed.
 - A plan-review disposition loses `sub_item_dispositions` with a
   `ParseDegradation` record (`ParsedPlanReview.disposition_degradations`), and
   the parent disposition stays authoritative. A plan finding drops a string or
@@ -215,6 +215,11 @@ raw agent JSON.
   `filter_surfaced_requirement_dispositions` drops dispositions for unsurfaced
   IDs before any blocked-state or conflict decision. Legacy labels,
   reviewer-owned IDs, missing coverage and conflicting duplicates still reject.
+  Every caller that keeps a parsed record (the plan-review, plan-state and
+  plan-revision acceptance paths, and their recovery reader) stores the kept
+  tuple that `validate_human_requirement_dispositions` returns. Semantic-patch
+  dispositions stay strict: assembly publishes them verbatim, so an unsurfaced
+  ID there still rejects.
 - Context-dependent checks run only in live validators.
   `parse_historical_structured_*` passes `historical_decode=True`, so an
   accepted approved follow-up beside an unsurfaced blocked disposition, or an

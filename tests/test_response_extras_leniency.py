@@ -357,14 +357,29 @@ def test_review_disposition_note_aliases_follow_deterministic_precedence(extra, 
         assert message in caplog.text
 
 
-def test_non_string_note_alias_rejects_and_known_rationale_is_never_renamed():
-    with pytest.raises(AgentLoopError, match="both `reason` and `note`"):
+@pytest.mark.parametrize("alias", ["reason", "rationale"])
+@pytest.mark.parametrize("value", [None, ["Fixed."], 3], ids=["null", "singleton-list", "number"])
+@pytest.mark.parametrize("with_note", [False, True], ids=["no-note", "beside-note"])
+def test_non_string_note_alias_always_rejects(alias, value, with_note):
+    disposition = {"item_id": "item-1", "disposition": "resolved", alias: value}
+    if with_note:
+        disposition["note"] = "N."
+    with pytest.raises(AgentLoopError, match=f"{alias} must be a string to be read as `note`"):
         parse_structured_pr_review(
-            structured_pr_review(prior_item_dispositions=[
-                {"item_id": "item-1", "disposition": "resolved", "note": "N.", "reason": ["R."]},
-            ]),
-            reviewer="Codex",
+            structured_pr_review(prior_item_dispositions=[disposition]), reviewer="Codex",
         )
+
+
+def test_list_valued_cross_kind_finding_alias_is_still_renamed():
+    text = _edit(
+        structured_plan_review(state="blocking"),
+        lambda payload: (payload.pop("blocking_plan_issues"), payload.update(blocking_items=["A.", "B."])),
+    )
+    parsed = parse_structured_plan_review(text, reviewer="Codex")
+    assert [item.text for item in parsed.items.blocking] == ["A.", "B."]
+
+
+def test_known_rationale_is_never_renamed():
     payload = {"disposition": "direct-implementation", "rationale": "Kept.", "unresolved_design_decisions": []}
     result = _expect_known_keys_lenient(
         payload, context="execution_disposition",
@@ -666,3 +681,85 @@ def test_historical_readers_decode_a_newly_accepted_coder_response():
             surfaced_text, unresolved_items=ITEMS, human_requirements=(REQUIREMENT,),
             architecture_status_mode="legacy",
         )
+
+
+# --- callers keep the filtered requirement dispositions (review item-1) -------
+#
+# Generalization: every caller of validate_human_requirement_dispositions that
+# keeps a parsed record carries the returned (kept) tuple, and the strict
+# semantic-patch path still rejects an unsurfaced ID.
+
+
+@pytest.mark.parametrize("surfaced", [False, True], ids=["none-surfaced", "some-surfaced"])
+def test_live_plan_review_validator_keeps_only_surfaced_dispositions(surfaced, caplog):
+    from coding_review_agent_loop.unresolved_items import _validate_plan_review_response
+
+    surfaced_ids = (SURFACED_ID,) if surfaced else ()
+    dispositions = [_blocked(UNSURFACED_ID), *([_addressed(SURFACED_ID)] if surfaced else [])]
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        parsed = _validate_plan_review_response(
+            structured_plan_review(human_requirement_dispositions=dispositions),
+            reviewer="OpenAI Codex", unresolved_items=(), surfaced_requirement_ids=surfaced_ids,
+            architecture_status_mode="legacy",
+        )
+    assert [item.requirement_id for item in parsed.human_requirement_dispositions] == list(surfaced_ids)
+    assert UNSURFACED_ID in caplog.text
+
+
+def test_plan_state_acceptance_keeps_only_surfaced_dispositions():
+    from coding_review_agent_loop.response_validation import _validate_response_with_human_requirements
+
+    parsed = _validate_response_with_human_requirements(
+        structured_plan_state(human_requirement_dispositions=[_blocked(UNSURFACED_ID)]),
+        marker_validator=lambda text: validate_structured_plan_state(text, architecture_status_mode="legacy"),
+        human_requirements=(), requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly.",
+    )
+    assert parsed.human_requirement_dispositions == ()
+
+
+def test_semantic_patch_dispositions_stay_strict_for_unsurfaced_ids():
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.errors import SemanticPatchPayloadRejection
+    from coding_review_agent_loop.response_validation import (
+        _check_plan_revision_patch_human_requirement_dispositions,
+    )
+
+    with pytest.raises(SemanticPatchPayloadRejection, match=f"unknown requirement ID\\(s\\): {UNSURFACED_ID}"):
+        _check_plan_revision_patch_human_requirement_dispositions(
+            SimpleNamespace(operations=()),
+            surfaced_requirement_ids=(SURFACED_ID,),
+            inherited_human_requirement_dispositions=(
+                HumanRequirementDisposition(SURFACED_ID, "addressed", "Done."),
+                HumanRequirementDisposition(UNSURFACED_ID, "blocked", "Waiting."),
+            ),
+        )
+
+
+def _plan_revision_with_matrix(notes):
+    examples = risk_test_matrix_prompt_examples()
+
+    def edit(payload):
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        matrix = copy.deepcopy(examples["applicable"])
+        if notes is not None:
+            matrix["rows"][0]["notes"] = notes
+        payload["risk_test_matrix"] = matrix
+        payload["risk_test_matrix_changes"] = copy.deepcopy(examples["changes"])
+
+    return _edit(structured_v1_plan_state(), edit)
+
+
+def test_plan_revision_with_matrix_row_notes_is_accepted(caplog):
+    baseline = validate_structured_plan_revision(_plan_revision_with_matrix(None), architecture_status_mode="legacy")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        plan = validate_structured_plan_revision(
+            _plan_revision_with_matrix("Reviewer asked for this row."), architecture_status_mode="legacy"
+        )
+    assert plan.risk_test_matrix == baseline.risk_test_matrix
+    assert risk_test_matrix_identity(plan.risk_test_matrix) == risk_test_matrix_identity(baseline.risk_test_matrix)
+    assert _dropped(caplog, "notes")
+    with pytest.raises(AgentLoopError, match="unknown field"):
+        validate_structured_plan_revision(_plan_revision_with_matrix(["not", "text"]), architecture_status_mode="legacy")

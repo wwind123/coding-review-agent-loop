@@ -2217,11 +2217,15 @@ def _validate_plan_review_response(
         # Non-carried dispositions are dropped and recorded (#2100).
         carried_item_ids=(frozenset(item.item_id for item in unresolved_items), frozenset()),
     )
-    validate_human_requirement_dispositions(
+    kept_requirement_dispositions = validate_human_requirement_dispositions(
         parsed.human_requirement_dispositions,
         surfaced_requirement_ids=surfaced_requirement_ids,
         context="plan_review.human_requirement_dispositions",
     )
+    if kept_requirement_dispositions != parsed.human_requirement_dispositions:
+        # Unsurfaced dispositions were dropped with a warning; the accepted
+        # review carries only the kept tuple, so nothing renders them (#2114).
+        parsed = replace(parsed, human_requirement_dispositions=kept_requirement_dispositions)
 
     unresolved_by_id = {item.item_id: item for item in unresolved_items}
     dispositions = _maybe_fill_resolved_dispositions_from_prose(

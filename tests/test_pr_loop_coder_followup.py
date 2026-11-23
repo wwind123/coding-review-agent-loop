@@ -3483,3 +3483,33 @@ def test_coder_reask_that_moves_the_head_takes_the_post_push_record_path_2066(tm
     assert record.coder_record_source in {"degraded", "synthesized"}
     reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
     assert reviews and reviews[-1].state == "approved"
+
+
+def test_pr_loop_drops_and_reports_an_unknown_coder_item_id_2114(tmp_path, capsys):
+    """Row coder-unknown-id through the real PR-loop coder seam (#2114)."""
+    coder = structured_coder_followup(
+        summary="Added the test.", addressed_items=["item-1", "item-99"],
+        addressed_item_notes={"item-1": "Added the regression test.", "item-99": "Stale claim."},
+        reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(coder_outputs=[coder])
+    config = make_config(tmp_path, coder="codex", reviewer="claude", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    err = capsys.readouterr().err
+    assert "listed unknown item ID(s) item-99; dropped them and their notes" in err
+    pushed = runner.pr_payload["headRefOid"]
+    (record,) = _coder_records_2086(runner, pushed)
+    # Accepted live (no degraded or synthesized record) on the first turn.
+    assert record.coder_record_source is None
+    assert len(_coder_prompts_1292(runner)) == 1
+    (body,) = [
+        comment["body"] for comment in runner.pr_payload["comments"]
+        if "## Coder follow-up" in comment["body"]
+    ]
+    addressed = body.split("### Addressed items", 1)[1].split("###", 1)[0]
+    assert "item-1" in addressed and "item-99" not in addressed
+    assert "Stale claim." not in body
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
+    assert reviews and reviews[-1].state == "approved"

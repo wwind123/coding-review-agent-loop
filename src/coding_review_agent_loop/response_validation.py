@@ -1544,11 +1544,22 @@ def _check_plan_revision_patch_human_requirement_dispositions(
     if dispositions is None:
         dispositions = ()
     try:
-        validate_human_requirement_dispositions(
+        kept = validate_human_requirement_dispositions(
             dispositions,
             surfaced_requirement_ids=surfaced_requirement_ids,
             context="plan_revision_patch.human_requirement_dispositions",
         )
+        # Semantic-patch operations stay strict (#2114): assembly publishes
+        # these dispositions verbatim, so an unsurfaced entry cannot be
+        # dropped here without diverging from the published state.
+        unknown = sorted(
+            {item.requirement_id for item in dispositions} - {item.requirement_id for item in kept}
+        )
+        if unknown:
+            raise SemanticPatchPayloadRejection(
+                "plan_revision_patch.human_requirement_dispositions contains unknown requirement ID(s): "
+                + ", ".join(unknown)
+            )
     except SemanticPatchPayloadRejection:
         raise
     except AgentLoopError as exc:

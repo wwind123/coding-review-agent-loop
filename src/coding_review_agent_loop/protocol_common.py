@@ -356,16 +356,24 @@ def _apply_key_renames(
     """Return a copy with alias keys renamed to canonical keys (#2114).
 
     ``conflict`` rejects when the alias and canonical key are both present.
-    ``prefer-canonical`` keeps an existing canonical value and drops a
-    string-valued alias with a warning; a non-string alias still rejects.
+    ``prefer-canonical`` requires a string alias (a non-string one always
+    rejects), renames it when the canonical key is absent, and otherwise
+    keeps the canonical value and drops the alias with a warning.
     The input is never mutated.
     """
     result = dict(value)
     for alias, canonical, policy in renames:
         if alias not in result:
             continue
+        if policy == RENAME_PREFER_CANONICAL and not isinstance(result[alias], str):
+            # A prefer-canonical alias is only ever read as text, whether or
+            # not the canonical key is present: a null or list value is never
+            # renamed or dropped silently.
+            raise AgentLoopError(  # shape-check: delegated
+                f"{context}.{alias} must be a string to be read as `{canonical}`."
+            )
         if canonical in result:
-            if policy == RENAME_PREFER_CANONICAL and isinstance(result[alias], str):
+            if policy == RENAME_PREFER_CANONICAL:
                 result.pop(alias)
                 _logger.warning("%s: dropped field %s because %s is present", context, alias, canonical)
                 continue
