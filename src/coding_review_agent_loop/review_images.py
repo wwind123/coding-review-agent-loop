@@ -15,6 +15,100 @@ from .review_images_prompts import build_visual_prompt
 from .review_scope import is_visual_item, is_visual_review, visual_candidate, lifecycle_present
 
 
+def visual_review_requested(config):
+    """Run-time opt-in for the whole visual lifecycle (#2070).
+
+    Any supplied --review-images-* option opts in. With none, the PR loop never
+    reads, authenticates, validates or writes visual lifecycle records.
+    ``review_images_paths`` still decides separately whether capture runs.
+    """
+    return any(getattr(config, name, None) for name in (
+        'review_images_requested', 'review_images_cmd', 'review_images_paths',
+        'review_images_seat', 'review_images_runtime_grant'))
+
+
+def drop_visual_records(records, config):
+    """Leave visual records out of a no-option run; opted-in runs are unchanged."""
+    if visual_review_requested(config):
+        return records
+    kept = (record for record in records if not visual_candidate(record.metadata))
+    return tuple(kept) if isinstance(records, tuple) else list(kept)
+
+
+def mask_visual_protocol_bodies(bodies, config):
+    """Turn visual records into plain prose before strict decoding in a no-option run (#2070).
+
+    Takes the owned protocol bodies of one admitted observation and returns
+    ``(bodies, reserves)``. A body whose leniently decoded metadata payload is a
+    visual candidate loses its round metadata, so no codec, sidecar hydration or
+    validator ever sees it. ``reserves`` holds the highest item number each
+    masked record named, so a later run never reuses a visual item ID. An
+    undecodable payload is not identifiable and stays on the strict path.
+    """
+    bodies = tuple(bodies)
+    # Without a config the caller's opt-in is unknown: keep today's strict view.
+    if config is None or visual_review_requested(config):
+        return bodies, (0,) * len(bodies)
+    from .round_metadata import _strip_round_metadata
+    from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
+    masked, reserves = [], []
+    for body in bodies:
+        match = None
+        if isinstance(body, str):
+            match = next(reversed(list(ROUND_RESUME_MARKER_RE.finditer(body))), None)
+        try:
+            payload = decode_mapping(match.group('payload')) if match else None
+        except AgentLoopError:
+            payload = None
+        if not isinstance(payload, dict) or not visual_candidate(payload):
+            masked.append(body)
+            reserves.append(0)
+            continue
+        try:
+            payload, _missing = hydrate_mapping(payload, [b for b in bodies if isinstance(b, str)])
+        except Exception:  # Reservation is best effort; masking is not.
+            pass
+        masked.append(_strip_round_metadata(body))
+        reserves.append(_item_number_high_water(payload))
+    return tuple(masked), tuple(reserves)
+
+
+def _item_number_high_water(payload):
+    import re
+    numbers = [0]
+    for key in ('prior_items', 'new_items'):
+        items = payload.get(key)
+        for item in items if isinstance(items, list) else ():
+            if not isinstance(item, dict):
+                continue
+            aliases = item.get('alias_item_ids')
+            for item_id in (item.get('item_id'), *(aliases if isinstance(aliases, list) else ())):
+                # Bounded digits: reservation must never raise on a masked record.
+                if isinstance(item_id, str) and (found := re.fullmatch(r'item-([0-9]{1,18})', item_id)):
+                    numbers.append(int(found.group(1)))
+    return max(numbers)
+
+
+def reserved_visual_item_number(comments, records):
+    """Highest item number named by visual records, masked or decoded; reading IDs never raises."""
+    from .round_state import _max_unresolved_item_number_from_records
+    return max(max((getattr(c, 'visual_item_reserve', 0) for c in comments), default=0),
+               _max_unresolved_item_number_from_records(visual_records(records)))
+
+
+def visual_records(records):
+    """The visual records alone; a no-option run reads only their item IDs, for reservation."""
+    return tuple(record for record in records if visual_candidate(record.metadata))
+
+
+def drop_visual_items(items, config):
+    """Leave carried visual findings out of a no-option run's ledger."""
+    if visual_review_requested(config):
+        return items
+    kept = (item for item in items if not is_visual_item(item))
+    return tuple(kept) if isinstance(items, tuple) else list(kept)
+
+
 def settings(config):
     # The disabled path must not probe runtimes, reviewers or changed files.
     if not config.review_images_paths:
@@ -186,7 +280,7 @@ class VisualRun:
         return self.reasons.get(head, 'the durable visual opportunity is spent; use a new head with changed images and an explicit assessment disposition, or an explicit human decision')
 
     def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic, round_number=1, usage_context=None):
-        if not config.review_images_paths or config.dry_run:
+        if not visual_review_requested(config) or not config.review_images_paths or config.dry_run:
             return VisualOutcome(diagnostic='disabled')
         head = metadata.head_sha
         if head in self.attempted:
@@ -324,7 +418,10 @@ def admitted_visual_history(runner, config, pr_number, comments):
     from .review_scope import coverage_candidate
     comments, actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments, resume=False)
-    records = _extract_round_metadata_records(comments, flow="pr")
+    decoded = _extract_round_metadata_records(comments, flow="pr")
+    # A no-option run never authenticates, reduces or replays visual records;
+    # identities still cover every record so other anchors resolve (#2070).
+    records = drop_visual_records(decoded, config)
     if not complete and any(visual_candidate(r.metadata) and (r.metadata.prior_items or r.metadata.new_items)
                             for r in records):
         raise AgentLoopError('Visual finding history cannot be authenticated; complete identity data is required.')
@@ -334,7 +431,7 @@ def admitted_visual_history(runner, config, pr_number, comments):
                             or any(item.screenshot_request for item in (*record.metadata.prior_items, *record.metadata.new_items)))
                     or _recovery_record_admitted(record, comments, actor)),
                    identities={record.index: getattr(comments[record.index], 'comment_id', None)
-                               for record in records}, complete=complete,
+                               for record in decoded}, complete=complete,
                    diagnostic='complete authenticated PR comment history is required', repo=config.repo, pr=pr_number)
 
 
@@ -488,7 +585,7 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
 
 def validate_boundary(runner, *, config, metadata, comments=None, diagnostic=lambda _: None):
     """Read-only lifecycle validation never opens a recovery or freeze gate."""
-    if not config.review_images_paths or config.dry_run:
+    if not visual_review_requested(config) or not config.review_images_paths or config.dry_run:
         return
     from .github_changed_paths import get_pr_changed_paths
     paths = getattr(runner, '_visual_boundary_paths', {}).get((config.repo, metadata.number, metadata.head_sha))

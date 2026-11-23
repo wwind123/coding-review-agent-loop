@@ -4066,9 +4066,10 @@ def _fresh_pr_qualification_snapshot(
             comments=context.comments, head=context.metadata.head_sha,
             plan=fresh_approved_plan_context, requirements=requirements.effective_requirements):
             context = dataclasses_replace(context, converted_capture_review_pending=True)
-    from .review_images import validate_boundary
-    validate_boundary(runner, config=config, metadata=context.metadata, comments=context.comments,
-                      diagnostic=lambda message: log(config, message))
+    from .review_images import validate_boundary, visual_review_requested
+    if visual_review_requested(config):  # No option: no visual boundary read (#2070).
+        validate_boundary(runner, config=config, metadata=context.metadata, comments=context.comments,
+                          diagnostic=lambda message: log(config, message))
     return context, requirement_ids, fresh_approved_plan_context, config
 
 

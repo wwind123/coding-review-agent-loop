@@ -692,13 +692,14 @@ def run_pr_loop(
     initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
-    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history
+    from .review_images import startup as visual_startup, VisualRun, recover_visual_findings, assigned_items, admitted_visual_history, visual_review_requested, drop_visual_records, drop_visual_items, reserved_visual_item_number
     from .workdirs import active_workdir
     from .post_merge_runtime import ObligationRun, round_start, reviewer_requests, manual_pending, resume_scheduled, complete_merge
     from .post_merge_obligations import parse_request as parse_post_merge_request
     post_merge_run = ObligationRun(runner, config, pr_number)
     runner._post_merge_run = post_merge_run
     visual_startup(config)
+    visual_enabled = visual_review_requested(config)  # The one run-time visual gate (#2070).
     visual_run = VisualRun(runner)
     runner._screenshot_coverage_pr = pr_number
     owned_usage_context = usage_context is None
@@ -2319,6 +2320,8 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        reserved_visual_number = reserved_visual_item_number(initial_pr_context.comments, startup_records)
+        startup_records = drop_visual_records(startup_records, config)
         human_evidence.seed(startup_records, _extract_round_metadata_records(initial_pr_context.comments, flow=HUMAN_CHECKS_FLOW))
         # Advisory per-run finding history (#1273), seeded once from the records
         # just extracted through the authoritative path above.
@@ -2341,7 +2344,7 @@ def run_pr_loop(
         # coder work, reviewer carried items, or round state.
         pending_future_items: dict[str, UnresolvedReviewItem] = {
             item.item_id: item
-            for item in canonical_deferred_history_items(
+            for item in drop_visual_items(canonical_deferred_history_items(
                 startup_records,
                 reconciliation_mode=(
                     "owner-scoped"
@@ -2349,7 +2352,7 @@ def run_pr_loop(
                     else "aggregate"
                 ),
                 same_status="same-pr",
-            )
+            ), config)
         }
         startup_records = authority_records(startup_records)
         # Signed reviewer-board amendments (#943) live on the PR itself, in
@@ -3090,15 +3093,20 @@ def run_pr_loop(
                 f"`{_child_resume_hint(planning_child_binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`."
             )
 
-        visual_history = admitted_visual_history(runner, config, pr_number, initial_pr_context.comments)
-        visual_ledger = recover_visual_findings(visual_history, reconciliation_mode=pr_reconciliation_mode)
-        unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
+        if visual_enabled:
+            visual_history = admitted_visual_history(runner, config, pr_number, initial_pr_context.comments)
+            visual_ledger = recover_visual_findings(visual_history, reconciliation_mode=pr_reconciliation_mode)
+            unresolved_items = [item for item in unresolved_items if not is_visual_item(item)] + list(visual_ledger)
+        else:  # No option: ignore carried visual findings but never reuse their IDs.
+            unresolved_items = drop_visual_items(unresolved_items, config)
+            next_unresolved_item_number = max(next_unresolved_item_number, reserved_visual_number + 1)
         if resumed_round is not None and tuple(unresolved_items) != resumed_round.prior_items:
             resumed_round = dataclasses_replace(resumed_round, prior_items=tuple(unresolved_items))
-        next_unresolved_item_number = max(next_unresolved_item_number,
-            max((int(item.item_id.split("-")[-1]) + 1 for record in visual_history if is_visual_review(record.metadata)
-                 for item in (*record.metadata.prior_items, *record.metadata.new_items)
-                 if item.item_id.startswith("item-") and item.item_id[5:].isdigit()), default=1))
+        if visual_enabled:
+            next_unresolved_item_number = max(next_unresolved_item_number,
+                max((int(item.item_id.split("-")[-1]) + 1 for record in visual_history if is_visual_review(record.metadata)
+                     for item in (*record.metadata.prior_items, *record.metadata.new_items)
+                     if item.item_id.startswith("item-") and item.item_id[5:].isdigit()), default=1))
 
         for round_number in round_sequence:
             # The effective-board floor is checked at every round (pure, no I/O).
@@ -3441,6 +3449,7 @@ def run_pr_loop(
             # unnecessary coder round.
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
                 runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
+            unresolved_items = drop_visual_items(unresolved_items, config)
             unresolved_items = post_merge_run.apply(unresolved_items)
             round_start_mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
             latest_mergeability = round_start_mergeability
@@ -3680,7 +3689,9 @@ def run_pr_loop(
             skip_visual_for_recovery = recovery_skips_reviewers(current_resume, broken_freeze_head, qualification_checkpoint)
             visual_outcome = None
             try:
-                if not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
+                if not visual_enabled:
+                    pass  # No --review-images-* option: no visual attempt, boundary or metadata (#2070).
+                elif not evidence_skip_reviewers and evidence_pass is None and not skip_visual_for_recovery:
                     unresolved_items = visual_run.rebind_items(unresolved_items, pr_ledger_view)
                     visual_outcome = visual_run.attempt(runner, config=config, metadata=pr_metadata,
                         checkout=active_workdir(config), items=unresolved_items, round_number=round_number,
@@ -3712,6 +3723,7 @@ def run_pr_loop(
             except HumanDecisionRequiredError as exc:
                 stop_for_human_decision(exc, round_number=round_number)
             unresolved_items, next_unresolved_item_number = restore_for_new_input(unresolved_items, current_resume, human_requirements, native_history(runner, config, pr_number, pr_comments), next_unresolved_item_number)
+            unresolved_items = drop_visual_items(unresolved_items, config)
             unresolved_items = human_evidence.normalize(unresolved_items, round_number=round_number, head_sha=pr_metadata.head_sha, clearances=evidence_clearances)
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
@@ -4839,6 +4851,7 @@ def run_pr_loop(
                     cleared_items_progress=[],
                     sub_item_degradations=[],
                 )
+                unresolved_items, closed_future_items = drop_visual_items(unresolved_items, config), drop_visual_items(closed_future_items, config)
                 for item in closed_reconciliation.prior_items:
                     pending_future_items.pop(item.item_id, None)
                 for item in closed_future_items:
@@ -6182,7 +6195,7 @@ def run_pr_loop(
                 ledger_view=pr_ledger_view,
                 **evidence_reconciliation_kwargs,
             )
-            visual_blockers = [item for item in unresolved_items if is_visual_item(item)
+            visual_blockers = [item for item in unresolved_items if visual_enabled and is_visual_item(item)
                                and item.status in {"blocking", "same-pr"}]
             reason = visual_run.blocker_stop_reason(visual_blockers, pr_metadata.head_sha, visual_outcome)
             if visual_blockers and reason is not None:
@@ -6278,6 +6291,7 @@ def run_pr_loop(
                         next_unresolved_item_number += 1
             unresolved_items, next_unresolved_item_number = screenshot_coverage.restore_requests(
                 runner, config=config, pr=pr_number, head=pr_metadata.head_sha, items=unresolved_items, number=next_unresolved_item_number, clearances=evidence_clearances, comments=pr_comments)
+            unresolved_items = drop_visual_items(unresolved_items, config)
             unresolved_items, post_merge_next = reviewer_requests(post_merge_run, accepted_review_carriers, items=unresolved_items, metadata=pr_metadata, round_number=round_number, board=tuple(agent_display_name(r) for r in configured_reviewers), next_number=next_unresolved_item_number)
             next_unresolved_item_number = max(next_unresolved_item_number, post_merge_next)
             unresolved_items = human_evidence.normalize(unresolved_items, round_number=round_number, head_sha=pr_metadata.head_sha)

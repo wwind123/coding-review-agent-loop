@@ -913,7 +913,7 @@
     {
       "module": "managed_ci_authorization",
       "function": "_ordinary_continuity_round_metadata_is_valid",
-      "call": "_continuity_round_records(comments, actor_id=authorization.actor_id)",
+      "call": "_continuity_round_records(comments, actor_id=authorization.actor_id, config=config)",
       "family": "rounds",
       "provenance": "managed_ci_authorization._ordinary_continuity_round_metadata_is_valid: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context.",
       "occurrence": 1
@@ -921,7 +921,7 @@
     {
       "module": "managed_ci_authorization",
       "function": "_recovery_continuity_is_valid",
-      "call": "_continuity_round_records(comments, actor_id=context.actor_id)",
+      "call": "_continuity_round_records(comments, actor_id=context.actor_id, config=context.config)",
       "family": "rounds",
       "provenance": "managed_ci_authorization._recovery_continuity_is_valid: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context.",
       "occurrence": 1
@@ -945,7 +945,7 @@
     {
       "module": "managed_ci_authorization",
       "function": "find_actor_round_metadata_comment_ids",
-      "call": "_continuity_round_records(comments, actor_id=actor_id)",
+      "call": "_continuity_round_records(comments, actor_id=actor_id, config=config)",
       "family": "rounds",
       "provenance": "managed_ci_authorization.find_actor_round_metadata_comment_ids: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Managed continuity uses its smaller raw field codec only after complete REST acquisition and explicit actor-ID partitioning; the actor is supplied by the invocation or authenticated authorization context.",
       "occurrence": 1
@@ -1017,7 +1017,7 @@
     {
       "module": "managed_ci_reconciliation",
       "function": "resolve_legacy_reference",
-      "call": "_extract_round_metadata_records([SimpleNamespace(body=c.get('body')) for c in trusted], flow='pr')",
+      "call": "_extract_round_metadata_records([SimpleNamespace(body=body) for _, body in pairs], flow='pr')",
       "family": "rounds",
       "provenance": "managed_ci_reconciliation.resolve_legacy_reference: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. resolve_legacy_reference validates candidate REST identities, then partitions the complete page by the contract actor login and immutable ID before projecting bodies.",
       "occurrence": 1
@@ -3501,6 +3501,18 @@
       "function": "classify_frozen_sequence",
       "classification": "reader",
       "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
+    },
+    {
+      "module": "review_images",
+      "function": "mask_visual_protocol_bodies",
+      "classification": "acquisition",
+      "admission": "review_images.mask_visual_protocol_bodies runs inside pr_round_ingestion.admit_pr_comments and pr_round_ingestion.owned_rest_protocol_bodies (when the caller passes its config) on actor-owned protocol bodies only, after complete REST identity binding; in a no-option run it removes round metadata from visual-candidate bodies before any strict codec, and its lenient payload read only yields item numbers for ID reservation, never authority (#2070)."
+    },
+    {
+      "module": "review_images",
+      "function": "reserved_visual_item_number",
+      "classification": "reader",
+      "admission": "review_images.reserved_visual_item_number reads only admitted comments' visual_item_reserve and already admitted round records' item numbers; it reserves IDs and grants no authority (#2070)."
     },
     {
       "module": "review_images_coverage_history",

@@ -11080,6 +11080,18 @@ it does not launch a browser or select a different model automatically.
 | `--review-images-max-bytes N` | 67108864 aggregate referenced PNG bytes, including baselines; positive integer, maximum 67108864 |
 | `--review-images-max-pixels N` | 64000000 aggregate referenced pixels, including baselines; positive integer, maximum 64000000 |
 
+**Run-time opt-in (#2070).** Visual review runs only in an invocation that
+supplies at least one of the eight `--review-images-*` options above. Any one
+option opts in, even at its default value (for example
+`--review-images-timeout 300`). With none of them, the PR loop runs no visual
+lifecycle code. Visual records become plain prose before decoding, so it does
+not read, authenticate, validate or write visual lifecycle records. It leaves old visual records and carried visual findings out
+of the ledger, deferred follow-ups and finding history, and never stops on
+malformed or unresolved visual metadata. Item IDs used by recorded visual
+findings stay reserved. Requester screenshot obligations stay authenticated and
+pending. An opted-in invocation keeps the full contract below, and the globs
+still decide whether capture runs.
+
 The visual reviewer has a separate fixed **300-second acquisition timeout**,
 independent of capture and ordinary reviewer timeouts. Each PNG remains bounded
 by 768 pixels per dimension and 2 MiB. Viewport metadata may describe a larger

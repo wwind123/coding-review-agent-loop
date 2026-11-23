@@ -2173,11 +2173,11 @@ def lineage_binding_resolver(
 
     from .pr_round_ingestion import AdmittedPrComment, owned_rest_protocol_bodies, human_control_eligibility, board_control_candidate
     try:
-        owned_rest_protocol_bodies(comments, actor_id=actor_id)
+        owned_bodies = owned_rest_protocol_bodies(comments, actor_id=actor_id, config=config)
     except AgentLoopError:
         return refuse
     namespaced = []
-    for comment in comments:
+    for comment, owned_body in zip(comments, owned_bodies):
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
         raw = body(comment)
         identity = SimpleNamespace(author=user.get("login"), author_id=user.get("id"))
@@ -2192,7 +2192,8 @@ def lineage_binding_resolver(
         namespaced.append(AdmittedPrComment(
             body=raw, author=user.get("login"), author_id=user.get("id"),
             created_at=comment.get("created_at"), comment_id=comment.get("id"),
-            invocation_actor_id=actor_id, admitted_body=raw, admitted_protocol_body=raw,
+            invocation_actor_id=actor_id, admitted_body=raw,
+            admitted_protocol_body=owned_body if user.get("id") == actor_id else raw,
             amendment_eligible=eligible))
     try:
         match = next(

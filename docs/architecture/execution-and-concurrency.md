@@ -898,7 +898,7 @@ exits and normalization. Repair has no image/proof authority. Re-asks, completio
 resume, fallback and replay are disabled. Prompt manifest, inventory, mappings
 and diff remain escaped untrusted data; requester coverage is excluded.
 
-For image admission, see [durable recovery](round-state-and-resume.md#durable-visible-defects-lifecycle).
+For image admission/opt-in, see [durable recovery](round-state-and-resume.md#durable-visible-defects-lifecycle).
 Rollout: #1796.
 
 ## Requester coverage execution
