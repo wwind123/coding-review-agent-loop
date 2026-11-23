@@ -156,3 +156,92 @@ assert 'coding_review_agent_loop.review_images_transport' not in sys.modules
 '''
     subprocess.run([sys.executable,'-c',code],stdin=subprocess.DEVNULL,check=True,timeout=10,
                    env={**os.environ,'PYTHONPATH':str(Path(__file__).resolve().parents[1]/'src')})
+
+
+# --- #2070: run-time opt-in presence detection and predicate ---
+
+REVIEW_IMAGES_OPTIONS = [
+    ('--review-images-cmd', '/usr/bin/python3 capture.py'),
+    ('--review-images-paths', 'ui/*'),
+    ('--review-images-seat', 'codex'),
+    ('--review-images-runtime-grant', '/usr/bin/python3'),
+    ('--review-images-timeout', '300'),
+    ('--review-images-max-images', '16'),
+    ('--review-images-max-bytes', '67108864'),
+    ('--review-images-max-pixels', '64000000'),
+]
+RESOLVED_DEFAULTS = {'review_images_timeout': 300, 'review_images_max_images': 16,
+                     'review_images_max_bytes': 67108864, 'review_images_max_pixels': 64000000}
+
+
+def _parse(tmp_path, *extra):
+    from coding_review_agent_loop.cli import build_parser
+    return build_parser().parse_args(['pr', '77', '--repo', 'OWNER/REPO', '--codex-dir', str(tmp_path / 'codex'),
+                                      '--claude-dir', str(tmp_path / 'claude'), '--dangerous-agent-permissions', *extra])
+
+
+def _config(tmp_path, *extra):
+    from agent_loop_helpers import FakeRunner
+    from coding_review_agent_loop.config import config_from_args
+    return config_from_args(_parse(tmp_path, *extra), FakeRunner())
+
+
+@pytest.mark.parametrize('option,value', REVIEW_IMAGES_OPTIONS)
+def test_any_single_review_images_option_opts_in(tmp_path, option, value):
+    from coding_review_agent_loop.config import review_images_requested_from_args
+    from coding_review_agent_loop.review_images import visual_review_requested
+    assert review_images_requested_from_args(_parse(tmp_path, option, value))
+    config = _config(tmp_path, option, value)
+    assert config.review_images_requested and visual_review_requested(config)
+
+
+def test_no_review_images_option_is_inert_and_keeps_resolved_defaults(tmp_path):
+    from coding_review_agent_loop.config import review_images_requested_from_args
+    from coding_review_agent_loop.review_images import visual_review_requested
+    args = _parse(tmp_path)
+    assert args.review_images_timeout is None and args.review_images_max_images is None
+    assert not review_images_requested_from_args(args)
+    config = _config(tmp_path)
+    assert not config.review_images_requested and not visual_review_requested(config)
+    assert {name: getattr(config, name) for name in RESOLVED_DEFAULTS} == RESOLVED_DEFAULTS
+    explicit = _config(tmp_path, '--review-images-timeout', '7', '--review-images-max-images', '3')
+    assert (explicit.review_images_timeout, explicit.review_images_max_images) == (7, 3)
+
+
+@pytest.mark.parametrize('field,value,expected', [
+    (None, None, False), ('review_images_requested', True, True), ('review_images_cmd', 'capture', True),
+    ('review_images_paths', ('ui/*',), True), ('review_images_seat', 'codex', True),
+    ('review_images_runtime_grant', ('/usr/bin/python3',), True)])
+def test_visual_review_requested_truth_table(tmp_path, field, value, expected):
+    from dataclasses import replace
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.review_images import visual_review_requested
+    config = make_config(tmp_path)
+    assert not visual_review_requested(config)
+    if field is not None:
+        config = replace(config, **{field: value})
+    assert visual_review_requested(config) is expected
+
+
+@pytest.mark.parametrize('opted_in', [False, True])
+def test_drop_visual_records_and_items_only_when_not_requested(tmp_path, opted_in):
+    from dataclasses import replace
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.review_images import drop_visual_items, drop_visual_records
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, PostedRoundRecord
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    config = replace(make_config(tmp_path), review_images_requested=opted_in)
+    ordinary = _next_unresolved_item(item_number=1, reviewer='Codex', source_round=1, text='ordinary', status='blocking')
+    visual_item = replace(_next_unresolved_item(item_number=2, reviewer='Codex', source_round=1, text='visual',
+                                                status='blocking'), origin_scope='visible-defects')
+    items = [ordinary, visual_item]
+    assert drop_visual_items(items, config) == (items if opted_in else [ordinary])
+    assert drop_visual_items(tuple(items), config) == (tuple(items) if opted_in else (ordinary,))
+    plain = PostedRoundRecord(0, PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex', round_number=1,
+                                                     subject='a' * 40), '')
+    scoped = PostedRoundRecord(1, PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex', round_number=1,
+        subject='a' * 40, review_scope={'version': 1, 'kind': 'visible-defects', 'head': 'a' * 40, 'seat': 'Codex'}), '')
+    lifecycle = PostedRoundRecord(2, PostedRoundMetadata(flow='pr', role='visual-intent', agent='Codex', round_number=1,
+        subject='a' * 40, visual_lifecycle={'version': 99}), '')
+    records = (plain, scoped, lifecycle)
+    assert drop_visual_records(records, config) == (records if opted_in else (plain,))

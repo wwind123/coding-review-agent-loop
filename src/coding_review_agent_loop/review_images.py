@@ -15,6 +15,34 @@ from .review_images_prompts import build_visual_prompt
 from .review_scope import is_visual_item, is_visual_review, visual_candidate, lifecycle_present
 
 
+def visual_review_requested(config):
+    """Run-time opt-in for the whole visual lifecycle (#2070).
+
+    Any supplied --review-images-* option opts in. With none, the PR loop never
+    reads, authenticates, validates or writes visual lifecycle records.
+    ``review_images_paths`` still decides separately whether capture runs.
+    """
+    return any(getattr(config, name, None) for name in (
+        'review_images_requested', 'review_images_cmd', 'review_images_paths',
+        'review_images_seat', 'review_images_runtime_grant'))
+
+
+def drop_visual_records(records, config):
+    """Leave visual records out of a no-option run; opted-in runs are unchanged."""
+    if visual_review_requested(config):
+        return records
+    kept = (record for record in records if not visual_candidate(record.metadata))
+    return tuple(kept) if isinstance(records, tuple) else list(kept)
+
+
+def drop_visual_items(items, config):
+    """Leave carried visual findings out of a no-option run's ledger."""
+    if visual_review_requested(config):
+        return items
+    kept = (item for item in items if not is_visual_item(item))
+    return tuple(kept) if isinstance(items, tuple) else list(kept)
+
+
 def settings(config):
     # The disabled path must not probe runtimes, reviewers or changed files.
     if not config.review_images_paths:
@@ -186,7 +214,7 @@ class VisualRun:
         return self.reasons.get(head, 'the durable visual opportunity is spent; use a new head with changed images and an explicit assessment disposition, or an explicit human decision')
 
     def attempt(self, runner, *, config, metadata, checkout, items, managed, current_head, diagnostic, round_number=1, usage_context=None):
-        if not config.review_images_paths or config.dry_run:
+        if not visual_review_requested(config) or not config.review_images_paths or config.dry_run:
             return VisualOutcome(diagnostic='disabled')
         head = metadata.head_sha
         if head in self.attempted:
@@ -324,7 +352,10 @@ def admitted_visual_history(runner, config, pr_number, comments):
     from .review_scope import coverage_candidate
     comments, actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments, resume=False)
-    records = _extract_round_metadata_records(comments, flow="pr")
+    decoded = _extract_round_metadata_records(comments, flow="pr")
+    # A no-option run never authenticates, reduces or replays visual records;
+    # identities still cover every record so other anchors resolve (#2070).
+    records = drop_visual_records(decoded, config)
     if not complete and any(visual_candidate(r.metadata) and (r.metadata.prior_items or r.metadata.new_items)
                             for r in records):
         raise AgentLoopError('Visual finding history cannot be authenticated; complete identity data is required.')
@@ -334,7 +365,7 @@ def admitted_visual_history(runner, config, pr_number, comments):
                             or any(item.screenshot_request for item in (*record.metadata.prior_items, *record.metadata.new_items)))
                     or _recovery_record_admitted(record, comments, actor)),
                    identities={record.index: getattr(comments[record.index], 'comment_id', None)
-                               for record in records}, complete=complete,
+                               for record in decoded}, complete=complete,
                    diagnostic='complete authenticated PR comment history is required', repo=config.repo, pr=pr_number)
 
 
@@ -488,7 +519,7 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
 
 def validate_boundary(runner, *, config, metadata, comments=None, diagnostic=lambda _: None):
     """Read-only lifecycle validation never opens a recovery or freeze gate."""
-    if not config.review_images_paths or config.dry_run:
+    if not visual_review_requested(config) or not config.review_images_paths or config.dry_run:
         return
     from .github_changed_paths import get_pr_changed_paths
     paths = getattr(runner, '_visual_boundary_paths', {}).get((config.repo, metadata.number, metadata.head_sha))

@@ -718,12 +718,15 @@ Qualification continues to use its filtered evidence view.
 
 Visible-defects finding replay hydrates REST comment identities and admits only
 publications authored by the authenticated orchestrator actor, matching both login
-and numeric identity. This applies even when image capture is disabled. Foreign
+and numeric identity. This applies to opted-in runs without capture globs. Foreign
 publications cannot introduce findings or settle carried findings. Unavailable
 identity data stops resume before capture or agent execution and preserves the
 existing ledger for a later authenticated retry.
 
 ## Durable visible-defects lifecycle
+
+With no `--review-images-*` option, visual records and items are dropped on read
+and no visual lifecycle code runs; raw records still reserve item IDs (#2070).
 
 `review_images_state.py` reduces authenticated visual round metadata. GitHub is
 its durable store; local sealed captures and private responses grant no recovery

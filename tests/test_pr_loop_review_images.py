@@ -1334,3 +1334,235 @@ def test_publication_head_boundary_retains_findings_without_stale_clearance(visu
     else: assert prior.item_id not in {i.item_id for i in items}
     new_items = items if movement == 'stable' else items[1:]
     assert [i.item_id for i in new_items] == ([] if movement == 'before-write' else ['item-2', 'item-3', 'item-4'])
+
+
+# --- #2070: visual review runs only when a --review-images-* option is given ---
+
+
+def _no_option(config):
+    """Clear every value field; review_images_requested stays False."""
+    return replace(config, review_images_cmd=None, review_images_paths=(), review_images_seat=None,
+                   review_images_runtime_grant=(), review_images_requested=False)
+
+
+def _append_visual_review(runner, items, *, prior_items=(), author_id=424242, head=None):
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    head = runner.pr_payload['headRefOid'] if head is None else head
+    metadata = PostedRoundMetadata(flow='pr', role='reviewer', agent='Codex', round_number=1,
+        subject=head, state='blocking', phase='visual', acquisition_outcome='success',
+        review_scope={'version': 1, 'kind': 'visible-defects', 'head': head, 'seat': 'Codex'},
+        new_items=tuple(items), prior_items=tuple(prior_items))
+    runner.pr_payload.setdefault('comments', []).append({'author': {'login': 'coding-review-agent-loop'},
+        '_rest_author_id': author_id, 'createdAt': '2026-10-01T12:00:00Z',
+        'body': _attach_round_metadata('Visual assessment.', metadata)})
+
+
+def _visual_item(number, text, status='blocking'):
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    return replace(_next_unresolved_item(item_number=number, reviewer='Codex', source_round=1,
+        text=text, status=status), origin_scope='visible-defects')
+
+
+def _append_malformed(runner, kind, monkeypatch):
+    from coding_review_agent_loop.round_metadata import _attach_round_metadata
+    if kind == 'incomplete-identity':
+        # Visual records carry items while the visual-history reader sees
+        # incomplete identity coverage; other readers keep complete coverage.
+        import sys
+        from coding_review_agent_loop import pr_loop_support
+        status = pr_loop_support._authenticated_pr_comments_status
+        def incomplete(*a, **kw):
+            hydrated, actor, complete = status(*a, **kw)
+            return hydrated, actor, complete and sys._getframe(1).f_code.co_name != 'admitted_visual_history'
+        monkeypatch.setattr(pr_loop_support, '_authenticated_pr_comments_status', incomplete)
+        _append_visual_review(runner, (_visual_item(1, 'Unauthenticated visual blocker'),))
+        return
+    head = runner.pr_payload['headRefOid']
+    value = {'version': 99} if kind == 'invalid-contract' else (
+        {'version': 1, 'kind': 'intent', 'head': head} if kind == 'unresolved-intent' else None)
+    _append_lifecycle(runner, value=value, head='unknown' if kind == 'unknown-subject' else None)
+    if kind in {'contradictory-lifecycle', 'contradictory-scope'}:
+        comment = runner.pr_payload['comments'][-1]
+        metadata = _extract_round_metadata_records([SimpleNamespace(body=comment['body'])], flow='pr')[0].metadata
+        metadata = (replace(metadata, visual_lifecycle={'head': 'a' * 40}) if kind == 'contradictory-lifecycle'
+                    else replace(metadata, review_scope={'head': 'a' * 40}))
+        comment['body'] = _attach_round_metadata('Malformed visual audit.', metadata)
+
+
+def _spy_visual_lifecycle(monkeypatch):
+    """Record visual-lifecycle entry points; histories handed to reduce_history must hold no visual record."""
+    from coding_review_agent_loop import review_images_state, review_images_coverage_history
+    spied = []
+    def wrap(owner, name, check_history=False):
+        original = getattr(owner, name)
+        def spy(*args, **kwargs):
+            if check_history:
+                assert not any(visual_candidate(r.metadata) for r in args[0]), 'visual record reached ' + name
+            else:
+                spied.append(name)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(owner, name, spy)
+    for name in ('recover_visual_findings', 'publish_assessment', 'persist_lifecycle', 'settings'):
+        wrap(visual, name)
+    wrap(review_images_state, 'validate')
+    wrap(review_images_state, 'reduce_history', check_history=True)
+    wrap(review_images_coverage_history, 'reduce_history', check_history=True)
+    return spied
+
+
+MALFORMED_KINDS = ['unknown-subject', 'contradictory-lifecycle', 'contradictory-scope', 'invalid-contract',
+                   'unresolved-intent', 'incomplete-identity']
+
+
+@pytest.mark.parametrize('kind', MALFORMED_KINDS)
+def test_no_visual_flags_ignores_malformed_lifecycle(visual_setup, monkeypatch, kind):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 5)
+    _append_malformed(runner, kind, monkeypatch)
+    spied = _spy_visual_lifecycle(monkeypatch)
+    before = len(runner.pr_payload['comments'])
+    assert run_pr_loop(runner, pr_number=77, config=_no_option(config)) == 0
+    assert spied == [] and calls == []
+    posted = records(runner)[before:]
+    assert posted and not any(visual_candidate(r.metadata) for r in posted)
+    assert not any(r.metadata.visual_lifecycle is not None for r in posted)
+    ordinary = [r for r in posted if r.metadata.role == 'reviewer']
+    assert ordinary and ordinary[-1].metadata.state == 'approved'
+
+
+@pytest.mark.parametrize('kind', MALFORMED_KINDS)
+def test_visual_flags_set_malformed_lifecycle_still_refuses(visual_setup, monkeypatch, kind):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 5)
+    _append_malformed(runner, kind, monkeypatch)
+    with pytest.raises(AgentLoopError) as exc:
+        run_pr_loop(runner, pr_number=77, config=config)
+    if kind == 'incomplete-identity':
+        assert 'cannot be authenticated' in str(exc.value)
+    else:
+        assert isinstance(exc.value, HumanDecisionRequiredError)
+    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+
+
+def test_no_visual_flags_ignores_carried_visual_blocker(visual_setup, monkeypatch):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Ordinary parser defect.']),
+                       structured_pr_review(prior_item_dispositions=[{'item_id': 'item-2', 'disposition': 'resolved'}])],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-2'],
+                                                  addressed_item_notes={'item-2': 'Fixed the parser.'})])
+    _append_visual_review(runner, (_visual_item(1, 'Carried visual clipped title'),))
+    spied = _spy_visual_lifecycle(monkeypatch)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=_no_option(config)) == 0
+    assert spied == [] and calls == []
+    ordinary = [r for r in records(runner) if r.metadata.role == 'reviewer' and not visual_candidate(r.metadata)]
+    assert [item.item_id for item in ordinary[0].metadata.new_items] == ['item-2']
+    for record in records(runner):
+        if not visual_candidate(record.metadata):
+            assert not any(i.origin_scope == 'visible-defects' for i in (*record.metadata.prior_items, *record.metadata.new_items))
+    coder = '\n'.join('\n'.join(cmd) for cmd, _ in runner.commands if cmd[:1] == ['claude'])
+    assert 'Carried visual clipped title' not in coder
+
+
+@pytest.mark.parametrize('opted_in', ['limit-only', 'partial-flags'])
+def test_explicit_limit_flag_only_keeps_today_recovery(visual_setup, tmp_path, opted_in):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+    config, calls, _ = visual_setup
+    if opted_in == 'limit-only':
+        argv = ['pr', '77', '--repo', 'OWNER/REPO', '--codex-dir', str(tmp_path / 'codex'),
+                '--claude-dir', str(tmp_path / 'claude'), '--dangerous-agent-permissions',
+                '--review-images-timeout', '300']
+        parsed = config_from_args(build_parser().parse_args(argv), FakeRunner())
+        assert parsed.review_images_requested and parsed.review_images_timeout == 300
+        config = replace(_no_option(config), review_images_requested=parsed.review_images_requested,
+                         review_images_timeout=parsed.review_images_timeout)
+        assert visual.visual_review_requested(config) and not config.review_images_paths
+    else:
+        config = replace(config, review_images_paths=())
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 5)
+    _append_visual_review(runner, (_visual_item(1, 'Carried visual clipped title'),))
+    with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(c[0] in {'capture', 'images'} for c in calls)
+
+
+def test_no_visual_flags_ignores_deferred_visual_followup(visual_setup, monkeypatch):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(codex_outputs=[structured_pr_review()] * 5)
+    _append_visual_review(runner, (_visual_item(1, 'Deferred visual spacing polish', status='future'),))
+    spied = _spy_visual_lifecycle(monkeypatch)
+    from coding_review_agent_loop import pr_loop
+    seen = []
+    original = pr_loop.canonical_deferred_history_items
+    def deferred(*args, **kwargs):
+        result = original(*args, **kwargs)
+        seen.extend(result)
+        return result
+    monkeypatch.setattr(pr_loop, 'canonical_deferred_history_items', deferred)
+    config = replace(_no_option(config), approved_followups='issue')
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert spied == [] and calls == []
+    assert not any(item.origin_scope == 'visible-defects' for item in seen)
+    published = '\n'.join([*runner.comments, *('\n'.join(cmd) for cmd, _ in runner.commands)])
+    assert 'Deferred visual spacing polish' not in published
+
+
+def test_no_visual_flags_excludes_visual_finding_history_from_coder_prompt(visual_setup, monkeypatch):
+    config, calls, _ = visual_setup
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Ordinary cache key collision.']),
+                       structured_pr_review(state='blocking', blocking_items=['Ordinary second defect.'],
+                                            prior_item_dispositions=[{'item_id': 'item-3', 'disposition': 'resolved'}]),
+                       structured_pr_review(prior_item_dispositions=[{'item_id': 'item-4', 'disposition': 'resolved'}])],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-3'], addressed_item_notes={'item-3': 'Fixed key.'}),
+                        structured_coder_followup(addressed_items=['item-4'], addressed_item_notes={'item-4': 'Fixed second.'})])
+    _append_visual_review(runner, (_visual_item(1, 'Historic visual blocker overlap'),
+                                   _visual_item(2, 'Historic visual future polish', status='future')))
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=replace(_no_option(config), max_rounds=4)) == 0
+    prompts = ['\n'.join(cmd) for cmd, _ in runner.commands if cmd[:1] == ['claude']]
+    assert len(prompts) == 2
+    history = prompts[1].split('Earlier-round history for this run', 1)[1]
+    assert 'item-3' in history
+    for prompt in prompts:
+        assert 'Historic visual' not in prompt
+
+
+def test_no_visual_flags_preserves_screenshot_obligation(visual_setup, monkeypatch):
+    from test_review_images_coverage import typed_review, responder
+    from coding_review_agent_loop import review_images_coverage_run as service
+    config, calls, _ = visual_setup
+    # An earlier opted-in run carries a pending requester obligation (and a
+    # well-formed visual attachment) on the PR.
+    responder(monkeypatch)
+    monkeypatch.setattr(service, 'report', lambda *a, **k: None)
+    runner = FakeRunner(codex_outputs=[typed_review()] * 3)
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    monkeypatch.undo()
+    visual_records = len([r for r in records(runner) if visual_candidate(r.metadata)])
+    assert visual_records
+    _append_malformed(runner, 'contradictory-lifecycle', monkeypatch)
+    _append_malformed(runner, 'invalid-contract', monkeypatch)
+    # Visual items whose author identity cannot be established. The global
+    # incomplete-coverage flag is left alone: the unchanged requester-coverage
+    # readers fail closed on it by design, independent of visual review.
+    _append_visual_review(runner, (_visual_item(9, 'Unauthenticated visual blocker'),), author_id=999)
+    runner.pr_payload['comments'][-1]['author']['login'] = 'attacker'
+    calls.clear()
+    spied = _spy_visual_lifecycle(monkeypatch)
+    for _ in range(2):
+        runner.simulate_new_process()
+        with pytest.raises(HumanDecisionRequiredError) as exc:
+            run_pr_loop(runner, pr_number=77, config=_no_option(config))
+        assert 'visual' not in str(exc.value).lower()
+        carriers = [r for r in records(runner) if not visual_candidate(r.metadata)
+                    and any(i.screenshot_request for i in (*r.metadata.prior_items, *r.metadata.new_items))]
+        assert carriers, 'requester screenshot obligation was dropped'
+        obligations = [i for i in (*carriers[-1].metadata.prior_items, *carriers[-1].metadata.new_items)
+                       if i.screenshot_request]
+        assert obligations and all(i.status != 'resolved' for i in obligations)
+        assert not any(r.metadata.screenshot_receipt_refs for r in records(runner))
+    assert spied == [] and calls == []

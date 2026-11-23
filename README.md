@@ -2297,7 +2297,9 @@ issue and PR runs; rollout remains deferred.
 
 Issue and PR runs accept `--review-images-cmd COMMAND` with repeatable
 `--review-images-paths GLOB` and `--review-images-runtime-grant /absolute/path`.
-No path globs means no image activity. `--review-images-seat SEAT` selects one
+No path globs means no image activity. With no `--review-images-*` option at
+all, the PR loop runs no visual lifecycle code and ignores old visual records.
+`--review-images-seat SEAT` selects one
 configured image-capable reviewer; omission requires an explicit primary.
 Unsupported executable/model/fallback combinations are refused without fallback.
 See [the CLI guide](docs/local_agent_loop.md#visual-defect-review) for grants,

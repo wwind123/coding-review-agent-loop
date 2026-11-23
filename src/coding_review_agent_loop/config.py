@@ -292,6 +292,8 @@ class AgentLoopConfig:
     review_images_max_images: int = 16
     review_images_max_bytes: int = 67108864
     review_images_max_pixels: int = 64000000
+    # True when any --review-images-* option was supplied (#2070).
+    review_images_requested: bool = False
     pr_review_broad_rules: tuple[str, ...] = DEFAULT_BROAD_RULES
     pr_review_force_full: bool = False
     # Issue plan-review scheduling, selected independently of the PR policy
@@ -2311,6 +2313,28 @@ def _arg_or_default(args: argparse.Namespace, name: str, default: int) -> int:
     return default if value is None else value
 
 
+REVIEW_IMAGES_VALUE_OPTIONS = (
+    "review_images_cmd",
+    "review_images_seat",
+    "review_images_timeout",
+    "review_images_max_images",
+    "review_images_max_bytes",
+    "review_images_max_pixels",
+)
+REVIEW_IMAGES_LIST_OPTIONS = ("review_images_paths", "review_images_runtime_grant")
+
+
+def review_images_requested_from_args(args: argparse.Namespace) -> bool:
+    """True when any of the eight --review-images-* options was supplied (#2070).
+
+    Presence, not value, decides: an explicit default such as
+    ``--review-images-timeout 300`` still opts the run in.
+    """
+    return any(getattr(args, name, None) is not None for name in REVIEW_IMAGES_VALUE_OPTIONS) or any(
+        bool(getattr(args, name, None)) for name in REVIEW_IMAGES_LIST_OPTIONS
+    )
+
+
 HUMAN_REVIEWER_TRUSTED_ACTOR_OPTION = "--human-reviewer-trusted-actor"
 
 
@@ -2737,10 +2761,11 @@ def config_from_args(
         review_images_paths=tuple(getattr(args, "review_images_paths", ())),
         review_images_seat=getattr(args, "review_images_seat", None),
         review_images_runtime_grant=tuple(getattr(args, "review_images_runtime_grant", ())),
-        review_images_timeout=getattr(args, "review_images_timeout", 300),
-        review_images_max_images=getattr(args, "review_images_max_images", 16),
-        review_images_max_bytes=getattr(args, "review_images_max_bytes", 67108864),
-        review_images_max_pixels=getattr(args, "review_images_max_pixels", 64000000),
+        review_images_timeout=_arg_or_default(args, "review_images_timeout", 300),
+        review_images_max_images=_arg_or_default(args, "review_images_max_images", 16),
+        review_images_max_bytes=_arg_or_default(args, "review_images_max_bytes", 67108864),
+        review_images_max_pixels=_arg_or_default(args, "review_images_max_pixels", 64000000),
+        review_images_requested=review_images_requested_from_args(args),
         watch_pending_ci=(
             bool(getattr(args, "auto_merge", False))
             if getattr(args, "watch_pending_ci", None) is None

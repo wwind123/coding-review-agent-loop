@@ -231,10 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--review-images-paths", action="append", default=[], help="Literal changed-path glob; repeatable; no globs disables visual review")
         subparser.add_argument("--review-images-seat", help="Configured image-capable reviewer seat; defaults to explicit primary")
         subparser.add_argument("--review-images-runtime-grant", action="append", default=[], help="Operator-owned absolute offline runtime path; repeatable")
-        subparser.add_argument("--review-images-timeout", type=float, default=300, help="Capture timeout in seconds (default 300)")
-        subparser.add_argument("--review-images-max-images", type=int, default=16)
-        subparser.add_argument("--review-images-max-bytes", type=int, default=67108864)
-        subparser.add_argument("--review-images-max-pixels", type=int, default=64000000)
+        # None marks "not supplied": any explicit --review-images-* option,
+        # even at its default value, opts the run into visual review (#2070).
+        subparser.add_argument("--review-images-timeout", type=float, default=None, help="Capture timeout in seconds (default 300)")
+        subparser.add_argument("--review-images-max-images", type=int, default=None, help="Maximum delivered images (default 16)")
+        subparser.add_argument("--review-images-max-bytes", type=int, default=None, help="Maximum delivered image bytes (default 67108864)")
+        subparser.add_argument("--review-images-max-pixels", type=int, default=None, help="Maximum delivered image pixels (default 64000000)")
         subparser.add_argument("--repo", help="GitHub repo as owner/name. Defaults to gh repo view.")
         subparser.add_argument(
             "--base",
