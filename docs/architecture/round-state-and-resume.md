@@ -726,7 +726,7 @@ existing ledger for a later authenticated retry.
 ## Durable visible-defects lifecycle
 
 With no `--review-images-*` option, visual records and items are dropped on read
-and no visual lifecycle code runs; raw records still reserve item IDs (#2070).
+and no visual lifecycle code runs; visual item IDs stay reserved (#2070).
 
 `review_images_state.py` reduces authenticated visual round metadata. GitHub is
 its durable store; local sealed captures and private responses grant no recovery

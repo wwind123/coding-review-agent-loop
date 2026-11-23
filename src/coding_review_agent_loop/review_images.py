@@ -35,6 +35,11 @@ def drop_visual_records(records, config):
     return tuple(kept) if isinstance(records, tuple) else list(kept)
 
 
+def visual_records(records):
+    """The visual records alone; a no-option run reads only their item IDs, for reservation."""
+    return tuple(record for record in records if visual_candidate(record.metadata))
+
+
 def drop_visual_items(items, config):
     """Leave carried visual findings out of a no-option run's ledger."""
     if visual_review_requested(config):
