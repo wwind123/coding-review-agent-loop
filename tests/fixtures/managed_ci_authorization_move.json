@@ -393,7 +393,7 @@
         ]
       },
       "find_actor_round_metadata_comment_ids": {
-        "sha256": "a615efae2695673f8da0ba0f1ade3838c28bdd6d84306e3b74883c33f71ee491",
+        "sha256": "b33a5cc13ae4986259b943589fc026db63290f557fe0f953562e3349a7e4b571",
         "original_lines": [
           1171,
           1282
@@ -440,7 +440,7 @@
         ]
       },
       "_continuity_round_records": {
-        "sha256": "bcd2994fb8e2e5733b67bd8d399d0909c22fdf3963d08bd5cc5ff6fc62db48a5",
+        "sha256": "45669798bfed70824b4334a2dfb2d6463c84c683b382c33d5cb298b45b3f64db",
         "original_lines": [
           1285,
           1358
@@ -547,7 +547,7 @@
         "consumer_candidates": []
       },
       "_ordinary_continuity_round_metadata_is_valid": {
-        "sha256": "eab4862f7e81ca964e407e17da771e36fd15f75df12f08c91a44cd699f32db77",
+        "sha256": "ed9eddcf25e3621a506ac5fae1b14111e783d61ddee7a39670cdec2e6c986798",
         "original_lines": [
           1434,
           1503
@@ -880,7 +880,7 @@
         "consumer_candidates": []
       },
       "_recovery_continuity_is_valid": {
-        "sha256": "0e8058cd2efbdd5ca8fc6eca85bdde6095945607651e67593bcc252a129f82de",
+        "sha256": "58d473cbea508f1bc139a1f063679e50ca433a454579f12a953878a001e184a8",
         "original_lines": [
           2167,
           2225
