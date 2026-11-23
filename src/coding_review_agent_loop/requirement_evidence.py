@@ -18,8 +18,11 @@ def normalize_empty_text(entry):
     return result
 
 
+ROLES = frozenset({"code", "human-only", "evidence-only", "mixed", "superseded"})
+
 _HUMAN_ONLY_RULE = "human-only must name its exact emitted evidence request in request"
-_NON_HUMAN_REQUEST_RULE = "only human-only names a request; code, evidence-only and mixed use request \"\""
+_NON_HUMAN_REQUEST_RULE = ("only human-only names a request; code, evidence-only, mixed and superseded "
+                           "use request \"\"")
 _ANSWER_RULES = {
     "mixed": ("mixed requires at least one answered_item_id; if no prior evidence item of yours "
               "is answered, use code or human-only"),
@@ -28,9 +31,27 @@ _ANSWER_RULES = {
     "code": "code uses answered_item_ids []; use evidence-only or mixed to answer your prior evidence items",
     "human-only": ("human-only uses answered_item_ids []; use evidence-only or mixed to answer "
                    "your prior evidence items"),
+    "superseded": "superseded uses answered_item_ids []; a replaced source answers nothing",
 }
 _LEFTOVER_RULE = ("mixed requires explicit leftover_instructions; if nothing is left for the coder, "
                   "use evidence-only")
+_SUPERSEDED_LEFTOVER_RULE = ('superseded uses leftover_instructions ""; if leftover code work remains, '
+                             "use mixed or code")
+# The valid choices for a reviewer that emitted no exact_head_evidence_requests
+# this turn (#2101): human-only cannot validate without a linked request.
+VALID_CHOICES_WITHOUT_REQUESTS = (
+    "you emitted no exact_head_evidence_requests, so choose superseded if a newer signed source "
+    "from the same author replaces it, evidence-only with your own prior evidence item IDs, or code")
+_NO_REQUEST_RULES = {
+    "human-only": "this role needs a request linked to an emitted evidence request; " + VALID_CHOICES_WITHOUT_REQUESTS,
+    "request": 'request must be ""; ' + VALID_CHOICES_WITHOUT_REQUESTS,
+    "mixed": "mixed requires at least one answered_item_id; " + VALID_CHOICES_WITHOUT_REQUESTS,
+    "evidence-only": ("evidence-only requires at least one answered_item_id; "
+                      + VALID_CHOICES_WITHOUT_REQUESTS),
+    "human-only-answers": "answered_item_ids must be []; " + VALID_CHOICES_WITHOUT_REQUESTS,
+}
+_SUPERSEDED_PRECONDITION = ("superseded requires another surfaced signed source from the same author "
+                            "with a strictly later created_at")
 
 
 def _inconsistent(index, entry, rule):
@@ -41,7 +62,13 @@ def _inconsistent(index, entry, rule):
                                       allowed_values=(rule,), observed_preview=message)
 
 
-def parse_associations(value):
+def parse_associations(value, *, emitted_requests=None):
+    """Parse reviewer classifications; role/field violations take the judgement re-ask.
+
+    ``emitted_requests`` is this turn's exact_head_evidence_requests, or None when
+    unknown (replay). With none emitted, re-ask rules never offer human-only.
+    """
+    no_requests = emitted_requests is not None and not emitted_requests
     if not isinstance(value, (list, tuple)):
         raise AgentLoopError("requirement_evidence must be an array")
     result = []
@@ -50,7 +77,7 @@ def parse_associations(value):
             "requirement_id", "role", "request", "answered_item_ids", "leftover_instructions"
         }:
             raise AgentLoopError("requirement_evidence entries require requirement_id, role, request, answered_item_ids and leftover_instructions")
-        if not isinstance(entry["role"], str) or entry["role"] not in {"code", "human-only", "evidence-only", "mixed"}:
+        if not isinstance(entry["role"], str) or entry["role"] not in ROLES:
             raise AgentLoopError("Unknown requirement_evidence role")
         entry = normalize_empty_text(entry)
         for field in ("requirement_id", "request", "leftover_instructions"):
@@ -66,11 +93,25 @@ def parse_associations(value):
             raise AgentLoopError("Human-only requirements must link an evidence request")
         # Role/field consistency is the reviewer's judgement (#2035): it takes
         # the bounded judgement re-ask, never format repair or a fatal stop.
+        if role == "superseded" and not entry["leftover_instructions"].strip():
+            entry["leftover_instructions"] = ""
         if (role == "human-only") != bool(entry["request"].strip()):
-            raise _inconsistent(index, entry, _HUMAN_ONLY_RULE if role == "human-only"
-                                else _NON_HUMAN_REQUEST_RULE)
+            if no_requests:
+                rule = _NO_REQUEST_RULES["human-only" if role == "human-only" else "request"]
+            else:
+                rule = _HUMAN_ONLY_RULE if role == "human-only" else _NON_HUMAN_REQUEST_RULE
+            raise _inconsistent(index, entry, rule)
         if (role in {"mixed", "evidence-only"}) != bool(answers):
-            raise _inconsistent(index, entry, _ANSWER_RULES[role])
+            rule = _ANSWER_RULES[role]
+            if no_requests and role in {"mixed", "evidence-only"}:
+                rule = _NO_REQUEST_RULES[role]
+            elif no_requests and role == "human-only":
+                rule = _NO_REQUEST_RULES["human-only-answers"]
+            raise _inconsistent(index, entry, rule)
+        if role == "superseded" and entry["leftover_instructions"]:
+            # Never cleared by normalize_empty_text: a superseded source with
+            # leftover code work would otherwise silently drop it (#2101).
+            raise _inconsistent(index, entry, _SUPERSEDED_LEFTOVER_RULE)
         if (role == "mixed") != bool(entry["leftover_instructions"].strip()):
             raise _inconsistent(index, entry, _LEFTOVER_RULE)
         if any(e["requirement_id"] == entry["requirement_id"] for e in result):
@@ -87,19 +128,65 @@ def decode_associations(payload):
         raise ValueError(str(exc)) from exc
 
 
+def _created_at(source):
+    """Parse a source's created_at as an aware timestamp; None fails closed."""
+    from datetime import datetime, timezone
+    raw = getattr(source, "created_at", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _same_author(left, right):
+    """Compare author_id when both carry it, otherwise the normalized login."""
+    if left.author_id is not None and right.author_id is not None:
+        return left.author_id == right.author_id
+    login = lambda source: str(source.author or "").strip().lower()
+    return bool(login(left)) and login(left) == login(right)
+
+
+def is_superseded(source, requirements):
+    """True when another surfaced source from the same author is strictly newer (#2101)."""
+    when = _created_at(source)
+    if when is None:
+        return False
+    for other in requirements:
+        if other.requirement_id == source.requirement_id or not _same_author(source, other):
+            continue
+        newer = _created_at(other)
+        if newer is not None and newer > when:
+            return True
+    return False
+
+
 def validate_associations(parsed, requirements, items, reviewer):
-    def invalid(message):
+    no_requests = not parsed.exact_head_evidence_requests
+
+    def invalid(message, *, choices=False):
         # Reuse the bounded semantic-judgement re-ask, never format repair.
+        if choices and no_requests:
+            message += "; " + VALID_CHOICES_WITHOUT_REQUESTS
         return MissingJudgementFieldError(message, field_path="requirement_evidence",
             allowed_values=("surfaced sources with linked emitted requests and requester-owned native answers",),
             observed_preview=message)
 
-    live = {r.requirement_id for r in requirements}
+    live = {r.requirement_id: r for r in requirements}
     for entry in parsed.requirement_evidence:
         if entry["requirement_id"] not in live:
             raise invalid("Requirement/evidence association names an unsurfaced source")
         if entry["role"] == "human-only" and entry["request"] not in parsed.exact_head_evidence_requests:
-            raise invalid("Human-only association must name this requester's emitted evidence request")
+            raise invalid("Human-only association must name this requester's emitted evidence request",
+                          choices=True)
+        if entry["role"] == "superseded" and not is_superseded(live[entry["requirement_id"]], requirements):
+            message = (f"Superseded association for {entry['requirement_id']} is invalid: "
+                       f"{_SUPERSEDED_PRECONDITION}")
+            if not no_requests:
+                message += "; use code, evidence-only, or human-only with your linked emitted request"
+            raise invalid(message, choices=True)
         for item_id in entry["answered_item_ids"]:
             targets = [i for i in items if item_id in (i.item_id, *i.alias_item_ids)]
             from .native_evidence import native
@@ -130,17 +217,12 @@ def _merged_mixed_body(source, attributed):
             + "\n".join(lines))
 
 
-def project(requirements, reviews, items):
-    """Keep original signed identity, and fail closed on disagreeing classifiers.
-
-    Agreement is decided by role; leftover wording differences merge instead of
-    conflicting. Called only on actual validated reviewer results or admitted
-    requester records. Absence of a classification never consumes a signed source.
-    """
+def _agreed_classifications(requirements, reviews, items):
+    """Map each source to its single agreed role and entries; invalid or split sources are absent."""
+    from types import SimpleNamespace
     by_source = {}
     invalid_sources = set()
     for reviewer, parsed in reviews.items():
-        from types import SimpleNamespace
         for entry in parsed.requirement_evidence:
             try:
                 validate_associations(SimpleNamespace(requirement_evidence=(entry,),
@@ -149,18 +231,30 @@ def project(requirements, reviews, items):
                 invalid_sources.add(entry["requirement_id"])
                 continue
             by_source.setdefault(entry["requirement_id"], []).append((reviewer, entry))
+    agreed = {}
+    for source_id, entries in by_source.items():
+        roles = {e["role"] for _, e in entries}
+        if source_id not in invalid_sources and len(roles) == 1:
+            agreed[source_id] = (next(iter(roles)), entries)
+    return agreed
+
+
+def project(requirements, reviews, items):
+    """Keep original signed identity, and fail closed on disagreeing classifiers.
+
+    Agreement is decided by role; leftover wording differences merge instead of
+    conflicting. Called only on actual validated reviewer results or admitted
+    requester records. Absence of a classification never consumes a signed source.
+    An agreed superseded source leaves the projection like evidence-only (#2101).
+    """
+    agreed = _agreed_classifications(requirements, reviews, items)
     result = []
     for source in requirements:
-        entries = by_source.get(source.requirement_id, [])
-        if not entries or source.requirement_id in invalid_sources:
+        if source.requirement_id not in agreed:
             result.append(source)
             continue
-        roles = {e["role"] for _, e in entries}
-        if len(roles) != 1:
-            result.append(source)
-            continue
-        (role,) = roles
-        if role in {"human-only", "evidence-only"}:
+        role, entries = agreed[source.requirement_id]
+        if role in {"human-only", "evidence-only", "superseded"}:
             continue
         if role == "mixed":
             from dataclasses import fields
@@ -169,6 +263,17 @@ def project(requirements, reviews, items):
                 source, [(reviewer, e["leftover_instructions"]) for reviewer, e in entries])
             source = ActionableRequirement(**values, original_id=source.requirement_id)
         result.append(source)
+    return tuple(result)
+
+
+def superseded_ids(requirements, reviews, items):
+    """Normalized labels of sources whose agreed, valid role is superseded (a subset of reviewer_owned_ids)."""
+    agreed = _agreed_classifications(requirements, reviews, items)
+    result = []
+    for source in requirements or ():
+        label = str(source.requirement_id).strip().lower()
+        if agreed.get(source.requirement_id, ("",))[0] == "superseded" and label and label not in result:
+            result.append(label)
     return tuple(result)
 
 
@@ -192,6 +297,15 @@ def _role_conflict_message(conflicts, previous_entries, reviewer_name):
                "exact-head evidence answers from code requirements, then rerun the same command."),
         safe_to_automate=False,
         automation_note="the clarifying signed comment must come from a human.")
+
+
+# How to route a signed source a later signed source replaces (#2101).
+SUPERSEDED_GUIDANCE = (
+    "Use superseded (request \"\", answered_item_ids [], leftover_instructions \"\") for a signed "
+    "source that a later signed source from the same author replaces, such as an older exact-head "
+    "approval or a note limiting it; it creates no coder work and no evidence, and it is valid only "
+    "when a strictly newer signed source from the same author is surfaced. Use human-only only when "
+    "you emit its linked exact_head_evidence_request in this same response.")
 
 
 # The signed-source classification continuation's validated-turn options. A
@@ -237,18 +351,19 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
             and (parsed.requirement_evidence or not human_requirements_resolved(text))):
         import json
         from .errors import HumanDecisionRequiredError
-        sources = [{"requirement_id": r.requirement_id, "body": r.body} for r in requirements]
+        sources = [{"requirement_id": r.requirement_id, "author": r.author, "created_at": r.created_at,
+                    "body": r.body} for r in requirements]
         prior = [{"requirement_id": p["requirement_id"], "reviewer": name, "role": p["role"]}
                  for name, p in previous_entries]
         prompt = ("Continue the PR review with semantic signed-source classification. Return a complete "
             "structured pr_review and its normal footer. Preserve code findings in blocking_items. Classify every signed "
             "source in requirement_evidence using exactly requirement_id, role (code, human-only, "
-            "evidence-only, mixed), request (a string: your exact emitted request for human-only, otherwise \"\"), "
+            "evidence-only, mixed, superseded), request (a string: your exact emitted request for human-only, otherwise \"\"), "
             "answered_item_ids (a list: your own prior evidence items only, otherwise []), leftover_instructions "
             "(a string: explicit leftover code instructions for mixed, otherwise \"\"). Do not infer acceptance "
             "from a head mention. Only requester dispositions with evidence_requirement_ids attest adequacy. "
             "This is a real semantic reviewer turn; do not invent instructions. Agreement is decided by role; "
-            "leftover wording need not match other reviewers.\nSigned sources: "
+            "leftover wording need not match other reviewers. " + SUPERSEDED_GUIDANCE + "\nSigned sources: "
             + json.dumps(sources) + "\nPrior classifications to reconcile: " + json.dumps(prior) + "\nPrior items: " + repr(items) + "\nPrevious review:\n" + text)
         if pinned_review is not None:
             prompt += ("\nThis review is already published and its peers are public: its verdict "
@@ -286,12 +401,8 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
     return parsed, text
 
 
-def historical_projection(requirements, records):
-    """Routing is replayed only from admitted requester records, never prose.
-
-    Routing does not fulfill evidence, so a push retains the human-only role
-    while the native evidence gate independently reopens exact-head acceptance.
-    """
+def _historical_inputs(requirements, records):
+    """Latest admitted reviewer classifications and their prior items, keyed for project()."""
     from types import SimpleNamespace
     live = {r.requirement_id for r in requirements}
     latest = {}
@@ -305,14 +416,29 @@ def historical_projection(requirements, records):
             exact_head_evidence_requests=m.evidence_requests)
         for item in m.prior_items:
             targets[item.item_id] = item
-    return project(requirements, latest, tuple(targets.values()))
+    return latest, tuple(targets.values())
+
+
+def historical_projection(requirements, records):
+    """Routing is replayed only from admitted requester records, never prose.
+
+    Routing does not fulfill evidence, so a push retains the human-only role
+    while the native evidence gate independently reopens exact-head acceptance.
+    """
+    return project(requirements, *_historical_inputs(requirements, records))
+
+
+def historical_superseded_ids(requirements, records):
+    """Replay twin of superseded_ids over admitted requester records."""
+    return superseded_ids(requirements, *_historical_inputs(requirements, records))
 
 
 def reviewer_owned_ids(requirements, projected):
     """Return normalized labels of live signed sources the projection routed away from the coder.
 
     Option A (#2020): evidence-only and human-only sources are reviewer-owned
-    exact-head evidence and never coder-dispositioned. Mixed sources keep their
+    exact-head evidence and never coder-dispositioned; agreed superseded
+    sources (#2101) are reviewer-owned and inert. Mixed sources keep their
     original identity in the projection and therefore stay coder-owned, as do
     sources with conflicting or missing classifications.
 

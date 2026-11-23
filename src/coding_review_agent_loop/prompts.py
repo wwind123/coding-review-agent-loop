@@ -135,11 +135,18 @@ review does not acknowledge it as resolved, including ordinary work with role
 `code`. Missing classification triggers one bounded reviewer continuation; a
 repeated omission stops the run before coder dispatch. Roles: `code` (ordinary code requirement), `human-only`
 (link `request` to a string in your exact_head_evidence_requests), `evidence-only`
-(answered prior item IDs, no remaining instructions), or `mixed` (answered prior
-item IDs plus explicit leftover code instruction text). `request` and
+(answered prior item IDs, no remaining instructions), `mixed` (answered prior
+item IDs plus explicit leftover code instruction text), or `superseded`. Use
+`superseded` (`request` `""`, `answered_item_ids` `[]`, `leftover_instructions`
+`""`) for a signed source that a later signed source from the same author
+replaces, such as an older exact-head approval or a note limiting it: it creates
+no coder work and no evidence, and it is valid only when a strictly newer signed
+source from the same author is surfaced. Use `human-only` only when you emit its
+linked exact_head_evidence_request in the same response. `request` and
 `leftover_instructions` are strings (`""` when inapplicable); `answered_item_ids`
 is a list (`[]` when inapplicable). Use explicit nonblank `leftover_instructions`
-only for `mixed`; use `""` for `code`, `human-only` and `evidence-only`. Put code
+only for `mixed`; use `""` for `code`, `human-only`, `evidence-only` and
+`superseded`. Put code
 findings in `blocking_items`. You may classify answers only to your own native evidence
 items. Mixed sources retain their original signed ID. Do not invent leftover
 instructions or acknowledge human acceptance as coder work. A classification
@@ -2925,6 +2932,7 @@ def _build_compact_pr_review_prompt(
     parent_issue_context: IssueContext | None,
     coder_followup_context: str = "",
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
     released_disputes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
@@ -2932,6 +2940,7 @@ def _build_compact_pr_review_prompt(
     checks_block = f"{format_pr_checks(pr_checks)}\n" if pr_checks is not None else ""
     human_requirements_guidance = prompt_support._human_requirements_review_guidance(
         human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+        superseded_requirement_ids=superseded_requirement_ids,
         scoped_acknowledgement=getattr(config, "pr_human_evidence", "advisory") == "freeze",
     )
     non_future_items = [item for item in unresolved_items if item.status != "future"]
@@ -3388,6 +3397,7 @@ def build_review_prompt(
     issue_context: IssueContext | None = None,
     human_requirements: Sequence[HumanReviewRequirement] | None = None,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
     unresolved_items: Sequence[UnresolvedReviewItem] | None = None,
     compact_context: bool = False,
     compact_prior: prompt_support.CompactPriorContext | None = None,
@@ -3440,6 +3450,7 @@ def build_review_prompt(
             issue_context=issue_context,
             human_requirements=human_requirements,
             reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            superseded_requirement_ids=superseded_requirement_ids,
             unresolved_items=unresolved_items or [],
             compact_prior=compact_prior,
             compact_tail=compact_tail,
@@ -3458,6 +3469,7 @@ def build_review_prompt(
     checks_block = f"{format_pr_checks(pr_checks)}\n" if pr_checks is not None else ""
     human_requirements_guidance = prompt_support._human_requirements_review_guidance(
         human_requirements, reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+        superseded_requirement_ids=superseded_requirement_ids,
         scoped_acknowledgement=getattr(config, "pr_human_evidence", "advisory") == "freeze",
     )
     unresolved_items_block = _format_unresolved_review_items(unresolved_items, released_disputes)
@@ -3640,6 +3652,7 @@ def build_followup_prompt(
     *,
     human_requirements_context: prompt_support.CoderHumanRequirementsPromptContext | None = None,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
@@ -3667,7 +3680,7 @@ Do not create a new PR.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids)}
+{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids)}
 {prompt_support._architecture_impact_guidance(required=True, config=config)}
 {prompt_support._architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {prompt_support._memory_block(memory, config, include_runtime=True)}{_local_test_failure_block(local_test_failure_context)}
@@ -3710,6 +3723,7 @@ def build_same_pr_followup_prompt(
     *,
     human_requirements_context: prompt_support.CoderHumanRequirementsPromptContext | None = None,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
@@ -3738,7 +3752,7 @@ same PR. Do not create a new PR.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids)}
+{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids)}
 {prompt_support._architecture_impact_guidance(required=True, config=config)}
 {prompt_support._architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {prompt_support._memory_block(memory, config, include_runtime=True)}{_local_test_failure_block(local_test_failure_context)}
@@ -3777,6 +3791,7 @@ def build_merge_conflict_prompt(
     merge_state_detail: str,
     human_requirements_context: prompt_support.CoderHumanRequirementsPromptContext | None = None,
     reviewer_owned_requirement_ids: Sequence[str] = (),
+    superseded_requirement_ids: Sequence[str] = (),
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
@@ -3806,7 +3821,7 @@ against the new head after your push.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids)}
+{human_requirements_context.block}{prompt_support._coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup", reviewer_owned_requirement_ids=reviewer_owned_requirement_ids, superseded_requirement_ids=superseded_requirement_ids)}
 {prompt_support._architecture_impact_guidance(required=True, config=config)}
 {prompt_support._architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {prompt_support._memory_block(memory, config, include_runtime=True)}

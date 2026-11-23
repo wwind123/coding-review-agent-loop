@@ -1577,7 +1577,8 @@ def _reviewer_owned_label_set(reviewer_owned_requirement_ids: Sequence[str]) -> 
 def _reviewer_owned_out_of_scope_message(context: str, ids: Sequence[str]) -> str:
     return (
         f"{context} names signed requirement ID(s) {', '.join(ids)} that are routed to "
-        "reviewer-owned exact-head evidence (evidence-only/human-only) and are outside coder "
+        "reviewer-owned exact-head evidence (evidence-only/human-only) or were superseded by a newer "
+        "signed source (superseded) and are outside coder "
         "scope; omit them from human_requirement_dispositions and human_requirements.addressed_ids. "
         "A reviewer demand for a coder disposition of these IDs is non-actionable for the coder."
     )
@@ -3469,7 +3470,7 @@ def parse_structured_pr_review(
     typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
     from .requirement_evidence import parse_associations
     associations = (
-        parse_associations(payload.get("requirement_evidence", []))
+        parse_associations(payload.get("requirement_evidence", []), emitted_requests=tuple(evidence_requests))
         if parse_requirement_evidence else ()
     )
     return dataclasses.replace(parsed, requirement_evidence=associations, exact_head_evidence_requests=evidence_requests,

@@ -284,15 +284,18 @@ def test_identity_is_not_normalized(value):
 
 
 @pytest.mark.parametrize("value", ["", "  ", [], None])
-@pytest.mark.parametrize("role,field,message", [
-    ("human-only", "request", "human-only must name its exact emitted evidence request"),
-    ("mixed", "leftover_instructions", "mixed requires explicit leftover_instructions")])
-def test_normalized_empty_text_retains_required_content(role, field, message, value):
+@pytest.mark.parametrize("role,field,message,live_message", [
+    ("human-only", "request", "human-only must name its exact emitted evidence request",
+     # A live review that emitted no request is offered only the valid choices (#2101).
+     "this role needs a request linked to an emitted evidence request; you emitted no exact_head_evidence_requests"),
+    ("mixed", "leftover_instructions", "mixed requires explicit leftover_instructions",
+     "mixed requires explicit leftover_instructions")])
+def test_normalized_empty_text_retains_required_content(role, field, message, live_message, value):
     entry = _association("source", role, answers=["item-1"] if role == "mixed" else [])
     entry[field] = value
     with pytest.raises(AgentLoopError, match=message):
         parse_associations([entry])
-    with pytest.raises(AgentLoopError, match=message):
+    with pytest.raises(AgentLoopError, match=live_message):
         parse_structured_pr_review(_classified_review([entry]), reviewer="Codex",
                                    architecture_status_mode="legacy")
 
@@ -579,3 +582,244 @@ def test_pinned_complete_associations_without_conflict_get_no_continuation():
         reviewer_name="Codex", invoke=invoke, pinned_review=published)
     assert result is published
     assert result_text == text
+
+
+# --- #2101: superseded signed sources ---
+
+from coding_review_agent_loop.requirement_evidence import (  # noqa: E402
+    VALID_CHOICES_WITHOUT_REQUESTS,
+    historical_superseded_ids,
+    normalize_empty_text,
+    reviewer_owned_ids,
+    superseded_ids,
+    validate_associations,
+)
+
+
+def _signed_source(body, minute, *, author="maintainer", author_id=7, created_at=None):
+    stamp = created_at if created_at is not None else f"2026-11-22T05:{minute:02d}:00Z"
+    return HumanReviewRequirement("PR comment", author, stamp, f"https://example.test/{minute}", body,
+                                  author_id=author_id)
+
+
+OLD_APPROVAL = _signed_source("Approved for head 13fd8b50.", 0)
+LIMITING_NOTE = _signed_source("The approval above does not cover later heads.", 5)
+NEW_APPROVAL = _signed_source("Approved for head 46ba82d9.", 12)
+SUPERSEDED_SET = (OLD_APPROVAL, LIMITING_NOTE, NEW_APPROVAL)
+
+
+def _carrier(entries, requests=()):
+    return SimpleNamespace(requirement_evidence=tuple(entries), exact_head_evidence_requests=tuple(requests))
+
+
+def _superseded_review(requests=()):
+    return _carrier([_association(OLD_APPROVAL.requirement_id, "superseded"),
+                     _association(LIMITING_NOTE.requirement_id, "superseded"),
+                     _association(NEW_APPROVAL.requirement_id, "code")], requests)
+
+
+@pytest.mark.parametrize("value", ["", None, [], "   "])
+def test_superseded_parses_with_empty_fields(value):
+    entry = _association("hr-old", "superseded")
+    entry["request"] = value if value != "   " else ""
+    entry["leftover_instructions"] = value
+    (parsed,) = parse_associations([entry])
+    assert parsed["role"] == "superseded"
+    assert parsed["request"] == "" and parsed["leftover_instructions"] == "" and parsed["answered_item_ids"] == []
+
+
+@pytest.mark.parametrize("field,value,rule", [
+    ("request", "Run the suite", "code, evidence-only, mixed and superseded use request \"\""),
+    ("answered_item_ids", ["item-1"], "superseded uses answered_item_ids []; a replaced source answers nothing"),
+    ("leftover_instructions", "Also fix retries.",
+     'superseded uses leftover_instructions ""; if leftover code work remains, use mixed or code'),
+])
+def test_superseded_shape_violation_takes_judgement_reask(field, value, rule):
+    entry = _association("hr-old", "superseded")
+    entry[field] = value
+    with pytest.raises(MissingJudgementFieldError) as error:
+        parse_associations([entry])
+    assert rule in str(error.value)
+    assert error.value.field_path == "requirement_evidence"
+    assert rule in error.value.allowed_values[0]
+    with pytest.raises(ValueError, match="superseded"):
+        decode_associations({"requirement_evidence": [entry]})
+
+
+def test_superseded_leftover_is_never_normalized_away():
+    entry = _association("hr-old", "superseded", leftover="Also fix retries.")
+    assert normalize_empty_text(entry)["leftover_instructions"] == "Also fix retries."
+    # Existing non-mixed normalization (#1954) is unchanged.
+    for role in ("code", "human-only", "evidence-only"):
+        assert normalize_empty_text({**entry, "role": role})["leftover_instructions"] == ""
+
+
+def test_superseded_validates_with_newer_same_author_source():
+    validate_associations(_superseded_review(), SUPERSEDED_SET, (), "Codex")
+    # Login match when either side lacks an author_id.
+    by_login = [dataclasses.replace(s, author_id=None, author=s.author.upper()) for s in SUPERSEDED_SET]
+    validate_associations(_superseded_review(), by_login, (), "Codex")
+
+
+@pytest.mark.parametrize("fault", ["newest", "other-author-id", "other-login", "equal-time", "missing-time",
+                                   "missing-newer-time", "missing-author", "alone"])
+def test_superseded_precondition_fails_closed(fault):
+    old, newer = OLD_APPROVAL, NEW_APPROVAL
+    if fault == "newest":
+        old, newer = NEW_APPROVAL, OLD_APPROVAL
+    elif fault == "other-author-id":
+        newer = dataclasses.replace(newer, author="maintainer", author_id=8)
+    elif fault == "other-login":
+        old, newer = (dataclasses.replace(old, author_id=None),
+                      dataclasses.replace(newer, author="someone-else", author_id=None))
+    elif fault == "equal-time":
+        newer = dataclasses.replace(newer, created_at=old.created_at)
+    elif fault == "missing-time":
+        old = dataclasses.replace(old, created_at=None)
+    elif fault == "missing-newer-time":
+        newer = dataclasses.replace(newer, created_at="not a time")
+    elif fault == "missing-author":
+        old, newer = (dataclasses.replace(old, author=None, author_id=None),
+                      dataclasses.replace(newer, author=None, author_id=None))
+    requirements = [old] if fault == "alone" else [old, newer]
+    review = _carrier([_association(old.requirement_id, "superseded")])
+    with pytest.raises(MissingJudgementFieldError, match="superseded requires another surfaced signed source"):
+        validate_associations(review, requirements, (), "Codex")
+    # Project and replay retain the full current source.
+    assert project(requirements, {"Codex": review}, ()) == tuple(requirements)
+    assert superseded_ids(requirements, {"Codex": review}, ()) == ()
+
+
+def test_superseded_project_drops_source_and_lists_it_reviewer_owned():
+    items, entry, _, parsed = setup_role("evidence-only")
+    evidence_source = SOURCE
+    requirements = (*SUPERSEDED_SET, evidence_source)
+    review = _carrier([*_superseded_review().requirement_evidence, entry])
+    projected = project(requirements, {"Codex": review}, items)
+    assert projected == (NEW_APPROVAL,)
+    owned = reviewer_owned_ids(requirements, projected)
+    assert owned == (OLD_APPROVAL.requirement_id, LIMITING_NOTE.requirement_id, evidence_source.requirement_id)
+    superseded = superseded_ids(requirements, {"Codex": review}, items)
+    assert superseded == (OLD_APPROVAL.requirement_id, LIMITING_NOTE.requirement_id)
+    assert set(superseded) <= set(owned)
+
+
+def test_two_reviewers_agree_on_superseded_without_conflict():
+    """`superseded-two-reviewer-agreement`: agreement is by role (#2101)."""
+    gemini = _superseded_review()
+    codex_text = _classified_review(list(_superseded_review().requirement_evidence), hr=True)
+    codex = parse_structured_pr_review(codex_text, reviewer="Codex", architecture_status_mode="legacy")
+    def invoke(prompt):
+        raise AssertionError("agreeing superseded roles must not trigger a continuation")
+    result, _ = classify_review(codex, codex_text, requirements=list(SUPERSEDED_SET), items=(),
+                                reviewer_name="Codex", invoke=invoke, previous={"Gemini": gemini})
+    assert result is codex
+    assert project(SUPERSEDED_SET, {"Gemini": gemini, "Codex": result}, ()) == (NEW_APPROVAL,)
+    assert superseded_ids(SUPERSEDED_SET, {"Gemini": gemini, "Codex": result}, ()) == (
+        OLD_APPROVAL.requirement_id, LIMITING_NOTE.requirement_id)
+
+
+def test_superseded_versus_code_still_conflicts():
+    """`superseded-vs-code-conflict`: a role split stops and retains the source."""
+    gemini = _superseded_review()
+    code_entries = [_association(s.requirement_id, "code") for s in SUPERSEDED_SET]
+    codex_text = _classified_review(code_entries, hr=True)
+    codex = parse_structured_pr_review(codex_text, reviewer="Codex", architecture_status_mode="legacy")
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(marker_value=codex, text=codex_text)
+    with pytest.raises(HumanDecisionRequiredError, match="classification remained conflicting") as error:
+        classify_review(codex, codex_text, requirements=list(SUPERSEDED_SET), items=(),
+                        reviewer_name="Codex", invoke=invoke, previous={"Gemini": gemini})
+    assert len(calls) == 1
+    assert f"{OLD_APPROVAL.requirement_id}: Codex: code, Gemini: superseded" in str(error.value)
+    assert project(SUPERSEDED_SET, {"Gemini": gemini, "Codex": codex}, ()) == SUPERSEDED_SET
+    assert superseded_ids(SUPERSEDED_SET, {"Gemini": gemini, "Codex": codex}, ()) == ()
+
+
+def test_classification_prompt_explains_superseded_routing():
+    codex_text = _classified_review([], hr=False)
+    codex = parse_structured_pr_review(codex_text, reviewer="Codex", architecture_status_mode="legacy")
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(marker_value=dataclasses.replace(
+            codex, requirement_evidence=_superseded_review().requirement_evidence), text=codex_text)
+    classify_review(codex, codex_text, requirements=list(SUPERSEDED_SET), items=(), reviewer_name="Codex",
+                    invoke=invoke)
+    (prompt,) = calls
+    assert "role (code, human-only, evidence-only, mixed, superseded)" in prompt
+    assert 'Use superseded (request "", answered_item_ids [], leftover_instructions "")' in prompt
+    assert "later signed source from the same author replaces" in prompt
+    assert "Use human-only only when you emit its linked exact_head_evidence_request" in prompt
+    assert '"created_at": "2026-11-22T05:00:00Z"' in prompt and '"author": "maintainer"' in prompt
+
+
+def _rule_text(error):
+    return error.value.allowed_values[0]
+
+
+@pytest.mark.parametrize("role,request_text,answers", [
+    ("evidence-only", "", []),
+    ("mixed", "", []),
+    ("human-only", "", []),
+    ("human-only", "", ["item-1"]),
+    ("code", "Run the suite", []),
+    ("superseded", "Run the suite", []),
+])
+def test_reask_without_emitted_requests_never_offers_human_only(role, request_text, answers):
+    """`reask-no-emitted-requests`: the re-ask names only choices that can validate (#2101)."""
+    leftover = "Fix retries." if role == "mixed" else ""
+    entry = _association("hr-x", role, request=request_text, answers=answers, leftover=leftover)
+    with pytest.raises(MissingJudgementFieldError) as error:
+        parse_associations([entry], emitted_requests=())
+    rule = _rule_text(error)
+    assert "human-only" not in rule
+    assert VALID_CHOICES_WITHOUT_REQUESTS in rule
+    for choice in ("superseded", "evidence-only with your own prior evidence item IDs", "code"):
+        assert choice in rule
+    # With emitted requests, or in replay (unknown), the existing wording is unchanged.
+    for emitted in (None, ("Run the suite",)):
+        with pytest.raises(MissingJudgementFieldError) as legacy:
+            parse_associations([entry], emitted_requests=emitted)
+        assert VALID_CHOICES_WITHOUT_REQUESTS not in _rule_text(legacy)
+
+
+def test_live_review_without_requests_reasks_with_valid_choices():
+    entry = _association("hr-x", "evidence-only")
+    with pytest.raises(MissingJudgementFieldError) as error:
+        parse_structured_pr_review(_classified_review([entry]), reviewer="Codex", architecture_status_mode="legacy")
+    assert "use code or human-only" not in str(error.value)
+    assert VALID_CHOICES_WITHOUT_REQUESTS in str(error.value)
+
+
+def test_unlinked_human_only_validation_names_valid_choices_without_requests():
+    entry = _association(OLD_APPROVAL.requirement_id, "human-only", request="Unemitted request")
+    with pytest.raises(MissingJudgementFieldError) as error:
+        validate_associations(_carrier([entry]), SUPERSEDED_SET, (), "Codex")
+    assert "Human-only association must name this requester's emitted evidence request" in str(error.value)
+    assert VALID_CHOICES_WITHOUT_REQUESTS in str(error.value)
+    with pytest.raises(MissingJudgementFieldError) as emitted:
+        validate_associations(_carrier([entry], ["Other request"]), SUPERSEDED_SET, (), "Codex")
+    assert VALID_CHOICES_WITHOUT_REQUESTS not in str(emitted.value)
+
+
+def test_superseded_metadata_round_trip_and_historical_replay():
+    """`superseded-resume-replay` helper coverage: decode, revalidate and replay (#2101)."""
+    review = _superseded_review()
+    meta = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=1, subject="a" * 40,
+                               requirement_evidence=review.requirement_evidence)
+    decoded = _decode_round_metadata(_encode_round_metadata(meta))
+    assert decoded.requirement_evidence == review.requirement_evidence
+    # The resumable-classification predicate's parse and validation accept it.
+    validate_associations(_carrier(parse_associations(list(decoded.requirement_evidence)),
+                                   decoded.evidence_requests), SUPERSEDED_SET, (), "Codex")
+    records = [SimpleNamespace(metadata=decoded)]
+    assert historical_projection(SUPERSEDED_SET, records) == project(SUPERSEDED_SET, {"Codex": review}, ())
+    assert historical_projection(SUPERSEDED_SET, records) == (NEW_APPROVAL,)
+    assert historical_superseded_ids(SUPERSEDED_SET, records) == (
+        OLD_APPROVAL.requirement_id, LIMITING_NOTE.requirement_id)
+    # Replay rechecks the precondition: without the newer source the old one is retained.
+    assert historical_projection(SUPERSEDED_SET[:1], records) == SUPERSEDED_SET[:1]
+    assert historical_superseded_ids(SUPERSEDED_SET[:1], records) == ()

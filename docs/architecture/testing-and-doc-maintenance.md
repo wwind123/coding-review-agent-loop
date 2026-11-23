@@ -303,13 +303,17 @@ classification (#1922). Every surfaced signed source must be classified whenever
 the review does not acknowledge it as resolved, including ordinary work with role
 `code`. Missing classification triggers one bounded reviewer continuation; a
 repeated omission stops the run before coder dispatch. Entries contain requirement_id, role (code, human-only,
-evidence-only, mixed), request, answered_item_ids and leftover_instructions.
+evidence-only, mixed, superseded), request, answered_item_ids and leftover_instructions.
 The parser checks shape; routing checks surfaced source identity, native target
 existence and requester ownership. Only `request` and `leftover_instructions`
 normalize empty lists or null to empty strings before strict validation; invalid
 text types report the indexed field and observed type (#1943). String leftovers
 for `code`, `human-only` and `evidence-only` are cleared on copies (#1954), without
 relocating text into findings or requests; mixed leftovers must remain nonblank.
+`superseded` (#2101) is excluded from that clearing: a nonblank superseded
+leftover is a judgement re-ask, while null, `[]` or whitespace-only leftovers
+canonicalize to empty. The role is valid only when a strictly newer surfaced
+signed source from the same author exists.
 Repair compares copies under this same role-aware normalization only when both collections
 parse, retaining raw equality otherwise. Collection shape, order and all other
 content stay protected. A real bounded reviewer continuation owns missing

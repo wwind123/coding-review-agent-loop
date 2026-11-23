@@ -5958,8 +5958,8 @@ def _record_failed_acknowledgement(
             "coder-owned signed human requirements surfaced in its prompt; each "
             "required reviewer must explicitly acknowledge the in-scope signed "
             "requirements at the current head (under --pr-human-evidence freeze, those "
-            "not routed to human-only or evidence-only evidence; otherwise all of them). "
-            "Reviewer-owned (evidence-only/human-only) signed requirements are not "
+            "not routed to human-only, evidence-only or superseded; otherwise all of them). "
+            "Reviewer-owned (evidence-only/human-only/superseded) signed requirements are not "
             "coder work and need no coder disposition."
         ),
     )
