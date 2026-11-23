@@ -282,9 +282,11 @@ only when present: the PR size from `_pr_size_measurement` (merge-base
 `git diff --shortstat`, never raising; omitted when unavailable), the newest
 PR coder record's `unsuperseded_receipts_sentence` and `tool_identity_clause`,
 the non-array citation diagnosis read back from that record
-(`durable_citation_diagnosis`: its persisted `test_observation_degradations`,
-and the receipts its bounded evidence introduced, all uncited once the list was
-dropped), so a resumed stop renders the same section as the live one, the
+(`durable_citation_diagnosis`: its persisted `test_observation_degradations`
+and the tool-owned `uncited_acquisition_receipts` count the loop writes on the
+coder record from the frozen original acquisition catalog, before evidence
+bounding, so repair-turn receipts never count and evicted rows are never lost),
+so a resumed stop renders the same section as the live one, the
 newest `Approach alternative:` excerpt at the stop head
 (`review_step_back.pr_approach_alternative_at_head`, selected even after later
 reviews of that head), and the child-plan supersession route for a PR bound to

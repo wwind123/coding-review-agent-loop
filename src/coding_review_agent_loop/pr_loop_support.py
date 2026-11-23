@@ -353,7 +353,8 @@ class FollowupCitationDiagnosis:
 
     non_array_drop: bool
     repair_attempted: bool
-    uncited_receipts: int
+    # ``None`` when a historical record carries no persisted count.
+    uncited_receipts: int | None
 
 
 def render_followup_local_test_evidence(
@@ -4385,32 +4386,33 @@ def _no_progress_defers_to_evidence_stall(
     return defers_to_evidence_stall(item_rows, unsatisfied_rows)
 
 
-def _turn_receipt_ids(evidence_value: object, earlier_turns: frozenset[str]) -> frozenset[str]:
-    from .local_test_evidence import decode_bounded_evidence
-
-    evidence = (
-        decode_bounded_evidence(evidence_value, restore_classification=True)
-        if evidence_value else None
-    )
-    if evidence is None:
-        return frozenset()
-    return frozenset(
-        row.receipt_id for row in evidence.observations
-        if row.receipt_id and row.provenance == "parent-observed"
-        and (row.turn_id or "") not in earlier_turns
-    )
+def _non_array_citation_drops(degradations: Iterable[object]) -> list:
+    return [
+        record
+        for record in degradations
+        if getattr(record, "outcome", None) == CITATION_DROPPED_OUTCOME
+        and getattr(record, "rule", None) in TEST_OBSERVATIONS_NOT_ARRAY_RULES
+        and getattr(record, "element_path", None) == "coder_followup.test_observations"
+    ]
 
 
-def _evidence_turn_ids(evidence_value: object) -> frozenset[str]:
-    from .local_test_evidence import decode_bounded_evidence
+def acquisition_uncited_receipts(
+    parsed: object, acquisition_receipt_ids: Iterable[str]
+) -> int | None:
+    """Uncited receipts of the frozen original coder acquisition, for persistence.
 
-    evidence = (
-        decode_bounded_evidence(evidence_value, restore_classification=True)
-        if evidence_value else None
-    )
-    if evidence is None:
-        return frozenset()
-    return frozenset(row.turn_id or "" for row in evidence.observations)
+    Only an accepted follow-up whose ``test_observations`` were dropped as a
+    non-array carries a count (#1626).  It is computed from the acquisition's
+    own closed catalog before evidence bounding, so a repair turn's receipts
+    never count and an acquisition larger than the bounded evidence cap is
+    never undercounted.  ``None`` means no diagnosis applies.
+    """
+    if not isinstance(parsed, StructuredCoderFollowup):
+        return None
+    if not _non_array_citation_drops(parsed.test_observation_degradations):
+        return None
+    cited = {citation.receipt_id for citation in parsed.test_observations}
+    return len(frozenset(acquisition_receipt_ids) - cited)
 
 
 def durable_citation_diagnosis(
@@ -4419,10 +4421,10 @@ def durable_citation_diagnosis(
     """The newest PR coder record's non-array citation diagnosis (#1626), from records.
 
     The drop and its re-ask come from the record's persisted
-    ``test_observation_degradations``.  A dropped non-array citation list
-    cites nothing, so every parent-observed receipt that record's bounded
-    evidence introduced (rows whose turn the previous coder record did not
-    carry) went uncited.  A live stop and a resumed stop read the same record,
+    ``test_observation_degradations``; the uncited count is the tool-owned
+    ``uncited_acquisition_receipts`` the loop persisted from the frozen
+    original acquisition catalog (``None`` on a historical record, rendered
+    without a number).  A live stop and a resumed stop read the same record,
     so they render the same section.
     """
     coders = sorted(
@@ -4435,25 +4437,15 @@ def durable_citation_diagnosis(
     if not coders:
         return None
     latest = coders[-1].metadata
-    non_array = [
-        record
-        for record in latest.test_observation_degradations
-        if record.outcome == CITATION_DROPPED_OUTCOME
-        and record.rule in TEST_OBSERVATIONS_NOT_ARRAY_RULES
-        and record.element_path == "coder_followup.test_observations"
-    ]
+    non_array = _non_array_citation_drops(latest.test_observation_degradations)
     if not non_array:
         return None
-    earlier = (
-        _evidence_turn_ids(coders[-2].metadata.local_test_evidence)
-        if len(coders) > 1 else frozenset()
-    )
     return FollowupCitationDiagnosis(
         non_array_drop=True,
         repair_attempted=any(
             record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE for record in non_array
         ),
-        uncited_receipts=len(_turn_receipt_ids(latest.local_test_evidence, earlier)),
+        uncited_receipts=latest.uncited_acquisition_receipts,
     )
 
 

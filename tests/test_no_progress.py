@@ -612,8 +612,13 @@ def _degradation(rule):
 
 
 @pytest.mark.parametrize("after_repair", [False, True])
-def test_the_citation_diagnosis_is_read_back_from_the_newest_coder_record(after_repair):
-    """`pr-planning-child-route` (unit): live and resumed stops read the same record."""
+@pytest.mark.parametrize("persisted", [0, 3, None], ids=["zero", "three", "historical"])
+def test_the_citation_diagnosis_is_read_back_from_the_newest_coder_record(after_repair, persisted):
+    """`pr-planning-child-route` (unit): live and resumed stops read the same record.
+
+    The count is the persisted tool-owned value, never inferred from the
+    bounded evidence (which may hold other turns' rows or be evicted).
+    """
     from coding_review_agent_loop.pr_loop_support import durable_citation_diagnosis
     from coding_review_agent_loop.protocol_risk import (
         TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
@@ -624,11 +629,66 @@ def test_the_citation_diagnosis_is_read_back_from_the_newest_coder_record(after_
     earlier = _coder(15, 2, H, local_test_evidence=_bounded(("old-1", "turn-1")))
     latest = _coder(
         25, 3, H, test_observation_degradations=(_degradation(rule),),
-        local_test_evidence=_bounded(("old-1", "turn-1"), ("new-1", "turn-2"), ("new-2", "turn-2")),
+        local_test_evidence=_bounded(("old-1", "turn-1"), ("new-1", "turn-2"), ("repair-1", "turn-3")),
+        uncited_acquisition_receipts=persisted,
     )
     diagnosis = durable_citation_diagnosis([earlier, latest])
     assert diagnosis is not None and diagnosis.non_array_drop
     assert diagnosis.repair_attempted is after_repair
-    assert diagnosis.uncited_receipts == 2  # only the receipts this turn introduced
+    assert diagnosis.uncited_receipts == persisted
+    sentence = np.citation_diagnosis_sentence(diagnosis)
+    if persisted is None:
+        assert "receipts went uncited (count not recorded)" in sentence
+    else:
+        assert f"; {persisted} run-tests receipt(s) from that turn went uncited" in sentence
     assert durable_citation_diagnosis([earlier]) is None
     assert durable_citation_diagnosis([]) is None
+
+
+def _followup_with(observations):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    payload = {
+        "schema_version": 1, "kind": "coder_followup", "state": "blocking", "summary": "Re-ran.",
+        "addressed_items": [], "remaining_items": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "test_observations": observations,
+    }
+    return validate_structured_coder_followup(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        test_observations_mode="degrade-after-repair",
+    )
+
+
+@pytest.mark.parametrize(
+    "catalog,expected",
+    [((), 0), (("a",), 1), (tuple(f"r-{n}" for n in range(40)), 40)],
+    ids=["empty-acquisition", "one", "beyond-evidence-cap"],
+)
+def test_the_persisted_count_comes_from_the_frozen_acquisition_catalog(catalog, expected):
+    """Only the acquisition's own catalog counts: a repair turn's receipt is not in
+    it, and the bounded evidence cap never trims it."""
+    from coding_review_agent_loop.pr_loop_support import acquisition_uncited_receipts
+
+    dropped = _followup_with("pytest passed locally")
+    assert acquisition_uncited_receipts(dropped, catalog) == expected
+    # A well-formed (empty) citation list records no drop, so no count is persisted.
+    assert acquisition_uncited_receipts(_followup_with([]), catalog) is None
+    assert acquisition_uncited_receipts(object(), catalog) is None
+
+
+def test_the_persisted_count_round_trips_and_is_omitted_when_absent():
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata, _encode_round_metadata,
+    )
+
+    with_count = _coder(1, 2, H, uncited_acquisition_receipts=40).metadata
+    without = _coder(1, 2, H).metadata
+    assert _decode_round_metadata(_encode_round_metadata(with_count)).uncited_acquisition_receipts == 40
+    assert _decode_round_metadata(_encode_round_metadata(without)).uncited_acquisition_receipts is None
+    # Historical records encode unchanged: the field is omitted when None.
+    from coding_review_agent_loop.round_transport import decode_mapping
+
+    assert "uncited_acquisition_receipts" not in decode_mapping(_encode_round_metadata(without))
+    assert decode_mapping(_encode_round_metadata(with_count))["uncited_acquisition_receipts"] == 40

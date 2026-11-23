@@ -4851,9 +4851,18 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     assert sum(1 for r in posted if r.metadata.step_back_entries) == 1
 
 
-@pytest.mark.parametrize("with_receipt", [False, True])
+_RECEIPT_SCENARIOS = {
+    "no-receipt": ({}, 0),
+    "one-receipt": ({2: ["receipt-2"]}, 1),
+    # 40 acquisition receipts exceed the 32-row bounded evidence cap; a later
+    # turn's receipt (a different test turn) is not part of the acquisition.
+    "beyond-cap-and-later-turn": ({2: [f"r-{n}" for n in range(40)], 4: ["late"]}, 40),
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_RECEIPT_SCENARIOS))
 def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
-    tmp_path, monkeypatch, with_receipt
+    tmp_path, monkeypatch, scenario
 ):
     """#985, #1182, #1626 via #2097 (`pr-planning-child-route`): the single
     no-progress stop keeps the child-plan supersession route, the receipt
@@ -4887,6 +4896,8 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
     payload, end = json.JSONDecoder().raw_decode(plain)
     non_array = json.dumps({**payload, "test_observations": "pytest passed locally"}) + plain[end:]
     registry = EnvironmentIdentityRegistry()
+    receipts_by_invocation, expected_uncited = _RECEIPT_SCENARIOS[scenario]
+    with_receipt = scenario == "one-receipt"
 
     class _ReceiptRunner(FakeRunner):
         coder_turns = 0
@@ -4896,12 +4907,12 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
                 self.coder_turns += 1
                 turn = f"coder-turn-{self.coder_turns}"
                 self._latest_test_turn_id = turn
-                if with_receipt and self.coder_turns == 2:
+                for receipt_id in receipts_by_invocation.get(self.coder_turns, ()):
                     self._local_test_observations.append(LocalTestObservation(
                         command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
                         outcome="failed", provenance="parent-observed",
                         scope=EvidenceScope("unknown", ()),
-                        receipt_id=f"receipt-{self.coder_turns}", turn_id=turn, cwd=str(tmp_path),
+                        receipt_id=receipt_id, turn_id=turn, cwd=str(tmp_path),
                         normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
                         attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
                         environment_identity=registry.capture({"PATH": "/usr/bin"}),
@@ -4934,7 +4945,7 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
     assert "\n" + route + "\n" in message
     assert (
         "The coder's test_observations were not a JSON array (same-agent re-asks "
-        f"attempted: yes); {1 if with_receipt else 0} run-tests receipt(s) from that turn "
+        f"attempted: yes); {expected_uncited} run-tests receipt(s) from that turn "
         "went uncited"
     ) in message
     if with_receipt:
@@ -4945,8 +4956,20 @@ def test_no_progress_stop_in_a_planning_child_keeps_the_route_and_names_receipts
         ) in message
         # The receipt sentence precedes the route, as the retired stop ordered it.
         assert message.index("unsuperseded failure receipts") < message.index(route)
-    else:
+    elif scenario == "no-receipt":
         assert "Latest coder turn evidence" not in message
+    # The count is persisted from the frozen acquisition catalog, not inferred
+    # from the bounded evidence, so it survives eviction and ignores other turns.
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from coding_review_agent_loop.github import get_pr_review_context
+
+    coder = [
+        r.metadata for r in _extract_round_metadata_records(
+            get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+        ) if r.metadata.role == "coder"
+    ]
+    assert coder[0].uncited_acquisition_receipts is None  # no drop on the first turn
+    assert coder[-1].uncited_acquisition_receipts == expected_uncited
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 3
     # A resumed run stops at round start, before any agent turn, with the same
     # route, receipts and citation diagnosis read back from the durable records.

@@ -465,6 +465,7 @@ from .pr_loop_support import (
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
     render_followup_local_test_evidence,
+    acquisition_uncited_receipts,
     local_test_failure_context as _local_test_failure_context,
     _coder_followup_head_log,
     _coder_followup_review_context,
@@ -9186,6 +9187,9 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
+            # Frozen at the coder acquisition (#1626); a repair launch cannot
+            # repoint it, and evidence bounding never trims it.
+            coder_turn_receipt_ids: frozenset[str] = frozenset()
             _followup_derived_risk_evidence = None
             _validate_coder_followup_response_by_mode = lambda mode, observations_mode, degraded_unacknowledged=False: lambda text, items=tuple(coder_followup_items), human_requirements=coder_requirements, owned_ids=reviewer_owned_requirement_ids, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids, excluded_ids=coder_excluded_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
@@ -9254,6 +9258,12 @@ def run_pr_loop(
                 ))
                 coder_output = coder_response.text
                 coder_session_id = coder_response.session_id
+                coder_turn_receipt_ids = frozenset(
+                    observation.receipt_id
+                    for observation in coder_response.acquisition_test_observations
+                    if isinstance(getattr(observation, "receipt_id", None), str)
+                    and observation.receipt_id
+                )
                 latest_coder_output = coder_output
                 public_comment, coder_render_kwargs = coder_output, None
                 raw_structured_coder_response: str | None = None
@@ -9546,6 +9556,9 @@ def run_pr_loop(
                     scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                     qualification_checkpoint=qualification_checkpoint,
                     followup_dispatch_head=followup_dispatch_head,
+                    uncited_acquisition_receipts=acquisition_uncited_receipts(
+                        coder_response.marker_value, coder_turn_receipt_ids
+                    ),
                     step_back_entries=step_back_entries, **coder_recovery.metadata_fields(),
                     **_test_observation_degradation_fields(coder_response.marker_value),
                     **_architecture_metadata_fields(

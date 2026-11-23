@@ -259,12 +259,16 @@ def citation_diagnosis_sentence(diagnosis: object) -> str:
     """The non-array ``test_observations`` sentence (#1626), or ``""``."""
     if diagnosis is None or not getattr(diagnosis, "non_array_drop", False):
         return ""
+    count = getattr(diagnosis, "uncited_receipts", None)
+    receipts = (
+        f"{int(count)} run-tests receipt(s) from that turn went uncited"
+        if isinstance(count, int) and not isinstance(count, bool)
+        else "that turn's run-tests receipts went uncited (count not recorded)"
+    )
     return (
         "The coder's test_observations were not a JSON array (same-agent re-asks "
         f"attempted: {'yes' if getattr(diagnosis, 'repair_attempted', False) else 'no'}); "
-        f"{int(getattr(diagnosis, 'uncited_receipts', 0) or 0)} run-tests receipt(s) from "
-        "that turn went uncited, so the blocker may be a tool format problem rather than a "
-        "code defect."
+        f"{receipts}, so the blocker may be a tool format problem rather than a code defect."
     )
 
 
