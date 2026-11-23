@@ -891,9 +891,9 @@ def test_accumulated_advisory_list_overflows_into_lossless_sidecars(tmp_path, mo
     assert sorted(i.text for i in _evidence_items(freeze.metadata.prior_items)) == expected
 
 
-@pytest.mark.parametrize("sidecars", ["present", "missing"])
-def test_spilled_human_checks_hydrate_or_decode_empty_when_a_sidecar_is_lost(sidecars):
-    """Item-6: the spilled list hydrates losslessly; a lost sidecar never fails the record."""
+@pytest.mark.parametrize("sidecars", ["present", "missing", "corrupt"])
+def test_spilled_human_checks_hydrate_or_fail_closed_when_a_sidecar_is_unavailable(sidecars):
+    """Items 6 and 7: the spilled list hydrates losslessly; an unavailable sidecar fails the record."""
     from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
     from coding_review_agent_loop.round_state import _decode_round_metadata_records
     from coding_review_agent_loop.round_transport import attachment_keys, prepare_round_comment
@@ -910,6 +910,91 @@ def test_spilled_human_checks_hydrate_or_decode_empty_when_a_sidecar_is_lost(sid
     bodies = [str(part) for part in prepare_round_comment(body)]
     assert any(key[1] == "human_checks" for b in bodies for key in attachment_keys(b))
     anchor = next(b for b in bodies if "AGENT_LOOP_META" in b)
-    kept = bodies if sidecars == "present" else [anchor]
-    [record] = _decode_round_metadata_records([SimpleNamespace(body=b) for b in kept], flow=HUMAN_CHECKS_FLOW)
-    assert record.metadata.human_checks == (tuple(checks) if sidecars == "present" else ())
+    kept = {"present": bodies, "missing": [anchor], "corrupt": [_corrupt_sidecar(b) for b in bodies]}[sidecars]
+    if sidecars == "present":
+        [record] = _decode_round_metadata_records([SimpleNamespace(body=b) for b in kept], flow=HUMAN_CHECKS_FLOW)
+        assert record.metadata.human_checks == tuple(checks)
+    else:
+        with pytest.raises(AgentLoopError, match="Incomplete round metadata: human_checks"):
+            _decode_round_metadata_records([SimpleNamespace(body=b) for b in kept], flow=HUMAN_CHECKS_FLOW)
+
+
+def _corrupt_sidecar(body):
+    """Flip the payload of every human_checks transport attachment in ``body``."""
+    import base64
+    import json as _json
+    from coding_review_agent_loop.round_transport import ROUND_TRANSPORT_SIDECAR_RE
+
+    def flip(match):
+        raw = match.group("payload")
+        pad = "=" * (-len(raw) % 4)
+        item = _json.loads(base64.urlsafe_b64decode(raw + pad).decode())
+        if item.get("field") != "human_checks":
+            return match.group(0)
+        item["data"] = item["data"][::-1]
+        encoded = base64.urlsafe_b64encode(_json.dumps(item).encode()).decode()
+        return match.group(0).replace(raw, encoded)
+
+    return ROUND_TRANSPORT_SIDECAR_RE.sub(flip, body)
+
+
+class _StopAfterRelease(Exception):
+    pass
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_release_boundary_with_unavailable_list_sidecar_fails_closed_without_losing_checks(
+    tmp_path, monkeypatch, damage
+):
+    """Item-7: a lost or corrupt list sidecar on the advisory-mode release never reads as empty."""
+    import hashlib
+    from coding_review_agent_loop import round_transport
+
+    texts = [f"Check {n} " + hashlib.sha256(str(n).encode()).hexdigest() for n in range(40)]
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=texts)])
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, pr_human_evidence="freeze"))
+
+    # Advisory migration, interrupted right after the release record is posted.
+    real_post = pr_loop_support.post_pr_comment
+
+    def post_then_stop(*args, **kwargs):
+        real_post(*args, **kwargs)
+        if "freeze released (advisory mode)" in str(kwargs.get("body", "")):
+            raise _StopAfterRelease()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pr_loop_support, "post_pr_comment", post_then_stop)
+        # A smaller comment budget forces the release record's list into sidecars
+        # without inflating the fixture (the technique test_round_transport uses).
+        patch.setattr(round_transport, "MAX_GITHUB_BODY_CHARS", 4_000)
+        patch.setattr(round_transport, "_PART_CHARS", 2_500)
+        with pytest.raises(_StopAfterRelease):
+            run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True))
+    [release] = _release_records(runner)
+    assert release.metadata.evidence_release.reason == "advisory-mode"
+    assert not _evidence_items(release.metadata.prior_items)
+    comments = runner.pr_payload["comments"]
+    carriers = [i for i, c in enumerate(comments)
+                if any(k[1] == "human_checks" for k in round_transport.attachment_keys(c["body"]))]
+    assert carriers, "the release record's list must use sidecar transport"
+    saved = {i: comments[i]["body"] for i in carriers}
+    if damage == "missing":
+        runner.pr_payload["comments"] = [c for i, c in enumerate(comments) if i not in carriers]
+    else:
+        for i in carriers:
+            comments[i]["body"] = _corrupt_sidecar(comments[i]["body"])
+
+    with pytest.raises(AgentLoopError, match="human_checks"):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True))
+    assert _merge_calls(runner) == [] and _check_comments(runner) == []
+
+    # Restoring the transport recovers every check; still no merge.
+    if damage == "missing":
+        runner.pr_payload["comments"] = comments
+    for i, body in saved.items():
+        comments[i]["body"] = body
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True)) == 0
+    [record] = _check_records(runner)
+    assert sorted(HumanCheck.from_mapping(e).text for e in record.metadata.human_checks) == sorted(texts)
+    assert _merge_calls(runner) == []

@@ -630,8 +630,9 @@ or finalization. `advisory` moves each removed item onto a deduplicated
 "Human checks requested" list and `off` drops it with a log line. The list is
 stamped, through a context-variable stamp at the single round-metadata encoder,
 on every orchestrator PR record while it is non-empty (`human_checks`; omitted
-when empty, decoded leniently; a spillable round-transport field, so a
-large list moves to sidecars and a lost sidecar decodes as an empty list). It is also written on the human-checks comment,
+when empty; malformed individual entries are dropped; a spillable
+round-transport field, so a large list moves to sidecars, and a missing or
+corrupt sidecar fails the record closed instead of reading as an empty list). It is also written on the human-checks comment,
 whose record uses its own flow so PR round reconstruction never reads it. Each
 entry keeps the complete removed item, so a later `freeze` resume restores the
 original typed obligation (converted-row identity, owners and owner states)

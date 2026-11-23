@@ -149,7 +149,9 @@ def test_malformed_human_checks_entries_are_dropped_without_failing_the_record()
     good = _check(_native()).as_dict()
     bad = [{"reviewer": "Codex"}, "text", {**good, "kind": "other"}, {**good, "origin_item": 3}]
     assert decode_human_check_entries([good, *bad]) == (good,)
-    assert decode_human_check_entries("nope") == ()
+    for unavailable in ("nope", None, {"$round_transport_spill": "anchor"}):
+        with pytest.raises(ValueError):
+            decode_human_check_entries(unavailable)
 
 
 def test_stamp_applies_only_to_orchestrator_pr_records_while_advisory_list_is_non_empty(tmp_path):

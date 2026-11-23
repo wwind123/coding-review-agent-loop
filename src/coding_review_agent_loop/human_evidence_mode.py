@@ -99,14 +99,18 @@ class HumanCheck:
 
 
 def decode_human_check_entries(value: object) -> tuple[dict, ...]:
-    """Lenient decode of a persisted ``human_checks`` list.
+    """Decode a persisted ``human_checks`` list.
 
     Valid entries are kept verbatim (so a re-encode is byte-stable); malformed
-    entries are dropped and logged without failing the record.
+    individual entries are dropped and logged without failing the record.  An
+    unavailable list is never read as an authoritative empty one: an
+    unhydrated transport reference or a non-list value fails the record, as a
+    missing or corrupt sidecar already does in the round decoder.
     """
+    if isinstance(value, Mapping) and "$round_transport_spill" in value:
+        raise ValueError("human_checks spill reference must be hydrated first")
     if not isinstance(value, list):
-        _logger.warning("Ignoring a malformed human_checks field on a persisted round record")
-        return ()
+        raise ValueError("human_checks must be a list")
     kept = tuple(dict(entry) for entry in value if HumanCheck.from_mapping(entry) is not None)
     if len(kept) != len(value):
         _logger.warning(
