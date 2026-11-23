@@ -509,6 +509,40 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "site."
         ),
     ),
+    "_expect_known_keys_lenient": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Generic shape helper; the consequence is classified at each caller's annotated "
+            "site."
+        ),
+    ),
+    "_apply_key_renames": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Generic shape helper; the consequence is classified at each caller's annotated "
+            "site."
+        ),
+    ),
+    "_live_human_requirements": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "Fatal sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim."
+        ),
+    ),
+    "filter_surfaced_requirement_dispositions": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "Fatal sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim."
+        ),
+    ),
     "_expect_execution_allocation": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),

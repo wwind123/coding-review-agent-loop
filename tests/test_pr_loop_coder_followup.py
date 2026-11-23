@@ -665,11 +665,15 @@ def _legacy_rejection_writer(monkeypatch):
 
 
 def _unknown_id_and_citation_followup():
-    """Unknown item ID plus a citation that selects no passing receipt (#2086)."""
+    """Unknown item ID plus a citation that selects no passing receipt (#2086).
+
+    An unknown ID alone is dropped live since #2114, so a live-target
+    ``tests_run`` entry supplies the rejection that reaches the degraded path.
+    """
     payload = json.loads(
         structured_coder_followup(
             summary="Added the test.", addressed_items=["item-1", "item-99"],
-            tests_run=["pytest tests/test_foo.py"], reviewer="OpenAI Codex",
+            tests_run=["pytest tests/test_foo.py https://live.example"], reviewer="OpenAI Codex",
         ).split("\n", 1)[0]
     )
     payload["test_observations"] = [
@@ -761,7 +765,7 @@ def test_unchanged_head_rejection_posts_no_coder_record_and_surfaces_the_error(t
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
-    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-99"):
+    with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert runner.pr_payload["headRefOid"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
@@ -861,7 +865,7 @@ def test_degraded_record_post_failure_surfaces_the_original_error(tmp_path, caps
     runner.run = failing_run
     config = make_config(tmp_path, coder="codex", reviewer="claude", quiet=False)
 
-    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs") as raised:
+    with pytest.raises(AgentLoopError, match="live remote target") as raised:
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert "GitHub write failed" in str(raised.value.__cause__)

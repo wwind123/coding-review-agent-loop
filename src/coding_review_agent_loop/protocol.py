@@ -47,6 +47,10 @@ from .protocol_common import (
     _consume_structured_footer_and_signature,
     _expect_bool,
     _expect_exact_keys,
+    _expect_known_keys_lenient,
+    _apply_key_renames,
+    NOTE_KEY_RENAMES,
+    RENAME_CONFLICT,
     _expect_int,
     _expect_int_like,
     _expect_non_empty_string,
@@ -469,6 +473,9 @@ class ParsedPlanReview:
     # Parser-derived (#2100): well-formed disposition IDs outside the live
     # carried set, dropped before parsing.  Never part of any payload encoding.
     ignored_prior_disposition_ids: tuple[str, ...] = field(default=(), compare=False)
+    # Parser-derived (#2114): PR-only disposition fields dropped from a plan
+    # review, such as ``sub_item_dispositions``.
+    disposition_degradations: tuple[ParseDegradation, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -957,6 +964,9 @@ class StructuredCoderFollowup:
     # history proves were already resolved, dropped by validation (#1388).
     dropped_resolved_addressed_items: tuple[str, ...] = ()
     dropped_excluded_items: tuple[str, ...] = ()
+    # Orchestrator-derived, never parsed: listed IDs outside the live ledger
+    # and not provably resolved, dropped with their claims (#2114).
+    dropped_unknown_items: tuple[str, ...] = ()
     # Parser-derived, never parsed from a key: the item-list buckets that named
     # the tool-owned acknowledgement record, which was stripped (#2026).
     dropped_ack_item_buckets: tuple[str, ...] = ()
@@ -1674,6 +1684,7 @@ def validate_structured_human_requirements_acknowledgement(
     acknowledgement raise, so the record says "not acknowledged" instead of
     fabricating the acknowledgement.
     """
+    derived = dispositions is not None
     if not surfaced_requirement_ids and not requires_direct_discussion_ack:
         if addressed_ids:
             _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
@@ -1681,16 +1692,23 @@ def validate_structured_human_requirements_acknowledgement(
                 reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
                 context="Coder response human_requirements.addressed_ids",
             )
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-                "Coder response listed signed human requirement IDs even though no signed human "
-                "requirements were surfaced. Use `human_requirements.addressed_ids: []`; issue "
-                "acceptance criteria, reviewer item IDs, reviewer comments, and arbitrary labels "
-                "are not signed human requirements."
+            if not derived:
+                raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                    "Coder response listed signed human requirement IDs even though no signed human "
+                    "requirements were surfaced. Use `human_requirements.addressed_ids: []`; issue "
+                    "acceptance criteria, reviewer item IDs, reviewer comments, and arbitrary labels "
+                    "are not signed human requirements."
+                )
+            # Derived from the (empty) surfaced dispositions instead (#2114).
+            _logger.warning(
+                "human_requirements.addressed_ids: ignored %d label(s); no signed human requirements are surfaced",
+                len(addressed_ids),
             )
         if checked_discussion_directly:
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-                "Coder response must set `human_requirements.checked_discussion_directly` to false "
-                "when no signed human requirements are surfaced and direct discussion acknowledgement is not required."
+            # A surplus acknowledgement asserts nothing that is required (#2114).
+            _logger.warning(
+                "human_requirements.checked_discussion_directly: ignored a surplus `true`; "
+                "direct discussion acknowledgement is not required"
             )
         return
 
@@ -1715,10 +1733,11 @@ def validate_structured_human_requirements_acknowledgement(
         }
     )
     if duplicates:
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            "Coder response listed signed human requirement IDs more than once: "
-            + ", ".join(duplicates)
+        # A repeated label asserts nothing new (#2114).
+        _logger.warning(
+            "human_requirements.addressed_ids: collapsed repeated label(s) %s", ", ".join(duplicates)
         )
+        normalized_addressed_ids = list(dict.fromkeys(normalized_addressed_ids))
 
     expected_ids = tuple(_normalize_requirement_label(item_id) for item_id in surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
     unknown = sorted(set(normalized_addressed_ids) - set(expected_ids))
@@ -1728,35 +1747,32 @@ def validate_structured_human_requirements_acknowledgement(
             reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
             context="Coder response human_requirements.addressed_ids",
         )
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            "Coder response referenced unknown signed human requirement IDs: "
-            + ", ".join(unknown)
-        )
+        if not derived:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                "Coder response referenced unknown signed human requirement IDs: "
+                + ", ".join(unknown)
+            )
 
     if expected_ids:
         if dispositions is None:
-            expected_addressed_ids = set(expected_ids)
-            missing_message = "Coder response did not address all surfaced signed human requirement IDs: "
-        else:
-            expected_addressed_ids = {
-                _normalize_requirement_label(item.requirement_id)  # shape-check: fatal:no-conservative-reading
-                for item in dispositions
-                if item.disposition == "addressed"
-            }
-            missing_message = (
-                "Coder response human_requirements.addressed_ids must contain every requirement "
-                "with an `addressed` disposition: "
-            )
-        actual_addressed_ids = set(normalized_addressed_ids)
-        missing = sorted(expected_addressed_ids - actual_addressed_ids)
-        unexpected = sorted(actual_addressed_ids - expected_addressed_ids)
-        if missing:
-            raise AgentLoopError(missing_message + ", ".join(missing))  # shape-check: fatal:no-conservative-reading
-        if unexpected:
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-                "Coder response human_requirements.addressed_ids may contain only requirements "
-                "with an `addressed` disposition: "
-                + ", ".join(unexpected)
+            missing = sorted(set(expected_ids) - set(normalized_addressed_ids))
+            if missing:
+                raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                    "Coder response did not address all surfaced signed human requirement IDs: "
+                    + ", ".join(missing)
+                )
+            return
+        # With dispositions present, addressed_ids is derivable from the
+        # surfaced `addressed` dispositions; a differing list is replaced by
+        # that derived set rather than rejected (#2114).
+        derived_ids = {
+            _normalize_requirement_label(item.requirement_id)  # shape-check: fatal:no-conservative-reading
+            for item in dispositions
+            if item.disposition == "addressed"
+        } & set(expected_ids)
+        if derived_ids != set(normalized_addressed_ids):
+            _logger.warning(
+                "human_requirements.addressed_ids: replaced by the IDs derived from `addressed` dispositions"
             )
         return
 
@@ -2014,7 +2030,14 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     if not isinstance(raw, dict):
         raise AgentLoopError(f"{item_context} must be a string or a finding object.")  # shape-check: fatal:no-conservative-reading
     raw = _normalize_plan_review_finding_key_aliases(raw, item_context=item_context)
-    text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
+    scope = raw.get("fix_scope")
+    if isinstance(scope, str) or (
+        isinstance(scope, list) and scope and all(isinstance(entry, str) for entry in scope)
+    ):
+        # PR scheduler metadata on a plan finding carries no plan meaning (#2114).
+        raw = {key: entry for key, entry in raw.items() if key != "fix_scope"}
+        _logger.warning("%s: dropped PR-only finding field fix_scope", item_context)
+    text_fields ={name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
     reference_fields = {name for name, _label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
     # ``provenance`` (#1505) is read separately by the parser and never folded
     # into the finding text.
@@ -2681,7 +2704,7 @@ def _expect_execution_recommendation(
     for index, raw_stage in enumerate(child_payload):
         item_context = f"{context}.child_stages[{index}]"
         item = _expect_object(raw_stage, context=item_context)  # shape-check: fatal:no-conservative-reading
-        _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+        item = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
             item,
             context=item_context,
             required={
@@ -2942,7 +2965,9 @@ def _expect_item_note_map(
     for raw_item_id, raw_note in note_payload.items():
         item_id = _expect_item_id(raw_item_id, context=f"{context} key")  # shape-check: fatal:no-conservative-reading
         if item_id not in allowed_item_ids:
-            raise AgentLoopError(f"{context} key `{item_id}` is not listed in {allowed_context}.")  # shape-check: fatal:no-conservative-reading
+            # A note for an unlisted ID claims nothing (#2114).
+            _logger.warning("%s: dropped note keyed to `%s`, which is not listed in %s", context, item_id, allowed_context)
+            continue
         rendered[item_id] = _expect_non_empty_string(raw_note, context=f"{context}.{item_id}")  # shape-check: fatal:no-conservative-reading
     return rendered
 
@@ -2990,7 +3015,7 @@ def _expect_human_requirement_dispositions(
                         alias,
                         canonical,
                     )
-        _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+        payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
             payload,
             context=item_context,
             required={"requirement_id", "disposition", "evidence"},
@@ -3011,8 +3036,101 @@ def _expect_human_requirement_dispositions(
         evidence = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
             payload["evidence"], context=f"{item_context}.evidence"
         )
-        result.append(HumanRequirementDisposition(requirement_id, disposition, evidence))
+        entry = HumanRequirementDisposition(requirement_id, disposition, evidence)
+        if entry in result:
+            # A byte-identical repeat asserts nothing new (#2114); a
+            # conflicting repeat is still rejected by the validators.
+            _logger.warning("%s: collapsed a duplicate of requirement %s", item_context, requirement_id)
+            continue
+        result.append(entry)
     return tuple(result)
+
+
+def filter_surfaced_requirement_dispositions(
+    dispositions: Sequence[HumanRequirementDisposition],
+    *,
+    surfaced_requirement_ids: Sequence[str],
+    reviewer_owned_requirement_ids: Sequence[str] = (),
+    context: str = "human_requirement_dispositions",
+) -> tuple[HumanRequirementDisposition, ...]:
+    """Drop dispositions for unsurfaced requirement IDs with a warning (#2114).
+
+    Legacy positional labels, reviewer-owned IDs (#2020) and conflicting
+    duplicates still reject; byte-identical duplicates collapse.  Runs before
+    any disposition-dependent decision, so an unsurfaced ``blocked`` entry can
+    never block an approval or make a terminal conflict.
+    """
+    expected = {_normalize_requirement_label(item) for item in surfaced_requirement_ids}  # shape-check: fatal:no-conservative-reading
+    actual = [item.requirement_id for item in dispositions]
+    _reject_legacy_requirement_labels(actual, surfaced_requirement_ids=surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
+    unique: list[HumanRequirementDisposition] = []
+    for item in dispositions:
+        if item not in unique:
+            unique.append(item)
+    ids = [item.requirement_id for item in unique]
+    conflicting = sorted({item for item in ids if ids.count(item) > 1})
+    if conflicting:
+        raise AgentLoopError(f"{context} contains duplicate requirement ID(s): {', '.join(conflicting)}")  # shape-check: fatal:no-conservative-reading
+    unknown = sorted(set(ids) - expected)
+    if unknown:
+        _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
+            unknown,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            context=context,
+        )
+        _logger.warning(
+            "%s: dropped disposition(s) for unsurfaced requirement ID(s) %s", context, ", ".join(unknown)
+        )
+    return tuple(item for item in unique if item.requirement_id in expected)
+
+
+def _live_human_requirements(
+    payload: Mapping[str, object],
+    dispositions: tuple[HumanRequirementDisposition, ...],
+    *,
+    context: str,
+    surfaced_requirement_ids: Sequence[str] | None,
+    reviewer_owned_requirement_ids: Sequence[str],
+) -> tuple[tuple[HumanRequirementDisposition, ...], StructuredHumanRequirementsPayload]:
+    """Read the acknowledgement, applying live #2114 relaxations when surfaced.
+
+    Without a surfaced set (historical decode) the submitted values are kept
+    verbatim.  With one, unsurfaced dispositions are dropped before any
+    disposition-dependent decision, and ``addressed_ids`` becomes the set
+    derived from the kept ``addressed`` dispositions; legacy and reviewer-owned
+    labels in the submitted list still reject.
+    """
+    addressed_ids = _expect_requirement_id_list(  # shape-check: fatal:no-conservative-reading
+        payload["addressed_ids"], context=f"{context}.human_requirements.addressed_ids"
+    )
+    checked = _expect_bool(  # shape-check: fatal:no-conservative-reading
+        payload["checked_discussion_directly"],
+        context=f"{context}.human_requirements.checked_discussion_directly",
+    )
+    if surfaced_requirement_ids is not None:
+        dispositions = filter_surfaced_requirement_dispositions(  # shape-check: fatal:no-conservative-reading
+            dispositions,
+            surfaced_requirement_ids=surfaced_requirement_ids,
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            context=f"{context}.human_requirement_dispositions",
+        )
+        _reject_legacy_requirement_labels(addressed_ids, surfaced_requirement_ids=surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
+        expected = {_normalize_requirement_label(item) for item in surfaced_requirement_ids}  # shape-check: fatal:no-conservative-reading
+        _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
+            sorted(set(addressed_ids) - expected),
+            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+            context=f"{context}.human_requirements.addressed_ids",
+        )
+        derived = tuple(item.requirement_id for item in dispositions if item.disposition == "addressed")
+        if derived != addressed_ids:
+            _logger.warning(
+                "%s.human_requirements.addressed_ids: replaced by the IDs derived from `addressed` dispositions",
+                context,
+            )
+        addressed_ids = derived
+    return dispositions, StructuredHumanRequirementsPayload(
+        addressed_ids=addressed_ids, checked_discussion_directly=checked
+    )
 
 
 def validate_human_requirement_dispositions(
@@ -3021,28 +3139,23 @@ def validate_human_requirement_dispositions(
     surfaced_requirement_ids: Sequence[str],
     context: str = "human_requirement_dispositions",
     reviewer_owned_requirement_ids: Sequence[str] = (),
-) -> None:
+) -> tuple[HumanRequirementDisposition, ...]:
+    """Validate coverage of the surfaced set and return the kept dispositions.
+
+    Unsurfaced IDs are dropped with a warning (#2114); a known signed ID routed
+    to reviewer-owned evidence still rejects as outside coder scope (#2020).
+    """
+    kept = filter_surfaced_requirement_dispositions(  # shape-check: fatal:no-conservative-reading
+        dispositions,
+        surfaced_requirement_ids=surfaced_requirement_ids,
+        reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+        context=context,
+    )
     expected = tuple(_normalize_requirement_label(item) for item in surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
-    actual = [item.requirement_id for item in dispositions]
-    _reject_legacy_requirement_labels(actual, surfaced_requirement_ids=surfaced_requirement_ids)  # shape-check: fatal:no-conservative-reading
-    duplicates = sorted({item for item in actual if actual.count(item) > 1})
-    if duplicates:
-        raise AgentLoopError(f"{context} contains duplicate requirement ID(s): {', '.join(duplicates)}")  # shape-check: fatal:no-conservative-reading
-    unknown = sorted(set(actual) - set(expected))
-    if unknown:
-        # A known signed ID routed to reviewer-owned evidence is not "unknown"
-        # (#2020); name it as outside coder scope, even when nothing is surfaced.
-        _reject_reviewer_owned_labels(  # shape-check: fatal:no-conservative-reading
-            unknown,
-            reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
-            context=context,
-        )
-        raise AgentLoopError(f"{context} contains unknown requirement ID(s): {', '.join(unknown)}")  # shape-check: fatal:no-conservative-reading
-    missing = sorted(set(expected) - set(actual))
+    missing = sorted(set(expected) - {item.requirement_id for item in kept})
     if missing:
         raise AgentLoopError(f"{context} is missing requirement ID(s): {', '.join(missing)}")  # shape-check: fatal:no-conservative-reading
-    if not expected and actual:
-        raise AgentLoopError(f"{context} must be empty when no signed human requirements are surfaced.")  # shape-check: fatal:no-conservative-reading
+    return kept
 
 
 def _consume_agent_unavailable_footer_and_signature(
@@ -3228,11 +3341,26 @@ def _parse_review_item_disposition_payload(
     degradations: list[ParseDegradation] | None = None,
 ) -> ReviewItemDisposition:
     payload = _expect_object(value, context=field_name)  # shape-check: fatal:no-conservative-reading
-    _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+    if is_plan_review and "sub_item_dispositions" in payload:
+        # Plan reviews have no sub-item equivalent; the parent disposition
+        # stays authoritative (#2114).
+        payload = {key: entry for key, entry in payload.items() if key != "sub_item_dispositions"}
+        _logger.warning("%s: dropped PR-only field sub_item_dispositions from a plan-review disposition", field_name)
+        if degradations is not None:
+            degradations.append(
+                ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                    element_path=f"{field_name}.sub_item_dispositions",
+                    rule="sub_item_dispositions-not-supported-in-plan-review",
+                    observed=value.get("sub_item_dispositions") if isinstance(value, dict) else None,
+                    outcome="claim-dropped",
+                )
+            )
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
         payload,
         context=field_name,
         required={"item_id", "disposition"},
         optional={"note"} if is_plan_review else {"note", "sub_item_dispositions", "evidence_requirement_ids"},
+        renames=NOTE_KEY_RENAMES,
     )
     item_id = _expect_item_id(payload["item_id"], context=f"{field_name}.item_id")  # shape-check: fatal:no-conservative-reading
     allowed_statuses = {"resolved", "blocking", allowed_same_status, "future"}
@@ -3326,8 +3454,9 @@ def _expect_disposition_list(
 ) -> tuple[ReviewItemDisposition, ...]:
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:no-conservative-reading
-    return tuple(
-        _parse_review_item_disposition_payload(  # shape-check: fatal:no-conservative-reading
+    parsed: list[ReviewItemDisposition] = []
+    for index, item in enumerate(value):
+        entry = _parse_review_item_disposition_payload(  # shape-check: fatal:no-conservative-reading
             item,
             field_name=f"{context}[{index}]",
             reviewer=reviewer,
@@ -3335,8 +3464,14 @@ def _expect_disposition_list(
             is_plan_review=is_plan_review,
             degradations=degradations,
         )
-        for index, item in enumerate(value)
-    )
+        if entry in parsed:
+            # Equal on every parsed field, including evidence citations: a
+            # repeat asserts nothing new (#2114).  Any difference still
+            # reaches the duplicate-ID rejection downstream.
+            _logger.warning("%s[%d]: collapsed a duplicate disposition for %s", context, index, entry.item_id)
+            continue
+        parsed.append(entry)
+    return tuple(parsed)
 
 
 def _check_architecture_status_mode(mode: str) -> str:
@@ -3500,6 +3635,11 @@ def _dedupe_pr_review_items(
 
 
 HUMAN_REQUIREMENT_DISPOSITIONS_FIELD = "human_requirement_dispositions"
+# PR-review finding keys a plan reviewer may copy; renamed, never dropped (#2114).
+PLAN_REVIEW_FINDING_KEY_RENAMES: tuple[tuple[str, str, str], ...] = (
+    ("blocking_items", "blocking_plan_issues", RENAME_CONFLICT),
+    ("same_pr_followups", "same_plan_followups", RENAME_CONFLICT),
+)
 PR_REVIEW_DISPOSITIONS_DROP_MESSAGE = (
     "pr_review: dropped coder-only field `human_requirement_dispositions` before validation"
 )
@@ -3532,7 +3672,7 @@ def parse_structured_pr_review(
         # A coder-only field a reviewer copied from shared context (#2026).
         payload = {k: v for k, v in payload.items() if k != HUMAN_REQUIREMENT_DISPOSITIONS_FIELD}
         _logger.warning(PR_REVIEW_DISPOSITIONS_DROP_MESSAGE)
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="pr_review",
         required={
@@ -3702,11 +3842,15 @@ def parse_structured_plan_review(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "plan_review":
         raise AgentLoopError("Structured response kind mismatch: expected `plan_review`.")  # shape-check: fatal:unparseable-envelope
+    # Cross-kind finding keys keep their findings (#2114); both present rejects.
+    payload = _apply_key_renames(  # shape-check: fatal:no-conservative-reading
+        payload, context="plan_review", renames=PLAN_REVIEW_FINDING_KEY_RENAMES,
+    )
     payload = _normalize_review_finding_shapes(
         payload, ("blocking_plan_issues", "same_plan_followups", "future_followups"),
         context="plan_review", pr_findings=False,
     )
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="plan_review",
         required={
@@ -3740,12 +3884,14 @@ def parse_structured_plan_review(
     raw_dispositions, ignored_ids = _partition_live_dispositions(
         payload["prior_plan_item_dispositions"], carried_item_ids
     )
+    disposition_degradations: list[ParseDegradation] = []
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
         raw_dispositions,
         context="plan_review.prior_plan_item_dispositions",
         reviewer=reviewer,
         allowed_same_status="same-plan",
         is_plan_review=True,
+        degradations=disposition_degradations,
     )
     human_requirement_dispositions = _expect_human_requirement_dispositions(  # shape-check: fatal:no-conservative-reading
         payload.get("human_requirement_dispositions", []),
@@ -3800,6 +3946,8 @@ def parse_structured_plan_review(
         )
     if ignored_ids:
         parsed = dataclasses.replace(parsed, ignored_prior_disposition_ids=ignored_ids)
+    if disposition_degradations:
+        parsed = dataclasses.replace(parsed, disposition_degradations=tuple(disposition_degradations))
     return parsed
 
 
@@ -3815,6 +3963,9 @@ def validate_structured_coder_followup(
     architecture_status_mode: str = "strict",
     expected_sub_item_ids: Mapping[str, Sequence[str]] | None = None,
     test_observations_mode: str = "degrade",
+    surfaced_requirement_ids: Sequence[str] | None = None,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
+    historical_decode: bool = False,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -3837,7 +3988,7 @@ def validate_structured_coder_followup(
     }
     if allow_historical_canonical_evidence:
         optional_fields.add("risk_test_matrix_evidence")
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="coder_followup",
         required={
@@ -3860,7 +4011,7 @@ def validate_structured_coder_followup(
         payload["human_requirement_dispositions"],
         context="coder_followup.human_requirement_dispositions",
     )
-    _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+    human_requirements_payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
         human_requirements_payload,
         context="coder_followup.human_requirements",
         required={"addressed_ids", "checked_discussion_directly"},
@@ -3927,6 +4078,16 @@ def validate_structured_coder_followup(
         payload.get("disputed_items", []),
         context="coder_followup.disputed_items",
     )
+    # A repeat within one bucket asserts nothing new (#2114); the same ID in
+    # two buckets is still a conflict below.
+    addressed_items, remaining_items, disputed_items = (
+        _collapse_repeated_item_ids(ids, context=f"coder_followup.{name}")
+        for name, ids in (
+            ("addressed_items", addressed_items),
+            ("remaining_items", remaining_items),
+            ("disputed_items", disputed_items),
+        )
+    )
     # The acknowledgement record is tool-owned: strip any placement of it
     # before every list, note, evidence and duplicate check (#2026).
     buckets = (
@@ -3980,12 +4141,24 @@ def validate_structured_coder_followup(
         skip_parent_ids=frozenset({HUMAN_REQUIREMENTS_ACK_ITEM_ID}),
     )
     state = _expect_state(payload["state"], context="coder_followup.state")  # shape-check: fatal:no-conservative-reading
+    human_requirement_dispositions, human_requirements = _live_human_requirements(  # shape-check: fatal:no-conservative-reading
+        human_requirements_payload,
+        human_requirement_dispositions,
+        context="coder_followup",
+        surfaced_requirement_ids=surfaced_requirement_ids,
+        reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
+    )
     if state == "approved" and any(
         item.disposition == "blocked" for item in human_requirement_dispositions
     ):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            "coder_followup.state must be `blocking` when a signed human requirement is blocked."
-        )
+        if historical_decode and surfaced_requirement_ids is None:
+            # Already accepted live against its surfaced set; a context-free
+            # reader never re-applies this context-dependent check (#2114).
+            _logger.warning("coder_followup.state: historical decode kept an approved state beside a blocked disposition")
+        else:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                "coder_followup.state must be `blocking` when a signed human requirement is blocked."
+            )
     return StructuredCoderFollowup(
         schema_version=1,
         kind="coder_followup",
@@ -3993,16 +4166,7 @@ def validate_structured_coder_followup(
         summary=_expect_non_empty_string(payload["summary"], context="coder_followup.summary"),  # shape-check: fatal:no-conservative-reading
         addressed_items=addressed_items,
         remaining_items=remaining_items,
-        human_requirements=StructuredHumanRequirementsPayload(
-            addressed_ids=_expect_requirement_id_list(  # shape-check: fatal:no-conservative-reading
-                human_requirements_payload["addressed_ids"],
-                context="coder_followup.human_requirements.addressed_ids",
-            ),
-            checked_discussion_directly=_expect_bool(  # shape-check: fatal:no-conservative-reading
-                human_requirements_payload["checked_discussion_directly"],
-                context="coder_followup.human_requirements.checked_discussion_directly",
-            ),
-        ),
+        human_requirements=human_requirements,
         human_requirement_dispositions=human_requirement_dispositions,
         addressed_item_notes=addressed_item_notes,
         remaining_item_notes=remaining_item_notes,
@@ -4021,6 +4185,14 @@ def validate_structured_coder_followup(
         sub_item_claim_degradations=sub_item_claim_degradations,
         dropped_ack_item_buckets=dropped_ack_item_buckets,
     )
+
+
+def _collapse_repeated_item_ids(ids: tuple[str, ...], *, context: str) -> tuple[str, ...]:
+    unique = tuple(dict.fromkeys(ids))
+    if len(unique) != len(ids):
+        repeated = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+        _logger.warning("%s: collapsed repeated item ID(s) %s", context, ", ".join(repeated))
+    return unique
 
 
 def _without_ack_item_key(value: object) -> object:
@@ -4110,6 +4282,9 @@ def validate_structured_issue_implementation(
     allow_historical_canonical_evidence: bool = False,
     architecture_status_mode: str = "strict",
     test_observations_mode: str = "degrade",
+    surfaced_requirement_ids: Sequence[str] | None = None,
+    reviewer_owned_requirement_ids: Sequence[str] = (),
+    historical_decode: bool = False,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -4132,7 +4307,7 @@ def validate_structured_issue_implementation(
     }
     if allow_historical_canonical_evidence:
         optional_fields.add("risk_test_matrix_evidence")
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="issue_implementation",
         required={
@@ -4167,7 +4342,7 @@ def validate_structured_issue_implementation(
     human_payload = _expect_object(  # shape-check: fatal:no-conservative-reading
         payload["human_requirements"], context="issue_implementation.human_requirements"
     )
-    _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+    human_payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
         human_payload,
         context="issue_implementation.human_requirements",
         required={"addressed_ids", "checked_discussion_directly"},
@@ -4175,6 +4350,13 @@ def validate_structured_issue_implementation(
     dispositions = _expect_human_requirement_dispositions(  # shape-check: fatal:no-conservative-reading
         payload["human_requirement_dispositions"],
         context="issue_implementation.human_requirement_dispositions",
+    )
+    dispositions, human_requirements = _live_human_requirements(  # shape-check: fatal:no-conservative-reading
+        human_payload,
+        dispositions,
+        context="issue_implementation",
+        surfaced_requirement_ids=surfaced_requirement_ids,
+        reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
     )
     tests_value = payload.get("tests_run")
     tests_run = (
@@ -4228,16 +4410,7 @@ def validate_structured_issue_implementation(
         state=state,
         summary=summary,
         pr_number=pr_number,
-        human_requirements=StructuredHumanRequirementsPayload(
-            addressed_ids=_expect_requirement_id_list(  # shape-check: fatal:no-conservative-reading
-                human_payload["addressed_ids"],
-                context="issue_implementation.human_requirements.addressed_ids",
-            ),
-            checked_discussion_directly=_expect_bool(  # shape-check: fatal:no-conservative-reading
-                human_payload["checked_discussion_directly"],
-                context="issue_implementation.human_requirements.checked_discussion_directly",
-            ),
-        ),
+        human_requirements=human_requirements,
         human_requirement_dispositions=dispositions,
         tests_run=tests_run,
         test_observations=test_observations,
@@ -4261,6 +4434,10 @@ def validate_structured_issue_implementation(
     if parsed.pr_number is not None and any(
         item.disposition == "blocked" for item in parsed.human_requirement_dispositions
     ):
+        if historical_decode and surfaced_requirement_ids is None:
+            # Context-free readers recover the same payload either way (#2114).
+            _logger.warning("issue_implementation: historical decode kept a PR beside a blocked disposition")
+            return parsed
         raise IssueImplementationConflictError(parsed)  # shape-check: fatal:no-conservative-reading
     return parsed
 
@@ -4273,7 +4450,7 @@ def parse_historical_structured_coder_followup(
     # Stored text decodes in the explicit legacy mode, exactly as before #925.
     kwargs.setdefault("architecture_status_mode", "legacy")
     return validate_structured_coder_followup(  # shape-check: fatal:no-conservative-reading
-        text, allow_historical_canonical_evidence=True, **kwargs
+        text, allow_historical_canonical_evidence=True, historical_decode=True, **kwargs
     )
 
 
@@ -4285,7 +4462,7 @@ def parse_historical_structured_issue_implementation(
     # Stored text decodes in the explicit legacy mode, exactly as before #925.
     kwargs.setdefault("architecture_status_mode", "legacy")
     return validate_structured_issue_implementation(  # shape-check: fatal:no-conservative-reading
-        text, allow_historical_canonical_evidence=True, **kwargs
+        text, allow_historical_canonical_evidence=True, historical_decode=True, **kwargs
     )
 
 
@@ -4308,7 +4485,7 @@ def validate_structured_task_result(
     _require_supported_schema_version(payload)  # shape-check: fatal:kind-or-version-mismatch
     if payload.get("kind") != "task_result":
         raise AgentLoopError("Structured response kind mismatch: expected `task_result`.")  # shape-check: fatal:unparseable-envelope
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload, context="task_result",
         required={"schema_version", "kind", "state", "outcome", "summary"},
         optional={"pr_number", "clarification", "architecture_impact"},
@@ -4371,7 +4548,7 @@ def validate_structured_plan_revision(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "plan_revision":
         raise AgentLoopError("Structured response kind mismatch: expected `plan_revision`.")  # shape-check: fatal:unparseable-envelope
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="plan_revision",
         required={
@@ -4493,7 +4670,7 @@ def validate_structured_plan_state(
     kind = payload.get("kind")
     if kind != "plan_state":
         raise AgentLoopError("Structured response kind mismatch: expected `plan_state`.")  # shape-check: fatal:unparseable-envelope
-    _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
         payload,
         context="plan_state",
         required={"schema_version", "kind", "state", "summary", "plan_steps"},

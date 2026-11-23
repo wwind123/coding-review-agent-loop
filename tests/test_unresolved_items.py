@@ -364,15 +364,18 @@ def test_1388_resolved_addressed_id_is_dropped_with_a_diagnostic():
     assert normalized.dropped_resolved_addressed_items == ("item-1",)
 
 
-def test_1388_unknown_addressed_id_without_resolution_proof_is_still_rejected():
+def test_1388_unknown_addressed_id_without_resolution_proof_is_dropped_2114():
+    # #2114: an ID outside the ledger and not provably resolved is dropped and
+    # recorded, never treated as addressed.
     parsed = _followup_1388(addressed_items=["item-1"])
 
-    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-1"):
-        _validate_structured_coder_followup_items(parsed, unresolved_items=())
-    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-1"):
-        _validate_structured_coder_followup_items(
-            parsed, unresolved_items=(), resolved_item_ids=("item-9",)
+    for resolved in ((), ("item-9",)):
+        normalized = _validate_structured_coder_followup_items(
+            parsed, unresolved_items=(), resolved_item_ids=resolved
         )
+        assert normalized.addressed_items == ()
+        assert normalized.dropped_unknown_items == ("item-1",)
+        assert normalized.dropped_resolved_addressed_items == ()
 
 
 @pytest.mark.parametrize("field", ["remaining_items", "disputed_items"])
@@ -553,10 +556,25 @@ def test_excluded_1868_dispute_is_invalid_even_with_optional_overlap(kind):
 
 @pytest.mark.parametrize("defect", ["duplicate", "missing", "unknown"])
 def test_excluded_1868_keeps_strict_partition(defect):
-    claims = {"duplicate": ("item-2", "item-2"), "missing": ("item-2",), "unknown": ("item-1", "invented")}
+    claims = {"duplicate": ("item-2", "item-2"), "missing": ("item-2",), "unknown": ("item-1", "item-2")}
     parsed = dataclasses.replace(_followup_1388(), addressed_items=claims[defect])
+    if defect == "unknown":
+        # An excluded record is a known ID: listing it as disputed still rejects.
+        parsed = dataclasses.replace(
+            parsed, addressed_items=("item-1",), disputed_items=("item-2",),
+            dispute_evidence={"item-2": "Counterclaim."},
+        )
     with pytest.raises(AgentLoopError, match={"duplicate": "more than once", "missing": "did not classify", "unknown": "unknown"}[defect]):
         _validate_structured_coder_followup_items(parsed, unresolved_items=(_item_1388("item-1"), _excluded_1868("future")))
+
+
+def test_excluded_1868_invented_id_is_dropped_2114():
+    parsed = dataclasses.replace(_followup_1388(), addressed_items=("item-1", "invented"))
+    normalized = _validate_structured_coder_followup_items(
+        parsed, unresolved_items=(_item_1388("item-1"), _excluded_1868("future"))
+    )
+    assert normalized.addressed_items == ("item-1",)
+    assert normalized.dropped_unknown_items == ("invented",)
 
 
 @pytest.mark.parametrize('kind', ['managed-exact-head-ci', 'github-pr-checks'])

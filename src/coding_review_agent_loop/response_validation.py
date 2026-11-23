@@ -11,7 +11,7 @@ from .terminal_diagnostics import terminal_response_diagnostic
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace as dataclasses_replace
+from dataclasses import dataclass, is_dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import TypeVar
 from .agents.registry import run_agent_result
@@ -178,9 +178,16 @@ def _validate_issue_implementation_response(
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
         return _TerminalNoPrImplementation("clarification")
+    surfaced_requirement_ids = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="implementation requirements",
+        full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    ).surfaced_requirement_ids
     try:
         parsed = validate_structured_issue_implementation(
             text,
+            # Unsurfaced dispositions are dropped before the conflict decision (#2114).
+            surfaced_requirement_ids=surfaced_requirement_ids,
             required_architecture_impact_contract=(1 if require_architecture_impact else 0),
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
@@ -908,11 +915,14 @@ def _validate_response_with_human_requirements(
         requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
     )
     if hasattr(marker_value, "human_requirement_dispositions"):
-        validate_human_requirement_dispositions(
+        kept = validate_human_requirement_dispositions(
             marker_value.human_requirement_dispositions,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             context=f"{getattr(marker_value, 'kind', 'structured')}.human_requirement_dispositions",
         )
+        if is_dataclass(marker_value) and kept != tuple(marker_value.human_requirement_dispositions):
+            # Unsurfaced dispositions were dropped with a warning (#2114).
+            marker_value = dataclasses_replace(marker_value, human_requirement_dispositions=kept)
     return marker_value
 
 

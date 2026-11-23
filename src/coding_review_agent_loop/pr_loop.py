@@ -9331,6 +9331,10 @@ def run_pr_loop(
                     if coder_response.marker_value.dropped_excluded_items:
                         log(config, f"Round {round_number}: {coder_name} listed excluded ledger item(s) "
                             + ", ".join(coder_response.marker_value.dropped_excluded_items) + "; dropped classifications")
+                    if coder_response.marker_value.dropped_unknown_items:
+                        log(config, f"Round {round_number}: {coder_name} listed unknown item ID(s) "
+                            + ", ".join(coder_response.marker_value.dropped_unknown_items)
+                            + "; dropped them and their notes from the follow-up")
                     if coder_response.marker_value.dropped_resolved_addressed_items:
                         dropped_names = ", ".join(
                             coder_response.marker_value.dropped_resolved_addressed_items

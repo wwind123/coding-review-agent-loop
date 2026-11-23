@@ -248,6 +248,8 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
                     "kind": "coder_followup",
                     "state": "blocking",
                     "summary": "Tried to handle the feedback.",
+                    # #2114: an unknown ID is dropped, so the uncovered
+                    # carried item is what rejects this follow-up.
                     "addressed_items": ["item-9"],
                     "remaining_items": [],
                     "human_requirement_dispositions": [],
@@ -286,7 +288,7 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
 
     with pytest.raises(
         AgentLoopError,
-        match="Coder follow-up referenced unknown unresolved reviewer item IDs: item-9",
+        match="Coder follow-up did not classify all unresolved reviewer items",
     ):
         run_pr_loop(runner, pr_number=77, config=config)
 

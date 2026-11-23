@@ -44,6 +44,7 @@ from .errors import (
 from .logging import log
 from .protocol import StructuredCoderFollowup, _degradable_response_impact
 from .protocol_common import (
+    partition_item_id_buckets,
     SIGNATURE_RE,
     _extract_json_object_prefix,
     normalize_response_file_structured_text,
@@ -98,14 +99,13 @@ def _passes(observation: object) -> bool:
 
 
 def _drop_unknown_item_ids(payload: dict, allowed: frozenset[str], notes: list[str]) -> None:
-    dropped: list[str] = []
-    for bucket in ("addressed_items", "remaining_items", "disputed_items"):
-        values = payload.get(bucket)
-        if not isinstance(values, list):
-            continue
-        kept = [value for value in values if not isinstance(value, str) or value in allowed]
-        dropped.extend(value for value in values if isinstance(value, str) and value not in allowed)
-        payload[bucket] = kept
+    buckets = {
+        bucket: payload[bucket]
+        for bucket in ("addressed_items", "remaining_items", "disputed_items")
+        if isinstance(payload.get(bucket), list)
+    }
+    kept, dropped = partition_item_id_buckets(buckets, allowed)
+    payload.update(kept)
     if not dropped:
         return
     # A dropped ID takes every claim that depends on it.

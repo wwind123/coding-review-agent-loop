@@ -16930,8 +16930,11 @@ def test_continuity_correlation_finds_a_degraded_coder_record_and_publishes(tmp_
 
 def test_degraded_follow_up_publishes_issue_created_continuity_in_the_pr_loop(tmp_path, monkeypatch):
     """Row managed-continuity-degraded through the real PR-loop coder seam."""
+    # An unknown ID alone is dropped live since #2114; the live-target
+    # tests_run entry supplies the rejection behind the degraded record.
     unknown = structured_coder_followup(
         summary="Repaired.", addressed_items=["item-1", "item-99"], reviewer="Anthropic Claude",
+        tests_run=["pytest tests/test_foo.py https://live.example"],
     )
     runner = FakeRunner(
         codex_outputs=[

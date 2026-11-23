@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -23,6 +24,7 @@ from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol_common import (
+    partition_item_id_buckets,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ParseDegradation,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -52,6 +54,8 @@ from .protocol import (
     validate_human_requirement_dispositions,
     _normalized_review_item_text,
 )
+
+_logger = logging.getLogger(__name__)
 
 MERGE_CONFLICT_ITEM_ID = "item-merge-conflict"
 CODER_DISPUTE_NOTE_PREFIX = "Coder disputes this item"
@@ -1346,7 +1350,9 @@ def _validate_structured_coder_followup_items(
     # ``resolved_item_ids`` is the orchestrator's fail-closed proof of items
     # already canonically resolved (#1388).  Listing one as addressed asserts
     # nothing new, so it is dropped with a diagnostic instead of rejected;
-    # listing one as remaining or disputed is still an unknown ID.
+    # listing one as remaining or disputed still rejects.  An ID that is not
+    # in the ledger at all is dropped with its claims and recorded in
+    # ``dropped_unknown_items`` (#2114).
     excluded = set(excluded_item_ids) | set(excluded_coder_followup_item_ids(unresolved_items))
     allowed_ids = [
         *(item.item_id for item in select_coder_followup_items(unresolved_items)),
@@ -1401,12 +1407,46 @@ def _validate_structured_coder_followup_items(
             dropped_resolved_addressed_items=dropped,
         )
         listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
-    unknown = sorted(set(listed_ids) - allowed)
-    if unknown:
+    # A known ID the coder may not classify (a ledger record outside the
+    # dispatched set such as the merge-conflict item, an excluded record, or a
+    # provably resolved item listed as remaining or disputed) is still rejected.
+    known_ids = excluded | set(resolved_item_ids) | {item.item_id for item in unresolved_items}
+    contradicting = sorted((set(listed_ids) - allowed) & known_ids)
+    if contradicting:
         raise AgentLoopError(
             "Coder follow-up referenced unknown unresolved reviewer item IDs: "
-            + ", ".join(unknown)
+            + ", ".join(contradicting)
         )
+    # An ID outside the ledger maps to no item, so it is dropped with every
+    # claim that depends on it rather than rejected (#2114).
+    kept_buckets, unknown = partition_item_id_buckets(
+        {
+            "addressed_items": parsed.addressed_items,
+            "remaining_items": parsed.remaining_items,
+            "disputed_items": parsed.disputed_items,
+        },
+        allowed,
+    )
+    if unknown:
+        unknown_set = set(unknown)
+        parsed = replace(
+            parsed,
+            addressed_items=kept_buckets["addressed_items"],
+            remaining_items=kept_buckets["remaining_items"],
+            disputed_items=kept_buckets["disputed_items"],
+            addressed_item_notes={i: n for i, n in parsed.addressed_item_notes.items() if i not in unknown_set},
+            remaining_item_notes={i: n for i, n in parsed.remaining_item_notes.items() if i not in unknown_set},
+            dispute_evidence={i: n for i, n in parsed.dispute_evidence.items() if i not in unknown_set},
+            addressed_sub_items=tuple(
+                i for i in parsed.addressed_sub_items if i.split(".", 1)[0] not in unknown_set
+            ),
+            dropped_unknown_items=tuple(unknown),
+        )
+        _logger.warning(
+            "Coder follow-up referenced unknown unresolved reviewer item ID(s) %s; dropped them",
+            ", ".join(unknown),
+        )
+        listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     missing = sorted(set(required_ids) - set(listed_ids))
     if missing:
         raise AgentLoopError(
@@ -1449,6 +1489,10 @@ def _validate_coder_followup_response(
         execution_catalog=execution_catalog,
         architecture_status_mode=architecture_status_mode,
         test_observations_mode=test_observations_mode,
+        # Unsurfaced requirement dispositions are dropped before the
+        # approved-plus-blocked decision (#2114).
+        surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+        reviewer_owned_requirement_ids=reviewer_owned_requirement_ids,
         # Advisory sub-item claims may name only sub-items still open on the
         # carried items (#958); invalid claims are dropped, never rejected.
         expected_sub_item_ids={

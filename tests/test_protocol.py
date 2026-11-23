@@ -2023,7 +2023,8 @@ def test_parse_pr_review_rejects_structured_candidate_with_unknown_nested_keys()
                 "same_pr_followups": [],
                 "future_followups": [],
                 "prior_item_dispositions": [
-                    {"item_id": "item-1", "disposition": "resolved", "extra": "nope"},
+                    # #2114: only a non-string (or protected) extra still rejects.
+                    {"item_id": "item-1", "disposition": "resolved", "extra": ["nope"]},
                 ],
             }
         )
@@ -3613,7 +3614,7 @@ def test_validate_structured_coder_followup_accepts_optional_item_notes():
     }
 
 
-def test_validate_structured_coder_followup_rejects_note_for_unlisted_item():
+def test_validate_structured_coder_followup_drops_note_for_unlisted_item(caplog):
     payload = (
         json.dumps(
             {
@@ -3634,8 +3635,11 @@ def test_validate_structured_coder_followup_rejects_note_for_unlisted_item():
         + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
     )
 
-    with pytest.raises(AgentLoopError, match="item-2.*not listed in coder_followup.addressed_items"):
-        validate_structured_coder_followup(payload)
+    # #2114: a note keyed to an unlisted ID is dropped with a warning.
+    caplog.set_level("WARNING")
+    parsed = validate_structured_coder_followup(payload)
+    assert parsed.addressed_item_notes == {}
+    assert "item-2" in caplog.text and "not listed in coder_followup.addressed_items" in caplog.text
 
 
 @pytest.mark.parametrize("bad_note", ["", "   ", 5, None])
@@ -3687,7 +3691,8 @@ def test_validate_structured_coder_followup_rejects_unknown_keys_in_structured_c
                 "human_requirements": {
                     "addressed_ids": [],
                     "checked_discussion_directly": True,
-                    "extra": "nope",
+                    # #2114: a non-string extra still rejects.
+                    "extra": 1,
                 },
             }
         )
@@ -3831,7 +3836,7 @@ def test_validate_structured_coder_followup_rejects_disputed_item_also_in_addres
         validate_structured_coder_followup(payload)
 
 
-def test_validate_structured_coder_followup_rejects_evidence_for_non_disputed_item():
+def test_validate_structured_coder_followup_drops_evidence_for_non_disputed_item(caplog):
     payload = (
         json.dumps(
             {
@@ -3853,8 +3858,11 @@ def test_validate_structured_coder_followup_rejects_evidence_for_non_disputed_it
         + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
     )
 
-    with pytest.raises(AgentLoopError, match="item-1.*not listed in coder_followup.disputed_items"):
-        validate_structured_coder_followup(payload)
+    # #2114: evidence keyed to an unlisted ID claims nothing and is dropped.
+    caplog.set_level("WARNING")
+    parsed = validate_structured_coder_followup(payload)
+    assert parsed.dispute_evidence == {}
+    assert "not listed in coder_followup.disputed_items" in caplog.text
 
 
 def test_validate_structured_coder_followup_rejects_disputed_item_without_evidence():
@@ -3972,11 +3980,13 @@ def test_validate_structured_human_requirements_acknowledgement_uses_disposition
         ("Requirement 2",), dispositions=dispositions, checked_discussion_directly=False,
         surfaced_requirement_ids=("Requirement 1", "Requirement 2"), requires_direct_discussion_ack=False,
     )
-    with pytest.raises(AgentLoopError, match="may contain only requirements with an `addressed` disposition"):
-        validate_structured_human_requirements_acknowledgement(
-            ("Requirement 1", "Requirement 2"), dispositions=dispositions, checked_discussion_directly=False,
-            surfaced_requirement_ids=("Requirement 1", "Requirement 2"), requires_direct_discussion_ack=False,
-        )
+
+    # #2114: with dispositions present, addressed_ids is derived from them, so
+    # a differing list is replaced (with a warning) rather than rejected.
+    validate_structured_human_requirements_acknowledgement(
+        ("Requirement 1", "Requirement 2"), dispositions=dispositions, checked_discussion_directly=False,
+        surfaced_requirement_ids=("Requirement 1", "Requirement 2"), requires_direct_discussion_ack=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -3988,13 +3998,6 @@ def test_validate_structured_human_requirements_acknowledgement_uses_disposition
             ("Requirement 1", "Requirement 2"),
             False,
             "did not address all surfaced signed human requirement IDs",
-        ),
-        (
-            ("Requirement 1", "Requirement 1"),
-            False,
-            ("Requirement 1",),
-            False,
-            "listed signed human requirement IDs more than once",
         ),
         (
             ("Requirement 99",),
@@ -7925,13 +7928,21 @@ def test_reserved_keys_collide_on_both_parsers_1328(key, caplog):
     "item",
     [
         {"finding": "Gap.", "depends_on_stage_ids": ["stage-1"]},
-        {"finding": "Gap.", "fix_scope": "current"},
         {"finding": "Gap.", "requested_change": "a", "required_change": "b"},
+        {"finding": "Gap.", "fix_scope": 7},
     ],
 )
 def test_plan_only_reserved_keys_collide_1328(item):
     with pytest.raises(AgentLoopError, match=_COLLISION_1328):
         _parse_plan_1328(item)
+
+
+def test_plan_finding_string_fix_scope_is_dropped_2114(caplog):
+    # #2114: PR scheduler metadata on a plan finding is dropped, not folded.
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_plan_1328({"finding": "Gap.", "fix_scope": "current"})
+    assert [item.text for item in parsed.items.blocking] == ["Gap."]
+    assert "dropped PR-only finding field fix_scope" in caplog.text
 
 
 @pytest.mark.parametrize("key", ["item_id", "id"])
@@ -8440,28 +8451,40 @@ def test_coder_without_ack_item_records_no_bucket():
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"addressed_items": ["item-1", _ACK, "item-999"]}, r"unknown unresolved reviewer item IDs: item-999$"),
         ({"addressed_items": [_ACK]}, "item-1"),
-        ({"addressed_items": ["item-1", "item-1", _ACK]}, "more than once: item-1"),
+        ({"addressed_items": ["item-1", "item-1", _ACK], "remaining_items": ["item-1"]}, "more than once: item-1"),
         ({"disputed_items": ["item-3", _ACK], "dispute_evidence": {}}, "Missing evidence for: item-3"),
         ({"addressed_items": ["item-1", _ACK], "addressed_item_notes": ["not", "a", "dict"]}, "addressed_item_notes"),
         ({"addressed_items": ["item-1", _ACK], "addressed_item_notes": {"item-1": ""}}, "addressed_item_notes"),
-        ({"addressed_items": ["item-1", "item-merge-conflict"]}, "item-merge-conflict"),
-        ({"addressed_items": ["item-1", _ACK + "s"]}, _ACK + "s"),
     ],
     ids=[
-        "unknown", "missing-required", "duplicate-real", "real-dispute-no-evidence",
-        "note-map-not-dict", "real-empty-note", "merge-conflict-not-stripped", "near-miss",
+        "missing-required", "duplicate-across-buckets", "real-dispute-no-evidence",
+        "note-map-not-dict", "real-empty-note",
     ],
 )
 def test_coder_other_validation_stays_fatal_alongside_ack_item(overrides, match):
-    with pytest.raises(AgentLoopError, match=match) as error:
+    with pytest.raises(AgentLoopError, match=match):
         _validate_coder_followup_response(
             _ack_followup(**overrides), unresolved_items=_ACK_REAL_ITEMS, human_requirements=(),
             architecture_status_mode="legacy",
         )
-    if "item-999" in str(overrides):
-        assert _ACK not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "extra_id",
+    ["item-999", "item-merge-conflict", _ACK + "s"],
+    ids=["unknown", "merge-conflict-not-stripped", "near-miss"],
+)
+def test_coder_unknown_ids_beside_ack_item_are_dropped_not_stripped(extra_id):
+    # #2114: a well-formed unknown ID is dropped and recorded, never treated
+    # as the tool-owned acknowledgement record.
+    parsed = _validate_coder_followup_response(
+        _ack_followup(addressed_items=["item-1", _ACK, extra_id]),
+        unresolved_items=_ACK_REAL_ITEMS, human_requirements=(),
+        architecture_status_mode="legacy",
+    )
+    assert parsed.dropped_unknown_items == (extra_id,)
+    assert extra_id not in parsed.addressed_items
 
 
 def _review_with(**extra):

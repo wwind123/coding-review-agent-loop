@@ -26,6 +26,7 @@ from .protocol_common import (
     ParseDegradation,
     TestObservationCitation,
     _expect_exact_keys,
+    _expect_known_keys_lenient,
     _expect_int,
     _expect_object,
     _expect_strict_string,
@@ -521,7 +522,9 @@ def _validate_risk_owner(value: object, *, context: str) -> str:
 
 def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") -> RiskTestMatrix:
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
-    _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+    # Complete-matrix path only (#2114): unknown string keys are dropped with a
+    # warning; the identity is computed from the parsed rows, never raw keys.
+    payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
         payload,
         context=context,
         required=set(RISK_TEST_MATRIX_REQUIRED_KEYS),
@@ -543,7 +546,7 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
     for index, raw_row in enumerate(rows_payload):
         row_context = f"{context}.rows[{index}]"
         row = _expect_object(raw_row, context=row_context)  # shape-check: fatal:no-conservative-reading
-        _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+        row = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
             row,
             context=row_context,
             required=set(RISK_TEST_MATRIX_ROW_KEYS),
