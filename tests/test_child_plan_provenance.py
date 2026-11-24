@@ -5889,3 +5889,100 @@ def test_m2100_same_round_ids_dispositioned_as_carried_are_dropped():
     )
     assert payload_parsed.ignored_prior_disposition_ids == parsed.ignored_prior_disposition_ids
     assert [d["item_id"] for d in payload_parsed.to_payload()["prior_plan_item_dispositions"]] == ["item-8"]
+
+
+def test_qualification_replacement_plan_carries_its_scope_notes_to_the_reviewer(
+    tmp_path, monkeypatch
+):
+    """Matrix row `pr-reviewer-context-resume`: the qualification replacement (#2145).
+
+    A child plan re-planned mid-run replaces the plan the PR run started
+    under.  Its scope holds a note from an earlier blocking round and a
+    distinct approving-round note, and an archived scope behind an
+    authenticated boundary holds a third note.  The re-recovered
+    qualification context and the reviewer prompt must carry both
+    current-scope notes, approving round first, and never the archived one.
+    """
+    from coding_review_agent_loop.plan_issue_scope import render_scope_boundary, scope_boundary_payload
+    from coding_review_agent_loop.prompts import build_review_prompt
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata, _attach_round_metadata, _plan_subject,
+    )
+
+    earlier = "Earlier-round note: refresh the stage inventory fixture."
+    approving = "Approving-round note: update the pinned row snapshot."
+    archived = "Archived-scope note: must never reach the reviewer."
+
+    def review(state, note, *, same_plan=(), dispositions=()):
+        payload = json.loads(structured_plan_review(state=state).split("\n<!-- AGENT_PLAN_STATE", 1)[0])
+        payload["implementation_notes"] = [note]
+        payload["same_plan_followups"] = list(same_plan)
+        payload["prior_plan_item_dispositions"] = list(dispositions)
+        return json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: {state} -->\n-- OpenAI Codex"
+
+    world = _M936World(tmp_path, monkeypatch)
+    # Round 2: the replacement plan blocks on one same-plan item with a note.
+    # The run stops when the scripted planner has no round-3 revision yet.
+    with pytest.raises(Exception, match="scripted agent output exhausted"):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[review("blocking", earlier, same_plan=["Name the retry bound explicitly."])],
+        )
+    world.settle()
+    round_two = [
+        record for record in _extract_round_metadata_records(world.comments, flow="plan")
+        if record.metadata.role == "coder" and record.metadata.round_number == 2
+    ][-1]
+    from coding_review_agent_loop.plan_assembly import hydrate_authenticated_plan_state
+
+    base = hydrate_authenticated_plan_state(round_two.metadata.assembled_plan_sidecar, round_number=2)
+    second_patch = {
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking", "summary": "Patch.",
+        "prior_plan_item_dispositions": [{"item_id": "item-1", "disposition": "resolved"}],
+        "base_round_number": 2, "base_state_identity": base.state_identity,
+        "operations": [{"op": "replace", "field": "summary", "value": "Retry bound named."}],
+    }
+    # Round 3: the resumed run revises and the replacement is approved.
+    assert world.run_issue(
+        claude_outputs=[json.dumps(second_patch) + PLAN_FOOTER],
+        codex_outputs=[
+            review("approved", approving, dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+            PR_APPROVAL,
+        ],
+    ) == 0
+    world.settle()
+    # Archive round 1 behind an authenticated scope boundary, with a note of
+    # its own, so a scope leak would surface in the replacement context.
+    boundary_at = next(
+        index for index, item in enumerate(world.comments)
+        if item.author != "bot"
+    )
+    old_subject = _plan_subject(
+        _extract_round_metadata_records(world.comments, flow="plan")[0].metadata.canonical_plan
+    )
+    world.comments[boundary_at:boundary_at] = [
+        comment(_attach_round_metadata("Archived review.", PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=1,
+            subject=old_subject, state="approved", implementation_notes=(archived,),
+        ))),
+        comment(str(render_scope_boundary(scope_boundary_payload(
+            issue_number=56, previous_issue_digest="0" * 16, current_issue_digest="1" * 16,
+            archived_round_number=1, archived_plan_subject=None,
+        )))),
+    ]
+    old_context = execution_policy.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    assert old_context.implementation_notes == ()
+
+    _context, _ids, adopted, config = _m936_snapshot(
+        world, binding=_m936_binding(world), approved_plan_context=old_context,
+    )
+
+    assert adopted.plan_hash != old_context.plan_hash
+    assert adopted.implementation_notes == (f"{approving} (Codex)", f"{earlier} (Codex)")
+    prompt = build_review_prompt(77, 1, config, reviewer="codex", approved_plan_context=adopted)
+    assert prompt.index(f"- {approving} (Codex)") < prompt.index(f"- {earlier} (Codex)")
+    assert archived not in prompt
+    assert "an unaddressed note is an ordinary PR review finding" in prompt

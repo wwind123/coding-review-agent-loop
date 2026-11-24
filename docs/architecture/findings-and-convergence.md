@@ -1,8 +1,8 @@
 # Findings and convergence
 
-How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the single PR no-progress stop, the PR step-back prompt and sweep, the evidence-only stall stop and evidence conversion.
+How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline, future follow-ups and plan-review implementation notes, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the single PR no-progress stop, the PR step-back prompt and sweep, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/human_evidence_mode.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/no_progress.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_no_progress.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`, `tests/test_human_evidence_mode.py`, `tests/test_pr_loop_human_evidence_mode.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/dispute_release.py`, `src/coding_review_agent_loop/native_evidence.py`, `src/coding_review_agent_loop/human_evidence_mode.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/no_progress.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/plan_implementation_notes.py`, `tests/test_review_step_back.py`, `tests/test_no_progress.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_dispute_release.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`, `tests/test_human_evidence_mode.py`, `tests/test_pr_loop_human_evidence_mode.py`, `tests/test_plan_implementation_notes.py`, `tests/test_plan_implementation_notes_inventory.py`.
 
 ## Findings, evidence and convergence
 
@@ -85,6 +85,48 @@ comments are extracted by the pure `scope_declarations.py` helper and rendered
 as a deterministic, bounded binding-scope block next to the issue context in
 planner and reviewer prompts, so compact stable prefixes stay byte-identical;
 compliance is enforced by the prompt, not by a deterministic classifier.
+
+Plan-review implementation notes (#2145). A plan review may also return
+`implementation_notes`: in-scope findings that need no change to the plan's
+design, steps or acceptance criteria and that building the change or running
+its tests would surface anyway (exact-inventory test updates, pinned fixture
+sets, snapshot or golden-file refreshes). When in doubt a finding still
+blocks, and a qualifying item placed in `same_plan_followups` stays valid.
+`protocol.parse_structured_plan_review` carries notes on
+`ParsedPlanReview.implementation_notes`, never on `PlanReviewItems`, so the
+unresolved-item ledger, dispositions, scheduling, no-progress and step-back
+logic never see them. Notes never block, are allowed in approved and blocking
+reviews, never become planner revision input, and are never filed as issues.
+Each review is bounded deterministically (10 notes of at most 1000
+characters; a note duplicating the same review's blocking or same-plan item
+is dropped) with recorded degradations instead of a rejection, and repair
+preservation keeps every note while letting a blocking duplicate win. Notes
+persist on the reviewer's plan round record (`implementation_notes`, omitted
+when empty so legacy encodings stay byte-identical, spillable to sidecars).
+`plan_implementation_notes.py` collects them at approval from settled plan
+reviewer records (authoritative records, or a parallel round's publication
+checkpoints followed by its reconciliation summary, minus failed seats) in
+the approved plan scope: from the newest authenticated scope boundary at or
+before the approving round through that round. They are de-duplicated with
+merged attribution, approving round first, and bounded to 20 notes and 6000
+characters with an omitted count. If the plan history cannot be admitted or
+the trusted actor is unknown, the notes are reported unavailable with a
+reason, which never blocks or fails the run. The collected notes are listed in
+the plan approval comment. When the announcement for identical plan text
+belongs to an archived scope, one notes-only supplement for the current scope
+is posted instead; it carries no approval record, files nothing, and is
+skipped when an identical orchestrator comment already follows the boundary.
+The notes ride on `ApprovedPlanContext` fields excluded from equality, so the
+plan hash, subject, matrix identity and handoff validation are unchanged, and
+`format_approved_plan_context` renders them in a fixed-bounded, non-binding
+section for the implementer and the PR reviewers; an unaddressed note is an
+ordinary PR finding. Every PR-facing construction or recovery site attaches
+them through one helper (fresh approval, the handoff and parent fallbacks in
+`run_pr_loop`, managed-CI recoveries, the qualification replacement and the
+canonical no-handoff plan), guarded by an inventory test. A direct-execution
+staged child inherits the parent plan's notes labeled with their origin;
+planning-route children see only their own scope's notes, and notes are never
+written into child issues or handoff records.
 
 An approving PR reviewer whose review lacks the signed-requirements
 acknowledgement is never reformatted by a repair model (#2066): the review

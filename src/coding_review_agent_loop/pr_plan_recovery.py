@@ -61,6 +61,13 @@ def _canonical_plan_without_handoff(
         runner, config=config, issue_context=issue_context, comments=comments,
         trusted_actor=trusted_actor, error_message=error_message,
     )
-    return make_approved_plan_context(
+    # The admitted history already authenticates the plan scope (#2145).
+    from .plan_implementation_notes import resolve_plan_notes_safely, with_plan_implementation_notes
+
+    context = make_approved_plan_context(
         plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
     )
+    return with_plan_implementation_notes(context, resolve_plan_notes_safely(
+        comments, trusted_actor, issue_number=issue_context.number,
+        plan_subject=context.plan_subject, plan_hash=context.plan_hash,
+    ))

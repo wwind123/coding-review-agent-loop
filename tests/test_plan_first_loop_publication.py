@@ -486,3 +486,74 @@ def test_plan_first_legacy_resume_convergence_binds_complete_handoff(tmp_path, m
     assert tip in handoffs[0]
     assert 'https://github.com/owner/repo/pull/77/' in handoffs[0]
     assert len(delegated) == 1
+
+
+# --- #2145: implementation notes survive an interrupted publication round ----
+
+
+def test_resumed_publication_round_restores_notes_exactly_once(tmp_path):
+    """Matrix row `resume-spooled-review`.
+
+    One reviewer's publication checkpoint (with notes) is public and the
+    other's review is withheld when the run is interrupted; the rerun replays
+    the withheld review, settles both, and collects every note once.
+    """
+    from types import SimpleNamespace
+
+    from test_review_parallel import (
+        _PartialPublicationProbeRunner,
+        _initial_plan,
+        _interrupt_plan_round_between_publications,
+        _spool_files,
+    )
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    def review(summary, notes, reviewer):
+        return (
+            json.dumps({
+                "schema_version": 1, "kind": "plan_review", "state": "approved",
+                "summary": summary, "blocking_plan_issues": [], "same_plan_followups": [],
+                "future_followups": [], "implementation_notes": notes,
+                "prior_plan_item_dispositions": [], "human_requirement_dispositions": [],
+            })
+            + f"\n<!-- AGENT_PLAN_STATE: approved -->\n-- {reviewer}"
+        )
+
+    markers = ("Codex approval with notes.", "Gemini approval with notes.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[review(markers[0], ["Refresh the golden file."], "OpenAI Codex")],
+        gemini_outputs=[review(
+            markers[1], ["Refresh the golden file.", "Update the inventory test."], "Google Gemini",
+        )],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert sorted(runner.reviewer_launches) == ["codex", "gemini"]  # replayed, never re-run
+    bodies = [str(comment["body"]) for comment in runner.issue_comments]
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=body) for body in bodies], flow="plan",
+    )
+    # A settled parallel round keeps each reviewer's publication record (with
+    # its notes) and closes with one reconciliation summary.
+    reviewer_records = [record for record in records if record.metadata.role == "reviewer"]
+    assert len(reviewer_records) == 2
+    assert any(
+        record.metadata.role == "summary" and record.metadata.phase == "reconciliation"
+        for record in records
+    )
+    assert {r.metadata.agent: r.metadata.implementation_notes for r in reviewer_records} == {
+        "Codex": ("Refresh the golden file.",),
+        "Gemini": ("Refresh the golden file.", "Update the inventory test."),
+    }
+    approval = next(body for body in reversed(bodies) if "Planning complete for issue" in body)
+    section = approval.split("Implementation notes from plan review (non-blocking", 1)[1]
+    assert section.count("Refresh the golden file.") == 1
+    # Merged attribution, in the durable posting order of the settled records.
+    assert re.search(r"- Refresh the golden file\. \((Codex, Gemini|Gemini, Codex)\)", section)
+    assert section.count("Update the inventory test.") == 1
+    assert _spool_files(config) == []

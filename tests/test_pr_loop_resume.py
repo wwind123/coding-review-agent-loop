@@ -2443,3 +2443,94 @@ def test_resume_after_a_degraded_or_synthesized_record_reviews_the_head_without_
 def _metadata_from_body_2086(body):
     match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_:-]+)\s*-->", body)
     return round_metadata._decode_round_metadata(match.group("payload")) if match else None
+
+
+# --- #2145: plan-review implementation notes on a restarted PR run ------------
+
+
+@pytest.mark.parametrize("foreign_malformed", [False, True])
+def test_restarted_one_shot_pr_shows_notes_from_every_round_of_the_plan_scope(tmp_path, foreign_malformed):
+    """Matrix row `pr-reviewer-context-resume`.
+
+    The PR loop restarts with only the issue-to-PR handoff, recovers the plan
+    from it, and still shows the earlier blocking round's notes beside the
+    approving round's, exactly as a fresh execution renders them.
+    """
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.plan_implementation_notes import (
+        render_prompt_section,
+        resolve_plan_notes,
+        with_plan_implementation_notes,
+    )
+    from coding_review_agent_loop.round_metadata import _plan_subject
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+
+    plan = "Preserve the old API.\n\nApproved plan with tests."
+    subject = _plan_subject(plan)
+
+    def record(metadata):
+        return {
+            "author": {"login": "bot"},
+            "createdAt": "2026-05-01T00:00:00Z",
+            "body": _attach_round_metadata("Plan round record.", metadata),
+        }
+
+    issue_comments = [
+        record(PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
+            canonical_plan=plan, raw_structured_coder_response=plan,
+        )),
+        record(PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=1, subject=subject,
+            state="blocking", implementation_notes=("Earlier-round note: refresh the golden file.",),
+        )),
+        record(PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=2, subject=subject,
+            state="approved", implementation_notes=("Approving-round note: update the inventory test.",),
+        )),
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-05-01T00:03:00Z",
+            "body": format_issue_pr_handoff_comment(
+                issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+                pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+                flow="approved-plan-implementation", plan_hash=approved_plan_hash(plan),
+            ),
+        },
+    ]
+    if foreign_malformed:
+        # A foreign comment with a malformed round record: the admitted reader
+        # masks it, and the raw notes prescan must not veto the real notes.
+        issue_comments.insert(2, {
+            "author": {"login": "intruder"},
+            "_rest_author_id": 999,
+            "createdAt": "2026-05-01T00:01:30Z",
+            "body": "Forged history.\n<!-- AGENT_LOOP_META: v1_AAAA -->",
+        })
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=issue_comments,
+        issue_payload={"number": 56, "title": "Issue", "body": "Original issue."},
+        pr_payload={"number": 77, "url": "https://github.com/OWNER/REPO/pull/77", "body": "Fixes #56"},
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Implementation notes from plan review" in prompt
+    assert "Implementation notes unavailable" not in prompt
+    approving = prompt.index("Approving-round note: update the inventory test. (Codex)")
+    earlier = prompt.index("Earlier-round note: refresh the golden file. (Codex)")
+    assert approving < earlier
+    assert "an unaddressed note is an ordinary PR review finding" in prompt
+    # Identical to what a fresh execution attaches from the same scope.
+    fresh_comments = [
+        SimpleNamespace(body=c["body"], author_id=1)
+        for c in issue_comments if c["author"]["login"] == "bot"
+    ]
+    fresh = with_plan_implementation_notes(
+        make_approved_plan_context(plan, expected_hash=approved_plan_hash(plan)),
+        resolve_plan_notes(fresh_comments, ("bot", 1), issue_number=56, plan_subject=subject),
+    )
+    assert render_prompt_section(fresh) in prompt

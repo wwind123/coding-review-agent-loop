@@ -72,11 +72,30 @@ _ARCHITECTURE_FLOW_ALIAS_KEYS = ("execution_flows", "data_flows")
 REVIEW_KINDS = frozenset({"plan_review", "pr_review"})
 
 # Bucket names carried by each review kind.  Order is (blocking, same-scope,
-# future); the first two are the current-scope buckets.
+# future[, non-blocking implementation notes (#2145)]); the first two are the
+# current-scope buckets.
 REVIEW_FINDING_BUCKETS = {
-    "plan_review": ("blocking_plan_issues", "same_plan_followups", "future_followups"),
+    "plan_review": (
+        "blocking_plan_issues", "same_plan_followups", "future_followups", "implementation_notes",
+    ),
     "pr_review": ("blocking_items", "same_pr_followups", "future_followups"),
 }
+def review_finding_entries(payload: dict, name: str) -> list[object]:
+    """A review finding list in the parser's canonical shape (#2109, #2145).
+
+    ``protocol._normalize_review_finding_shapes`` reads ``null`` as no
+    findings and a lone non-empty string as one finding, so grounding and
+    preservation read source and target the same way; any other non-list
+    value carries no finding here (the parser rejects it).
+    """
+    value = payload.get(name)
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
 REVIEW_DISPOSITION_FIELD = {
     "plan_review": "prior_plan_item_dispositions",
     "pr_review": "prior_item_dispositions",
@@ -95,6 +114,7 @@ REVIEW_ACTIVE_DISPOSITIONS = {
 REVIEW_KIND_UNIQUE_FIELDS = {
     "plan_review": frozenset({
         "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+        "implementation_notes",
     }),
     "pr_review": frozenset({
         "blocking_items", "same_pr_followups", "prior_item_dispositions",
@@ -120,7 +140,7 @@ GROUNDING_STOP_WORDS = frozenset({
 # enum values.  Repair may supply these words while rewriting an envelope.
 REVIEW_SCHEMA_VOCABULARY = frozenset({
     "blocking_plan_issues", "same_plan_followups", "blocking_items",
-    "same_pr_followups", "future_followups", "prior_plan_item_dispositions",
+    "same_pr_followups", "future_followups", "implementation_notes", "prior_plan_item_dispositions",
     "prior_item_dispositions", "summary", "state", "kind", "schema_version",
     "item_id", "disposition", "note", "reviewer", "architecture_impact",
     "human_requirement_dispositions",
@@ -440,9 +460,7 @@ def _validate_review_grounding(
     def bucket_entries(payload: dict, names: Sequence[str]) -> list[object]:
         entries: list[object] = []
         for name in names:
-            value = payload.get(name)
-            if isinstance(value, list):
-                entries.extend(value)
+            entries.extend(review_finding_entries(payload, name))
         return entries
 
     source_findings = bucket_entries(source, buckets)
@@ -478,10 +496,7 @@ def _validate_review_grounding(
     # candidate's own marker families rather than merely stripping to nothing.
     target_findings: list[tuple[str, str, Counter]] = []
     for name in buckets:
-        value = target.get(name)
-        if not isinstance(value, list):
-            continue
-        for entry in value:
+        for entry in review_finding_entries(target, name):
             target_findings.append((
                 name, _joined_text(entry), _authorized_neutralization_labels(entry),
             ))
@@ -1679,7 +1694,7 @@ def validate_repair_preservation(
             _valid_plan_provenance(entry) if source["kind"] == "plan_review" else None,
         )
         for field in finding_fields
-        for entry in target.get(field, [])
+        for entry in review_finding_entries(target, field)
         if isinstance(entry, str)
         or (source["kind"] == "plan_review" and isinstance(entry, dict))
         or (source["kind"] == "pr_review" and isinstance(_pr_finding_text(entry), str))
@@ -1728,10 +1743,7 @@ def validate_repair_preservation(
     if source["kind"] == "pr_review":
         _validate_evidence_row_tag_preservation(source, target, evidence_row_id_universe)
     for field in finding_fields:
-        entries = source.get(field)
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
+        for entry in review_finding_entries(source, field):
             fragments = _fragments(
                 _pr_finding_view(entry) if source["kind"] == "pr_review"
                 else _plan_finding_prose_view(entry)
@@ -1754,6 +1766,54 @@ def validate_repair_preservation(
             require(match is not None, field)
             available.pop(match)
             available_tags.pop(match)
+    if source["kind"] == "plan_review":
+        _require_implementation_notes_preserved(source, target, require)
+
+
+def _require_implementation_notes_preserved(source: dict, target: dict, require) -> None:
+    """Repair keeps every plan implementation note (#2145).
+
+    A note whose concern is also a blocking or same-plan finding in the source
+    may be dropped (the blocking entry wins); every other note must survive in
+    the repaired ``implementation_notes`` list, never vanish.
+    """
+    notes = review_finding_entries(source, "implementation_notes")
+    if not notes:
+        return
+
+    def flat(entry: object, context: str) -> str | None:
+        if isinstance(entry, str):
+            return entry
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return _flatten_plan_review_finding(entry, item_context=context)
+        except AgentLoopError:
+            return None
+
+    blocking_texts = {
+        _normalized_review_item_text(text)
+        for field in ("blocking_plan_issues", "same_plan_followups")
+        for entry in review_finding_entries(source, field)
+        if (text := flat(entry, field)) is not None
+    }
+    target_notes = review_finding_entries(target, "implementation_notes")
+    candidates = [
+        text
+        for entry in target_notes
+        if (text := flat(entry, "implementation_notes")) is not None
+    ]
+    for entry in notes:
+        text = flat(entry, "implementation_notes")
+        if text is None:
+            continue
+        fragments = _fragments(text)
+        if not fragments or _normalized_review_item_text(text) in blocking_texts:
+            continue
+        require(
+            any(_contains_fragments(candidate, fragments) for candidate in candidates),
+            "implementation_notes",
+        )
 
 
 def _plan_finding_prose_view(entry: object) -> object:

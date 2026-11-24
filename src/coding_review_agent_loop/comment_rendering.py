@@ -1671,6 +1671,19 @@ def _render_public_plan_review_comment(
                 ]
             )
         )
+    if parsed_review.implementation_notes:
+        # Reviewer-authored notes (#2145) are untrusted historical text.
+        sections.append(
+            "\n".join(
+                [
+                    "### Implementation notes (non-blocking; for the implementer)",
+                    *[
+                        f"- {sanitize_historical_text(item.text)}"
+                        for item in parsed_review.implementation_notes
+                    ],
+                ]
+            )
+        )
     if prior_items:
         sections.append(
             _render_prior_dispositions_section(

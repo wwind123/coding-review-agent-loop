@@ -667,6 +667,26 @@ def _plan_review_volatile_blocks(
     )
 
 
+def _plan_review_implementation_notes_guidance() -> str:
+    """The implementation-note qualification test (#2145), shared by both plan-review prompts."""
+    return """`implementation_notes` holds non-blocking notes for the implementer. A
+finding is an implementation note only if it (a) is in scope under the blocking
+scope criteria, (b) needs no change to the plan's design, steps, or acceptance
+criteria, and (c) would be found anyway by building the change or running the
+tests. Typical cases: exact-list or inventory updates in tests and fixtures,
+snapshot or golden-file refreshes, and other files that must change in step with
+files the plan already names. A plan need not enumerate every test or fixture
+file that changes in step with the code; flagging an omitted one is an
+implementation note, not a Same-plan follow-up. Anything about design,
+correctness, requirement coverage, or risk still goes in `blocking_plan_issues`
+or `same_plan_followups`; when in doubt, the finding blocks. Implementation
+notes never block, are allowed in approved and blocking reviews, are not carried
+items or planner work, and are never filed as issues: on approval they are
+listed in the approval comment and passed to the implementer and the PR
+reviewers as non-binding context.
+"""
+
+
 def _plan_review_schema_and_rules() -> str:
     return """Plan review response protocol
 
@@ -680,6 +700,7 @@ Use this mandatory structured JSON response format:
   "blocking_plan_issues": [],
   "same_plan_followups": [],
   "future_followups": ["Consider a later cleanup pass."],
+  "implementation_notes": [],
   "prior_plan_item_dispositions": [
     {"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}
   ],
@@ -721,9 +742,9 @@ initialising a variable, renaming for clarity, adding a missing annotation —
 also belongs in `same_plan_followups`, never in `future_followups`; a separate
 PR just for a one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
-`same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
-the same concern across Same-plan and Future follow-up lists.
-Approved means there are no blocking plan issues, no Same-plan follow-ups, and
+`same_plan_followups`, `future_followups`, or `implementation_notes`. Do not
+duplicate or reclassify the same concern across these lists.
+""" + _plan_review_implementation_notes_guidance() + """Approved means there are no blocking plan issues, no Same-plan follow-ups, and
 no carried-forward plan items left active for this planning round. If you
 return `<!-- AGENT_PLAN_STATE: blocking -->`, keep all required current-round
 issues in `blocking_plan_issues` or `same_plan_followups` so they are not missed
@@ -1778,6 +1799,7 @@ the issue's scope, test strategy, and ambiguity. Use this mandatory structured J
   "blocking_plan_issues": [],
   "same_plan_followups": [],
   "future_followups": ["Consider a later cleanup pass."],
+  "implementation_notes": [],
   "prior_plan_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}}
   ],
@@ -1806,9 +1828,9 @@ initialising a variable, renaming for clarity, adding a missing annotation —
 also belongs in `same_plan_followups`, never in `future_followups`; a separate
 PR just for a one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
-`same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
-the same concern across Same-plan and Future follow-up lists.
-Approved means there are no blocking plan issues, no Same-plan follow-ups, and
+`same_plan_followups`, `future_followups`, or `implementation_notes`. Do not
+duplicate or reclassify the same concern across these lists.
+{_plan_review_implementation_notes_guidance()}Approved means there are no blocking plan issues, no Same-plan follow-ups, and
 no carried-forward plan items left active for this planning round. If you
 return `<!-- AGENT_PLAN_STATE: blocking -->`, keep all required current-round
 issues in `blocking_plan_issues` or `same_plan_followups` so they are not missed

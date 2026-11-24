@@ -8,7 +8,7 @@ import logging
 import contextvars
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from .review_scope import encode_review_scope, decode_review_scope
@@ -429,6 +429,11 @@ class PostedRoundMetadata:
     # these seats' carried items.  Bounded; omitted when empty so legacy and
     # failure-free records stay byte-stable.
     failed_reviewer_seats: tuple[str, ...] = ()
+    # Non-blocking plan-review implementation notes (#2145), written on plan
+    # reviewer records from the parsed review.  Each entry keeps the record's
+    # reviewer attribution.  Omitted when empty so legacy and note-free
+    # records stay byte-stable; a missing value decodes as ``()``.
+    implementation_notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -716,6 +721,17 @@ class ApprovedPlanContext:
     risk_test_matrix_enforceable_row_ids: tuple[str, ...] | None = None
     risk_test_matrix_pending_row_ids: tuple[str, ...] = ()
     risk_test_matrix_execution_owner: str | None = None
+    # Advisory plan-review implementation notes (#2145).  Rendered, sanitized
+    # lines with reviewer attribution; never part of the plan hash, subject,
+    # matrix identity, availability or handoff validation (``compare=False``).
+    implementation_notes: tuple[str, ...] = field(default=(), compare=False)
+    implementation_notes_omitted: int = field(default=0, compare=False)
+    # ``parent plan #N`` for a staged direct-execution child.
+    implementation_notes_origin: str | None = field(default=None, compare=False)
+    implementation_notes_unavailable: str | None = field(default=None, compare=False)
+    # Whether a notes lookup already ran for this context, so a re-attach
+    # after a nested recovery does not read GitHub twice.
+    implementation_notes_resolved: bool = field(default=False, compare=False)
 
     @property
     def raw_canonical_text(self) -> str | None:
@@ -2512,6 +2528,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["ignored_prior_disposition_ids"] = list(metadata.ignored_prior_disposition_ids)
     if metadata.failed_reviewer_seats:
         payload["failed_reviewer_seats"] = list(metadata.failed_reviewer_seats)
+    if metadata.implementation_notes:
+        payload["implementation_notes"] = list(metadata.implementation_notes)
     if metadata.evidence_freeze is not None:
         payload["evidence_freeze"] = metadata.evidence_freeze.as_dict()
     if metadata.evidence_release is not None:
@@ -2905,6 +2923,32 @@ def decode_failed_reviewer_seats(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+MAX_RECORDED_IMPLEMENTATION_NOTES = 32
+MAX_RECORDED_IMPLEMENTATION_NOTE_CHARS = 2000
+
+
+def decode_implementation_notes(value: object) -> tuple[str, ...]:
+    """Decode the #2145 notes list like other optional bounded string lists.
+
+    A malformed value fails closed exactly as ``failed_reviewer_seats`` does;
+    ``null`` and ``[]`` decode as no notes.
+    """
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or len(value) > MAX_RECORDED_IMPLEMENTATION_NOTES
+        or any(
+            not isinstance(note, str)
+            or not note.strip()
+            or len(note) > MAX_RECORDED_IMPLEMENTATION_NOTE_CHARS
+            for note in value
+        )
+    ):
+        raise ValueError("implementation_notes must be a bounded list of non-empty strings")
+    return tuple(value)
+
+
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the optional #1068 evidence fields; absent is legacy.
 
@@ -2934,6 +2978,8 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
         )
     if "failed_reviewer_seats" in payload:
         fields["failed_reviewer_seats"] = decode_failed_reviewer_seats(payload["failed_reviewer_seats"])
+    if "implementation_notes" in payload:
+        fields["implementation_notes"] = decode_implementation_notes(payload["implementation_notes"])
     if "evidence_freeze" in payload:
         fields["evidence_freeze"] = EvidenceFreezeRecord.from_mapping(payload["evidence_freeze"])
     if "evidence_release" in payload:
