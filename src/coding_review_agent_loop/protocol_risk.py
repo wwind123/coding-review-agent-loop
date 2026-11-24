@@ -1916,7 +1916,7 @@ def parse_risk_test_matrix_evidence(
         seen.add(row_id)
         status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)  # shape-check: fatal:authentication-or-forgery
         if status not in RISK_MATRIX_EVIDENCE_STATUSES:
-            raise AgentLoopError(f"{row_context}.status is invalid.")  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(f"{row_context}.status is invalid (got `{_dropped_ref_preview(status)}`); allowed values: {', '.join(sorted(RISK_MATRIX_EVIDENCE_STATUSES))}.")  # shape-check: fatal:authentication-or-forgery
         parsed_row = RiskTestMatrixEvidenceRow(
             row_id=row_id,
             status=status,

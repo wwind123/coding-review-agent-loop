@@ -8638,3 +8638,24 @@ def test_requirement_evidence_non_object_entry_message_says_so():
     message = str(caught.value)
     assert "requirement_evidence[0] must be an object (got str)" in message
     assert "requirement_id, role, request, answered_item_ids, leftover_instructions" in message
+
+
+def test_risk_matrix_evidence_status_message_names_index_and_allowed_values():
+    """`messages-allowed-values`: evidence row status (#2128 review item-1)."""
+    from coding_review_agent_loop.protocol_risk import parse_risk_test_matrix_evidence
+
+    row = {
+        "row_id": "row-1", "status": "bogus-status", "test_identifiers": [], "test_locations": [],
+        "workflow_path_claim": "", "outcome_assertions": [], "forbidden_effect_assertions": [],
+        "evidence_citations": [],
+    }
+    with pytest.raises(AgentLoopError) as caught:
+        parse_risk_test_matrix_evidence({"matrix_identity": "a" * 64, "rows": [row]})
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "rows[0].status is invalid" in message
+    assert "`bogus-status`" in message
+    assert (
+        "allowed values: blocked, failed, incomplete, missing, not-run, "
+        "stale/unverified, timed-out, verified" in message
+    )
