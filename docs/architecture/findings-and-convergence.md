@@ -123,6 +123,10 @@ obligation, which stays decided by the signed acknowledgement fields. A `pr_revi
 `human_requirement_dispositions` field has it dropped (and logged) by
 `parse_structured_pr_review` before the exact-key check; other unknown fields
 remain fatal (#2026).
+A reviewer seat that fails in a round where another seat blocked no longer
+stops the round; its carried items are frozen against every healthy seat's
+disposition before settlement (see
+[Failed reviewer seats in a blocked round](review-scheduling.md#failed-reviewer-seats-in-a-blocked-round)).
 
 Human-only exact-head evidence is a separate channel from findings.
 Reviewers list it in `exact_head_evidence_requests`, and the ledger records it

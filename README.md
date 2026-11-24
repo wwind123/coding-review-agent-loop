@@ -630,7 +630,10 @@ creating a waiver record.
 3. Blocking findings return to the coder as an explicit work ledger.
 4. The updated head is reviewed again.
 5. The run stops on unanimous approval, a terminal blocker, a clarification
-   request, unavailable required input, or the round limit.
+   request, unavailable required input, or the round limit. A reviewer that
+   fails (unavailable, rejected after re-asks, or incomplete) while another
+   reviewer blocked does not stop the round: its carried items stay unchanged,
+   it is never counted as approving, and it reviews again next round.
 
 Repeat `--reviewer` to require multiple approvals. Use `--review-parallel` when
 the reviewers have distinct workdirs and may run concurrently. Same-round

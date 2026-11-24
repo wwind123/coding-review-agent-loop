@@ -87,6 +87,7 @@ from .round_state import (
     startup_force_full_latch,
 )
 from .round_metadata import reset_pr_board_stamp, set_pr_board_stamp, reset_human_checks_stamp, set_human_checks_stamp
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, finalization_wording, force_select_failed_seats, peer_blocked_settlement, pending_failed_seat_retries
 from .human_evidence_mode import HUMAN_CHECKS_FLOW, HumanEvidenceRun
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
@@ -281,6 +282,7 @@ from .followups import (
     _publish_approved_followups,
 )
 from .round_metadata import (
+    bound_failed_reviewer_seats,
     ApprovedPlanContext,
     EVIDENCE_CONVERSION_PHASE,
     EVIDENCE_FREEZE_PHASE,
@@ -328,6 +330,7 @@ from .round_visibility import (
 from .legacy_machine_items import consumed_acknowledgement_disposition
 from .dispute_release import carries_dispute, round_dispute_release, stop_for_held_disputes
 from .unresolved_items import (
+    preserve_failed_seat_items,
     ClearedItemProgress,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     MERGE_CONFLICT_ITEM_ID,
@@ -2235,6 +2238,7 @@ def run_pr_loop(
             )
         reviewer_session_ids: dict[AgentName, str | None] = {}
         unavailable_reviewer_failures: dict[AgentName, AgentInvocationError] = {}
+        pr_force_reinvoke_seats: set[str] = set()  # failed seats of a continued round (#2129)
         configured_reviewers = reviewers(config)
         scheduler_capabilities = policy_capabilities(config.pr_review_policy)
         # Historical variable name retained for compatibility with helpers and
@@ -4690,6 +4694,12 @@ def run_pr_loop(
                             if name not in selected_reviewer_names
                         ),
                     )
+                elif pr_force_reinvoke_seats := pr_force_reinvoke_seats | pending_failed_seat_retries(historical_records):
+                    scheduler_decision = force_select_failed_seats(
+                        scheduler_decision, pr_force_reinvoke_seats, scheduler_contract.required_reviewers)
+                    selected_reviewer_names = set(scheduler_decision.selected_reviewers)
+                    log(config, f"Round {round_number}: re-invoking failed seat(s) {', '.join(sorted(pr_force_reinvoke_seats))}")
+                pr_force_reinvoke_seats = set()
                 if capture_scopes:
                     final_sweep = False
                     selected_reviewer_names = set(capture_scopes)
@@ -5521,6 +5531,11 @@ def run_pr_loop(
                             public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             retry_bound=_pr_retry_bound,
+                            settle_failures=peer_blocked_settlement(
+                                parse=_pr_publication_parsed, name=agent_display_name, retry_types=(AgentSettingsLockWaitTimeout,),
+                                blocks=lambda p: p.state == "blocking" and not _is_incomplete_pr_review(p),
+                                configured_reviewer_count=len(configured_reviewers), round_number=round_number,
+                                allowed_rounds=allowed_rounds, evidence_pass=evidence_pass),
                             unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
                             max_workers=None if config.review_parallel else 1,
                             # A spooled reviewer skipped the pre-review sync
@@ -5788,11 +5803,12 @@ def run_pr_loop(
                         )
                     )
                     if review_failure is not None:
-                        if (
-                            len(configured_reviewers) == 1
-                            or review_failure.failure_category in {None, "deterministic"}
-                        ):
+                        if len(configured_reviewers) == 1:
                             raise review_failure
+                        if review_failure.failure_category in {None, "deterministic"}:
+                            # The remaining seats still run (#2129); decided after the round.
+                            pr_fatal_errors.append((reviewer_name, review_failure))
+                            continue
                         unavailable_reviewer_failures[reviewer] = review_failure
                         category = review_failure.failure_category or "unknown"
                         log(
@@ -6093,11 +6109,25 @@ def run_pr_loop(
             same_model_note = same_model_panel_note(round_review_models)
             if same_model_note is not None:
                 log(config, f"Round {round_number}: {same_model_note}")
+            # Failed seats (#2129): their carried items are frozen against every
+            # healthy seat's disposition, live and (via the record) on resume.
+            round_failed_seats = {name: error for name, error in pr_fatal_errors} | {
+                agent_display_name(reviewer): error for reviewer, error in unavailable_reviewer_failures.items()}
+            prior_dispositions, frozen_failed_item_ids = preserve_failed_seat_items(
+                prior_unresolved_items, prior_dispositions, tuple(round_failed_seats))
+            pr_continuation_allowed = failed_seat_continuation_allowed(
+                configured_reviewer_count=len(configured_reviewers), blocking_seats=round_blocking_reviewer_names,
+                failed_seats=round_failed_seats, failures=round_failed_seats.values(),
+                round_number=round_number, allowed_rounds=allowed_rounds, evidence_pass=evidence_pass)
+            if pr_fatal_errors and not pr_round_parallel and not pr_continuation_allowed:
+                # A sequential stop keeps today's shape: no reconciliation record.
+                raise next((e for _n, e in pr_fatal_errors if isinstance(e, QuotaResetExceededError)), pr_fatal_errors[0][1])
             if (
                 (
                     pr_round_parallel
                     or selective_policy
                     or unavailable_reviewer_failures
+                    or pr_continuation_allowed
                     or same_model_note is not None
                 )
                 and not skip_reviewers_this_round
@@ -6114,14 +6144,18 @@ def run_pr_loop(
                     runner, config=config, pr_number=pr_number,
                     body=_attach_round_metadata(
                         f"PR review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
-                        f"Finalization {'stops' if pr_fatal_errors or unavailable_reviewer_failures else 'continues'} after reconciliation. "
+                        "Finalization " + finalization_wording(stops=bool(round_failed_seats), continuation_allowed=pr_continuation_allowed,
+                                                               failed=tuple(round_failed_seats)) + " after reconciliation. "
                         f"Historical approvals remain exact-head-bound; scheduler-policy calls avoided "
                         f"cumulatively: {scheduler_calls_avoided}. Phase: "
                         f"{scheduler_decision.phase if scheduler_decision is not None else 'full-board'}; "
                         f"force-full: {scheduler_recorded_force_full} "
                         f"(source: {scheduler_recorded_force_full_source or 'none'})."
-                        + (f" {same_model_note}." if same_model_note else ""),
+                        + (f" {same_model_note}." if same_model_note else "")
+                        + (" " + describe_failed_seats(round_failed_seats, prior_items=prior_unresolved_items,
+                                                       frozen_item_ids=frozen_failed_item_ids) if round_failed_seats else ""),
                         bound_pr_metadata(
+                            failed_reviewer_seats=bound_failed_reviewer_seats(tuple(round_failed_seats)),
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,
                             dispositions=tuple(
@@ -6166,7 +6200,10 @@ def run_pr_loop(
                     ),
                 )
 
-            if pr_fatal_errors:
+            if pr_fatal_errors and pr_continuation_allowed:
+                log(config, f"Round {round_number}: deferring the stop for failed seat(s) "
+                    f"{', '.join(round_failed_seats)}; another seat blocked this round")
+            elif pr_fatal_errors:
                 # Every healthy reviewer above was already applied (comment
                 # posted, items numbered, unavailable failures recorded) in
                 # configured order, so a rerun resumes them instead of
@@ -6336,7 +6373,7 @@ def run_pr_loop(
                 for item in future_followup_items.values()
             ]
             migration_validation = None
-            if not unavailable_reviewer_failures and any(
+            if not round_failed_seats and any(
                 _is_machine_obligation(item)
                 and item.obligation_kind == "alembic-migration"
                 for item in unresolved_items
@@ -6409,7 +6446,7 @@ def run_pr_loop(
             if (
                 carried_panel_ids
                 and must_fix_items
-                and not unavailable_reviewer_failures
+                and not round_failed_seats
                 and evidence_pass is None
                 and all(item.item_id in carried_panel_ids for item in must_fix_items)
                 and scheduler_decision is not None
@@ -6435,6 +6472,14 @@ def run_pr_loop(
                         "restarted primary approved. No coder follow-up or merge was attempted."
                     )
                 continue
+            if round_failed_seats and pr_continuation_allowed and must_fix_items:
+                log(config, f"Round {round_number}: continuing to the coder with failed seat(s) "
+                    f"{', '.join(round_failed_seats)}; their carried items stay unchanged and they are invoked again next round")
+                unavailable_reviewer_failures.clear()
+                pr_force_reinvoke_seats = set(round_failed_seats)
+                pr_round_spool.discard()
+            elif pr_fatal_errors:
+                raise next((e for _n, e in pr_fatal_errors if isinstance(e, QuotaResetExceededError)), pr_fatal_errors[0][1])
             if unavailable_reviewer_failures:
                 # Decide at the point of detection (#1129): a required reviewer
                 # that cannot be reached can never be satisfied by continuing.

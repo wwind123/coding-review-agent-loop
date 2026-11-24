@@ -536,11 +536,13 @@ def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishe
             )
         ],
     )
+    # The final allowed round keeps the stop even beside a blocking peer
+    # (#2129); earlier rounds continue to the coder instead.
     config = make_config(
         tmp_path,
         coder="gemini",
         reviewer=("codex", "claude"),
-        max_rounds=3,
+        max_rounds=1,
     )
 
     with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
