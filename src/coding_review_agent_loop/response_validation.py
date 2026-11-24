@@ -22,7 +22,6 @@ from .errors import (
     ReportWorkdirRefusal,
     NonRepairableEvidenceRejection,
     TESTS_RUN_WORKDIR_REASON,
-    IssueImplementationConflictError,
     SemanticPatchPayloadRejection,
     SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
@@ -105,7 +104,6 @@ from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
     _VALIDATION_TEST_TURN_CONTEXT,
     _TerminalNoPrImplementation,
-    _TerminalIssueImplementationConflict,
     architecture_impact_contract_unsatisfied,
 )
 
@@ -155,9 +153,7 @@ def _validate_issue_implementation_contract(
 
 def _implementation_terminal_diagnostic(result, text: str, *, repo: str) -> str:
     """Describe an already-selected terminal result without authenticating a PR."""
-    parsed = (result.parsed if isinstance(result, (
-        _TerminalIssueImplementationConflict, _TerminalNoPrImplementation,
-    )) else result)
+    parsed = result.parsed if isinstance(result, _TerminalNoPrImplementation) else result
     return terminal_response_diagnostic(text, repo=repo, parsed=parsed, terminal=True)
 
 
@@ -174,8 +170,8 @@ def _validate_issue_implementation_response(
     execution_catalog=None,
     architecture_status_mode: str,
     test_observations_mode: str = "degrade",
-) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
-    """Validate an implementation result and isolate the terminal conflict path."""
+) -> StructuredIssueImplementation | _TerminalNoPrImplementation:
+    """Validate an implementation result and isolate the terminal no-PR path."""
     if is_clarification_request(text):
         return _TerminalNoPrImplementation("clarification")
     surfaced_requirement_ids = render_coder_human_requirements_prompt_context(
@@ -183,29 +179,20 @@ def _validate_issue_implementation_response(
         requirement_scope="implementation requirements",
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
     ).surfaced_requirement_ids
-    try:
-        parsed = validate_structured_issue_implementation(
-            text,
-            # Unsurfaced dispositions are dropped before the conflict decision (#2114).
-            surfaced_requirement_ids=surfaced_requirement_ids,
-            required_architecture_impact_contract=(1 if require_architecture_impact else 0),
-            delivered_risk_test_matrix=delivered_risk_test_matrix,
-            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
-            required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
-            authoritative_test_observations=authoritative_test_observations,
-            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
-            execution_catalog=execution_catalog,
-            architecture_status_mode=architecture_status_mode,
-            test_observations_mode=test_observations_mode,
-        )
-    except IssueImplementationConflictError as exc:
-        parsed = exc.payload
-        if not isinstance(parsed, StructuredIssueImplementation):
-            raise AgentLoopError("Issue implementation conflict did not retain a typed payload.") from exc
-        # A conflict is terminal only after the normal acknowledgement and
-        # exact-ledger contract has been proven valid for this issue.
-        _validate_issue_implementation_contract(parsed, human_requirements=human_requirements)
-        return _TerminalIssueImplementationConflict(parsed)
+    parsed = validate_structured_issue_implementation(
+        text,
+        # Unsurfaced dispositions are dropped before any decision (#2114).
+        surfaced_requirement_ids=surfaced_requirement_ids,
+        required_architecture_impact_contract=(1 if require_architecture_impact else 0),
+        delivered_risk_test_matrix=delivered_risk_test_matrix,
+        delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+        required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
+        authoritative_test_observations=authoritative_test_observations,
+        delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+        execution_catalog=execution_catalog,
+        architecture_status_mode=architecture_status_mode,
+        test_observations_mode=test_observations_mode,
+    )
     if parsed is None:
         raise AgentLoopError(
             "Issue implementation response must use the required structured `issue_implementation` format."

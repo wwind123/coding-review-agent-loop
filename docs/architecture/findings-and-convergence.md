@@ -106,6 +106,16 @@ human-only evidence stays the deferred final barrier. Although its lifecycle is
 `repair_required`, a new head never clears it, so its stop message names
 current-head reviewer acknowledgement or coder `human_requirement_dispositions`
 instead of asking for a strictly different head.
+An issue implementation that reports a PR beside blocked surfaced signed
+requirements is a valid handoff, not a terminal conflict (#2120). Round-start
+reconciliation of that implementation carrier upserts the same acknowledgement
+obligation, listing each blocked surfaced requirement with the coder's reason
+(sanitized and bounded per entry and in total), so reviewers and the operator
+see it in the first review round. Decisions use only the surfaced tuple that
+`validate_human_requirement_dispositions` returns, so unsurfaced entries kept
+by historical decode never mint or appear in it. Clearing and merge behaviour
+is the #2083 path above; PR-loop coder follow-ups that report `blocked` still
+clear it as before.
 A coder that lists the tool-owned acknowledgement record in its addressed,
 remaining or disputed items has it stripped by the coder follow-up parser, with
 one accepted-response log line; the listing never clears or blocks the

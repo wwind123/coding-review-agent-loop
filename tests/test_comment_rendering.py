@@ -52,11 +52,11 @@ from coding_review_agent_loop.comment_rendering import (
     render_canonical_plan_steps,
 )
 from coding_review_agent_loop.execution_policy import _extract_current_deferred_stages
-from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
 from coding_review_agent_loop.response_validation import _validate_issue_implementation_response, render_public_agent_comment
 from coding_review_agent_loop.plan_first_loop import render_canonical_plan_revision
 from coding_review_agent_loop.protocol import (
     ChildStage,
+    StructuredIssueImplementation,
     DeferredStage,
     ReviewItemDisposition,
     UnresolvedReviewItem,
@@ -275,7 +275,7 @@ def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identi
     assert '"kind": "issue_implementation"' not in rendered
 
 
-def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
+def test_render_issue_implementation_pr_beside_blocked_requirement_reports_handoff():
     requirement = HumanReviewRequirement(
         source_type="Issue comment",
         author="maintainer",
@@ -299,14 +299,18 @@ def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
         human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
-    assert isinstance(result, _TerminalIssueImplementationConflict)
+    assert isinstance(result, StructuredIssueImplementation)
     rendered = _render_public_issue_implementation_comment(
-        result.parsed,
+        result,
         agent="claude",
         model_used="claude-test",
     )
 
-    assert "Rejected for handoff: reported PR #77 was not accepted" in rendered
+    # #2120: the PR is handed off; the blocked requirement goes to review.
+    assert "Pull request reported: #77." in rendered
+    assert "carried to review as the human-requirements acknowledgement item" in rendered
+    assert "Rejected for handoff" not in rendered
+    assert "The required integration is unavailable." in rendered
     assert "PR #77 was opened, but Requirement 1 is blocked." in rendered
     assert '"kind": "issue_implementation"' not in rendered
 

@@ -62,7 +62,6 @@ from coding_review_agent_loop.pr_loop_support import (
 )
 from coding_review_agent_loop.response_validation import _validate_issue_implementation_response
 from coding_review_agent_loop.round_metadata import PostedRoundMetadata, rebuild_resumed_coder_carrier
-from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
 from coding_review_agent_loop.unresolved_items import (
     _validate_coder_followup_response,
     _validate_review_response,
@@ -499,11 +498,14 @@ def test_issue_implementation_with_unsurfaced_blocked_disposition_is_not_a_confl
     )
     assert isinstance(accepted, StructuredIssueImplementation)
     assert accepted.pr_number == 77 and accepted.human_requirement_dispositions == ()
-    conflict = _validate_issue_implementation_response(
+    # A surfaced blocked disposition beside a PR is also a valid handoff (#2120).
+    handoff = _validate_issue_implementation_response(
         structured_issue_implementation(human_requirement_dispositions=[_blocked(SURFACED_ID)]),
         human_requirements=(REQUIREMENT,), architecture_status_mode="legacy",
     )
-    assert isinstance(conflict, _TerminalIssueImplementationConflict)
+    assert isinstance(handoff, StructuredIssueImplementation)
+    assert handoff.pr_number == 77
+    assert [item.requirement_id for item in handoff.human_requirement_dispositions] == [SURFACED_ID]
 
 
 def test_missing_coverage_conflicting_duplicates_and_reviewer_owned_ids_still_reject():

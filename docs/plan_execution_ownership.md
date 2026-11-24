@@ -38,7 +38,7 @@ use the same rule. Callback tests patch the entry point supplied by the caller.
 | Issue resume/recovery and dependency guard fixtures | Entry checks, approved execution, PR resume and child planning | Cover `issue_loop`, execution-policy helpers and `plan_execution` where each call path binds the dependency; keep the caller's planning callback patched. |
 | PR workflow fixtures | PR-owned context/authentication helpers; issue/plan transitions when reached | Preserve original PR owners, replace removed driver bindings with execution bindings so existing multi-owner replacements remain coherent on transitions. |
 | `test_same_model_note.py` shared `_POSTER_OWNERS` and conditional log owner | Review reconciliation publication and model-note logging | Retain the review owner: execution binds no publication function, and these fixtures intercept review logging before approval. |
-| `test_issue_implementation_managed_pr.py` loop-carried gate tuples | PR context, handoff publication and PR-loop gates after an implementation conflict | Replace removed driver bindings with execution; the existing listed-owner guard still checks every row of the loop. |
+| `test_issue_implementation_managed_pr.py` loop-carried gate tuples | PR context, handoff publication and PR-loop gates after an implementation handoff | Replace removed driver bindings with execution; the existing listed-owner guard still checks every row of the loop. |
 | Publication/architecture/review-round fixtures | `post_issue_comment` during review publication | Retain review and existing helper owners. Execution has no `post_issue_comment` binding; its handoff helpers own publication. |
 
 Other package modules merely importing a dependency are not presumed reachable.

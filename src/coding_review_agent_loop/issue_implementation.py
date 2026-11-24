@@ -131,7 +131,6 @@ from .architecture_contract import (
     _architecture_metadata_fields,
     _test_observation_degradation_fields,
     _TerminalNoPrImplementation,
-    _TerminalIssueImplementationConflict,
     _architecture_and_test_observation_mode_validators,
     _architecture_mode_validators,
     _architecture_document_paths_hook,
@@ -616,16 +615,14 @@ def _implement_approved_issue_unscoped(
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
     terminal_diagnostic = ""
-    if (isinstance(implementation_result, (_TerminalIssueImplementationConflict, _TerminalNoPrImplementation))
+    if (isinstance(implementation_result, _TerminalNoPrImplementation)
             or isinstance(implementation_result, StructuredIssueImplementation) and implementation_result.pr_number is None):
         terminal_diagnostic = capture_terminal_salvage(
             runner, config=implementation_config,
             context=SalvageContext(repo=implementation_config.repo, issue_number=issue_number,
                 scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE, agent=implementation_config.coder,
                 run_id=usage_context.run_id, approved_plan_hash=plan_hash),
-            reason=(implementation_result.parsed.summary
-                    if isinstance(implementation_result, _TerminalIssueImplementationConflict)
-                    else implementation_result.summary
+            reason=(implementation_result.summary
                     if isinstance(implementation_result, StructuredIssueImplementation)
                     else f"Coder returned a terminal {implementation_result.state} response without a PR."),
         )
@@ -633,23 +630,6 @@ def _implement_approved_issue_unscoped(
         terminal_diagnostic = _implementation_terminal_diagnostic(
             implementation_result, coder_output, repo=implementation_config.repo,
         ) + terminal_diagnostic
-    if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-        implementation_result = _TerminalIssueImplementationConflict(
-            _degrade_out_of_checkout_tests(
-                implementation_result.parsed, config=implementation_config
-            )
-        )
-        _post_structured_issue_implementation_terminal_comment(
-            runner,
-            config=implementation_config,
-            issue_number=issue_number,
-            parsed=implementation_result.parsed,
-            model_used=coder_response.model_used,
-        )
-        raise AgentLoopError(
-            "Coder implementation result was not accepted for handoff because a signed "
-            "human requirement is blocked." + terminal_diagnostic
-        )
     if isinstance(implementation_result, StructuredIssueImplementation):
         if implementation_result.pr_number is None:
             implementation_result = _degrade_out_of_checkout_tests(
@@ -773,33 +753,6 @@ def _implement_approved_issue_unscoped(
                     log(config, coverage_discard_note)
                 else:
                     reask_result = reask_response.marker_value
-                    if isinstance(reask_result, _TerminalIssueImplementationConflict):
-                        terminal_diagnostic = capture_terminal_salvage(
-                            runner, config=implementation_config,
-                            context=SalvageContext(repo=implementation_config.repo,
-                                issue_number=issue_number, scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
-                                agent=implementation_config.coder, run_id=usage_context.run_id,
-                                approved_plan_hash=plan_hash), reason=reask_result.parsed.summary,
-                        )
-                        terminal_diagnostic = _implementation_terminal_diagnostic(
-                            reask_result, reask_response.text, repo=implementation_config.repo,
-                        ) + terminal_diagnostic
-                        reask_result = _TerminalIssueImplementationConflict(
-                            _degrade_out_of_checkout_tests(
-                                reask_result.parsed, config=implementation_config
-                            )
-                        )
-                        _post_structured_issue_implementation_terminal_comment(
-                            runner,
-                            config=implementation_config,
-                            issue_number=issue_number,
-                            parsed=reask_result.parsed,
-                            model_used=reask_response.model_used,
-                        )
-                        raise AgentLoopError(
-                            "Coder implementation result was not accepted for handoff because a signed "
-                            "human requirement is blocked." + terminal_diagnostic
-                        )
                     if (
                         isinstance(reask_result, StructuredIssueImplementation)
                         and reask_result.pr_number == pr_number

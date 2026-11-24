@@ -6814,7 +6814,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     budget so the worker-dependent guidance sentences stay comparable.
     The baseline includes intentional reviewer-guidance updates from #1954
     and the remote-tracking review diff base from #1977, and the superseded
-    signed-source classification guidance from #2101.
+    signed-source classification guidance from #2101, and the keep-the-PR
+    blocked-requirement guidance from #2120.
     """
     import json as _golden_json
     import os as _golden_os
@@ -7539,3 +7540,54 @@ def test_review_and_coder_prompts_thread_superseded_ids(tmp_path):
     for prompt in coder_prompts:
         assert f"Superseded signed requirements (read-only, no action needed): `{rid}`." in prompt
         assert "Reviewer-owned signed requirements (read-only)" not in prompt
+
+
+# --- #2120: coder guidance keeps the positive PR beside a blocked requirement ---
+
+
+def test_coder_guidance_keeps_positive_pr_beside_blocked_signed_requirement(tmp_path):
+    """Matrix row `prompt-guidance-keeps-pr`."""
+    from coding_review_agent_loop.github import HumanReviewRequirement, IssueContext
+    from coding_review_agent_loop.repair import _build_repair_prompt
+
+    requirement = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-1",
+        body="The operator runs the canary on dev after deploy.",
+    )
+    issue_context = IssueContext(
+        number=56, repo="OWNER/REPO", title="Issue", body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56", comments=(),
+        human_requirements=(requirement,),
+    )
+    config = make_config(tmp_path)  # noqa: F405
+    coder_prompts = [
+        build_issue_prompt(56, config, issue_context=issue_context),
+        build_issue_implementation_prompt(56, "1. Fix it.", config, issue_context=issue_context),
+        build_completion_recovery_prompt(config, issue_context=issue_context, human_requirements=(requirement,)),
+    ]
+    repair_prompt = _build_repair_prompt(
+        "Not structured.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        expected_kind="issue_implementation",
+    )
+    forbidden = (
+        "discovered to be blocked after a PR",
+        "requires `pr_number: null`",
+        "may not contain a `blocked` signed-requirement disposition",
+        "set `pr_number` to `null`",
+        "remains a terminal conflict",
+        "blocked signed requirement discovered after a PR was opened",
+    )
+    for prompt in coder_prompts:
+        assert requirement.requirement_id in prompt
+        assert "stays beside the positive `pr_number` as a `blocked` disposition" in prompt
+        assert "reserve `pr_number: null`\nfor the no-PR result" in prompt
+        for phrase in forbidden:
+            assert phrase not in prompt, phrase
+    assert any("keeps the real positive `pr_number`" in prompt for prompt in coder_prompts)
+    assert "Use `pr_number: null` only for a no-PR result" in repair_prompt
+    assert "stays beside the positive PR as a `blocked`" in repair_prompt
+    for phrase in forbidden:
+        assert phrase not in repair_prompt, phrase

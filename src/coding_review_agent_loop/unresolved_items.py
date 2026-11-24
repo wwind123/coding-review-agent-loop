@@ -13,7 +13,6 @@ from dataclasses import dataclass, replace
 from .errors import (
     AgentLoopError,
     HumanDecisionRequiredError,
-    IssueImplementationConflictError,
     MissingPriorItemDispositionError,
     UnknownPriorItemDispositionError,
     prior_item_disposition_guidance,
@@ -23,6 +22,7 @@ from .prompt_context import released_dispute_pointer_lines
 from .prompt_support import (
     render_coder_human_requirements_prompt_context,
 )
+from .protocol_markers import sanitize_untrusted_prose
 from .protocol_common import (
     partition_item_id_buckets,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
@@ -31,6 +31,7 @@ from .protocol_common import (
     parse_human_requirements_acknowledgement,
 )
 from .protocol import (
+    HumanRequirementDisposition,
     ParsedPlanReview,
     ParsedReview,
     ReviewItemDisposition,
@@ -1112,6 +1113,43 @@ def split_acknowledgement_obligations(
     )
 
 
+IMPLEMENTATION_BLOCKED_REASON_MAX_CHARS = 600
+IMPLEMENTATION_BLOCKED_TOTAL_MAX_CHARS = 2400
+
+
+def _implementation_blocked_requirements_ack_text(blocked: Sequence[HumanRequirementDisposition]) -> str:
+    """Render blocked implementation dispositions as acknowledgement text (#2120).
+
+    The coder's reasons are untrusted prose: each is sanitized and bounded,
+    and the listing is bounded in total with an explicit truncation note.
+    The text never asks for a new head.
+    """
+    lines: list[str] = []
+    used = 0
+    omitted = 0
+    for item in blocked:
+        requirement_id = sanitize_untrusted_prose(item.requirement_id).strip()
+        reason = " ".join(sanitize_untrusted_prose(item.evidence or "").split())
+        if len(reason) > IMPLEMENTATION_BLOCKED_REASON_MAX_CHARS:
+            reason = reason[: IMPLEMENTATION_BLOCKED_REASON_MAX_CHARS - 1].rstrip() + "… (truncated)"
+        line = f"- {requirement_id}: {reason or '(no reason given)'}"
+        if lines and used + len(line) > IMPLEMENTATION_BLOCKED_TOTAL_MAX_CHARS:
+            omitted += 1
+            continue
+        lines.append(line)
+        used += len(line)
+    if omitted:
+        lines.append(f"- … {omitted} more blocked requirement(s) omitted from this listing (truncated).")
+    return (
+        "The coder reported these signed human requirements as blocked at issue implementation:\n"
+        + "\n".join(lines)
+        + "\nEvery required reviewer must acknowledge the in-scope signed human requirements at "
+        "the current head, or the coder must supply valid `human_requirement_dispositions`; "
+        "a new head is not required. Human-only requirements remain subject to the exact-head "
+        "human evidence barrier."
+    )
+
+
 def _clear_human_requirements_ack_item(
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> list[UnresolvedReviewItem]:
@@ -1147,8 +1185,6 @@ def _reconcile_human_requirements_ack_item(
     structured_followup: StructuredCoderFollowup | None = None
     try:
         structured_implementation = parse_historical_structured_issue_implementation(coder_output)
-    except IssueImplementationConflictError as exc:
-        structured_implementation = exc.payload
     except AgentLoopError:
         structured_implementation = None
 
@@ -1160,7 +1196,9 @@ def _reconcile_human_requirements_ack_item(
 
     if isinstance(structured_implementation, StructuredIssueImplementation):
         try:
-            validate_human_requirement_dispositions(
+            # The historical parse keeps unsurfaced entries (#2114); only the
+            # surfaced-only tuple returned here may drive the decision.
+            kept = validate_human_requirement_dispositions(
                 structured_implementation.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 context="issue_implementation.human_requirement_dispositions",
@@ -1179,6 +1217,15 @@ def _reconcile_human_requirements_ack_item(
                 unresolved_items,
                 source_round=source_round,
                 text=str(exc),
+            )
+        blocked = [item for item in kept if item.disposition == "blocked"]
+        if blocked:
+            # A valid implementation handoff beside blocked signed requirements
+            # carries them to review as the acknowledgement obligation (#2120).
+            return _upsert_human_requirements_ack_item(
+                unresolved_items,
+                source_round=source_round,
+                text=_implementation_blocked_requirements_ack_text(blocked),
             )
         return _clear_human_requirements_ack_item(unresolved_items)
 

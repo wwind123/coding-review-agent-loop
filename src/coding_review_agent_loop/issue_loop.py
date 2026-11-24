@@ -108,7 +108,6 @@ from .architecture_contract import (
     _architecture_metadata_fields,
     _test_observation_degradation_fields,
     _TerminalNoPrImplementation,
-    _TerminalIssueImplementationConflict,
     _architecture_and_test_observation_mode_validators,
     _architecture_mode_validators,
     _architecture_document_paths_hook,
@@ -559,16 +558,14 @@ def run_issue_loop(
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
         terminal_diagnostic = ""
-        if (isinstance(implementation_result, (_TerminalIssueImplementationConflict, _TerminalNoPrImplementation))
+        if (isinstance(implementation_result, _TerminalNoPrImplementation)
                 or isinstance(implementation_result, StructuredIssueImplementation) and implementation_result.pr_number is None):
             terminal_diagnostic = capture_terminal_salvage(
                 runner, config=config,
                 context=SalvageContext(repo=config.repo, issue_number=issue_number,
                     scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE, agent=config.coder,
                     run_id=usage_context.run_id, approved_plan_hash=None),
-                reason=(implementation_result.parsed.summary
-                    if isinstance(implementation_result, _TerminalIssueImplementationConflict)
-                    else implementation_result.summary
+                reason=(implementation_result.summary
                     if isinstance(implementation_result, StructuredIssueImplementation)
                     else f"Coder returned a terminal {implementation_result.state} response without a PR."),
             )
@@ -576,26 +573,6 @@ def run_issue_loop(
             terminal_diagnostic = _implementation_terminal_diagnostic(
                 implementation_result, coder_output, repo=config.repo,
             ) + terminal_diagnostic
-        if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-            implementation_result = _TerminalIssueImplementationConflict(
-                _degrade_out_of_checkout_tests(implementation_result.parsed, config=config)
-            )
-            validate_test_observation_citations_within_workdir(
-                implementation_result.parsed.test_observations,
-                assigned_workdir=active_workdir(config),
-                dependency_hint=dependency_remedy(config, active_workdir(config)),
-            )
-            _post_structured_issue_implementation_terminal_comment(
-                runner,
-                config=config,
-                issue_number=issue_number,
-                parsed=implementation_result.parsed,
-                model_used=coder_response.model_used,
-            )
-            raise AgentLoopError(
-                "Coder implementation result was not accepted for handoff because a signed "
-                "human requirement is blocked." + terminal_diagnostic
-            )
         if isinstance(implementation_result, StructuredIssueImplementation):
             if implementation_result.pr_number is None:
                 implementation_result = _degrade_out_of_checkout_tests(
