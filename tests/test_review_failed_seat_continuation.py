@@ -639,7 +639,8 @@ def test_plan_sequential_round_without_failures_posts_no_reconciliation_record(t
     assert not [r for r in _plan_records(runner) if r.phase == "reconciliation"]
 
 
-def test_plan_sequential_resume_retries_the_failed_seat_in_the_same_round(tmp_path):
+@pytest.mark.parametrize("rerun_parallel", [False, True], ids=["rerun-sequential", "rerun-parallel"])
+def test_plan_sequential_resume_retries_the_failed_seat_in_the_same_round(tmp_path, rerun_parallel):
     """Row pr-resume-after-continued-round (plan, sequential): interrupted before the planner record."""
     claude, codex, gemini = _plan_round_one()
     codex.append(_codex_plan_blocks_and_clears_gemini())
@@ -655,8 +656,9 @@ def test_plan_sequential_resume_retries_the_failed_seat_in_the_same_round(tmp_pa
         {"item_id": "item-3", "disposition": "resolved"},
     ]))
     start = len(runner.commands)
+    rerun = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=rerun_parallel)
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        run_issue_loop(runner, issue_number=56, config=rerun, plan_first=True)
 
     records = _plan_records(runner)
     rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"claude", "codex", "gemini"}]
@@ -850,7 +852,8 @@ def test_history_replay_and_head_advance_recovery_apply_the_freeze(failed_seats)
     assert bool(aggregate["item-2"]) is (not failed_seats)
 
 
-def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("final_parallel", [False, True], ids=["final-sequential", "final-parallel"])
+def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path, monkeypatch, final_parallel):
     """Row pr-resume-after-continued-round (plan): a retry interrupted before its fresh record.
 
     Gemini failed in round 2 (recorded). The rerun retries Gemini, which now
@@ -890,8 +893,11 @@ def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path
         {"item_id": "item-3", "disposition": "resolved"},
     ]))
     start = len(runner.commands)
+    # The final restart may run in either mode: eligibility comes from the
+    # recorded (sequential) round, not from this invocation's flag.
+    final = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=final_parallel)
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        run_issue_loop(runner, issue_number=56, config=final, plan_first=True)
 
     rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"claude", "codex", "gemini"}]
     assert rerun_agents[0] == "claude"  # no reviewer re-invoked; the planner revision runs

@@ -2665,13 +2665,15 @@ def _run_plan_first_loop_body(
         # Reuse existing obligations; publish no approvals for a known-invalid plan.
         if ownership_review_failure is not None:
             round_reviewers = tuple(r for r in configured_reviewers if agent_display_name(r) in resumed_by_name)
-        # A sequential round whose reconciliation record names failed seats
-        # (#2129) is not rolled over when only those seats are missing: the
-        # rerun re-invokes them in the same round, resumes the healthy reviews,
-        # and posts a fresh reconciliation record for the retried settlement.
-        # Parallel rounds keep the rollover: a same-round retry would let the
-        # failed seat read its peers' published verdicts.
-        plan_failed_seat_retry = not config.review_parallel and plan_round_retries_failed_seats(
+        # A round whose reconciliation record names failed seats (#2129) and
+        # whose reviews were recorded sequentially is not rolled over when
+        # only those seats are missing: the rerun re-invokes them in the same
+        # round, resumes the healthy reviews, and posts a fresh reconciliation
+        # record. An interrupted replacement settlement is finished the same
+        # way. Eligibility comes from the recorded round, never from this
+        # invocation's parallel flag; rounds recorded in parallel keep the
+        # rollover (a same-round retry would read published peer verdicts).
+        plan_failed_seat_retry = plan_round_retries_failed_seats(
             current_resume, round_reviewers=[agent_display_name(r) for r in round_reviewers],
             resumed=resumed_by_name, records=lambda: plan_history_records(),
             subject=current_plan_subject,
