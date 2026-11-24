@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/round_closure.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/round_closure.py`, `src/coding_review_agent_loop/round_closure_writer.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 `round_metadata.py` owns round value types, semantic validation, field codecs,
 diagnostic transport and recovery, board stamp contexts, attach/strip helpers,
@@ -178,46 +178,16 @@ not reconciliation or approval. Parallel-review peer visibility and partial-roun
 recovery use the same latest same-head, same-round boundary in the history being
 read: earlier publications are historical context, and neither they nor the
 boundary are deletion targets. Publications after the boundary remain peers.
-A posted review that resume rejects keeps the deletion-only refusal, but the
-refusal names the failing predicate (changed signed requirement set, reconciled
-round, approved-plan, acquisition or seat-binding change), except where the
-classification-only resume below admits it (#2035), or where the signed set
-only grew (#2054).
+A posted review that resume rejects (and the classification-only resume below,
+#2035, does not admit) is a publication that the closed-incomplete writer below
+closes, with the failing predicate as its cause.
 
-When every published review of an unreconciled same-head round is
-rejected only because the signed requirement set grew
-since publication (a strict digest superset,
-with the same round, head, seat binding, approved plan and acquisition
-identity), and every such review proves its publication unedited, resume posts
-a tool-owned `signed-input-supersession` Orchestrator summary before any
-scheduling record or reviewer launch, then takes the closed-round rollover
-into round N+1 (`signed_input_supersession.py`). A review proves it is
-unedited either through its frozen spool carrier on this host, which must
-classify `complete` against the actor-bound listing with exactly the record's
-anchor and sidecar comment IDs, or, without a carrier, through GitHub edit
-history showing that its anchor and sidecars were never edited. A partly
-public carrier of another reviewer, a malformed or legacy spool record, an
-unreadable history, an edit, a withdrawn or edited signed source (an ID
-missing from the live set), a capture-scoped round, an evidence boundary or a
-recovery, conflict, evidence or conversion pass keeps today's refusal. The
-record carries the ledger resume rebuilt for round N (its input ledger plus the
-durable evidence requests resume already restores for reviews invalidated by
-new input, so a signed answer can clear them, #1922), the superseded reviewers
-(agent, anchor comment ID, integrity route), the old and new surfaced IDs and
-the item-number high-water mark. On a board of two or more reviewers one
-public review is already a peer for every reviewer still to launch. A
-one-reviewer board rolls over only when its published review's carrier is
-still spooled, because that carrier cannot be resumed against the grown set;
-without a carrier its fresh same-round turn already applies. A malformed payload never closes a round. On
-resume the record closes round N like a reconciliation with no completed
-reviews, so an interrupted rerun rolls over without a second record. Reviewer
-records it supersedes are inert for resume, panel evidence and scheduler
-history (`drop_inert_post_reconciliation_checkpoints`); approval carry already
-rejects them. They stay on GitHub as history, add no votes, dispositions or
-new findings, and partial-round recovery lists no deletion target for the
-round. The rollover consumes one round of the budget: with none left the
-ordinary round-limit stop fires and nothing is posted. Managed-CI
-authorization and qualification records are untouched.
+Legacy (#2054, read-only since #2064 stage 2): a tool-owned
+`signed-input-supersession` Orchestrator summary closed an unreconciled round
+whose published reviews were all rejected only because the signed requirement
+set grew (`signed_input_supersession.py`, unit-tested but no longer called). A
+malformed payload never closes a round; an existing record keeps closing round N
+like a reconciliation with no completed reviews, its reviews inert history.
 
 A tool-owned `round-closed-incomplete` Orchestrator summary (#2064,
 `round_closure.py`) closes a PR or plan round in which some reviews were
@@ -254,7 +224,36 @@ approval with a non-qualifying entry, exactly as the PR approval reader does
 (its live callers pass raw history, which carry projects itself),
 so resume rolls
 over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
-history and never approve. In this stage nothing writes the record yet.
+history and never approve.
+
+Since stage 2 (#2080) `round_closure_writer.py` writes the record on both
+flows. At round start, before any spool preflight, plan checkpoint or launch,
+`decide_round_closure` closes round N when it holds any publication and any
+configured reviewer needs a fresh round-N turn. A publication is a resumed
+withheld-round publication of the launch batch, a reviewer's own
+publication-phase review that resume rejected, a published pre-panel-unqualified
+review (PR), or a spool record that may be public (a carrier with public bodies
+on a complete actor-bound listing, a malformed record, or a structurally
+failing carrier). A verified unpublished carrier is not one (if invalid it is
+discarded and its reviewer runs fresh). A rejected own review always needs a
+fresh turn; others need one without a settled failure or valid spooled response.
+Reconciled rounds, failed-seat retries, recovery, conflict, evidence and
+conversion passes, the approved-plan shortcut and plan ownership failures are
+excluded, and a rejected sequential (authoritative) record keeps its same-round
+re-run. `close_incomplete_round` rebuilds published reviews with helpers shared
+with resume and settlement, by published verdict: minted IDs are kept,
+provisional checkpoints are numbered above the high-water mark, then evidence
+obligations. It posts before the
+spool is discarded; the #1553 or reconciled-plan rollover continues to N+1, and
+at `--max-rounds` the ordinary limit stop follows the record. Former refusal
+sites raise `RoundIncompleteSignal` before any launch; the loop's handler uses
+the same writer (a reconciled round re-enters its own rollover; an excluded pass
+stops fail-closed). Carrier stops route by category: read failures, and an
+unadmitted conversion boundary, are retryable `RoundStateReadError` stops with
+nothing posted; structural failures close the round. The partial-round refusal
+and supersession writer never fire; nothing deletes a comment. A
+reconciled round with a blocking pre-panel review keeps its pre-panel stop.
+Stage 3 removes the retained deletion-list, carrier and classification code.
 It reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
 round and history-wide numbering into a fresh review on the new head without

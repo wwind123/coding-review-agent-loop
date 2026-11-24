@@ -652,14 +652,16 @@ def test_published_malformed_association_is_reparsed_on_same_round_resume_withou
     codex_record = next(r for r in _pr_records(runner) if r.metadata.agent == "Codex")
     assert '"requirement_id": "R1"' in codex_record.metadata.canonical_reviewer_response
     reparsed = []
-    real_parse = pr_loop.parse_structured_pr_review
+    # Resume rebuilds published reviews through the shared reconstruction helper (#2064).
+    from coding_review_agent_loop import round_closure_writer
+    real_parse = round_closure_writer.parse_structured_pr_review
 
     def spy(text, **kwargs):
         result = real_parse(text, **kwargs)
         reparsed.append((kwargs.get("parse_requirement_evidence"), result.requirement_evidence if result else None))
         return result
 
-    monkeypatch.setattr(pr_loop, "parse_structured_pr_review", spy)
+    monkeypatch.setattr(round_closure_writer, "parse_structured_pr_review", spy)
     calls_before = len(_reviewer_calls(runner))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert reparsed and all(flag is False and evidence == () for flag, evidence in reparsed)

@@ -1,10 +1,13 @@
-"""Signed-input growth rolls a published PR round over instead of refusing (#2054).
+"""Signed-input growth now closes a published PR round under the one rule (#2054, #2064).
 
 The sequence from llm-dialectic PR #2310: every review of a round is published,
 the conflicting-classification stop tells the operator to post a follow-up
 signed comment, and the resume after that comment must open a fresh round
-rather than ask for the round's reviews to be deleted.  Edits, withdrawals and
-every other rejection keep the partial-round refusal.
+rather than ask for the round's reviews to be deleted.  Since #2064 stage 2 the
+round-wide closure rule handles this and every other rejection reason: one
+closed-incomplete record closes the round, its published findings carry
+forward as prior items, and no new signed-input supersession record is
+posted.  A legacy supersession record still closes its round.
 """
 
 import dataclasses
@@ -18,8 +21,8 @@ from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.github import _parse_pr_human_requirements
 from coding_review_agent_loop.publication_resume import PublicationCarrier, classify_frozen_sequence
-from coding_review_agent_loop.review_rounds import PartialReviewRoundError
 from coding_review_agent_loop.review_spool import ReviewRoundSpool
+from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
 from coding_review_agent_loop.signed_input_record import (
     SIGNED_INPUT_SUPERSESSION_PHASE,
     decode_supersession_payload,
@@ -82,17 +85,19 @@ def _follow_hint(runner):
         _signed(f"The policy run is accepted for {HEAD}; keep the policy check code-actionable.", 2))
 
 
-def _queue_fresh_round(runner):
+def _queue_fresh_round(runner, *, carried=("item-2",)):
     """Round 2: Codex accepts its carried evidence request (item-1) by citing the
-    added signed answer; both reviewers classify against the grown set."""
+    added signed answer; both reviewers classify against the grown set and
+    dispose of the round-1 findings the closure carried forward."""
     old, new = _rids(runner)[0], _rids(runner)[-1]
     answer = {"item_id": "item-1", "disposition": "resolved", "note": "The signed answer accepts the run.",
               "evidence_requirement_ids": [new]}
+    fixed = [{"item_id": item, "disposition": "resolved", "note": "The policy check is fixed."} for item in carried]
     runner.codex_outputs = [_classified_review(
-        [_association(old, "code"), _association(new, "code")], hr=True, dispositions=[answer])]
+        [_association(old, "code"), _association(new, "code")], hr=True, dispositions=[answer, *fixed])]
     runner.gemini_outputs = [_classified_review(
         [_association(old, "code"), _association(new, "code")], reviewer="Google Gemini", hr=True,
-        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}])]
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}, *fixed])]
 
 
 def _agent_commands(runner, start=0):
@@ -107,15 +112,17 @@ def _supersessions(runner):
     return [r for r in _pr_records(runner) if r.metadata.phase == SIGNED_INPUT_SUPERSESSION_PHASE]
 
 
-def _spy_supersession_post(monkeypatch, runner):
-    """Record how many reviewer agents had run when the supersession record was posted."""
+def _closures(runner):
+    return [r for r in _pr_records(runner) if r.metadata.phase == ROUND_CLOSED_INCOMPLETE_PHASE]
+
+
+def _spy_closure_post(monkeypatch, runner):
+    """Record how many reviewer agents had run when the closure record was posted."""
     seen = []
     real = pr_loop.post_pr_comment
 
     def spy(*args, **kwargs):
-        if SIGNED_INPUT_SUPERSESSION_PHASE in str(kwargs.get("body", "")) or (
-            "superseded by new signed input" in str(kwargs.get("body", ""))
-        ):
+        if "closed, incomplete" in str(kwargs.get("body", "")):
             seen.append(len(_agent_commands(runner)))
         return real(*args, **kwargs)
 
@@ -127,21 +134,49 @@ class _Interrupted(Exception):
     pass
 
 
-def _interrupt_after_supersession(runner, config, monkeypatch):
-    """Post the supersession record, then stop before any round-2 work."""
+def _interrupt_after_closure(runner, config, monkeypatch):
+    """Post the closed-incomplete record, then stop before any round-2 work."""
     real = pr_loop.post_pr_comment
 
     def post(*args, **kwargs):
         real(*args, **kwargs)
-        if "superseded by new signed input" in str(kwargs.get("body", "")):
+        if "closed, incomplete" in str(kwargs.get("body", "")):
             raise _Interrupted()
 
     with monkeypatch.context() as patch:
         patch.setattr(pr_loop, "post_pr_comment", post)
         with pytest.raises(_Interrupted):
             run_pr_loop(runner, pr_number=77, config=config)
-    (record,) = _supersessions(runner)
+    (record,) = _closures(runner)
     assert _pr_records(runner)[-1].index == record.index
+    return record
+
+
+def _post_legacy_supersession(runner, config):
+    """A legacy #2054 supersession record, as an older release wrote it."""
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
+    resumed = _resume_pr_round(comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config))
+    reviews = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 1]
+    previous = sorted({str(i) for r in reviews for i in r.metadata.surfaced_reviewer_requirement_ids})
+    current = sorted(_rids(runner))
+    payload = decode_supersession_payload({
+        "round": 1, "head": HEAD,
+        "superseded": [{"agent": r.metadata.agent, "comment_id": None, "route": "edit-history"} for r in reviews],
+        "previous_requirement_ids": previous, "requirement_ids": current,
+        "item_number_high_water": resumed.next_unresolved_item_number - 1,
+    }, round_number=1, subject=HEAD)
+    assert payload is not None
+    metadata = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=HEAD,
+        prior_items=resumed.prior_items, phase=SIGNED_INPUT_SUPERSESSION_PHASE,
+        surfaced_reviewer_requirement_ids=tuple(current), signed_input_supersession=payload,
+    )
+    pr_loop.post_pr_comment(runner, config=config, pr_number=77, body=_attach_round_metadata(
+        "Review round 1 is superseded by new signed input. No comment needs to be deleted.", metadata))
+    (record,) = _supersessions(runner)
     return record
 
 
@@ -154,177 +189,159 @@ def _round_spool(tmp_path, config, round_number=1):
         config, surface="pr", number=77, round_number=round_number, subject=HEAD)
 
 
-def _assert_refused_without_rollover(runner, config, before_commands, match="Delete these",
-                                     error=PartialReviewRoundError):
-    with pytest.raises(error, match=match) as refusal:
-        run_pr_loop(runner, pr_number=77, config=config)
+def _assert_closed_and_rolled_over(runner, before_commands, *, published=("Codex", "Gemini")):
+    """One closed-incomplete record closed round 1 and round 2 ran the full board."""
+    (record,) = _closures(runner)
+    payload = record.metadata.round_closure
+    assert record.metadata.round_number == 1 and record.metadata.subject == HEAD
+    assert [e["agent"] for e in payload["published"]] == sorted(published)
+    assert all(isinstance(e["comment_id"], int) for e in payload["published"])
+    assert {e["agent"] for e in payload["unreplayable"]} == set(published)
     assert not _supersessions(runner)
-    assert _agent_commands(runner, before_commands) == []
-    return str(refusal.value)
+    later = [r for r in _pr_records(runner) if r.index > record.index]
+    assert later and all(r.metadata.round_number >= 2 for r in later)
+    round_two = [r for r in later if r.metadata.role == "reviewer"]
+    assert sorted({r.metadata.agent for r in round_two}) == ["Codex", "Gemini"]
+    assert sorted(_agent_commands(runner, before_commands))[:2] == ["codex", "gemini"]
+    assert _no_deletes(runner)
+    assert not any("Delete these" in c or "partial-round recovery" in c for c in runner.comments)
+    return record
 
 
-# --- growth-after-conflict-stop ---------------------------------------------
+# --- signed-growth-closure ----------------------------------------------------
 
 
-@pytest.mark.parametrize("carrier", [False, True], ids=["edit-history", "carrier"])
-def test_growth_after_conflict_stop_opens_round_two_without_deletion(tmp_path, monkeypatch, carrier):
+@pytest.mark.parametrize("carrier", [False, True], ids=["no-carrier", "carrier"])
+def test_growth_after_conflict_stop_closes_round_one_without_deletion(tmp_path, monkeypatch, carrier):
+    """`signed-growth-closure` (#2064): a closed-incomplete record, not a supersession record."""
     runner, config = _conflict_stop(tmp_path, monkeypatch, carrier=carrier)
     round_one = [c["body"] for c in runner.pr_payload["comments"]]
     _follow_hint(runner)
     _queue_fresh_round(runner)
-    before = len(_agent_commands(runner))
-    seen = _spy_supersession_post(monkeypatch, runner)
+    before = len(runner.commands)
+    seen = _spy_closure_post(monkeypatch, runner)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    (record,) = _supersessions(runner)
-    payload = record.metadata.signed_input_supersession
-    assert record.metadata.round_number == 1 and record.metadata.subject == HEAD
+    record = _assert_closed_and_rolled_over(runner, before)
     # The carried ledger is round 1's, plus Codex's durable evidence request
     # that resume restores for a review invalidated by new input (#1922).
     assert [(i.item_id, i.reviewer, i.obligation_kind) for i in record.metadata.prior_items] == [
         ("item-1", "Codex", "human-exact-head-evidence")]
-    assert {e["agent"] for e in payload["superseded"]} == {"Codex", "Gemini"}
-    assert {e["route"] for e in payload["superseded"]} == {"carrier" if carrier else "edit-history"}
-    assert set(payload["previous_requirement_ids"]) < set(payload["requirement_ids"]) == set(_rids(runner))
+    # Gemini's published blocker carries forward as a fresh, never-reused item;
+    # Codex's evidence request is already item-1, so no duplicate obligation.
+    assert [(i.item_id, i.reviewer, i.text) for i in record.metadata.new_items] == [
+        ("item-2", "Gemini", "Fix the policy check.")]
+    assert record.metadata.round_closure["evidence_obligations"] == []
+    assert record.metadata.round_closure["item_number_high_water"] == 2
     # Save before emit: posted before any round-2 reviewer launch.
-    assert seen == [before]
-    later = [r for r in _pr_records(runner) if r.index > record.index]
-    assert later and all(r.metadata.round_number >= 2 for r in later)
-    round_two = [r for r in later if r.metadata.role == "reviewer"]
-    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
-    assert all(set(r.metadata.surfaced_reviewer_requirement_ids) == set(_rids(runner)) for r in round_two)
-    assert sorted(_agent_commands(runner, 0)[before:]) == ["codex", "gemini"]
+    assert seen == [len(_agent_commands(runner)) - len(_agent_commands(runner, before))]
+    reconciliation = next(r for r in _pr_records(runner)
+                          if r.index > record.index and r.metadata.phase == "reconciliation")
+    assert reconciliation.metadata.round_number == 2
+    assert {i.item_id for i in reconciliation.metadata.prior_items} == {"item-1", "item-2"}
     # Round-1 comments are untouched and nothing was deleted or asked for.
     assert [c["body"] for c in runner.pr_payload["comments"][:len(round_one)]] == round_one
-    assert _no_deletes(runner)
-    assert not any("Delete these" in c for c in runner.comments)
-    # Superseded reviews add no dispositions, votes or new findings: round 2
-    # starts from the carried ledger and settles it from its own reviews.
-    reconciliation = next(r for r in later if r.metadata.phase == "reconciliation")
-    assert reconciliation.metadata.round_number == 2
-    assert reconciliation.metadata.prior_items == record.metadata.prior_items
-    assert not any("Fix the policy check." in i.text for i in reconciliation.metadata.prior_items)
-    if carrier:
-        # The round-1 carriers stay as integrity evidence.
-        spool = _round_spool(tmp_path, config)
-        assert spool.publication_state("Codex")[0] == "carrier"
-        assert spool.publication_state("Gemini")[0] == "carrier"
-    else:
-        assert getattr(runner, "edit_history_calls", 0) >= 1
 
 
-def test_superseded_reviews_are_inert_for_approval_panel_and_resume(tmp_path, monkeypatch):
-    from coding_review_agent_loop.round_state import (
-        _resume_pr_round, drop_inert_post_reconciliation_checkpoints, superseded_review_indexes,
-    )
-    from pr_loop_test_helpers import _pr_records as records
+def test_interrupt_after_closure_record_resumes_into_round_two(tmp_path, monkeypatch):
+    """`closure-idempotent` (PR): a rerun after the record never posts a second one."""
     runner, config = _conflict_stop(tmp_path, monkeypatch)
     _follow_hint(runner)
-    _interrupt_after_supersession(runner, config, monkeypatch)
-    history = records(runner)
-    (record,) = _supersessions(runner)
-    superseded = superseded_review_indexes(history)
-    assert superseded == {r.index for r in history if r.metadata.role == "reviewer"}
-    assert not superseded & {r.index for r in drop_inert_post_reconciliation_checkpoints(history)}
+    _interrupt_after_closure(runner, config, monkeypatch)
+    _queue_fresh_round(runner)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_closures(runner)) == 1
+    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
+    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
+    assert _no_deletes(runner)
+    assert not any("Delete these" in c for c in runner.comments)
+
+
+def test_closed_reviews_are_inert_for_approval_panel_and_resume(tmp_path, monkeypatch):
+    """`closed-review-no-approval` on the live writer: closed reviews never approve or resume."""
+    from coding_review_agent_loop.code_approval import _latest_pr_approved_reviews_for_head
+    from coding_review_agent_loop.round_closure import closed_round_reviewer_indexes
+    from coding_review_agent_loop.round_state import _resume_pr_round, drop_inert_post_reconciliation_checkpoints
+
+    runner, config = _conflict_stop(tmp_path, monkeypatch)
+    _follow_hint(runner)
+    _interrupt_after_closure(runner, config, monkeypatch)
+    history = _pr_records(runner)
+    closed = closed_round_reviewer_indexes(history, flow="pr")
+    assert closed == {r.index for r in history if r.metadata.role == "reviewer"}
+    assert not closed & {r.index for r in drop_inert_post_reconciliation_checkpoints(history)}
     comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
     resumed = _resume_pr_round(comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config))
-    assert resumed.round_number == 1 and resumed.reconciled
-    assert resumed.completed_reviews == ()
-    assert resumed.reconciliation_record.metadata.phase == SIGNED_INPUT_SUPERSESSION_PHASE
-    # Approval carry never admits a review that misses the grown signed set.
+    assert resumed.round_number == 1 and resumed.reconciled and resumed.completed_reviews == ()
+    assert resumed.reconciliation_record.metadata.phase == ROUND_CLOSED_INCOMPLETE_PHASE
+    # Withdrawing the added source makes Codex's approval cover the live set
+    # again, yet the closed round's approval never carries.
+    added = next(i for i, c in enumerate(runner.pr_payload["comments"])
+                 if "keep the policy check code-actionable" in c["body"])
+    del runner.pr_payload["comments"][added]
     requirements = _parse_pr_human_requirements(runner.pr_payload)
-    approved = [r for r in history if r.metadata.role == "reviewer" and r.metadata.state == "approved"]
-    assert approved and not any(
-        response_validation._resumed_pr_reviewer_matches_requirements(r, requirements) for r in approved)
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
+    codex = next(r for r in _pr_records(runner) if r.metadata.agent == "Codex" and r.metadata.role == "reviewer")
+    assert codex.metadata.state == "approved"
+    assert response_validation._resumed_pr_reviewer_matches_requirements(codex, requirements)
+    assert _latest_pr_approved_reviews_for_head(
+        comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config),
+        human_requirements=requirements) == {}
 
 
-def test_single_published_review_on_two_reviewer_board_rolls_over(tmp_path, monkeypatch):
+def test_legacy_supersession_record_still_closes_its_round(tmp_path, monkeypatch):
+    """Migration (#2064): an existing #2054 record keeps closing its round for one release."""
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    runner, config = _conflict_stop(tmp_path, monkeypatch)
+    _follow_hint(runner)
+    record = _post_legacy_supersession(runner, config)
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
+    resumed = _resume_pr_round(comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config))
+    assert resumed.round_number == 1 and resumed.reconciled and resumed.completed_reviews == ()
+    assert resumed.reconciliation_record.metadata.phase == SIGNED_INPUT_SUPERSESSION_PHASE
+    # The legacy record settles no findings: round 2 starts from its ledger.
+    _queue_fresh_round(runner, carried=())
+    before = len(runner.commands)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_supersessions(runner)) == 1 and not _closures(runner)
+    later = [r for r in _pr_records(runner) if r.index > record.index]
+    assert sorted({r.metadata.agent for r in later if r.metadata.role == "reviewer"}) == ["Codex", "Gemini"]
+    assert all(r.metadata.round_number >= 2 for r in later)
+    assert sorted(_agent_commands(runner, before)) == ["codex", "gemini"]
+    assert _no_deletes(runner)
+
+
+def test_single_published_review_on_two_reviewer_board_closes(tmp_path, monkeypatch):
     """Only Codex published before the stop; Gemini never began.  Gemini's turn
-    would sit beside Codex's public review, so today's path refuses; pure growth
-    must roll over instead (#2054 review item-1)."""
+    would sit beside Codex's public review, so the round closes."""
     runner, config = _conflict_stop(tmp_path, monkeypatch)
     gemini = next(r for r in _pr_records(runner) if r.metadata.agent == "Gemini")
     del runner.pr_payload["comments"][gemini.index]
     assert [r.metadata.agent for r in _pr_records(runner) if r.metadata.role == "reviewer"] == ["Codex"]
     _follow_hint(runner)
-    _queue_fresh_round(runner)
-    before = len(_agent_commands(runner))
+    _queue_fresh_round(runner, carried=())
+    before = len(runner.commands)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    (record,) = _supersessions(runner)
-    assert [e["agent"] for e in record.metadata.signed_input_supersession["superseded"]] == ["Codex"]
+    (record,) = _closures(runner)
+    payload = record.metadata.round_closure
+    assert [e["agent"] for e in payload["published"]] == ["Codex"]
+    assert {e["agent"] for e in payload["unreplayable"]} == {"Codex", "Gemini"}
     round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
     assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
-    assert sorted(_agent_commands(runner)[before:]) == ["codex", "gemini"]
+    assert sorted(_agent_commands(runner, before)) == ["codex", "gemini"]
     assert _no_deletes(runner)
     assert not any("Delete these" in c for c in runner.comments)
 
 
-def test_withdrawn_source_after_boundary_never_revives_superseded_approval(tmp_path, monkeypatch):
-    """Review item-2: after the closing record, withdrawing the added source makes the
-    old approvals cover the live set again; they must still never carry."""
-    from coding_review_agent_loop.code_approval import _latest_pr_approved_reviews_for_head
-    from coding_review_agent_loop.github import _parse_pr_human_requirements as parse
-    runner, config = _conflict_stop(tmp_path, monkeypatch)
-    _follow_hint(runner)
-    _interrupt_after_supersession(runner, config, monkeypatch)
-    added = next(i for i, c in enumerate(runner.pr_payload["comments"])
-                 if "keep the policy check code-actionable" in c["body"])
-    del runner.pr_payload["comments"][added]
-    requirements = parse(runner.pr_payload)
-    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
-    codex = next(r for r in _pr_records(runner) if r.metadata.agent == "Codex" and r.metadata.role == "reviewer")
-    assert codex.metadata.state == "approved"
-    # The old approval covers the live set again ...
-    assert response_validation._resumed_pr_reviewer_matches_requirements(codex, requirements)
-    # ... but the approval reader still excludes it as superseded history.
-    carried = _latest_pr_approved_reviews_for_head(
-        comments, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config),
-        human_requirements=requirements)
-    assert carried == {}
-    # Control: without the closing record the same approval would carry.
-    unclosed = [c for c in comments if "superseded by new signed input" not in c.body]
-    assert "Codex" in _latest_pr_approved_reviews_for_head(
-        unclosed, head_sha=HEAD, configured_reviewers=pr_loop.reviewers(config),
-        human_requirements=requirements)
-    # The resumed run opens round 2 with fresh turns for both reviewers.
-    rid = requirements[0].requirement_id
-    runner.codex_outputs = [_classified_review([_association(rid, "code")], hr=True,
-        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Withdrawn request."}])]
-    runner.gemini_outputs = [_classified_review([_association(rid, "code")], reviewer="Google Gemini", hr=True,
-        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}])]
-    before = len(_agent_commands(runner))
-    try:
-        run_pr_loop(runner, pr_number=77, config=config)
-    except AgentLoopError:
-        pass
-    assert sorted(_agent_commands(runner)[before:])[:2] == ["codex", "gemini"]
-    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
-    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
-
-
-# --- interrupt-after-boundary -----------------------------------------------
-
-
-def test_interrupt_after_supersession_record_resumes_into_round_two(tmp_path, monkeypatch):
-    runner, config = _conflict_stop(tmp_path, monkeypatch)
-    _follow_hint(runner)
-    # Interrupted after the record, before any round-2 record or launch.
-    _interrupt_after_supersession(runner, config, monkeypatch)
-    _queue_fresh_round(runner)
-
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert len(_supersessions(runner)) == 1
-    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
-    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
-    assert _no_deletes(runner)
-    assert not any("Delete these" in c for c in runner.comments)
-
-
-# --- tamper and non-growth refusals -----------------------------------------
+# --- every former refusal reason closes the round -----------------------------
 
 
 def _edit_review_body(runner, agent):
@@ -337,7 +354,7 @@ def _edit_review_body(runner, agent):
     return record.index
 
 
-def test_edited_review_with_retained_carrier_is_refused(tmp_path, monkeypatch):
+def test_edited_review_with_retained_carrier_closes_the_round(tmp_path, monkeypatch):
     runner, config = _conflict_stop(tmp_path, monkeypatch, carrier=True)
     index = _edit_review_body(runner, "Codex")
     _follow_hint(runner)
@@ -356,68 +373,63 @@ def test_edited_review_with_retained_carrier_is_refused(tmp_path, monkeypatch):
     assert (result.kind, result.matched_count) == ("prefix", 0)
     before = len(runner.commands)
 
-    # Today's refusal for a carrier that no longer matches: the spool preflight
-    # stops before any launch and points at the partial-round recovery list.
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
-    message = _assert_refused_without_rollover(
-        runner, config, before, match="partial-round recovery", error=PublicationResumeStop)
+    # Formerly a carrier stop pointing at the recovery list (#1258).
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert "Codex" in message and "spool record was kept" in message
-    assert spool.publication_state("Codex") == (state, raw)
-    assert not any("superseded by new signed input" in c for c in runner.comments)
+    _assert_closed_and_rolled_over(runner, before)
+    assert spool.publication_state("Codex")[0] == "absent"  # the round spool is discarded
 
 
-@pytest.mark.parametrize("history", ["edited", "missing"])
-def test_edited_or_unproven_review_without_carrier_is_refused(tmp_path, monkeypatch, history):
-    runner, config = _conflict_stop(tmp_path, monkeypatch)
-    record = next(r for r in _pr_records(runner) if r.metadata.agent == "Gemini")
-    comment = runner.pr_payload["comments"][record.index]
-    comment["_edit_history"] = None if history == "missing" else {
-        "lastEditedAt": "2026-11-21T18:00:00Z", "includesCreatedEdit": True,
-        "userContentEdits": {"totalCount": 1, "nodes": [
-            {"editedAt": "2026-11-21T18:00:00Z", "deletedAt": None, "diff": "edited"}]}}
-    _follow_hint(runner)
-    _queue_fresh_round(runner)
-
-    _assert_refused_without_rollover(runner, config, len(runner.commands))
-
-    assert getattr(runner, "edit_history_calls", 0) >= 1
-
-
-def test_metadata_no_longer_pure_growth_match_is_refused(tmp_path, monkeypatch):
-    """An altered acquisition identity is not pure growth, even with an added source."""
-    runner, config = _conflict_stop(tmp_path, monkeypatch, policy="selective-intermediate")
-
-    def alter(payload):
-        if payload.get("role") == "reviewer" and payload.get("agent") == "Codex":
-            return {**payload, "configured_effort": "a-different-effort"}
-        return None
-
-    _rewrite_pr_metadata(runner, alter)
-    _follow_hint(runner)
-    _queue_fresh_round(runner)
-
-    message = _assert_refused_without_rollover(runner, config, len(runner.commands))
-
-    assert "acquisition contract no longer matches" in message
-
-
-@pytest.mark.parametrize("added", [False, True], ids=["edited", "edited-and-added"])
-def test_edited_or_withdrawn_signed_source_is_refused(tmp_path, monkeypatch, added):
-    runner, config = _conflict_stop(tmp_path, monkeypatch)
-    signed = next(c for c in runner.pr_payload["comments"] if c["body"].endswith("-- Human Reviewer"))
-    signed["body"] = "A human must accept the policy run, edited.\n\n-- Human Reviewer"
-    if added:
+@pytest.mark.parametrize("variant", ["edited-history", "missing-history", "metadata-mismatch",
+                                     "edited-signed-source", "edited-and-added-signed-source"])
+def test_former_refusals_close_the_round_and_roll_over(tmp_path, monkeypatch, variant):
+    """Edits, unproven histories, acquisition mismatches and withdrawn sources all
+    used to keep the partial-round refusal; the one rule closes the round for any reason."""
+    policy = "selective-intermediate" if variant == "metadata-mismatch" else None
+    runner, config = _conflict_stop(tmp_path, monkeypatch, policy=policy)
+    if variant in {"edited-history", "missing-history"}:
+        record = next(r for r in _pr_records(runner) if r.metadata.agent == "Gemini")
+        comment = runner.pr_payload["comments"][record.index]
+        comment["_edit_history"] = None if variant == "missing-history" else {
+            "lastEditedAt": "2026-11-21T18:00:00Z", "includesCreatedEdit": True,
+            "userContentEdits": {"totalCount": 1, "nodes": [
+                {"editedAt": "2026-11-21T18:00:00Z", "deletedAt": None, "diff": "edited"}]}}
         _follow_hint(runner)
-    _queue_fresh_round(runner)
+    elif variant == "metadata-mismatch":
+        _rewrite_pr_metadata(runner, lambda payload: (
+            {**payload, "configured_effort": "a-different-effort"}
+            if payload.get("role") == "reviewer" and payload.get("agent") == "Codex" else None))
+        _follow_hint(runner)
+    else:
+        signed = next(c for c in runner.pr_payload["comments"] if c["body"].endswith("-- Human Reviewer"))
+        signed["body"] = "A human must accept the policy run, edited.\n\n-- Human Reviewer"
+        if variant == "edited-and-added-signed-source":
+            _follow_hint(runner)
+    if variant.startswith("edited-signed") or variant.startswith("edited-and-added"):
+        rids = _rids(runner)
+        fixed = [{"item_id": "item-1", "disposition": "resolved", "note": "The request was withdrawn."},
+                 {"item_id": "item-2", "disposition": "resolved", "note": "The policy check is fixed."}]
+        runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True,
+                                                   dispositions=fixed)]
+        runner.gemini_outputs = [_classified_review([_association(r, "code") for r in rids],
+                                                    reviewer="Google Gemini", hr=True, dispositions=fixed)]
+    else:
+        _queue_fresh_round(runner)
+    before = len(runner.commands)
 
-    message = _assert_refused_without_rollover(runner, config, len(runner.commands))
+    if variant in {"edited-signed-source", "edited-and-added-signed-source"}:
+        # Without the signed answer, Codex's evidence request survives the
+        # rollover and freezes round 2 for human evidence.
+        with pytest.raises(HumanDecisionRequiredError, match="awaiting human-only exact-head evidence: item-1"):
+            run_pr_loop(runner, pr_number=77, config=config)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert "signed requirement set changed since publication" in message
-    assert "withdrawn hr-" in message
+    _assert_closed_and_rolled_over(runner, before)
 
 
-def test_budget_exhausted_takes_round_limit_stop_without_record(tmp_path, monkeypatch):
+def test_budget_exhausted_posts_the_closure_then_the_round_limit_stop(tmp_path, monkeypatch):
+    """`closure-at-max-rounds` (PR): the record is posted, then the ordinary round limit names round 2."""
     runner, config = _conflict_stop(tmp_path, monkeypatch, max_rounds=1)
     _follow_hint(runner)
     _queue_fresh_round(runner)
@@ -426,13 +438,18 @@ def test_budget_exhausted_takes_round_limit_stop_without_record(tmp_path, monkey
     with pytest.raises(AgentLoopError) as stop:
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert not isinstance(stop.value, PartialReviewRoundError)
-    # The ordinary round-limit diagnostic for the exhausted budget.
-    assert str(stop.value).startswith("PR #77") and "after round 1" in str(stop.value)
+    (record,) = _closures(runner)
+    assert record.metadata.round_number == 1
+    assert str(stop.value).startswith("PR #77") and "round" in str(stop.value)
     assert "Delete these" not in str(stop.value)
     assert not _supersessions(runner)
     assert _agent_commands(runner, before) == []
     assert not any("Delete these" in c for c in runner.comments)
+    # Resuming with a higher limit proceeds in round 2 without a second record.
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
+    assert len(_closures(runner)) == 1
+    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
+    assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
 
 
 # --- unit: round-level decision ---------------------------------------------
@@ -774,12 +791,14 @@ def test_managed_ci_rollover_workflow_keeps_authorization_and_correlates_new_rec
     _follow_hint(runner)
     old, new = _rids(runner)
     answer = {"item_id": "item-1", "disposition": "resolved", "note": "Accepted.", "evidence_requirement_ids": [new]}
+    # Gemini's round-1 blocker carries forward as item-2 through the closure (#2064).
+    fixed = {"item_id": "item-2", "disposition": "resolved", "note": "The policy check is fixed."}
     runner.codex_outputs = [_classified_review(
-        [_association(old, "code"), _association(new, "code")], hr=True, dispositions=[answer],
+        [_association(old, "code"), _association(new, "code")], hr=True, dispositions=[answer, fixed],
         state="blocking", blocking=["Bound the policy retries."])]
     runner.gemini_outputs = [_classified_review(
         [_association(old, "code"), _association(new, "code")], reviewer="Google Gemini", hr=True,
-        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}])]
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Requester-owned."}, fixed])]
     runner.claude_outputs = [structured_coder_followup(
         addressed_items=["item-1"], human_requirement_ids=[old, new],
         human_requirement_dispositions=[{"requirement_id": r, "disposition": "addressed", "evidence": "Done."}
@@ -790,7 +809,8 @@ def test_managed_ci_rollover_workflow_keeps_authorization_and_correlates_new_rec
         run()
 
     assert fresh == []
-    (record,) = _supersessions(runner)
+    (record,) = _closures(runner)
+    assert not _supersessions(runner)
     ((kwargs, ids),) = correlated
     assert kwargs["round_number"] == 2 and kwargs["predecessor_head"] == HEAD
     assert kwargs["after_comment_id"] == 17  # the original authorization, not a fresh one
@@ -831,14 +851,15 @@ def _single_reviewer_publication(tmp_path, monkeypatch, *, carrier):
     return runner, config
 
 
-def test_single_reviewer_board_with_retained_carrier_rolls_over(tmp_path, monkeypatch):
-    """Review item-4: with one configured reviewer and its complete carrier still
-    spooled, the same-round resume cannot revalidate against the grown set; pure
-    growth must roll over instead of stopping for partial-round recovery."""
-    runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=True)
+@pytest.mark.parametrize("carrier", [True, False], ids=["carrier", "no-carrier"])
+def test_single_reviewer_board_whose_own_review_is_rejected_closes_the_round(tmp_path, monkeypatch, carrier):
+    """`single-reviewer-own-rejected` (#2064): with one configured reviewer whose own
+    published review resume rejects, the round closes and the reviewer runs fresh in
+    round 2, never in round 1; retained content-valid spool data never replays it."""
+    runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=carrier)
     spool = _round_spool(tmp_path, config)
-    assert spool.publication_state("Codex")[0] == "carrier"
-    carrier_before = spool.publication_state("Codex")
+    if carrier:
+        assert spool.publication_state("Codex")[0] == "carrier"
     _follow_hint(runner)
     rids = _rids(runner)
     runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True)]
@@ -847,26 +868,17 @@ def test_single_reviewer_board_with_retained_carrier_rolls_over(tmp_path, monkey
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    (record,) = _supersessions(runner)
-    assert record.metadata.signed_input_supersession["superseded"] == [
-        {"agent": "Codex", "comment_id": record.metadata.signed_input_supersession["superseded"][0]["comment_id"],
-         "route": "carrier"}]
-    round_two = [r for r in _pr_records(runner) if r.metadata.role == "reviewer" and r.metadata.round_number == 2]
-    assert [r.metadata.agent for r in round_two] == ["Codex"]
+    (record,) = _closures(runner)
+    payload = record.metadata.round_closure
+    assert [e["agent"] for e in payload["published"]] == ["Codex"]
+    assert [e["agent"] for e in payload["unreplayable"]] == ["Codex"]
+    assert "rejected by resume" in payload["unreplayable"][0]["cause"]
+    assert not _supersessions(runner)
+    reviews = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    assert [r.metadata.round_number for r in reviews if r.index > record.index] == [2]
+    assert [r.metadata.round_number for r in reviews if r.index < record.index] == [1]
     assert _agent_commands(runner)[before:] == ["codex"]
     assert [c["body"] for c in runner.pr_payload["comments"][:len(kept)]] == kept
-    assert spool.publication_state("Codex") == carrier_before
+    assert spool.publication_state("Codex")[0] == "absent"
     assert _no_deletes(runner)
     assert not any("Delete these" in c or "partial-round recovery" in c for c in runner.comments)
-
-
-def test_single_reviewer_board_without_carrier_keeps_same_round_turn(tmp_path, monkeypatch):
-    """Control for item-4: with no retained carrier the one-reviewer fresh turn in
-    the same round still works, so no supersession record is posted."""
-    runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=False)
-    _follow_hint(runner)
-    rids = _rids(runner)
-    runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True)]
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert not _supersessions(runner)
-    assert [r.metadata.round_number for r in _pr_records(runner) if r.metadata.role == "reviewer"] == [1, 1]

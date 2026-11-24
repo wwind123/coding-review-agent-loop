@@ -895,7 +895,7 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         repair_calls.append(raw)
         return repaired
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((architecture_contract, pr_loop, plan_first_loop), "_resumed_review_architecture", spy_resumed
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((architecture_contract, pr_loop), "_resumed_review_architecture", spy_resumed
     ), patch_object_in((architecture_contract,), "_pin_acknowledgement_repair", spy_pin):
         try:
             outcome = run_pr_loop(runner, pr_number=77, config=config)

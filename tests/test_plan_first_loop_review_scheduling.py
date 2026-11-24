@@ -2830,3 +2830,134 @@ def test_effective_link_rollover_with_idle_or_invalid_retained_checkpoint(tmp_pa
     assert all(m.subject == _plan_subject(canonical) for m in fresh)
     assert {m.agent for m in fresh if m.role == "reviewer"} == {"Codex", "Gemini"}
     assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+# --- #2064 stage 2: one rollover rule on the plan surface ---------------------------
+
+
+def _plan_rollover_runner(*, legacy=False, max_rounds=None):
+    from test_review_parallel import _PartialPublicationProbeRunner, _initial_plan
+    from agent_loop_helpers import structured_plan_review
+
+    markers = ("Codex blocks the plan with a unique note.", "Gemini independent plan approval.")
+    first = (
+        "### Blocking plan issues\n- Add a migration step.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+        if legacy else structured_plan_review(
+            state="blocking", summary=markers[0], blocking_plan_issues=["Add a migration step."])
+    )
+    if legacy:
+        markers = ("Add a migration step.", markers[1])
+    resolved = [{"item_id": "item-1", "disposition": "resolved", "note": "The migration step is planned."}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        slow_reviewer="gemini",
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[first, structured_plan_review(summary="Codex approves round two.",
+                                                     prior_plan_item_dispositions=resolved)],
+        gemini_outputs=[
+            structured_plan_review(summary=markers[1], reviewer="Google Gemini"),
+            structured_plan_review(summary="Gemini approves round two.", reviewer="Google Gemini",
+                                   prior_plan_item_dispositions=resolved),
+        ],
+    )
+    runner.serve_rest_issue_comments = True
+    return runner, markers
+
+
+def _plan_records(runner):
+    from test_review_parallel import _comment_records
+
+    return _comment_records(runner, surface="issue", flow="plan")
+
+
+def _plan_closures(runner):
+    from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
+
+    return [r for r in _plan_records(runner) if r.phase == ROUND_CLOSED_INCOMPLETE_PHASE]
+
+
+def _interrupted_plan_round(tmp_path, **kwargs):
+    from test_review_parallel import _interrupt_plan_round_between_publications, _published_count, _spool_files
+    from agent_loop_helpers import make_config
+
+    runner, markers = _plan_rollover_runner(**{k: v for k, v in kwargs.items() if k in {"legacy"}})
+    extra = {"max_rounds": kwargs["max_rounds"]} if kwargs.get("max_rounds") else {}
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, **extra)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    assert [_published_count(runner, m) > 0 for m in markers] == [True, False]
+    codex = next(r for r in _plan_records(runner) if r.role == "reviewer" and r.agent == "Codex")
+    assert codex.phase == "publication" and codex.new_items == ()  # provisional, unnumbered
+    for path in _spool_files(config):
+        path.unlink()
+    return runner, config
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["structured", "legacy-text"])
+def test_plan_round_with_a_published_review_and_an_unreplayable_reviewer_rolls_over(tmp_path, legacy):
+    """`plan-partial-rollover`: the provisional finding is re-parsed and minted into the record;
+    round 2 runs on the unchanged plan with the full plan board; closed reviews never approve."""
+    runner, config = _interrupted_plan_round(tmp_path, legacy=legacy)
+    claude_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    (closure,) = _plan_closures(runner)
+    assert closure.round_number == 1
+    assert [e["agent"] for e in closure.round_closure["published"]] == ["Codex"]
+    assert [e["agent"] for e in closure.round_closure["unreplayable"]] == ["Gemini"]
+    assert [(i.item_id, i.text, i.status) for i in closure.new_items] == [("item-1", "Add a migration step.", "blocking")]
+    records = _plan_records(runner)
+    advance = [r for r in records if r.phase == "plan-phase-advance"]
+    assert [r.round_number for r in advance] == [2]
+    assert advance[0].subject == closure.subject  # the unchanged canonical plan
+    assert "item-1" in {i.item_id for i in advance[0].prior_items}
+    assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == ["Codex", "Gemini"]
+    assert len(runner.reviewer_launches) - launches_before == 2
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == claude_before
+    assert not any("Delete these" in body for body in runner.comments)
+
+
+def test_plan_closure_record_alone_restores_the_ledger_after_an_interruption(tmp_path):
+    """`closure-idempotent` (plan): interrupted between the closure and the phase advance."""
+    from coding_review_agent_loop import plan_first_loop
+
+    runner, config = _interrupted_plan_round(tmp_path)
+
+    class _Stop(Exception):
+        pass
+
+    real = plan_first_loop.post_issue_comment
+
+    def stop_after_closure(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if "closed, incomplete" in str(kwargs.get("body", "")):
+            raise _Stop
+        return result
+
+    with patch.object(plan_first_loop, "post_issue_comment", side_effect=stop_after_closure):
+        with pytest.raises(_Stop):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not [r for r in _plan_records(runner) if r.phase == "plan-phase-advance"]
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert len(_plan_closures(runner)) == 1
+    advance = [r for r in _plan_records(runner) if r.phase == "plan-phase-advance"]
+    assert [r.round_number for r in advance] == [2]
+    assert "item-1" in {i.item_id for i in advance[0].prior_items}
+
+
+def test_plan_closure_at_max_rounds_posts_the_record_then_the_round_limit_stop(tmp_path):
+    """`closure-at-max-rounds` (plan): the record first, then an ordinary stop naming round 2."""
+    from dataclasses import replace as _replace
+
+    runner, config = _interrupted_plan_round(tmp_path, max_rounds=1)
+
+    with pytest.raises(AgentLoopError, match="round 2, beyond --max-rounds"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(_plan_closures(runner)) == 1
+    assert not any("Delete these" in body for body in runner.comments)
+    assert run_issue_loop(runner, issue_number=56, config=_replace(config, max_rounds=3), plan_first=True) == 0
+    assert len(_plan_closures(runner)) == 1

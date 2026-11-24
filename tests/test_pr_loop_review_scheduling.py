@@ -2020,17 +2020,25 @@ def test_840_premature_secondary_approvals_are_not_resumed_carried_or_counted(tm
     runner.gemini_outputs.append(_staged_review(reviewer="Google Gemini"))
     runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity"))
     if parallel:
-        # #1156: the premature Gemini review is public, so Antigravity's fresh
-        # post-opening turn would read it.  Visibility, not resume
-        # qualification, decides: the round is refused before any launch.
+        # #1156/#2064: the premature Gemini review is public, so a fresh
+        # post-opening turn in the reconciled round would read it.  The round
+        # is already closed by its own record, so it rolls over (#1553) instead
+        # of refusing; nothing is deleted and no closed-incomplete record is needed.
         launches_before = len(_agent_sequence(runner))
-        with pytest.raises(AgentLoopError, match="partially published") as excinfo:
+        try:
             run_pr_loop(
                 runner, pr_number=77,
                 config=_staged_config(tmp_path, auto_merge=True, review_parallel=parallel),
             )
-        assert "Gemini review" in str(excinfo.value)
-        assert len(_agent_sequence(runner)) == launches_before
+        except AgentLoopError as exc:
+            assert "partially published" not in str(exc) and "Delete these" not in str(exc)
+        assert not any("closed, incomplete" in c or "Delete these" in c for c in runner.comments)
+        later = [
+            item for item in _posted_scheduler_metadata(runner)
+            if item.phase == "scheduler-prelaunch" and item.round_number == 2
+        ]
+        assert later, "the reconciled round did not roll over"
+        assert len(_agent_sequence(runner)) > launches_before
         return
     merges = []
 

@@ -389,12 +389,13 @@ def test_launcher_never_invokes_a_reviewer_whose_frozen_carrier_no_longer_valida
     spool.store_publication(REVIEWER, {"bodies": ["x"]})
     invoked = []
     runner = SimpleNamespace(terminate_active_processes=lambda: None)
-    with pytest.raises(PublicationResumeStop, match="no longer validates"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _launch_reviewer_turns(
             runner, ["codex"], thread_name_prefix="t",
             run_turn=lambda reviewer: invoked.append(reviewer),
             spool=spool, replay_turn=lambda reviewer, fields: None,
         )
+    _closes(excinfo, "no longer validates")
     assert invoked == [] and spool.record_exists(REVIEWER)
 
 
@@ -403,6 +404,15 @@ def test_launcher_never_invokes_a_reviewer_whose_frozen_carrier_no_longer_valida
 # ---------------------------------------------------------------------------
 
 from coding_review_agent_loop import review_rounds
+from coding_review_agent_loop.round_closure_writer import RoundIncompleteSignal, RoundStateReadError
+
+
+def _closes(excinfo, cause):
+    """A structural carrier stop is routed to the round-closure signal (#2064)."""
+    signal = excinfo.value
+    assert isinstance(signal, RoundIncompleteSignal) and not isinstance(signal, PublicationResumeStop)
+    assert any(cause in reason for _name, reason in signal.unreplayable), signal.unreplayable
+    assert "delet" not in str(signal).lower()
 
 
 def _two_reviewer_spool(tmp_path):
@@ -475,8 +485,10 @@ def test_preflight_posts_nothing_when_a_later_record_refuses(tmp_path, replayabl
     _freeze_with_prefix(fake, tmp_path, spool, "Gemini", bodies=[_anchor_for("Gemini")], post_count=0)
     comments_before = len(fake.comments)
     contexts = {"Gemini": context_digest(head="moved", surfaced=[])}
-    with pytest.raises(PublicationResumeStop, match="validation context"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:  # a binding failure closes the round
         _preflight(fake, tmp_path, spool, contexts=contexts)
+    _closes(excinfo, "cannot be resumed")
+    assert "validation context" in str(excinfo.value.__cause__)
     assert len(fake.comments) == comments_before and fake.writes == []
     # With both valid, the verified suffix of every record is handed to the poster.
     posted = _preflight(fake, tmp_path, spool)
@@ -489,8 +501,9 @@ def test_preflight_refuses_a_partly_public_carrier_beside_a_fresh_reviewer(tmp_p
     _freeze_with_prefix(fake, tmp_path, spool, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=1)
     spool.remove("Gemini")
     writes = len(fake.writes)
-    with pytest.raises(PublicationResumeStop, match="partly public"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _preflight(fake, tmp_path, spool)
+    _closes(excinfo, "partly public carrier")
     assert len(fake.writes) == writes
     # No public prefix: a deferral alone is fine (the suffix waits for settlement).
     clean = _two_reviewer_spool(tmp_path / "clean")
@@ -513,8 +526,10 @@ def test_malformed_or_null_carrier_stops_before_anything(tmp_path, replayable, d
         payload["response"] = {"text": 5}
     path.write_text(json.dumps(payload))
     assert spool.publication_state("Codex")[0] == "malformed"
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _preflight(fake, tmp_path, spool)
+    _closes(excinfo, "cannot be resumed")
+    assert "malformed or unreadable" in str(excinfo.value.__cause__)
     assert fake.writes == [] and path.exists()
 
 
@@ -527,11 +542,13 @@ def test_legacy_record_is_checked_even_when_its_anchor_is_already_public(tmp_pat
         path.write_text(json.dumps(payload))
     fake = FakeGitHub(actor=OTHER_ACTOR)
     fake.add(_anchor_for("Codex"), author=ACTOR)  # the old invocation's public anchor
-    with pytest.raises(PublicationResumeStop, match="possible earlier publication"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _preflight(fake, tmp_path, spool, published=("Codex",))
+    assert "possible earlier publication" in str(excinfo.value.__cause__)
     blind = FakeGitHub()
     blind.list_failure_page = 1
-    with pytest.raises(PublicationResumeStop, match="could not be read completely"):
+    # A failed listing read is a retryable read failure, never a closure.
+    with pytest.raises(RoundStateReadError, match="could not be read completely"):
         _preflight(blind, tmp_path, spool, published=("Codex",))
     assert spool.record_exists("Codex") and spool.record_exists("Gemini")
 
@@ -549,8 +566,9 @@ def test_a_readable_but_unvalidatable_peer_counts_as_a_fresh_turn(tmp_path, monk
     writes = len(fake.writes)
     # Gemini's record is readable, but the current validator rejects it: it would
     # launch fresh beside Codex's public sidecar, so the run stops with zero posts.
-    with pytest.raises(PublicationResumeStop, match="partly public"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _preflight(fake, tmp_path, spool)
+    _closes(excinfo, "partly public carrier")
     assert len(fake.writes) == writes and spool.record_exists("Gemini")
     # A settled failure outcome is replayed as a failure, never relaunched.
     spool.store_failure("Gemini", message="boom", failure_category=None)
@@ -574,12 +592,13 @@ def test_launcher_refuses_a_fresh_turn_beside_an_undecodable_record_without_publ
     spool._path(REVIEWER).write_text("{broken", encoding="utf-8")
     invoked = []
     runner = SimpleNamespace(terminate_active_processes=lambda: None)
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+    with pytest.raises(RoundIncompleteSignal) as excinfo:
         _launch_reviewer_turns(
             runner, ["codex"], thread_name_prefix="t",
             run_turn=lambda reviewer: invoked.append(reviewer),
             spool=spool, replay_turn=lambda reviewer, fields: None,
         )
+    _closes(excinfo, "malformed or unreadable")
     assert invoked == [] and spool._path(REVIEWER).exists()
 
 

@@ -1,5 +1,10 @@
 """Close a PR round superseded by new signed input, then open the next (#2054).
 
+Since #2064 stage 2 no review path calls this writer: signed-input growth is
+one cause of the round-wide closed-incomplete rule (``round_closure_writer``).
+Existing records are still read as closure boundaries for one release window;
+stage 3 deletes this module.
+
 When the operator follows the conflicting-classification hint and posts a
 new signed comment, every review already published in the unreconciled round
 was formed against the old signed set.  Resume used to reject them and then

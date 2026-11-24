@@ -258,12 +258,29 @@ def test_partial_publication_never_launches_against_unsafe_spool(tmp_path, monke
     retained = path.read_bytes() if path.exists() else None
     fresh = _fresh(retry)
     fresh.authenticated_actor = retry.authenticated_actor
-    with pytest.raises(AgentLoopError, match="partially published|malformed|validat"):
-        run_pr_loop(fresh, pr_number=77, config=config)
+
+    class _Closed(Exception):
+        pass
+
+    def stop_after_closure(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        if "closed, incomplete" in str(kwargs.get("body", "")):
+            raise _Closed
+        return result
+
+    # #2064: the round closes incomplete (one record) instead of refusing; nothing launches.
+    with monkeypatch.context() as patch:
+        patch_attr_in(patch, (pr_loop, pr_loop_support), "post_pr_comment", stop_after_closure)
+        with pytest.raises(_Closed):
+            run_pr_loop(fresh, pr_number=77, config=config)
     assert _agent_sequence(fresh) == []
     assert [r for r in _records(fresh) if r.metadata.role == "reviewer"] == [
         r for r in _records(retry) if r.metadata.role == "reviewer"
     ]
+    (closure,) = [r for r in _records(fresh) if r.metadata.phase == "round-closed-incomplete"]
+    assert closure.metadata.round_number == 2
+    assert unpublished in {e["agent"] for e in closure.metadata.round_closure["unreplayable"]}
+    assert published == {e["agent"] for e in closure.metadata.round_closure["published"]} - {unpublished}
     if retained is not None:
         assert path.read_bytes() == retained
     if foreign is not None:

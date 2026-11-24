@@ -24,7 +24,8 @@ The payload decodes strictly; a malformed or mis-bound payload decodes as
 ``None`` and the record then never closes a round.  Author authentication is
 unchanged: only records admitted by ``pr_round_ingestion`` are read at all.
 
-Stage 1 of #2064 adds only these readers; no code path writes the record yet.
+Stage 1 of #2064 added these readers; since stage 2 (#2080) the round-start
+decision in ``round_closure_writer`` writes the record on both flows.
 """
 
 from __future__ import annotations

@@ -1903,14 +1903,6 @@
       "occurrence": 1
     },
     {
-      "module": "pr_loop",
-      "function": "run_pr_loop::_pr_recovery_fingerprint",
-      "call": "_extract_round_metadata_records(remaining, flow='pr')",
-      "family": "rounds",
-      "provenance": "pr_loop.run_pr_loop::_pr_recovery_fingerprint: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects.",
-      "occurrence": 1
-    },
-    {
       "module": "pr_loop_support",
       "function": "_fresh_pr_qualification_snapshot",
       "call": "_extract_round_metadata_records(context.comments, flow='pr')",

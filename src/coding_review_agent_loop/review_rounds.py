@@ -45,8 +45,14 @@ from .round_state import (
     _live_round_resolved_item_ids,
     _extract_round_metadata_records,
 )
-from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget
 from .publication_resume import PublicationResumeStop
+from .round_closure_writer import (
+    RoundIncompleteSignal,
+    RoundStateReadError,
+    round_incomplete_signal,
+    round_state_read_error,
+    route_publication_stop,
+)
 from . import quota_wait
 from .scratch import make_private_dirs
 from .review_spool import (
@@ -924,7 +930,9 @@ def _preflight_spooled_publications(
     response, validation context and original actor, and its whole sequence is
     classified against a complete listing.  A legacy record is checked across
     every author.  Any failure raises with the record kept, nothing posted and
-    nothing launched.  Reviewers whose anchor is already public are still
+    nothing launched: a failed read is a retryable ``RoundStateReadError``, any
+    other carrier failure a ``RoundIncompleteSignal`` that closes the round
+    (#2064).  Reviewers whose anchor is already public are still
     checked, so a rerun can never discard a carrier unchecked.
 
     The missing suffix of a verified carrier is posted here (before a new
@@ -954,18 +962,25 @@ def _preflight_spooled_publications(
                 else None
             )
             if replayed is None:
-                raise PublicationResumeStop(
-                    f"{name}'s frozen same-round publication no longer validates in this run's "
-                    "context, so it cannot be resumed. The spool record was kept, nothing was "
-                    "posted, and no reviewer was launched; repair the round with the "
-                    "partial-round recovery list (#1142)."
+                raise round_incomplete_signal(
+                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                    published=(*sorted(published), name),
+                    unreplayable=((name, "its frozen same-round publication no longer validates"),),
                 )
-        plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
+        try:
+            plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
+        except PublicationResumeStop as exc:
+            raise route_publication_stop(
+                exc, surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                reviewer_name=name, published=sorted(published),
+            ) from exc
         if plan is not None:
             plans.append((name, plan))
     defer_posting = False
+    fresh_name = ""
     for reviewer in selected_reviewers if selected_reviewers is not None else reviewers:
         name = agent_display_name(reviewer)
+        fresh_name = name
         if name in published:
             continue
         outcome = spool.load(name)
@@ -985,12 +1000,10 @@ def _preflight_spooled_publications(
     if defer_posting and partial:
         # Public sidecars carry no round metadata, so the peer-visibility guard
         # cannot see them; a fresh turn now would read them.
-        raise PublicationResumeStop(
-            f"{', '.join(partial)}'s frozen publication is partly public (sidecars without "
-            "an anchor) while another reviewer still needs a fresh turn, which would read "
-            "those attachments. The spool record was kept, nothing was posted, and no "
-            "reviewer was launched; repair the round with the partial-round recovery list "
-            "(#1142)."
+        raise round_incomplete_signal(
+            surface=spool.surface, number=spool.number, round_number=spool.round_number,
+            published=(*sorted(published), *partial),
+            unreplayable=((fresh_name, "it needs a fresh turn beside a partly public carrier"),),
         )
     if defer_posting or post_frozen is None:
         return
@@ -1051,7 +1064,7 @@ def _incomplete_pr_review_error(reviewer_name: str) -> AgentLoopError:
 
 
 class PartialReviewRoundError(AgentLoopError):
-    """A reviewer would have to run while a same-round peer's body is public (#1025)."""
+    """Retained until #2064 stage 3; no review path raises it any more."""
 
 
 def _replay_unavailable_cause(
@@ -1088,53 +1101,6 @@ def _replay_unavailable_cause(
     return f"{reviewer_name}'s spooled outcome no longer validates against this run."
 
 
-def _format_recovery_target(target: RecoveryTarget) -> str:
-    if target.comment_id is None:
-        # A projection can carry a permalink without a numeric id; never print
-        # "comment None".
-        url = f" {target.url}" if target.url else ""
-        return (
-            f"- {target.label}: by {target.author or 'unknown author'}, created "
-            f"{target.created_at or 'unknown time'} (id could not be determined){url}"
-        )
-    return f"- {target.label}: comment {target.comment_id} {target.url or ''}".rstrip()
-
-
-def _render_recovery(recovery: PartialRoundRecovery) -> str:
-    lines: list[str] = []
-    if recovery.verified:
-        lines.append(
-            f"Delete these {len(recovery.targets)} comments so the whole round runs again "
-            "independently, then rerun:"
-        )
-        lines.extend(_format_recovery_target(t) for t in recovery.targets)
-        lines.append(
-            "Other comments (such as the incomplete-status notice) carry no round state for "
-            "this round and need not be deleted."
-        )
-        lines.append(
-            "Deleting qualification checkpoint records also removes the managed-CI "
-            "authorization binding; the next resume may then need fresh managed-CI "
-            "authorization (`--managed-ci-fresh`)."
-        )
-    elif not recovery.targets and not recovery.uncertain:
-        lines.append(
-            f"No deletion list is given ({recovery.reason or 'unverified'}); inspect the "
-            "round's records before deleting anything."
-        )
-    else:
-        lines.append(
-            "The comments below are a provisional list that could not be verified as a "
-            f"sufficient deletion set ({recovery.reason or 'unverified'}); inspect the "
-            "round's records before deleting."
-        )
-        lines.extend(_format_recovery_target(t) for t in recovery.targets)
-        if recovery.uncertain:
-            lines.append("Unreferenced attachments possibly from this round, not verified:")
-            lines.extend(_format_recovery_target(t) for t in recovery.uncertain)
-    return "\n".join(lines)
-
-
 def _partial_round_refusal(
     *,
     surface: str,
@@ -1143,43 +1109,31 @@ def _partial_round_refusal(
     reviewer_name: str,
     public_peers: Sequence[str],
     cause: str = "",
-    recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
-) -> PartialReviewRoundError:
-    target = f"PR #{number}" if surface == "pr" else f"issue #{number}"
-    prefix = (
-        f"Review round {round_number} on {target} is partially published "
-        f"({', '.join(public_peers)} already posted)"
-    )
+) -> AgentLoopError:
+    """The defensive invariant at a former partial-round refusal site (#2064).
+
+    A reviewer needing a fresh turn beside public same-round peers raises
+    the internal ``RoundIncompleteSignal`` (the loop closes the round and
+    rolls over).  An evidence-conversion boundary that could not be admitted
+    is a retryable read failure, never a closure.
+    """
     if unresolved_conversion_boundary:
         # Neutral about the cause: an identity read that failed and an
         # untrusted record both leave the boundary unresolved (#1676).
-        message = (
-            f"{prefix}, and this round's evidence-conversion record could not be admitted "
-            "as a trusted boundary: either its identity could not be read or it is not a "
-            "trusted, accepted conversion record. So the earlier pass's publications cannot "
-            f"be excluded from the peer set, and invoking {reviewer_name} now could let it "
-            "read them; the run stopped fail-closed. Retry once GitHub comment reads "
-            "succeed, or inspect the conversion record if reads were healthy."
+        return round_state_read_error(
+            surface=surface, number=number, round_number=round_number,
+            detail=(
+                "this round's evidence-conversion record could not be admitted as a trusted "
+                "boundary, so the earlier pass's publications cannot be excluded from the peer "
+                "set; inspect the conversion record if reads were healthy"
+            ),
         )
-    else:
-        message = (
-            f"{prefix} but {reviewer_name}'s withheld "
-            "same-round outcome is missing or no longer validates, so invoking it now would "
-            "let it read its peers' findings."
-        )
-        if cause:
-            message += f" {cause}"
-    if recovery is not None:
-        try:
-            listing = _render_recovery(recovery())
-        except Exception:  # the refusal type must never change
-            listing = (
-                "The round's comment list is unavailable; inspect the round's reviewer "
-                "verdicts, reconciliation records and attachments before deleting them."
-            )
-        message += "\n" + listing
-    return PartialReviewRoundError(message)
+    return round_incomplete_signal(
+        surface=surface, number=number, round_number=round_number,
+        published=tuple(public_peers),
+        unreplayable=((reviewer_name, cause or "its withheld outcome is missing or no longer validates"),),
+    )
 
 
 def _replay_spooled_failure(fields: dict[str, object], reviewer_name: str) -> AgentInvocationError | None:
@@ -1198,7 +1152,6 @@ def _refuse_partial_round_before_sequential_turns(
     fresh_turn_reviewers: Sequence[AgentName],
     public_peers: Sequence[AgentName],
     already_posted: Sequence[AgentName] = (),
-    recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
     posted_rejection_reasons: Mapping[str, str] | None = None,
 ) -> None:
@@ -1220,7 +1173,6 @@ def _refuse_partial_round_before_sequential_turns(
                     spool, agent_display_name(reviewer), own_posted=reviewer in already_posted,
                     own_posted_reason=(posted_rejection_reasons or {}).get(agent_display_name(reviewer), ""),
                 ) if not unresolved_conversion_boundary else "",
-                recovery=recovery,
                 unresolved_conversion_boundary=unresolved_conversion_boundary,
             )
 
@@ -1235,7 +1187,6 @@ def _same_round_replay_or_invoke(
     validators: dict[str, object],
     invoke: Callable[[], ValidatedAgentResponse],
     already_posted: bool = False,
-    recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
     posted_rejection_reasons: Mapping[str, str] | None = None,
 ) -> ValidatedAgentResponse:
@@ -1243,8 +1194,8 @@ def _same_round_replay_or_invoke(
 
     A parallel round interrupted between publications may be resumed without
     ``--review-parallel``.  The unpublished reviewer's withheld outcome is then
-    replayed exactly as in parallel mode; without a valid one the run stops
-    instead of invoking the reviewer.
+    replayed exactly as in parallel mode; without a valid one the round is
+    incomplete (``RoundIncompleteSignal``) instead of invoking the reviewer.
     """
     reviewer_name = agent_display_name(reviewer)
     peers = [agent_display_name(peer) for peer in public_peers if peer != reviewer]
@@ -1268,7 +1219,6 @@ def _same_round_replay_or_invoke(
             loaded_unreplayable=fields is not None,
             own_posted_reason=(posted_rejection_reasons or {}).get(reviewer_name, ""),
         ) if not unresolved_conversion_boundary else "",
-        recovery=recovery,
         unresolved_conversion_boundary=unresolved_conversion_boundary,
     )
 
@@ -1290,7 +1240,6 @@ def _launch_reviewer_turns(
     already_posted: Sequence[AgentName] = (),
     max_workers: int | None = None,
     prepare_fallback: Callable[[AgentName], None] | None = None,
-    recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
     posted_rejection_reasons: Mapping[str, str] | None = None,
     settle_failures: Callable[
@@ -1329,7 +1278,8 @@ def _launch_reviewer_turns(
       healthy outcomes stay in the spool and that failure is raised, so the
       retried reviewer later runs with no same-round peer body visible;
     * a reviewer still needing a fresh turn while ``public_peers`` is
-      non-empty -- a lost or invalid spool record -- stops the run.
+      non-empty -- a lost or invalid spool record -- raises the internal
+      ``RoundIncompleteSignal`` before anything is launched (#2064).
 
     A reviewer in ``already_posted`` has its own same-round record on the
     surface that resume rejected; it is re-invoked, never replayed.
@@ -1355,15 +1305,13 @@ def _launch_reviewer_turns(
                 if spool.publication_state(reviewer_name)[0] == "malformed" and not any(
                     peer != reviewer for peer in public_peers
                 ):
-                    # An undecodable record may hide a published prefix: stop
-                    # rather than launch a fresh turn beside it (#1258).  With a
-                    # public peer the partial-round refusal below already stops,
-                    # with its recovery list.
-                    raise PublicationResumeStop(
-                        f"{reviewer_name}'s spool record is malformed or unreadable and may "
-                        "hide a partly published round. The record was kept, nothing was "
-                        "posted, and no reviewer was launched; repair the round with the "
-                        "partial-round recovery list (#1142)."
+                    # An undecodable record may hide a published prefix: close
+                    # rather than launch a fresh turn beside it (#1258, #2064).
+                    # With a public peer the invariant below closes the round.
+                    raise round_incomplete_signal(
+                        surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                        published=(reviewer_name,),
+                        unreplayable=((reviewer_name, "its spool record is malformed or unreadable"),),
                     )
                 continue
             replay_fallbacks.append(reviewer)
@@ -1376,12 +1324,12 @@ def _launch_reviewer_turns(
             if result is None and spool.publication_state(reviewer_name)[0] in {"carrier", "malformed"}:
                 # A frozen publication may already be partly public: a fresh
                 # turn would read its own sidecars, and an unvalidated body must
-                # never be published.  Stop with the record kept (#1258).
-                raise PublicationResumeStop(
-                    f"{reviewer_name}'s frozen same-round publication no longer validates in "
-                    "this run's context, so it cannot be resumed. The spool record was kept, "
-                    "nothing was posted, and no reviewer was launched; repair the round with "
-                    "the partial-round recovery list (#1142)."
+                # never be published.  Close the round instead (#1258, #2064).
+                raise round_incomplete_signal(
+                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                    published=(*sorted(agent_display_name(p) for p in public_peers if p != reviewer),
+                               reviewer_name),
+                    unreplayable=((reviewer_name, "its frozen same-round publication no longer validates"),),
                 )
             if result is not None:
                 results[reviewer] = result
@@ -1401,8 +1349,7 @@ def _launch_reviewer_turns(
                         own_posted_reason=(posted_rejection_reasons or {}).get(
                             agent_display_name(reviewer), ""),
                     ) if not unresolved_conversion_boundary else "",
-                    recovery=recovery,
-                    unresolved_conversion_boundary=unresolved_conversion_boundary,
+                        unresolved_conversion_boundary=unresolved_conversion_boundary,
                 )
     if prepare_fallback is not None:
         for reviewer in [r for r in replay_fallbacks if r in to_launch]:
@@ -1495,11 +1442,24 @@ def _launch_reviewer_turns(
                 raise retry_errors[reviewer]
         raise retry_errors[failed[0]]
     if on_completion is not None:
+        posted_now: list[str] = []
         for reviewer, result in results.items():
-            if on_completion(reviewer, result):
+            try:
+                published_now = on_completion(reviewer, result)
+            except PublicationResumeStop as exc:
+                # A read failure keeps every unpublished outcome spooled for a
+                # rerun; a structural carrier failure closes the round (#2064).
+                raise route_publication_stop(
+                    exc, surface=spool.surface, number=spool.number,
+                    round_number=spool.round_number, reviewer_name=agent_display_name(reviewer),
+                    published=(*sorted(agent_display_name(p) for p in public_peers), *posted_now),
+                    before_publication=not posted_now,
+                ) from exc
+            if published_now:
                 # Published now: a rerun resumes (or, if the posted record is
                 # rejected, re-invokes) it rather than replaying a stale outcome.
                 spool.remove(agent_display_name(reviewer))
+                posted_now.append(agent_display_name(reviewer))
     spool.discard()
     return results
 
