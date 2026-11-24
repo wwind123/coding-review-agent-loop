@@ -307,13 +307,6 @@ class _TerminalNoPrImplementation:
     parsed: StructuredTaskResult | None = None
 
 
-@dataclass(frozen=True)
-class _TerminalIssueImplementationConflict:
-    """A valid implementation payload rejected from handoff by semantics."""
-
-    parsed: StructuredIssueImplementation
-
-
 # Every parsed result type that carries an architecture-impact contract.  The
 # unsatisfied check enumerates these explicitly rather than defaulting through
 # ``getattr``, so a new result wrapper cannot silently bypass the contract.
@@ -329,13 +322,13 @@ _ARCHITECTURE_CONTRACT_CARRIERS = (
 _ARCHITECTURE_RECORD_CARRIERS = (*_ARCHITECTURE_CONTRACT_CARRIERS, ParsedReview, ParsedPlanReview)
 
 
-_TERMINAL_PAYLOAD_WRAPPERS = (_TerminalNoPrImplementation, _TerminalIssueImplementationConflict)
+_TERMINAL_PAYLOAD_WRAPPERS = (_TerminalNoPrImplementation,)
 
 
 def _carrier_payload(result: object) -> object | None:
     """Return the structured payload a result carries, looking inside wrappers.
 
-    Both terminal wrappers expose ``parsed``; a carrier is its own payload;
+    The terminal wrapper exposes ``parsed``; a carrier is its own payload;
     clarification, legacy PR numbers and payload-less wrappers carry none.
     """
     if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS):

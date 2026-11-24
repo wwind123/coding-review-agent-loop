@@ -289,12 +289,11 @@ For an approved coder follow-up, use `"state": "approved"`, an
 -- <Coder Name>
 
 For issue implementation repair, preserve the original PR identity and
-requirement semantics. Use `pr_number: null` for a no-PR result or for a
-blocked signed requirement discovered after a PR was opened, and retain the
-real PR number or URL in the summary or disposition evidence. A positive PR
-with a blocked disposition remains a terminal conflict after repair; do not
-relabel or silently remove that blocker. `tests_run` may be absent, null, or
-an empty array, but supplied values must be exact command strings.
+requirement semantics. Use `pr_number: null` only for a no-PR result. A
+blocked signed requirement stays beside the positive PR as a `blocked`
+disposition with its reason; do not relabel or silently remove that blocker.
+`tests_run` may be absent, null, or an empty array, but supplied values must
+be exact command strings.
 
 ## Valid Format E — Discuss Review:
 
@@ -1422,8 +1421,8 @@ def _issue_implementation_instruction(
             else "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "
         )
         + requirement_rule
-        + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
-        "do not relabel or silently remove that blocker.\n"
+        + " Preserve PR identity and requirement semantics: a blocked disposition stays beside "
+        "the positive PR; do not relabel or silently remove that blocker.\n"
     )
 
 

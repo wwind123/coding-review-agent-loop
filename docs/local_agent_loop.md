@@ -3166,10 +3166,12 @@ exact signed-human-requirement disposition ledger, and optional `tests_run`
 command strings. The orchestrator validates supplied commands inside the
 assigned checkout. A null-PR result is posted as a readable issue-level
 terminal comment and stops before PR operations. If a signed requirement is
-blocked after a PR was opened, the coder must retain the real PR number or URL
-in the summary or disposition evidence while setting `pr_number` to `null`;
-the conflict is posted once without retrying or entering handoff, review, or
-merge gates. Accepted created-PR results are rendered for GitHub and retain the
+blocked after a PR was opened (for example a human-only step), the coder keeps
+the real positive `pr_number` and marks the requirement `blocked` with a
+concrete reason. The run hands off to the PR loop as usual, and the blocked
+requirement is carried to review as the human-requirements acknowledgement
+item with the coder's reason. An invalid ledger (missing or unknown
+requirement IDs) still stops before handoff. Accepted created-PR results are rendered for GitHub and retain the
 raw structured payload in round metadata so resume can restore the typed result.
 
 Run issue mode as plan-first discussion before implementation:
@@ -10333,8 +10335,7 @@ are logged and never mask the
 original agent failure. Use `--no-salvage-comments` to keep salvage entirely
 local (matching prior behavior).
 
-Valid terminal stops include issue and approved-plan no-PR results and signed
-requirement conflicts (also after a coverage re-ask), plus task blocking results
+Valid terminal stops include issue and approved-plan no-PR results, plus task blocking results
 and clarification exits. Successfully answered task clarification continues without
 terminal capture. Capture or publication failure never replaces the original stop.
 Task salvage stays local-only; there is no automatic task restart discovery.

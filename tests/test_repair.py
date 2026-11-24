@@ -4708,9 +4708,12 @@ def _prose_source_1626(kind):
 
 # SHA-256 of the full prompt rendered by the pre-#1626 source (commit
 # dc2d68ae1f) for the same input: the flag-unset prompt must not change.
+# Re-pinned for #2120, which intentionally replaced only the issue
+# implementation repair guidance that told the coder to null a positive PR
+# beside a blocked signed requirement.
 _PRE_1626_PROMPT_DIGESTS = {
-    "coder_followup": "88d02009c436c48384578229b808dc197d3a7d859ed5dd4a2f69f3af815d5190",
-    "issue_implementation": "4944b744c463469310cdbde3df39a908ec19f51b3587c9c619457c5eca9f1bcc",
+    "coder_followup": "e7410cf07b19d19acb5b6424a9dcfc06d9d7b4bb40f291ffca15ea5565f97b39",
+    "issue_implementation": "90de56f4849a666c1ba96385e0c41bff7ddbd3173a5d26445d67a4da500874f9",
 }
 _RECEIPTS_1626 = (
     {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass-1", "outcome": "passed"},

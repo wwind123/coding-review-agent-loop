@@ -268,9 +268,10 @@ Do not wait for {reviewer_name} yourself; this local orchestrator will run
 {reviewer_name} after you create the PR. Use the structured
 `issue_implementation` JSON contract above. A positive `pr_number` hands the
 PR to {reviewer_name} for review; `pr_number: null` is the terminal no-PR
-blocking result. A signed requirement discovered to be blocked after a PR was
-opened requires `pr_number: null` with the real PR reference retained in the
-summary or disposition evidence. Do not invent a placeholder PR identity or
+blocking result. A signed requirement that is blocked after you opened a PR
+stays beside the positive `pr_number` as a `blocked` disposition with a
+concrete reason, and the PR still goes to review; reserve `pr_number: null`
+for the no-PR result. Do not invent a placeholder PR identity or
 add an `AGENT_PR` marker to the structured result. For clarification, use the
 separate `AGENT_CLARIFY` terminal alternative.
 
@@ -490,7 +491,7 @@ Rules:
 - `schema_version` is 1, `kind` is `issue_implementation`, and `state` is `blocking`.
 - `summary` is non-blank and must explain the implementation outcome. `pr_number` is either a positive integer for the newly reported PR or `null` when no PR was accepted for handoff.
 - {requirement_rules}
-- A created-PR result may not contain a `blocked` signed-requirement disposition. If a signed requirement is discovered to be blocked after a PR was opened, set `pr_number` to `null`, keep the real PR number or URL in the summary or disposition evidence so the operator can locate it, and describe the conflict.
+- A signed requirement that is blocked after you opened a PR (for example a human-only step) keeps the real positive `pr_number`: mark the requirement `blocked` with a concrete reason and use `state: blocking`. The PR still goes to review, and the blocked requirement is carried there as the human-requirements acknowledgement item. Reserve `pr_number: null` for the no-PR result.
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited. {prompt_support.TEST_OBSERVATIONS_ARRAY_GUIDANCE}

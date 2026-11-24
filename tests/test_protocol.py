@@ -15,12 +15,12 @@ from coding_review_agent_loop.cli import (
     parse_agent_state,
 )
 from coding_review_agent_loop.pr_loop import HUMAN_REQUIREMENTS_ACK_ITEM_ID, _validate_coder_followup_response, _validate_review_response
-from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
 from coding_review_agent_loop.comment_rendering import _review_freeform_summary_text
 from coding_review_agent_loop.response_validation import _validate_issue_implementation_response, _validate_plan_revision_response
 from coding_review_agent_loop.plan_first_loop import _validate_plan_review_response
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
+    StructuredIssueImplementation,
     DeferredStage,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
@@ -129,7 +129,8 @@ def test_issue_implementation_protocol_accepts_null_pr_and_nullable_tests():
     assert parsed.tests_run is None
 
 
-def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
+def test_issue_implementation_protocol_accepts_positive_pr_beside_blocked_requirement():
+    """A PR beside a blocked signed requirement is a valid handoff (#2120)."""
     from coding_review_agent_loop.github import HumanReviewRequirement
 
     requirement = HumanReviewRequirement(
@@ -155,9 +156,10 @@ def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
         human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
-    assert isinstance(result, _TerminalIssueImplementationConflict)
-    assert result.parsed.pr_number == 77
-    assert result.parsed.human_requirement_dispositions[0].evidence.endswith("unavailable.")
+    assert isinstance(result, StructuredIssueImplementation)
+    assert result.pr_number == 77
+    assert result.human_requirement_dispositions[0].disposition == "blocked"
+    assert result.human_requirement_dispositions[0].evidence.endswith("unavailable.")
 
 
 def test_issue_implementation_protocol_rejects_wrong_footer_state():
@@ -5779,17 +5781,17 @@ def test_required_contract_enforcement_points_still_raise_for_unrelated_defects(
         validator(json.dumps(payload) + text[split:])
 
 
-def test_unsatisfied_issue_implementation_conflict_returns_parsed_instead_of_raising():
+def test_issue_implementation_pr_beside_blocked_returns_parsed_satisfied_or_not():
     text = _deg_issue_implementation(
         human_requirement_ids=["Requirement 1"],
         human_requirement_dispositions=[
             {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}
         ],
     )
-    from coding_review_agent_loop.errors import IssueImplementationConflictError
-
-    with pytest.raises(IssueImplementationConflictError):
-        validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    # #2120: no conflict raise; a satisfied contract returns the payload.
+    satisfied = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    assert satisfied.pr_number == 77
+    assert satisfied.architecture_impact_contract.satisfied is True
     parsed = validate_structured_issue_implementation(
         _with_impact(text, None), required_architecture_impact_contract=1
     )

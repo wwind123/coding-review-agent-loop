@@ -45,7 +45,7 @@ from agent_loop_helpers import (
 import coding_review_agent_loop.validated_agent as validated_agent_module
 
 
-def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
+def test_unsatisfied_blocked_payload_is_returned_for_the_seam_to_refuse():
     blocked = [{"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}]
     text = _deg_with(
         structured_issue_implementation(
@@ -53,14 +53,11 @@ def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
         ),
         None,
     )
-    # The typed conflict is raised only for a satisfied contract; an
-    # unsatisfied one returns the parsed payload for the seam to refuse.
+    # A PR beside a blocked disposition is a valid handoff (#2120), but an
+    # unsatisfied required contract still returns a payload the seam refuses.
     result = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
     assert result.pr_number == 77
     assert architecture_contract.architecture_impact_contract_unsatisfied(result)
-    # A conflict wrapper around an unsatisfied payload is still unsatisfied.
-    wrapped = architecture_contract._TerminalIssueImplementationConflict(result)
-    assert architecture_contract.architecture_impact_contract_unsatisfied(wrapped)
 
 
 def test_metadata_writer_requires_the_whole_result():
@@ -116,16 +113,6 @@ def test_accepted_non_review_carrier_persists_and_renders_its_record(name, parse
     assert record.outcome == "normalized-to-changed"
     assert "### Parse degradations" in body
     assert "normalized-to-changed" in body
-
-
-def test_accepted_conflict_wrapper_persists_its_record():
-    parsed = validate_structured_issue_implementation(
-        _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
-        architecture_status_mode="degradable",
-    )
-    wrapped = architecture_contract._TerminalIssueImplementationConflict(parsed)
-    fields = architecture_contract._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)
-    assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
 
 
 def test_metadata_helper_rejects_an_unlisted_assessment_bearing_object():

@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from .post_merge_obligations import ObligationRequest
 from .errors import (
     AgentLoopError,
-    IssueImplementationConflictError,
     MissingJudgementFieldError,
 )
 from .protocol_discuss_types import (
@@ -3064,7 +3063,7 @@ def filter_surfaced_requirement_dispositions(
     Legacy positional labels, reviewer-owned IDs (#2020) and conflicting
     duplicates still reject; byte-identical duplicates collapse.  Runs before
     any disposition-dependent decision, so an unsurfaced ``blocked`` entry can
-    never block an approval or make a terminal conflict.
+    never block an approval or mint an acknowledgement item.
     """
     expected = {_normalize_requirement_label(item) for item in surfaced_requirement_ids}  # shape-check: fatal:no-conservative-reading
     actual = [item.requirement_id for item in dispositions]
@@ -4428,23 +4427,10 @@ def validate_structured_issue_implementation(
         architecture_impact_degradations=architecture_impact_degradations,
         risk_test_matrix_coverage_gaps=coverage_gaps,
     )
-    # An unsatisfied required contract outranks the semantic conflict, as the
-    # former raise did: return it so the seam refuses it rather than letting a
-    # conflict wrapper hide the missing assessment.
-    if architecture_impact_contract.required and not architecture_impact_contract.satisfied:
-        return parsed
-    # Keep this semantic contradiction visible to callers as a dedicated error
-    # with the typed payload attached.  The orchestration adapter first
-    # re-applies caller-specific requirement coverage before treating it as a
-    # terminal conflict.
-    if parsed.pr_number is not None and any(
-        item.disposition == "blocked" for item in parsed.human_requirement_dispositions
-    ):
-        if historical_decode and surfaced_requirement_ids is None:
-            # Context-free readers recover the same payload either way (#2114).
-            _logger.warning("issue_implementation: historical decode kept a PR beside a blocked disposition")
-            return parsed
-        raise IssueImplementationConflictError(parsed)  # shape-check: fatal:no-conservative-reading
+    # A positive PR beside a blocked signed-requirement disposition is a valid
+    # handoff (#2120): the PR loop carries the blocked requirement as the
+    # human-requirements acknowledgement item.  An unsatisfied required
+    # architecture contract is still refused at the seam.
     return parsed
 
 

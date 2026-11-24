@@ -1,4 +1,4 @@
-"""Issue-implementation tests: managed PR creation and requirement blocking (#1543)."""
+"""Issue-implementation tests: managed PR creation and requirement blocking (#1543, #2120)."""
 
 import coding_review_agent_loop.issue_recovery as issue_recovery
 import coding_review_agent_loop.plan_execution as plan_execution
@@ -197,45 +197,72 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     assert merged_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
 
 
-def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_path, monkeypatch):
+def test_direct_issue_blocked_requirement_beside_pr_hands_off_to_pr_loop(tmp_path, monkeypatch):
+    """#2120: a PR beside a blocked signed requirement enters the PR loop."""
     runner = FakeRunner(claude_outputs=[_blocked_issue_implementation()])
     config = make_config(tmp_path)
     issue_context = _issue_context_with_blocked_requirement()
-    gate_calls = []
+    reviewed = []
 
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", lambda *args, **kwargs: issue_context)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop, issue_recovery,), "prepare_agent_memory", lambda *args, **kwargs: None)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(
+        monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop",
+        lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0,
+    )
 
-    def unexpected_gate(name):
-        def _fail(*args, **kwargs):
-            gate_calls.append(name)
-            raise AssertionError(f"{name} must not run after an implementation conflict")
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
-        return _fail
-
-    for name, owners in (
-        ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_execution, issue_loop)),
-        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_execution, issue_loop)),
-        ("run_pr_loop", (pr_loop, issue_implementation, plan_execution, issue_loop)),
-    ):
-        patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
-
-    with pytest.raises(AgentLoopError, match="not accepted for handoff"):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    assert gate_calls == []
-    assert len(runner.comments) == 1
-    assert runner.comments[0].count("Rejected for handoff: reported PR #77") == 1
+    assert reviewed == [77]
+    assert not any("Rejected for handoff" in comment for comment in runner.comments)
+    assert not any("not accepted for handoff" in comment for comment in runner.comments)
+    assert any("Pull request reported: #77." in comment for comment in runner.comments)
 
 
-def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_gates(
+def test_approved_plan_blocked_requirement_beside_pr_hands_off_to_pr_loop(
     tmp_path, monkeypatch
 ):
+    """#2120: the plan-first driver hands off instead of a terminal conflict."""
     runner = FakeRunner(claude_outputs=[_blocked_issue_implementation()])
+    config = make_config(tmp_path)
+    issue_context = _issue_context_with_blocked_requirement()
+    reviewed = []
+
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *args, **kwargs: None)
+    patch_attr_in(
+        monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop",
+        lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0,
+    )
+
+    assert issue_implementation._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan="Approved implementation plan.",
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=validated_agent_module._new_usage_context(config),
+    ) == 0
+
+    assert reviewed == [77]
+    assert not any("Rejected for handoff" in comment for comment in runner.comments)
+    assert any("Pull request reported: #77." in comment for comment in runner.comments)
+
+
+def test_approved_plan_missing_requirement_disposition_beside_pr_still_stops(
+    tmp_path, monkeypatch
+):
+    """#2120 keeps the stop for an invalid ledger: no PR auth, no PR loop."""
+    invalid = structured_issue_implementation(
+        summary="PR #77 was opened.", pr_number=77, human_requirement_dispositions=[],
+    )
+    runner = FakeRunner(claude_outputs=[invalid] * 4)
     config = make_config(tmp_path)
     issue_context = _issue_context_with_blocked_requirement()
     gate_calls = []
@@ -247,19 +274,18 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
     def unexpected_gate(name):
         def _fail(*args, **kwargs):
             gate_calls.append(name)
-            raise AssertionError(f"{name} must not run after an implementation conflict")
+            raise AssertionError(f"{name} must not run after an invalid implementation contract")
 
         return _fail
 
     for name, owners in (
         ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_execution, issue_loop)),
         ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_execution, issue_loop)),
         ("run_pr_loop", (pr_loop, issue_implementation, plan_execution, issue_loop)),
     ):
         patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
 
-    with pytest.raises(AgentLoopError, match="not accepted for handoff"):
+    with pytest.raises(AgentLoopError, match="missing requirement ID"):
         issue_implementation._implement_approved_issue(
             runner,
             issue_number=56,
@@ -272,8 +298,7 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
         )
 
     assert gate_calls == []
-    assert len(runner.comments) == 1
-    assert runner.comments[0].count("Rejected for handoff: reported PR #77") == 1
+    assert not any("acknowledgement item" in comment for comment in runner.comments)
 
 
 def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
@@ -447,3 +472,153 @@ def test_new_managed_pr_observation_precedes_authorization(tmp_path, monkeypatch
             run_issue_loop(runner, issue_number=56, config=config)
     assert calls == []
     assert not runner.pr_payload.get('comments')
+
+
+# --- #2120: blocked human-only requirement reaches the first review --------
+
+_BLOCKED_REASON_2120 = "Operator must run the dev canary after deploy (zq-2120-reason)."
+
+
+def _issue_requirement_2120():
+    return HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2120",
+        body="The operator runs the canary on dev after deploy.",
+    )
+
+
+def _issue_context_2120():
+    return IssueContext(
+        number=56, repo="OWNER/REPO", title="Issue", body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56", comments=(),
+        human_requirements=(_issue_requirement_2120(),),
+    )
+
+
+def test_approved_plan_blocked_human_only_requirement_reaches_first_review_prompt(
+    tmp_path, monkeypatch
+):
+    """#2120 matrix row `handoff-blocked-human-only` through the real PR loop."""
+    from coding_review_agent_loop.unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID
+
+    requirement = _issue_requirement_2120()
+    implementation = structured_issue_implementation(
+        summary="PR #77 was opened; the human-only canary step is blocked.",
+        pr_number=77,
+        human_requirement_dispositions=[{
+            "requirement_id": requirement.requirement_id,
+            "disposition": "blocked",
+            "evidence": _BLOCKED_REASON_2120,
+        }],
+    )
+    runner = FakeRunner(
+        claude_outputs=[implementation],
+        codex_outputs=[structured_pr_review(state="blocking", summary="Waiting on the canary.")],
+    )
+    config = make_config(tmp_path, max_rounds=1)
+    issue_context = _issue_context_2120()
+    seen_ledgers = []
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", lambda *args, **kwargs: issue_context)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *args, **kwargs: None)
+    real_reconcile = pr_loop._reconcile_human_requirements_ack_item
+
+    def spy_reconcile(*args, **kwargs):
+        result = real_reconcile(*args, **kwargs)
+        seen_ledgers.append(list(result))
+        return result
+
+    monkeypatch.setattr(pr_loop, "_reconcile_human_requirements_ack_item", spy_reconcile)
+
+    try:
+        issue_implementation._implement_approved_issue(
+            runner, issue_number=56, approved_plan="Approved implementation plan.",
+            config=config, memory=None, issue_context=issue_context,
+            coder_session_id=None,
+            usage_context=validated_agent_module._new_usage_context(config),
+        )
+    except AgentLoopError as exc:
+        # Only the bounded round budget may end the run; never a terminal
+        # implementation conflict.
+        assert "not accepted for handoff" not in str(exc)
+        assert "signed human requirement is blocked" not in str(exc)
+
+    assert not any("Rejected for handoff" in comment for comment in runner.comments)
+    assert any("Pull request reported: #77." in comment for comment in runner.comments)
+    # The acknowledgement item is in the ledger with the Orchestrator owner.
+    carried = [item for ledger in seen_ledgers for item in ledger if item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID]
+    assert carried and carried[0].reviewer == "Orchestrator"
+    assert _BLOCKED_REASON_2120 in carried[0].text
+    assert "strictly different head" not in carried[0].text
+    assert "a new head is not required" in carried[0].text
+    # The first reviewer prompt shows the item and the blocked reason.
+    review_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd and cmd[0] == "codex"]
+    assert review_prompts
+    assert HUMAN_REQUIREMENTS_ACK_ITEM_ID in review_prompts[0]
+    assert _BLOCKED_REASON_2120 in review_prompts[0]
+
+
+def test_resume_reconcile_from_stored_round_one_record_reupserts_blocked_ack_item(
+    tmp_path, monkeypatch
+):
+    """#2120 matrix row `resume-after-handoff`: the stored raw response rebuilds the item."""
+    from issue_loop_test_helpers import _metadata_from_public_comment
+    from coding_review_agent_loop.round_metadata import rebuild_resumed_coder_carrier
+    from coding_review_agent_loop.unresolved_items import (
+        HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+        _reconcile_human_requirements_ack_item,
+    )
+
+    requirement = _issue_requirement_2120()
+    implementation = structured_issue_implementation(
+        summary="PR #77 was opened; the human-only canary step is blocked.",
+        pr_number=77,
+        human_requirement_dispositions=[{
+            "requirement_id": requirement.requirement_id,
+            "disposition": "blocked",
+            "evidence": _BLOCKED_REASON_2120,
+        }],
+    )
+    runner = FakeRunner(claude_outputs=[implementation])
+    config = make_config(tmp_path)
+    issue_context = _issue_context_2120()
+    reviewed = []
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *args, **kwargs: None)
+    patch_attr_in(
+        monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "run_pr_loop",
+        lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0,
+    )
+    assert issue_implementation._implement_approved_issue(
+        runner, issue_number=56, approved_plan="Approved implementation plan.",
+        config=config, memory=None, issue_context=issue_context, coder_session_id=None,
+        usage_context=validated_agent_module._new_usage_context(config),
+    ) == 0
+    assert reviewed == [77]
+
+    pr_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ]
+    (record,) = [c for c in pr_comments + list(runner.comments) if "AGENT_LOOP_META: " in c]
+    metadata = _metadata_from_public_comment(record)
+    stored = metadata.raw_structured_coder_response
+    assert stored
+    # Historical decode of the stored record never raises.
+    carrier = rebuild_resumed_coder_carrier(stored, metadata)
+    assert carrier is not None and carrier.pr_number == 77
+
+    first = _reconcile_human_requirements_ack_item(
+        (), coder_output=stored, human_requirements=(requirement,), source_round=1,
+    )
+    again = _reconcile_human_requirements_ack_item(
+        first, coder_output=stored, human_requirements=(requirement,), source_round=1,
+    )
+    assert [item.item_id for item in first] == [HUMAN_REQUIREMENTS_ACK_ITEM_ID]
+    assert _BLOCKED_REASON_2120 in first[0].text
+    assert again == first

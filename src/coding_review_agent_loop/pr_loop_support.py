@@ -48,7 +48,6 @@ from .pr_round_errors import PrRoundHistoryError
 from .errors import (
     AgentLoopError,
     HumanDecisionRequiredError,
-    IssueImplementationConflictError,
     parse_human_decision,
     render_human_decision,
     reraise_human_decision,
@@ -573,8 +572,6 @@ def _extract_structured_coder_summary(text: str | None) -> str | None:
     try:
         try:
             implementation = parse_historical_structured_issue_implementation(text)
-        except IssueImplementationConflictError as exc:
-            implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):
@@ -591,8 +588,6 @@ def _extract_structured_coder_tests_run(text: str | None) -> tuple[str, ...] | N
     try:
         try:
             implementation = parse_historical_structured_issue_implementation(text)
-        except IssueImplementationConflictError as exc:
-            implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):

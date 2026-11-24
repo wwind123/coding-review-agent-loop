@@ -220,7 +220,6 @@
   "support_owners": {
     "encode_review_scope": "review_scope",
     "decode_review_scope": "review_scope",
-    "IssueImplementationConflictError": "errors",
     "_decode_execution_mode": "round_state_scheduler",
     "_decode_common_scheduler_lists": "round_state_scheduler",
     "_decode_plan_scheduler_fields": "round_state_scheduler",

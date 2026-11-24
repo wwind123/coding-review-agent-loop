@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from .review_scope import encode_review_scope, decode_review_scope
-from .errors import AgentLoopError, IssueImplementationConflictError
+from .errors import AgentLoopError
 from .round_state_scheduler import (
     _decode_execution_mode,
     _decode_scheduler_fields,
@@ -866,8 +866,6 @@ def rebuild_resumed_coder_carrier(
     carrier: StructuredCoderFollowup | StructuredIssueImplementation | None
     try:
         carrier = parse_historical_structured_issue_implementation(text)
-    except IssueImplementationConflictError as exc:
-        carrier = exc.payload if isinstance(exc.payload, StructuredIssueImplementation) else None
     except AgentLoopError:
         carrier = None
     if carrier is None:

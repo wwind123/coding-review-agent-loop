@@ -218,7 +218,7 @@ raw agent JSON.
   surfaced `addressed` dispositions. Live parsers carry the derived tuple,
   while a historical decode keeps the submitted list.
   `filter_surfaced_requirement_dispositions` drops dispositions for unsurfaced
-  IDs before any blocked-state or conflict decision. Legacy labels,
+  IDs before any blocked-state decision. Legacy labels,
   reviewer-owned IDs, missing coverage and conflicting duplicates still reject.
   Every caller that keeps a parsed record (the plan-review, plan-state and
   plan-revision acceptance paths, and their recovery reader) stores the kept
@@ -230,8 +230,8 @@ raw agent JSON.
   `parse_historical_structured_*`, and the post-authentication
   claim-correction reader (`_parse_fresh_correction_claims`), which takes only
   the claim set. So an accepted approved follow-up beside an unsurfaced
-  blocked disposition, or an implementation PR beside one, decodes with a
-  warning.
+  blocked disposition decodes with a warning. An implementation PR beside a
+  blocked disposition is a valid handoff and decodes normally (#2120).
 - Duplicates: entries that are equal on every parsed field collapse with a
   warning. This covers review dispositions (including
   `evidence_requirement_ids`), requirement dispositions, IDs repeated within

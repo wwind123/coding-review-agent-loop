@@ -651,33 +651,32 @@ def test_workflow_clarification_first_response_never_reaches_the_gate(tmp_path, 
     assert len(_claude_commands(h)) == 1 and h.run_pr_calls == []
 
 
-def test_workflow_signed_requirement_conflict_on_reask_is_terminal(tmp_path, monkeypatch):
+def test_workflow_blocked_requirement_on_same_pr_reask_is_adopted_and_handed_off(tmp_path, monkeypatch):
+    """#2120: a same-PR re-ask with a blocked disposition is adopted, not terminal."""
     from coverage_reask_helpers import CoverageHarness, claim, response_text
-    from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
     from coding_review_agent_loop.protocol import HumanRequirementDisposition
 
     h = CoverageHarness(tmp_path, monkeypatch)
     h.runner.git_diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
     first = h.response(response_text(claims=[claim("row-wf")]))
 
-    def conflict(harness):
+    def blocked_reask(harness):
         reask = harness.response(response_text(claims=[claim("row-wf")]))
         blocked = replace(
             reask.marker_value,
             human_requirement_dispositions=(HumanRequirementDisposition("hr-1", "blocked", "cannot comply"),),
         )
-        return replace(reask, marker_value=_TerminalIssueImplementationConflict(blocked))
+        return replace(reask, marker_value=blocked)
 
-    h.script = [first, conflict]
-    with pytest.raises(AgentLoopError, match="signed human requirement is blocked"):
-        h.run()
+    h.script = [first, blocked_reask]
+    assert h.run() == 0
     assert len(h.calls) == 2
-    assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in h.all_comments())
-    assert h.run_pr_calls == []
-
-    summaries = list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
-    assert len(summaries) == 1
-    assert "valid terminal response" in summaries[0].read_text()
+    assert h.run_pr_calls
+    comment = h.coder_comment()
+    assert "Pull request reported: #77." in comment
+    assert "cannot comply" in comment
+    assert "Rejected for handoff" not in comment
+    assert not list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
 
 
 @pytest.mark.parametrize("plan_mode", ["none", "not-applicable"])
@@ -904,30 +903,24 @@ def test_workflow_corroborated_near_miss_on_still_incomplete_reask_is_canonicali
 
 
 @pytest.mark.parametrize("direct", [False, True])
-def test_workflow_initial_signed_requirement_conflict_never_reaches_the_gate(tmp_path, monkeypatch, direct):
-    from coverage_reask_helpers import CoverageHarness, claim, response_text
-    from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
+def test_workflow_initial_blocked_requirement_beside_pr_hands_off(tmp_path, monkeypatch, direct):
+    """#2120: an initial PR beside a blocked disposition is no terminal stop."""
+    from coverage_reask_helpers import CoverageHarness, complete_claims, response_text
     from coding_review_agent_loop.protocol import HumanRequirementDisposition
 
     h = CoverageHarness(tmp_path, monkeypatch)
-    h.runner.git_diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
-    first = h.response(response_text(claims=[claim("row-wf")]))
+    first = h.response(response_text(claims=complete_claims()))
     blocked = replace(
         first.marker_value,
         human_requirement_dispositions=(HumanRequirementDisposition("hr-1", "blocked", "cannot comply"),),
     )
-    h.script = [replace(first, marker_value=_TerminalIssueImplementationConflict(blocked))]
-    with pytest.raises(AgentLoopError, match="signed human requirement is blocked"):
-        if direct:
-            issue_loop.run_issue_loop(h.runner, issue_number=56, config=h.config)
-        else:
-            h.run()
-    assert len(h.calls) == 1 and h.run_pr_calls == []
-    assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in h.all_comments())
-
-    summaries = list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
-    assert len(summaries) == 1
-    assert "valid terminal response" in summaries[0].read_text()
+    h.script = [replace(first, marker_value=blocked)]
+    if direct:
+        assert issue_loop.run_issue_loop(h.runner, issue_number=56, config=h.config) == 0
+    else:
+        assert h.run() == 0
+    assert len(h.calls) == 1 and h.run_pr_calls
+    assert not list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
 
 
 @pytest.mark.parametrize("outcome", ["null-pr", "different-pr", "failure", "adopted"])

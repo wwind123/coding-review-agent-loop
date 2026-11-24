@@ -2177,15 +2177,15 @@ def _render_public_issue_implementation_comment(
         item.disposition == "blocked"
         for item in parsed.human_requirement_dispositions
     )
-    if has_blocked_requirement and parsed.pr_number is not None:
-        result = (
-            f"Rejected for handoff: reported PR #{parsed.pr_number} was not accepted "
-            "because a signed human requirement is blocked."
-        )
-    elif parsed.pr_number is None:
+    if parsed.pr_number is None:
         result = "No pull request was accepted for handoff."
     else:
         result = f"Pull request reported: #{parsed.pr_number}."
+        if has_blocked_requirement:
+            result += (
+                "\nBlocked signed human requirements are carried to review as the "
+                "human-requirements acknowledgement item."
+            )
     sections = ["## Issue implementation", parsed.summary.strip(), f"### Result\n{result}"]
     if parsed.tests_run:
         sections.append(

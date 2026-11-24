@@ -1944,3 +1944,143 @@ def test_resumed_superseded_classification_replays_from_admitted_records(tmp_pat
         assert "These signed requirements are reviewer-owned" not in scope
         assert "a pending one belongs in" not in scope
         assert new.requirement_id not in scope
+
+
+# --- #2120: implementation carriers with blocked dispositions ---------------
+
+def _requirement_2120(suffix):
+    return HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-01-01T00:00:00Z",
+        url=f"https://github.com/OWNER/REPO/issues/56#issuecomment-{suffix}",
+        body=f"Signed requirement {suffix}.",
+    )
+
+
+def _implementation_2120(dispositions, *, pr_number=77):
+    from agent_loop_helpers import structured_issue_implementation
+
+    return structured_issue_implementation(
+        summary="Implemented; see dispositions.",
+        pr_number=pr_number,
+        human_requirement_dispositions=dispositions,
+    )
+
+
+def _pending_ack_2120():
+    return (
+        UnresolvedReviewItem(
+            item_id=HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+            reviewer="Orchestrator",
+            source_round=1,
+            text="Ack missing.",
+            status="blocking",
+        ),
+    )
+
+
+def test_implementation_blocked_disposition_upserts_sanitized_bounded_ack_item():
+    from coding_review_agent_loop.unresolved_items import IMPLEMENTATION_BLOCKED_REASON_MAX_CHARS
+
+    requirement = _requirement_2120("a")
+    reason = "Human-only canary step; names AGENT_ISSUE_PR_HANDOFF. " + "x" * 5000
+    reconciled = _reconcile_human_requirements_ack_item(
+        (),
+        coder_output=_implementation_2120([
+            {"requirement_id": requirement.requirement_id, "disposition": "blocked", "evidence": reason},
+        ]),
+        human_requirements=(requirement,),
+        source_round=1,
+    )
+
+    (item,) = reconciled
+    assert item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    assert item.reviewer == "Orchestrator"
+    assert requirement.requirement_id in item.text
+    assert "Human-only canary step;" in item.text
+    assert "AGENT_ISSUE_PR_HANDOFF" not in item.text
+    assert "[protocol ISSUE_PR_HANDOFF record]" in item.text
+    assert "(truncated)" in item.text
+    assert len(item.text) < IMPLEMENTATION_BLOCKED_REASON_MAX_CHARS + 1000
+    assert "a new head is not required" in item.text
+    assert "strictly different head" not in item.text
+
+
+def test_implementation_blocked_listing_is_bounded_in_total():
+    from coding_review_agent_loop.unresolved_items import (
+        IMPLEMENTATION_BLOCKED_TOTAL_MAX_CHARS,
+        _implementation_blocked_requirements_ack_text,
+    )
+    from coding_review_agent_loop.protocol import HumanRequirementDisposition
+
+    blocked = [
+        HumanRequirementDisposition(f"hr-{index:064d}", "blocked", "y" * 550) for index in range(20)
+    ]
+    text = _implementation_blocked_requirements_ack_text(blocked)
+    assert len(text) < IMPLEMENTATION_BLOCKED_TOTAL_MAX_CHARS + 1200
+    assert "more blocked requirement(s) omitted" in text
+
+
+def test_implementation_only_unsurfaced_blocked_entry_clears_the_item():
+    surfaced = _requirement_2120("a")
+    unsurfaced = _requirement_2120("b")
+    reconciled = _reconcile_human_requirements_ack_item(
+        _pending_ack_2120(),
+        coder_output=_implementation_2120([
+            {"requirement_id": surfaced.requirement_id, "disposition": "addressed", "evidence": "Done."},
+            {"requirement_id": unsurfaced.requirement_id, "disposition": "blocked", "evidence": "RB-unsurfaced-reason"},
+        ]),
+        human_requirements=(surfaced,),
+        source_round=2,
+    )
+    assert reconciled == []
+
+
+def test_implementation_mixed_blocked_renders_only_surfaced_requirement_via_historical_parse():
+    from coding_review_agent_loop.protocol import parse_historical_structured_issue_implementation
+
+    surfaced = _requirement_2120("a")
+    unsurfaced = _requirement_2120("b")
+    text = _implementation_2120([
+        {"requirement_id": surfaced.requirement_id, "disposition": "blocked", "evidence": "RA-surfaced-reason"},
+        {"requirement_id": unsurfaced.requirement_id, "disposition": "blocked", "evidence": "RB-unsurfaced-reason"},
+    ])
+    # The historical decode used on resume keeps the unsurfaced entry.
+    historical = parse_historical_structured_issue_implementation(text)
+    assert unsurfaced.requirement_id in [d.requirement_id for d in historical.human_requirement_dispositions]
+
+    (item,) = _reconcile_human_requirements_ack_item(
+        (), coder_output=text, human_requirements=(surfaced,), source_round=1,
+    )
+    assert surfaced.requirement_id in item.text and "RA-surfaced-reason" in item.text
+    assert unsurfaced.requirement_id not in item.text
+    assert "RB-unsurfaced-reason" not in item.text
+
+
+def test_followup_blocked_disposition_still_clears_the_item():
+    requirement = _requirement_2120("a")
+    followup = structured_coder_followup(
+        addressed_items=[],
+        human_requirement_ids=[],
+        human_requirement_dispositions=[
+            {"requirement_id": requirement.requirement_id, "disposition": "blocked", "evidence": "Still blocked."},
+        ],
+    )
+    reconciled = _reconcile_human_requirements_ack_item(
+        _pending_ack_2120(), coder_output=followup, human_requirements=(requirement,), source_round=2,
+    )
+    assert reconciled == []
+
+
+def test_implementation_without_blocked_disposition_still_clears_the_item():
+    requirement = _requirement_2120("a")
+    reconciled = _reconcile_human_requirements_ack_item(
+        _pending_ack_2120(),
+        coder_output=_implementation_2120([
+            {"requirement_id": requirement.requirement_id, "disposition": "addressed", "evidence": "Done."},
+        ]),
+        human_requirements=(requirement,),
+        source_round=2,
+    )
+    assert reconciled == []
