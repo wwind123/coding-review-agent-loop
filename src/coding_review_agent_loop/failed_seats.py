@@ -157,25 +157,43 @@ def peer_blocked_settlement(
 
 
 def plan_round_retries_failed_seats(current_resume, *, round_reviewers, resumed, records, subject) -> bool:
-    """Whether a reconciled plan round is retried for its recorded failed seats.
+    """Whether a reconciled plan round still owes a failed-seat settlement.
 
-    True when the resumed round is reconciled, some round reviewer has no
-    resumed review, and every such reviewer is a failed seat named by the
-    round's latest reconciliation record.  ``records`` is called lazily.
+    The round's latest reconciliation record names failed seats ``F`` and
+    every round reviewer without a resumed review is in ``F``.  Two cases
+    qualify: a failed seat is still missing (it is retried in the same round),
+    or a failed seat already published a review after that record but the
+    replacement reconciliation was interrupted (it is resumed and the fresh
+    record is posted before the round advances).  A round whose reviews were
+    published in parallel never qualifies: a same-round retry would let the
+    failed seat read its peers' published verdicts, so it keeps the
+    reviewer-only rollover.  ``records`` is called lazily.
     """
     if current_resume is None or not current_resume.reconciled:
         return False
     missing = {name for name in round_reviewers if name not in resumed}
-    if not missing:
-        return False
-    from .round_state import _round_failed_seats
-
-    failed = _round_failed_seats([
+    round_records = [
         record for record in records()
         if record.metadata.round_number == current_resume.round_number
         and record.metadata.subject == subject
-    ])
-    return missing <= set(failed)
+    ]
+    if any(r.metadata.role == "reviewer" and r.metadata.phase == "publication" for r in round_records):
+        return False
+    latest = None
+    for position, record in enumerate(round_records):
+        metadata = record.metadata
+        if metadata.role == "summary" and metadata.phase == "reconciliation":
+            latest = position
+    if latest is None:
+        return False
+    failed = set(round_records[latest].metadata.failed_reviewer_seats)
+    if not failed or not missing <= failed:
+        return False
+    reviewed_after = {
+        record.metadata.agent for record in round_records[latest + 1:]
+        if record.metadata.role == "reviewer"
+    }
+    return bool(missing) or bool(failed & reviewed_after)
 
 
 def pending_failed_seat_retries(records) -> frozenset[str]:

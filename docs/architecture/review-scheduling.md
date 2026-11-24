@@ -473,9 +473,12 @@ coder (PR) or planner revision (plan). The shared rule lives in
 - **Plan resume.** A rerun of a reconciled sequential plan round whose only
   missing reviews are the recorded failed seats re-invokes those seats in the
   same round, resumes the healthy reviews and posts a fresh reconciliation
-  record; the latest record of a round is the one recovery reads. Parallel
-  rounds keep the reviewer-only rollover, because a same-round retry would let
-  the failed seat read its peers' published verdicts.
+  record; the latest record of a round is the one recovery reads. A retry
+  interrupted after the failed seat published but before that fresh record is
+  finished on the next rerun before the round advances. A round whose reviews
+  were published in parallel keeps the reviewer-only rollover even when rerun
+  sequentially, because a same-round retry would let the failed seat read its
+  peers' published verdicts.
 - **Parallel independence.** A parallel round normally withholds healthy
   peers' outcomes until a failed seat completes an independent rerun. When a
   healthy peer returned a completed blocking review (a new finding, a carried

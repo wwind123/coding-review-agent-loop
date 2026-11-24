@@ -671,8 +671,14 @@ def test_plan_sequential_resume_retries_the_failed_seat_in_the_same_round(tmp_pa
     assert not any(r.agent == "Gemini" and r.state == "approved" for r in records if r.role == "reviewer")
 
 
-def test_plan_resume_after_continued_round_keeps_frozen_item(tmp_path):
-    """Row pr-resume-after-continued-round (plan): interrupted before the planner record."""
+@pytest.mark.parametrize("rerun_parallel", [True, False], ids=["rerun-parallel", "rerun-sequential"])
+def test_plan_resume_after_continued_round_keeps_frozen_item(tmp_path, rerun_parallel):
+    """Row pr-resume-after-continued-round (plan): interrupted before the planner record.
+
+    The continued round was parallel, so its healthy review is a public
+    publication. A rerun in either mode keeps the reviewer-only rollover: a
+    sequential rerun must not retry the failed seat in the same round.
+    """
     claude, codex, gemini = _plan_round_one()
     codex.append(_codex_plan_blocks_and_clears_gemini())
     runner = FakeRunner(claude_outputs=claude, codex_outputs=codex, gemini_outputs=gemini)
@@ -683,8 +689,10 @@ def test_plan_resume_after_continued_round_keeps_frozen_item(tmp_path):
     assert not any(r.role == "coder" and r.round_number == 3 for r in _plan_records(runner))
 
     before = len(_plan_records(runner))
+    rerun = config if rerun_parallel else make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=False)
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        run_issue_loop(runner, issue_number=56, config=rerun, plan_first=True)
 
     # The reconciled round is missing Gemini's review, so the rerun carries
     # the ledger over from the round's GitHub records (a reviewer-only advance
@@ -840,3 +848,151 @@ def test_history_replay_and_head_advance_recovery_apply_the_freeze(failed_seats)
         records[:1], prior_items=records[0].metadata.prior_items, failed_seats=failed_seats,
     )
     assert bool(aggregate["item-2"]) is (not failed_seats)
+
+
+def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path, monkeypatch):
+    """Row pr-resume-after-continued-round (plan): a retry interrupted before its fresh record.
+
+    Gemini failed in round 2 (recorded). The rerun retries Gemini, which now
+    resolves its own item, but the process stops before the replacement
+    reconciliation record. The next rerun resumes both reviews, posts the
+    replacement record (no failed seats) and settles with Gemini's
+    dispositions, so the live ledger and the durable replay agree.
+    """
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    claude, codex, gemini = _plan_round_one()
+    codex.append(_codex_plan_blocks_and_clears_gemini())
+    runner = FakeRunner(claude_outputs=claude, codex_outputs=codex, gemini_outputs=gemini)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=False)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _reconciliation(_plan_records(runner), 2).failed_reviewer_seats == ("Gemini",)
+
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer=GEMINI, prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "resolved"},
+        {"item_id": "item-2", "disposition": "resolved"},
+    ]))
+    real_post = plan_first_loop.post_issue_comment
+
+    def stop_before_replacement(*args, **kwargs):
+        if "Plan review round 2 reconciliation" in kwargs.get("body", ""):
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    monkeypatch.setattr(plan_first_loop, "post_issue_comment", stop_before_replacement)
+    with pytest.raises(KeyboardInterrupt):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    monkeypatch.setattr(plan_first_loop, "post_issue_comment", real_post)
+    assert any(r.agent == "Gemini" and r.round_number == 2 for r in _plan_records(runner) if r.role == "reviewer")
+
+    runner.claude_outputs.append(structured_plan_revision(summary="Second revision.", prior_plan_item_dispositions=[
+        {"item_id": "item-3", "disposition": "resolved"},
+    ]))
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"claude", "codex", "gemini"}]
+    assert rerun_agents[0] == "claude"  # no reviewer re-invoked; the planner revision runs
+    records = _plan_records(runner)
+    round_two = [r for r in records if r.phase == "reconciliation" and r.round_number == 2]
+    assert [r.failed_reviewer_seats for r in round_two] == [("Gemini",), ()]
+    planner = next(r for r in records if r.role == "coder" and r.round_number == 3)
+    ledger = {item.item_id for item in planner.prior_items}
+    assert "item-2" not in ledger and "item-1" not in ledger and "item-3" in ledger
+    # Durable replay of the round agrees with the live settlement.
+    assert _round_failed_seats_for(records, 2) == ()
+
+
+def _round_failed_seats_for(records, round_number):
+    from coding_review_agent_loop.round_state import _round_failed_seats
+
+    return _round_failed_seats([
+        PostedRoundRecord(index=i, metadata=m, body="")
+        for i, m in enumerate(records) if m.round_number == round_number
+    ])
+
+
+def _staged_plan_fixtures():
+    """A fresh generation-1 plan plus a revision patch resolving both panel items."""
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+    from agent_loop_helpers import structured_v1_plan_state
+
+    fresh = structured_v1_plan_state()
+    base = plan_first_loop.AuthenticatedPlanState.from_plan(validate_structured_plan_state(fresh), round_number=1)
+    patch = {
+        "schema_version": 1, "kind": "plan_revision_patch", "semantic_patch_contract_version": 1,
+        "state": "blocking", "summary": "Address both panel findings.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved", "rationale": "The owner is named."},
+            {"item_id": "item-2", "disposition": "resolved", "rationale": "The rollback is named."},
+        ],
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": [{"op": "replace", "field": "plan_steps",
+                        "value": ["Implement the scope, name the owner and the rollback."]}],
+    }
+    return fresh, json.dumps(patch) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def test_staged_paused_primary_approval_cannot_clear_a_failed_seat_item(tmp_path, monkeypatch):
+    """Row failed-seat-items-frozen (staged plan): a paused primary's same-round approval.
+
+    Primary-then-panel: round 3 is a remediation round. Codex (primary)
+    approves and resolves both panel items, then the run stops (a quota reset
+    from Gemini). On the rerun Codex is paused on its qualifying approval, so
+    its dispositions arrive through the staged paused-approval branch; Gemini
+    fails and Antigravity keeps its own item blocking. Gemini's item-1 must
+    stay unchanged in both the settled ledger and the reconciliation record.
+    """
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    fresh, patch_text = _staged_plan_fixtures()
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}, {"item_id": "item-2", "disposition": "resolved"}]
+    runner = QuotaRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[structured_plan_review(state="approved"),
+                       structured_plan_review(state="approved", prior_plan_item_dispositions=resolved)],
+        gemini_outputs=[structured_plan_review(state="blocking", reviewer=GEMINI, summary="Owner missing.",
+                                               same_plan_followups=["Name the rollout owner."]), QUOTA],
+        antigravity_outputs=[structured_plan_review(state="blocking", reviewer="Google Antigravity",
+                                                    summary="Rollback missing.",
+                                                    same_plan_followups=["Name the rollback."])],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", max_rounds=8, review_parallel=False,
+    )
+    with pytest.raises(QuotaResetExceededError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert any(r.agent == "Codex" and r.round_number == 3 and r.state == "approved"
+               for r in _plan_records(runner) if r.role == "reviewer")
+
+    settled = []
+    real_apply = plan_first_loop._apply_unresolved_item_dispositions
+
+    def capture(*args, **kwargs):
+        result = real_apply(*args, **kwargs)
+        settled.append(result[0])
+        return result
+
+    monkeypatch.setattr(plan_first_loop, "_apply_unresolved_item_dispositions", capture)
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="blocking", reviewer="Google Antigravity", prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "resolved"},
+            {"item_id": "item-2", "disposition": "blocking", "note": "The rollback step is still unnamed; add it."},
+        ]))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    records = _plan_records(runner)
+    prelaunch = [r for r in records if r.round_number == 3 and r.phase == "scheduler-prelaunch"][-1]
+    assert "Codex" not in prelaunch.scheduler_selected_reviewers  # paused on its approval
+    reconciliation = _reconciliation(records, 3)
+    assert reconciliation.failed_reviewer_seats == ("Gemini",)
+    recorded = {(d.item_id, d.reviewer, d.disposition) for d in reconciliation.dispositions}
+    assert ("item-2", "Codex", "resolved") in recorded  # the paused approval was collected
+    assert not any(item_id == "item-1" for item_id, _r, _d in recorded)  # and frozen for Gemini
+    ledger = {item.item_id: item for item in settled[-1]}
+    assert ledger["item-1"].status == "same-plan" and ledger["item-1"].reviewer == "Gemini"
