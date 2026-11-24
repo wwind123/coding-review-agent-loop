@@ -1349,3 +1349,64 @@ def test_direct_child_issue_entry_loads_parent_notes_from_durable_history(tmp_pa
     prompt = build_issue_implementation_prompt(56, plan, config, approved_plan_context=context)
     assert f"- {note} (Codex)" in prompt
     assert "These notes come from the parent plan #55" in prompt
+
+
+@pytest.mark.parametrize("entry", ["issue", "pr"])
+def test_direct_child_pr_review_shows_parent_notes_from_durable_history(tmp_path, monkeypatch, entry):
+    """Matrix row `direct-child-notes`: the child's real PR loop, entered fresh or restarted.
+
+    ``issue`` drives the child issue entry through the shared dispatch and the
+    implementation resume into the PR loop; ``pr`` restarts the PR loop, which
+    recovers the plan through the parent fallback.  The notes live only in the
+    parent's durable plan history.
+    """
+    import dataclasses as _dc
+
+    import coding_review_agent_loop.execution_policy as execution_policy
+    import coding_review_agent_loop.plan_execution as plan_execution
+    from agent_loop_helpers import FakeRunner, make_config, serve_authenticated_issue_context
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
+    )
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from test_child_plan_provenance import comment, fresh_child_contexts, fresh_staged_matrix_plan
+
+    plan = fresh_staged_matrix_plan()
+    child, parent = fresh_child_contexts(plan, inherited_matrix_row_ids=("row-stage-one",))
+    note = "Parent note: update the pinned stage inventory test."
+    review = _attach_round_metadata("Parent plan review.", PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=1,
+        subject=_plan_subject(plan), state="approved", implementation_notes=(note,),
+    ))
+    parent = _dc.replace(parent, comments=(parent.comments[0], comment(review), *parent.comments[1:]))
+    patch_attr_in(
+        monkeypatch,
+        (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+         plan_first_loop_module, issue_loop, plan_execution),
+        "get_issue_context",
+        lambda runner, *, config, issue_number: serve_authenticated_issue_context(
+            runner, config, child if issue_number == 56 else parent,
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    if entry == "issue":
+        assert issue_loop.run_issue_loop(runner, issue_number=56, config=config) == 0
+    else:
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert f"- {note} (Codex)" in prompt
+    assert "These notes come from the parent plan #55" in prompt
+    assert "Plan hash: " + approved_plan_hash(plan) in prompt  # identity unchanged
+    # No implementation turn ran, and the note was never written into the
+    # child issue or any handoff record.
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert note not in child.body
+    assert not any(note in str(body) for body in runner.comments)

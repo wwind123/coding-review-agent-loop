@@ -5889,3 +5889,41 @@ def test_m2100_same_round_ids_dispositioned_as_carried_are_dropped():
     )
     assert payload_parsed.ignored_prior_disposition_ids == parsed.ignored_prior_disposition_ids
     assert [d["item_id"] for d in payload_parsed.to_payload()["prior_plan_item_dispositions"]] == ["item-8"]
+
+
+def test_qualification_replacement_plan_carries_its_scope_notes_to_the_reviewer(
+    tmp_path, monkeypatch
+):
+    """Matrix row `pr-reviewer-context-resume`: the qualification replacement (#2145).
+
+    A child plan re-planned mid-run (with an implementation note) replaces the
+    plan the PR run started under; the re-recovered qualification context must
+    carry the replacement scope's notes into the reviewer prompt.
+    """
+    from coding_review_agent_loop.prompts import build_review_prompt
+
+    note = "Replacement-scope note: refresh the stage inventory fixture."
+    approval_with_note = structured_plan_review(state="approved").replace(
+        '"future_followups": []',
+        f'"future_followups": [], "implementation_notes": ["{note}"]',
+    )
+    assert "implementation_notes" in approval_with_note
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()], codex_outputs=[approval_with_note, PR_APPROVAL],
+    ) == 0
+    world.settle()
+    old_context = execution_policy.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    assert old_context.implementation_notes == ()
+
+    _context, _ids, adopted, config = _m936_snapshot(
+        world, binding=_m936_binding(world), approved_plan_context=old_context,
+    )
+
+    assert adopted.plan_hash != old_context.plan_hash
+    assert adopted.implementation_notes == (f"{note} (Codex)",)
+    prompt = build_review_prompt(77, 1, config, reviewer="codex", approved_plan_context=adopted)
+    assert f"- {note} (Codex)" in prompt
+    assert "an unaddressed note is an ordinary PR review finding" in prompt

@@ -20,6 +20,7 @@ from agent_loop_helpers import (
     make_config,
     patch_object_in,
     structured_plan_review,
+    structured_plan_revision,
     structured_v1_plan_state,
 )
 from issue_loop_test_helpers import _m1103_agent_calls, _plan_round_records
@@ -1060,3 +1061,81 @@ def test_identical_plan_reapproved_in_a_new_scope_posts_one_notes_supplement(tmp
     later = [str(c["body"]) for c in restarted.issue_comments[len(runner.issue_comments):]]
     assert not any(body.startswith(SUPPLEMENT_HEADING_PREFIX) for body in later)
     assert not any("AGENT_PLAN_APPROVED_FOLLOWUPS:" in body for body in later)
+
+
+def _canonical_context_and_prompts(tmp_path, history):
+    """Recover the plan the managed-CI no-handoff way and render both consumers."""
+    from coding_review_agent_loop.pr_plan_recovery import _canonical_plan_without_handoff
+    from coding_review_agent_loop.prompts import build_issue_implementation_prompt, build_review_prompt
+
+    runner = _m1390_runner(history)
+    config = _m1390_config(tmp_path)
+    issue_context = get_issue_context(runner, config=config, issue_number=56)
+    context = _canonical_plan_without_handoff(
+        config, issue_context, runner=runner,
+        source_locator="issue #56 canonical approved plan",
+        error_message="incomplete canonical approval",
+    )
+    assert context is not None and context.is_available
+    implementation = build_issue_implementation_prompt(
+        56, context.canonical_text, config, approved_plan_context=context,
+    )
+    review = build_review_prompt(77, 1, config, reviewer="codex", approved_plan_context=context)
+    return context, implementation, review
+
+
+def test_reapproved_scope_notes_reach_implementer_and_recovered_reviewer_prompts(tmp_path):
+    """Matrix row `reapproval-new-scope`: delivery after the reopen, via no-handoff recovery."""
+    first = _m1390_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[_approval_with_notes("Old-scope note: refresh the archived fixture.")],
+    )
+    assert run_issue_loop(first, issue_number=56, config=_m1390_config(tmp_path), plan_first=True) == 0
+    runner, result, _calls, _messages = _rerun(
+        tmp_path, list(first.issue_comments),
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[_approval_with_notes("New-scope note: update the inventory test.")],
+    )
+    assert result == 0
+
+    context, implementation, review = _canonical_context_and_prompts(
+        tmp_path, list(runner.issue_comments),
+    )
+    assert context.implementation_notes == ("New-scope note: update the inventory test. (Codex)",)
+    for prompt in (implementation, review):
+        assert "- New-scope note: update the inventory test. (Codex)" in prompt
+        assert "Old-scope note" not in prompt
+
+
+def test_canonical_recovery_shows_earlier_blocking_and_approving_round_notes(tmp_path):
+    """Matrix row `pr-reviewer-context-resume`: canonical no-handoff recovery."""
+    import json as _json
+
+    from issue_loop_test_helpers import _m1103_blocking_chain, _m1103_fresh_base
+
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _next = _m1103_blocking_chain(1, 1, base=base)
+    payload_text, footer = codex[0].split("\n<!-- AGENT_PLAN_STATE", 1)
+    payload = _json.loads(payload_text)
+    payload["implementation_notes"] = ["Earlier-round note: refresh the golden file."]
+    blocking = _json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE" + footer
+    approving = _approval_with_notes("Approving-round note: update the inventory test.").replace(
+        '"prior_plan_item_dispositions": []',
+        '"prior_plan_item_dispositions": [{"item_id": "item-1", "disposition": "resolved"}]',
+    )
+    first = _m1390_runner(
+        claude_outputs=[fresh, *claude],
+        codex_outputs=[blocking, approving],
+    )
+    assert run_issue_loop(first, issue_number=56, config=_m1390_config(tmp_path), plan_first=True) == 0
+
+    context, implementation, review = _canonical_context_and_prompts(
+        tmp_path, list(first.issue_comments),
+    )
+    assert context.implementation_notes == (
+        "Approving-round note: update the inventory test. (Codex)",
+        "Earlier-round note: refresh the golden file. (Codex)",
+    )
+    for prompt in (implementation, review):
+        assert prompt.index("Approving-round note") < prompt.index("Earlier-round note")
+    assert "an unaddressed note is an ordinary PR review finding" in review
