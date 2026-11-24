@@ -3136,3 +3136,31 @@ def test_repair_cannot_move_a_blocking_concern_into_the_notes():
         _plan_review(implementation_notes=["The retry loop never terminates."]),
         match="blocking_plan_issues",
     )
+
+
+@pytest.mark.parametrize("bucket", ["implementation_notes", "blocking_plan_issues", "same_plan_followups"])
+@pytest.mark.parametrize("target_shape", ["list", "scalar", "dropped"])
+def test_scalar_plan_findings_are_normalized_like_the_parser(bucket, target_shape):
+    """A lone-string finding list (accepted by the parser) is preserved like a list (#2145).
+
+    Grounding and preservation read source and target through the parser's
+    canonical shape, so a scalar source finding can neither vanish during an
+    unrelated repair nor escape the grounding ceiling as a scalar target.
+    """
+    text = "Refresh the golden file for the renderer."
+    state = "approved" if bucket == "implementation_notes" else "blocking"
+    source = _plan_review(state=state, **{bucket: text})
+    kept = {"list": [text], "scalar": text, "dropped": []}[target_shape]
+    target = _plan_review(state=state, **{bucket: kept})
+    if target_shape == "dropped":
+        rejects(source, target, match=bucket)
+    else:
+        check(source, target)
+
+
+def test_unsupported_scalar_target_finding_still_hits_the_grounding_ceiling():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(source, _plan_review(
+        blocking_plan_issues=["The retry loop never terminates."],
+        same_plan_followups="Plan review incomplete: the test command was terminated.",
+    ))

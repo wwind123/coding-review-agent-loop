@@ -1292,3 +1292,60 @@ def test_direct_child_dispatch_inherits_parent_notes_and_planning_children_do_no
     for prompt in (implementation_prompt, review_prompt):
         assert f"- {note} (Codex)" in prompt
         assert "These notes come from the parent plan #55" in prompt
+
+
+def test_direct_child_issue_entry_loads_parent_notes_from_durable_history(tmp_path, monkeypatch):
+    """Matrix row `direct-child-notes` through the real child-issue entry (#2145).
+
+    ``agent-loop issue <child>`` recovers the parent plan context without
+    notes; the dispatch must read them from the parent's durable plan history
+    before the child inherits them.
+    """
+    import dataclasses as _dc
+
+    import coding_review_agent_loop.execution_policy as execution_policy
+    import coding_review_agent_loop.plan_execution as plan_execution
+    from agent_loop_helpers import FakeRunner, make_config, serve_authenticated_issue_context
+    from coding_review_agent_loop.prompts import build_issue_implementation_prompt
+    from coding_review_agent_loop.round_metadata import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _plan_subject,
+    )
+    from test_child_plan_provenance import comment, fresh_child_contexts, fresh_staged_matrix_plan
+
+    plan = fresh_staged_matrix_plan()
+    child, parent = fresh_child_contexts(plan, inherited_matrix_row_ids=("row-stage-one",))
+    child = _dc.replace(child, comments=())
+    note = "Parent note: update the pinned stage inventory test."
+    review = _attach_round_metadata("Parent plan review.", PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=1,
+        subject=_plan_subject(plan), state="approved", implementation_notes=(note,),
+    ))
+    parent = _dc.replace(parent, comments=(parent.comments[0], comment(review), *parent.comments[1:]))
+    patch_attr_in(
+        monkeypatch,
+        (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+         plan_first_loop_module, issue_loop, plan_execution),
+        "get_issue_context",
+        lambda runner, *, config, issue_number: serve_authenticated_issue_context(
+            runner, config, child if issue_number == 56 else parent,
+        ),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        plan_execution, "_implement_approved_issue",
+        lambda runner, **kwargs: captured.update(kwargs) or 0,
+    )
+    config = make_config(tmp_path)
+
+    assert issue_loop.run_issue_loop(FakeRunner(), issue_number=56, config=config) == 0
+
+    context = captured["approved_plan_context"]
+    assert context.implementation_notes == (f"{note} (Codex)",)
+    assert context.implementation_notes_origin == "parent plan #55"
+    assert context.plan_hash == captured["approved_plan_context"].plan_hash
+    assert note not in child.body
+    prompt = build_issue_implementation_prompt(56, plan, config, approved_plan_context=context)
+    assert f"- {note} (Codex)" in prompt
+    assert "These notes come from the parent plan #55" in prompt

@@ -279,7 +279,10 @@ def _raw_records_carry_notes(comments: Sequence[object]) -> bool:
     try:
         records = _decode_round_metadata_records(tuple(comments), flow="plan")
     except AgentLoopError:
-        return False
+        # An undecodable raw comment (for example a foreign malformed record
+        # the admitted reader would mask) must never veto the authenticated
+        # read: proceed to admission instead.
+        return True
     return any(
         record.metadata.role == "reviewer" and record.metadata.implementation_notes
         for record in records
@@ -292,7 +295,7 @@ def _plan_source_matches(comments: Sequence[object], *, plan_subject: str) -> bo
     try:
         records = _decode_round_metadata_records(tuple(comments), flow="plan")
     except AgentLoopError:
-        return False
+        return True  # Undecidable raw history: let the authenticated read decide.
     return any(record.metadata.subject == plan_subject for record in records)
 
 
@@ -387,6 +390,14 @@ def attach_plan_implementation_notes(
             runner, config=config, plan_issue_number=number, comments=comments,
             plan_subject=plan_subject, plan_hash=context.plan_hash,
         )
+        if (
+            notes.approving_round is None
+            and notes.unavailable_reason is None
+            and position < len(candidates) - 1
+        ):
+            # The authenticated history holds no approval of this plan here:
+            # try the next (parent) source.
+            continue
         origin = f"parent plan #{number}" if position > 0 else None
         return with_plan_implementation_notes(context, notes, origin=origin)
     return context
@@ -405,7 +416,9 @@ def inherit_parent_plan_implementation_notes(
         implementation_notes_omitted=getattr(parent_context, "implementation_notes_omitted", 0),
         implementation_notes_origin=f"parent plan #{parent_issue}" if notes else None,
         implementation_notes_unavailable=getattr(parent_context, "implementation_notes_unavailable", None),
-        implementation_notes_resolved=True,
+        # Only a resolved parent lookup resolves the child; otherwise a later
+        # PR-loop parent fallback may still attach the parent's notes.
+        implementation_notes_resolved=bool(getattr(parent_context, "implementation_notes_resolved", False)),
     )
 
 

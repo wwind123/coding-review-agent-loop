@@ -69,6 +69,7 @@ from .followups import (
 from .round_metadata import ApprovedPlanContext, _plan_subject, scope_approved_plan_matrix
 from .round_state import _extract_round_metadata_records, make_approved_plan_context
 from .plan_implementation_notes import (
+    attach_plan_implementation_notes,
     inherit_parent_plan_implementation_notes,
     load_plan_implementation_notes,
     with_plan_implementation_notes,
@@ -344,7 +345,12 @@ def _dispatch_decomposition_child(
             expected_hash=plan_hash,
             expected_subject=plan_subject,
         ),
-        approved_plan_context,
+        # A child issue entry recovers the parent context without notes, so
+        # resolve them from the parent's durable history first (no-op when
+        # the fresh approval already attached them).
+        attach_plan_implementation_notes(
+            approved_plan_context, runner=runner, config=config, sources=(parent_issue_context,),
+        ),
         parent_issue=parent_issue,
     )
     child_plan_context = scope_approved_plan_matrix(
