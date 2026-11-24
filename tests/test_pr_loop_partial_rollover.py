@@ -499,24 +499,83 @@ def test_published_prepanel_unqualified_blocking_review_closes_an_unreconciled_r
     causes = {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
     assert "before any qualified panel opening" in causes["Gemini"]
     assert [i.text for i in closure.new_items if i.reviewer == "Gemini"] == ["premature cache race"]
-    # Round 2 applies the ordinary pre-panel rules: the carried secondary-owned finding
-    # needs a qualified opening, so the scheduler's existing safety stop (not a
-    # partial-round refusal) names --pr-review-force-full; nobody is invoked.
-    before = len(_agent_sequence(runner))
-    with pytest.raises(pr_loop.PrePanelSafetyError, match="pending on configured secondary reviewer"):
-        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
-    assert len(_agent_sequence(runner)) == before
-    assert len(_closures(runner)) == 1  # the rerun never closes round 1 again
-    # The operator override then opens round 2 with the complete board.
+    # Round 2 proceeds without the operator override: the carried secondary-owned
+    # finding is a carried obligation, so a fresh primary phase opens and the panel
+    # rechecks the finding once the primary approves.
     from agent_loop_helpers import structured_coder_followup
-    runner.claude_outputs.append(structured_coder_followup(
-        summary="Fixed the cache race.", addressed_items=[i.item_id for i in closure.new_items]))
+    carried = [i.item_id for i in closure.new_items]
+    resolved = [{"item_id": item, "disposition": "resolved", "note": "Fixed."} for item in carried]
+    runner.claude_outputs.append(structured_coder_followup(summary="Fixed the cache race.", addressed_items=carried))
+    runner.codex_outputs.append(_staged_review(reviewer="OpenAI Codex", dispositions=resolved))
+    runner.gemini_outputs.append(_staged_review(reviewer="Google Gemini", dispositions=resolved))
+    runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity", dispositions=resolved))
+    agents_before = len(_agent_sequence(runner))
     try:
-        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pr_review_force_full=True))
-    except AgentLoopError:
-        pass  # the scripted board runs dry; only the round-2 opening matters
-    round_two = [m for m in _posted_scheduler_metadata(runner)
-                 if m.phase == "scheduler-prelaunch" and m.round_number == 2]
-    assert round_two and round_two[0].scheduler_force_full
-    assert "Gemini" not in round_two[0].scheduler_approved_reviewers
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    except AgentLoopError as exc:
+        assert not isinstance(exc, pr_loop.PrePanelSafetyError), exc
+    assert len(_closures(runner)) == 1  # the rerun never closes round 1 again
+    later = [m for m in _posted_scheduler_metadata(runner)
+             if m.phase == "scheduler-prelaunch" and m.round_number >= 2]
+    assert later and later[0].scheduler_phase == "primary"
+    assert later[0].scheduler_selected_reviewers == ("Codex",)
+    assert not any(m.scheduler_force_full for m in later)
+    assert all("Gemini" not in m.scheduler_approved_reviewers for m in later[:1])
+    # The configured board reviews after the closure: the primary, then the panel.
+    new_agents = _agent_sequence(runner)[agents_before:]
+    assert {"codex", "gemini", "agy"} <= set(new_agents), new_agents
+    assert any(m.scheduler_phase == "secondary-audit" for m in later)
+    _no_deletion_advice(runner)
+
+
+# --- item-1 (round 1 review): every completed review enters the closure ledger -------
+
+
+def test_closure_ledger_keeps_an_authoritative_sequential_review_findings(tmp_path):
+    """A sequential (authoritative) review's minted finding survives a closure that another
+    publication triggers (here a malformed spool record of the unpublished reviewer)."""
+    from coding_review_agent_loop import review_rounds
+
+    markers = ("Codex blocks sequentially.", "Gemini reviews second.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary=markers[0], blocking_items=["Bound the retry loop."]),
+            structured_pr_review(summary="Codex approves round two.",
+                                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary=markers[1], reviewer="Google Gemini"),
+            structured_pr_review(summary="Gemini approves round two.", reviewer="Google Gemini",
+                                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=False)
+    _interrupt_pr(runner, config, markers, at=2)  # Codex posted; Gemini's turn is lost
+    codex = next(r for r in _comment_records(runner, surface="pr", flow="pr") if r.agent == "Codex")
+    assert codex.phase == "authoritative" and [i.item_id for i in codex.new_items] == ["item-1"]
+    spool = review_rounds._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
+    spool.store("Gemini", {"text": "x"})
+    spool._path("Gemini").write_text("{broken", encoding="utf-8")  # publication cannot be excluded
+
+    class _Stop(Exception):
+        pass
+
+    real = pr_loop.post_pr_comment
+
+    def stop_after_closure(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if "closed, incomplete" in str(kwargs.get("body", "")):
+            raise _Stop
+        return result
+
+    with patch_object_in((pr_loop,), "post_pr_comment", side_effect=stop_after_closure):
+        with pytest.raises(_Stop):
+            run_pr_loop(runner, pr_number=77, config=config)
+
+    (closure,) = _closures(runner)
+    assert [e["agent"] for e in closure.round_closure["unreplayable"]] == ["Gemini"]
+    # Codex's authoritative finding keeps its minted ID in the closure ledger.
+    assert [(i.item_id, i.text) for i in closure.new_items] == [("item-1", "Bound the retry loop.")]
+    assert closure.round_closure["item_number_high_water"] == 1
     _no_deletion_advice(runner)

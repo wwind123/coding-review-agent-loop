@@ -289,12 +289,15 @@ def classify_round_reviewers(
 # -- shared reconstruction (resume and writer) ---------------------------------
 
 
-def pr_published_review(record: object, *, reviewer: str, parse_requirement_evidence: bool = False):
+def pr_published_review(record: object, *, reviewer: str, parse_requirement_evidence: bool = False,
+                        strict: bool = False):
     """Rebuild a posted PR review exactly as ordinary resume does.
 
     The review output is the canonical reviewer response, else the body; it
     is parsed as a structured review in legacy mode with the legacy-text
     fallback, and every metadata-sourced field comes from the record.
+    With ``strict`` (the closure writer), a response with neither a structured
+    review nor the legacy state marker raises ``AgentLoopError``.
     Returns ``(parsed_review, review_output)``.
     """
     from .architecture_contract import _resumed_review_architecture
@@ -308,6 +311,10 @@ def pr_published_review(record: object, *, reviewer: str, parse_requirement_evid
                                    parse_requirement_evidence=parse_requirement_evidence)
         if canonical is not None else None
     )
+    if strict and structured is None:
+        # The legacy fallback accepts arbitrary text; the closure writer needs a
+        # recognizable review envelope or it would close the round with no findings.
+        parse_agent_state(review_output)
     reparsed = structured or parse_review(review_output, reviewer=reviewer)
     impact, degradations = _resumed_review_architecture(
         metadata, structured.architecture_impact if structured is not None else None,
@@ -389,7 +396,8 @@ def mint_pr_review_items(
     return items
 
 
-def plan_published_review(record: object, *, reviewer: str, surfaced_requirement_ids: Sequence[str]):
+def plan_published_review(record: object, *, reviewer: str, surfaced_requirement_ids: Sequence[str],
+                          strict: bool = False):
     """Rebuild a posted plan review exactly as ordinary resume does.
 
     Structured parse of the canonical response (else the body) with the
@@ -404,6 +412,9 @@ def plan_published_review(record: object, *, reviewer: str, surfaced_requirement
         review_output, architecture_status_mode="legacy", reviewer=reviewer,
         surfaced_requirement_ids=tuple(surfaced_requirement_ids),
     )
+    if strict and structured is None:
+        # Arbitrary text parses as an empty legacy review; require the plan envelope.
+        parse_plan_state(review_output)
     impact, degradations = _resumed_review_architecture(
         metadata, structured.architecture_impact if structured is not None else None,
     )
@@ -453,6 +464,42 @@ def mint_plan_review_items(
                 **plan_review_item_tags(item, prior_items),  # type: ignore[arg-type]
             ))
     return items
+
+
+def impending_opening_source(*, opened: bool, source: str | None, launch_phase: str | None,
+                             operator: bool) -> str | None:
+    """The panel opening in force for a launch decided before its scheduler checkpoint.
+
+    An already recorded opening keeps its source.  Otherwise the checkpoint about
+    to be posted is itself the opening: an operator force-full latch, or a gated
+    secondary launch opened by the primary's approval (``panel_evidence``).
+    """
+    from .round_visibility import GATED_LAUNCH_PHASES, PRIMARY_APPROVAL_OPENING
+
+    if opened:
+        return source
+    if operator:
+        return "operator"
+    return PRIMARY_APPROVAL_OPENING if launch_phase in GATED_LAUNCH_PHASES else None
+
+
+def closure_carried_items(items: Sequence[object], closure_item_ids: Collection[str], *, primary: str | None) -> tuple[str, ...]:
+    """Active findings a closed-incomplete record carried forward that are pending on a non-primary owner.
+
+    Like pre-epoch panel items (board change D5a), they are carried obligations:
+    a closed review never makes a secondary a finding owner before a qualified
+    panel opening, so the next round can open a fresh primary phase and the
+    owners recheck them when the panel opens.
+    """
+    carried: list[str] = []
+    for item in items:
+        if item.item_id not in closure_item_ids or item.status not in {"blocking", "same-pr"}:  # type: ignore[attr-defined]
+            continue
+        owners = tuple(item.resolution_owners or (item.reviewer,))  # type: ignore[attr-defined]
+        states = dict(item.owner_states or ((owner, "pending") for owner in owners))  # type: ignore[attr-defined]
+        if any(owner != primary and states.get(owner) != "cleared" for owner in owners):
+            carried.append(item.item_id)  # type: ignore[attr-defined]
+    return tuple(carried)
 
 
 def _item_number(item: object) -> int:

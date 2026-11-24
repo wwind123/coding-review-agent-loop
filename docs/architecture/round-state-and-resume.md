@@ -227,31 +227,31 @@ over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
 history and never approve.
 
 Since stage 2 (#2080) `round_closure_writer.py` writes the record on both
-flows. At round start, before any spool preflight, plan checkpoint or launch,
+flows. At round start, before any spool preflight, checkpoint or launch,
 `decide_round_closure` closes round N when it holds any publication and any
-configured reviewer needs a fresh round-N turn. A publication is a resumed
-withheld-round publication of the launch batch, a reviewer's own
-publication-phase review that resume rejected, a published pre-panel-unqualified
-review (PR), or a spool record that may be public (a carrier with public bodies
-on a complete actor-bound listing, a malformed record, or a structurally
-failing carrier). A verified unpublished carrier is not one (if invalid it is
-discarded and its reviewer runs fresh). A rejected own review always needs a
-fresh turn; others need one without a settled failure or valid spooled response.
-Reconciled rounds, failed-seat retries, recovery, conflict, evidence and
-conversion passes, the approved-plan shortcut and plan ownership failures are
-excluded, and a rejected sequential (authoritative) record keeps its same-round
-re-run. `close_incomplete_round` rebuilds published reviews with helpers shared
-with resume and settlement, by published verdict: minted IDs are kept,
-provisional checkpoints are numbered above the high-water mark, then evidence
-obligations. It posts before the
-spool is discarded; the #1553 or reconciled-plan rollover continues to N+1, and
-at `--max-rounds` the ordinary limit stop follows the record. Former refusal
-sites raise `RoundIncompleteSignal` before any launch; the loop's handler uses
-the same writer (a reconciled round re-enters its own rollover; an excluded pass
-stops fail-closed). Carrier stops route by category: read failures, and an
-unadmitted conversion boundary, are retryable `RoundStateReadError` stops with
-nothing posted; structural failures close the round. The partial-round refusal
-and supersession writer never fire; nothing deletes a comment. A
+configured reviewer needs a fresh round-N turn. A publication is a public
+same-round publication by the shared visibility rule (any scheduler phase, minus
+the primary review gating this launch), an own publication-phase review resume
+rejected, a published pre-panel-unqualified review (PR), or a carrier with
+public bodies, a malformed record or a structurally failing carrier. A verified
+unpublished carrier is not one (if invalid it is discarded). A rejected own
+review always needs a fresh turn; others need one without a settled failure or
+valid spooled response. Reconciled rounds, failed-seat retries, recovery,
+conflict, evidence and conversion passes, the approved-plan shortcut and plan
+ownership failures are excluded; sequential (authoritative) records, which the
+visibility rule never treats as peers, keep their same-round re-run but still
+enter the closure ledger. `close_incomplete_round` rebuilds every completed
+review with helpers shared with resume and settlement, by published verdict:
+minted IDs are kept, provisional checkpoints are numbered above the high-water
+mark, then evidence obligations; an unreadable response stops retryably. It
+posts before the spool is discarded; the #1553 or reconciled-plan rollover
+continues to N+1, where carried secondary-owned findings are carried
+obligations, and at `--max-rounds` the limit stop follows the record. Former
+refusal sites raise `RoundIncompleteSignal` before any launch; the handler uses
+the same writer (a reconciled round re-enters its rollover; an excluded pass
+stops fail-closed). Read failures and an unadmitted conversion boundary are
+retryable `RoundStateReadError` stops; structural carrier failures close.
+The refusal and supersession writer never fire; nothing deletes a comment. A
 reconciled round with a blocking pre-panel review keeps its pre-panel stop.
 Stage 3 removes the retained deletion-list, carrier and classification code.
 It reopens scheduler checkpoint admission after

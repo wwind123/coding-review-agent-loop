@@ -3871,7 +3871,8 @@ def _prelaunch_phases(runner, *, round_number):
 @pytest.mark.parametrize("review_parallel", [True, False])
 def test_pr_final_sweep_closes_beside_a_public_panel_peer(tmp_path, review_parallel):
     """#1156/#2064: a rerun that crosses into final-secondary-sweep never reads a
-    published panel review; the defensive invariant closes the round instead."""
+    published panel review; the round-start decision closes the round before any
+    new scheduler checkpoint, counting the earlier-phase public review."""
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path)
     _interrupt_panel_pr_round(runner, config)
@@ -3883,11 +3884,11 @@ def test_pr_final_sweep_closes_beside_a_public_panel_peer(tmp_path, review_paral
     _closure_of_rerun(runner, config, review_parallel=review_parallel, round_number=2,
                       published=["Gemini"], unreplayable=["Antigravity"])
 
-    assert _prelaunch_phases(runner, round_number=2) == ["secondary-audit", "final-secondary-sweep"]
+    assert _prelaunch_phases(runner, round_number=2) == ["secondary-audit"]  # no new checkpoint
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    # The run posted its own scheduler checkpoint and the one closure record.
-    assert len(runner.comments) - comments_before == 2
+    # The closure record is the only newly posted record.
+    assert len(runner.comments) - comments_before == 1
     assert not any(
         r.role == "reviewer" and r.round_number == 2 and r.agent == "Antigravity"
         for r in _records(runner, flow="pr", surface="pr")
@@ -3966,7 +3967,7 @@ def test_plan_final_sweep_closes_beside_a_public_panel_peer(tmp_path):
         r.scheduler_phase for r in _records(runner, flow="plan", surface="issue")
         if r.round_number == 2 and r.phase == "scheduler-prelaunch"
     ]
-    assert phases == ["secondary-audit", "final-secondary-sweep"]
+    assert phases == ["secondary-audit"]  # closed before any new checkpoint
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
     _closure(runner, surface="issue", round_number=2, published=["Gemini"])
@@ -4212,35 +4213,28 @@ def test_plan_same_round_gate_is_kept_and_listing_is_verified(tmp_path):
                        surface="issue")
 
     assert runner.reviewer_launches == launches_before
-    assert plan_phases() == ["primary", "secondary-audit", "final-secondary-sweep"]
+    assert plan_phases() == ["primary", "secondary-audit"]  # closed before any new checkpoint
     # The primary's opening review is not a same-batch peer.
     _closure(runner, surface="issue", published=["Gemini"])
 
 
-def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp_path):
-    """A failed post-checkpoint read must neither abort nor hide the public panel peer."""
+def test_plan_round_closes_before_any_checkpoint_or_post_checkpoint_read(tmp_path):
+    """#2064: the public panel peer is found from durable history before the
+    final-sweep checkpoint, so no post-checkpoint visibility read is needed."""
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
     _interrupt_panel_plan_round(runner, config)
     for path in _spool_files(config):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
-    real_context = discuss_loop.get_issue_context
-    failures = []
+    comments_before = len(runner.issue_comments)
 
-    def flaky_context(*args, **kwargs):
-        newest = runner.issue_comments[-1]["body"] if runner.issue_comments else ""
-        if "final-secondary-sweep" in newest:
-            failures.append(newest)
-            raise AgentLoopError("transient read failure")
-        return real_context(*args, **kwargs)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    with patch_object_in((discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", side_effect=flaky_context):
-        _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
-                           surface="issue")
     _closure(runner, surface="issue", round_number=2, published=["Gemini"])
-
-    assert failures, "the post-checkpoint read was never exercised"
+    assert len(runner.issue_comments) == comments_before + 1
+    assert not any("final-secondary-sweep" in c["body"] for c in runner.issue_comments[comments_before:])
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
 
@@ -4684,7 +4678,7 @@ def test_plan_secondary_remediation_verdict_is_a_peer_beside_the_retained_gate(t
 
     # The sweep would read Gemini's round-3 verdict; the primary's approval is the gate.
     assert runner.reviewer_launches == launches_before
-    assert _plan_round_three_phases(runner) == ["remediation", "final-secondary-sweep"]
+    assert _plan_round_three_phases(runner) == ["remediation"]  # closed before any new checkpoint
     closure = _closure(runner, surface="issue", round_number=3)
     names = [e["agent"] for e in closure.round_closure["published"]]
     assert "Gemini" in names and "Codex" not in names

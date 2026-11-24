@@ -320,11 +320,12 @@ from .review_scheduling import (
 )
 from .partial_round_recovery import RecoveryVisibilityContext
 from .round_closure_writer import (
-    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, decide_round_closure,
-    excluded_route_stop, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
+    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, decide_round_closure,
+    excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
 )
 from .round_visibility import (
     latest_round_checkpoint_index,
+    same_round_public_publications,
     visible_peer_names,
 )
 from .legacy_machine_items import consumed_acknowledgement_disposition
@@ -2520,6 +2521,10 @@ def run_pr_loop(
         pr_fresh_from_rounds = pr_contract_lineage.fresh_from_rounds
         pr_primary_epoch_round = pr_contract_lineage.primary_epoch_round
         pr_pre_epoch_panel_items = pre_epoch_panel_items(startup_records, pr_contract_lineage)
+        # Findings a closed-incomplete record carried forward (#2064): like pre-epoch
+        # panel items, they never make a secondary an owner before a qualified opening.
+        pr_closure_item_ids = {item.item_id for record in startup_records
+                               if is_round_closed_incomplete(record.metadata) for item in record.metadata.new_items}
         if plan_handoff_board is not None and plan_handoff_board.changed:
             # One orchestrator-written audit record per derived board change,
             # before round 1; its digest makes every rerun a no-op.
@@ -4228,7 +4233,7 @@ def run_pr_loop(
 
             def _pr_mint_closed(record: PostedRoundRecord, next_number: int) -> list[UnresolvedReviewItem]:
                 """Rebuild a published review's items through resume's parser chain and settlement's minting."""
-                parsed, _output = pr_published_review(record, reviewer=record.metadata.agent, parse_requirement_evidence=human_evidence.freeze)
+                parsed, _output = pr_published_review(record, reviewer=record.metadata.agent, parse_requirement_evidence=human_evidence.freeze, strict=True)
                 return mint_pr_review_items(
                     parsed, reviewer=record.metadata.agent, round_number=record.metadata.round_number,
                     next_item_number=next_number, approved_followups=config.approved_followups,
@@ -4240,21 +4245,40 @@ def run_pr_loop(
                     round_number=round_number, prior_items=tuple(prior_unresolved_items), coder_output=None,
                     completed_reviews=(), next_unresolved_item_number=next_unresolved_item_number)
 
+            def _pr_closure_ledger_records(public: dict[str, PostedRoundRecord]) -> dict[str, PostedRoundRecord]:
+                """Every completed round-N review (any phase) and any other public publication, in board order."""
+                return {name: record for name in (agent_display_name(r) for r in configured_reviewers)
+                        if name not in superseded_prepanel_reviews
+                        and (record := completed_by_name.get(name) or public.get(name)) is not None}
+
             def _pr_round_closure() -> object | None:
                 """Round-wide closed-incomplete decision and writer (#2064); replaces #2054's call."""
                 if ((current_resume is not None and (current_resume.round_number != round_number
                         or current_resume.reconciliation_record is not None or current_resume.evidence_boundary is not None))
                         or skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None or conversion_pass):
                     return None
+                order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
+                # Public same-round publications by the shared visibility rule (#1156), across
+                # scheduler phases, minus the primary review that gates this launch.
+                history = drop_inert_post_reconciliation_checkpoints(_extract_round_metadata_records(pr_comments, flow="pr"))
                 launch_phase = scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
-                published = {name: record for name, record in resumed_by_name.items()
-                             if record.metadata.phase == "publication" and record.metadata.scheduler_phase == launch_phase}
+                visible = visible_peer_names(
+                    history, opening_source=impending_opening_source(
+                        opened=bool(panel_evidence is not None and panel_evidence.opened),
+                        source=panel_evidence.opening_source if panel_evidence is not None else None,
+                        launch_phase=launch_phase, operator=scheduler_operator_force_full),
+                    flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order,
+                    primary_reviewer=scheduler_contract.primary_reviewer if scheduler_capabilities.requires_primary else None,
+                    launch_phase=launch_phase, launching=tuple(sorted(selected_reviewer_names)),
+                    checkpoint_index=len(pr_comments))
+                published = {record.metadata.agent: record for record in same_round_public_publications(
+                    history, flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order)
+                    if record.metadata.agent in visible and record.metadata.agent not in superseded_prepanel_reviews}
                 # A rejected own withheld-round publication, or a published pre-panel-unqualified
                 # review; a sequential (authoritative) record keeps its same-round re-run.
                 rejected = {name: record for name, record in completed_by_name.items()
                             if name not in resumed_by_name and name not in superseded_prepanel_reviews
                             and (record.metadata.phase == "publication" or name in prepanel_unqualified_reviews)}
-                order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
                 found = classify_round_reviewers(
                     runner, config=config, surface="pr", number=pr_number, round_number=round_number,
                     reviewers=configured_reviewers, published_records=published, rejected_records=rejected,
@@ -4274,11 +4298,12 @@ def run_pr_loop(
                 closed = close_incomplete_round(
                     runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
                     comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
-                    published_records={name: published.get(name) or rejected[name] for name in order if name in published or name in rejected},
+                    published_records=_pr_closure_ledger_records(published),
                     next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
                     mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
                     post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
                 pr_round_spool.discard()  # Save before emit: the ledger is durable in the posted record.
+                pr_closure_item_ids.update(item.item_id for item in closed.current_round_new_items)
                 for state in (completed_by_name, resumed_by_name, posted_rejection_reasons, prepanel_unqualified_reviews):
                     state.clear()
                 return closed
@@ -4298,8 +4323,7 @@ def run_pr_loop(
                     pending_automatic_fallback_reasons[:] = list(restored)
                     round_sequence.repeat_current()
                     return
-                records = {name: completed_by_name[name] for name in (agent_display_name(r) for r in configured_reviewers)
-                           if name in signal.published and name in completed_by_name}
+                records = _pr_closure_ledger_records({})
                 decision = decide_round_closure(
                     round_number=round_number, reviewer_order=[agent_display_name(r) for r in configured_reviewers],
                     publications={name: (getattr(pr_comments[records[name].index], "comment_id", None) if name in records else None)
@@ -4314,6 +4338,7 @@ def run_pr_loop(
                     mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
                     post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
                 pr_round_spool.discard()
+                pr_closure_item_ids.update(item.item_id for item in resumed_round.current_round_new_items)
                 final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
                 pending_automatic_fallback_reasons[:] = list(restored)
                 round_sequence.repeat_current()
@@ -4690,7 +4715,8 @@ def run_pr_loop(
                         epoch_round=pr_primary_epoch_round,
                         primary=scheduler_contract.primary_reviewer,
                         eligible=pr_pre_epoch_panel_items,
-                    ),
+                    ) + closure_carried_items(pr_ledger_view(prior_unresolved_items), pr_closure_item_ids,
+                                              primary=scheduler_contract.primary_reviewer),
                 )
                 try:
                     scheduler_decision = select_reviewers(
@@ -6382,7 +6408,8 @@ def run_pr_loop(
                     epoch_round=pr_primary_epoch_round,
                     primary=scheduler_contract.primary_reviewer,
                     eligible=pr_pre_epoch_panel_items,
-                ))
+                )) | set(closure_carried_items(pr_ledger_view(unresolved_items), pr_closure_item_ids,
+                                               primary=scheduler_contract.primary_reviewer))
                 if scheduler_capabilities.requires_primary else set()
             )
             if (

@@ -197,7 +197,7 @@ from .plan_review_scheduling import (
     select_plan_reviewers,
 )
 from .partial_round_recovery import RecoveryVisibilityContext
-from .round_visibility import latest_round_checkpoint_index, visible_peer_names
+from .round_visibility import latest_round_checkpoint_index, same_round_public_publications, visible_peer_names
 from .unresolved_items import (
     preserve_failed_seat_items,
     _apply_unresolved_item_dispositions,
@@ -300,7 +300,7 @@ from .review_rounds import (
 )
 from .round_closure_writer import (
     RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, decide_round_closure,
-    mint_plan_review_items, plan_published_review,
+    impending_opening_source, mint_plan_review_items, plan_published_review,
 )
 from .execution_policy import (
     _current_execution_recommendation,
@@ -2664,10 +2664,23 @@ def _run_plan_first_loop_body(
                 return None
             order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
             completed = {record.metadata.agent: record for record in current_resume.completed_reviews}
-            # Same-batch publications, as in the peer guard: the round's selected reviewers.
-            batch = {agent_display_name(reviewer) for reviewer in round_reviewers}
-            published = {name: record for name, record in resumed_by_name.items()
-                         if name in batch and record.metadata.phase == "publication"}
+            # Public same-round publications by the shared visibility rule (#1156), across
+            # scheduler phases, minus the primary review that gates this launch.
+            history = plan_history_records()
+            launching = tuple(sorted(agent_display_name(reviewer) for reviewer in round_reviewers))
+            plan_launch_phase = plan_scheduler_decision.phase if staged_planning and plan_scheduler_decision is not None else None
+            visible = visible_peer_names(
+                history, opening_source=impending_opening_source(
+                    opened=plan_panel_evidence.opened, source=plan_panel_evidence.opening_source,
+                    launch_phase=plan_launch_phase, operator=bool(plan_operator_force_full)), flow="plan",
+                round_number=round_number, subject=current_plan_subject, reviewer_names=order,
+                primary_reviewer=plan_primary_name if staged_planning else None,
+                launch_phase=plan_launch_phase, launching=launching, checkpoint_index=max((record.index for record in history), default=-1) + 1)
+            published = {record.metadata.agent: completed.get(record.metadata.agent, record)
+                         for record in same_round_public_publications(
+                             history, flow="plan", round_number=round_number, subject=current_plan_subject,
+                             reviewer_names=order)
+                         if record.metadata.agent in visible and record.metadata.agent not in superseded_plan_prepanel}
             rejected = {name: record for name, record in completed.items()
                         if name not in resumed_by_name and name not in superseded_plan_prepanel
                         and record.metadata.phase == "publication"}
@@ -2698,10 +2711,12 @@ def _run_plan_first_loop_body(
                 runner, config=config, decision=decision, flow="plan", subject=current_plan_subject,
                 number=issue_number, comments_length=len(issue_context.comments), current_resume=current_resume,
                 prior_items=prior_unresolved_items,
-                published_records={name: completed[name] for name in order if name in completed and name in publications},
+                # Every completed round-N review (any phase) and any other public publication.
+                published_records={name: completed.get(name) or published[name] for name in order
+                                   if name not in superseded_plan_prepanel and (name in completed or name in published)},
                 next_item_number=max(next_unresolved_item_number, current_resume.next_unresolved_item_number),
                 mint_record=lambda record, n: mint_plan_review_items(
-                    plan_published_review(record, reviewer=record.metadata.agent, surfaced_requirement_ids=plan_hr_ids)[0],
+                    plan_published_review(record, reviewer=record.metadata.agent, surfaced_requirement_ids=plan_hr_ids, strict=True)[0],
                     round_number=record.metadata.round_number, next_item_number=n, prior_items=prior_unresolved_items),
                 bound_metadata=bound_plan_metadata,
                 post_comment=lambda body: post_issue_comment(runner, config=config, issue_number=issue_number, body=body),

@@ -4276,21 +4276,29 @@ Execution model:
     would need a fresh turn in it, resume posts one tool-owned
     `round-closed-incomplete` record before any scheduler checkpoint, spool
     preflight or reviewer launch, then reviews again in the next round with the
-    full board. A published review counts whether resume accepted it or
-    rejected it (for example after the signed requirement set changed, or a
-    review recorded before any qualified panel opening), and so does a spool
-    carrier that is partly or fully public, or a malformed spool record whose
-    publication state cannot be excluded. A reviewer whose own published
+    full board. A published review is any same-round peer as defined above,
+    whatever scheduler phase it was published under, and it counts whether
+    resume accepted it or rejected it (for example after the signed requirement
+    set changed, or a review recorded before any qualified panel opening). A
+    sequential round's reviews are not peers of each other, so an interrupted
+    sequential round still resumes in the same round. A spool carrier that is
+    partly or fully public, or a malformed spool record whose publication state
+    cannot be excluded, also counts as a publication. A reviewer whose own published
     review was rejected always takes its fresh turn in the next round, even
     when its spool still holds a valid response. The record names the
     published reviewers (with comment IDs) and the unreplayable reviewers (with
     a short cause: no spooled outcome on this host, an outcome that no longer
     validates, a malformed spool record, a carrier that cannot be resumed, or a
-    rejected own review). It carries the round's ledger: prior items stay open,
+    rejected own review). It carries the round's ledger, built from every
+    completed review of the round: prior items stay open,
     the published reviews' findings become prior items of the next round under
     fresh, never-reused item IDs (re-parsed from each stored response exactly as
     resume would, following the published verdict), and published exact-head
-    evidence requests stay open obligations. The published reviews stay on
+    evidence requests stay open obligations. A stored response the parser
+    cannot read stops the run retryably instead, with nothing posted. A finding
+    carried forward from a review recorded before any qualified panel opening
+    is a carried obligation in the next round: the primary reviews first and
+    the panel rechecks it, with no `--pr-review-force-full`. The published reviews stay on
     GitHub as history and never count toward approval. A rerun after the record
     resumes in the next round without a second record; the next round uses one
     round of `--max-rounds`, and at the limit the record is posted first and the
