@@ -3126,6 +3126,8 @@ def _run_plan_first_loop_body(
                         acquisition_returncode=acquisition_returncode,
                         **_architecture_metadata_fields(config, result=parsed),
                         **ignored_disposition_metadata_fields(parsed),
+                        # Non-blocking notes (#2145) ride on the reviewer record.
+                        implementation_notes=tuple(note.text for note in parsed.implementation_notes),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                         plan_sweep=_plan_sweep_requested(reviewer_name),
                         **_baseline_metadata_fields(_plan_rendered_baseline(reviewer_name)),

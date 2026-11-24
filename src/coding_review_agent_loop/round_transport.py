@@ -80,6 +80,9 @@ _SPILL_FIELDS = (
     "human_checks",
     # Dropped non-carried disposition IDs (#2100): unbounded, lossless via sidecars.
     "ignored_prior_disposition_ids",
+    # Plan-review implementation notes (#2145): bounded, but up to ~10 KB per
+    # reviewer record, so they may spill rather than make an anchor unpostable.
+    "implementation_notes",
     # Review-state growth fields go last (#953).  They grow with review
     # history and matrix size rather than with the change under review, so a
     # long review would otherwise become unpostable.  The loop stops as soon

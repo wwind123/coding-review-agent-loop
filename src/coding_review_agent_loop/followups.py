@@ -1640,6 +1640,7 @@ def _format_plan_approval_summary_with_followups(
     filing_enabled: bool = False,
     publication_details: str | None = None,
     plan_char_budget: int | None = None,
+    implementation_notes: object | None = None,
 ) -> str:
     approved_plan = _bounded_approved_plan_text(approved_plan, budget=plan_char_budget)
     lines = [
@@ -1704,6 +1705,10 @@ def _format_plan_approval_summary_with_followups(
                 "item IDs are not PR prior review items.",
             ]
         )
+    # Fixed-bounded notes section (#2145); never a filed-issue source.
+    from .plan_implementation_notes import render_approval_section
+
+    lines.extend(render_approval_section(implementation_notes))
     lines.extend(["", "-- coding-review-agent-loop"])
     return "\n".join(lines)
 
@@ -1722,6 +1727,7 @@ def _publish_plan_approved_followups(
     allow_issue_filing: bool = True,
     usage_context: object | None = None,
     semantic_transport: SemanticTransport | None = None,
+    implementation_notes: object | None = None,
 ) -> bool:
     filing_enabled = allow_issue_filing and config.approved_followups in ("issue", "fix-and-issue")
     mode = "issue" if filing_enabled else "summarize"
@@ -1735,6 +1741,13 @@ def _publish_plan_approved_followups(
             config,
             f"Planning future follow-ups already recorded for issue #{issue_number} "
             f"plan {plan_hash} ({mode})",
+        )
+        # An announcement from an archived planning scope (#2145) gets one
+        # notes-only supplement for the current scope; nothing is filed.
+        from .plan_implementation_notes import publish_scope_notes_supplement
+
+        publish_scope_notes_supplement(
+            runner, config=config, issue_number=issue_number, notes=implementation_notes,
         )
         return False
 
@@ -1826,6 +1839,7 @@ def _publish_plan_approved_followups(
                 filing_enabled=filing_enabled,
                 publication_details=publication_details,
                 plan_char_budget=plan_char_budget,
+                implementation_notes=implementation_notes,
             ),
             issue_number=issue_number,
             plan_hash=plan_hash,

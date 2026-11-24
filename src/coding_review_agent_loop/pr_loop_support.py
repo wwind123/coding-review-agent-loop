@@ -3979,7 +3979,9 @@ def _fresh_pr_qualification_snapshot(
                         "it is not a verified same-PR plan replacement with a rebind audit "
                         "record; no final sweep, merge, or managed-CI gate ran."
                     )
-            fresh_approved_plan_context = replacement_plan
+            from .plan_implementation_notes import attach_plan_implementation_notes as _notes
+            fresh_approved_plan_context = _notes(
+                replacement_plan, runner=runner, config=config, sources=(fresh_issue, fresh_parent))
         # The handoff hash alone is not enough: recover the canonical plan
         # again from the freshly fetched issue/parent comments and require the
         # same hash and subject that the reviewers were bound to.

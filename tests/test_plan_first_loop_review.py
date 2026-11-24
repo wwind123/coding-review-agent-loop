@@ -2635,3 +2635,113 @@ def test_blocking_plan_review_future_followup_is_summarized_under_ignore(tmp_pat
     revision_prompts = _plan_revision_prompts_1389(runner)
     assert len(revision_prompts) == 1
     assert "item-2" not in revision_prompts[0]
+
+
+# --- Non-blocking plan-review implementation notes (#2145) ------------------
+
+
+def _plan_review_with_notes(*, state="approved", notes=(), same_plan=(), dispositions=None):
+    return (
+        json.dumps({
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": state,
+            "summary": "Plan review with implementation notes.",
+            "blocking_plan_issues": [],
+            "same_plan_followups": list(same_plan),
+            "future_followups": [],
+            "implementation_notes": list(notes),
+            "prior_plan_item_dispositions": dispositions or [],
+            "human_requirement_dispositions": [],
+        })
+        + f"\n<!-- AGENT_PLAN_STATE: {state} -->\n-- OpenAI Codex"
+    )
+
+
+def _reviewer_records(runner):
+    records = []
+    for comment in runner.issue_comments:
+        body = comment["body"]
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow == "plan" and metadata.role == "reviewer":
+            records.append((body, metadata))
+    return records
+
+
+def test_approved_plan_review_with_notes_approves_without_a_revision_round(tmp_path):
+    """Matrix row `approved-with-notes`."""
+    runner = FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Initial plan.")],
+        codex_outputs=[
+            _plan_review_with_notes(notes=[
+                "Also update the pinned inventory in tests/test_help_registry.py.",
+            ]),
+        ],
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_calls) == 1  # no planner revision round
+    [(body, metadata)] = _reviewer_records(runner)
+    assert metadata.state == "approved"
+    assert metadata.implementation_notes == (
+        "Also update the pinned inventory in tests/test_help_registry.py.",
+    )
+    assert metadata.new_items == ()  # a note is never minted as an unresolved item
+    assert "### Implementation notes (non-blocking; for the implementer)" in body
+    approval = runner.comments[-1]
+    assert "Outcome: implement" in approval
+    assert "Implementation notes from plan review (non-blocking" in approval
+    assert "tests/test_help_registry.py. (Codex)" in approval
+
+
+def test_blocking_review_with_notes_carries_only_the_same_plan_item(tmp_path):
+    """Matrix row `blocking-notes-plus-same-plan`."""
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Initial plan."),
+            structured_plan_revision(summary="Revised plan with the cap fixed."),
+        ],
+        codex_outputs=[
+            _plan_review_with_notes(
+                state="blocking",
+                same_plan=["A per-model cap of 3 cannot admit one model in all four roles."],
+                notes=[
+                    "Add the new entry to the pinned _GEMINI_MEDIUM_THINKING_MODELS set.",
+                    "Refresh the SIBLINGS inventory in the pricing test.",
+                ],
+            ),
+            _plan_review_with_notes(
+                notes=["Refresh the SIBLINGS inventory in the pricing test."],
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _reviewer_records(runner)
+    first = records[0][1]
+    assert [item.text for item in first.new_items] == [
+        "A per-model cap of 3 cannot admit one model in all four roles."
+    ]
+    assert len(first.implementation_notes) == 2
+    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    revision_prompt = claude_calls[1][-1]
+    # Only the same-plan finding is a carried ledger item; the notes appear
+    # nowhere in the carried item lines (they stay in the raw review only).
+    assert "[item-1] same-plan from Codex in round 1" in revision_prompt
+    assert "[item-2]" not in revision_prompt and "[item-3]" not in revision_prompt
+    assert [item.text for item in records[1][1].new_items] == []
+    approval = runner.comments[-1]
+    # Collected across both rounds of the scope, de-duplicated, approving round first.
+    section = approval.split("Implementation notes from plan review (non-blocking", 1)[1]
+    assert section.count("SIBLINGS inventory") == 1
+    assert "_GEMINI_MEDIUM_THINKING_MODELS" in section
+    assert section.index("SIBLINGS inventory") < section.index("_GEMINI_MEDIUM_THINKING_MODELS")

@@ -779,6 +779,18 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "fields or canonical evidence rows."
         ),
     ),
+    "_bound_plan_implementation_notes": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Over-limit or duplicate plan implementation notes (#2145) degrade by "
+            "deterministic truncation or drop, never rejecting the review; record "
+            "construction reaches marker neutralization. Fatal sites: "
+            "authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
     "_degradable_sub_items": ShapeCheckClassification(
         "mixed",
         frozenset({"authentication-or-forgery"}),

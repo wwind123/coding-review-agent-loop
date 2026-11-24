@@ -1359,6 +1359,30 @@
       "occurrence": 2
     },
     {
+      "module": "plan_implementation_notes",
+      "function": "_plan_source_matches",
+      "call": "_decode_round_metadata_records(tuple(comments), flow='plan')",
+      "family": "rounds",
+      "provenance": "plan_implementation_notes._plan_source_matches: Advisory prescan only (#2145): the raw codec decides whether an authenticated notes read is worth a GitHub acquisition, or which supplied plan source to read; it never selects approval, routing or authority, and notes are never taken from it. A forged or malformed raw record can at most suppress advisory notes, because plan_implementation_notes.load_plan_implementation_notes then reads notes only from plan_board_state.admitted_issue_comments (invocation-only masking after authenticated acquisition).",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_implementation_notes",
+      "function": "_raw_records_carry_notes",
+      "call": "_decode_round_metadata_records(tuple(comments), flow='plan')",
+      "family": "rounds",
+      "provenance": "plan_implementation_notes._raw_records_carry_notes: Advisory prescan only (#2145): the raw codec decides whether an authenticated notes read is worth a GitHub acquisition, or which supplied plan source to read; it never selects approval, routing or authority, and notes are never taken from it. A forged or malformed raw record can at most suppress advisory notes, because plan_implementation_notes.load_plan_implementation_notes then reads notes only from plan_board_state.admitted_issue_comments (invocation-only masking after authenticated acquisition).",
+      "occurrence": 1
+    },
+    {
+      "module": "plan_implementation_notes",
+      "function": "resolve_plan_notes",
+      "call": "_extract_round_metadata_records(admitted_comments, flow='plan')",
+      "family": "rounds",
+      "provenance": "plan_implementation_notes.resolve_plan_notes: callers pass history admitted by plan_board_state.admitted_issue_comments (pr_round_ingestion.protocol_comments masks invocation-only plan anchors and sidecars after github authenticated acquisition) with its authenticated actor; scope boundaries come from plan_issue_scope.admitted_scope_boundaries with that actor. Without an actor the result is unavailable. The output is advisory implementation notes only, never approval or authority.",
+      "occurrence": 1
+    },
+    {
       "module": "plan_issue_scope",
       "function": "_archived_indexes",
       "call": "_extract_round_metadata_records(comments, flow='plan')",
@@ -3165,6 +3189,12 @@
       "function": "_run_plan_first_loop_body::inherited_review_context",
       "classification": "reader",
       "admission": "plan_first_loop admits startup context and every refreshed issue context before scope, drift, approval, scheduler or recovery readers; parent/child acquisitions remain separate."
+    },
+    {
+      "module": "plan_implementation_notes",
+      "function": "resolve_plan_notes",
+      "classification": "reader",
+      "admission": "plan_implementation_notes.resolve_plan_notes reads admitted plan history and the authenticated actor supplied by plan_board_state.admitted_issue_comments; trusted-actor comment bodies after the authenticated scope boundary and approval-announcement records are read only to decide idempotence of an advisory notes-only supplement."
     },
     {
       "module": "plan_issue_scope",

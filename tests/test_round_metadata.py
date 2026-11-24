@@ -66,3 +66,58 @@ def test_legacy_step_back_entries_parse_and_never_change_observations(value, sta
     )
     assert pr_no_progress_observations(records) == pr_no_progress_observations(reference)
     assert [o.round_number for o in pr_no_progress_observations(records)] == [1]
+
+
+# --- Plan review implementation notes (#2145) --------------------------------
+
+
+def _plan_reviewer_metadata(**fields):
+    return PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=2,
+        subject="a" * 64, state="approved", **fields,
+    )
+
+
+def test_implementation_notes_round_trip_through_round_metadata():
+    from coding_review_agent_loop.round_metadata import _encode_round_metadata
+    from coding_review_agent_loop.round_metadata import _decode_round_metadata
+
+    metadata = _plan_reviewer_metadata(implementation_notes=("Update the fixture.", "Refresh SIBLINGS."))
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.implementation_notes == ("Update the fixture.", "Refresh SIBLINGS.")
+
+
+def test_legacy_record_without_notes_is_byte_identical_and_decodes_empty():
+    """Matrix row `legacy-record`."""
+    from coding_review_agent_loop.round_metadata import (
+        _decode_round_metadata,
+        _encode_round_metadata,
+        decode_mapping,
+    )
+
+    legacy = _plan_reviewer_metadata()
+    explicit_empty = _plan_reviewer_metadata(implementation_notes=())
+    encoded = _encode_round_metadata(legacy)
+    assert _encode_round_metadata(explicit_empty) == encoded
+    payload = decode_mapping(encoded)
+    assert "implementation_notes" not in payload
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.implementation_notes == ()
+    assert decoded == legacy
+    # A record written before this change, re-encoded, keeps its exact bytes.
+    assert _encode_round_metadata(decoded) == encoded
+
+
+@pytest.mark.parametrize("value", [None, []])
+def test_null_or_empty_notes_decode_as_none(value):
+    from coding_review_agent_loop.round_metadata import decode_implementation_notes
+
+    assert decode_implementation_notes(value) == ()
+
+
+@pytest.mark.parametrize("value", ["one note", [1], [""], ["x" * 5000]])
+def test_malformed_notes_fail_closed(value):
+    from coding_review_agent_loop.round_metadata import decode_implementation_notes
+
+    with pytest.raises(ValueError):
+        decode_implementation_notes(value)

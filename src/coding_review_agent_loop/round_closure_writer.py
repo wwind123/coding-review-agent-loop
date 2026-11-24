@@ -405,6 +405,7 @@ def plan_published_review(record: object, *, reviewer: str, surfaced_requirement
     Returns ``(parsed_review, review_output)``.
     """
     from .architecture_contract import _resumed_review_architecture
+    from .plan_implementation_notes import resumed_implementation_notes
 
     metadata = record.metadata  # type: ignore[attr-defined]
     review_output = metadata.canonical_reviewer_response or record.body  # type: ignore[attr-defined]
@@ -427,6 +428,9 @@ def plan_published_review(record: object, *, reviewer: str, surfaced_requirement
         architecture_impact=impact,
         architecture_impact_degradations=degradations,
         ignored_prior_disposition_ids=metadata.ignored_prior_disposition_ids,
+        # Restored once from the record (#2145); a record written before
+        # notes were persisted re-parses its response.
+        implementation_notes=resumed_implementation_notes(metadata, structured, reviewer=reviewer),
     )
     return parsed, review_output
 

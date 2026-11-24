@@ -8661,3 +8661,104 @@ def test_risk_matrix_evidence_status_message_names_index_and_allowed_values():
         "allowed values: blocked, failed, incomplete, missing, not-run, "
         "stale/unverified, timed-out, verified" in message
     )
+
+
+# --- Plan review implementation notes (#2145) --------------------------------
+
+
+def _notes_plan_review(**fields):
+    from coding_review_agent_loop.protocol import parse_structured_plan_review
+
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks sound.",
+        "blocking_plan_issues": [],
+        "same_plan_followups": [],
+        "future_followups": [],
+        "prior_plan_item_dispositions": [],
+    }
+    payload.update(fields)
+    text = json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: {payload['state']} -->\n-- OpenAI Codex"
+    return parse_structured_plan_review(text, reviewer="Codex")
+
+
+def test_plan_review_without_implementation_notes_parses_with_none():
+    parsed = _notes_plan_review()
+    assert parsed.implementation_notes == ()
+    assert parsed.implementation_note_degradations == ()
+
+
+def test_approved_plan_review_with_notes_stays_approved_and_off_the_item_lists():
+    parsed = _notes_plan_review(implementation_notes=[
+        "Also update the pinned inventory in tests/test_help_registry.py.",
+        {"title": "Refresh the snapshot", "location": "tests/fixtures/snapshot.json"},
+    ])
+    assert parsed.state == "approved"
+    assert [note.text for note in parsed.implementation_notes] == [
+        "Also update the pinned inventory in tests/test_help_registry.py.",
+        "Refresh the snapshot Location: tests/fixtures/snapshot.json",
+    ]
+    assert all(note.reviewer == "Codex" for note in parsed.implementation_notes)
+    assert parsed.items.blocking == parsed.items.same_plan == parsed.items.future == ()
+    assert parsed.dispositions == ()
+
+
+def test_blocking_plan_review_keeps_notes_beside_a_same_plan_followup():
+    parsed = _notes_plan_review(
+        state="blocking",
+        same_plan_followups=["A per-model cap of 3 cannot admit one model in all four roles."],
+        implementation_notes=["Add the entry to the pinned model set.", "Refresh SIBLINGS."],
+    )
+    assert [item.text for item in parsed.items.same_plan] == [
+        "A per-model cap of 3 cannot admit one model in all four roles."
+    ]
+    assert len(parsed.implementation_notes) == 2
+
+
+@pytest.mark.parametrize("value", [None, "Refresh the golden file."])
+def test_implementation_notes_lossless_shapes_normalize(value):
+    parsed = _notes_plan_review(implementation_notes=value)
+    assert [note.text for note in parsed.implementation_notes] == (
+        [] if value is None else ["Refresh the golden file."]
+    )
+
+
+def test_a_note_duplicating_a_same_plan_item_is_dropped_with_a_degradation():
+    parsed = _notes_plan_review(
+        state="blocking",
+        same_plan_followups=["Update the fixture inventory."],
+        implementation_notes=["update the fixture inventory", "Refresh the snapshot."],
+    )
+    assert [note.text for note in parsed.implementation_notes] == ["Refresh the snapshot."]
+    assert [record.rule for record in parsed.implementation_note_degradations] == [
+        "note-duplicates-a-blocking-finding"
+    ]
+
+
+def test_over_limit_notes_degrade_deterministically_without_rejection():
+    """Matrix row `oversized-notes`."""
+    from coding_review_agent_loop.protocol import (
+        IMPLEMENTATION_NOTE_TRUNCATION_SUFFIX,
+        MAX_IMPLEMENTATION_NOTE_CHARS,
+        MAX_IMPLEMENTATION_NOTES_PER_REVIEW,
+    )
+
+    notes = ["L" * (MAX_IMPLEMENTATION_NOTE_CHARS + 50)] + [f"Note {n}." for n in range(12)]
+    first = _notes_plan_review(implementation_notes=notes)
+    second = _notes_plan_review(implementation_notes=notes)
+
+    assert first.state == "approved"
+    assert first.implementation_notes == second.implementation_notes
+    assert len(first.implementation_notes) == MAX_IMPLEMENTATION_NOTES_PER_REVIEW
+    assert first.implementation_notes[0].text == (
+        "L" * MAX_IMPLEMENTATION_NOTE_CHARS + IMPLEMENTATION_NOTE_TRUNCATION_SUFFIX
+    )
+    rules = [record.rule for record in first.implementation_note_degradations]
+    assert rules.count("note-longer-than-1000-characters") == 1
+    assert rules.count("more-than-ten-notes") == 3
+    assert all(
+        record.outcome in {"note-truncated", "note-dropped"}
+        for record in first.implementation_note_degradations
+    )

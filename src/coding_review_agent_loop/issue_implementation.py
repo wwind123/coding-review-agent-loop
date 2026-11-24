@@ -114,6 +114,7 @@ from .round_metadata import (
     _attach_round_metadata,
     _plan_subject,
 )
+from .plan_implementation_notes import attach_plan_implementation_notes
 from .round_state import (
     make_approved_plan_context,
 )
@@ -334,11 +335,14 @@ def _implement_approved_issue_unscoped(
         if execution_recommendation is not None else None
     )
     if approved_plan_context is None:
-        approved_plan_context = make_approved_plan_context(
-            approved_plan,
-            source_locator=f"issue #{issue_number} approved-plan implementation",
-            expected_hash=plan_hash,
-            expected_subject=plan_subject,
+        approved_plan_context = attach_plan_implementation_notes(
+            make_approved_plan_context(
+                approved_plan,
+                source_locator=f"issue #{issue_number} approved-plan implementation",
+                expected_hash=plan_hash,
+                expected_subject=plan_subject,
+            ),
+            runner=runner, config=config, sources=(issue_context, parent_issue_context),
         )
     if execution_recommendation is not None and approved_plan_context.matrix_available:
         validate_approved_risk_matrix_ownership(

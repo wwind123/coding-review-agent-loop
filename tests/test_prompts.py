@@ -1121,7 +1121,9 @@ def test_plan_review_prompt_includes_structured_sections_and_prior_items(tmp_pat
     assert "they may appear only in blocking plan reviews" in prompt
     assert "Future\nfollow-ups are independent later work" in prompt
     assert "A concern or\nparaphrase belongs in exactly one current-round list" in prompt
-    assert "Do not duplicate or reclassify\nthe same concern across Same-plan and Future follow-up lists" in prompt
+    assert "`same_plan_followups`, `future_followups`, or `implementation_notes`. Do not\nduplicate or reclassify the same concern across these lists." in prompt
+    assert '"implementation_notes": []' in prompt
+    assert "when in doubt, the finding blocks" in prompt
     assert "do not use structured Future\nfollow-ups" not in prompt
     assert "they are allowed in both approved and blocking plan reviews" in prompt
     assert "no blocking plan issues, no Same-plan\nfollow-ups, and no carried-forward plan items left active" in prompt
@@ -4930,7 +4932,8 @@ def test_exhaustiveness_rule_is_static_per_flow_and_keeps_existing_review_rules(
         plan_flat = " ".join(_exhaustive_reviewer_prompt(config, "plan", compact).split())
         assert '"kind": "plan_review"' in plan_flat
         assert "A concern or paraphrase belongs in exactly one current-round list" in plan_flat
-        assert "Do not duplicate or reclassify the same concern across Same-plan and Future follow-up lists." in plan_flat
+        assert "Do not duplicate or reclassify the same concern across these lists." in plan_flat
+        assert "flagging an omitted one is an implementation note" in plan_flat
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -6815,7 +6818,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     The baseline includes intentional reviewer-guidance updates from #1954
     and the remote-tracking review diff base from #1977, and the superseded
     signed-source classification guidance from #2101, and the keep-the-PR
-    blocked-requirement guidance from #2120.
+    blocked-requirement guidance from #2120, and the plan-review
+    implementation-notes list and guidance from #2145.
     """
     import json as _golden_json
     import os as _golden_os
@@ -7591,3 +7595,62 @@ def test_coder_guidance_keeps_positive_pr_beside_blocked_signed_requirement(tmp_
     assert "stays beside the positive PR as a `blocked`" in repair_prompt
     for phrase in forbidden:
         assert phrase not in repair_prompt, phrase
+
+
+# --- #2145: plan-review implementation notes reach implementer and PR reviewers ---
+
+
+def _plan_context_with_notes():
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.plan_implementation_notes import (
+        PlanImplementationNote,
+        PlanImplementationNotes,
+        with_plan_implementation_notes,
+    )
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+
+    plan = "1. Fix it.\n2. Add tests."
+    base = make_approved_plan_context(
+        plan, source_locator="issue #56 approved-plan round", expected_hash=approved_plan_hash(plan),
+    )
+    notes = PlanImplementationNotes(
+        notes=(
+            PlanImplementationNote("Update the pinned inventory in tests/test_help_registry.py.", ("Codex",)),
+            PlanImplementationNote("Refresh the SIBLINGS fixture.", ("Codex", "Claude")),
+        ),
+        omitted=1,
+    )
+    return base, with_plan_implementation_notes(base, notes)
+
+
+def test_implementation_prompt_carries_bounded_non_binding_notes(tmp_path):
+    """Matrix row `implementer-prompt`."""
+    config = make_config(tmp_path, coder="claude")
+    base, context = _plan_context_with_notes()
+    prompt = build_issue_implementation_prompt(56, "1. Fix it.", config, approved_plan_context=context)
+
+    assert "Implementation notes from plan review" in prompt
+    assert "Reviewer-authored, non-binding context from the plan review" in prompt
+    assert "- Update the pinned inventory in tests/test_help_registry.py. (Codex)" in prompt
+    assert "- Refresh the SIBLINGS fixture. (Codex, Claude)" in prompt
+    assert "(1 more note(s) omitted; see the plan review comments.)" in prompt
+    # Identity is untouched: same hash, subject and matrix identity as without notes.
+    assert (context.plan_hash, context.plan_subject, context.risk_test_matrix_identity) == (
+        base.plan_hash, base.plan_subject, base.risk_test_matrix_identity,
+    )
+    assert "Implementation notes from plan review" not in build_issue_implementation_prompt(
+        56, "1. Fix it.", config, approved_plan_context=base,
+    )
+
+
+def test_pr_review_prompt_carries_notes_as_ordinary_findings_guidance(tmp_path):
+    """Matrix row `pr-reviewer-context-resume` (prompt rendering)."""
+    config = make_config(tmp_path)
+    _base, context = _plan_context_with_notes()
+    for compact in (False, True):
+        prompt = build_review_prompt(
+            7, 1, config, reviewer="codex", approved_plan_context=context, compact_context=compact,
+        )
+        assert "Implementation notes from plan review" in prompt, compact
+        assert "an unaddressed note is an ordinary PR review finding, never an automatic block" in prompt
+        assert "- Refresh the SIBLINGS fixture. (Codex, Claude)" in prompt

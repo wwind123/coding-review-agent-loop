@@ -561,6 +561,7 @@ from .pr_loop_decisions import (
 from .pr_board_entry import _enforce_pr_board_floor
 
 from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
+from .plan_implementation_notes import attach_plan_implementation_notes
 
 
 from .requirement_evidence import CLASSIFICATION_INVOKE_OPTIONS, historical_projection, historical_superseded_ids, classify_review, project, reviewer_owned_ids, superseded_ids, validate_associations
@@ -937,7 +938,8 @@ def run_pr_loop(
                             "Managed-CI fresh authorization approved-plan scope does not "
                             "match the canonical issue plan."
                         )
-                    approved_plan_context = recovered
+                    approved_plan_context = attach_plan_implementation_notes(
+                        recovered, runner=runner, config=config, sources=(issue_context, parent_issue_context))
                     (
                         fresh_retired_plan_hashes,
                         fetched_parent_issue_context,
@@ -1128,7 +1130,9 @@ def run_pr_loop(
                                 "Managed-CI ordinary resume approved-plan scope does not match "
                                 "the canonical issue plan."
                             )
-                        approved_plan_context = recovered_scope
+                        approved_plan_context = attach_plan_implementation_notes(
+                            recovered_scope, runner=runner, config=config,
+                            sources=(issue_context, parent_issue_context))
                         ordinary_retired: frozenset[str] = frozenset()
                         if canonical_handoff is not None:
                             # A verified signed rebind leaves grants under the
@@ -1793,7 +1797,8 @@ def run_pr_loop(
                                         child_plan_context=child_plan_context,
                                         pr_number=pr_number,
                                     )
-                                    approved_plan_context = child_plan_context
+                                    approved_plan_context = attach_plan_implementation_notes(
+                                        child_plan_context, runner=runner, config=config, sources=(issue_context,))
                                 if phase_handoff is None:
                                     # A fresh child phase without a parent-owned
                                     # implementation handoff is independently
@@ -1846,7 +1851,8 @@ def run_pr_loop(
                                     # the separately approved child plan,
                                     # including inherited and child-local rows,
                                     # remain enforceable here.
-                                    approved_plan_context = child_plan_context
+                                    approved_plan_context = attach_plan_implementation_notes(
+                                        child_plan_context, runner=runner, config=config, sources=(issue_context,))
                             else:
                                 checkpoint = None
                                 for topology_mode in ("decompose-only", "implement-by-phase"):
@@ -1904,6 +1910,11 @@ def run_pr_loop(
                                 )
                                 if parent_candidate.is_available:
                                     approved_plan_context = parent_candidate
+                            # Notes of the plan's own scope; a parent source
+                            # labels them with the parent-plan origin (#2145).
+                            approved_plan_context = attach_plan_implementation_notes(
+                                approved_plan_context, runner=runner, config=config,
+                                sources=(issue_context, parent_issue_context))
                     if (
                         fresh_phase
                         and phase_handoff is not None

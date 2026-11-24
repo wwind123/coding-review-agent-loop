@@ -471,6 +471,7 @@ _REVIEW_KINDS = frozenset({"plan_review", "pr_review"})
 _REVIEW_KIND_UNIQUE_FIELDS = {
     "plan_review": frozenset({
         "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+        "implementation_notes",
     }),
     "pr_review": frozenset({
         "blocking_items", "same_pr_followups", "prior_item_dispositions",
