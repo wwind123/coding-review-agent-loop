@@ -8526,3 +8526,136 @@ def test_pr_review_drops_coder_only_dispositions_field(value, caplog):
     assert drops == [
         "pr_review: dropped coder-only field `human_requirement_dispositions` before validation"
     ]
+
+
+# ---------------------------------------------------------------------------
+# #2128: rejected-enum and entry-shape messages name the index and allowed values
+# ---------------------------------------------------------------------------
+
+
+def _msg2128_risk_row(**extra) -> dict:
+    row = {
+        "row_id": "row-1", "label": "Label", "entry_path_or_mode": "mode",
+        "initial_state": "start", "event": "event", "expected_outcome": "outcome",
+        "forbidden_side_effects": ["none"], "proposed_test_level": "unit",
+        "proposed_test_location": "tests/test_x.py", "related_scope_item_ids": [],
+        "applicability": "required", "execution_owner": "one-shot",
+    }
+    row.update(extra)
+    return row
+
+
+def test_risk_matrix_row_applicability_message_names_index_and_allowed_values():
+    """`messages-allowed-values`: parse_risk_test_matrix row applicability."""
+    from coding_review_agent_loop.protocol_risk import parse_risk_test_matrix
+
+    matrix = {
+        "applicability": "applicable",
+        "rows": [_msg2128_risk_row(), _msg2128_risk_row(row_id="row-2", applicability="mandatory")],
+        "important_exclusions": [],
+    }
+    with pytest.raises(AgentLoopError) as caught:
+        parse_risk_test_matrix(matrix)
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "rows[1].applicability is invalid" in message
+    assert "`mandatory`" in message
+    assert "allowed values: applicable, not-applicable, required" in message
+
+
+def test_risk_matrix_change_operation_message_names_index_and_allowed_values():
+    """`messages-allowed-values`: matrix change operation."""
+    from coding_review_agent_loop.protocol_risk import parse_risk_test_matrix_changes
+
+    changes = [
+        {"operation": "add", "row_ids": ["row-1"], "rationale": "New row."},
+        {"operation": "insert", "row_ids": ["row-2"], "rationale": "New row."},
+    ]
+    with pytest.raises(AgentLoopError) as caught:
+        parse_risk_test_matrix_changes(changes)
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "risk_test_matrix_changes[1].operation is invalid" in message
+    assert "`insert`" in message
+    assert "allowed values: add, change, merge, retire, split" in message
+
+
+def test_semantic_row_applicability_message_names_allowed_values():
+    """`messages-allowed-values`: semantic-op complete row."""
+    from coding_review_agent_loop.protocol_risk import parse_risk_test_matrix_row
+
+    with pytest.raises(AgentLoopError) as caught:
+        parse_risk_test_matrix_row(_msg2128_risk_row(applicability="mandatory"), context="ops[3].row")
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "ops[3].row.applicability is invalid" in message
+    assert "allowed values: applicable, not-applicable, required" in message
+
+
+def _msg2128_association(**extra) -> dict:
+    entry = {
+        "requirement_id": "hr-1", "role": "code", "request": "",
+        "answered_item_ids": [], "leftover_instructions": "",
+    }
+    entry.update(extra)
+    return entry
+
+
+def test_requirement_evidence_role_message_names_index_and_allowed_roles():
+    """`messages-allowed-values`: requirement_evidence role."""
+    from coding_review_agent_loop.requirement_evidence import parse_associations
+
+    with pytest.raises(AgentLoopError) as caught:
+        parse_associations([_msg2128_association(), _msg2128_association(role="bogus")])
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "requirement_evidence[1].role" in message
+    assert "`bogus`" in message
+    assert "allowed values: code, evidence-only, human-only, mixed, superseded" in message
+
+
+def test_requirement_evidence_keys_message_names_index_and_missing_keys():
+    """`messages-allowed-values`: requirement_evidence entry keys."""
+    from coding_review_agent_loop.requirement_evidence import parse_associations
+
+    entry = _msg2128_association(extra_key="x")
+    del entry["request"]
+    with pytest.raises(AgentLoopError) as caught:
+        parse_associations([_msg2128_association(), entry])
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "requirement_evidence[1]" in message
+    assert "missing: request" in message
+    assert "unexpected: `extra_key`" in message
+
+
+def test_requirement_evidence_non_object_entry_message_says_so():
+    """`messages-allowed-values`: a non-object requirement_evidence entry."""
+    from coding_review_agent_loop.requirement_evidence import parse_associations
+
+    with pytest.raises(AgentLoopError) as caught:
+        parse_associations(["not-an-object"])
+    message = str(caught.value)
+    assert "requirement_evidence[0] must be an object (got str)" in message
+    assert "requirement_id, role, request, answered_item_ids, leftover_instructions" in message
+
+
+def test_risk_matrix_evidence_status_message_names_index_and_allowed_values():
+    """`messages-allowed-values`: evidence row status (#2128 review item-1)."""
+    from coding_review_agent_loop.protocol_risk import parse_risk_test_matrix_evidence
+
+    row = {
+        "row_id": "row-1", "status": "bogus-status", "test_identifiers": [], "test_locations": [],
+        "workflow_path_claim": "", "outcome_assertions": [], "forbidden_effect_assertions": [],
+        "evidence_citations": [],
+    }
+    with pytest.raises(AgentLoopError) as caught:
+        parse_risk_test_matrix_evidence({"matrix_identity": "a" * 64, "rows": [row]})
+    assert type(caught.value) is AgentLoopError
+    message = str(caught.value)
+    assert "rows[0].status is invalid" in message
+    assert "`bogus-status`" in message
+    assert (
+        "allowed values: blocked, failed, incomplete, missing, not-run, "
+        "stale/unverified, timed-out, verified" in message
+    )

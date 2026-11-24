@@ -560,7 +560,7 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
             {"applicable", "required", "not-applicable"}, context=f"{row_context}.applicability",
         )
         if row_applicability not in {"applicable", "required", "not-applicable"}:
-            raise AgentLoopError(f"{row_context}.applicability is invalid.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{row_context}.applicability is invalid (got `{_dropped_ref_preview(row_applicability)}`); allowed values: applicable, not-applicable, required.")  # shape-check: fatal:no-conservative-reading
         rows.append(
             RiskTestMatrixRow(
                 row_id=row_id,
@@ -639,7 +639,7 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
             RISK_MATRIX_CHANGE_OPERATIONS, context=f"{change_context}.operation",
         )
         if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
-            raise AgentLoopError(f"{change_context}.operation is invalid.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{change_context}.operation is invalid (got `{_dropped_ref_preview(operation)}`); allowed values: {', '.join(sorted(RISK_MATRIX_CHANGE_OPERATIONS))}.")  # shape-check: fatal:no-conservative-reading
         row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(  # shape-check: fatal:no-conservative-reading
             _risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
                 change["row_ids"],
@@ -1916,7 +1916,7 @@ def parse_risk_test_matrix_evidence(
         seen.add(row_id)
         status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)  # shape-check: fatal:authentication-or-forgery
         if status not in RISK_MATRIX_EVIDENCE_STATUSES:
-            raise AgentLoopError(f"{row_context}.status is invalid.")  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(f"{row_context}.status is invalid (got `{_dropped_ref_preview(status)}`); allowed values: {', '.join(sorted(RISK_MATRIX_EVIDENCE_STATUSES))}.")  # shape-check: fatal:authentication-or-forgery
         parsed_row = RiskTestMatrixEvidenceRow(
             row_id=row_id,
             status=status,
@@ -3700,7 +3700,7 @@ def parse_risk_test_matrix_row(value: object, *, context: str = "risk_test_matri
     """Parse one complete row for semantic matrix operations."""
     row = _parse_complete_risk_test_matrix_row(value, context=context)  # shape-check: fatal:no-conservative-reading
     if row.applicability not in {"applicable", "required", "not-applicable"}:
-        raise AgentLoopError(f"{context}.applicability is invalid.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.applicability is invalid (got `{_dropped_ref_preview(row.applicability)}`); allowed values: applicable, not-applicable, required.")  # shape-check: fatal:no-conservative-reading
     return row
 
 def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMetadata:

@@ -1312,7 +1312,8 @@ def _run_validated_agent_in_scope(
 
         A coder re-ask needs a readable checkout head as its baseline; without
         one the turn fails as before.  The re-ask resumes the response's own
-        session when there is one and otherwise resends the full prompt.
+        session when there is one and otherwise resends the full prompt with
+        a bounded, sanitized copy of the rejected response (#2128).
         """
         nonlocal reasks_used, pending_reask, reask_budget_exhausted, reask_skip_detail
         nonlocal turn_producer_model
@@ -1347,6 +1348,9 @@ def _run_validated_agent_in_scope(
                 coder=is_coder_turn,
                 fresh_evidence=fresh_evidence,
                 config=config,
+                # A session-less re-ask is a fresh turn: quote the rejected
+                # response back so the agent can keep its judgements (#2128).
+                prior_response=result.text if reask_session is None else None,
             ),
             session_id=reask_session,
             fresh_evidence=fresh_evidence,

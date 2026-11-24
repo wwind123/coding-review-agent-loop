@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .protocol_markers import sanitize_historical_text
+from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
 from .runner import strip_ansi
 
 if TYPE_CHECKING:
@@ -28,6 +28,13 @@ REASK_PROMPT_HEADER = "## Previous response rejected (re-ask"
 
 # Bound on the validator message quoted back to the agent.
 VALIDATOR_MESSAGE_MAX_CHARS = 2000
+# Bound on the rejected response quoted back to a session-less agent (#2128).
+REASK_PRIOR_RESPONSE_MAX_CHARS = 24000
+# Characters of the rejected response's tail kept after truncation.
+REASK_PRIOR_RESPONSE_TAIL_CHARS = 2000
+PRIOR_RESPONSE_HEADING = (
+    "Your previous (rejected) response, for reference — keep its judgements:"
+)
 
 _KNOWN_ERROR_RE = re.compile(
     r"(?i)(fatal|error|exception|authentication|unauthorized|forbidden|quota|rate.?limit|timed?.?out)"
@@ -83,6 +90,38 @@ def sanitize_validator_message(
     return clean
 
 
+def sanitize_prior_response(
+    text: str,
+    *,
+    config: AgentLoopConfig | None = None,
+    limit: int = REASK_PRIOR_RESPONSE_MAX_CHARS,
+) -> str:
+    """Return a bounded, marker-free copy of a rejected response (#2128).
+
+    Used only when the re-ask cannot resume the agent's session, so the agent
+    sees what it sent.  Unlike :func:`sanitize_validator_message` the line
+    structure is kept.  Secrets and local paths are redacted, reserved
+    protocol records and names are replaced by their safe labels, and HTML
+    comment delimiters are neutralized so no complete record is echoed.  An
+    oversized response keeps its head and a short tail around an explicit
+    omission note; slicing is by code point, so no UTF-8 character is split.
+    """
+    clean = _redact(text, config=config)
+    clean = sanitize_untrusted_prose(clean)
+    clean = clean.replace("<!--", "(!--").replace("-->", "--)")
+    if len(clean) <= limit:
+        return clean
+    tail_chars = min(REASK_PRIOR_RESPONSE_TAIL_CHARS, max(limit // 4, 0))
+    # Reserve room for the widest possible note: the omitted count never
+    # exceeds the full length, so the result never exceeds ``limit``.
+    reserve = len(f"\n[... {len(clean)} characters omitted ...]\n")
+    head_chars = max(limit - tail_chars - reserve, 0)
+    omitted = len(clean) - head_chars - tail_chars
+    note = f"\n[... {omitted} characters omitted ...]\n"
+    tail = clean[len(clean) - tail_chars :] if tail_chars else ""
+    return clean[:head_chars] + note + tail
+
+
 def build_reask_prompt(
     original_prompt: str,
     validator_message: str,
@@ -91,8 +130,15 @@ def build_reask_prompt(
     coder: bool = False,
     fresh_evidence: bool = False,
     config: AgentLoopConfig | None = None,
+    prior_response: str | None = None,
 ) -> str:
     """Append the re-ask instruction to ``original_prompt``.
+
+    ``prior_response`` is the rejected response text, passed only when the
+    re-ask cannot resume the agent's session (Codex, Antigravity, or any
+    result without a session).  It is quoted back bounded and sanitized
+    between the validator message and the resend instruction; a
+    session-backed re-ask omits it so the response is not duplicated.
 
     ``original_prompt`` may already carry a typed hint section (missing IDs,
     allowed values, evidence reason, contract field).  A coder re-ask forbids
@@ -109,6 +155,20 @@ def build_reask_prompt(
         "The orchestrator rejected your previous response during validation.",
         f"Validator message: {detail}",
         "",
+    ]
+    if prior_response is not None:
+        quoted = sanitize_prior_response(prior_response, config=config)
+        lines.extend(
+            [
+                PRIOR_RESPONSE_HEADING,
+                "",
+                "----- BEGIN PREVIOUS RESPONSE -----",
+                quoted,
+                "----- END PREVIOUS RESPONSE -----",
+                "",
+            ]
+        )
+    lines += [
         "Resend the complete corrected response only, in exactly the required format. "
         "Keep every judgement, claim and item from your previous response unless the "
         "validator message requires a change.",
