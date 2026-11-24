@@ -853,10 +853,6 @@ def _evidence_boundary_ledger(
     )
 
 
-class _RecoveryRefusal(AgentLoopError):
-    """A refusal ``--review-unrecorded-head`` is allowed to override (#1292)."""
-
-
 def _strip_bot_suffix(login: object) -> object:
     if isinstance(login, str) and login.endswith("[bot]"):
         return login[: -len("[bot]")]
@@ -871,7 +867,7 @@ def _recovery_record_admitted(
     """True only when the authenticated GitHub actor authored ``record``.
 
     Round metadata is not authenticated in general; this check applies only to
-    the record kinds and anchor branch added by #1292.
+    legacy recovery records, the legacy checkpoint anchor and authority carriers.
     """
     if trusted_actor is None:
         return False
@@ -968,7 +964,7 @@ def _admit_recovery_records(
     comments: Sequence[object],
     trusted_actor: tuple[str, int] | None,
 ) -> tuple[round_metadata.PostedRoundRecord, ...]:
-    """Drop new-phase records the authenticated actor did not author.
+    """Drop legacy recovery records the authenticated actor did not author.
 
     A conversion record (#1325) is a ledger handoff too, so a foreign one is
     dropped rather than restored; every other record loses only its
@@ -979,7 +975,7 @@ def _admit_recovery_records(
             record
             for record in records
             if (
-                record.metadata.phase not in round_metadata.RECOVERY_RECORD_PHASES
+                record.metadata.phase not in round_metadata.LEGACY_RECOVERY_RECORD_PHASES
                 and record.metadata.phase != round_metadata.EVIDENCE_CONVERSION_PHASE
             )
             or (
@@ -997,39 +993,24 @@ def _admit_recovery_records(
     )
 
 
-def _is_budget_candidate(metadata: round_metadata.PostedRoundMetadata) -> bool:
-    """Whether the operator override may take a round budget from this record.
-
-    One predicate shared by budget selection and REST coverage, so the records
-    that can supply a budget are exactly the records whose authorship must be
-    proven: any record bearing a qualification checkpoint, or a recovery record.
-    """
-    return metadata.qualification_checkpoint is not None or (
-        metadata.phase in round_metadata.RECOVERY_RECORD_PHASES and metadata.recovery_round_budget is not None
-    )
-
-
 def unauthenticated_recovery_record_indexes(
     comments: Sequence[object],
     head_sha: str | None = None,
-    review_unrecorded_head: bool = False,
 ) -> tuple[int, ...]:
     """Indexes of records recovery depends on whose comment has no author identity.
 
     After the REST identity merge every matched comment has a numeric author ID.
     A needed record left without one was not covered by the REST read (a page
     omitted it), so it can be neither admitted nor ruled out as another
-    author's.  Needed records are: every recovery-phase record; the legacy
-    qualification-checkpoint anchor of a head that has no records of its own;
-    and, under ``--review-unrecorded-head``, every checkpoint (a budget source).
+    author's.  Needed records are: every legacy recovery-phase record and
+    authority carrier, and the legacy qualification-checkpoint anchor of a head
+    that has no records of its own.
     """
     records = authority_records(_extract_round_metadata_records(comments, flow="pr"))
     needed: set[int] = set()
     for record in records:
         phase = record.metadata.phase
-        if phase in round_metadata.RECOVERY_RECORD_PHASES or record_carries_evidence_authority(record.metadata):
-            needed.add(record.index)
-        elif review_unrecorded_head and _is_budget_candidate(record.metadata):
+        if phase in round_metadata.LEGACY_RECOVERY_RECORD_PHASES or record_carries_evidence_authority(record.metadata):
             needed.add(record.index)
     if head_sha and records and not any(r.metadata.subject == head_sha for r in records):
         prior = [r for r in records if r.metadata.phase != round_metadata.CODER_DISPATCH_PHASE]
@@ -1046,14 +1027,11 @@ def unauthenticated_recovery_record_indexes(
 def pr_resume_needs_author_admission(
     comments: Sequence[object],
     head_sha: str | None,
-    review_unrecorded_head: bool = False,
 ) -> bool:
     """Whether resuming needs REST identities and the authenticated actor."""
-    if review_unrecorded_head:
-        return True
     records = authority_records(_extract_round_metadata_records(comments, flow="pr"))
     if any(
-        record.metadata.phase in round_metadata.RECOVERY_RECORD_PHASES
+        record.metadata.phase in round_metadata.LEGACY_RECOVERY_RECORD_PHASES
         or record_carries_evidence_authority(record.metadata)
         for record in records
     ):
@@ -1065,143 +1043,64 @@ def pr_resume_needs_author_admission(
     )
 
 
-def _coder_handoff_is_live(
-    records: Sequence[round_metadata.PostedRoundRecord], handoff: round_metadata.PostedRoundRecord
-) -> bool:
-    """A coder-recovery handoff is retired by any later coder, reviewer or review handoff."""
-    for record in records:
-        if record.index <= handoff.index:
-            continue
-        metadata = record.metadata
-        if scope_present(metadata):
-            continue
-        if metadata.role in {"coder", "reviewer"} or metadata.phase == round_metadata.HEAD_REVIEW_RECOVERY_PHASE:
-            return False
-    return True
+# Orchestrator checkpoints that never displace a legacy recovery record as the
+# latest handoff: they were written after it, before any reviewer ran.
+_LEGACY_MIGRATION_TRANSPARENT_PHASES = frozenset({"scheduler-prelaunch", "qualification-checkpoint"})
 
 
-def _head_review_handoff_is_live(
-    records: Sequence[round_metadata.PostedRoundRecord], handoff: round_metadata.PostedRoundRecord
-) -> bool:
-    """A head-review handoff is retired by a later coder/reviewer record or reconciliation on its subject."""
-    for record in records:
-        if record.index <= handoff.index or record.metadata.subject != handoff.metadata.subject:
-            continue
-        metadata = record.metadata
-        if scope_present(metadata):
-            continue
-        if metadata.role in {"coder", "reviewer"}:
-            return False
-        if (
-            metadata.role == "summary"
-            and metadata.round_number == handoff.metadata.round_number
-            and (
-                metadata.phase in {"reconciliation", "authoritative"}
-                or metadata.phase in round_metadata.EVIDENCE_TERMINAL_PHASES
-            )
-        ):
-            return False
-    return True
-
-
-def _live_recovery_handoff(
-    records: Sequence[round_metadata.PostedRoundRecord], subject: str, *, head_moved: bool
-) -> round_metadata.PostedRoundRecord | None:
-    """The newest live recovery handoff on ``subject``, validated before any field is read.
-
-    Candidacy and liveness use only fields that always decode (index, phase,
-    subject, role, core round).  A structurally invalid live candidate raises
-    before any agent call.  Only a valid first-attempt dispatch on the current
-    head is skipped, because ordinary resume must behave as it did before.
-    """
-    candidates: list[round_metadata.PostedRoundRecord] = []
-    for record in records:
-        metadata = record.metadata
-        if metadata.subject != subject:
-            continue
-        if metadata.phase in {round_metadata.CODER_DISPATCH_PHASE, round_metadata.CODER_FOLLOWUP_REJECTED_PHASE}:
-            if _coder_handoff_is_live(records, record):
-                candidates.append(record)
-        elif metadata.phase == round_metadata.HEAD_REVIEW_RECOVERY_PHASE:
-            if _head_review_handoff_is_live(records, record):
-                candidates.append(record)
-    for record in reversed(candidates):
-        problems = round_metadata._recovery_record_problems(record.metadata)
-        if problems:
-            raise _RecoveryRefusal(
-                f"Recovery record at comment index {record.index} "
-                f"(phase {record.metadata.phase}) is malformed: {', '.join(problems)}. "
-                "Rerun with --review-unrecorded-head to review the current head."
-            )
-        metadata = record.metadata
-        if (
-            not head_moved
-            and metadata.phase == round_metadata.CODER_DISPATCH_PHASE
-            and metadata.dispatch_attempt == 1
-            and metadata.recovery_dispatch is False
-        ):
-            continue
-        return record
-    return None
-
-
-def _consume_recovery_handoff(
-    records: Sequence[round_metadata.PostedRoundRecord],
-    handoff: round_metadata.PostedRoundRecord,
+def _legacy_recovery_migration(
+    walk_records: Sequence[round_metadata.PostedRoundRecord],
     *,
-    head_moved: bool,
-    review_unrecorded_head: bool = False,
-) -> round_metadata.ResumedReviewRound | None:
-    """Resume from a live recovery handoff.
+    head_sha: str,
+) -> tuple[bool, round_metadata.ResumedReviewRound | None]:
+    """Migrate a PR whose latest admitted record is a legacy recovery record (#2087).
 
-    Under ``--review-unrecorded-head`` the coder-recovery attempt limit is not
-    applied: the caller converts the result into an operator head review
-    (#2059), so attempts 1 and 2 behave the same.
+    The coder-dispatch, coder-followup-rejected and head-review-recovery
+    records are no longer written.  When one (already admitted from the
+    authenticated actor) is the latest handoff, resume is an ordinary review
+    round of the current head with that record's active ledger and round: no
+    coder turn, no refusal and no new record.  Only fields that always decode
+    are read, so a malformed legacy record migrates the same way.
+
+    Returns ``(matched, resume)``; ``resume`` is None when the recorded ledger
+    has no active item, which starts an ordinary first review of the head.
     """
-    metadata = handoff.metadata
-    next_number = _max_unresolved_item_number_from_records(records) + 1
+    latest = next(
+        (
+            record
+            for record in reversed(walk_records)
+            if not scope_present(record.metadata)
+            and record.metadata.phase not in _LEGACY_MIGRATION_TRANSPARENT_PHASES
+        ),
+        None,
+    )
+    if latest is None or latest.metadata.phase not in round_metadata.LEGACY_RECOVERY_RECORD_PHASES:
+        return False, None
+    metadata = latest.metadata
     ledger = tuple(_active_pr_items(metadata.prior_items))
-    if metadata.phase == round_metadata.HEAD_REVIEW_RECOVERY_PHASE:
-        if not ledger:
-            return None
-        return round_metadata.ResumedReviewRound(
-            round_number=metadata.round_number,
-            prior_items=ledger,
-            coder_output=None,
-            completed_reviews=(),
-            next_unresolved_item_number=next_number,
-            ledger_may_be_incomplete=True,
-            qualification_checkpoint=None,
-            recovery_round_budget=metadata.recovery_round_budget,
-            head_review_recovery=metadata.head_review_recovery_source,
-            head_review_recovery_post_required=head_moved,
-        )
-    reason = metadata.rejected_coder_followup_reason or round_metadata.UNRECORDED_DISPATCH_REASON
-    carried = (*metadata.carried_rejection_reasons, reason)[-round_metadata.MAX_REJECTED_DISPATCH_ATTEMPTS:]
-    attempt = metadata.dispatch_attempt or 1
-    if attempt >= round_metadata.MAX_REJECTED_DISPATCH_ATTEMPTS and not review_unrecorded_head:
-        listed = "; ".join(f"({number}) {text}" for number, text in enumerate(carried, 1))
-        raise _RecoveryRefusal(
-            f"Coder recovery stopped after {attempt} consecutive rejected or interrupted "
-            f"follow-up attempts at round {metadata.dispatch_round}. Recorded reasons: {listed}. "
-            + round_metadata.REVIEW_UNRECORDED_HEAD_HINT
-        )
     if not ledger:
-        return None
-    return round_metadata.ResumedReviewRound(
-        round_number=int(metadata.dispatch_round or metadata.round_number),
+        return True, None
+    round_number = metadata.round_number
+    dispatch_round = metadata.dispatch_round
+    if (
+        metadata.phase != round_metadata.HEAD_REVIEW_RECOVERY_PHASE
+        and isinstance(dispatch_round, int)
+        and not isinstance(dispatch_round, bool)
+        and dispatch_round >= 1
+    ):
+        round_number = dispatch_round
+    recorded_head = metadata.dispatch_head or metadata.subject
+    return True, round_metadata.ResumedReviewRound(
+        round_number=round_number,
         prior_items=ledger,
         coder_output=None,
         completed_reviews=(),
-        next_unresolved_item_number=next_number,
-        ledger_may_be_incomplete=False,
-        unrecorded_head_advance=True,
+        next_unresolved_item_number=_max_unresolved_item_number_from_records(walk_records) + 1,
+        ledger_may_be_incomplete=True,
+        unrecorded_head_advance=False,
         qualification_checkpoint=None,
-        rejected_coder_followup_reason=reason,
-        rejected_coder_followup_from_head=metadata.dispatch_head,
-        dispatch_attempt=attempt,
-        recovery_round_budget=metadata.recovery_round_budget,
-        carried_rejection_reasons=carried,
+        head_review_recovery="legacy-recovery",
+        head_advanced_past_boundary=recorded_head != head_sha,
     )
 
 
@@ -1216,7 +1115,7 @@ def _legacy_checkpoint_head_review(
 
     The checkpoint may have preceded a coder dispatch or a required head review;
     legacy records cannot tell which, so both become an ordinary review round of
-    the current head at the anchor's own round.  Only the bounded budget carries.
+    the current head at the anchor's own round.  No record is written for it.
     """
     if not _is_legacy_checkpoint_anchor(anchor, comments, trusted_actor):
         return None
@@ -1233,105 +1132,32 @@ def _legacy_checkpoint_head_review(
         ledger_may_be_incomplete=True,
         unrecorded_head_advance=False,
         qualification_checkpoint=None,
-        recovery_round_budget=round_metadata.RecoveryRoundBudget.from_checkpoint(
-            metadata.qualification_checkpoint
-        ),
         head_review_recovery="legacy-checkpoint",
-        head_review_recovery_post_required=True,
     )
 
 
-def _operator_recovery_budget(
-    walk_records: Sequence[round_metadata.PostedRoundRecord],
-    *,
-    comments: Sequence[object],
-    trusted_actor: tuple[str, int] | None,
-) -> round_metadata.RecoveryRoundBudget | None:
-    """The newest valid round budget from an authenticated budget source."""
-    for record in reversed(walk_records):
-        metadata = record.metadata
-        # Every budget source is authenticated: recovery records were admitted
-        # already, and a qualification checkpoint (or any other record) only
-        # counts when the authenticated actor authored it.  Only recovery
-        # phases may carry a recovery budget.
-        if not _is_budget_candidate(metadata):
-            continue
-        if not _recovery_record_admitted(record, comments, trusted_actor):
-            continue
-        if round_metadata._recovery_record_problems(metadata):
-            continue
-        if (
-            metadata.phase in round_metadata.RECOVERY_RECORD_PHASES
-            and metadata.recovery_round_budget is not None
-            and metadata.recovery_round_budget.valid
-        ):
-            return metadata.recovery_round_budget
-        if metadata.qualification_checkpoint is not None:
-            candidate = round_metadata.RecoveryRoundBudget.from_checkpoint(metadata.qualification_checkpoint)
-            if candidate is not None and candidate.valid:
-                return candidate
-    return None
-
-
-def _as_operator_head_review(
-    recovered: round_metadata.ResumedReviewRound,
-    walk_records: Sequence[round_metadata.PostedRoundRecord],
-    *,
-    comments: Sequence[object],
-    trusted_actor: tuple[str, int] | None,
-    head_moved: bool,
-) -> round_metadata.ResumedReviewRound:
-    """``--review-unrecorded-head`` at any attempt (#2059): review the head, no coder turn.
-
-    A pure field transform of a coder-recovery or unrecorded-advance resume.
-    The reconstructed ledger, round, item numbering and evidence-boundary fields
-    are kept; coder routing and the dispatch-attempt lineage are cleared so the
-    result reads like ``_operator_head_review_resume`` output.  The moved-head
-    fact survives in ``head_advanced_past_boundary`` for the boundary readers.
-    """
-    budget = recovered.recovery_round_budget
-    if budget is None or not budget.valid:
-        budget = _operator_recovery_budget(
-            authority_records(walk_records), comments=comments, trusted_actor=trusted_actor
-        )
-    return replace(
-        recovered,
-        coder_output=None,
-        coder_metadata=None,
-        coder_comment_body=None,
-        compact_prior_summaries=(),
-        local_test_evidence=None,
-        qualification_checkpoint=None,
-        unrecorded_head_advance=False,
-        dispatch_attempt=None,
-        rejected_coder_followup_reason=None,
-        rejected_coder_followup_from_head=None,
-        carried_rejection_reasons=(),
-        recovery_round_budget=budget,
-        head_review_recovery="operator",
-        head_review_recovery_post_required=True,
-        ledger_may_be_incomplete=True,
-        head_advanced_past_boundary=head_moved,
-    )
-
-
-def _operator_head_review_resume(
+def _current_head_review_from_latest_ledger(
     walk_records: Sequence[round_metadata.PostedRoundRecord],
     records: Sequence[round_metadata.PostedRoundRecord],
-    *,
-    comments: Sequence[object] = (),
-    trusted_actor: tuple[str, int] | None = None,
 ) -> round_metadata.ResumedReviewRound | None:
-    """``--review-unrecorded-head``: an ordinary review round of the current head."""
+    """An ordinary review round of the current head from the latest admitted ledger.
+
+    The fallback for a head that advanced with no record and no coherent
+    handoff (#2087): resume used to refuse and require an operator override.
+    It never routes through the coder and never writes a coder record.
+    """
     records = authority_records(records)
     walk_records = authority_records(walk_records)
-    if not records:
+    # A scoped record (valid or malformed) never owns the ordinary ledger.
+    latest_record = next(
+        (record for record in reversed(records) if not scope_present(record.metadata)), None
+    )
+    if latest_record is None:
         return None
-    latest = records[-1].metadata
+    latest = latest_record.metadata
     ledger = _active_pr_items(latest.prior_items)
     if latest.role in {"reviewer", "summary"}:
-        _append_active_pr_new_items(ledger, (records[-1],))
-    budget = _operator_recovery_budget(walk_records, comments=comments, trusted_actor=trusted_actor)
+        _append_active_pr_new_items(ledger, (latest_record,))
     if not ledger:
         return None
     return round_metadata.ResumedReviewRound(
@@ -1342,9 +1168,8 @@ def _operator_head_review_resume(
         next_unresolved_item_number=_max_unresolved_item_number_from_records(walk_records) + 1,
         ledger_may_be_incomplete=True,
         qualification_checkpoint=None,
-        recovery_round_budget=budget,
-        head_review_recovery="operator",
-        head_review_recovery_post_required=True,
+        head_review_recovery="unrecorded-advance",
+        head_advanced_past_boundary=True,
     )
 
 
@@ -1356,13 +1181,12 @@ def _recover_unrecorded_pr_head_advance(
     walk_records: Sequence[round_metadata.PostedRoundRecord] | None = None,
     comments: Sequence[object] = (),
     trusted_actor: tuple[str, int] | None = None,
-    review_unrecorded_head: bool = False,
 ) -> round_metadata.ResumedReviewRound | None:
     """Recover a head that carries no records of its own.
 
-    ``records`` is the ordinary view (coder-dispatch records excluded);
-    ``walk_records`` additionally holds the admitted dispatch records the
-    recovery-handoff walk inspects.
+    ``records`` is the ordinary view (legacy coder-dispatch records excluded);
+    ``walk_records`` additionally holds the admitted legacy dispatch records,
+    used only for item numbering.
     """
     records = authority_records(records)
     if walk_records is not None:
@@ -1373,17 +1197,6 @@ def _recover_unrecorded_pr_head_advance(
         if walk_records is None
         else _drop_unterminated_evidence_response_records(walk_records)
     )
-    prior_walk_records = [
-        record for record in walk_view if record.metadata.subject != head_sha
-    ]
-    if prior_walk_records:
-        handoff = _live_recovery_handoff(
-            walk_view, prior_walk_records[-1].metadata.subject, head_moved=True
-        )
-        if handoff is not None:
-            return _consume_recovery_handoff(
-                walk_view, handoff, head_moved=True, review_unrecorded_head=review_unrecorded_head
-            )
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
         return None
@@ -2135,7 +1948,6 @@ def _resume_pr_round(
     configured_reviewers: Sequence[AgentName],
     reconciliation_mode: str = "aggregate",
     trusted_actor: tuple[str, int] | None = None,
-    review_unrecorded_head: bool = False,
 ) -> round_metadata.ResumedReviewRound | None:
     if not head_sha:
         return None
@@ -2144,29 +1956,22 @@ def _resume_pr_round(
     )
     if not all_records:
         return None
-    # Only authenticated-actor recovery records are admitted; the walk sees the
-    # admitted coder-dispatch records, ordinary selection never does.
+    # Only authenticated-actor legacy recovery records are admitted; the
+    # migration reader sees admitted legacy coder-dispatch records, ordinary
+    # selection never does.
     walk_records = _admit_recovery_records(all_records, comments, trusted_actor)
     records = tuple(
         record for record in walk_records if record.metadata.phase != round_metadata.CODER_DISPATCH_PHASE
     )
-    try:
-        return _resume_pr_round_from_records(
-            comments,
-            walk_records=walk_records,
-            records=records,
-            head_sha=head_sha,
-            configured_reviewers=configured_reviewers,
-            reconciliation_mode=reconciliation_mode,
-            trusted_actor=trusted_actor,
-            review_unrecorded_head=review_unrecorded_head,
-        )
-    except _RecoveryRefusal:
-        if not review_unrecorded_head:
-            raise
-        return _operator_head_review_resume(
-            walk_records, records, comments=comments, trusted_actor=trusted_actor
-        )
+    return _resume_pr_round_from_records(
+        comments,
+        walk_records=walk_records,
+        records=records,
+        head_sha=head_sha,
+        configured_reviewers=configured_reviewers,
+        reconciliation_mode=reconciliation_mode,
+        trusted_actor=trusted_actor,
+    )
 
 
 def _conversion_handoff_resume(
@@ -2210,31 +2015,13 @@ def _resume_pr_round_from_records(
     configured_reviewers: Sequence[AgentName],
     reconciliation_mode: str,
     trusted_actor: tuple[str, int] | None,
-    review_unrecorded_head: bool = False,
 ) -> round_metadata.ResumedReviewRound | None:
     records = authority_records(records)
     walk_records = authority_records(walk_records)
 
-    def operator_review(
-        recovered: round_metadata.ResumedReviewRound | None, *, head_moved: bool
-    ) -> round_metadata.ResumedReviewRound | None:
-        # The single conversion point of ``--review-unrecorded-head`` (#2059):
-        # every resume outcome routed through coder recovery becomes an
-        # operator head review.  Without the flag the outcome is unchanged.
-        if not review_unrecorded_head or recovered is None or not recovered.unrecorded_head_advance:
-            return recovered
-        return _as_operator_head_review(
-            recovered, walk_records, comments=comments, trusted_actor=trusted_actor, head_moved=head_moved
-        )
-
-    handoff = _live_recovery_handoff(walk_records, head_sha, head_moved=False)
-    if handoff is not None:
-        return operator_review(
-            _consume_recovery_handoff(
-                walk_records, handoff, head_moved=False, review_unrecorded_head=review_unrecorded_head
-            ),
-            head_moved=False,
-        )
+    migrated, migration = _legacy_recovery_migration(walk_records, head_sha=head_sha)
+    if migrated:
+        return migration
     # A checkpoint posted into a closed round never anchors the resume, so a
     # later ledger cannot displace the reconciled transcript (#1553).
     records = drop_inert_post_reconciliation_checkpoints(records)
@@ -2282,22 +2069,16 @@ def _resume_pr_round_from_records(
             walk_records=walk_records,
             comments=comments,
             trusted_actor=trusted_actor,
-            review_unrecorded_head=review_unrecorded_head,
         )
         if recovered is not None:
-            return operator_review(recovered, head_moved=True)
+            return recovered
         if _latest_prior_pr_subject_is_coherent(
             records, head_sha=head_sha, comments=comments, trusted_actor=trusted_actor
         ):
             return None
-        latest_prior_subject = records[-1].metadata.subject
-        raise _RecoveryRefusal(
-            "PR head advanced without a recorded coder follow-up and the metadata-backed "
-            "handoff could not be recovered safely. "
-            f"Current head: {head_sha}. Latest recorded metadata subject: {latest_prior_subject}. "
-            + round_metadata.REVIEW_UNRECORDED_HEAD_HINT
-            + " Do not hand-author a coder follow-up in the coder's name."
-        )
+        # No coherent handoff (#2087): review the current head from the latest
+        # admitted ledger instead of refusing.  Never a coder turn or record.
+        return _current_head_review_from_latest_ledger(walk_records, records)
     current_round_records = selection.current_round_records
     anchor_metadata = selection.anchor_record.metadata
     review_handoff = next(
@@ -2306,7 +2087,6 @@ def _resume_pr_round_from_records(
             for record in reversed(records)
             if record.metadata.subject == head_sha
             and record.metadata.phase == round_metadata.HEAD_REVIEW_RECOVERY_PHASE
-            and not round_metadata._recovery_record_problems(record.metadata)
         ),
         None,
     )
@@ -2462,16 +2242,7 @@ def _resume_pr_round_from_records(
         qualification_checkpoint=_latest_qualification_checkpoint(
             records, head_sha=head_sha, min_index=superseded_below
         ),
-        recovery_round_budget=(
-            review_handoff.metadata.recovery_round_budget
-            if review_handoff is not None
-            else None
-        ),
-        head_review_recovery=(
-            review_handoff.metadata.head_review_recovery_source
-            if review_handoff is not None
-            else None
-        ),
+        head_review_recovery="legacy-recovery" if review_handoff is not None else None,
         reconciliation_record=reconciliation_record,
     )
 

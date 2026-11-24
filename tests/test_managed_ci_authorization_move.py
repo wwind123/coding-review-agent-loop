@@ -18,8 +18,13 @@ MANIFEST = json.loads((ROOT / 'tests/fixtures/managed_ci_authorization_move.json
 
 
 def historical_authorization_body(owner, name, body):
-    """Undo only the approved codec import move for the frozen byte check."""
+    """Undo only the approved codec import move for the frozen byte check.
+
+    #2087 renamed the read-only validator to ``legacy_recovery_record_problems``;
+    that rename is undone too, so the frozen logic is still checked byte for byte.
+    """
     if (owner, name) == ('managed_ci_authorization', '_decode_recovery_round_record'):
+        body = body.replace('legacy_recovery_record_problems', 'recovery_record_problems')
         body = body.replace(
             '    from .round_metadata import (\n'
             '        decode_round_metadata_mapping,\n'

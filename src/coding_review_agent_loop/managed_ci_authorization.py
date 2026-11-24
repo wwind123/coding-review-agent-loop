@@ -972,8 +972,8 @@ def _ordinary_continuity_round_metadata_is_valid(
     return len(reviewers) + 1 == len(selected)
 
 
-# Summary-record phases of the rejected-coder recovery shape (#1367).  These
-# mirror round_state's CODER_FOLLOWUP_REJECTED_PHASE / CODER_DISPATCH_PHASE.
+# Summary-record phases of the legacy rejected-coder recovery shape (#1367),
+# read-only since #2087: no writer produces them, historical chains still validate.
 _CONTINUITY_REJECTED_PHASE = "coder-followup-rejected"
 _CONTINUITY_DISPATCH_PHASE = "coder-dispatch"
 _CONTINUITY_RECOVERY_PHASES = frozenset(
@@ -1399,14 +1399,14 @@ def _decode_recovery_round_record(payload: Mapping[str, object]) -> object | Non
     """Decode a recovery summary record; None when it fails per-phase validation."""
     from .round_metadata import (
         decode_round_metadata_mapping,
-        recovery_record_problems,
+        legacy_recovery_record_problems,
     )
 
     try:
         metadata = decode_round_metadata_mapping(payload)
     except Exception:  # noqa: BLE001 - any decode failure leaves the record unusable
         return None
-    if metadata.phase not in _CONTINUITY_RECOVERY_PHASES or recovery_record_problems(metadata):
+    if metadata.phase not in _CONTINUITY_RECOVERY_PHASES or legacy_recovery_record_problems(metadata):
         return None
     return metadata
 

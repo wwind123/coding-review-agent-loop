@@ -619,28 +619,36 @@ def test_planning_only_scheduler_mode_is_invalid_on_a_pr_flow_checkpoint():
     assert _decode_round_metadata(encode_mapping(payload)).scheduler_metadata_status == "invalid"
 
 
-# --- Coder-recovery and head-review-recovery records (#1292) -----------------
+# --- Legacy coder-recovery and head-review-recovery records (#1292, #2087) ---
+#
+# No writer produces these records any more (#2087).  A PR whose latest
+# admitted record is one of them resumes as an ordinary review round of the
+# current head with the recorded ledger: no coder turn, no refusal and no new
+# record.  Their per-phase shape is still decoded read-only for legacy
+# managed-CI continuity chains (#1367).
+
+from pathlib import Path  # noqa: E402
 
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem  # noqa: E402
-from coding_review_agent_loop.round_metadata import (
+from coding_review_agent_loop.round_metadata import (  # noqa: E402
     CODER_DISPATCH_PHASE,
     CODER_FOLLOWUP_REJECTED_PHASE,
     HEAD_REVIEW_RECOVERY_PHASE,
-    MAX_REJECTED_DISPATCH_ATTEMPTS,
-    RecoveryRoundBudget,
-    _recovery_record_problems,
+    LEGACY_RECOVERY_RECORD_PHASES,
+    LegacyRoundBudget,
+    legacy_recovery_record_problems,
     sanitize_recovery_reason,
 )
-from coding_review_agent_loop.qualification_checkpoint import (
+from coding_review_agent_loop.qualification_checkpoint import (  # noqa: E402
     QualificationCheckpoint,
 )
-from coding_review_agent_loop.round_state import (
+from coding_review_agent_loop.round_state import (  # noqa: E402
     pr_resume_needs_author_admission,
 )
 
 _ACTOR = ("agent-actor", 4242)
 _OLD, _NEW, _NEWER = "a" * 40, "b" * 40, "c" * 40
-_BUDGET = RecoveryRoundBudget(6, True, False)
+_BUDGET = LegacyRoundBudget(6, True, False)
 
 
 def _item(number=1, text="Fix the thing."):
@@ -718,10 +726,10 @@ def _base_history():
     return [_coder(), _reviewer(new_items=(_item(),))]
 
 
-def _resume(history, head, *, actor=_ACTOR, flag=False, forged=()):
+def _resume(history, head, *, actor=_ACTOR, forged=()):
     return _resume_pr_round(
         _history(*history, forged=forged), head_sha=head, configured_reviewers=("codex",),
-        trusted_actor=actor, review_unrecorded_head=flag,
+        trusted_actor=actor,
     )
 
 
@@ -744,30 +752,42 @@ def _checkpoint_summary(round_number=2, items=(_item(),), **checkpoint_extra):
     )
 
 
-def test_stranded_checkpoint_anchor_refuses_without_admission_and_names_the_flag():
-    """Reproduces the #1370 incident: the pre-handoff checkpoint is the only prior-head anchor."""
+def _assert_current_head_review(resumed, *, round_number, items=("item-1",), source="legacy-recovery"):
+    """A migrated resume: a review round of the current head, never a coder turn."""
+    assert resumed is not None
+    assert resumed.round_number == round_number
+    assert [item.item_id for item in resumed.prior_items] == list(items)
+    assert resumed.head_review_recovery == source
+    assert resumed.unrecorded_head_advance is False  # never routed through the coder
+    assert resumed.coder_output is None and resumed.coder_metadata is None
+    assert resumed.completed_reviews == ()  # the full board reviews the head
+    assert resumed.qualification_checkpoint is None
+
+
+def test_unrecoverable_unrecorded_advance_reviews_the_current_head_instead_of_refusing():
+    """The #1370 shape without an admitted anchor no longer refuses (#2087)."""
     history = [*_base_history(), _checkpoint_summary()]
-    with pytest.raises(AgentLoopError, match="PR head advanced without a recorded coder follow-up") as raised:
-        _resume(history, _NEW, actor=None)
-    assert "--review-unrecorded-head" in str(raised.value)
-    # A forged anchor (authored by someone else) is not admitted either.
-    with pytest.raises(AgentLoopError, match="PR head advanced"):
-        _resume(history, _NEW, forged=(2,))
+    for kwargs in ({"actor": None}, {"forged": (2,)}):
+        resumed = _resume(history, _NEW, **kwargs)
+        _assert_current_head_review(resumed, round_number=2, source="unrecorded-advance")
+        # The moved head still counts for evidence-boundary readers.
+        assert resumed.head_advanced_without_record is True
+        assert resumed.next_unresolved_item_number == 2
+
+
+def test_malformed_legacy_record_without_admission_still_reviews_the_current_head():
+    """A legacy record that cannot be admitted leaves an unrecorded advance: review, never refuse."""
+    broken = _dispatch(attempt=2, recovery_dispatch=False)
+    history = [*_base_history(), _checkpoint_summary(), broken]
+    resumed = _resume(history, _NEWER, actor=None)
+    _assert_current_head_review(resumed, round_number=2, source="unrecorded-advance")
 
 
 @pytest.mark.parametrize("lifecycle", ["repair_required", "awaiting_current_head_review"])
 def test_legacy_checkpoint_anchor_resumes_as_an_ordinary_head_review(lifecycle):
     history = [*_base_history(), _checkpoint_summary(lifecycle=lifecycle)]
     resumed = _resume(history, _NEW)
-    assert resumed is not None
-    assert resumed.round_number == 2  # never rewound
-    assert [item.item_id for item in resumed.prior_items] == ["item-1"]
-    assert resumed.head_review_recovery == "legacy-checkpoint"
-    assert resumed.head_review_recovery_post_required is True
-    assert resumed.unrecorded_head_advance is False  # never routed through a coder first
-    assert resumed.qualification_checkpoint is None  # the old head's checkpoint is not reused
-    assert resumed.coder_output is None
-    assert resumed.recovery_round_budget == RecoveryRoundBudget(6, True, False)
+    _assert_current_head_review(resumed, round_number=2, source="legacy-checkpoint")
     assert resumed.next_unresolved_item_number == 2
 
 
@@ -776,241 +796,130 @@ def test_checkpoint_anchor_with_no_active_items_gets_a_full_fresh_review():
     assert _resume(history, _NEW) is None
 
 
-def test_post_push_rejection_resumes_a_coder_recovery_in_the_original_slot():
+@pytest.mark.parametrize("head", [_NEW, _NEWER])
+def test_latest_legacy_rejected_record_migrates_to_a_current_head_review(head):
+    """Acceptance (#2065): a latest coder-followup-rejected record resumes as a review, no coder turn."""
     history = [*_base_history(), _dispatch(), _rejection()]
-    resumed = _resume(history, _NEW)
-    assert resumed is not None
-    assert resumed.unrecorded_head_advance is True
-    assert resumed.round_number == 1  # the dispatch slot, not slot + 1
-    assert resumed.rejected_coder_followup_reason == "live remote target"
-    assert resumed.rejected_coder_followup_from_head == _OLD
-    assert resumed.dispatch_attempt == 1
-    assert resumed.recovery_round_budget == _BUDGET
-    assert resumed.qualification_checkpoint is None
-    assert resumed.carried_rejection_reasons == ("live remote target",)
-    assert [item.item_id for item in resumed.prior_items] == ["item-1"]
+    resumed = _resume(history, head)
+    _assert_current_head_review(resumed, round_number=1)
+    assert resumed.head_advanced_without_record is True
     assert resumed.next_unresolved_item_number == 2
 
 
-def test_unchanged_head_recovery_rejection_resumes_with_its_attempt():
+def test_exhausted_legacy_rejection_migrates_instead_of_refusing():
     history = [
         *_base_history(), _dispatch(), _rejection(),
         _dispatch(subject=_NEW, attempt=2, reasons=("live remote target",)),
         _rejection(subject=_NEW, dispatch_head=_NEW, attempt=2, reason="again", reasons=("live remote target",)),
     ]
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
-        _resume(history, _NEW)
-    assert "live remote target" in str(raised.value) and "again" in str(raised.value)
-
-
-def test_recovery_dispatch_rejected_without_a_push_resumes_in_its_slot_with_the_attempt():
-    history = [*_base_history(), _dispatch(), _rejection(attempt=1, reason="first")]
-    # Rejection of attempt 1 on an unchanged head cannot exist; attempt-2 dispatch only:
-    history = [*_base_history(), _dispatch(subject=_OLD, attempt=2, reasons=("first",))]
-    with pytest.raises(AgentLoopError, match="consecutive"):
-        _resume(history, _OLD)
-
-
-def test_dispatch_record_alone_after_a_push_recovers_as_not_recorded():
-    history = [*_base_history(), _dispatch()]
     resumed = _resume(history, _NEW)
-    assert resumed is not None and resumed.unrecorded_head_advance is True
-    assert resumed.dispatch_attempt == 1 and resumed.round_number == 1
-    assert "not recorded" in resumed.rejected_coder_followup_reason
+    _assert_current_head_review(resumed, round_number=1)
+    # The rejected turn did not move the head past the record it was bound to.
+    assert resumed.head_advanced_without_record is False
 
 
-def test_valid_first_attempt_dispatch_on_the_current_head_is_ignored_by_resume():
-    base = [*_base_history(), _checkpoint_summary()]
-    with_dispatch = [*base, _dispatch(subject=_OLD, dispatch_round=2)]
-    for head in (_OLD,):
-        without = _resume(base, head)
-        assert _resume(with_dispatch, head) == without
+@pytest.mark.parametrize(
+    "dispatch, head",
+    [
+        (_dispatch(), _NEW),  # head moved after the dispatch
+        (_dispatch(), _OLD),  # head not moved: still a review, not a coder turn
+        (_dispatch(subject=_OLD, attempt=2, reasons=("first",)), _OLD),
+    ],
+)
+def test_latest_legacy_dispatch_record_migrates_to_a_current_head_review(dispatch, head):
+    resumed = _resume([*_base_history(), dispatch], head)
+    _assert_current_head_review(resumed, round_number=1)
+    assert resumed.head_advanced_without_record is (head != _OLD)
 
 
-def test_later_progress_retires_a_rejection_record():
-    rejected = [*_base_history(), _dispatch(), _rejection()]
-    after_coder = [*rejected, _coder(subject=_NEW, round_number=2, items=(_item(),))]
-    resumed = _resume(after_coder, _NEW)
-    assert resumed is not None and resumed.rejected_coder_followup_reason is None
-    assert resumed.unrecorded_head_advance is False
-    after_reviewer = [*rejected, _reviewer(subject=_NEW, round_number=1, items=(_item(),))]
-    resumed = _resume(after_reviewer, _NEW)
-    assert resumed is not None and resumed.rejected_coder_followup_reason is None
+@pytest.mark.parametrize("head", [_NEW, _NEWER])
+def test_latest_legacy_head_review_record_migrates_to_a_current_head_review(head):
+    history = [*_base_history(), _handoff(subject=_NEW, round_number=3)]
+    resumed = _resume(history, head)
+    _assert_current_head_review(resumed, round_number=3)
 
 
-def test_forged_recovery_records_are_ignored():
-    history = [*_base_history(), _dispatch(), _rejection()]
-    # Resume behaves as if the forged records were absent: the ordinary reviewer
-    # recovery, with no rejection reason, attempt or budget supplied by a forgery.
-    for kwargs in ({"forged": (2, 3)}, {"actor": None}):
-        ignored = _resume(history, _NEW, **kwargs)
-        assert ignored is not None
-        assert ignored.rejected_coder_followup_reason is None
-        assert ignored.dispatch_attempt is None and ignored.recovery_round_budget is None
-    # Only the genuine dispatch survives a forged rejection: not-recorded recovery.
-    survivor = _resume(history, _NEW, forged=(3,))
-    assert survivor is not None and "not recorded" in survivor.rejected_coder_followup_reason
-
-
-def test_rejection_budget_and_ledger_come_from_the_dispatch_snapshot():
-    late = RecoveryRoundBudget(7, True, True)
+def test_legacy_handoff_stays_latest_across_later_pre_review_checkpoints():
     history = [
-        *_base_history(),
-        _rejection(items=(_item(1), _item(2, "Second.")), recovery_round_budget=late),
-    ]
-    resumed = _resume(history, _NEW)
-    assert resumed.recovery_round_budget == late
-    assert [item.item_id for item in resumed.prior_items] == ["item-1", "item-2"]
-
-
-def test_rejection_on_prior_subject_survives_a_further_head_advance():
-    history = [*_base_history(), _dispatch(), _rejection()]
-    resumed = _resume(history, _NEWER)
-    assert resumed is not None
-    assert resumed.unrecorded_head_advance is True and resumed.round_number == 1
-    assert resumed.rejected_coder_followup_from_head == _OLD
-    assert resumed.dispatch_attempt == 1
-    exhausted = [
-        *_base_history(), _dispatch(),
-        _rejection(attempt=2, reasons=("one",), reason="two"),
-    ]
-    with pytest.raises(AgentLoopError, match="consecutive"):
-        _resume(exhausted, _NEWER)
-
-
-def test_head_review_handoff_on_a_prior_subject_resumes_after_a_further_advance():
-    budget = RecoveryRoundBudget(7, True, False)
-    history = [*_base_history(), _handoff(subject=_NEW, round_number=3, budget=budget)]
-    resumed = _resume(history, _NEWER)
-    assert resumed is not None
-    assert resumed.round_number == 3 and resumed.recovery_round_budget == budget
-    assert resumed.head_review_recovery == "operator"
-    assert resumed.head_review_recovery_post_required is True
-    assert resumed.unrecorded_head_advance is False
-
-
-def test_head_review_handoff_on_the_current_head_survives_later_pre_review_summaries():
-    budget = RecoveryRoundBudget(7, True, False)
-    history = [
-        *_base_history(), _handoff(subject=_NEW, round_number=3, budget=budget),
+        *_base_history(), _handoff(subject=_NEW, round_number=3),
         _summary("scheduler-prelaunch", _NEW, 3, (_item(),)),
         _summary("qualification-checkpoint", _NEW, 3, (_item(),),
                  qualification_checkpoint=_legacy_checkpoint(lifecycle="repair_required")),
     ]
     resumed = _resume(history, _NEW)
-    assert resumed is not None and resumed.round_number == 3
-    assert resumed.recovery_round_budget == budget
-    assert resumed.qualification_checkpoint is None
-    assert resumed.head_review_recovery_post_required is False
+    _assert_current_head_review(resumed, round_number=3)
     assert resumed.reconciled is False
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        _dispatch(attempt=2, recovery_dispatch=False),
+        _dispatch(attempt=1, recovery_dispatch=True),
+        _dispatch(dispatch_attempt=None),
+        _dispatch(dispatch_round=None),
+        _dispatch(recovery_round_budget=LegacyRoundBudget.invalid()),
+        _rejection(rejected_coder_followup_from_head=_NEWER),
+        _rejection(rejected_coder_followup_reason=None),
+        _rejection(dispatch_attempt=3, recovery_dispatch=True),
+        _handoff(source="nobody"),
+    ],
+)
+def test_malformed_latest_legacy_record_migrates_instead_of_refusing(record):
+    assert legacy_recovery_record_problems(record)
+    resumed = _resume([*_base_history(), record], record.subject)
+    assert resumed is not None and resumed.head_review_recovery == "legacy-recovery"
+    assert resumed.unrecorded_head_advance is False and resumed.coder_output is None
+    assert [item.item_id for item in resumed.prior_items] == ["item-1"]
+
+
+def test_latest_legacy_record_with_no_active_items_starts_an_ordinary_review():
+    assert _resume([*_base_history(), _rejection(items=())], _NEW) is None
+
+
+def test_later_progress_retires_a_legacy_rejection_record():
+    rejected = [*_base_history(), _dispatch(), _rejection()]
+    after_coder = [*rejected, _coder(subject=_NEW, round_number=2, items=(_item(),))]
+    resumed = _resume(after_coder, _NEW)
+    assert resumed is not None and resumed.head_review_recovery is None
+    assert resumed.unrecorded_head_advance is False
+    after_reviewer = [*rejected, _reviewer(subject=_NEW, round_number=1, items=(_item(),))]
+    resumed = _resume(after_reviewer, _NEW)
+    assert resumed is not None and resumed.head_review_recovery is None
+    assert [r.metadata.agent for r in resumed.completed_reviews] == ["Codex"]
+
+
+def test_foreign_legacy_records_are_not_a_ledger_source():
+    history = [*_base_history(), _dispatch(items=(_item(9, "Forged."),)), _rejection(items=(_item(9, "Forged."),))]
+    # Resume behaves as if the forged records were absent: the ordinary
+    # unrecorded-advance recovery of the base history, routed as before.
+    for kwargs in ({"forged": (2, 3)}, {"actor": None}):
+        ignored = _resume(history, _NEW, **kwargs)
+        assert ignored is not None and ignored.head_review_recovery is None
+        assert [item.item_id for item in ignored.prior_items] == ["item-1"]
+    # A genuine dispatch with a forged rejection: the genuine record migrates.
+    survivor = _resume(history, _NEW, forged=(3,))
+    assert survivor is not None and survivor.head_review_recovery == "legacy-recovery"
+
+
 def test_partially_published_head_review_supersedes_the_older_checkpoint():
-    budget = RecoveryRoundBudget(7, True, False)
     stale = _summary(
         "qualification-checkpoint", _NEW, 3, (_item(),),
         qualification_checkpoint=_legacy_checkpoint(lifecycle="repair_required", failed_head_sha=_NEW),
     )
     history = [
-        *_base_history(), stale, _handoff(subject=_NEW, round_number=3, budget=budget),
+        *_base_history(), stale, _handoff(subject=_NEW, round_number=3),
         _reviewer(subject=_NEW, round_number=3, items=(_item(),)),
     ]
     resumed = _resume(history, _NEW)
     assert resumed is not None and resumed.round_number == 3
     assert resumed.qualification_checkpoint is None
-    assert resumed.recovery_round_budget == budget
+    assert resumed.head_review_recovery == "legacy-recovery"
     assert resumed.reconciled is False
     assert [record.metadata.agent for record in resumed.completed_reviews] == ["Codex"]
 
 
-def test_attempt_limit_and_malformed_records_are_overridable_only_by_the_operator_flag():
-    exhausted = [*_base_history(), _dispatch(), _rejection(attempt=2, reason="two", reasons=("one",))]
-    resumed = _resume(exhausted, _NEW, flag=True)
-    assert resumed is not None
-    assert resumed.head_review_recovery == "operator"
-    assert resumed.head_review_recovery_post_required is True
-    assert resumed.qualification_checkpoint is None
-    assert resumed.recovery_round_budget == _BUDGET
-    assert [item.item_id for item in resumed.prior_items] == ["item-1"]
-    # An unrefused history ignores the flag.
-    clean = [*_base_history()]
-    assert _resume(clean, _OLD, flag=True) == _resume(clean, _OLD)
-
-
-def test_operator_flag_takes_no_budget_from_a_malformed_record():
-    broken = _dispatch(attempt=2, recovery_dispatch=False, recovery_round_budget=RecoveryRoundBudget(7, True, True))
-    history = [*_base_history(), broken]
-    with pytest.raises(AgentLoopError, match="malformed"):
-        _resume(history, _OLD)
-    resumed = _resume(history, _OLD, flag=True)
-    assert resumed is not None and resumed.recovery_round_budget is None
-
-
-def test_operator_flag_without_any_budget_source_leaves_defaults():
-    history = [*_base_history(), _summary("scheduler-prelaunch", _OLD, 2, (_item(),))]
-    resumed = _resume(history, _NEW, flag=True)
-    assert resumed is not None
-    assert resumed.round_number == 2 and resumed.recovery_round_budget is None
-
-
-@pytest.mark.parametrize(
-    "record, fields",
-    [
-        (_dispatch(attempt=2, recovery_dispatch=False), "recovery_dispatch"),
-        (_dispatch(attempt=1, recovery_dispatch=True), "recovery_dispatch"),
-        (_dispatch(dispatch_attempt=None), "dispatch_attempt"),
-        (_dispatch(dispatch_round=None), "dispatch_round"),
-        (_dispatch(recovery_round_budget=RecoveryRoundBudget.invalid()), "recovery_round_budget"),
-        (_rejection(rejected_coder_followup_from_head=_NEWER), "rejected_coder_followup_from_head"),
-        (_rejection(rejected_coder_followup_reason=None), "rejected_coder_followup_reason"),
-        (_rejection(dispatch_attempt=3, recovery_dispatch=True), "dispatch_attempt"),
-        (_handoff(source="nobody"), "head_review_recovery_source"),
-    ],
-)
-def test_malformed_live_recovery_record_raises_before_any_field_is_used(record, fields):
-    history = [*_base_history(), record]
-    head = record.subject
-    with pytest.raises(AgentLoopError, match=rf"comment index 2 .*malformed: .*{fields}") as raised:
-        _resume(history, head)
-    assert "--review-unrecorded-head" in str(raised.value)
-
-
-def test_dispatch_whose_subject_differs_from_its_dispatch_head_is_malformed():
-    bad = _dispatch()
-    bad = PostedRoundMetadata(**{**bad.__dict__, "subject": _NEW})
-    assert "subject" in _recovery_record_problems(bad)
-    wrong_round = PostedRoundMetadata(**{**_dispatch().__dict__, "round_number": 1})
-    assert "round_number" in _recovery_record_problems(wrong_round)
-
-
-def test_both_rejection_shapes_and_writer_outputs_are_structurally_valid():
-    assert _recovery_record_problems(_rejection()) == ()
-    unchanged = _rejection(subject=_OLD, dispatch_head=_OLD, attempt=2, reasons=("x",))
-    assert _recovery_record_problems(unchanged) == ()
-    assert _recovery_record_problems(_dispatch()) == ()
-    assert _recovery_record_problems(_handoff()) == ()
-
-
-def test_a_retired_malformed_record_no_longer_affects_resume():
-    broken = _dispatch(attempt=2, recovery_dispatch=False)
-    history = [*_base_history(), broken, _handoff(subject=_OLD, round_number=1)]
-    resumed = _resume(history, _OLD)
-    assert resumed is not None and resumed.head_review_recovery == "operator"
-    with_coder = [*_base_history(), broken, _coder(subject=_OLD, round_number=2, items=(_item(),))]
-    assert _resume(with_coder, _OLD) is not None
-
-
-def test_exhausted_coder_handoff_never_overrides_a_later_head_review_handoff():
-    history = [
-        *_base_history(), _dispatch(),
-        _rejection(attempt=2, reason="two", reasons=("one",)),
-        _handoff(subject=_NEW),
-    ]
-    resumed = _resume(history, _NEW)
-    assert resumed is not None and resumed.head_review_recovery == "operator"
-
-
-def test_reconciled_head_review_is_not_resumed_after_a_manual_push():
+def test_reconciled_legacy_head_review_is_not_resumed_after_a_manual_push():
     history = [
         *_base_history(), _dispatch(),
         _rejection(attempt=2, reason="two", reasons=("one",)),
@@ -1019,24 +928,37 @@ def test_reconciled_head_review_is_not_resumed_after_a_manual_push():
         _summary("reconciliation", _NEW, 1, (_item(),)),
     ]
     resumed = _resume(history, _NEWER)
-    # The retired handoffs are skipped; B's reconciled ledger is rebuilt at its round.
+    # The legacy records are no longer latest; B's reconciled ledger is rebuilt.
     assert resumed is not None
     assert resumed.unrecorded_head_advance is True and resumed.round_number == 1
-    assert resumed.rejected_coder_followup_reason is None
+    assert resumed.head_review_recovery is None
 
 
-def test_item_numbering_continues_after_every_recovery_branch():
+def test_item_numbering_continues_after_every_legacy_branch():
     high = (_item(7, "Seventh."),)
     for history, head in (
         ([_coder(), _reviewer(new_items=high), _dispatch(items=high), _rejection(items=high)], _NEW),
         ([_coder(), _reviewer(new_items=high), _checkpoint_summary(items=high)], _NEW),
         ([_coder(), _reviewer(new_items=high), _handoff(subject=_NEW, items=high)], _NEW),
+        ([_coder(), _reviewer(new_items=high), _checkpoint_summary(items=high)], _NEWER),
     ):
         resumed = _resume(history, head)
         assert resumed is not None and resumed.next_unresolved_item_number == 8
 
 
-def test_recovery_fields_round_trip_and_legacy_encodings_are_byte_identical():
+def test_legacy_shape_validation_reads_the_historical_per_phase_rules():
+    bad = PostedRoundMetadata(**{**_dispatch().__dict__, "subject": _NEW})
+    assert "subject" in legacy_recovery_record_problems(bad)
+    wrong_round = PostedRoundMetadata(**{**_dispatch().__dict__, "round_number": 1})
+    assert "round_number" in legacy_recovery_record_problems(wrong_round)
+    assert legacy_recovery_record_problems(_rejection()) == ()
+    unchanged = _rejection(subject=_OLD, dispatch_head=_OLD, attempt=2, reasons=("x",))
+    assert legacy_recovery_record_problems(unchanged) == ()
+    assert legacy_recovery_record_problems(_dispatch()) == ()
+    assert legacy_recovery_record_problems(_handoff()) == ()
+
+
+def test_legacy_recovery_fields_round_trip_and_ordinary_encodings_are_byte_identical():
     legacy = _checkpoint()
     payload = decode_mapping(_encode_round_metadata(legacy))
     for key in (
@@ -1047,13 +969,15 @@ def test_recovery_fields_round_trip_and_legacy_encodings_are_byte_identical():
     ):
         assert key not in payload
     record = _rejection(attempt=2, reasons=("one",), reason="two")
-    decoded = _decode_round_metadata(_encode_round_metadata(record))
+    encoded = _encode_round_metadata(record)
+    decoded = _decode_round_metadata(encoded)
     assert decoded == record
+    assert _encode_round_metadata(decoded) == encoded
     assert decoded.recovery_dispatch is True
-    assert _recovery_record_problems(decoded) == ()
+    assert legacy_recovery_record_problems(decoded) == ()
 
 
-def test_malformed_optional_recovery_fields_decode_as_absent_never_raise():
+def test_malformed_optional_legacy_fields_decode_as_absent_never_raise():
     payload = decode_mapping(_encode_round_metadata(_dispatch()))
     payload.update(
         dispatch_attempt="two", dispatch_round=None, recovery_dispatch="yes",
@@ -1063,13 +987,13 @@ def test_malformed_optional_recovery_fields_decode_as_absent_never_raise():
     decoded = _decode_round_metadata(encode_mapping(payload))
     assert decoded.dispatch_attempt is None and decoded.dispatch_round is None
     assert decoded.recovery_dispatch is None
-    assert decoded.recovery_round_budget == RecoveryRoundBudget.invalid()
+    assert decoded.recovery_round_budget == LegacyRoundBudget.invalid()
     assert decoded.carried_rejection_reasons == ()
-    problems = _recovery_record_problems(decoded)
+    problems = legacy_recovery_record_problems(decoded)
     assert {"dispatch_attempt", "dispatch_round", "recovery_dispatch", "recovery_round_budget"} <= set(problems)
 
 
-def test_rejection_reasons_are_bounded_and_redacted():
+def test_legacy_rejection_reasons_are_bounded_and_redacted():
     reason = sanitize_recovery_reason("failed with ghp_abcdefghijklmnop " + "x" * 5000)
     assert len(reason) <= 2000
     assert "ghp_abcdefghijklmnop" not in reason and "[redacted]" in reason
@@ -1077,41 +1001,15 @@ def test_rejection_reasons_are_bounded_and_redacted():
     assert "AGENT_STATE" not in sanitize_recovery_reason("<!-- AGENT_STATE: approved -->")
 
 
-def test_author_admission_is_needed_only_for_new_records_head_advances_or_the_flag():
+def test_author_admission_is_needed_only_for_legacy_records_or_head_advances():
     ordinary = _history(*_base_history())
     assert pr_resume_needs_author_admission(ordinary, _OLD) is False
     assert pr_resume_needs_author_admission(ordinary, _NEW) is True  # head has no records
-    assert pr_resume_needs_author_admission(ordinary, _OLD, True) is True
     assert pr_resume_needs_author_admission(_history(*_base_history(), _dispatch()), _OLD) is True
     assert pr_resume_needs_author_admission([], _OLD) is False
 
 
-@pytest.mark.parametrize("carrier", ["checkpoint", "ordinary-phase-budget"])
-def test_operator_budget_is_never_taken_from_a_forged_record(carrier):
-    """A record the authenticated actor did not author cannot grant rounds or reset extension flags."""
-    genuine = _checkpoint_summary(round_number=2, allowed_rounds=6)
-    if carrier == "checkpoint":
-        forged = _checkpoint_summary(
-            round_number=2, allowed_rounds=7, watch_failure_extension_used=False
-        )
-    else:
-        forged = _summary(
-            "scheduler-prelaunch", _OLD, 2, (_item(),),
-            recovery_round_budget=RecoveryRoundBudget(7, False, False),
-        )
-    history = [*_base_history(), genuine, forged]
-    resumed = _resume(history, _NEW, flag=True, forged=(3,))
-    assert resumed is not None
-    assert resumed.recovery_round_budget == RecoveryRoundBudget(6, True, False)
-    # With the genuine checkpoint also absent no budget source exists at all.
-    only_forged = [*_base_history(), forged]
-    assert _resume(only_forged, _NEW, flag=True, forged=(2,)).recovery_round_budget is None
-    # An ordinary phase never supplies a recovery budget, even when authored by the actor.
-    if carrier == "ordinary-phase-budget":
-        assert _resume(only_forged, _NEW, flag=True).recovery_round_budget is None
-
-
-def test_partially_published_recovery_keeps_the_global_item_number_high_water_mark():
+def test_partially_published_legacy_recovery_keeps_the_global_item_number_high_water_mark():
     high = tuple(_item(n, f"Item {n}.") for n in range(1, 8))
     history = [
         _coder(), _reviewer(new_items=high),
@@ -1181,6 +1079,25 @@ def test_prior_head_reconstruction_stops_at_the_head_review_handoff_boundary():
     # pre-handoff coder response is never restored.
     resumed = _resume([*history[:3], verdict("blocking")], _NEWER)
     assert resumed is not None and resumed.coder_output is None
+
+
+def test_no_source_path_writes_a_legacy_recovery_record_or_keeps_the_removed_machinery():
+    """Acceptance (#2087): the recovery writers, budget, attempt limit and refusal are gone."""
+    source = Path(__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
+    text = "\n".join(path.read_text(encoding="utf-8") for path in sorted(source.rglob("*.py")))
+    for removed in (
+        "RecoveryRoundBudget", "MAX_REJECTED_DISPATCH_ATTEMPTS", "_RecoveryRefusal",
+        "REVIEW_UNRECORDED_HEAD_HINT", "_persist_coder_dispatch", "_persist_rejected_coder_followup",
+        "_record_coder_followup_rejection", "_persist_head_review_recovery",
+        "head_review_recovery_post_required",
+    ):
+        assert removed not in text, removed
+    # Phase constants survive only as legacy read constants; no record is built with them.
+    for phase in ("CODER_DISPATCH_PHASE", "CODER_FOLLOWUP_REJECTED_PHASE", "HEAD_REVIEW_RECOVERY_PHASE"):
+        assert f"phase={phase}" not in text, phase
+    assert LEGACY_RECOVERY_RECORD_PHASES == {
+        "coder-dispatch", "coder-followup-rejected", "head-review-recovery",
+    }
 
 
 def test_durable_sanitizer_strips_coverage_gaps_like_claims():
@@ -2341,11 +2258,10 @@ def test_neutral_rollover_does_not_treat_malformed_wire_scheduler_as_absent():
                                              PostedRoundRecord(1, decoded, "body")])
 
 
-@pytest.mark.parametrize('operator', [False, True])
 @pytest.mark.parametrize('move', [False, True])
 @pytest.mark.parametrize('boundary', ['release', 'conversion'])
 @pytest.mark.parametrize('nonempty', [False, True])
-def test_visual_tail_preserves_current_prior_boundary_and_operator_sources(operator, move, boundary, nonempty):
+def test_visual_tail_preserves_current_prior_boundary_sources(move, boundary, nonempty):
     from coding_review_agent_loop.round_state import _resume_pr_round
     from coding_review_agent_loop.review_scope import authority_records
     metadata = (_conversion_record() if boundary == 'conversion' else
@@ -2364,7 +2280,7 @@ def test_visual_tail_preserves_current_prior_boundary_and_operator_sources(opera
         subject=head,state='approved',phase='visual',review_scope={
             'version':1,'kind':'visible-defects','head':head,'seat':'Codex'})
     args = dict(head_sha='b'*40 if move else head, configured_reviewers=('codex',),
-                trusted_actor=('coding-review-agent-loop',424242), review_unrecorded_head=operator)
+                trusted_actor=('coding-review-agent-loop',424242))
     baseline = _resume_pr_round(history, **args)
     if nonempty or boundary == 'conversion' or not move:
         assert baseline is not None
@@ -2373,7 +2289,6 @@ def test_visual_tail_preserves_current_prior_boundary_and_operator_sources(opera
         assert baseline.round_number == metadata.round_number
         assert {'item-20', 'item-21'} <= {item.item_id for item in baseline.prior_items}
         assert next(item for item in baseline.prior_items if item.item_id=='item-21').origin_scope == 'visible-defects'
-        assert baseline.recovery_round_budget is None
         if boundary == 'release':
             assert baseline.evidence_boundary == metadata
             assert baseline.evidence_clearances == (() if move else metadata.evidence_clearances)
@@ -2406,13 +2321,12 @@ def test_visual_origin_roundtrips_and_changes_only_visual_ledger_signature():
     assert visual_signature[-1] == ('origin_scope','visible-defects')
 
 
-@pytest.mark.parametrize('operator', [False, True])
 @pytest.mark.parametrize('scope', ['visual', 'null', 'foreign'])
-def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(operator, scope):
+def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(scope):
     ordinary = replace(_item(), item_id='item-20', text='ordinary prior')
     new = replace(_item(), item_id='item-22', text='ordinary new')
     visual = replace(_item(), item_id='item-21', origin_scope='visible-defects')
-    # A later ordinary handoff supersedes the old release and carries budget.
+    # A later ordinary legacy handoff supersedes the old release.
     release = replace(_freeze_metadata(()), subject=_OLD, phase='evidence-release', evidence_freeze=None)
     handoff = _handoff(subject=_OLD, round_number=4, items=(ordinary, visual))
     reviewer = _reviewer(subject=_OLD, round_number=4, items=(ordinary, visual), new_items=(new,))
@@ -2422,35 +2336,29 @@ def test_visual_tail_cannot_replace_later_ordinary_recovery_ledger(operator, sco
     if scope != 'visual':
         tail = replace(tail, review_scope=None if scope=='null' else {'kind':'foreign'}, review_scope_present=True)
     history = [release, handoff, reviewer]
-    baseline = _resume(history, _NEW, flag=operator)
+    baseline = _resume(history, _NEW)
     assert baseline is not None and baseline.round_number == 4
-    # The later reviewer retires the automatic handoff budget. The operator
-    # override recovers authenticated budget sources: under the flag the
-    # unrecorded advance is itself an operator head review (#2059).
-    assert baseline.recovery_round_budget == (_BUDGET if operator else None)
-    assert (baseline.head_review_recovery == 'operator') is operator
-    from coding_review_agent_loop.round_state import _operator_head_review_resume, _extract_round_metadata_records
+    # The later reviewer retires the legacy handoff: an ordinary unrecorded advance.
+    assert baseline.head_review_recovery is None
+    assert {i.item_id for i in baseline.prior_items} == {'item-20','item-21','item-22'}
+    from coding_review_agent_loop.round_state import (
+        _current_head_review_from_latest_ledger, _extract_round_metadata_records,
+    )
     comments = _history(*history)
     ordinary_records = _extract_round_metadata_records(comments, flow='pr')
-    override = _operator_head_review_resume(ordinary_records, ordinary_records,
-        comments=comments, trusted_actor=_ACTOR)
-    assert override is not None and override.round_number == 4
-    assert override.recovery_round_budget == _BUDGET
-    assert {i.item_id for i in override.prior_items} == {'item-20','item-21','item-22'}
-    assert {i.item_id for i in baseline.prior_items} == {'item-20','item-21','item-22'}
+    fallback = _current_head_review_from_latest_ledger(ordinary_records, ordinary_records)
+    assert fallback is not None and fallback.round_number == 4
+    assert {i.item_id for i in fallback.prior_items} == {'item-20','item-21','item-22'}
     if scope == 'visual':
-        assert _resume([*history,tail], _NEW, flag=operator) == baseline
-        comments = _history(*history, tail)
-        mixed = _extract_round_metadata_records(comments, flow='pr')
-        assert _operator_head_review_resume(mixed, mixed, comments=comments, trusted_actor=_ACTOR) == override
+        assert _resume([*history,tail], _NEW) == baseline
     else:
-        # Invalid scope is retained by the real resume reader; it cannot
-        # silently fall back to the older ordinary handoff.
-        if operator:
-            assert _resume([*history,tail], _NEW, flag=True) is None
-        else:
-            with pytest.raises(AgentLoopError, match='handoff could not be recovered safely'):
-                _resume([*history,tail], _NEW)
+        # An invalid scope is retained by the real resume reader.  Resume no
+        # longer refuses (#2087): it reviews the current head from the latest
+        # ordinary ledger, never from the scoped tail or the older handoff.
+        resumed = _resume([*history,tail], _NEW)
+        assert resumed is not None and resumed.head_review_recovery == 'unrecorded-advance'
+        assert resumed.round_number == 4 and resumed.coder_output is None
+        assert {i.item_id for i in resumed.prior_items} == {'item-20','item-21','item-22'}
 
 
 def test_extracted_metadata_board_contexts_share_identity_and_reset():
@@ -2527,156 +2435,3 @@ def test_malformed_supersession_payload_never_closes_the_round():
     resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex", "gemini"))
     assert resumed.reconciliation_record is None
     assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}
-
-
-# --- --review-unrecorded-head takes effect at any dispatch attempt (#2059) ----
-
-
-def _assert_operator_head_review(resumed, *, items, round_number=1):
-    assert resumed is not None
-    assert resumed.head_review_recovery == "operator"
-    assert resumed.head_review_recovery_post_required is True
-    assert resumed.unrecorded_head_advance is False
-    assert resumed.coder_output is None and resumed.coder_metadata is None
-    assert resumed.dispatch_attempt is None
-    assert resumed.rejected_coder_followup_reason is None
-    assert resumed.rejected_coder_followup_from_head is None
-    assert resumed.qualification_checkpoint is None
-    assert resumed.ledger_may_be_incomplete is True
-    assert resumed.round_number == round_number
-    assert [item.item_id for item in resumed.prior_items] == list(items)
-
-
-def test_flag_at_dispatch_attempt_one_gives_head_review_recovery():
-    """Row flag-attempt1-dispatch: a live attempt-1 dispatch on a prior head."""
-    history = [*_base_history(), _dispatch()]
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(resumed, items=["item-1"])
-    assert resumed.recovery_round_budget == _BUDGET
-    assert resumed.head_advanced_past_boundary is True
-    assert resumed.head_advanced_without_record is True
-
-
-def test_flag_with_rejected_followup_at_attempt_one_keeps_ledger_and_budget():
-    """Row flag-attempt1-rejected."""
-    history = [*_base_history(), _dispatch(), _rejection()]
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(resumed, items=["item-1"])
-    assert resumed.recovery_round_budget == _BUDGET
-    assert resumed.carried_rejection_reasons == ()
-    assert resumed.next_unresolved_item_number == 2
-
-
-def test_no_flag_attempt_one_is_unchanged_coder_recovery():
-    """Row noflag-attempt1: without the flag the attempt-1 handoff routes the coder."""
-    for history in ([*_base_history(), _dispatch()], [*_base_history(), _dispatch(), _rejection()]):
-        resumed = _resume(history, _NEW)
-        assert resumed is not None
-        assert resumed.unrecorded_head_advance is True
-        assert resumed.dispatch_attempt == 1
-        assert resumed.head_review_recovery is None
-        assert resumed.head_advanced_past_boundary is False
-
-
-def test_flag_at_the_attempt_limit_still_gives_head_review_recovery():
-    """Row flag-attempt-limit: no refusal, operator head review as before."""
-    exhausted = [*_base_history(), _dispatch(), _rejection(attempt=2, reason="two", reasons=("one",))]
-    with pytest.raises(AgentLoopError, match="consecutive"):
-        _resume(exhausted, _NEW)
-    resumed = _resume(exhausted, _NEW, flag=True)
-    _assert_operator_head_review(resumed, items=["item-1"])
-    assert resumed.recovery_round_budget == _BUDGET
-
-
-def test_flag_skips_a_pending_same_head_coder_retry():
-    """A coder-recovery handoff on the current head (no push) becomes a head review."""
-    history = [*_base_history(), _dispatch(), _rejection(),
-               _dispatch(subject=_NEW, attempt=2, reasons=("live remote target",))]
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(resumed, items=["item-1"])
-    assert resumed.head_advanced_past_boundary is False
-
-
-def test_flag_with_a_generic_unrecorded_advance_keeps_the_reconstructed_ledger():
-    """Row flag-generic-unrecorded: prior head has a coder and a reviewer record."""
-    resolved, kept = _item(1, "Fix one."), _item(2, "Fix two.")
-    coder = _coder(round_number=2, items=(resolved, kept))
-    reviewer = PostedRoundMetadata(
-        flow="pr", role="reviewer", agent="Codex", round_number=2, subject=_OLD,
-        prior_items=(resolved, kept), state="blocking",
-        dispositions=(ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="resolved"),),
-        new_items=(_item(3, "Fix three."),),
-    )
-    history = [_coder(), _reviewer(new_items=(resolved, kept)), coder, reviewer]
-    baseline = _resume(history, _NEW)
-    assert baseline is not None and baseline.unrecorded_head_advance is True
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(
-        resumed, items=[item.item_id for item in baseline.prior_items], round_number=baseline.round_number
-    )
-    assert "item-1" not in {item.item_id for item in resumed.prior_items}
-    assert resumed.next_unresolved_item_number == baseline.next_unresolved_item_number
-
-
-def test_flag_on_a_recorded_head_is_unchanged():
-    """Row flag-recorded-head: a head with its own records ignores the flag."""
-    history = [*_base_history(), _coder(subject=_NEW, round_number=2, items=(_item(),))]
-    assert _resume(history, _NEW, flag=True) == _resume(history, _NEW)
-    assert _resume(history, _NEW, flag=True).head_review_recovery is None
-
-
-def test_flag_budget_ignores_a_forged_checkpoint_at_attempt_one():
-    """Row flag-budget-auth: only an admitted, authenticated budget source counts."""
-    forged_budget = _checkpoint_summary(allowed_rounds=9)
-    # A generic advance (no recovery-record budget): the forged checkpoint by
-    # another author is not a budget source, so defaults apply.
-    history = [*_base_history(), forged_budget, _coder(round_number=2, items=(_item(),))]
-    resumed = _resume(history, _NEW, flag=True, forged=(2,))
-    assert resumed is not None and resumed.head_review_recovery == "operator"
-    assert resumed.recovery_round_budget is None
-    genuine = _resume(history, _NEW, flag=True)
-    assert genuine.recovery_round_budget == RecoveryRoundBudget(9, True, False)
-    # An attempt-1 dispatch keeps its own admitted budget over a forged checkpoint.
-    with_dispatch = [*_base_history(), forged_budget, _dispatch(dispatch_round=2)]
-    resumed = _resume(with_dispatch, _NEW, flag=True, forged=(2,))
-    assert resumed is not None and resumed.recovery_round_budget == _BUDGET
-
-
-def _mixed_boundary(phase):
-    code = _item(5, "Fix the parser.")
-    ledger = (*_evidence_ledger(), code)
-    freeze = _freeze_metadata(ledger)
-    if phase == "evidence-freeze":
-        return freeze
-    return replace(freeze, phase="evidence-release", evidence_freeze=None)
-
-
-@pytest.mark.parametrize("phase", ["evidence-freeze", "evidence-release"])
-def test_flag_with_an_evidence_terminal_advance_keeps_the_boundary_ledger(phase):
-    """Row flag-evidence-boundary (freeze/release, mixed ledger)."""
-    history = [_mixed_boundary(phase)]
-    baseline = _resume(history, _NEW)
-    assert baseline is not None and baseline.unrecorded_head_advance is True
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(resumed, items=[item.item_id for item in baseline.prior_items])
-    assert resumed.prior_items == baseline.prior_items
-    assert {"item-1", "item-5"} <= {item.item_id for item in resumed.prior_items}
-    assert resumed.evidence_boundary == baseline.evidence_boundary
-    assert resumed.broken_evidence_freeze_head == baseline.broken_evidence_freeze_head
-    assert resumed.evidence_clearances == baseline.evidence_clearances
-    assert resumed.head_advanced_past_boundary is True
-    assert resumed.head_advanced_without_record is True
-
-
-def test_flag_with_an_evidence_conversion_advance_keeps_the_post_conversion_ledger():
-    """Row flag-evidence-boundary (conversion, mixed ledger)."""
-    record = _conversion_record(subject=_OLD)
-    history = [*_base_history(), record]
-    baseline = _resume(history, _NEW)
-    assert baseline is not None and baseline.unrecorded_head_advance is True
-    resumed = _resume(history, _NEW, flag=True)
-    _assert_operator_head_review(
-        resumed, items=[item.item_id for item in baseline.prior_items], round_number=baseline.round_number
-    )
-    assert resumed.prior_items == baseline.prior_items
-    assert resumed.head_advanced_past_boundary is True

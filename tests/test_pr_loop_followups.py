@@ -1215,7 +1215,7 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
 
     agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
     assert agent_commands == [["codex", "exec"], ["claude", "--print"], ["codex", "exec"]]
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 4
     followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "requested same-PR follow-ups" in followup_prompt
     assert "remains blocked pending another review round" in followup_prompt
@@ -1596,7 +1596,7 @@ def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tm
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert len(runner.comments) == 2  # the review and the dispatch record
+    assert len(runner.comments) == 1  # only the review: no coder-dispatch record (#2087)
     assert runner.comments[0].startswith("**Review verdict:** Blocking")
     assert not any("Added the test." in comment for comment in runner.comments)
 

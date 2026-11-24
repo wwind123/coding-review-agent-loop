@@ -483,7 +483,7 @@ from coding_review_agent_loop.managed_ci_types import (
     UNPROTECTED_OVERRIDE_TRAILER,
 )  # noqa: E402
 from coding_review_agent_loop.round_metadata import (
-    RecoveryRoundBudget,
+    LegacyRoundBudget,
 )  # noqa: E402
 
 
@@ -527,7 +527,7 @@ def _recovery_meta(comment_id, **fields):
 
 
 def _recovery_chain(root=None, fresh=None):
-    budget = RecoveryRoundBudget(5, False, False)
+    budget = LegacyRoundBudget(5, False, False)
     return [
         _auth_comment(41, root or _root()),
         _recovery_meta(50, role="reviewer", subject="head-0", round_number=1),

@@ -102,12 +102,12 @@ def ack_resume_history(*, promoted=False, coder_ack=False, conflict=False, unrel
         body=structured_pr_review(state="blocking" if conflict else "approved", human_requirements_resolved=True),
     )
     from coding_review_agent_loop.round_metadata import (
-        RecoveryRoundBudget,
+        LegacyRoundBudget,
     )
     dispatch = durable_record(
         (alias, *other), role="summary", agent="Orchestrator", phase="coder-dispatch",
         dispatch_round=1, dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", dispatch_attempt=1, recovery_dispatch=False,
-        recovery_round_budget=RecoveryRoundBudget(2, False, False),
+        recovery_round_budget=LegacyRoundBudget(2, False, False),
     )
     return [dispatch, original, coder, review]
 

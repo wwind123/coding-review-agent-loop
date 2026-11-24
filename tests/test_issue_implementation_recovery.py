@@ -161,7 +161,7 @@ def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
-    assert len(runner.comments) == 6
+    assert len(runner.comments) == 5
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 

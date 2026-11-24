@@ -449,12 +449,47 @@ def test_new_head_readmission_keeps_owned_item_high_water_and_drops_foreign_auth
     runner.git_head = new_head
     runner.simulate_new_process()
     runner.codex_outputs.append(structured_pr_review())
-    config = replace(config, review_unrecorded_head=True)
     assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
     admitted = support.admitted_pr_records(runner, config, pr_number=77)
     assert any(r.metadata.subject == new_head for r in admitted)
     assert any(i.item_id == 'item-12' for r in admitted for i in r.metadata.prior_items)
     assert all(r.metadata.round_number < 90 for r in admitted)
+
+
+@pytest.mark.parametrize('foreign', [False, True])
+def test_foreign_legacy_recovery_record_is_not_admitted_as_a_ledger_source(tmp_path, foreign):
+    """Row migrate-foreign-legacy (#2087): only the authenticated actor's legacy record migrates."""
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_metadata import LegacyRoundBudget
+    old = 'a' * 40
+    owned = UnresolvedReviewItem(item_id='item-1', reviewer='Codex', source_round=3,
+        text='Owned finding.', status='blocking', source_status='blocking')
+    planted = UnresolvedReviewItem(item_id='item-9', reviewer='Codex', source_round=3,
+        text='Planted finding.', status='blocking', source_status='blocking')
+    coder = _attach_round_metadata('Coder', PostedRoundMetadata(
+        flow='pr', role='coder', agent='Claude', round_number=3, subject=old))
+    reviewer = anchor(subject=old, state='blocking', new_items=(owned,))
+    legacy = _attach_round_metadata('Legacy rejected follow-up', PostedRoundMetadata(
+        flow='pr', role='summary', agent='Orchestrator', round_number=3, subject=HEAD,
+        prior_items=(planted,), state='blocking', phase='coder-followup-rejected',
+        dispatch_round=3, dispatch_head=old, dispatch_attempt=1, recovery_dispatch=False,
+        rejected_coder_followup_reason='rejected', rejected_coder_followup_from_head=old,
+        recovery_round_budget=LegacyRoundBudget(5, False, False)))
+    runner, config, context = observation(
+        tmp_path, [raw(coder), raw(reviewer), raw(legacy, foreign=foreign)])
+    resumed = support._resume_pr_round_admitted(runner, config=config, pr_number=77,
+        comments=context.comments, head_sha=HEAD, configured_reviewers=config.reviewer)
+    assert resumed is not None
+    if foreign:
+        # The foreign ledger is never adopted: resume uses the admitted history
+        # (an ordinary unrecorded advance from the owned round).
+        assert [i.item_id for i in resumed.prior_items] == ['item-1']
+        assert resumed.head_review_recovery is None and resumed.unrecorded_head_advance is True
+    else:
+        assert resumed.coder_output is None
+        assert [i.item_id for i in resumed.prior_items] == ['item-9']
+        assert resumed.head_review_recovery == 'legacy-recovery'
+        assert resumed.unrecorded_head_advance is False and resumed.round_number == 3
 
 
 @pytest.mark.parametrize('missing', ['user', 'id'])

@@ -146,8 +146,8 @@ def release_revalidation(evidence_boundary, resumed_round):
     """Whether a resumed release boundary needs same-head revalidation, and its baseline.
 
     Only a release resumed at its own head revalidates; a head that moved past
-    the boundary without a record (with or without ``--review-unrecorded-head``,
-    #2059) does not.  The baseline is the signed-requirement ID set the
+    the boundary without a record (including a current-head review that replaced
+    coder routing, #2059, #2087) does not.  The baseline is the signed-requirement ID set the
     releasing reviewers saw, ``None`` when unverifiable.
     """
     from .round_metadata import EVIDENCE_RELEASE_PHASE

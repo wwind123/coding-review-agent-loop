@@ -366,10 +366,11 @@ class PostedRoundMetadata:
     # decodes as absent.
     provenance_baseline_form: str | None = None
     provenance_baseline_chars: int | None = None
-    # Coder-recovery and head-review-recovery records (#1292).  All are
-    # optional and omitted from the encoding when unset, so every historical
-    # record re-encodes byte-identically.  A malformed scalar decodes as
-    # absent (never raises); ``_recovery_record_problems`` then reports it.
+    # Legacy coder-recovery and head-review-recovery records (#1292).  No
+    # writer produces them any more (#2087); they are decoded read-only so
+    # historical records re-encode byte-identically and legacy managed-CI
+    # continuity chains (#1367) still validate.  A malformed scalar decodes
+    # as absent (never raises); ``legacy_recovery_record_problems`` reports it.
     dispatch_round: int | None = None
     dispatch_head: str | None = None
     dispatch_attempt: int | None = None
@@ -378,7 +379,7 @@ class PostedRoundMetadata:
     rejected_coder_followup_reason: str | None = None
     rejected_coder_followup_from_head: str | None = None
     head_review_recovery_source: str | None = None
-    recovery_round_budget: "RecoveryRoundBudget | None" = None
+    recovery_round_budget: "LegacyRoundBudget | None" = None
     # Orchestrator-derived evidence-only stall snapshot (#1324), written only on
     # PR coder follow-up records.  It classifies review round ``round_number - 1``
     # and is omitted from the encoding when None.  An invalid stored value
@@ -939,29 +940,21 @@ class ResumedReviewRound:
     broken_evidence_freeze_head: str | None = None
     # Head-scoped evidence clearances carried by the latest terminal record.
     evidence_clearances: tuple[tuple[str, str], ...] = ()
-    # Coder-recovery context (#1292): why the previous coder follow-up was not
-    # accepted, the head it was dispatched on, and its consecutive attempt.
-    rejected_coder_followup_reason: str | None = None
-    rejected_coder_followup_from_head: str | None = None
-    dispatch_attempt: int | None = None
-    # Bounded round budget carried by a recovery record.
-    recovery_round_budget: "RecoveryRoundBudget | None" = None
-    # ``legacy-checkpoint`` or ``operator`` when the resume is an ordinary
-    # review round of the current head; ``post_required`` is True while the
-    # handoff record for the current head has not been written yet.
+    # Set when the resume is an ordinary review round of the current head
+    # read from a legacy anchor (#2087): ``legacy-recovery`` for a legacy
+    # recovery record, ``legacy-checkpoint`` for a pre-handoff qualification
+    # checkpoint, ``unrecorded-advance`` for an advance with no coherent
+    # handoff.  Informational only; no record is written for it.
     head_review_recovery: str | None = None
-    head_review_recovery_post_required: bool = False
-    # Rejection reasons carried into the next coder-dispatch record (bounded).
-    carried_rejection_reasons: tuple[str, ...] = ()
     # The anchor round's own reconciliation-phase summary (#1553).  Set only
     # by the ordinary transcript resume, never by a qualification-checkpoint,
     # evidence-boundary, conversion or recovery anchor.  It closes the round:
     # a later decision that needs fresh reviewer turns opens the next round,
     # with the ledger settled from this record.
     reconciliation_record: PostedRoundRecord | None = None
-    # Set when ``--review-unrecorded-head`` turned an unrecorded head advance
-    # into an operator head review (#2059).  The coder routing no longer sees
-    # an unrecorded advance, but evidence-boundary decisions still must.
+    # Set when a current-head review replaced coder routing after the head
+    # moved past its last record (#2059, #2087).  The coder routing no longer
+    # sees an unrecorded advance, but evidence-boundary decisions still must.
     head_advanced_past_boundary: bool = False
 
     @property
@@ -2089,23 +2082,20 @@ def _sanitize_durable_coder_response(raw: str | None) -> str | None:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + normalized[end:]
 
 
+# Legacy recovery phases (#1292).  No writer produces them since #2087; they
+# are kept only so historical records decode, migrate on resume to a review of
+# the current head, and still validate in legacy managed-CI continuity chains.
 CODER_DISPATCH_PHASE = "coder-dispatch"
 CODER_FOLLOWUP_REJECTED_PHASE = "coder-followup-rejected"
 HEAD_REVIEW_RECOVERY_PHASE = "head-review-recovery"
-RECOVERY_RECORD_PHASES = frozenset(
+LEGACY_RECOVERY_RECORD_PHASES = frozenset(
     {CODER_DISPATCH_PHASE, CODER_FOLLOWUP_REJECTED_PHASE, HEAD_REVIEW_RECOVERY_PHASE}
 )
-HEAD_REVIEW_RECOVERY_SOURCES = frozenset({"operator", "legacy-checkpoint"})
-MAX_REJECTED_DISPATCH_ATTEMPTS = 2
+_LEGACY_HEAD_REVIEW_SOURCES = frozenset({"operator", "legacy-checkpoint"})
+# Historical writers never recorded more than two consecutive dispatch attempts.
+_LEGACY_DISPATCH_ATTEMPT_CEILING = 2
 MAX_RECOVERY_REASON_CHARS = 2000
 NO_REASON_TEXT = "rejected without a reason"
-UNRECORDED_DISPATCH_REASON = (
-    "the previous coder follow-up response was not recorded (rejected or interrupted)"
-)
-REVIEW_UNRECORDED_HEAD_HINT = (
-    "Rerun with `--review-unrecorded-head` to run an ordinary review round of the "
-    "current head from the recorded items."
-)
 
 
 def sanitize_recovery_reason(value: object) -> str:
@@ -2127,8 +2117,8 @@ def sanitize_recovery_reason(value: object) -> str:
 
 
 @dataclass(frozen=True)
-class RecoveryRoundBudget:
-    """Bounded round budget carried by a recovery record."""
+class LegacyRoundBudget:
+    """Round budget a legacy recovery record carried; decoded read-only (#2087)."""
 
     allowed_rounds: int
     watch_failure_extension_used: bool
@@ -2143,11 +2133,11 @@ class RecoveryRoundBudget:
         }
 
     @classmethod
-    def invalid(cls) -> "RecoveryRoundBudget":
+    def invalid(cls) -> "LegacyRoundBudget":
         return cls(0, False, False, valid=False)
 
     @classmethod
-    def from_mapping(cls, value: object) -> "RecoveryRoundBudget":
+    def from_mapping(cls, value: object) -> "LegacyRoundBudget":
         if not isinstance(value, Mapping):
             return cls.invalid()
         allowed = value.get("allowed_rounds")
@@ -2163,30 +2153,17 @@ class RecoveryRoundBudget:
             return cls.invalid()
         return cls(allowed, failure, head)
 
-    @classmethod
-    def from_checkpoint(
-        cls, checkpoint: "QualificationCheckpoint | None"
-    ) -> "RecoveryRoundBudget | None":
-        if checkpoint is None:
-            return None
-        if not checkpoint.valid:
-            return cls.invalid()
-        return cls(
-            checkpoint.allowed_rounds,
-            checkpoint.watch_failure_extension_used,
-            checkpoint.watch_head_extension_used,
-        )
-
 
 def _is_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
-    """Names of the fields that make a recovery record structurally invalid.
+def legacy_recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
+    """Names of the fields that make a legacy recovery record structurally invalid.
 
-    Rules are per phase; no head rule is shared across phases.  An empty tuple
-    means valid.  Callers must run this before reading any recovery field.
+    Read-only validation of the historical per-phase shape, used only by the
+    legacy managed-CI continuity reader (#1367).  Resume never refuses on it:
+    a legacy record migrates to a current-head review whatever its shape.
     """
     phase = metadata.phase
     problems: list[str] = []
@@ -2198,7 +2175,7 @@ def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
         if not metadata.dispatch_head:
             problems.append("dispatch_head")
         attempt = metadata.dispatch_attempt
-        if not _is_positive_int(attempt) or attempt > MAX_REJECTED_DISPATCH_ATTEMPTS:
+        if not _is_positive_int(attempt) or attempt > _LEGACY_DISPATCH_ATTEMPT_CEILING:
             problems.append("dispatch_attempt")
         if not isinstance(metadata.recovery_dispatch, bool) or (
             _is_positive_int(attempt)
@@ -2229,7 +2206,7 @@ def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
             ):
                 problems.append("round_number")
     elif phase == HEAD_REVIEW_RECOVERY_PHASE:
-        if metadata.head_review_recovery_source not in HEAD_REVIEW_RECOVERY_SOURCES:
+        if metadata.head_review_recovery_source not in _LEGACY_HEAD_REVIEW_SOURCES:
             problems.append("head_review_recovery_source")
         if not budget_ok:
             problems.append("recovery_round_budget")
@@ -2238,18 +2215,13 @@ def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
     return tuple(problems)
 
 
-def recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
-    """Public view of the per-phase recovery-record validation (#1367)."""
-    return _recovery_record_problems(metadata)
-
-
 def decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
     """Decode one hydrated round-metadata payload with the canonical decoder."""
     return _decode_round_metadata_mapping(payload)
 
 
 def _decode_recovery_fields(payload: Mapping[str, object]) -> dict[str, object]:
-    """Decode the optional #1292 recovery fields; a malformed one is absent."""
+    """Decode the optional legacy #1292 recovery fields; a malformed one is absent."""
     fields: dict[str, object] = {}
     for key in ("dispatch_round", "dispatch_attempt"):
         value = payload.get(key)
@@ -2270,10 +2242,10 @@ def _decode_recovery_fields(payload: Mapping[str, object]) -> dict[str, object]:
     if isinstance(reasons, list) and all(isinstance(item, str) for item in reasons):
         fields["carried_rejection_reasons"] = tuple(
             sanitize_recovery_reason(item)
-            for item in reasons[:MAX_REJECTED_DISPATCH_ATTEMPTS]
+            for item in reasons[:_LEGACY_DISPATCH_ATTEMPT_CEILING]
         )
     if "recovery_round_budget" in payload:
-        fields["recovery_round_budget"] = RecoveryRoundBudget.from_mapping(
+        fields["recovery_round_budget"] = LegacyRoundBudget.from_mapping(
             payload["recovery_round_budget"]
         )
     return fields

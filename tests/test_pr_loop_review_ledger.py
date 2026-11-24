@@ -214,7 +214,7 @@ def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 6
+    assert len(runner.comments) == 5
     followup_prompt = next(
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Address the review below" in cmd[-1]
     )
@@ -455,7 +455,7 @@ def test_pr_loop_stops_on_incomplete_review_without_coder_followup(tmp_path):
 
     coder_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(coder_commands) == 1
-    assert len(runner.comments) == 3
+    assert len(runner.comments) == 2
     assert "Review incomplete" not in "\n".join(runner.comments)
 
 
@@ -644,7 +644,7 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "<!-- AGENT_STATE: blocking -->\n"
         "-- OpenAI Codex: unknown model (medium)"
     )
-    assert runner.comments[3] == (
+    assert runner.comments[2] == (
         "**Review verdict:** Approved\n\n"
         "Looks good.\n\n"
         "### Prior unresolved item dispositions\n"

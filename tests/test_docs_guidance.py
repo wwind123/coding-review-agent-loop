@@ -612,6 +612,35 @@ def test_docs_describe_rejected_coder_recovery_continuity_exception():
     assert "the PR stays draft and unmerged and no approval is synthesized" in doc_text
 
 
+def test_docs_describe_coder_recovery_removal_legacy_migration_and_deprecated_flag():
+    # #2087: no coder-recovery records, attempts or refusals; legacy records
+    # migrate to a current-head review; the flag is a deprecated no-op.
+    arch = " ".join(
+        (REPO_ROOT / "docs" / "architecture" / "round-state-and-resume.md").read_text(encoding="utf-8").split()
+    )
+    guide = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    for text in (arch, guide):
+        assert "LEGACY_RECOVERY_RECORD_PHASES" in arch
+        assert "no new record" in text
+        assert "`--review-unrecorded-head` is" in text and "deprecated" in text
+    assert "No coder-recovery record is written any more (#2087)" in arch
+    assert "`_legacy_recovery_migration`" in arch
+    assert "**No coder-recovery records (#2087).**" in guide
+    assert "**Legacy records migrate on resume.**" in guide
+    assert "resume no longer refuses" in guide
+    # The removed recovery machinery is no longer described as live behaviour.
+    for removed in (
+        "MAX_REJECTED_DISPATCH_ATTEMPTS", "_as_operator_head_review", "Written before every PR coder",
+        "**Coder recovery.**", "takes effect whenever it is given",
+    ):
+        assert removed not in arch and removed not in guide and removed not in readme, removed
+    anchor = _github_anchor("Rejected coder follow-ups and legacy recovery records (#1292, #2087)")
+    assert f"(docs/local_agent_loop.md#{anchor})" in readme
+    parser_help = build_parser()._subparsers._group_actions[0].choices["pr"].format_help()
+    assert "Deprecated no-op" in " ".join(parser_help.split())
+
+
 def test_architecture_documents_the_planning_scheduler():
     """`scope-5` (#905, from #841): the canonical overview is updated."""
     import pathlib
