@@ -162,3 +162,33 @@ def f():
     for pattern_text in ("Delete these 3 comments so the whole round runs again.",
                          "inspect the round's records before deleting anything."):
         assert any(p.search(pattern_text) for p in ROUND_RECOVERY_PATTERNS)
+
+
+# Phrases that describe a removed remedy as live behaviour (#2081 review item-3).
+# The docs may still say a remedy was removed; they may not describe it as
+# something the loop does.
+REMOVED_REMEDY_DOC_PHRASES = (
+    re.compile(r"frozen publication replay", re.IGNORECASE),
+    re.compile(r"\bfrozen carrier\b", re.IGNORECASE),
+    re.compile(r"missing suffix is posted", re.IGNORECASE),
+    re.compile(r"posts only a strictly missing suffix", re.IGNORECASE),
+    re.compile(r"recovery listing names", re.IGNORECASE),
+    re.compile(r"redoes only (?:its|the missing) classification", re.IGNORECASE),
+    re.compile(r"supersession record is posted", re.IGNORECASE),
+)
+
+
+def _doc_paths() -> list[Path]:
+    return [ROOT / "ARCHITECTURE.md", ROOT / "README.md", ROOT / "docs" / "local_agent_loop.md",
+            *sorted((ROOT / "docs" / "architecture").glob("*.md"))]
+
+
+def test_docs_no_longer_describe_removed_remedies_as_live():
+    hits = []
+    for path in _doc_paths():
+        text = path.read_text(encoding="utf-8")
+        for pattern in REMOVED_REMEDY_DOC_PHRASES:
+            for match in pattern.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                hits.append(f"{path.relative_to(ROOT)}:{line}: {match.group(0)!r}")
+    assert hits == [], "docs still describe a removed remedy:\n" + "\n".join(hits)

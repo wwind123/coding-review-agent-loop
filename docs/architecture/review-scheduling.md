@@ -80,7 +80,7 @@ A legitimate force-full or contradictory-key recovery prelaunch retires its
 selected reviewers' approvals from earlier rounds, including across restart.
 This also covers primary-only unopened recovery without a force-full latch.
 Completed same-round reviews survive repeated prelaunches, matching live reuse
-and frozen publication replay.
+and withheld-outcome replay.
 Checkpoints followed by same-subject, same-round reviewers retain qualified
 primary-approved secondary-audit or operator openings, including blocking
 findings. Reconciliation remains the settled ledger anchor. Automatic latches
