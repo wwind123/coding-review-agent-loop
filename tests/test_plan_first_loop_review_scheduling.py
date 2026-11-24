@@ -2830,3 +2830,301 @@ def test_effective_link_rollover_with_idle_or_invalid_retained_checkpoint(tmp_pa
     assert all(m.subject == _plan_subject(canonical) for m in fresh)
     assert {m.agent for m in fresh if m.role == "reviewer"} == {"Codex", "Gemini"}
     assert not any(cmd[0] == "claude" for cmd, _ in runner.commands)
+
+
+# --- #2064 stage 2: one rollover rule on the plan surface ---------------------------
+
+
+def _plan_rollover_runner(*, legacy=False, max_rounds=None):
+    from test_review_parallel import _PartialPublicationProbeRunner, _initial_plan
+    from agent_loop_helpers import structured_plan_review
+
+    markers = ("Codex blocks the plan with a unique note.", "Gemini independent plan approval.")
+    first = (
+        "### Blocking plan issues\n- Add a migration step.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+        if legacy else structured_plan_review(
+            state="blocking", summary=markers[0], blocking_plan_issues=["Add a migration step."])
+    )
+    if legacy:
+        markers = ("Add a migration step.", markers[1])
+    resolved = [{"item_id": "item-1", "disposition": "resolved", "note": "The migration step is planned."}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        slow_reviewer="gemini",
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[first, structured_plan_review(summary="Codex approves round two.",
+                                                     prior_plan_item_dispositions=resolved)],
+        gemini_outputs=[
+            structured_plan_review(summary=markers[1], reviewer="Google Gemini"),
+            structured_plan_review(summary="Gemini approves round two.", reviewer="Google Gemini",
+                                   prior_plan_item_dispositions=resolved),
+        ],
+    )
+    runner.serve_rest_issue_comments = True
+    return runner, markers
+
+
+def _plan_records(runner):
+    from test_review_parallel import _comment_records
+
+    return _comment_records(runner, surface="issue", flow="plan")
+
+
+def _plan_closures(runner):
+    from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
+
+    return [r for r in _plan_records(runner) if r.phase == ROUND_CLOSED_INCOMPLETE_PHASE]
+
+
+def _interrupted_plan_round(tmp_path, **kwargs):
+    from test_review_parallel import _interrupt_plan_round_between_publications, _published_count, _spool_files
+    from agent_loop_helpers import make_config
+
+    runner, markers = _plan_rollover_runner(**{k: v for k, v in kwargs.items() if k in {"legacy"}})
+    extra = {"max_rounds": kwargs["max_rounds"]} if kwargs.get("max_rounds") else {}
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, **extra)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    assert [_published_count(runner, m) > 0 for m in markers] == [True, False]
+    codex = next(r for r in _plan_records(runner) if r.role == "reviewer" and r.agent == "Codex")
+    assert codex.phase == "publication" and codex.new_items == ()  # provisional, unnumbered
+    for path in _spool_files(config):
+        path.unlink()
+    return runner, config
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["structured", "legacy-text"])
+def test_plan_round_with_a_published_review_and_an_unreplayable_reviewer_rolls_over(tmp_path, legacy):
+    """`plan-partial-rollover`: the provisional finding is re-parsed and minted into the record;
+    round 2 runs on the unchanged plan with the full plan board; closed reviews never approve."""
+    runner, config = _interrupted_plan_round(tmp_path, legacy=legacy)
+    claude_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    (closure,) = _plan_closures(runner)
+    assert closure.round_number == 1
+    assert [e["agent"] for e in closure.round_closure["published"]] == ["Codex"]
+    assert [e["agent"] for e in closure.round_closure["unreplayable"]] == ["Gemini"]
+    assert [(i.item_id, i.text, i.status) for i in closure.new_items] == [("item-1", "Add a migration step.", "blocking")]
+    records = _plan_records(runner)
+    advance = [r for r in records if r.phase == "plan-phase-advance"]
+    assert [r.round_number for r in advance] == [2]
+    assert advance[0].subject == closure.subject  # the unchanged canonical plan
+    assert "item-1" in {i.item_id for i in advance[0].prior_items}
+    assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == ["Codex", "Gemini"]
+    assert len(runner.reviewer_launches) - launches_before == 2
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == claude_before
+    assert not any("Delete these" in body for body in runner.comments)
+
+
+def test_plan_closure_record_alone_restores_the_ledger_after_an_interruption(tmp_path):
+    """`closure-idempotent` (plan): interrupted between the closure and the phase advance."""
+    from coding_review_agent_loop import plan_first_loop
+
+    runner, config = _interrupted_plan_round(tmp_path)
+
+    class _Stop(Exception):
+        pass
+
+    real = plan_first_loop.post_issue_comment
+
+    def stop_after_closure(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if "closed, incomplete" in str(kwargs.get("body", "")):
+            raise _Stop
+        return result
+
+    with patch.object(plan_first_loop, "post_issue_comment", side_effect=stop_after_closure):
+        with pytest.raises(_Stop):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not [r for r in _plan_records(runner) if r.phase == "plan-phase-advance"]
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert len(_plan_closures(runner)) == 1
+    advance = [r for r in _plan_records(runner) if r.phase == "plan-phase-advance"]
+    assert [r.round_number for r in advance] == [2]
+    assert "item-1" in {i.item_id for i in advance[0].prior_items}
+
+
+def test_plan_closure_at_max_rounds_posts_the_record_then_the_round_limit_stop(tmp_path):
+    """`closure-at-max-rounds` (plan): the record first, then an ordinary stop naming round 2."""
+    from dataclasses import replace as _replace
+
+    runner, config = _interrupted_plan_round(tmp_path, max_rounds=1)
+
+    with pytest.raises(AgentLoopError, match="round 2, beyond --max-rounds"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(_plan_closures(runner)) == 1
+    assert not any("Delete these" in body for body in runner.comments)
+    assert run_issue_loop(runner, issue_number=56, config=_replace(config, max_rounds=3), plan_first=True) == 0
+    assert len(_plan_closures(runner)) == 1
+
+
+def _rewrite_plan_payloads(runner, transform):
+    from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping
+
+    for comment in runner.issue_comments:
+        matches = list(ROUND_RESUME_MARKER_RE.finditer(comment["body"]))
+        if not matches:
+            continue
+        match = matches[-1]
+        payload = transform(dict(decode_mapping(match.group("payload"))))
+        if payload is not None:
+            comment["body"] = (comment["body"][: match.start("payload")] + encode_mapping(payload)
+                               + comment["body"][match.end("payload"):])
+
+
+def test_unusable_plan_publication_is_a_retryable_stop_not_an_empty_closure(tmp_path):
+    """Round-1 item-4: a stored response the parser chain cannot read posts nothing."""
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+    from test_review_parallel import _spool_files
+
+    runner, config = _interrupted_plan_round(tmp_path)
+    _rewrite_plan_payloads(runner, lambda payload: (
+        {**payload, "canonical_reviewer_response": "not a plan review at all"}
+        if payload.get("role") == "reviewer" and payload.get("agent") == "Codex" else None))
+    _round_one_plan_spool(runner, config).store("Gemini", {"text": "not a structured plan review"})
+    comments_before = len(runner.issue_comments)
+
+    with pytest.raises(RoundStateReadError, match="could not be rebuilt"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(runner.issue_comments) == comments_before  # no closure, no phase advance
+    assert not _plan_closures(runner)
+    assert _spool_files(config)  # the round spool is kept for a rerun
+
+
+def _round_one_plan_spool(runner, config):
+    from coding_review_agent_loop import review_rounds
+
+    codex = next(r for r in _plan_records(runner) if r.role == "reviewer" and r.agent == "Codex")
+    return review_rounds._review_round_spool(
+        config, surface="issue", number=56, round_number=1, subject=codex.subject)
+
+
+# --- item-5: plan-loop own-publication and carrier-stop-routing workflows ------------
+
+
+@pytest.mark.parametrize("review_parallel", [True, False], ids=["parallel", "sequential"])
+def test_plan_own_rejected_publication_closes_and_discards_the_replayable_peer(tmp_path, monkeypatch, review_parallel):
+    """`own-publication-rollover` (plan): only Codex's own plan review is public and resume
+    rejects it; Gemini's valid spooled outcome is discarded and both review fresh in round 2."""
+    import dataclasses as _dc
+    from coding_review_agent_loop import plan_first_loop
+    from test_review_parallel import (
+        _PartialPublicationProbeRunner, _initial_plan, _interrupt_plan_round_between_publications,
+        _published_count, _spool_files,
+    )
+    from agent_loop_helpers import make_config, structured_plan_review
+
+    markers = ("Codex approves the plan alone.", "Gemini independent plan approval.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers, slow_reviewer="gemini", claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(summary=markers[0]),
+                       structured_plan_review(summary="Codex approves round two.")],
+        gemini_outputs=[structured_plan_review(summary=markers[1], reviewer="Google Gemini"),
+                        structured_plan_review(summary="Gemini approves round two.", reviewer="Google Gemini")],
+    )
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    assert [_published_count(runner, m) for m in markers] == [1, 0]
+    assert len(_spool_files(config)) == 1  # Gemini's withheld outcome is replayable
+    real_binding = plan_first_loop.approval_record_binding
+
+    def reject_round_one(record, **kwargs):
+        if record.metadata.round_number == 1 and record.metadata.role == "reviewer":
+            return "stale"  # e.g. the requirement set changed since publication
+        return real_binding(record, **kwargs)
+
+    monkeypatch.setattr(plan_first_loop, "approval_record_binding", reject_round_one)
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=_dc.replace(config, review_parallel=review_parallel),
+                          plan_first=True) == 0
+
+    (closure,) = _plan_closures(runner)
+    assert [e["agent"] for e in closure.round_closure["published"]] == ["Codex"]
+    assert [e["agent"] for e in closure.round_closure["unreplayable"]] == ["Codex"]
+    assert _published_count(runner, markers[1]) == 0  # Gemini's spooled round-1 review never posts
+    assert sorted(runner.reviewer_launches[len(launches_before):]) == ["codex", "gemini"]
+    records = _plan_records(runner)
+    # Codex never reviews again in round 1; both review in round 2.
+    assert sorted((r.agent, r.round_number) for r in records if r.role == "reviewer") == [
+        ("Codex", 1), ("Codex", 2), ("Gemini", 2)]
+    assert not any("Delete these" in body for body in runner.comments)
+
+
+@pytest.mark.parametrize("failure", ["listing", "actor"])
+def test_plan_carrier_read_failure_at_classification_is_retryable_and_keeps_the_spool(
+    tmp_path, monkeypatch, failure
+):
+    """`carrier-stop-routing` (plan, round start): no closure, nothing posted, spool kept;
+    a rerun with healthy reads then closes the round normally."""
+    import dataclasses as _dc
+    from coding_review_agent_loop import plan_first_loop, publication_resume
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+    from test_review_parallel import _exhausted_plan, _spool_files
+
+    runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
+    runner.issue_comments = [c for c in runner.issue_comments if "Gemini independent plan approval." not in c["body"]]
+    for path in _spool_files(config):
+        if path.name == "Gemini.json":
+            path.unlink()  # Gemini needs a fresh turn beside the partly public carrier
+    spooled = {path: path.read_bytes() for path in _spool_files(config)}
+    comments_before = len(runner.issue_comments)
+    launches_before = list(runner.reviewer_launches)
+    with monkeypatch.context() as patch_:
+        if failure == "listing":
+            patch_.setattr(publication_resume.RoundPublication, "_complete", lambda self, actor: (_ for _ in ()).throw(
+                self._stop("the conversation could not be read completely (HTTP 502).", category="read")))
+        else:
+            real = plan_first_loop.round_publication
+
+            def actor_fails(*args, **kwargs):
+                def unavailable():
+                    raise AgentLoopError("actor lookup failed (HTTP 502)")
+                return _dc.replace(real(*args, **kwargs), resolve_actor=unavailable)
+
+            patch_.setattr(plan_first_loop, "round_publication", actor_fails)
+        with pytest.raises(RoundStateReadError, match="rerun once GitHub comment reads succeed"):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(runner.issue_comments) == comments_before
+    assert not _plan_closures(runner)
+    assert runner.reviewer_launches == launches_before
+    assert {path: path.read_bytes() for path in _spool_files(config)} == spooled
+
+
+def test_plan_read_failure_while_publishing_keeps_outcomes_spooled_and_a_rerun_replays_them(tmp_path, monkeypatch):
+    """`carrier-stop-routing` (plan, publication time): retryable, outcomes kept and replayed."""
+    from coding_review_agent_loop import publication_resume
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+    from test_review_parallel import _plan_partial_round_runner, _published_count, _spool_files
+    from agent_loop_helpers import make_config
+
+    runner, markers = _plan_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+
+    def freeze_read_fails(self, bodies):
+        raise self._stop("a publication carrier could not be frozen because the pre-publication "
+                         "baseline listing is incomplete (HTTP 502).", category="read")
+
+    with monkeypatch.context() as patch_:
+        patch_.setattr(publication_resume.RoundPublication, "_freeze", freeze_read_fails)
+        with pytest.raises(RoundStateReadError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any(_published_count(runner, marker) for marker in markers)
+    assert len(_spool_files(config)) == 2
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert runner.reviewer_launches == launches_before  # replayed, not re-run
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    assert not _plan_closures(runner)

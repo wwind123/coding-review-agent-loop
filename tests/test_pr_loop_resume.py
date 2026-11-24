@@ -1787,9 +1787,8 @@ def test_2035_classification_redo_cannot_change_published_verdict(tmp_path, chan
 
 
 def test_2035_diagnosis_unacknowledged_publication_is_the_rejecting_predicate(tmp_path, monkeypatch):
-    """Pin Run B: without the classification admission the rerun hits the deletion refusal."""
+    """Pin Run B: without the classification admission the rerun closes the round (#2064)."""
     from coding_review_agent_loop.protocol import human_requirements_resolved
-    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
     from pr_loop_test_helpers import _association, _classified_review, _pr_records
     runner, config, rids = _classification_failed_round(tmp_path)
     requirements = _parse_pr_human_requirements(runner.pr_payload)
@@ -1801,9 +1800,14 @@ def test_2035_diagnosis_unacknowledged_publication_is_the_rejecting_predicate(tm
     assert response_validation.classification_resume_kind(codex, requirements) == "pending"
     monkeypatch.setattr(response_validation, "classification_resume_kind", lambda *a, **k: None)
     runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in rids], hr=True)]
-    with pytest.raises(PartialReviewRoundError, match="Delete these"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert runner.codex_outputs
+    runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in rids],
+                                                reviewer="Google Gemini", hr=True)]
+    # Formerly a deletion refusal: round 1 now closes incomplete and round 2 reviews again.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not runner.codex_outputs
+    assert any("closed, incomplete" in c for c in runner.comments)
+    assert not any("Delete these" in c for c in runner.comments)
+    assert _no_deletes(runner)
 
 
 @pytest.mark.parametrize("policy", [None, "selective-intermediate"])

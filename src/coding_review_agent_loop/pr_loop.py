@@ -318,13 +318,14 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
-from .partial_round_recovery import (
-    PartialRoundRecovery,
-    RecoveryVisibilityContext,
-    compute_partial_round_recovery,
+from .partial_round_recovery import RecoveryVisibilityContext
+from .round_closure_writer import (
+    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, closure_round_limit_note, decide_round_closure,
+    excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
 )
 from .round_visibility import (
     latest_round_checkpoint_index,
+    same_round_public_publications,
     visible_peer_names,
 )
 from .legacy_machine_items import consumed_acknowledgement_disposition
@@ -2531,6 +2532,10 @@ def run_pr_loop(
         pr_fresh_from_rounds = pr_contract_lineage.fresh_from_rounds
         pr_primary_epoch_round = pr_contract_lineage.primary_epoch_round
         pr_pre_epoch_panel_items = pre_epoch_panel_items(startup_records, pr_contract_lineage)
+        # Findings a closed-incomplete record carried forward (#2064): like pre-epoch
+        # panel items, they never make a secondary an owner before a qualified opening.
+        pr_closure_item_ids = {item.item_id for record in startup_records
+                               if is_round_closed_incomplete(record.metadata) for item in record.metadata.new_items}
         if plan_handoff_board is not None and plan_handoff_board.changed:
             # One orchestrator-written audit record per derived board change,
             # before round 1; its digest makes every rerun a no-op.
@@ -3124,6 +3129,7 @@ def run_pr_loop(
                      for item in (*record.metadata.prior_items, *record.metadata.new_items)
                      if item.item_id.startswith("item-") and item.item_id[5:].isdigit()), default=1))
 
+        closed_incomplete_round: int | None = None  # set by a closed-incomplete rollover (#2064)
         for round_number in round_sequence:
             # The effective-board floor is checked at every round (pure, no I/O).
             check_lineage_floor(
@@ -3151,7 +3157,7 @@ def run_pr_loop(
                             else initial_pr_context.metadata.head_sha
                         ),
                         sub_item_stall_rounds=config.no_progress_rounds,
-                    )
+                    ) + closure_round_limit_note(closed_incomplete_round, round_number)
                 )
             coder_name = agent_display_name(config.coder)
             pre_review_tests_passed = False
@@ -3905,8 +3911,8 @@ def run_pr_loop(
                 # Classify every completed review of the interrupted round, not
                 # only the resume-eligible ones: a premature blocking review
                 # whose requirement, plan, or acquisition identity is now stale
-                # must still reach the diagnostic or the audited supersession
-                # rather than being dropped silently.
+                # must still reach the audited supersession or the round-wide
+                # closure (#2064) rather than being dropped silently.
                 for resumed_name, resumed_candidate in completed_by_name.items():
                     if not is_complete_code_review(resumed_candidate.metadata):
                         continue
@@ -3938,19 +3944,14 @@ def run_pr_loop(
                         superseded_prepanel_reviews[resumed_name] = resumed_candidate
                     else:
                         unqualified_blocking.append(resumed_candidate)
-                if unqualified_blocking:
-                    stop_pre_panel(
-                        pre_panel_safety_message(
-                            "premature panel review(s) "
-                            + "; ".join(
-                                _describe_superseded_prepanel_review(record)
-                                for record in unqualified_blocking
-                            )
-                            + " were recorded before any qualified panel opening and are "
-                            "blocking or carry new items,"
-                        ),
-                        round_number=round_number,
-                    )
+                # An unreconciled round closes incomplete under the round-wide rule
+                # and its findings carry forward (#2064); a reconciled round keeps
+                # its existing pre-panel safety stop.
+                if unqualified_blocking and current_resume is not None and current_resume.reconciliation_record is not None:
+                    stop_pre_panel(pre_panel_safety_message(
+                        "premature panel review(s) " + "; ".join(_describe_superseded_prepanel_review(record) for record in unqualified_blocking)
+                        + " were recorded before any qualified panel opening and are blocking or carry new items,"),
+                        round_number=round_number)
             # Summaries are review-level context, not new findings or substitutes
             # for an item's immutable claim. Seed from saved reviews for recovery.
             reviewer_summaries = {
@@ -4242,8 +4243,118 @@ def run_pr_loop(
                     human_requirements=human_requirements,
                 )
 
-            from .signed_input_supersession import supersede_for_signed_growth  # #2054: close round N on pure signed growth
-            current_resume = supersede_for_signed_growth(runner, config=config, pr_number=pr_number, comments=pr_comments, current_resume=current_resume, round_number=round_number, allowed_rounds=allowed_rounds, head_sha=current_pr_subject, human_requirements=human_requirements, approved_plan_context=approved_plan_context, acquisition_contract=reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None, seat_binding=seat_binding, prior_items=prior_unresolved_items, configured_reviewer_names=[agent_display_name(r) for r in configured_reviewers], completed_by_name=completed_by_name, resumed_by_name=resumed_by_name, rejection_reasons=posted_rejection_reasons, spool=pr_round_spool, bound_metadata=bound_pr_metadata, post_comment=post_pr_comment, unresolved_items=unresolved_items, blocked=bool(skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None or conversion_pass or prepanel_unqualified_reviews))
+            def _pr_mint_closed(record: PostedRoundRecord, next_number: int) -> list[UnresolvedReviewItem]:
+                """Rebuild a published review's items through resume's parser chain and settlement's minting."""
+                parsed, _output = pr_published_review(record, reviewer=record.metadata.agent, parse_requirement_evidence=human_evidence.freeze, strict=True)
+                return mint_pr_review_items(
+                    parsed, reviewer=record.metadata.agent, round_number=record.metadata.round_number,
+                    next_item_number=next_number, approved_followups=config.approved_followups,
+                    has_blocking_summary=pr_records_blocking_summary(parsed, had_prior_items=bool(prior_unresolved_items)))
+
+            def _pr_closure_base() -> ResumedReviewRound:
+                """Round N's state; a round with only public sidecars or carriers has no resumed record."""
+                return current_resume if current_resume is not None else ResumedReviewRound(
+                    round_number=round_number, prior_items=tuple(prior_unresolved_items), coder_output=None,
+                    completed_reviews=(), next_unresolved_item_number=next_unresolved_item_number)
+
+            def _pr_closure_ledger_records(public: dict[str, PostedRoundRecord]) -> dict[str, PostedRoundRecord]:
+                """Every completed round-N review (any phase) and any other public publication, in board order."""
+                return {name: record for name in (agent_display_name(r) for r in configured_reviewers)
+                        if name not in superseded_prepanel_reviews
+                        and (record := completed_by_name.get(name) or public.get(name)) is not None}
+
+            def _pr_round_closure() -> object | None:
+                """Round-wide closed-incomplete decision and writer (#2064); replaces #2054's call."""
+                if ((current_resume is not None and (current_resume.round_number != round_number
+                        or current_resume.reconciliation_record is not None or current_resume.evidence_boundary is not None))
+                        or skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None or conversion_pass):
+                    return None
+                order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
+                # Public same-round publications by the shared visibility rule (#1156), across
+                # scheduler phases, minus the primary review that gates this launch.
+                history = drop_inert_post_reconciliation_checkpoints(_extract_round_metadata_records(pr_comments, flow="pr"))
+                launch_phase = scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
+                visible = visible_peer_names(
+                    history, opening_source=impending_opening_source(
+                        opened=bool(panel_evidence is not None and panel_evidence.opened),
+                        source=panel_evidence.opening_source if panel_evidence is not None else None,
+                        launch_phase=launch_phase, operator=scheduler_operator_force_full),
+                    flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order,
+                    primary_reviewer=scheduler_contract.primary_reviewer if scheduler_capabilities.requires_primary else None,
+                    launch_phase=launch_phase, launching=tuple(sorted(selected_reviewer_names)),
+                    checkpoint_index=len(pr_comments))
+                published = {record.metadata.agent: record for record in same_round_public_publications(
+                    history, flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order)
+                    if record.metadata.agent in visible and record.metadata.agent not in superseded_prepanel_reviews}
+                # A rejected own withheld-round publication, or a published pre-panel-unqualified
+                # review; a sequential (authoritative) record keeps its same-round re-run.
+                rejected = {name: record for name, record in completed_by_name.items()
+                            if name not in resumed_by_name and name not in superseded_prepanel_reviews
+                            and (record.metadata.phase == "publication" or name in prepanel_unqualified_reviews)}
+                found = classify_round_reviewers(
+                    runner, config=config, surface="pr", number=pr_number, round_number=round_number,
+                    reviewers=configured_reviewers, published_records=published, rejected_records=rejected,
+                    turn_names={agent_display_name(r) for r in configured_reviewers if _pr_reviewer_prelaunch_kind(r) == "turn"},
+                    rejection_reasons={**posted_rejection_reasons, **{name: "it was recorded before any qualified panel opening"
+                                                                      for name in prepanel_unqualified_reviews}}, spool=pr_round_spool,
+                    validators_for=_pr_review_validators, publication_for=_pr_publication,
+                    comment_id_for=lambda record: getattr(pr_comments[record.index], "comment_id", None) if 0 <= record.index < len(pr_comments) else None)
+                decision = decide_round_closure(round_number=round_number, reviewer_order=order,
+                                                publications=found.publications, fresh_turns=found.fresh_turns)
+                if decision is None:
+                    for name in found.stale_unpublished:  # A verified unpublished stale carrier is discarded.
+                        pr_round_spool.remove(name)
+                    return None
+
+                base = _pr_closure_base()
+                closed = close_incomplete_round(
+                    runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
+                    comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
+                    published_records=_pr_closure_ledger_records(published),
+                    next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
+                    mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
+                    post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
+                pr_round_spool.discard()  # Save before emit: the ledger is durable in the posted record.
+                pr_closure_item_ids.update(item.item_id for item in closed.current_round_new_items)
+                for state in (completed_by_name, resumed_by_name, posted_rejection_reasons, prepanel_unqualified_reviews):
+                    state.clear()
+                return closed
+
+            def _pr_close_on_signal(signal: RoundIncompleteSignal) -> None:
+                """A former refusal site found round N incomplete before any post: close it and re-enter (#2064)."""
+                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided
+                if conversion_pass or evidence_pass is not None or skip_reviewers_for_recovery or conflict_pending:
+                    raise excluded_route_stop(signal, route="conversion repeat" if conversion_pass else "evidence pass" if evidence_pass is not None else "recovery route") from signal
+                if not signal.before_publication:
+                    raise signal  # Fail closed without deletion advice; the next resume's decision closes the round.
+                if current_resume is not None and current_resume.reconciliation_record is not None:
+                    # A reconciled round is already closed (#1553): re-enter so its own
+                    # record rolls it over instead of launching beside public peers.
+                    resumed_round = dataclasses_replace(current_resume, completed_reviews=())
+                    final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
+                    pending_automatic_fallback_reasons[:] = list(restored)
+                    round_sequence.repeat_current()
+                    return
+                records = _pr_closure_ledger_records({})
+                decision = decide_round_closure(
+                    round_number=round_number, reviewer_order=[agent_display_name(r) for r in configured_reviewers],
+                    publications={name: (getattr(pr_comments[records[name].index], "comment_id", None) if name in records else None)
+                                  for name in signal.published}, fresh_turns=dict(signal.unreplayable))
+                if decision is None:
+                    raise signal
+                base = _pr_closure_base()
+                resumed_round = close_incomplete_round(
+                    runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
+                    comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
+                    published_records=records, next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
+                    mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
+                    post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
+                pr_round_spool.discard()
+                pr_closure_item_ids.update(item.item_id for item in resumed_round.current_round_new_items)
+                final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
+                pending_automatic_fallback_reasons[:] = list(restored)
+                round_sequence.repeat_current()
+
             # A reconciled round is closed (#1553): it never receives another
             # scheduling or reviewer record.  Recovery, qualification,
             # evidence, conflict, evidence-pass and conversion resumes keep
@@ -4616,7 +4727,8 @@ def run_pr_loop(
                         epoch_round=pr_primary_epoch_round,
                         primary=scheduler_contract.primary_reviewer,
                         eligible=pr_pre_epoch_panel_items,
-                    ),
+                    ) + closure_carried_items(pr_ledger_view(prior_unresolved_items), pr_closure_item_ids,
+                                              primary=scheduler_contract.primary_reviewer),
                 )
                 try:
                     scheduler_decision = select_reviewers(
@@ -4735,10 +4847,12 @@ def run_pr_loop(
                     and pr_contract_lineage.active_amendment is not None
                     and round_number == pr_contract_lineage.active_amendment.effective_from_round
                 )
+                if (pr_closed := _pr_round_closure()) is not None:
+                    current_resume, closed_round_gate = pr_closed, True
                 if closed_round_gate and any(
                     _pr_reviewer_prelaunch_kind(reviewer) == "turn"
                     for reviewer in configured_reviewers
-                ):
+                ) or pr_closed is not None:
                     closed_round_rollover_reason = scheduler_decision.reason
 
                 def post_scheduler_checkpoint(
@@ -4819,7 +4933,11 @@ def run_pr_loop(
                     # remaining reviewer's review is reused and nobody is
                     # invoked.  That activation is the only record a closed
                     # round may still receive (#1553).
-                    _pr_spool_preflight(selected_reviewer_names)
+                    try:
+                        _pr_spool_preflight(selected_reviewer_names)
+                    except RoundIncompleteSignal as signal:
+                        _pr_close_on_signal(signal)
+                        continue
                     if (
                         (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
                         and not skip_reviewers_for_recovery
@@ -4843,13 +4961,19 @@ def run_pr_loop(
                 final_sweep = False
                 scheduler_recorded_force_full, scheduler_recorded_force_full_source = False, None
                 superseded_audit_text = ""
+                if (pr_closed := _pr_round_closure()) is not None:
+                    current_resume, closed_round_gate = pr_closed, True
                 if closed_round_gate and any(
                     _pr_reviewer_prelaunch_kind(reviewer) == "turn"
                     for reviewer in configured_reviewers
-                ):
+                ) or pr_closed is not None:
                     closed_round_rollover_reason = "fresh full-board reviewer turns are needed"
                 else:
-                    _pr_spool_preflight(selected_reviewer_names)
+                    try:
+                        _pr_spool_preflight(selected_reviewer_names)
+                    except RoundIncompleteSignal as signal:
+                        _pr_close_on_signal(signal)
+                        continue
             if closed_round_rollover_reason is not None:
                 # Closed-round rollover (#1553): settle round N's ledger from its
                 # own reconciliation record through the ordinary round-end
@@ -4916,6 +5040,7 @@ def run_pr_loop(
                     restored_fallback_reasons,
                 ) = closed_round_pre_scheduler
                 pending_automatic_fallback_reasons[:] = list(restored_fallback_reasons)
+                closed_incomplete_round = round_number if is_round_closed_incomplete(closed_reconciliation) else None
                 resumed_round = None
                 current_resume = None
                 log(
@@ -5234,68 +5359,6 @@ def run_pr_loop(
             pr_round_parallel = (
                 config.review_parallel or pr_round_spool.has_records()
             ) and evidence_pass is None
-            def _pr_recovery_fingerprint(remaining: Sequence[object]) -> object:
-                """The qualified panel opening, identified by its comment, not its index."""
-                if not scheduler_capabilities.requires_primary:
-                    return None
-                evidence = _derive_pr_panel_evidence(
-                    drop_inert_post_reconciliation_checkpoints(
-                        _extract_round_metadata_records(remaining, flow="pr")
-                    ),
-                    primary_reviewer=scheduler_contract.primary_reviewer,
-                    required_reviewers=scheduler_contract.required_reviewers,
-                )
-                opening = (
-                    remaining[evidence.opening_index]
-                    if evidence.opening_index is not None
-                    else None
-                )
-                return (
-                    evidence.opening_source,
-                    getattr(opening, "created_at", None),
-                    getattr(opening, "body", None),
-                )
-
-            def _pr_conversion_resolver(history: Sequence[object]) -> int | None:
-                """The guard's conversion boundary, located by identity in ``history``."""
-                resolved = conversion_visibility_boundary(
-                    runner, config, pr_number=pr_number, comments=history,
-                    round_number=round_number, head_sha=pr_metadata.head_sha,
-                )
-                if resolved is None or resolved.key != pr_conversion_boundary_key:
-                    return None
-                return resolved.index
-
-            def _pr_round_recovery() -> PartialRoundRecovery:
-                return compute_partial_round_recovery(
-                    snapshot=pr_comments,
-                    read_rest=lambda: read_rest_issue_comments(
-                        runner, config=config, issue_number=pr_number,
-                        purpose="the partial review round's comment ids cannot be listed",
-                        reject_empty_output=True,
-                    ),
-                    flow="pr", round_number=round_number, subject=current_pr_subject,
-                    context=pr_recovery_context,
-                    reviewer_names=[agent_display_name(r) for r in configured_reviewers],
-                    resume=lambda remaining: _resume_pr_round(
-                        remaining,
-                        head_sha=pr_metadata.head_sha,
-                        configured_reviewers=configured_reviewers,
-                        reconciliation_mode=(
-                            "owner-scoped"
-                            if scheduler_capabilities.owner_scoped_reconciliation
-                            else "aggregate"
-                        ),
-                        trusted_actor=_cached_trusted_actor(runner),
-                        review_unrecorded_head=config.review_unrecorded_head,
-                    ),
-                    fingerprint=_pr_recovery_fingerprint,
-                    conversion_boundary=(
-                        _pr_conversion_resolver
-                        if pr_conversion_boundary_key is not None else None
-                    ),
-                )
-
             if closed_round_gate and any(
                 _pr_reviewer_prelaunch_kind(reviewer) == "turn" for reviewer in configured_reviewers
             ):
@@ -5305,20 +5368,23 @@ def run_pr_loop(
                     "into the closed round; rerun after reporting this defect."
                 )
             if not pr_round_parallel and not skip_reviewers_this_round and evidence_pass is None:
-                _refuse_partial_round_before_sequential_turns(
-                    spool=pr_round_spool,
-                    fresh_turn_reviewers=[
-                        reviewer for reviewer in configured_reviewers
-                        if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
-                    ],
-                    public_peers=pr_round_public_peers,
-                    already_posted=tuple(
-                        reviewer for reviewer in configured_reviewers
-                        if agent_display_name(reviewer) in completed_by_name
-                    ),
-                    recovery=_pr_round_recovery,
-                    unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
-                )
+                try:
+                    _refuse_partial_round_before_sequential_turns(
+                        spool=pr_round_spool,
+                        fresh_turn_reviewers=[
+                            reviewer for reviewer in configured_reviewers
+                            if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
+                        ],
+                        public_peers=pr_round_public_peers,
+                        already_posted=tuple(
+                            reviewer for reviewer in configured_reviewers
+                            if agent_display_name(reviewer) in completed_by_name
+                        ),
+                        unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
+                    )
+                except RoundIncompleteSignal as signal:
+                    _pr_close_on_signal(signal)
+                    continue
             if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
                     reviewer for reviewer in configured_reviewers
@@ -5528,45 +5594,48 @@ def run_pr_loop(
                             early_published_pr_reviewers.add(reviewer)
                             return True
 
-                        pr_turn_results = _launch_reviewer_turns(
-                            runner,
-                            launchable_pr_reviewers,
-                            thread_name_prefix=f"pr-review-r{round_number}",
-                            run_turn=_pr_reviewer_worker,
-                            on_completion=_publish_pr_completion,
-                            spool=pr_round_spool,
-                            replay_turn=lambda reviewer, fields: _replay_spooled_review(
-                                runner, config=config, reviewer=reviewer, fields=fields,
-                                validators=_pr_review_validators(agent_display_name(reviewer)),
-                            ),
-                            public_peers=pr_round_public_peers,
-                            recovery=_pr_round_recovery,
-                            retry_bound=_pr_retry_bound,
-                            settle_failures=peer_blocked_settlement(
-                                parse=_pr_publication_parsed, name=agent_display_name, retry_types=(AgentSettingsLockWaitTimeout,),
-                                blocks=lambda p: p.state == "blocking" and not _is_incomplete_pr_review(p),
-                                configured_reviewer_count=len(configured_reviewers), round_number=round_number,
-                                allowed_rounds=allowed_rounds, evidence_pass=evidence_pass),
-                            unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
-                            max_workers=None if config.review_parallel else 1,
-                            # A spooled reviewer skipped the pre-review sync
-                            # above; sync it if its replay falls back to a turn.
-                            prepare_fallback=lambda reviewer: sync_reviewer_pr_before_review(
-                                config, runner, reviewer, pr_number, pr_metadata
-                            ),
-                            already_posted=tuple(
-                                reviewer for reviewer in configured_reviewers
-                                if agent_display_name(reviewer) in completed_by_name
-                            ),
-                            prelaunch_failures={
-                                reviewer: _ReviewerTurnResult(
-                                    reviewer_name=agent_display_name(reviewer), error=error
-                                )
-                                for reviewer, error in pr_prep_failures.items()
-                            },
-                            configured_order=configured_reviewers,
-                            config=config,
-                        )
+                        try:
+                            pr_turn_results = _launch_reviewer_turns(
+                                runner,
+                                launchable_pr_reviewers,
+                                thread_name_prefix=f"pr-review-r{round_number}",
+                                run_turn=_pr_reviewer_worker,
+                                on_completion=_publish_pr_completion,
+                                spool=pr_round_spool,
+                                replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                                    runner, config=config, reviewer=reviewer, fields=fields,
+                                    validators=_pr_review_validators(agent_display_name(reviewer)),
+                                ),
+                                public_peers=pr_round_public_peers,
+                                        retry_bound=_pr_retry_bound,
+                                settle_failures=peer_blocked_settlement(
+                                    parse=_pr_publication_parsed, name=agent_display_name, retry_types=(AgentSettingsLockWaitTimeout,),
+                                    blocks=lambda p: p.state == "blocking" and not _is_incomplete_pr_review(p),
+                                    configured_reviewer_count=len(configured_reviewers), round_number=round_number,
+                                    allowed_rounds=allowed_rounds, evidence_pass=evidence_pass),
+                                unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
+                                max_workers=None if config.review_parallel else 1,
+                                # A spooled reviewer skipped the pre-review sync
+                                # above; sync it if its replay falls back to a turn.
+                                prepare_fallback=lambda reviewer: sync_reviewer_pr_before_review(
+                                    config, runner, reviewer, pr_number, pr_metadata
+                                ),
+                                already_posted=tuple(
+                                    reviewer for reviewer in configured_reviewers
+                                    if agent_display_name(reviewer) in completed_by_name
+                                ),
+                                prelaunch_failures={
+                                    reviewer: _ReviewerTurnResult(
+                                        reviewer_name=agent_display_name(reviewer), error=error
+                                    )
+                                    for reviewer, error in pr_prep_failures.items()
+                                },
+                                configured_order=configured_reviewers,
+                                config=config,
+                            )
+                        except RoundIncompleteSignal as signal:
+                            _pr_close_on_signal(signal)
+                            continue
                     else:
                         log(
                             config,
@@ -5601,39 +5670,12 @@ def run_pr_loop(
                 resumed_record = resumed_by_name.get(reviewer_name)
                 carried_approval_record: PostedRoundRecord | None = None
                 if resumed_record is not None:
-                    canonical_review_output = resumed_record.metadata.canonical_reviewer_response
-                    review_output = canonical_review_output or resumed_record.body
+                    # The same parser chain the closed-incomplete writer uses (#2064).
+                    parsed_review, review_output = pr_published_review(
+                        resumed_record, reviewer=reviewer_name, parse_requirement_evidence=human_evidence.freeze)
                     review_model_used = resumed_record.metadata.model_used
                     review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                     review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
-                    structured_review = (
-                        parse_structured_pr_review(review_output, reviewer=reviewer_name, architecture_status_mode="legacy",
-                                                   parse_requirement_evidence=human_evidence.freeze)
-                        if canonical_review_output is not None
-                        else None
-                    )
-                    reparsed_review = structured_review or parse_review(
-                        review_output, reviewer=reviewer_name
-                    )
-                    resumed_impact, resumed_records = _resumed_review_architecture(
-                        resumed_record.metadata,
-                        structured_review.architecture_impact if structured_review is not None else None,
-                    )
-                    parsed_review = ParsedReview(
-                        state=resumed_record.metadata.state or parse_agent_state(review_output),
-                        summary=reparsed_review.summary,
-                        blocking_items=reparsed_review.blocking_items,
-                        followups=reparsed_review.followups,
-                        dispositions=resumed_record.metadata.dispositions,
-                        architecture_impact=resumed_impact,
-                        architecture_impact_degradations=resumed_records,
-                        exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
-                        requirement_evidence=resumed_record.metadata.requirement_evidence,
-                        screenshot_requests=resumed_record.metadata.screenshot_requests, screenshot_coverage_acceptances=resumed_record.metadata.screenshot_coverage_acceptances,
-                        post_merge_obligations=tuple(parse_post_merge_request(r) for r in resumed_record.metadata.post_merge_requests),
-                        sub_item_degradations=resumed_record.metadata.sub_item_degradations,
-                        ignored_prior_disposition_ids=resumed_record.metadata.ignored_prior_disposition_ids,
-                    )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
                     log(config, f"Round {round_number}: resuming {reviewer_name}'s completed review")
@@ -5746,8 +5788,7 @@ def run_pr_loop(
                             reviewer=reviewer,
                             spool=pr_round_spool,
                             public_peers=pr_round_public_peers,
-                            recovery=_pr_round_recovery,
-                            validators=sequential_pr_validators,
+                                    validators=sequential_pr_validators,
                             unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
                             already_posted=reviewer_name in completed_by_name, posted_rejection_reasons=posted_rejection_reasons,
                             invoke=lambda: _run_validated_agent(
@@ -5982,20 +6023,7 @@ def run_pr_loop(
                     round_evidence_requests.append(
                         (reviewer_name, parsed_review.exact_head_evidence_requests)
                     )
-                blocking_summary = parsed_review.summary
-                has_structured_blocking_content = bool(
-                    parsed_review.blocking_items or parsed_review.followups.same_pr
-                )
-                has_active_carried_disposition = any(
-                    disposition.disposition in {"blocking", "same-pr"}
-                    for disposition in parsed_review.dispositions
-                )
-                has_blocking_summary = not has_structured_blocking_content and _should_record_new_blocking_item(
-                    blocking_summary,
-                    had_prior_items=bool(prior_unresolved_items),
-                    had_dispositions=bool(parsed_review.dispositions),
-                    has_active_carried_disposition=has_active_carried_disposition,
-                )
+                has_blocking_summary = pr_records_blocking_summary(parsed_review, had_prior_items=bool(prior_unresolved_items))
                 log(
                     config,
                     f"Round {round_number}: {reviewer_name} outcome is "
@@ -6007,67 +6035,14 @@ def run_pr_loop(
                         (resumed_record is None or resumed_record.metadata.phase == "publication")
                         and carried_approval_record is None
                     ):
-                        if parsed_review.blocking_items:
-                            for blocking_item in parsed_review.blocking_items:
-                                tracked_item = _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer=blocking_item.reviewer,
-                                    source_round=round_number,
-                                    text=blocking_item.text,
-                                    status="blocking",
-                                    fix_scope=blocking_item.fix_scope,
-                                    sub_items=blocking_item.sub_items,
-                                    evidence_row_ids=blocking_item.evidence_row_ids,
-                                )
-                                round_new_unresolved_items.append(tracked_item)
-                                reviewer_new_unresolved_items.append(tracked_item)
-                                next_unresolved_item_number += 1
-                        elif has_blocking_summary:
-                            tracked_item = _next_unresolved_item(
-                                item_number=next_unresolved_item_number,
-                                reviewer=reviewer_name,
-                                source_round=round_number,
-                                text=blocking_summary,
-                                status="blocking",
-                            )
-                            round_new_unresolved_items.append(tracked_item)
-                            reviewer_new_unresolved_items.append(tracked_item)
-                            next_unresolved_item_number += 1
-                        if parsed_review.followups.same_pr:
-                            # Once a review is blocking, its same-PR findings
-                            # belong in the mandatory fix round regardless of
-                            # the policy for optional follow-ups on an approved
-                            # review. The mode only controls publication of the
-                            # latter.
-                            for followup in parsed_review.followups.same_pr:
-                                tracked_item = _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer=followup.reviewer,
-                                    source_round=round_number,
-                                    text=followup.text,
-                                    status="same-pr",
-                                    fix_scope=followup.fix_scope,
-                                    sub_items=followup.sub_items,
-                                )
-                                round_new_unresolved_items.append(tracked_item)
-                                reviewer_new_unresolved_items.append(tracked_item)
-                                next_unresolved_item_number += 1
-                        if config.approved_followups != "ignore":
-                            # Off-scope future follow-ups on a blocking review
-                            # (#1389) are recorded exactly like those on an
-                            # approved review: never coder work, published at
-                            # approval.
-                            for followup in parsed_review.followups.future:
-                                tracked_item = _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer=followup.reviewer,
-                                    source_round=round_number,
-                                    text=followup.text,
-                                    status="future",
-                                )
-                                round_new_unresolved_items.append(tracked_item)
-                                reviewer_new_unresolved_items.append(tracked_item)
-                                next_unresolved_item_number += 1
+                        # Settlement's minting, shared with the closed-incomplete writer (#2064).
+                        minted = mint_pr_review_items(
+                            parsed_review, reviewer=reviewer_name, round_number=round_number,
+                            next_item_number=next_unresolved_item_number, has_blocking_summary=has_blocking_summary,
+                            approved_followups=config.approved_followups)
+                        round_new_unresolved_items.extend(minted)
+                        reviewer_new_unresolved_items.extend(minted)
+                        next_unresolved_item_number += len(minted)
                         if reviewer not in early_published_pr_reviewers:
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed_review, review_output=review_output,
@@ -6088,18 +6063,13 @@ def run_pr_loop(
                     (resumed_record is None or resumed_record.metadata.phase == "publication")
                     and carried_approval_record is None
                 ):
-                    if config.approved_followups != "ignore":
-                        for followup in parsed_review.followups.future:
-                            tracked_item = _next_unresolved_item(
-                                item_number=next_unresolved_item_number,
-                                reviewer=followup.reviewer,
-                                source_round=round_number,
-                                text=followup.text,
-                                status="future",
-                            )
-                            round_new_unresolved_items.append(tracked_item)
-                            reviewer_new_unresolved_items.append(tracked_item)
-                            next_unresolved_item_number += 1
+                    minted = mint_pr_review_items(
+                        parsed_review, reviewer=reviewer_name, round_number=round_number,
+                        next_item_number=next_unresolved_item_number, has_blocking_summary=False,
+                        approved_followups=config.approved_followups)
+                    round_new_unresolved_items.extend(minted)
+                    reviewer_new_unresolved_items.extend(minted)
+                    next_unresolved_item_number += len(minted)
                     if reviewer not in early_published_pr_reviewers:
                         _post_pr_reviewer_comment(
                             reviewer_name, parsed_review, review_output=review_output,
@@ -6451,7 +6421,8 @@ def run_pr_loop(
                     epoch_round=pr_primary_epoch_round,
                     primary=scheduler_contract.primary_reviewer,
                     eligible=pr_pre_epoch_panel_items,
-                ))
+                )) | set(closure_carried_items(pr_ledger_view(unresolved_items), pr_closure_item_ids,
+                                               primary=scheduler_contract.primary_reviewer))
                 if scheduler_capabilities.requires_primary else set()
             )
             if (

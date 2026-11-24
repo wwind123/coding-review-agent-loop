@@ -1006,8 +1006,6 @@ from .review_rounds import (
     _incomplete_pr_review_error,
     PartialReviewRoundError,
     _replay_unavailable_cause,
-    _format_recovery_target,
-    _render_recovery,
     _partial_round_refusal,
     _replay_spooled_failure,
     _refuse_partial_round_before_sequential_turns,

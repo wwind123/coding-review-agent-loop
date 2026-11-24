@@ -12,9 +12,9 @@ response digest and a digest of the validation context.  A rerun then
 classifies the *whole* frozen sequence against a complete actor-bound listing
 and posts only a strictly missing suffix.  Any other pattern -- a gap, an
 ambiguous or out-of-order match, a changed actor, a changed validation
-context, an incomplete read -- stops the run with the record kept, nothing
-posted, and no reviewer launched; the operator repairs it with the existing
-partial-round recovery list (#1142).
+context, an incomplete read -- stops with the record kept, nothing posted, and
+no reviewer launched.  Each stop carries a category (#2064): a failed read is
+a retryable stop, and any other failure closes the round as incomplete.
 
 Records written before this protocol are *legacy*: their original actor and
 publication progress are unknown, so a complete cross-author listing must
@@ -38,8 +38,8 @@ from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, is_round_tr
 CLOCK_SKEW = datetime.timedelta(seconds=120)
 
 _RECOVERY_HINT = (
-    "Repair the round with the partial-round recovery list (#1142): delete the listed "
-    "comments so the whole round runs again, then rerun."
+    "The round is closed as incomplete and review continues in the next round; no "
+    "comment needs to be deleted."
 )
 
 
@@ -47,7 +47,14 @@ class PublicationResumeStop(AgentLoopError):
     """A spooled publication must not be resumed automatically.
 
     Nothing was posted, the spool record was kept, and no reviewer was launched.
+    ``category`` is ``read`` for a failed comment, listing, actor or age read
+    (a retryable stop) and ``structural`` for a malformed, mismatched or
+    possibly public carrier (the round closes as incomplete, #2064).
     """
+
+    def __init__(self, message: str, *, category: str = "structural") -> None:
+        super().__init__(message)
+        self.category = category
 
 
 def _sha256(text: str) -> str:
@@ -251,11 +258,12 @@ class RoundPublication:
     config: object | None = None
 
     # -- helpers -----------------------------------------------------------
-    def _stop(self, message: str) -> PublicationResumeStop:
+    def _stop(self, message: str, *, category: str) -> PublicationResumeStop:
         return PublicationResumeStop(
             f"{self.reviewer_name}'s spooled round-{self.round_number} publication on "
             f"{self.surface} cannot be resumed automatically: {message} The spool record "
-            "was kept, nothing was posted, and no reviewer was launched."
+            "was kept, nothing was posted, and no reviewer was launched.",
+            category=category,
         )
 
     def _complete(self, actor: bool):
@@ -264,7 +272,8 @@ class RoundPublication:
         if comments is None:
             raise self._stop(
                 "the conversation could not be read completely "
-                f"({getattr(listing, 'reason', 'unknown reason')})."
+                f"({getattr(listing, 'reason', 'unknown reason')}).",
+                category="read",
             )
         return comments
 
@@ -291,7 +300,7 @@ class RoundPublication:
         del published  # no exception for an already-public anchor
         state, raw = self.spool.publication_state(self.reviewer_name)
         if state == "malformed":
-            raise self._stop("its spool record or frozen publication carrier is malformed or unreadable. " + _RECOVERY_HINT)
+            raise self._stop("its spool record or frozen publication carrier is malformed or unreadable. " + _RECOVERY_HINT, category="structural")
         if state == "legacy":
             self._check_legacy()
             return None
@@ -306,7 +315,7 @@ class RoundPublication:
         if state == "absent":
             return PreparedPublication(bodies)
         if state == "malformed":
-            raise self._stop("its frozen publication carrier is malformed.")
+            raise self._stop("its frozen publication carrier is malformed.", category="structural")
         if state == "legacy":
             self._check_legacy()
         if state in {"legacy", "fresh"}:
@@ -331,14 +340,16 @@ class RoundPublication:
         except AgentLoopError as exc:
             raise self._stop(
                 f"a publication carrier could not be frozen because the authenticated actor "
-                f"is unavailable ({exc})."
+                f"is unavailable ({exc}).",
+                category="read",
             ) from exc
         listing = self.list_comments(True)
         comments = getattr(listing, "comments", None)
         if comments is None:
             raise self._stop(
                 "a publication carrier could not be frozen because the pre-publication "
-                f"baseline listing is incomplete ({getattr(listing, 'reason', 'unknown reason')})."
+                f"baseline listing is incomplete ({getattr(listing, 'reason', 'unknown reason')}).",
+                category="read",
             )
         baseline = tuple(sorted(c.comment_id for c in comments if c.body in bodies))
         carrier = PublicationCarrier(
@@ -360,40 +371,45 @@ class RoundPublication:
         try:
             carrier = PublicationCarrier.from_dict(raw)
         except (ValueError, TypeError) as exc:
-            raise self._stop(f"its frozen publication carrier is malformed ({exc}).") from exc
+            raise self._stop(f"its frozen publication carrier is malformed ({exc}).", category="structural") from exc
         fields = self.spool.load(self.reviewer_name)
         if fields is None or response_digest(fields) != carrier.response_sha256:
-            raise self._stop("the spooled response no longer matches the frozen carrier.")
+            raise self._stop("the spooled response no longer matches the frozen carrier.", category="structural")
         anchor = carrier.bodies[-1]
         if not self._names_this_reviewer(anchor):
             raise self._stop(
                 "the frozen anchor's round metadata does not name this reviewer, flow, "
-                "subject and round."
+                "subject and round.",
+                category="structural",
             )
         if carrier.validation_context_digest != self.validation_context:
             raise self._stop(
                 "the validation context (head, candidate or surfaced requirements) changed "
-                "since the carrier was frozen."
+                "since the carrier was frozen.",
+                category="structural",
             )
         if carrier.actor_id is None or carrier.baseline_ids is None:
             raise self._stop(
-                "the carrier was frozen without a provable actor or pre-write baseline."
+                "the carrier was frozen without a provable actor or pre-write baseline.",
+                category="structural",
             )
         try:
             _login, current_id = self.resolve_actor()
         except AgentLoopError as exc:
-            raise self._stop(f"the authenticated actor could not be resolved ({exc}).") from exc
+            raise self._stop(f"the authenticated actor could not be resolved ({exc}).", category="read") from exc
         if current_id != carrier.actor_id:
             raise self._stop(
                 f"it was frozen by actor {carrier.actor_login} (id {carrier.actor_id}) but the "
-                f"current credentials authenticate actor id {current_id}."
+                f"current credentials authenticate actor id {current_id}.",
+                category="structural",
             )
         comments = self._complete(True)
         result = classify_frozen_sequence(carrier, comments)
         if result.kind in {"ambiguous", "disorder", "gap"}:
             raise self._stop(
                 f"{result.detail}; matched comment ids: {_describe_matches(result)}. "
-                + _RECOVERY_HINT
+                + _RECOVERY_HINT,
+                category="structural",
             )
         if self.config is not None:
             log(
@@ -409,7 +425,7 @@ class RoundPublication:
     def _check_legacy(self) -> None:
         mtime = self.spool.record_mtime(self.reviewer_name)
         if mtime is None:
-            raise self._stop("the legacy spool record's age cannot be read.")
+            raise self._stop("the legacy spool record's age cannot be read.", category="read")
         floor = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc) - CLOCK_SKEW
         comments = self._complete(False)
         suspects = [
@@ -426,5 +442,6 @@ class RoundPublication:
             )
             raise self._stop(
                 "this record predates publication carriers and possible earlier publication is "
-                f"visible ({listed}). " + _RECOVERY_HINT
+                f"visible ({listed}). " + _RECOVERY_HINT,
+                category="structural",
             )

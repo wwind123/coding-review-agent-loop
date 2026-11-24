@@ -571,46 +571,35 @@ def test_home_exemption_does_not_cover_ancestors_of_home(tmp_path, spool_config,
         review_rounds.validate_review_spool_placement(config)
 
 
-def test_partial_round_refusal_wording_with_and_without_an_unresolved_conversion_boundary():
-    """The ordinary refusal is unchanged; an unresolved boundary drops the withheld-outcome diagnosis (#1676)."""
-    recovery_calls = []
-
-    def recovery():
-        recovery_calls.append(True)
-        raise RuntimeError("listing unavailable")
+def test_partial_round_invariant_signals_closure_or_a_retryable_read_failure():
+    """#2064: the former refusal is a closure signal; an unresolved boundary is a read failure (#1676)."""
+    from coding_review_agent_loop.round_closure_writer import RoundIncompleteSignal, RoundStateReadError
 
     ordinary = review_rounds._partial_round_refusal(
         surface="pr", number=77, round_number=3, reviewer_name="Codex",
         public_peers=["Antigravity", "Gemini"], cause="Some cause.",
     )
-    assert str(ordinary) == (
-        "Review round 3 on PR #77 is partially published (Antigravity, Gemini already posted) "
-        "but Codex's withheld same-round outcome is missing or no longer validates, so "
-        "invoking it now would let it read its peers' findings. Some cause."
-    )
+    assert type(ordinary) is RoundIncompleteSignal
+    assert ordinary.published == ("Antigravity", "Gemini")
+    assert ordinary.unreplayable == (("Codex", "Some cause."),)
+    assert ordinary.before_publication
+    assert "round 4" in str(ordinary) and "delet" not in str(ordinary).lower()
     unresolved = review_rounds._partial_round_refusal(
         surface="pr", number=77, round_number=3, reviewer_name="Codex",
-        public_peers=["Antigravity"], cause="Ignored cause.", recovery=recovery,
-        unresolved_conversion_boundary=True,
+        public_peers=["Antigravity"], cause="Ignored cause.", unresolved_conversion_boundary=True,
     )
-    assert type(unresolved) is review_rounds.PartialReviewRoundError
+    assert type(unresolved) is RoundStateReadError
     message = str(unresolved)
-    first, listing = message.split("\n", 1)
-    assert first == (
-        "Review round 3 on PR #77 is partially published (Antigravity already posted), and "
-        "this round's evidence-conversion record could not be admitted as a trusted boundary: "
-        "either its identity could not be read or it is not a trusted, accepted conversion "
-        "record. So the earlier pass's publications cannot be excluded from the peer set, and "
-        "invoking Codex now could let it read them; the run stopped fail-closed. Retry once "
-        "GitHub comment reads succeed, or inspect the conversion record if reads were healthy."
-    )
-    assert recovery_calls == [True] and "comment list is unavailable" in listing
-    assert "withheld" not in message and "Ignored cause" not in message
+    assert "evidence-conversion record could not be admitted" in message
+    assert "rerun once GitHub comment reads succeed" in message
+    assert "Ignored cause" not in message and "delet" not in message.lower()
 
 
 def test_sequential_guard_threads_the_unresolved_conversion_boundary():
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+
     spool = SimpleNamespace(surface="pr", number=77, round_number=3)
-    with pytest.raises(review_rounds.PartialReviewRoundError) as refused:
+    with pytest.raises(RoundStateReadError) as refused:
         review_rounds._refuse_partial_round_before_sequential_turns(
             spool=spool, fresh_turn_reviewers=["codex"], public_peers=["antigravity"],
             unresolved_conversion_boundary=True,
@@ -689,3 +678,171 @@ def test_reviewer_executor_polls_and_consumes_completions_once(monkeypatch, outc
         assert terminated == ([True] if outcome == 'interrupt' else [])
         assert executor.consumed == ([] if outcome == 'interrupt' else ['gemini'])
     assert executor.shutdown_calls == [{'wait': True, 'cancel_futures': True}]
+
+
+# --- #2064 stage 2: round-wide closure decision and defensive signals -------------
+
+
+def test_decide_round_closure_requires_a_publication_and_a_fresh_turn():
+    from coding_review_agent_loop.round_closure_writer import decide_round_closure
+
+    order = ["Codex", "Gemini", "Claude"]
+    assert decide_round_closure(round_number=2, reviewer_order=order, publications={},
+                                fresh_turns={"Claude": "no spool"}) is None
+    assert decide_round_closure(round_number=2, reviewer_order=order, publications={"Codex": 11},
+                                fresh_turns={}) is None
+    for flag in ("already_closed", "excluded"):
+        assert decide_round_closure(round_number=2, reviewer_order=order, publications={"Codex": 11},
+                                    fresh_turns={"Claude": "no spool"}, **{flag: True}) is None
+    decision = decide_round_closure(
+        round_number=2, reviewer_order=order, publications={"Gemini": 12, "Codex": 11},
+        fresh_turns={"Claude": "no spool", "Codex": "own review rejected"},
+    )
+    # Board order, round-wide: Codex's only public review is its own and it still closes.
+    assert decision.published == (("Codex", 11), ("Gemini", 12))
+    assert decision.unreplayable == (("Codex", "own review rejected"), ("Claude", "no spool"))
+
+
+class _Spool:
+    surface, number, round_number = "pr", 77, 3
+
+    def __init__(self, states, records=None):
+        self.states, self.records, self.removed = states, records or {}, []
+
+    def publication_state(self, name):
+        return self.states.get(name, ("absent", None))
+
+    def load(self, name):
+        return self.records.get(name)
+
+    def remove(self, name):
+        self.removed.append(name)
+
+
+def _classify(spool, *, publication_for, turn_names=("Codex", "Gemini"), published=None, rejected=None,
+              replay=lambda **kwargs: object(), monkeypatch=None):
+    from coding_review_agent_loop.round_closure_writer import classify_round_reviewers
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(review_rounds, "_replay_spooled_review", lambda runner, **kwargs: replay(**kwargs))
+    return classify_round_reviewers(
+        SimpleNamespace(), config=SimpleNamespace(), surface="pr", number=77, round_number=3,
+        reviewers=["codex", "gemini"], turn_names=set(turn_names),
+        published_records=published or {}, rejected_records=rejected or {}, rejection_reasons={},
+        spool=spool, validators_for=lambda name: {}, publication_for=publication_for,
+        comment_id_for=lambda record: getattr(record, "comment_id", None),
+    )
+
+
+def test_classification_read_failure_is_retryable_and_never_a_closure(monkeypatch):
+    """`read-failure-no-closure`: a failed listing or actor read raises before any post."""
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+
+    def gate_read_fails(name):
+        return SimpleNamespace(gate=lambda **kwargs: (_ for _ in ()).throw(
+            PublicationResumeStop("the conversation could not be read completely (HTTP 502).", category="read")))
+
+    spool = _Spool({"Codex": ("carrier", {})}, {"Codex": {"text": "x"}})
+    with pytest.raises(RoundStateReadError) as error:
+        _classify(spool, publication_for=gate_read_fails, monkeypatch=monkeypatch)
+    assert "rerun once GitHub comment reads succeed" in str(error.value)
+    assert "delet" not in str(error.value).lower()
+    assert spool.removed == []
+
+
+def test_classification_counts_public_or_unverifiable_carriers_and_not_verified_unpublished_ones(monkeypatch):
+    """`spool-carrier-closes` / `no-published-no-rollover` at the classifier."""
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    def publication_for(name):
+        if name == "Codex":  # a structural carrier failure: cannot exclude publication
+            return SimpleNamespace(gate=lambda **k: (_ for _ in ()).throw(PublicationResumeStop("gap", category="structural")))
+        return SimpleNamespace(gate=lambda **k: SimpleNamespace(already_public=frozenset(), bodies=("a", "b")))
+
+    spool = _Spool({"Codex": ("carrier", {}), "Gemini": ("carrier", {})},
+                   {"Codex": {"text": "x"}, "Gemini": {"text": "y"}})
+    found = _classify(spool, publication_for=publication_for, monkeypatch=monkeypatch,
+                      replay=lambda **kwargs: None if kwargs["reviewer"] == "gemini" else object())
+    assert found.publications == {"Codex": None}
+    assert found.fresh_turns["Codex"] == "its frozen same-round publication cannot be resumed"
+    # Gemini's carrier is verified unpublished: an invalid response is an ordinary fresh turn.
+    assert found.fresh_turns["Gemini"] == "its spooled outcome no longer validates against this run"
+    assert found.stale_unpublished == ["Gemini"]
+    malformed = _classify(_Spool({"Gemini": ("malformed", None)}), publication_for=publication_for,
+                          monkeypatch=monkeypatch)
+    assert malformed.publications == {"Gemini": None}
+    assert malformed.fresh_turns["Gemini"] == "its spool record is malformed or unreadable"
+
+
+def test_rejected_own_publication_always_needs_a_fresh_turn_even_with_a_valid_spool(monkeypatch):
+    """`single-reviewer-own-rejected`: content-valid spool data never makes it replayable."""
+    record = SimpleNamespace(comment_id=41)
+    spool = _Spool({"Codex": ("fresh", None)}, {"Codex": {"text": "still valid"}})
+    found = _classify(spool, publication_for=lambda name: None, turn_names=("Codex",),
+                      rejected={"Codex": record}, monkeypatch=monkeypatch)
+    assert found.publications == {"Codex": 41}
+    assert found.fresh_turns == {"Codex": "its own published review was rejected by resume"}
+
+
+def test_former_refusal_sites_raise_the_closure_signal_before_invoking_anyone(tmp_path):
+    """`defensive-signal-routed`: each former site raises RoundIncompleteSignal, posts nothing."""
+    from coding_review_agent_loop.round_closure_writer import RoundIncompleteSignal
+
+    spool = review_rounds.ReviewRoundSpool(
+        root=tmp_path, repo="OWNER/REPO", surface="pr", number=77, round_number=3, subject="abc")
+    with pytest.raises(RoundIncompleteSignal) as sequential:
+        review_rounds._refuse_partial_round_before_sequential_turns(
+            spool=spool, fresh_turn_reviewers=["codex"], public_peers=["gemini"])
+    assert sequential.value.published == ("Gemini",) and sequential.value.before_publication
+    invoked = []
+    with pytest.raises(RoundIncompleteSignal):
+        review_rounds._same_round_replay_or_invoke(
+            SimpleNamespace(), config=SimpleNamespace(), reviewer="codex", spool=spool,
+            public_peers=["gemini"], validators={}, invoke=lambda: invoked.append("codex"))
+    with pytest.raises(RoundIncompleteSignal) as launch:
+        review_rounds._launch_reviewer_turns(
+            SimpleNamespace(terminate_active_processes=lambda: None), ["codex"], thread_name_prefix="t",
+            run_turn=lambda reviewer: invoked.append(reviewer), spool=spool,
+            replay_turn=lambda reviewer, fields: None, public_peers=["gemini"])
+    assert invoked == []
+    for error in (sequential.value, launch.value):
+        message = str(error)
+        assert "round 4" in message and "delet" not in message.lower()
+        assert not isinstance(error, review_rounds.PartialReviewRoundError)
+
+
+def test_shared_pr_reconstruction_matches_resume_and_follows_the_published_state():
+    """Resume and the closure writer rebuild the same review and mint by published state."""
+    from agent_loop_helpers import structured_pr_review
+    from coding_review_agent_loop.round_closure_writer import (
+        mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
+    )
+
+    response = structured_pr_review(state="blocking", summary="Blocks.", blocking_items=["Fix the race."],
+                                    future_followups=["Track a metric."])
+    for state, expected in (("blocking", ["blocking", "future"]), ("approved", ["future"])):
+        record = SimpleNamespace(body="rendered", metadata=PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=2, subject="h", state=state,
+            phase="publication", canonical_reviewer_response=response))
+        parsed, output = pr_published_review(record, reviewer="Codex")
+        assert output == response and parsed.state == state
+        assert [i.text for i in parsed.blocking_items] == ["Fix the race."]
+        minted = mint_pr_review_items(
+            parsed, reviewer="Codex", round_number=2, next_item_number=5, approved_followups="record",
+            has_blocking_summary=pr_records_blocking_summary(parsed, had_prior_items=False))
+        assert [i.status for i in minted] == expected
+        assert [i.item_id for i in minted] == [f"item-{5 + n}" for n in range(len(expected))]
+
+
+def test_shared_plan_reconstruction_uses_the_legacy_fallback_and_mints_every_list():
+    from coding_review_agent_loop.round_closure_writer import mint_plan_review_items, plan_published_review
+
+    legacy = "### Blocking plan issues\n- Add a migration step.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    record = SimpleNamespace(body=legacy, metadata=PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=2, subject="p", state="blocking",
+        phase="publication"))
+    parsed, output = plan_published_review(record, reviewer="Codex", surfaced_requirement_ids=())
+    assert output == legacy and parsed.state == "blocking"
+    minted = mint_plan_review_items(parsed, round_number=2, next_item_number=3, prior_items=())
+    assert [(i.item_id, i.status, i.text) for i in minted] == [("item-3", "blocking", "Add a migration step.")]

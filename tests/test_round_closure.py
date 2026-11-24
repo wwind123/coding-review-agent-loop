@@ -241,10 +241,18 @@ def test_pr_closure_record_closes_round_for_scheduler_checkpoints():
     assert inert_post_reconciliation_checkpoint_indexes(records) == {3}
 
 
-def test_closure_of_another_head_or_round_leaves_reviews_live():
+def test_closure_of_another_head_or_round_is_a_freshness_boundary_for_earlier_reviews():
+    """#2064 item-7: a closed-incomplete record of another round or head closes
+    no review of its own round here, but round N+1 needs the full board, so
+    every earlier reviewer record is history.  The same-round view used by the
+    no-progress window leaves them live."""
+    from coding_review_agent_loop.round_closure import closed_round_reviewer_indexes
+
     for closure in (_closure(subject="d" * 40), _closure(round_number=3)):
         records = _extract_round_metadata_records(_pr_comments(closure=closure), flow="pr")
-        assert closed_round_review_indexes(records) == frozenset()
+        reviewers = {r.index for r in records if r.metadata.role == "reviewer"}
+        assert reviewers and closed_round_review_indexes(records) == reviewers
+        assert closed_round_reviewer_indexes(records, flow="pr", freshness=False) == frozenset()
 
 
 def test_pr_closure_blocks_approval_carry_unit():

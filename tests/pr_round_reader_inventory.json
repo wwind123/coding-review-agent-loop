@@ -1928,10 +1928,10 @@
     },
     {
       "module": "pr_loop",
-      "function": "run_pr_loop::_pr_recovery_fingerprint",
-      "call": "_extract_round_metadata_records(remaining, flow='pr')",
+      "function": "run_pr_loop::_pr_round_closure",
+      "call": "_extract_round_metadata_records(pr_comments, flow='pr')",
       "family": "rounds",
-      "provenance": "pr_loop.run_pr_loop::_pr_recovery_fingerprint: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Live startup, post-publication, head-change and qualification consumers use comments from get_observed_pr_review_context; subset fingerprinting retains bound immutable objects.",
+      "provenance": "pr_loop.run_pr_loop::_pr_round_closure: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. The round-start closure decision (#2064) reads the same admitted observed pr_comments snapshot as resume, through round_visibility, before any checkpoint or launch.",
       "occurrence": 1
     },
     {
@@ -3180,6 +3180,12 @@
     },
     {
       "module": "plan_first_loop",
+      "function": "_run_plan_first_loop_body::_plan_round_closure",
+      "classification": "reader",
+      "admission": "plan_first_loop admits startup context and every refreshed issue context before scope, drift, approval, scheduler or recovery readers; the round-start closure decision (#2064) reads admitted plan_history_records through round_visibility."
+    },
+    {
+      "module": "plan_first_loop",
       "function": "_run_plan_first_loop_body::inherited_review_context",
       "classification": "reader",
       "admission": "plan_first_loop admits startup context and every refreshed issue context before scope, drift, approval, scheduler or recovery readers; parent/child acquisitions remain separate."
@@ -3351,6 +3357,12 @@
       "function": "_entry_plan_handoff_board",
       "classification": "reader",
       "admission": "pr_loop startup and refresh use github.get_pr_review_context; pr_loop_support.admitted_pr_records and admitted_capture_history bind fresh invocation-only history before resume, approval or capture selection."
+    },
+    {
+      "module": "pr_loop",
+      "function": "run_pr_loop::_pr_round_closure",
+      "classification": "reader",
+      "admission": "pr_loop startup and refresh use github.get_pr_review_context; the round-start closure decision (#2064) reads the same admitted observed pr_comments snapshot as resume through round_visibility before any checkpoint or launch."
     },
     {
       "module": "pr_loop",

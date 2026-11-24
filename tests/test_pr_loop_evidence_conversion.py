@@ -24,7 +24,7 @@ from coding_review_agent_loop.pr_loop_support import (
     authenticated_pr_comments,
     evidence_authority_from_records,
 )
-from coding_review_agent_loop.review_rounds import PartialReviewRoundError
+from coding_review_agent_loop.round_closure_writer import RoundIncompleteSignal, RoundStateReadError
 from coding_review_agent_loop.protocol_risk import (
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
@@ -1488,12 +1488,20 @@ def test_a_primary_only_round_then_auto_conversion_reruns_the_full_board_without
 
 
 def _assert_unresolved_boundary_refusal(message: str) -> None:
-    """The refusal names the unresolved conversion boundary, neutral about why (#1676)."""
-    assert message.startswith("Review round 3 on PR #77 is partially published (Antigravity already posted), ")
+    """A retryable read failure names the unresolved conversion boundary (#1676, #2064)."""
+    assert message.startswith("Review round 3 on PR #77 could not be classified because a GitHub read failed")
     assert "this round's evidence-conversion record could not be admitted as a trusted boundary" in message
-    assert "either its identity could not be read or it is not a trusted, accepted conversion record" in message
-    assert "withheld" not in message
+    assert "rerun once GitHub comment reads succeed" in message
+    assert "withheld" not in message and "delet" not in message.lower()
     assert "missing or no longer validates" not in message
+
+
+def _assert_excluded_pass_stop(error, peer: str) -> None:
+    """Inside a conversion repeat the invariant stops fail-closed; the pass is never closed (#2064)."""
+    assert isinstance(error, RoundIncompleteSignal)
+    assert "inside its conversion repeat" in str(error)
+    assert peer in error.published
+    assert "delet" not in str(error).lower()
 
 
 def _fail_boundary_identity_reads(monkeypatch) -> None:
@@ -1529,10 +1537,10 @@ def test_an_untrusted_conversion_record_does_not_move_the_visibility_boundary(tm
         return outcome
 
     monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_forge)
-    with pytest.raises(PartialReviewRoundError) as refused:
+    with pytest.raises(RoundIncompleteSignal) as refused:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
-    assert "Antigravity already posted" in str(refused.value)
-    assert "withheld same-round outcome" in str(refused.value)
+    _assert_excluded_pass_stop(refused.value, "Antigravity")
+    assert not any("closed, incomplete" in c for c in runner.comments)
     conversion = _conversion(runner)
     assert runner.pr_payload["comments"][conversion.index]["author"] == {"login": "mallory"}
     assert _reviews_after(runner, conversion.index) == []
@@ -1553,7 +1561,7 @@ def test_a_failed_identity_read_names_the_unresolved_conversion_boundary(tmp_pat
         return outcome
 
     monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_lose_reads)
-    with pytest.raises(PartialReviewRoundError) as refused:
+    with pytest.raises(RoundStateReadError) as refused:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     _assert_unresolved_boundary_refusal(str(refused.value))
     conversion = _conversion(runner)
@@ -1609,20 +1617,15 @@ def test_a_partial_repeat_pass_still_refuses_and_lists_only_post_conversion_reco
     ).discard()
     runner.simulate_new_process()
     launches = {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
-    with pytest.raises(PartialReviewRoundError) as refused:
+    with pytest.raises(RoundIncompleteSignal) as refused:
         run_pr_loop(
             runner, pr_number=77, approved_plan_context=context,
             config=dataclasses.replace(config, review_parallel=False),
         )
-    message = str(refused.value)
-    assert f"({peer} already posted)" in message
-    assert "Antigravity already posted" not in message or peer == "Antigravity"
+    _assert_excluded_pass_stop(refused.value, peer)
     assert launches == {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
-    # Only records after the conversion are deletion targets.
-    listed = [int(value) for value in re.findall(r"comment (\d+) https://", message)]
-    assert listed
-    conversion_id = 10_000 + conversion.index + 1
-    assert all(comment_id > conversion_id for comment_id in listed)
+    # Nothing is posted into the pass and no comment is named for deletion.
+    assert not any("closed, incomplete" in c for c in runner.comments)
 
 
 def test_a_sequential_resume_with_a_failed_boundary_read_names_the_unresolved_boundary(
@@ -1642,16 +1645,12 @@ def test_a_sequential_resume_with_a_failed_boundary_read_names_the_unresolved_bo
     runner.simulate_new_process()
     _fail_boundary_identity_reads(monkeypatch)
     launches = {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
-    with pytest.raises(PartialReviewRoundError) as refused:
+    with pytest.raises(RoundStateReadError) as refused:
         run_pr_loop(
             runner, pr_number=77, approved_plan_context=context,
             config=dataclasses.replace(config, review_parallel=False),
         )
-    message = str(refused.value)
-    assert message.startswith("Review round 3 on PR #77 is partially published (")
-    assert "Antigravity" in message.split(" already posted)", 1)[0]
-    assert "this round's evidence-conversion record could not be admitted as a trusted boundary" in message
-    assert "withheld" not in message and "missing or no longer validates" not in message
+    _assert_unresolved_boundary_refusal(str(refused.value))
     assert launches == {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
 
 
@@ -1773,12 +1772,12 @@ def test_a_partial_repeat_after_an_operator_conversion_restart_still_refuses(tmp
         config, surface="pr", number=77, round_number=3, subject=START_HEAD
     ).discard()
     runner.simulate_new_process()
-    with pytest.raises(PartialReviewRoundError) as refused:
+    with pytest.raises(RoundIncompleteSignal) as refused:
         run_pr_loop(
             runner, pr_number=77, approved_plan_context=context,
             config=dataclasses.replace(config, pr_convert_evidence_rows=(), review_parallel=False),
         )
-    assert f"({published.metadata.agent} already posted)" in str(refused.value)
+    _assert_excluded_pass_stop(refused.value, published.metadata.agent)
 
 
 def _conversion_metadata(*, source, round_number, head=START_HEAD, review_round=None):

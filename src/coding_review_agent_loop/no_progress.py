@@ -165,7 +165,7 @@ def pr_no_progress_observations(
         (record for record in records if getattr(record.metadata, "flow", None) == "pr"),
         key=lambda record: record.index,
     )
-    inert = closed_round_reviewer_indexes(ordered, flow="pr")
+    inert = closed_round_reviewer_indexes(ordered, flow="pr", freshness=False)
     closed_rounds = {
         record.metadata.round_number
         for record in ordered

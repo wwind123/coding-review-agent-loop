@@ -234,8 +234,6 @@ def test_orphan_attachments_are_attributed_only_after_the_conversion():
 
 def test_an_unlocatable_boundary_advises_no_deletion_at_all():
     """item-1: the resolver fails in REST and in the snapshot (an identity-read outage)."""
-    from coding_review_agent_loop.review_rounds import _render_recovery
-
     history, _at = _conversion_round()
     calls = []
 
@@ -248,9 +246,6 @@ def test_an_unlocatable_boundary_advises_no_deletion_at_all():
     assert not recovery.verified
     assert recovery.targets == () and recovery.uncertain == ()
     assert "could not be located" in recovery.reason
-    rendered = _render_recovery(recovery)
-    assert "No deletion list is given" in rendered
-    assert "issuecomment" not in rendered and "c/10" not in rendered
 
 
 def test_closed_planning_round_never_advises_deletion_with_rest_or_snapshot():
@@ -301,14 +296,13 @@ def test_ack_failure_recovery_retains_boundary_and_earlier_pass(shift, later_pub
         assert recovery.verified, recovery.reason
 
 
-# --- #2035: a changed signed requirement set still refuses, naming the change ---
+# --- #2035/#2064: a changed signed requirement set closes the round and rolls over ---
 
 
 @pytest.mark.parametrize("change", ["added", "edited", "withdrawn"])
-def test_2035_changed_requirement_set_refuses_with_named_cause(tmp_path, change):
+def test_2035_changed_requirement_set_closes_the_round_and_rolls_over(tmp_path, change):
     from coding_review_agent_loop.cli import run_pr_loop
     from coding_review_agent_loop.github import _parse_pr_human_requirements
-    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
     from pr_loop_test_helpers import _association, _classified_review, _signed
     from test_pr_loop_resume import _classification_failed_round, _no_deletes
 
@@ -325,27 +319,14 @@ def test_2035_changed_requirement_set_refuses_with_named_cause(tmp_path, change)
         del comments[signed_indexes[-1]]
     current = {r.requirement_id for r in _parse_pr_human_requirements(runner.pr_payload)}
     assert current != set(rids)
-    before = len(runner.commands)
     runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)], hr=True)]
-    if change == "added":
-        # Pure growth now rolls over into round 2 instead of refusing (#2054).
-        runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)],
-                                                    reviewer="Google Gemini", hr=True)]
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-        assert any("superseded by new signed input" in c for c in runner.comments)
-        assert not any("Delete these" in c for c in runner.comments)
-        assert _no_deletes(runner)
-        return
-    with pytest.raises(PartialReviewRoundError) as error:
-        run_pr_loop(runner, pr_number=77, config=config)
-    message = str(error.value)
-    assert "Codex's own review for this round is already posted but no longer accepted" in message
-    assert "the signed requirement set changed since publication" in message
-    expected_word = {"edited": "added", "withdrawn": "withdrawn"}[change]
-    assert expected_word in message.split("signed requirement set changed since publication", 1)[1]
-    # No fresh turn beside public peers, and no classification continuation.
-    assert not any(cmd[:1] in (["codex"], ["gemini"]) for cmd, _ in runner.commands[before:])
-    assert runner.codex_outputs
+    runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in sorted(current)],
+                                                reviewer="Google Gemini", hr=True)]
+    # Every change, growth or not, now closes round 1 and reviews again in round 2 (#2064).
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert any("closed, incomplete" in c for c in runner.comments)
+    assert not any("superseded by new signed input" in c for c in runner.comments)
+    assert not any("Delete these" in c for c in runner.comments)
     assert _no_deletes(runner)
 
 

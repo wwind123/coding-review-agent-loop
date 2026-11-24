@@ -92,7 +92,6 @@ from .github import (
     IssueContext,
     get_issue_context,
     post_issue_comment,
-    read_rest_issue_comments,
     post_frozen_round_bodies,
     round_publication,
 )
@@ -127,10 +126,6 @@ from .protocol import (
     UnresolvedReviewItem,
     human_requirements_resolved,
     is_clarification_request,
-    parse_plan_review_items,
-    parse_plan_state,
-    parse_structured_plan_review,
-    review_freeform_summary_text,
     validate_structured_plan_state,
 )
 from .protocol_risk import validate_risk_test_matrix_revision, risk_test_matrix_identity
@@ -201,12 +196,8 @@ from .plan_review_scheduling import (
     plan_undecodable_history_message,
     select_plan_reviewers,
 )
-from .partial_round_recovery import (
-    PartialRoundRecovery,
-    RecoveryVisibilityContext,
-    compute_partial_round_recovery,
-)
-from .round_visibility import latest_round_checkpoint_index, visible_peer_names
+from .partial_round_recovery import RecoveryVisibilityContext
+from .round_visibility import latest_round_checkpoint_index, same_round_public_publications, visible_peer_names
 from .unresolved_items import (
     preserve_failed_seat_items,
     _apply_unresolved_item_dispositions,
@@ -215,7 +206,6 @@ from .unresolved_items import (
     _next_unresolved_item,
     _record_prior_item_disposition,
     _validate_plan_review_response,
-    carried_item_repeated_by,
 )
 from .agent_failure import (
     _capture_agent_invocation,
@@ -226,9 +216,7 @@ from .architecture_contract import (
     _architecture_metadata_fields,
     ignored_disposition_metadata_fields,
     _architecture_mode_validators,
-    _resumed_review_architecture,
 )
-from .plan_implementation_notes import resumed_implementation_notes
 from .validated_agent import (
     _run_validated_agent,
 )
@@ -310,6 +298,10 @@ from .review_rounds import (
     _launch_reviewer_turns,
     _ensure_parallel_reviewer_workdirs,
 )
+from .round_closure_writer import (
+    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, decide_round_closure,
+    impending_opening_source, mint_plan_review_items, plan_published_review,
+)
 from .execution_policy import (
     _current_execution_recommendation,
     staged_plan_mode_conflict_message,
@@ -356,20 +348,6 @@ def _plan_acknowledgement_blocker(
             status="blocking",
         ),
     )
-
-
-def _plan_review_item_tags(
-    item: object, prior_items: Sequence[UnresolvedReviewItem]
-) -> dict[str, object]:
-    """Minting-time provenance and repeat tags of a plan review finding (#1505).
-
-    Shared by every plan review minting path.  ``repeat_of`` is computed here
-    from the carried ledger the reviewer was shown, never read from agent output.
-    """
-    return {
-        "provenance": getattr(item, "provenance", None),
-        "repeat_of": carried_item_repeated_by(item.text, prior_items),  # type: ignore[attr-defined]
-    }
 
 
 def _plan_sweep_turn_inputs(
@@ -2679,25 +2657,85 @@ def _run_plan_first_loop_body(
             resumed=resumed_by_name, records=lambda: plan_history_records(),
             subject=current_plan_subject,
         )
-        if ownership_review_failure is None and not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and not plan_failed_seat_retry and any(
-            agent_display_name(reviewer) not in resumed_by_name
-            for reviewer in round_reviewers
-        ):
-            # Settlement precedes rollover; superseded secondary claims above
-            # establish no obligation. Qualified findings and dispositions stay.
+        def _plan_round_closure(signal: RoundIncompleteSignal | None = None) -> object | None:
+            """Round-wide closed-incomplete decision and writer on the plan surface (#2064)."""
+            if (ownership_review_failure is not None or plan_approved_shortcut or plan_failed_seat_retry
+                    or current_resume is None or current_resume.round_number != round_number or current_resume.reconciled):
+                return None
+            order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
+            completed = {record.metadata.agent: record for record in current_resume.completed_reviews}
+            # Public same-round publications by the shared visibility rule (#1156), across
+            # scheduler phases, minus the primary review that gates this launch.
+            history = plan_history_records()
+            launching = tuple(sorted(agent_display_name(reviewer) for reviewer in round_reviewers))
+            plan_launch_phase = plan_scheduler_decision.phase if staged_planning and plan_scheduler_decision is not None else None
+            visible = visible_peer_names(
+                history, opening_source=impending_opening_source(
+                    opened=plan_panel_evidence.opened, source=plan_panel_evidence.opening_source,
+                    launch_phase=plan_launch_phase, operator=bool(plan_operator_force_full)), flow="plan",
+                round_number=round_number, subject=current_plan_subject, reviewer_names=order,
+                primary_reviewer=plan_primary_name if staged_planning else None,
+                launch_phase=plan_launch_phase, launching=launching, checkpoint_index=max((record.index for record in history), default=-1) + 1)
+            published = {record.metadata.agent: completed.get(record.metadata.agent, record)
+                         for record in same_round_public_publications(
+                             history, flow="plan", round_number=round_number, subject=current_plan_subject,
+                             reviewer_names=order)
+                         if record.metadata.agent in visible and record.metadata.agent not in superseded_plan_prepanel}
+            rejected = {name: record for name, record in completed.items()
+                        if name not in resumed_by_name and name not in superseded_plan_prepanel
+                        and record.metadata.phase == "publication"}
+
+            def comment_id(record: PostedRoundRecord) -> int | None:
+                comments = issue_context.comments
+                return getattr(comments[record.index], "comment_id", None) if 0 <= record.index < len(comments) else None
+
+            if signal is None:
+                found = classify_round_reviewers(
+                    runner, config=config, surface="issue", number=issue_number, round_number=round_number,
+                    reviewers=configured_reviewers, published_records=published, rejected_records=rejected,
+                    turn_names={agent_display_name(r) for r in round_reviewers if agent_display_name(r) not in resumed_by_name},
+                    rejection_reasons={}, spool=plan_round_spool, validators_for=_plan_review_validators,
+                    publication_for=_plan_publication, comment_id_for=comment_id)
+                publications, fresh_turns = found.publications, found.fresh_turns
+            else:
+                publications = {name: (comment_id(completed[name]) if name in completed else None) for name in signal.published}
+                fresh_turns = dict(signal.unreplayable)
+                found = None
+            decision = decide_round_closure(round_number=round_number, reviewer_order=order,
+                                            publications=publications, fresh_turns=fresh_turns)
+            if decision is None:
+                for name in (found.stale_unpublished if found is not None else ()):
+                    plan_round_spool.remove(name)  # A verified unpublished stale carrier is discarded.
+                return None
+            closed = close_incomplete_round(
+                runner, config=config, decision=decision, flow="plan", subject=current_plan_subject,
+                number=issue_number, comments_length=len(issue_context.comments), current_resume=current_resume,
+                prior_items=prior_unresolved_items,
+                # Every completed round-N review (any phase) and any other public publication.
+                published_records={name: completed.get(name) or published[name] for name in order
+                                   if name not in superseded_plan_prepanel and (name in completed or name in published)},
+                next_item_number=max(next_unresolved_item_number, current_resume.next_unresolved_item_number),
+                mint_record=lambda record, n: mint_plan_review_items(
+                    plan_published_review(record, reviewer=record.metadata.agent, surfaced_requirement_ids=plan_hr_ids, strict=True)[0],
+                    round_number=record.metadata.round_number, next_item_number=n, prior_items=prior_unresolved_items),
+                bound_metadata=bound_plan_metadata,
+                post_comment=lambda body: post_issue_comment(runner, config=config, issue_number=issue_number, body=body),
+                extra_metadata=_architecture_metadata_fields(config))
+            plan_round_spool.discard()  # Save before emit: the ledger is durable in the posted record.
+            resumed_by_name.clear()
+            round_new_unresolved_items[:] = list(closed.current_round_new_items)
+            return closed
+
+        def _plan_roll_over_closed_round(closed_reviews: tuple[PostedRoundRecord, ...]) -> None:
+            """Reviewer-only advance from a closed round N to N+1 on the unchanged plan."""
+            nonlocal unresolved_items, next_unresolved_item_number, resumed_round
             if round_number >= plan_round_limit:
                 raise AgentLoopError(
                     f"Planning round {round_number} is reconciled; fresh reviews require "
                     f"round {round_number + 1}, beyond --max-rounds. No fresh review was published."
                 )
             carry = carry_over_anchor_round(
-                prior_items=prior_unresolved_items,
-                completed_reviews=tuple(
-                    record for record in current_resume.completed_reviews
-                    if not (staged_planning and record.metadata.agent != plan_primary_name
-                            and (plan_panel_evidence.opening_index is None
-                                 or record.index <= plan_panel_evidence.opening_index))
-                ),
+                prior_items=prior_unresolved_items, completed_reviews=closed_reviews,
                 settled_new_items=tuple(round_new_unresolved_items),
                 records=plan_history_records(),
                 round_number=round_number,
@@ -2722,6 +2760,22 @@ def _run_plan_first_loop_body(
                 ),
             )
             resumed_round = None
+
+        if (plan_closed := _plan_round_closure()) is not None:
+            current_resume = plan_closed
+            next_unresolved_item_number = max(next_unresolved_item_number, plan_closed.next_unresolved_item_number)
+        if ownership_review_failure is None and not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and not plan_failed_seat_retry and (plan_closed is not None or any(
+            agent_display_name(reviewer) not in resumed_by_name
+            for reviewer in round_reviewers
+        )):
+            # Settlement precedes rollover; superseded secondary claims above
+            # establish no obligation. Qualified findings and dispositions stay.
+            _plan_roll_over_closed_round(tuple(
+                record for record in current_resume.completed_reviews
+                if not (staged_planning and record.metadata.agent != plan_primary_name
+                        and (plan_panel_evidence.opening_index is None
+                             or record.index <= plan_panel_evidence.opening_index))
+            ))
             continue
         if staged_planning and plan_scheduler_decision is not None and ownership_review_failure is None:
             if plan_scheduler_decision.latches_force_full:
@@ -2755,7 +2809,13 @@ def _run_plan_first_loop_body(
                 f"calls_avoided_cumulative={plan_scheduler_calls_avoided}"
                 + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
-            _plan_spool_preflight()
+            try:
+                _plan_spool_preflight()
+            except RoundIncompleteSignal as signal:
+                if (plan_closed := _plan_round_closure(signal)) is None:
+                    raise
+                _plan_roll_over_closed_round(())
+                continue
             plan_posted_checkpoint = bound_plan_metadata(
                 flow="plan",
                 role="summary",
@@ -2831,7 +2891,13 @@ def _run_plan_first_loop_body(
             )
             if plan_reset_round and plan_scheduler_decision.phase == "primary":
                 plan_reset_checkpoint_written = True
-        _plan_spool_preflight()
+        try:
+            _plan_spool_preflight()
+        except RoundIncompleteSignal as signal:
+            if (plan_closed := _plan_round_closure(signal)) is None:
+                raise
+            _plan_roll_over_closed_round(())
+            continue
         use_compact_context = (
             config.planning_context_mode == "compact"
             and round_number >= 2
@@ -3148,43 +3214,21 @@ def _run_plan_first_loop_body(
                     if reviewer in plan_today_peers
                     or agent_display_name(reviewer) in plan_visible_names
                 )
-        def _plan_round_recovery() -> PartialRoundRecovery:
-            return compute_partial_round_recovery(
-                snapshot=issue_context.comments,
-                read_rest=lambda: admitted_issue_comments(
-                    runner, config=config, issue_number=issue_number,
-                    comments=read_rest_issue_comments(
-                        runner, config=config, issue_number=issue_number,
-                        purpose="the partial review round's comment ids cannot be listed",
-                        reject_empty_output=True,
-                    ),
-                )[0],
-                flow="plan", round_number=round_number, subject=current_plan_subject,
-                context=plan_recovery_context,
-                reviewer_names=[agent_display_name(r) for r in configured_reviewers],
-                resume=lambda remaining: _resume_plan_round(
-                    remaining, configured_reviewers=configured_reviewers,
-                    min_round_number=plan_scope_start_round,
-                ),
-                # The resumed plan subject must not shift after deletion.
-                fingerprint=lambda remaining: (
-                    lambda resumed: resumed[0] if resumed is not None else None
-                )(_resume_plan_round(
-                    remaining, configured_reviewers=configured_reviewers,
-                    min_round_number=plan_scope_start_round,
-                )),
-            )
-
         if not plan_round_parallel and not plan_approved_shortcut:
-            _refuse_partial_round_before_sequential_turns(
-                spool=plan_round_spool,
-                fresh_turn_reviewers=[
-                    reviewer for reviewer in round_reviewers
-                    if resumed_by_name.get(agent_display_name(reviewer)) is None
-                ],
-                public_peers=plan_round_public_peers,
-                recovery=_plan_round_recovery,
-            )
+            try:
+                _refuse_partial_round_before_sequential_turns(
+                    spool=plan_round_spool,
+                    fresh_turn_reviewers=[
+                        reviewer for reviewer in round_reviewers
+                        if resumed_by_name.get(agent_display_name(reviewer)) is None
+                    ],
+                    public_peers=plan_round_public_peers,
+                )
+            except RoundIncompleteSignal as signal:
+                if (plan_closed := _plan_round_closure(signal)) is None:
+                    raise
+                _plan_roll_over_closed_round(())
+                continue
         if plan_round_parallel:
             pending_plan_reviewers = [
                 reviewer for reviewer in round_reviewers
@@ -3282,73 +3326,48 @@ def _run_plan_first_loop_body(
                     early_published_plan_reviewers.add(reviewer)
                     return True
 
-                plan_turn_results = _launch_reviewer_turns(
-                    runner,
-                    pending_plan_reviewers,
-                    thread_name_prefix=f"plan-review-r{round_number}",
-                    run_turn=_plan_reviewer_worker,
-                    on_completion=_publish_plan_completion,
-                    spool=plan_round_spool,
-                    replay_turn=lambda reviewer, fields: _replay_spooled_review(
-                        runner, config=config, reviewer=reviewer, fields=fields,
-                        validators=_plan_review_validators(agent_display_name(reviewer)),
-                    ),
-                    public_peers=plan_round_public_peers,
-                    recovery=_plan_round_recovery,
-                    retry_bound=_plan_retry_bound,
-                    settle_failures=peer_blocked_settlement(
-                        parse=_plan_publication_parsed, name=agent_display_name,
-                        blocks=lambda p: p.state == "blocking" and not _is_incomplete_plan_review(p),
-                        configured_reviewer_count=len(round_reviewers), round_number=round_number,
-                        allowed_rounds=plan_round_limit),
-                    max_workers=None if config.review_parallel else 1,
-                    configured_order=round_reviewers,
-                    config=config,
-                )
+                try:
+                    plan_turn_results = _launch_reviewer_turns(
+                        runner,
+                        pending_plan_reviewers,
+                        thread_name_prefix=f"plan-review-r{round_number}",
+                        run_turn=_plan_reviewer_worker,
+                        on_completion=_publish_plan_completion,
+                        spool=plan_round_spool,
+                        replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                            runner, config=config, reviewer=reviewer, fields=fields,
+                            validators=_plan_review_validators(agent_display_name(reviewer)),
+                        ),
+                        public_peers=plan_round_public_peers,
+                            retry_bound=_plan_retry_bound,
+                        settle_failures=peer_blocked_settlement(
+                            parse=_plan_publication_parsed, name=agent_display_name,
+                            blocks=lambda p: p.state == "blocking" and not _is_incomplete_plan_review(p),
+                            configured_reviewer_count=len(round_reviewers), round_number=round_number,
+                            allowed_rounds=plan_round_limit),
+                        max_workers=None if config.review_parallel else 1,
+                        configured_order=round_reviewers,
+                        config=config,
+                    )
+                except RoundIncompleteSignal as signal:
+                    if not signal.before_publication or (plan_closed := _plan_round_closure(signal)) is None:
+                        raise
+                    _plan_roll_over_closed_round(())
+                    continue
 
         for reviewer in round_reviewers:
             reviewer_name = agent_display_name(reviewer)
             resumed_record = resumed_by_name.get(reviewer_name)
             if resumed_record is not None:
-                review_output = resumed_record.metadata.canonical_reviewer_response or resumed_record.body
+                # The same parser chain the closed-incomplete writer uses (#2064).
+                parsed_review, review_output = plan_published_review(
+                    resumed_record, reviewer=reviewer_name,
+                    surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                        issue_context.human_requirements, requirement_scope="planning requirements"),
+                )
                 review_model_used = resumed_record.metadata.model_used
                 review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                 review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
-                structured_review = parse_structured_plan_review(
-                    review_output,
-                    architecture_status_mode="legacy",
-                    reviewer=reviewer_name,
-                    surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
-                        issue_context.human_requirements,
-                        requirement_scope="planning requirements",
-                    ),
-                )
-                resumed_impact, resumed_records = _resumed_review_architecture(
-                    resumed_record.metadata,
-                    structured_review.architecture_impact if structured_review is not None else None,
-                )
-                parsed_review = ParsedPlanReview(
-                    state=resumed_record.metadata.state or parse_plan_state(review_output),
-                    summary=(
-                        structured_review.summary
-                        if structured_review is not None
-                        else review_freeform_summary_text(review_output)
-                    ),
-                    items=(
-                        structured_review.items
-                        if structured_review is not None
-                        else parse_plan_review_items(review_output, reviewer=reviewer_name)
-                    ),
-                    dispositions=resumed_record.metadata.dispositions,
-                    architecture_impact=resumed_impact,
-                    architecture_impact_degradations=resumed_records,
-                    ignored_prior_disposition_ids=resumed_record.metadata.ignored_prior_disposition_ids,
-                    # Restored once from the record (#2145); a record written
-                    # before notes were persisted re-parses its response.
-                    implementation_notes=resumed_implementation_notes(
-                        resumed_record.metadata, structured_review, reviewer=reviewer_name,
-                    ),
-                )
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")
                 reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
@@ -3408,8 +3427,7 @@ def _run_plan_first_loop_body(
                     reviewer=reviewer,
                     spool=plan_round_spool,
                     public_peers=plan_round_public_peers,
-                    recovery=_plan_round_recovery,
-                    validators=sequential_plan_validators,
+                        validators=sequential_plan_validators,
                     invoke=lambda reviewer=reviewer, validators=sequential_plan_validators, turn=_plan_review_turn(reviewer): _run_validated_agent(
                         runner,
                         agent=turn[0],
@@ -3505,42 +3523,13 @@ def _run_plan_first_loop_body(
                     or reviewer_name in plan_retry_unsettled
                 )
             ):
-                for item in parsed_review.items.blocking:
-                    tracked_item = _next_unresolved_item(
-                        item_number=next_unresolved_item_number,
-                        reviewer=item.reviewer,
-                        source_round=round_number,
-                        text=item.text,
-                        status="blocking",
-                        **_plan_review_item_tags(item, prior_unresolved_items),
-                    )
-                    round_new_unresolved_items.append(tracked_item)
-                    reviewer_new_unresolved_items.append(tracked_item)
-                    next_unresolved_item_number += 1
-                for item in parsed_review.items.same_plan:
-                    tracked_item = _next_unresolved_item(
-                        item_number=next_unresolved_item_number,
-                        reviewer=item.reviewer,
-                        source_round=round_number,
-                        text=item.text,
-                        status="same-plan",
-                        **_plan_review_item_tags(item, prior_unresolved_items),
-                    )
-                    round_new_unresolved_items.append(tracked_item)
-                    reviewer_new_unresolved_items.append(tracked_item)
-                    next_unresolved_item_number += 1
-                for item in parsed_review.items.future:
-                    tracked_item = _next_unresolved_item(
-                        item_number=next_unresolved_item_number,
-                        reviewer=item.reviewer,
-                        source_round=round_number,
-                        text=item.text,
-                        status="future",
-                        **_plan_review_item_tags(item, prior_unresolved_items),
-                    )
-                    round_new_unresolved_items.append(tracked_item)
-                    reviewer_new_unresolved_items.append(tracked_item)
-                    next_unresolved_item_number += 1
+                # Settlement's minting, shared with the closed-incomplete writer (#2064).
+                minted = mint_plan_review_items(
+                    parsed_review, round_number=round_number,
+                    next_item_number=next_unresolved_item_number, prior_items=prior_unresolved_items)
+                round_new_unresolved_items.extend(minted)
+                reviewer_new_unresolved_items.extend(minted)
+                next_unresolved_item_number += len(minted)
                 if reviewer not in early_published_plan_reviewers:
                     _post_plan_reviewer_comment(
                         reviewer_name, parsed_review, review_output=review_output,

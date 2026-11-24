@@ -38,6 +38,7 @@ from coding_review_agent_loop.agents import antigravity as agy_backend
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 import coding_review_agent_loop.architecture_contract as architecture_contract
 import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.round_closure_writer as round_closure_writer
 import coding_review_agent_loop.discuss_loop as discuss_loop
 import coding_review_agent_loop.execution_policy as execution_policy
 import coding_review_agent_loop.history_export as history_export
@@ -1707,6 +1708,54 @@ def _published_count(runner, marker):
     return sum(marker in body for body in runner.comments)
 
 
+class _ClosurePosted(Exception):
+    """Raised right after the round-wide decision posts its closed-incomplete record (#2064)."""
+
+
+def _run_until_closure(run, *, surface="pr"):
+    """Run until the closed-incomplete record is posted, then stop before round N+1."""
+    module, name = (pr_loop, "post_pr_comment") if surface == "pr" else (plan_first_loop, "post_issue_comment")
+    real = getattr(module, name)
+
+    def post(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if "closed, incomplete" in str(kwargs.get("body", "")):
+            raise _ClosurePosted
+        return result
+
+    with patch.object(module, name, side_effect=post):
+        with pytest.raises(_ClosurePosted):
+            run()
+
+
+def _closure(runner, *, surface="pr", round_number=1, published=None, unreplayable=None):
+    """The one closed-incomplete record of ``round_number``; no deletion advice anywhere."""
+    from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
+
+    flow = "pr" if surface == "pr" else "plan"
+    closures = [r for r in _comment_records(runner, surface=surface, flow=flow)
+                if r.phase == ROUND_CLOSED_INCOMPLETE_PHASE]
+    assert len(closures) == 1, closures
+    (closure,) = closures
+    assert closure.round_number == round_number
+    payload = closure.round_closure
+    if published is not None:
+        assert [e["agent"] for e in payload["published"]] == sorted(published)
+    if unreplayable is not None:
+        assert [e["agent"] for e in payload["unreplayable"]] == sorted(unreplayable)
+    assert not any("Delete these" in body or "partial-round recovery" in body for body in runner.comments)
+    return closure
+
+
+def _causes(closure):
+    return {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
+
+
+def _published_names(runner, markers, names=("Codex", "Gemini")):
+    """Reviewer display names whose round marker is public, in ``names`` order."""
+    return [name for name, marker in zip(names, markers) if _published_count(runner, marker)]
+
+
 def _spool_files(config):
     # The spool root is non-listable (0o300, #1560); list it owner-side.
     root = review_rounds.review_spool_root(config.agent_memory_dir)
@@ -1901,20 +1950,22 @@ def test_plan_partial_round_sequential_resume_replays_withheld_review(tmp_path):
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
-def test_pr_partial_round_without_spool_record_stops_before_invoking(tmp_path, review_parallel):
+def test_pr_partial_round_without_spool_record_closes_before_invoking(tmp_path, review_parallel):
+    """`pr-partial-rollover` (#2064): the round closes before any round-N launch."""
     runner, markers = _pr_partial_round_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     _interrupt_pr_round_between_publications(runner, config, markers)
     for path in _spool_files(config):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
+    published = _published_names(runner, markers)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
-        run_pr_loop(
-            runner, pr_number=77,
-            config=dataclasses.replace(config, review_parallel=review_parallel),
-        )
+    _run_until_closure(lambda: run_pr_loop(
+        runner, pr_number=77, config=dataclasses.replace(config, review_parallel=review_parallel)))
 
+    closure = _closure(runner, published=published,
+                       unreplayable=[n for n in ("Codex", "Gemini") if n not in published])
+    assert all(isinstance(e["comment_id"], int) for e in closure.round_closure["published"])
     assert len(runner.reviewer_launches) == launches_before
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
@@ -1926,8 +1977,8 @@ def test_ordinary_round_withheld_reviewer_is_not_reinvoked_blind_after_a_peer_pu
     """`ordinary-withheld-isolation` (#1664): no conversion, so no visibility boundary.
 
     Reviewer A was withheld (its outcome is missing or no longer validates)
-    and peer B published in round N; a sequential resume still refuses rather
-    than invoking A beside B's public findings.
+    and peer B published in round N; a sequential resume closes the round
+    (#2064) rather than invoking A beside B's public findings.
     """
     runner, markers = _pr_partial_round_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
@@ -1941,16 +1992,17 @@ def test_ordinary_round_withheld_reviewer_is_not_reinvoked_blind_after_a_peer_pu
         withheld.write_text(json.dumps(payload), encoding="utf-8")
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
-        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, review_parallel=False))
+    _run_until_closure(lambda: run_pr_loop(
+        runner, pr_number=77, config=dataclasses.replace(config, review_parallel=False)))
 
+    _closure(runner, published=_published_names(runner, markers))
     assert runner.reviewer_launches == launches_before
     assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
 @pytest.mark.parametrize("spool_state", ["missing", "invalid"])
-def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_path, review_parallel, spool_state):
+def test_plan_partial_round_with_invalid_spool_record_closes_before_invoking(tmp_path, review_parallel, spool_state):
     runner, markers = _plan_partial_round_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     _interrupt_plan_round_between_publications(runner, config, markers)
@@ -1962,13 +2014,15 @@ def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_
             payload["response"]["text"] = "not a structured plan review"
             path.write_text(json.dumps(payload), encoding="utf-8")
     launches_before = len(runner.reviewer_launches)
+    published = _published_names(runner, markers)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
-        run_issue_loop(
-            runner, issue_number=56,
-            config=dataclasses.replace(config, review_parallel=review_parallel), plan_first=True,
-        )
+    _run_until_closure(lambda: run_issue_loop(
+        runner, issue_number=56,
+        config=dataclasses.replace(config, review_parallel=review_parallel), plan_first=True,
+    ), surface="issue")
 
+    _closure(runner, surface="issue", published=published,
+             unreplayable=[n for n in ("Codex", "Gemini") if n not in published])
     assert len(runner.reviewer_launches) == launches_before
 
 
@@ -2072,7 +2126,7 @@ def test_plan_held_round_sequential_rerun_never_shows_withheld_peer_to_retry(tmp
 @pytest.mark.parametrize("review_parallel", [True, False])
 @pytest.mark.parametrize("spool_state", ["missing", "invalid"])
 @pytest.mark.parametrize("slow_reviewer", ["codex", "gemini"])
-def test_pr_partial_round_with_rejected_posted_record_stops_before_invoking(
+def test_pr_partial_round_with_rejected_posted_record_closes_before_invoking(
     tmp_path, monkeypatch, review_parallel, spool_state, slow_reviewer
 ):
     runner, markers = _pr_partial_round_runner(slow_reviewer=slow_reviewer)
@@ -2092,13 +2146,14 @@ def test_pr_partial_round_with_rejected_posted_record_stops_before_invoking(
     ), "_resumed_pr_reviewer_matches_requirements", lambda *args, **kwargs: False
     )
     launches_before = len(runner.reviewer_launches)
+    published = _published_names(runner, markers)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
-        run_pr_loop(
-            runner, pr_number=77,
-            config=dataclasses.replace(config, review_parallel=review_parallel),
-        )
+    _run_until_closure(lambda: run_pr_loop(
+        runner, pr_number=77, config=dataclasses.replace(config, review_parallel=review_parallel)))
 
+    # The rejected own review and the unreplayable peer both need fresh turns.
+    closure = _closure(runner, published=published, unreplayable=["Codex", "Gemini"])
+    assert "rejected by resume" in _causes(closure)[published[0]]
     assert len(runner.reviewer_launches) == launches_before
 
 
@@ -2973,13 +3028,13 @@ def _approving_pr_runner():
     return runner, markers
 
 
-def _refusal_message(runner, config, *, review_parallel=True):
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_pr_loop(
-            runner, pr_number=77,
-            config=dataclasses.replace(config, review_parallel=review_parallel),
-        )
-    return str(excinfo.value)
+def _closure_of_rerun(runner, config, *, review_parallel=True, **expected):
+    """The rerun posts one closed-incomplete record before launching anyone (#2064)."""
+    launches_before = list(runner.reviewer_launches)
+    _run_until_closure(lambda: run_pr_loop(
+        runner, pr_number=77, config=dataclasses.replace(config, review_parallel=review_parallel)))
+    assert runner.reviewer_launches == launches_before
+    return _closure(runner, **expected)
 
 
 def _listed_comment_ids(message):
@@ -3002,42 +3057,28 @@ def _delete_listed_comments(runner, ids, *, surface):
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
-def test_pr_partial_round_refusal_lists_comments_and_recovers(tmp_path, review_parallel):
+def test_pr_partial_round_closes_and_rolls_over_without_deletion(tmp_path, review_parallel):
+    """`pr-partial-rollover` (#2064): formerly a deletion list, now one record and round 2."""
     runner, markers = _approving_pr_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     _interrupt_pr_round_between_publications(runner, config, markers)
     for path in _spool_files(config):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
+    published = _published_names(runner, markers)
+    kept = list(runner.pr_payload["comments"])
 
-    message = _refusal_message(runner, config, review_parallel=review_parallel)
+    assert run_pr_loop(
+        runner, pr_number=77, config=dataclasses.replace(config, review_parallel=review_parallel)) == 0
 
-    assert len(runner.reviewer_launches) == launches_before
-    assert "No review spool for this round exists on this host" in message
-    assert "Rerun from the host" not in message
-    assert "Delete these 1 comments so the whole round runs again independently" in message
-    assert "need not be deleted" in message
-    ids = _listed_comment_ids(message)
-    assert len(ids) == 1
-
-    _delete_listed_comments(runner, ids, surface="pr")
-    # Deleting only the advertised ids must have removed every peer body.
-    assert not any(m in body for m in markers for body in runner.comments)
-    comments_before = len(runner.comments)
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert not runner.peer_body_visible_at_launch
+    closure = _closure(runner, published=published,
+                       unreplayable=[n for n in ("Codex", "Gemini") if n not in published])
+    assert "no spooled outcome" in _causes(closure)[[n for n in ("Codex", "Gemini") if n not in published][0]]
+    # Round 2 runs the full board; the round-1 publication stays as history.
     assert len(runner.reviewer_launches) - launches_before == 2
-
-    # Effective transition equals a never-started fixture: same reviewers
-    # launched and the same number of records published (verdicts plus a
-    # fresh reconciliation).  The raw resume result is not compared.
-    baseline, _markers = _approving_pr_runner()
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
-    )
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
-    assert len(runner.comments) - comments_before == len(baseline.comments)
+    assert runner.pr_payload["comments"][:len(kept)] == kept
+    reviews = [r for r in _comment_records(runner, surface="pr", flow="pr") if r.role == "reviewer"]
+    assert sorted(r.agent for r in reviews if r.round_number == 2) == ["Codex", "Gemini"]
 
 
 def test_pr_partial_round_refusal_without_rest_ids_is_provisional(tmp_path):
@@ -3073,11 +3114,9 @@ def test_pr_partial_round_spool_missing_record_cause(tmp_path):
     path.unlink()
     (path.parent / "another-reviewer.json").write_text("{}", encoding="utf-8")
 
-    message = _refusal_message(runner, config)
+    closure = _closure_of_rerun(runner, config)
 
-    assert "holds no outcome for" in message
-    assert "No review spool for this round exists" not in message
-    assert "Rerun from the host" not in message
+    assert set(_causes(closure).values()) == {"no spooled outcome for this round exists on this host"}
 
 
 def test_pr_partial_round_spool_unusable_file_cause(tmp_path):
@@ -3087,10 +3126,11 @@ def test_pr_partial_round_spool_unusable_file_cause(tmp_path):
     path = _unpublished_reviewer_spool_file(config, markers, runner)
     path.write_text("{not json", encoding="utf-8")
 
-    message = _refusal_message(runner, config)
+    closure = _closure_of_rerun(runner, config)
 
-    assert f"spool file {path} exists but is unreadable or does not belong to this round" in message
-    assert "holds no outcome" not in message
+    # The cause is neutral: no host path is published in the record.
+    assert set(_causes(closure).values()) == {"its spool record is malformed or unreadable"}
+    assert str(path) not in str(closure.round_closure)
 
 
 def test_pr_partial_round_invalid_spool_record_cause(tmp_path):
@@ -3102,9 +3142,9 @@ def test_pr_partial_round_invalid_spool_record_cause(tmp_path):
     payload["response"]["text"] = "not a structured PR review"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    message = _refusal_message(runner, config)
+    closure = _closure_of_rerun(runner, config)
 
-    assert "spooled outcome no longer validates against this run" in message
+    assert set(_causes(closure).values()) == {"its spooled outcome no longer validates against this run"}
 
 
 def test_replay_unavailable_cause_for_rejected_own_record_ignores_spool(tmp_path):
@@ -3124,7 +3164,7 @@ def test_replay_unavailable_cause_for_rejected_own_record_ignores_spool(tmp_path
     )
 
 
-def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
+def test_plan_partial_round_closure_lists_the_posted_review(tmp_path):
     runner, markers = _plan_partial_round_runner()
     runner.serve_rest_issue_comments = True
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
@@ -3134,13 +3174,12 @@ def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
         payload["response"]["text"] = "not a structured plan review"
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    message = str(excinfo.value)
-    assert "no longer validates against this run" in message
-    assert "Rerun from the host" not in message
-    assert re.search(r"comment \d+ https://", message)
+    closure = _closure(runner, surface="issue", published=_published_names(runner, markers))
+    assert all(isinstance(e["comment_id"], int) for e in closure.round_closure["published"])
+    assert "no longer validates against this run" in " ".join(_causes(closure).values())
 
 
 # --- #1142 review: recovery-list unit coverage (boundaries, authors, attachments) ---
@@ -3391,12 +3430,10 @@ def test_recovery_requires_anchored_round_to_resume_as_the_same_round():
     assert not recovery.verified
 
 
-def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
-    """Delete exactly the advertised ids, rerun: no refusal, no peer body visible."""
+def test_plan_partial_round_closes_and_rolls_over_on_the_unchanged_plan(tmp_path):
+    """`plan-partial-rollover` (#2064): no deletion; round 2 reviews the unchanged plan."""
     runner, markers = _plan_partial_round_runner()
     runner.serve_rest_issue_comments = True
-    # The rerun needs a fresh plan and fresh reviews for the deleted round.
-    runner.claude_outputs.append(_initial_plan())
     runner.codex_outputs.append(structured_plan_review(summary="Codex plan approval rerun note."))
     runner.gemini_outputs.append(structured_plan_review(
         summary="Gemini independent plan approval rerun.", reviewer="Google Gemini"
@@ -3406,53 +3443,23 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
     for path in _spool_files(config):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
+    claude_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    published = _published_names(runner, markers)
+    kept = list(runner.issue_comments)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    message = str(excinfo.value)
-    assert len(runner.reviewer_launches) == launches_before
-    assert "No review spool for this round exists on this host" in message
-    assert "Delete these" in message, message
-    ids = _listed_comment_ids(message)
-    assert ids
-
-    _delete_listed_comments(runner, ids, surface="issue")
-    # Deleting only the advertised ids must have removed every peer body.
-    assert not any(m in body for m in markers for body in runner.comments)
-    runner.peer_body_visible_at_launch = False
-
-    comments_before = len(runner.comments)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-    assert not runner.peer_body_visible_at_launch
+
+    closure = _closure(runner, surface="issue", published=published,
+                       unreplayable=[n for n in ("Codex", "Gemini") if n not in published])
+    records = _comment_records(runner, surface="issue", flow="plan")
+    advance = [r for r in records if r.phase == "plan-phase-advance"]
+    assert [r.round_number for r in advance] == [2]
+    assert closure.subject == advance[0].subject  # the unchanged canonical plan
+    assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == [
+        "Codex", "Gemini"]
     assert len(runner.reviewer_launches) - launches_before == 2
-
-    # Same effective transition as a never-started plan round.
-    baseline, _markers = _plan_partial_round_runner()
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
-    )
-    assert run_issue_loop(baseline, issue_number=56, config=baseline_config, plan_first=True) == 0
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
-    # The retained plan record plus the fresh records equal the baseline's.
-    assert len(runner.comments) == len(baseline.comments)
-
-
-def test_provisional_target_without_id_but_with_url_never_prints_none():
-    from coding_review_agent_loop.partial_round_recovery import RecoveryTarget
-
-    line = review_rounds._format_recovery_target(
-        RecoveryTarget(
-            label="Codex review (round 1)", comment_id=None,
-            url="https://example.test/c/1", author="bot", created_at="2026-01-01T00:00:01Z",
-        )
-    )
-    assert "comment None" not in line
-    assert "id could not be determined" in line
-    assert "https://example.test/c/1" in line
-    with_id = review_rounds._format_recovery_target(
-        RecoveryTarget(label="x", comment_id=7, url="https://example.test/c/7", author=None, created_at=None)
-    )
-    assert with_id == "- x: comment 7 https://example.test/c/7"
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == claude_before
+    assert runner.issue_comments[:len(kept)] == kept
 
 
 def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undecodable():
@@ -3470,13 +3477,6 @@ def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undeco
     assert not recovery.verified
     assert recovery.reason == "attachment references could not be fully decoded"
     assert 1000 + verdict + 1 in {t.comment_id for t in recovery.targets}
-    message = str(review_rounds._partial_round_refusal(
-        surface="pr", number=77, round_number=1, reviewer_name="Gemini",
-        public_peers=["Codex"], recovery=lambda: recovery,
-    ))
-    assert "provisional list" in message
-    assert "attachment references could not be fully decoded" in message
-    assert "Delete these" not in message
 
 
 def test_reconciled_round_with_unavailable_reviewer_rolls_over_without_deletion(tmp_path):
@@ -3569,8 +3569,8 @@ def test_overflow_peer_verdict_attachments_survive_a_closed_round_rollover(tmp_p
     assert not any("partially published" in body for body in runner.comments)
 
 
-def test_orphan_attachments_before_a_lost_anchor_are_listed_and_recovered(tmp_path):
-    """Interruption between a peer's attachments and its anchor leaves orphans."""
+def test_orphan_attachments_before_a_lost_anchor_close_the_round_and_stay(tmp_path):
+    """Interruption between a peer's attachments and its anchor leaves orphans (#2064: kept)."""
     import coding_review_agent_loop.github as github_module
     from coding_review_agent_loop.round_transport import attachment_keys
 
@@ -3590,33 +3590,16 @@ def test_orphan_attachments_before_a_lost_anchor_are_listed_and_recovered(tmp_pa
     with patch.object(github_module, "_post_comment_body", side_effect=interrupting_post):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
-    posted = runner.pr_payload["comments"]
-    orphans = [10_000 + i for i, c in enumerate(posted, start=1) if attachment_keys(c["body"])]
+    posted = list(runner.pr_payload["comments"])
+    orphans = [c["body"] for c in posted if attachment_keys(c["body"])]
     assert len(orphans) == 2 and len(posted) == 3  # Gemini's verdict plus two orphans
     for path in _spool_files(config):
         path.unlink()
-    launches_before = len(runner.reviewer_launches)
 
-    message = _refusal_message(runner, config)
+    _closure_of_rerun(runner, config, published=["Gemini"], unreplayable=["Codex"])
 
-    assert len(runner.reviewer_launches) == launches_before
-    ids = _listed_comment_ids(message)
-    assert set(orphans) <= set(ids) and len(ids) == 3, message
-    assert "Delete these 3 comments" in message
-    _delete_listed_comments(runner, ids, surface="pr")
-    assert runner.pr_payload["comments"] == []  # no comment carries any peer response
-    runner.peer_body_visible_at_launch = False
-
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert not runner.peer_body_visible_at_launch
-    baseline, _ = _overflow_pr_runner((12,))
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
-    )
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
-    assert len(runner.pr_payload["comments"]) == len(baseline.pr_payload["comments"])
+    # Nothing is deleted: the orphans and the verdict stay as history.
+    assert runner.pr_payload["comments"][:len(posted)] == posted
 
 
 # --- #1142 review: real-loop deletion-and-rerun for the scheduler, plan and panel paths ---
@@ -3633,6 +3616,15 @@ def _comment_records(runner, *, surface, flow):
         for i, c in enumerate(store)
     ]
     return [record.metadata for record in _extract_round_metadata_records(comments, flow=flow)]
+
+
+def _comment_records_from(store):
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    comments = [IssueComment(author="bot", created_at=f"2026-01-01T00:00:{i:02d}Z", body=c["body"])
+                for i, c in enumerate(store)]
+    return [record.metadata for record in _extract_round_metadata_records(comments, flow="pr")]
 
 
 def _transition(records, *, round_number):
@@ -3680,8 +3672,8 @@ def _selective_followup_runner():
     return runner, markers
 
 
-def test_scheduler_enabled_round_recovers_with_retained_prelaunch_and_coder(tmp_path):
-    """A coder-anchored scheduler round: prelaunch and coder retained, rerun reconciles."""
+def test_scheduler_enabled_round_closes_with_retained_prelaunch_and_coder(tmp_path):
+    """A coder-anchored scheduler round closes incomplete and round 3 reconciles (#2064)."""
     runner, markers = _selective_followup_runner()
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
@@ -3693,78 +3685,29 @@ def test_scheduler_enabled_round_recovers_with_retained_prelaunch_and_coder(tmp_
     retained = list(runner.pr_payload["comments"])
     launches_before = len(runner.reviewer_launches)
 
-    message = _refusal_message(runner, config)
-
-    assert len(runner.reviewer_launches) == launches_before
-    assert "Rerun from the host" not in message
-    ids = _listed_comment_ids(message)
-    assert ids and "Delete these" in message, message
-    # The prelaunch summaries and the coder record are never advertised.
-    doomed = {i - 10_001 for i in ids}
-    for index, comment in enumerate(retained):
-        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
-        if match is None:
-            continue
-        metadata = round_metadata._decode_round_metadata(match["payload"])
-        if index in doomed:
-            assert metadata.role != "coder" and metadata.phase != "scheduler-prelaunch"
-    _delete_listed_comments(runner, ids, surface="pr")
-    assert not any(m in body for m in markers for body in runner.comments)
-    assert any(
-        r.phase == "scheduler-prelaunch" and r.round_number == 2
-        for r in _comment_records(runner, surface="pr", flow="pr")
-    )
-    assert any(
-        r.role == "coder" for r in _comment_records(runner, surface="pr", flow="pr")
-    )
-    runner.peer_body_visible_at_launch = False
-
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert not runner.peer_body_visible_at_launch
+    closure = _closure(runner, round_number=2)
+    # item-1 is not settled by the closed round: it stays open for round 3.
+    assert [i.item_id for i in closure.prior_items] == ["item-1"]
+    assert runner.pr_payload["comments"][:len(retained)] == retained
     after = _comment_records(runner, surface="pr", flow="pr")
-    # The rerun stayed in round 2 and posted a fresh reconciliation.
-    assert any(r.role == "summary" and r.phase == "reconciliation" and r.round_number == 2 for r in after)
+    assert any(r.role == "summary" and r.phase == "reconciliation" and r.round_number == 3 for r in after)
+    assert sorted(r.agent for r in after if r.role == "reviewer" and r.round_number == 3) == ["Codex", "Gemini"]
     assert launches_before + 2 <= len(runner.reviewer_launches)
-    assert not any(m in body for m in markers for body in runner.comments)
-
-    baseline, _ = _selective_followup_runner()
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True,
-        pr_review_policy="selective-intermediate", max_rounds=4,
-    )
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-    def effective(records):
-        # Checkpoints are retained history (a rerun may add one); compare the
-        # records the round itself publishes: coder, verdicts, reconciliation.
-        return [
-            entry for entry in _transition(records, round_number=2)
-            if entry[2] != "scheduler-prelaunch"
-        ]
-
-    assert effective(after) == effective(_comment_records(baseline, surface="pr", flow="pr"))
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(
-        baseline.reviewer_launches[2:]
-    )
 
 
-def test_plan_round_with_spilled_coder_artifact_recovers_and_keeps_its_attachments(tmp_path):
-    """The coder record's attachments are referenced by a retained comment: never listed."""
+def test_plan_round_with_spilled_coder_artifact_closes_and_keeps_its_attachments(tmp_path):
+    """The coder record's attachments stay public; round 2 reviews the same plan (#2064)."""
     from coding_review_agent_loop.round_transport import attachment_keys
 
-    def build():
-        runner, markers = _plan_partial_round_runner()
-        runner.serve_rest_issue_comments = True
-        runner.claude_outputs[:] = [structured_plan_state(
-            state="blocking", summary="Initial plan.", plan_steps=["Make the change.", _big_text(21)],
-        )]
-        runner.codex_outputs.append(structured_plan_review(summary="Codex rerun note."))
-        runner.gemini_outputs.append(structured_plan_review(
-            summary="Gemini rerun note.", reviewer="Google Gemini"
-        ))
-        return runner, markers
-
-    runner, markers = build()
+    runner, markers = _plan_partial_round_runner()
+    runner.serve_rest_issue_comments = True
+    runner.claude_outputs[:] = [structured_plan_state(
+        state="blocking", summary="Initial plan.", plan_steps=["Make the change.", _big_text(21)],
+    )]
+    runner.codex_outputs.append(structured_plan_review(summary="Codex rerun note."))
+    runner.gemini_outputs.append(structured_plan_review(summary="Gemini rerun note.", reviewer="Google Gemini"))
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     _interrupt_plan_round_between_publications(runner, config, markers)
     for path in _spool_files(config):
@@ -3773,35 +3716,14 @@ def test_plan_round_with_spilled_coder_artifact_recovers_and_keeps_its_attachmen
     assert spilled, "the coder artifact did not spill into attachments"
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    message = str(excinfo.value)
-
-    assert len(runner.reviewer_launches) == launches_before
-    ids = _listed_comment_ids(message)
-    assert ids and "Delete these" in message, message
-    _delete_listed_comments(runner, ids, surface="issue")
-    # Every attachment of the retained coder artifact survives.
-    assert [c["body"] for c in runner.issue_comments if attachment_keys(c["body"])] == spilled
-    assert not any(m in body for m in markers for body in runner.comments)
-    runner.peer_body_visible_at_launch = False
-
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    assert not runner.peer_body_visible_at_launch
+    _closure(runner, surface="issue", published=_published_names(runner, markers))
+    # Every attachment of the coder artifact survives.
+    assert [c["body"] for c in runner.issue_comments if attachment_keys(c["body"])][:len(spilled)] == spilled
     assert sorted(runner.reviewer_launches[launches_before:]) == ["codex", "gemini"]
     after = _comment_records(runner, surface="issue", flow="plan")
-    assert {r.round_number for r in after} == {1}
-    assert any(r.role == "summary" and r.phase == "reconciliation" for r in after)
-    baseline, _ = build()
-    assert run_issue_loop(
-        baseline, issue_number=56,
-        config=make_config(tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True),
-        plan_first=True,
-    ) == 0
-    assert _transition(after, round_number=1) == _transition(
-        _comment_records(baseline, surface="issue", flow="plan"), round_number=1
-    )
+    assert any(r.role == "summary" and r.phase == "reconciliation" and r.round_number == 2 for r in after)
 
 
 def test_snapshot_cover_requires_sidecars_and_multiplicity():
@@ -3947,8 +3869,10 @@ def _prelaunch_phases(runner, *, round_number):
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
-def test_pr_final_sweep_refuses_beside_a_public_panel_peer(tmp_path, review_parallel):
-    """#1156: a rerun that crosses into final-secondary-sweep never reads a published panel review."""
+def test_pr_final_sweep_closes_beside_a_public_panel_peer(tmp_path, review_parallel):
+    """#1156/#2064: a rerun that crosses into final-secondary-sweep never reads a
+    published panel review; the round-start decision closes the round before any
+    new scheduler checkpoint, counting the earlier-phase public review."""
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path)
     _interrupt_panel_pr_round(runner, config)
@@ -3957,14 +3881,13 @@ def test_pr_final_sweep_refuses_beside_a_public_panel_peer(tmp_path, review_para
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.comments)
 
-    message = _refusal_message(runner, config, review_parallel=review_parallel)
+    _closure_of_rerun(runner, config, review_parallel=review_parallel, round_number=2,
+                      published=["Gemini"], unreplayable=["Antigravity"])
 
-    assert _prelaunch_phases(runner, round_number=2) == ["secondary-audit", "final-secondary-sweep"]
+    assert _prelaunch_phases(runner, round_number=2) == ["secondary-audit"]  # no new checkpoint
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    assert "Gemini already posted" in message
-    assert "Delete these" in message
-    # The refused run posted only its own scheduler checkpoint.
+    # The closure record is the only newly posted record.
     assert len(runner.comments) - comments_before == 1
     assert not any(
         r.role == "reviewer" and r.round_number == 2 and r.agent == "Antigravity"
@@ -3972,72 +3895,25 @@ def test_pr_final_sweep_refuses_beside_a_public_panel_peer(tmp_path, review_para
     )
 
 
-def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round(tmp_path):
+def test_pr_final_sweep_closure_rerun_never_posts_a_second_record(tmp_path):
+    """`closure-idempotent`: after the closure a rerun moves on without a second round-2 record."""
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path)
     _interrupt_panel_pr_round(runner, config)
     for path in _spool_files(config):
         path.unlink()
-    launches_before = len(runner.reviewer_launches)
-    message = _refusal_message(runner, config)
+    _closure_of_rerun(runner, config, round_number=2, published=["Gemini"], unreplayable=["Antigravity"])
+    kept = list(runner.pr_payload["comments"])
 
-    assert "Delete these 3 comments" in message, message
-    assert "provisional" not in message
-    ids = _listed_comment_ids(message)
-    assert len(ids) == 3
-    listed = {
-        index: comment for index, comment in enumerate(runner.pr_payload["comments"])
-        if index + 10_001 in ids
-    }
-    phases = []
-    for comment in listed.values():
-        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
-        metadata = round_metadata._decode_round_metadata(match["payload"])
-        phases.append((metadata.round_number, metadata.role, metadata.agent, metadata.scheduler_phase))
-        # Never the primary's gating review, never a round-1 record.
-        assert metadata.round_number == 2 and metadata.agent != "Codex"
-    assert sorted(phases) == sorted([
-        (2, "summary", "Orchestrator", "secondary-audit"),
-        (2, "reviewer", "Gemini", "secondary-audit"),
-        (2, "summary", "Orchestrator", "final-secondary-sweep"),
-    ])
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError:
+        pass  # the scripted board may run dry in round 3; only the transition matters
 
-    _delete_listed_comments(runner, ids, surface="pr")
-    assert not any(marker in body for marker in _PANEL_MARKERS for body in runner.comments)
-    runner.peer_body_visible_at_launch = False
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert not runner.peer_body_visible_at_launch
-    # The never-started baseline: a run stopped just before the panel opens,
-    # then rerun.  Deleting the listed records must restore exactly that history.
-    baseline = _panel_pr_runner()
-    baseline_config = _panel_pr_config(tmp_path / "baseline")
-    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
-        side_effect=_interrupt_on_phase(
-            pr_loop_support.post_pr_comment, "scheduler-prelaunch", round_number=2
-        ),
-    ):
-        with pytest.raises(KeyboardInterrupt):
-            run_pr_loop(baseline, pr_number=77, config=baseline_config)
-    baseline_launches_before = len(baseline.reviewer_launches)
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-
-    assert _prelaunch_phases(runner, round_number=1) == _prelaunch_phases(baseline, round_number=1)
-    # Round 1 was reconciled after the primary approved, so the panel opens
-    # round 2 (#1553) in both histories.
-    assert _prelaunch_phases(runner, round_number=1)[-1] == "primary"
-    assert _prelaunch_phases(runner, round_number=2) == _prelaunch_phases(baseline, round_number=2)
-    assert _prelaunch_phases(runner, round_number=2)[0] == "secondary-audit"
-    assert "final-secondary-sweep" not in {
-        r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
-    }
-    assert _transition(_records(runner, flow="pr", surface="pr"), round_number=1) == _transition(
-        _records(baseline, flow="pr", surface="pr"), round_number=1
-    )
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(
-        baseline.reviewer_launches[baseline_launches_before:]
-    )
-    assert sorted(runner.reviewer_launches[launches_before:]) == ["agy", "gemini"]
+    _closure(runner, round_number=2)
+    assert runner.pr_payload["comments"][:len(kept)] == kept
+    later = _records(runner, flow="pr", surface="pr")[len(_comment_records_from(kept)):]
+    assert later and all(r.round_number >= 3 for r in later)
 
 
 def test_pr_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_path):
@@ -4075,8 +3951,8 @@ def test_pr_interrupted_primary_resumed_into_a_same_round_panel_still_launches_t
     assert [_published_count(runner, marker) for marker in _PANEL_MARKERS] == [1, 1]
 
 
-def test_plan_final_sweep_refuses_beside_a_public_panel_peer(tmp_path):
-    """#1156: staged planning, primary plus two panel reviewers."""
+def test_plan_final_sweep_closes_beside_a_public_panel_peer(tmp_path):
+    """#1156/#2064: staged planning, primary plus two panel reviewers."""
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
     _interrupt_panel_plan_round(runner, config)
@@ -4084,19 +3960,17 @@ def test_plan_final_sweep_refuses_beside_a_public_panel_peer(tmp_path):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
     phases = [
         r.scheduler_phase for r in _records(runner, flow="plan", surface="issue")
         if r.round_number == 2 and r.phase == "scheduler-prelaunch"
     ]
-    assert phases == ["secondary-audit", "final-secondary-sweep"]
+    assert phases == ["secondary-audit"]  # closed before any new checkpoint
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    message = str(excinfo.value)
-    assert "Gemini already posted" in message
-    assert "Gemini review (round 2)" in message
+    _closure(runner, surface="issue", round_number=2, published=["Gemini"])
 
 
 def test_plan_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_path):
@@ -4300,36 +4174,14 @@ def _same_round_panel_state(tmp_path):
     return runner, config
 
 
-def test_pr_same_round_gate_survives_verified_deletion_and_rerun(tmp_path):
+def test_pr_same_round_gate_closes_without_deleting_the_primary(tmp_path):
     runner, config = _same_round_panel_state(tmp_path)
-    launches_before = len(runner.reviewer_launches)
+    kept = list(runner.pr_payload["comments"])
 
-    message = _refusal_message(runner, config)
+    _closure_of_rerun(runner, config, published=["Gemini"], unreplayable=["Antigravity"])
 
-    assert len(runner.reviewer_launches) == launches_before
-    assert "provisional" not in message and "Delete these" in message, message
-    ids = _listed_comment_ids(message)
-    listed = []
-    for index, comment in enumerate(runner.pr_payload["comments"]):
-        if index + 10_001 in ids:
-            metadata = round_metadata._decode_round_metadata(
-                discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
-            )
-            listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
-    # The opening, the refused rerun's checkpoint and the panel review; never the primary.
-    assert sorted(listed) == sorted([
-        ("summary", "Orchestrator", "secondary-audit"),
-        ("reviewer", "Gemini", "secondary-audit"),
-        ("summary", "Orchestrator", "final-secondary-sweep"),
-    ])
-
-    _delete_listed_comments(runner, ids, surface="pr")
-    runner.peer_body_visible_at_launch = False
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    assert not runner.peer_body_visible_at_launch
-    assert sorted(runner.reviewer_launches[launches_before:]) == ["agy", "gemini"]
-    assert _prelaunch_phases(runner, round_number=1) == ["primary", "secondary-audit"]
+    # The primary's gating review and every round record stay public.
+    assert runner.pr_payload["comments"][:len(kept)] == kept
     primary = [
         r for r in _records(runner, flow="pr", surface="pr")
         if r.role == "reviewer" and r.agent == "Codex"
@@ -4357,42 +4209,32 @@ def test_plan_same_round_gate_is_kept_and_listing_is_verified(tmp_path):
     ]
     assert plan_phases() == ["primary", "secondary-audit"]
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    message = str(excinfo.value)
     assert runner.reviewer_launches == launches_before
-    assert plan_phases() == ["primary", "secondary-audit", "final-secondary-sweep"]
-    assert "provisional" not in message and "Delete these 1 comments" in message, message
-    assert "Gemini review (round 1)" in message
-    assert "Codex review" not in message
-    # Plan checkpoints are never targeted.
-    assert "scheduler checkpoint" not in message
+    assert plan_phases() == ["primary", "secondary-audit"]  # closed before any new checkpoint
+    # The primary's opening review is not a same-batch peer.
+    _closure(runner, surface="issue", published=["Gemini"])
 
 
-def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp_path):
-    """A failed post-checkpoint read must neither abort nor hide the public panel peer."""
+def test_plan_round_closes_before_any_checkpoint_or_post_checkpoint_read(tmp_path):
+    """#2064: the public panel peer is found from durable history before the
+    final-sweep checkpoint, so no post-checkpoint visibility read is needed."""
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
     _interrupt_panel_plan_round(runner, config)
     for path in _spool_files(config):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
-    real_context = discuss_loop.get_issue_context
-    failures = []
+    comments_before = len(runner.issue_comments)
 
-    def flaky_context(*args, **kwargs):
-        newest = runner.issue_comments[-1]["body"] if runner.issue_comments else ""
-        if "final-secondary-sweep" in newest:
-            failures.append(newest)
-            raise AgentLoopError("transient read failure")
-        return real_context(*args, **kwargs)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    with patch_object_in((discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop, plan_execution), "get_issue_context", side_effect=flaky_context):
-        with pytest.raises(review_rounds.PartialReviewRoundError):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert failures, "the post-checkpoint read was never exercised"
+    _closure(runner, surface="issue", round_number=2, published=["Gemini"])
+    assert len(runner.issue_comments) == comments_before + 1
+    assert not any("final-secondary-sweep" in c["body"] for c in runner.issue_comments[comments_before:])
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
 
@@ -4471,12 +4313,11 @@ def test_pr_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     launches_before = list(runner.reviewer_launches)
     assert sorted(launches_before) == ["agy", "codex", "gemini"]
 
-    message = _refusal_message(runner, config)
+    closure = _closure_of_rerun(runner, config)
 
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    assert "Codex already posted" in message
-    assert "Codex review (round 1)" in message
+    assert "Codex" in [e["agent"] for e in closure.round_closure["published"]]
 
 
 def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
@@ -4499,13 +4340,13 @@ def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     launches_before = list(runner.reviewer_launches)
     assert sorted(launches_before) == ["agy", "codex", "gemini"]
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    assert "Codex already posted" in str(excinfo.value)
-    assert "Codex review (round 1)" in str(excinfo.value)
+    closure = _closure(runner, surface="issue")
+    assert "Codex" in [e["agent"] for e in closure.round_closure["published"]]
 
 
 def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
@@ -4520,7 +4361,8 @@ def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
     seen = []
 
     def extract(comments, *, flow):
-        if any("final-secondary-sweep" in str(getattr(c, "body", "")) for c in comments):
+        # History refreshed after the round-2 closure record (#2064) is undecodable.
+        if any("closed, incomplete" in str(getattr(c, "body", "")) for c in comments):
             seen.append(flow)
             raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
         return real_extract(comments, flow=flow)
@@ -4558,7 +4400,6 @@ def _rewrite_payloads(runner, transform):
 def test_pr_publication_hidden_by_a_ledger_mismatch_still_counts_as_a_peer(tmp_path):
     """Resume drops a same-round review whose prior-item ledger differs; it is still public."""
     runner, config = _same_round_panel_state(tmp_path)
-    _refusal_message(runner, config)  # the rerun's later checkpoint becomes the round's anchor
 
     def mismatch(payload):
         if payload.get("agent") != "Gemini" or payload.get("phase") != "publication":
@@ -4574,13 +4415,12 @@ def test_pr_publication_hidden_by_a_ledger_mismatch_still_counts_as_a_peer(tmp_p
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.pr_payload["comments"])
 
-    message = _refusal_message(runner, config)
+    closure = _closure_of_rerun(runner, config)
 
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    assert "Gemini already posted" in message
-    assert "Gemini review (round 1)" in message
-    # No reviewer comment was posted by the refused run.
+    assert "Gemini" in [e["agent"] for e in closure.round_closure["published"]]
+    # No reviewer comment was posted by the closing run.
     new = runner.pr_payload["comments"][comments_before:]
     assert not any("Antigravity" in c["body"] and "panel review" in c["body"] for c in new)
 
@@ -4619,13 +4459,13 @@ def test_plan_publication_stripped_as_pre_opening_still_counts_as_a_peer(tmp_pat
     comments.insert(opening, comments.pop(gemini))  # Gemini's review now precedes the opening
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
-    assert "Gemini already posted" in str(excinfo.value)
-    assert "Gemini review (round 1)" in str(excinfo.value)
+    closure = _closure(runner, surface="issue")
+    assert "Gemini" in [e["agent"] for e in closure.round_closure["published"]]
 
 
 def _remediation_gate_state(tmp_path, monkeypatch):
@@ -4686,7 +4526,7 @@ def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_
     }
 
 
-def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, monkeypatch):
+def test_pr_remediation_gate_is_never_closed_over_but_the_sweep_peers_are(tmp_path, monkeypatch):
     runner, config = _remediation_gate_state(tmp_path, monkeypatch)
     with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
         side_effect=_interrupt_on_second_review_post(pr_loop_support.post_pr_comment, _PANEL_MARKERS),
@@ -4697,28 +4537,22 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
     for path in _spool_files(config):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
-
-    message = _refusal_message(runner, config)
-
-    assert runner.reviewer_launches == launches_before
-    assert "provisional" not in message, message
-    listed = []
-    for index, comment in enumerate(runner.pr_payload["comments"]):
-        if index + 10_001 in _listed_comment_ids(message):
-            metadata = round_metadata._decode_round_metadata(
-                discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
-            )
-            listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
     # Publication follows completion order, so assert whichever panel reviewer
     # actually published for the new head rather than assuming one.
-    published = {
-        r.agent for r in _records(runner, flow="pr", surface="pr")
+    sweep = [
+        r for r in _records(runner, flow="pr", surface="pr")
         if r.subject == "0b3d8b29493059afd7f9912106279c4643ac4939" and r.role == "reviewer" and r.scheduler_phase == "final-secondary-sweep"
-    }
+    ]
+    published = {r.agent for r in sweep}
     assert len(published) == 1 and published <= {"Gemini", "Antigravity"}
-    assert ("reviewer", next(iter(published)), "final-secondary-sweep") in listed
-    # The primary's remediation approval gates the sweep and is retained.
-    assert not any(agent == "Codex" for _role, agent, _phase in listed)
+
+    closure = _closure_of_rerun(runner, config, round_number=sweep[0].round_number)
+
+    assert runner.reviewer_launches == launches_before
+    names = [e["agent"] for e in closure.round_closure["published"]]
+    assert next(iter(published)) in names
+    # The primary's remediation approval gates the sweep; it is not a same-batch peer.
+    assert "Codex" not in names
 
 
 def test_recovery_lists_a_secondary_remediation_verdict_beside_the_retained_gate():
@@ -4840,16 +4674,15 @@ def test_plan_secondary_remediation_verdict_is_a_peer_beside_the_retained_gate(t
     runner, config = _seeded_plan_remediation_state(tmp_path, secondary_published=True)
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    message = str(excinfo.value)
     # The sweep would read Gemini's round-3 verdict; the primary's approval is the gate.
     assert runner.reviewer_launches == launches_before
-    assert _plan_round_three_phases(runner) == ["remediation", "final-secondary-sweep"]
-    assert "Gemini already posted" in message and "provisional" not in message, message
-    assert "Gemini review (round 3)" in message
-    assert "Codex review" not in message
+    assert _plan_round_three_phases(runner) == ["remediation"]  # closed before any new checkpoint
+    closure = _closure(runner, surface="issue", round_number=3)
+    names = [e["agent"] for e in closure.round_closure["published"]]
+    assert "Gemini" in names and "Codex" not in names
 
 
 def _frozen_carriers(config):
@@ -4902,7 +4735,7 @@ def test_pr_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(tmp
     assert _spool_files(config) == []
 
 
-def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_reviewers(tmp_path):
+def test_pr_parallel_rerun_under_a_different_actor_closes_without_other_posts_or_reviewers(tmp_path):
     import coding_review_agent_loop.github as github_module
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
@@ -4932,11 +4765,10 @@ def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_review
     runner.authenticated_actor = ("someone-else", 99)
     issue_loop.reset_authenticated_github_actor(runner)
 
-    with pytest.raises(PublicationResumeStop, match="id 99"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
     assert runner.reviewer_launches[launches_before:] == []
-    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert len(_frozen_carriers(config)) == 1
 
 
@@ -4977,7 +4809,7 @@ def test_plan_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(t
     assert _spool_files(config) == []
 
 
-def test_plan_parallel_rerun_with_a_changed_validation_context_stops_before_any_launch(tmp_path):
+def test_plan_parallel_rerun_with_a_changed_validation_context_closes_before_any_launch(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, markers = _plan_partial_round_runner()
@@ -4993,15 +4825,15 @@ def test_plan_parallel_rerun_with_a_changed_validation_context_stops_before_any_
             payload["publication"]["validation_context_digest"] = "0" * 64
             path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(PublicationResumeStop, match="validation context"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
     assert runner.reviewer_launches == launches_before
-    assert len(runner.issue_comments) == comments_before
+    assert len(runner.issue_comments) == comments_before + 1  # only the closure record
     assert len(_frozen_carriers(config)) == 1
 
 
-def test_pr_parallel_legacy_record_with_foreign_sidecar_stops_before_any_post_or_launch(tmp_path):
+def test_pr_parallel_legacy_record_with_foreign_sidecar_closes_before_any_launch(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, markers = _pr_partial_round_runner()
@@ -5028,11 +4860,10 @@ def test_pr_parallel_legacy_record_with_foreign_sidecar_stops_before_any_post_or
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.pr_payload["comments"])
 
-    with pytest.raises(PublicationResumeStop, match="old-bot"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
     assert runner.reviewer_launches == launches_before
-    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert len(_spool_files(config)) == 1
 
 
@@ -5092,7 +4923,7 @@ def test_pr_rerun_completes_the_frozen_suffix_before_a_new_scheduler_checkpoint(
     assert runner.reviewer_launches[launches_before:].count("gemini") <= 1  # round 2 only
 
 
-def test_pr_refusals_publish_no_checkpoint_and_launch_no_reviewer(tmp_path):
+def test_pr_carrier_closures_publish_no_checkpoint_and_launch_no_reviewer(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _selective_interrupted_after_freeze(tmp_path)
@@ -5101,10 +4932,9 @@ def test_pr_refusals_publish_no_checkpoint_and_launch_no_reviewer(tmp_path):
     runner.authenticated_actor = ("someone-else", 99)
     issue_loop.reset_authenticated_github_actor(runner)
 
-    with pytest.raises(PublicationResumeStop, match="id 99"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before  # no new checkpoint either
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # the closure, no checkpoint
     assert runner.reviewer_launches == launches_before
     assert len(_frozen_carriers(config)) == 1
 
@@ -5124,15 +4954,10 @@ def test_pr_already_public_anchor_is_still_checked_before_the_spool_is_discarded
     comments_before = len(runner.pr_payload["comments"])
     runner.authenticated_actor = ("someone-else", 99)
     issue_loop.reset_authenticated_github_actor(runner)
-    with pytest.raises(PublicationResumeStop, match="id 99"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_frozen_carriers(config)) == 1 and len(runner.pr_payload["comments"]) == comments_before
-
-    runner.authenticated_actor = ("agent-bot", 7)
-    issue_loop.reset_authenticated_github_actor(runner)
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
+    # The record is saved before the spool is discarded, and nothing else is posted.
+    assert len(_frozen_carriers(config)) == 1 and len(runner.pr_payload["comments"]) == comments_before + 1
     assert sum(c["body"] == carrier["bodies"][-1] for c in runner.pr_payload["comments"]) == 1
-    assert _spool_files(config) == []
 
 
 def test_pr_carrier_is_checked_before_a_fresh_peer_is_launched(tmp_path):
@@ -5149,8 +4974,7 @@ def test_pr_carrier_is_checked_before_a_fresh_peer_is_launched(tmp_path):
     runner.authenticated_actor = ("someone-else", 99)
     issue_loop.reset_authenticated_github_actor(runner)
 
-    with pytest.raises(PublicationResumeStop):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
     assert runner.reviewer_launches == launches_before
 
@@ -5263,7 +5087,7 @@ def test_pr_rerun_after_a_sidecar_prefix_completes_the_frozen_suffix_before_the_
     assert _spool_files(config) == []
 
 
-def test_pr_gap_in_the_frozen_sequence_refuses_with_zero_posts(tmp_path):
+def test_pr_gap_in_the_frozen_sequence_closes_with_one_record(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, carrier = _prefix_interrupted_pr(tmp_path)
@@ -5275,40 +5099,34 @@ def test_pr_gap_in_the_frozen_sequence_refuses_with_zero_posts(tmp_path):
     comments_before = len(runner.pr_payload["comments"])
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="absent while a later body"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert len(_frozen_carriers(config)) == 1
 
 
-def test_pr_public_anchor_with_a_surplus_match_or_swapped_response_is_refused(tmp_path):
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
-
+@pytest.mark.parametrize("damage", ["surplus", "swapped"])
+def test_pr_public_anchor_with_a_surplus_match_or_swapped_response_closes(tmp_path, damage):
     runner, config, carrier = _prefix_interrupted_pr(tmp_path)
     frozen = carrier["bodies"]
     _public_comment(runner, frozen[2])  # anchor accepted; spool removal never happened
-    _public_comment(runner, frozen[0])  # surplus identical match for sidecar 1
+    if damage == "surplus":
+        _public_comment(runner, frozen[0])  # surplus identical match for sidecar 1
+    else:
+        for path in _spool_files(config):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if "publication" in payload:
+                payload["response"]["text"] = payload["response"]["text"] + " tampered"
+                path.write_text(json.dumps(payload), encoding="utf-8")
     comments_before = len(runner.pr_payload["comments"])
-    with pytest.raises(PublicationResumeStop, match="identical candidates"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(runner.pr_payload["comments"]) == comments_before
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
+    assert len(runner.pr_payload["comments"]) == comments_before + 1
     assert len(_frozen_carriers(config)) == 1
-
-    runner.pr_payload["comments"].pop()  # drop the surplus match
-    for path in _spool_files(config):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if "publication" in payload:
-            payload["response"]["text"] = payload["response"]["text"] + " tampered"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(PublicationResumeStop):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(runner.pr_payload["comments"]) == comments_before - 1
-    assert len(_frozen_carriers(config)) == 1
+    _closure(runner)
 
 
-def test_pr_null_or_unreadable_carrier_stops_before_checkpoint_and_launch(tmp_path):
+def test_pr_null_or_unreadable_carrier_closes_before_checkpoint_and_launch(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _prefix_interrupted_pr(tmp_path)
@@ -5319,14 +5137,13 @@ def test_pr_null_or_unreadable_carrier_stops_before_checkpoint_and_launch(tmp_pa
         if "publication" in payload:
             payload["publication"] = None
             path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len(runner.pr_payload["comments"]) == comments_before
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert _spool_files(config)
 
 
-def test_pr_legacy_record_with_a_public_anchor_is_still_refused(tmp_path):
+def test_pr_legacy_record_with_a_public_anchor_closes_the_round(tmp_path):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, carrier = _prefix_interrupted_pr(tmp_path)
@@ -5340,10 +5157,9 @@ def test_pr_legacy_record_with_a_public_anchor_is_still_refused(tmp_path):
     comments_before = len(runner.pr_payload["comments"])
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="possible earlier publication"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert _spool_files(config)
 
@@ -5420,29 +5236,29 @@ def test_staged_plan_rerun_after_a_sidecar_prefix_completes_before_the_checkpoin
     assert runner.reviewer_launches[launches_before:].count("codex") == 0
 
 
-def test_staged_plan_gap_and_null_carrier_refuse_with_zero_posts(tmp_path):
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
-
+@pytest.mark.parametrize("damage", ["gap", "null"])
+def test_staged_plan_gap_and_null_carrier_close_with_one_record(tmp_path, damage):
+    """`spool-carrier-closes` (plan): a gapped or null carrier closes the round, posting nothing else."""
     runner, config, carrier = _prefix_interrupted_staged_plan(tmp_path)
     frozen = carrier["bodies"]
-    runner.issue_comments = [c for c in runner.issue_comments if c["body"] != frozen[0]]
+    if damage == "gap":
+        runner.issue_comments = [c for c in runner.issue_comments if c["body"] != frozen[0]]
+    else:
+        for path in _spool_files(config):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if "publication" in payload:
+                payload["publication"] = None
+                path.write_text(json.dumps(payload), encoding="utf-8")
     comments_before = len(runner.issue_comments)
     launches_before = list(runner.reviewer_launches)
-    with pytest.raises(PublicationResumeStop, match="absent while a later body"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert len(runner.issue_comments) == comments_before
-    assert runner.reviewer_launches == launches_before
 
-    for path in _spool_files(config):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if "publication" in payload:
-            payload["publication"] = None
-            path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert len(runner.issue_comments) == comments_before
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
+
+    assert len(runner.issue_comments) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
-    assert _spool_files(config)
+    _closure(runner, surface="issue")
+    assert not any(c["body"] in frozen for c in runner.issue_comments[comments_before:])
 
 
 # ---------------------------------------------------------------------------
@@ -5599,7 +5415,7 @@ def _drop_peer(runner, config, *, peer_marker, peer_name="Gemini", invalid_recor
 
 
 @pytest.mark.parametrize("invalid_record", [False, True])
-def test_pr_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, monkeypatch, invalid_record):
+def test_pr_public_sidecar_prefix_beside_a_fresh_peer_closes_the_round(tmp_path, monkeypatch, invalid_record):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
@@ -5608,10 +5424,9 @@ def test_pr_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, monke
     launches_before = list(runner.reviewer_launches)
     audits_before = len(_audit_indexes(runner))
 
-    with pytest.raises(PublicationResumeStop, match="partly public"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before  # no checkpoint, no post
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert len(_audit_indexes(runner)) == audits_before
     assert runner.reviewer_launches == launches_before
     assert any("publication" in json.loads(p.read_text(encoding="utf-8")) for p in _spool_files(config))
@@ -5665,7 +5480,7 @@ def test_plan_exhausted_publication_resumes_hours_later_and_removes_the_spool(tm
 
 
 @pytest.mark.parametrize("invalid_record", [False, True])
-def test_plan_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, monkeypatch, invalid_record):
+def test_plan_public_sidecar_prefix_beside_a_fresh_peer_closes_the_round(tmp_path, monkeypatch, invalid_record):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
@@ -5687,10 +5502,10 @@ def test_plan_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, mon
     comments_before = len(runner.issue_comments)
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="partly public"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    assert len(runner.issue_comments) == comments_before
+    assert len(runner.issue_comments) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert any("publication" in json.loads(p.read_text(encoding="utf-8")) for p in _spool_files(config))
 
@@ -5710,7 +5525,7 @@ def _undecodable(config, reviewer_file="Codex.json"):
     return damaged
 
 
-def test_pr_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+def test_pr_undecodable_spool_file_beside_a_public_prefix_closes_the_round(tmp_path, monkeypatch):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _exhausted_pr(tmp_path, monkeypatch)
@@ -5719,15 +5534,14 @@ def test_pr_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path, m
     comments_before = len(runner.pr_payload["comments"])
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before  # no checkpoint, no post
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before  # no fresh turn beside the sidecars
     assert all(path.exists() for path in damaged)
 
 
-def test_plan_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+def test_plan_undecodable_spool_file_beside_a_public_prefix_closes_the_round(tmp_path, monkeypatch):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
@@ -5741,10 +5555,10 @@ def test_plan_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path,
     comments_before = len(runner.issue_comments)
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    assert len(runner.issue_comments) == comments_before
+    assert len(runner.issue_comments) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert all(path.exists() for path in damaged)
 
@@ -5872,7 +5686,7 @@ def _damage_identity(config, reviewer_file="Codex.json", key="subject"):
     return damaged
 
 
-def test_pr_identity_damaged_carrier_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+def test_pr_identity_damaged_carrier_beside_a_public_prefix_closes_the_round(tmp_path, monkeypatch):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _exhausted_pr(tmp_path, monkeypatch)
@@ -5882,16 +5696,15 @@ def test_pr_identity_damaged_carrier_beside_a_public_prefix_is_refused(tmp_path,
     launches_before = list(runner.reviewer_launches)
     audits_before = len(_audit_indexes(runner))
 
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=config))
 
-    assert len(runner.pr_payload["comments"]) == comments_before  # no post
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
     assert len(_audit_indexes(runner)) == audits_before  # no checkpoint
     assert runner.reviewer_launches == launches_before
     assert all(path.read_bytes() == content for path, content in damaged)
 
 
-def test_plan_identity_damaged_carrier_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+def test_plan_identity_damaged_carrier_beside_a_public_prefix_closes_the_round(tmp_path, monkeypatch):
     from coding_review_agent_loop.publication_resume import PublicationResumeStop
 
     runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
@@ -5905,10 +5718,10 @@ def test_plan_identity_damaged_carrier_beside_a_public_prefix_is_refused(tmp_pat
     comments_before = len(runner.issue_comments)
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _run_until_closure(lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True),
+                       surface="issue")
 
-    assert len(runner.issue_comments) == comments_before
+    assert len(runner.issue_comments) == comments_before + 1  # only the closure record
     assert runner.reviewer_launches == launches_before
     assert all(path.read_bytes() == content for path, content in damaged)
 
@@ -6068,7 +5881,7 @@ def test_m2100_pr_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_pa
         marker for marker in markers
         if any(marker in str(c["body"]) for c in runner.pr_payload["comments"])
     )
-    resumed = _m2100_resumed_spy(monkeypatch, pr_loop, "ParsedReview")
+    resumed = _m2100_resumed_spy(monkeypatch, round_closure_writer, "ParsedReview")
     launches_before = len(runner.reviewer_launches)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -6119,7 +5932,7 @@ def test_m2100_plan_parallel_publication_replay_and_resume_keep_ignored_ids(tmp_
     _interrupt_plan_round_between_publications(runner, config, markers)
     spooled = [json.loads(path.read_text(encoding="utf-8")) for path in _spool_files(config)]
     assert [record["response"]["ignored_prior_disposition_ids"] for record in spooled] == [["item-77"]]
-    resumed = _m2100_resumed_spy(monkeypatch, plan_first_loop, "ParsedPlanReview")
+    resumed = _m2100_resumed_spy(monkeypatch, round_closure_writer, "ParsedPlanReview")
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
@@ -6180,3 +5993,199 @@ def test_m2100_malformed_spooled_ignored_ids_fall_back_to_a_fresh_turn(tmp_path)
     assert not any("Gemini approves the PR." in body for body in bodies)
     fresh = [body for body in bodies if "Gemini approves on a fresh turn." in body]
     assert len(fresh) == 1 and f"{_M2100_NOTE}`item-77`" in fresh[0]
+
+
+# ---------------------------------------------------------------------------
+# #2064 stage 2: no publication means no closure; carrier stops are routed
+# ---------------------------------------------------------------------------
+
+
+def _first_publication_frozen_then_failed(runner, config, markers, *, surface="pr"):
+    """Freeze the first reviewer's carrier, then fail before its first post: nothing is public."""
+    import coding_review_agent_loop.github as github_module
+
+    real_post = pr_loop_support.post_pr_comment if surface == "pr" else architecture_contract.post_issue_comment
+
+    def fail_first_review_body(*args, **kwargs):
+        if any(marker in str(kwargs["body"]) for marker in markers):
+            with patch.object(github_module, "_post_comment_body", side_effect=KeyboardInterrupt):
+                return real_post(*args, **kwargs)
+        return real_post(*args, **kwargs)
+
+    modules = ((pr_loop_support, pr_loop, issue_loop), "post_pr_comment") if surface == "pr" else (
+        (architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+         child_plan_binding, plan_first_loop), "post_issue_comment")
+    with patch_object_in(modules[0], modules[1], side_effect=fail_first_review_body):
+        with pytest.raises(KeyboardInterrupt):
+            if surface == "pr":
+                run_pr_loop(runner, pr_number=77, config=config)
+            else:
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any(_published_count(runner, marker) for marker in markers)
+
+
+def test_pr_withheld_invalid_spool_with_nothing_published_gets_a_fresh_turn_and_no_closure(tmp_path):
+    """`no-published-no-rollover` (PR): no round-1 review is public, so round 1 just continues."""
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Codex approves the PR first.",),
+        codex_outputs=[structured_pr_review(summary="Codex approves the PR first."),
+                       structured_pr_review(summary="Codex approves on its fresh turn.")],
+        gemini_outputs=[("gemini exploded", 1)],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0)
+    with pytest.raises(AgentLoopError, match="Gemini"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _published_count(runner, "Codex approves the PR first.") == 0
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "response" in payload:
+            payload["response"]["text"] = "not a structured PR review"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    runner.gemini_outputs.append(structured_pr_review(summary="Gemini approves on retry.", reviewer="Google Gemini"))
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not [r for r in _comment_records(runner, surface="pr", flow="pr") if r.phase == "round-closed-incomplete"]
+    assert sorted(runner.reviewer_launches[len(launches_before):]) == ["codex", "gemini"]
+    records = _comment_records(runner, surface="pr", flow="pr")
+    assert {r.round_number for r in records if r.role == "reviewer"} == {1}
+
+
+@pytest.mark.parametrize("surface", ["pr", "issue"])
+def test_verified_unpublished_carrier_with_an_invalid_response_gets_an_ordinary_fresh_turn(
+    tmp_path, monkeypatch, surface
+):
+    """`no-published-no-rollover` (item-6): a complete listing shows zero public bodies, so the
+    stale carrier is discarded and its reviewer runs fresh in the same round, without closure."""
+    if surface == "pr":
+        runner, markers = _approving_pr_runner()
+        runner.authenticated_actor = ("agent-bot", 7)
+        config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    else:
+        runner, markers = _plan_partial_round_runner()
+        runner.authenticated_actor = ("agent-bot", 7)
+        runner.serve_rest_issue_comments = True
+        runner.codex_outputs.append(structured_plan_review(summary="Codex plan approval on a fresh turn."))
+        runner.gemini_outputs.append(structured_plan_review(summary="Gemini fresh plan approval.", reviewer="Google Gemini"))
+        config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _first_publication_frozen_then_failed(runner, config, markers, surface=surface)
+    carriers = _frozen_carriers(config)
+    assert len(carriers) == 1
+    frozen_agent = round_metadata._decode_round_metadata(
+        discuss_loop.ROUND_RESUME_MARKER_RE.search(carriers[0]["bodies"][-1])["payload"]).agent
+    real_replay = review_rounds._replay_spooled_review
+
+    def carrier_invalid(runner_, *, config, reviewer, fields, validators):
+        if NAMES_BY_COMMAND[reviewer] == frozen_agent:
+            return None  # the frozen response no longer validates in this run's context
+        return real_replay(runner_, config=config, reviewer=reviewer, fields=fields, validators=validators)
+
+    monkeypatch.setattr(review_rounds, "_replay_spooled_review", carrier_invalid)
+    launches_before = list(runner.reviewer_launches)
+
+    if surface == "pr":
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    else:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    flow = "pr" if surface == "pr" else "plan"
+    records = _comment_records(runner, surface=surface, flow=flow)
+    assert not [r for r in records if r.phase == "round-closed-incomplete"]
+    frozen_command = next(command for command, name in NAMES_BY_COMMAND.items() if name == frozen_agent)
+    assert frozen_command in runner.reviewer_launches[len(launches_before):]
+    assert {r.round_number for r in records if r.role == "reviewer"} == {1}
+    # The unvalidated frozen body is never published.
+    assert not any(body == carriers[0]["bodies"][-1] for body in (c["body"] for c in (
+        runner.pr_payload["comments"] if surface == "pr" else runner.issue_comments)))
+
+
+NAMES_BY_COMMAND = {"codex": "Codex", "gemini": "Gemini", "agy": "Antigravity"}
+
+
+def test_carrier_listing_read_failure_at_round_start_is_retryable_with_the_spool_kept(tmp_path, monkeypatch):
+    """`carrier-stop-routing`: a failed complete-listing read never closes the round."""
+    from coding_review_agent_loop import publication_resume
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+
+    runner, config, _carrier = _prefix_interrupted_pr(tmp_path)
+    spooled = {path: path.read_bytes() for path in _spool_files(config)}
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+
+    def listing_fails(self, actor):
+        raise self._stop("the conversation could not be read completely (HTTP 502).", category="read")
+
+    monkeypatch.setattr(publication_resume.RoundPublication, "_complete", listing_fails)
+    with pytest.raises(RoundStateReadError, match="rerun once GitHub comment reads succeed"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before  # no closure, no checkpoint
+    assert runner.reviewer_launches == launches_before
+    assert {path: path.read_bytes() for path in _spool_files(config)} == spooled
+    assert not any("Delete these" in body for body in runner.comments)
+
+
+def test_read_failure_while_publishing_keeps_outcomes_spooled_and_a_rerun_replays_them(tmp_path, monkeypatch):
+    """`carrier-stop-routing` at publication time: a failed freeze read is retryable."""
+    from coding_review_agent_loop import publication_resume
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+
+    runner, markers = _approving_pr_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_freeze = publication_resume.RoundPublication._freeze
+
+    def freeze_read_fails(self, bodies):
+        raise self._stop("a publication carrier could not be frozen because the pre-publication "
+                         "baseline listing is incomplete (HTTP 502).", category="read")
+
+    with monkeypatch.context() as patch_:
+        patch_.setattr(publication_resume.RoundPublication, "_freeze", freeze_read_fails)
+        with pytest.raises(RoundStateReadError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(_published_count(runner, marker) for marker in markers)
+    assert len(_spool_files(config)) == 2  # both outcomes are kept
+    assert real_freeze is publication_resume.RoundPublication._freeze
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.reviewer_launches == launches_before  # replayed, not re-run
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    assert not [r for r in _comment_records(runner, surface="pr", flow="pr") if r.phase == "round-closed-incomplete"]
+
+
+
+@pytest.mark.parametrize("surface", ["pr", "plan"])
+def test_closure_requires_fresh_reviews_from_the_full_board_including_an_earlier_primary(tmp_path, surface):
+    """#2064 item-7: the primary approved in round 1 and the panel partially
+    published in round 2.  After the closure (and a restart, since the closure
+    run stops right after posting the record) the primary's round-1 approval
+    no longer carries: round 3 opens a fresh primary phase and the panel
+    follows, so every configured reviewer reviews again after the closure."""
+    if surface == "pr":
+        runner, config = _panel_pr_runner(), _panel_pr_config(tmp_path)
+        _interrupt_panel_pr_round(runner, config)
+        run = lambda: run_pr_loop(runner, pr_number=77, config=config)
+        flow, records_surface = "pr", "pr"
+    else:
+        runner, config = _panel_plan_runner(), _panel_plan_config(tmp_path)
+        _interrupt_panel_plan_round(runner, config)
+        run = lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        flow, records_surface = "plan", "issue"
+    for path in _spool_files(config):
+        path.unlink()
+    _run_until_closure(run, surface=records_surface)
+    closure = _closure(runner, surface=records_surface, round_number=2, published=["Gemini"])
+    launches_before = list(runner.reviewer_launches)
+
+    assert run() == 0
+
+    assert sorted(runner.reviewer_launches[len(launches_before):]) == ["agy", "codex", "gemini"]
+    later = [r for r in _records(runner, flow=flow, surface=records_surface) if r.round_number > 2]
+    phases = [r.scheduler_phase for r in later if r.phase == "scheduler-prelaunch"]
+    assert phases[0] == "primary"  # the primary gate is preserved after the closure
+    fresh = {r.agent for r in later if r.role == "reviewer"}
+    assert fresh == {"Codex", "Gemini", "Antigravity"}
+    assert closure.round_number == 2
