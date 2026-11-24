@@ -811,7 +811,8 @@ def _recover_plan_revision_human_requirements_acknowledgement(
                 source_plan = validate_structured_plan_revision(source_text, architecture_status_mode="legacy")
                 if source_plan is None:
                     raise AgentLoopError("captured response was not a structured plan revision")
-                validate_human_requirement_dispositions(
+                # Only the kept (surfaced) dispositions are carried (#2114).
+                kept_dispositions = validate_human_requirement_dispositions(
                     source_plan.human_requirement_dispositions,
                     surfaced_requirement_ids=context.surfaced_requirement_ids,
                     context="plan_revision.human_requirement_dispositions",
@@ -819,7 +820,7 @@ def _recover_plan_revision_human_requirements_acknowledgement(
             except AgentLoopError:
                 invalid_count += 1
                 continue
-            valid_blocks.append((source, block, source_plan.human_requirement_dispositions))
+            valid_blocks.append((source, block, kept_dispositions))
 
     unique_valid: list[tuple[str, str, tuple[object, ...]]] = []
     seen_blocks: set[str] = set()

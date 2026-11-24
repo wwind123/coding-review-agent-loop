@@ -11,7 +11,7 @@ from .terminal_diagnostics import terminal_response_diagnostic
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace as dataclasses_replace
+from dataclasses import dataclass, is_dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import TypeVar
 from .agents.registry import run_agent_result
@@ -178,9 +178,16 @@ def _validate_issue_implementation_response(
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
         return _TerminalNoPrImplementation("clarification")
+    surfaced_requirement_ids = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="implementation requirements",
+        full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    ).surfaced_requirement_ids
     try:
         parsed = validate_structured_issue_implementation(
             text,
+            # Unsurfaced dispositions are dropped before the conflict decision (#2114).
+            surfaced_requirement_ids=surfaced_requirement_ids,
             required_architecture_impact_contract=(1 if require_architecture_impact else 0),
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
@@ -361,12 +368,18 @@ def _parse_fresh_correction_claims(
     row_ids: Sequence[str],
     execution_catalog: Sequence[object],
 ) -> StructuredIssueImplementation | StructuredCoderFollowup | None:
+    # Only the claim set is taken from the candidate; the authenticated
+    # response already passed the live, context-dependent checks.  So this
+    # reader is context-free and never re-applies them (#2114): an approved
+    # follow-up or a PR beside an unsurfaced blocked disposition still yields
+    # its corrected claims.
     if isinstance(original, StructuredIssueImplementation):
         candidate = validate_structured_issue_implementation(
             text,
             architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
+            historical_decode=True,
         )
     else:
         candidate = validate_structured_coder_followup(
@@ -374,6 +387,7 @@ def _parse_fresh_correction_claims(
             architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
+            historical_decode=True,
         )
     if candidate is None or candidate.kind != original.kind:
         return None
@@ -908,11 +922,14 @@ def _validate_response_with_human_requirements(
         requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
     )
     if hasattr(marker_value, "human_requirement_dispositions"):
-        validate_human_requirement_dispositions(
+        kept = validate_human_requirement_dispositions(
             marker_value.human_requirement_dispositions,
             surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
             context=f"{getattr(marker_value, 'kind', 'structured')}.human_requirement_dispositions",
         )
+        if is_dataclass(marker_value) and kept != tuple(marker_value.human_requirement_dispositions):
+            # Unsurfaced dispositions were dropped with a warning (#2114).
+            marker_value = dataclasses_replace(marker_value, human_requirement_dispositions=kept)
     return marker_value
 
 
@@ -1534,11 +1551,30 @@ def _check_plan_revision_patch_human_requirement_dispositions(
     if dispositions is None:
         dispositions = ()
     try:
-        validate_human_requirement_dispositions(
+        kept = validate_human_requirement_dispositions(
             dispositions,
             surfaced_requirement_ids=surfaced_requirement_ids,
             context="plan_revision_patch.human_requirement_dispositions",
         )
+        # Semantic-patch operations stay strict (#2114): assembly publishes
+        # these dispositions verbatim, so an unsurfaced entry or a repeated ID
+        # cannot be dropped or collapsed here without diverging from the
+        # published state.
+        ids = [item.requirement_id for item in dispositions]
+        repeated = sorted({item for item in ids if ids.count(item) > 1})
+        if repeated:
+            raise SemanticPatchPayloadRejection(
+                "plan_revision_patch.human_requirement_dispositions contains duplicate requirement ID(s): "
+                + ", ".join(repeated)
+            )
+        unknown = sorted(
+            {item.requirement_id for item in dispositions} - {item.requirement_id for item in kept}
+        )
+        if unknown:
+            raise SemanticPatchPayloadRejection(
+                "plan_revision_patch.human_requirement_dispositions contains unknown requirement ID(s): "
+                + ", ".join(unknown)
+            )
     except SemanticPatchPayloadRejection:
         raise
     except AgentLoopError as exc:

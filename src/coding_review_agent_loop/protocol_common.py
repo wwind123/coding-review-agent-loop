@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import re
@@ -283,6 +285,198 @@ def _expect_exact_keys(
     unknown = sorted(keys - required - optional)
     if unknown:
         raise AgentLoopError(f"{context} has unknown field(s): {', '.join(unknown)}")  # shape-check: delegated
+
+
+# Lenient agent-response key policy (#2114).  Unknown string-valued keys are
+# dropped with a warning at opted-in agent-response sites, but these names
+# (and any authority-looking name) always keep the strict unknown-field error.
+PROTECTED_RESPONSE_KEY_NAMES = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "state",
+        "item_id",
+        "id",
+        "disposition",
+        "requirement_id",
+        "requirement_label",
+        "pr_number",
+        "head_sha",
+        "head",
+        "expected_head_sha",
+        "risk_test_matrix_evidence",
+        "evidence_requirement_ids",
+        "evidence_row_ids",
+        "evidence_citations",
+        "matrix_identity",
+        "identity",
+        "receipt_id",
+        "execution_ref",
+        "dispatch_id",
+        "dispatch_nonce",
+        "nonce",
+        "qualification",
+        "workflow_run_id",
+        "run_id",
+        # Tool-stamped recommendation fields (#1333): rejected when nested.
+        "topology_source",
+        "recommendation_digest",
+        "execution_strategy_contract_version",
+    }
+)
+_AUTHORITY_KEY_RE = re.compile(r"agent_|signature|managed_ci|provenance|marker|nonce|dispatch", re.I)
+
+RENAME_CONFLICT = "conflict"
+RENAME_PREFER_CANONICAL = "prefer-canonical"
+
+# Ordered alias -> canonical renames for an optional ``note`` (#2114).
+NOTE_KEY_RENAMES: tuple[tuple[str, str, str], ...] = (
+    ("reason", "note", RENAME_PREFER_CANONICAL),
+    ("rationale", "note", RENAME_PREFER_CANONICAL),
+)
+
+
+# Semantic plan-patch operations write approved plan state verbatim, so every
+# parser they reach stays strict (#2114).  Set only by ``strict_response_keys``.
+_STRICT_RESPONSE_KEYS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "strict_response_keys", default=False
+)
+
+
+@contextlib.contextmanager
+def strict_response_keys():
+    """Disable every #2114 leniency for parsers called inside this block."""
+    token = _STRICT_RESPONSE_KEYS.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_RESPONSE_KEYS.reset(token)
+
+
+def response_keys_strict() -> bool:
+    """True inside ``strict_response_keys`` (semantic plan-patch operations)."""
+    return _STRICT_RESPONSE_KEYS.get()
+
+
+def is_protected_response_key(name: object) -> bool:
+    """True when an unknown key must never be dropped silently (#2114)."""
+    if not isinstance(name, str):
+        return True
+    return (
+        name in PROTECTED_RESPONSE_KEY_NAMES
+        or name.strip().lower() in PROTECTED_RESPONSE_KEY_NAMES
+        or "<" in name
+        or ">" in name
+        or _AUTHORITY_KEY_RE.search(name) is not None
+    )
+
+
+def _apply_key_renames(
+    value: dict[str, object],
+    *,
+    context: str,
+    renames: Collection[tuple[str, str, str]],
+) -> dict[str, object]:
+    """Return a copy with alias keys renamed to canonical keys (#2114).
+
+    ``conflict`` rejects when the alias and canonical key are both present.
+    ``prefer-canonical`` requires a string alias (a non-string one always
+    rejects), renames it when the canonical key is absent, and otherwise
+    keeps the canonical value and drops the alias with a warning.
+    The input is never mutated.
+    """
+    result = dict(value)
+    for alias, canonical, policy in renames:
+        if alias not in result:
+            continue
+        if policy == RENAME_PREFER_CANONICAL and not isinstance(result[alias], str):
+            # A prefer-canonical alias is only ever read as text, whether or
+            # not the canonical key is present: a null or list value is never
+            # renamed or dropped silently.
+            raise AgentLoopError(  # shape-check: delegated
+                f"{context}.{alias} must be a string to be read as `{canonical}`."
+            )
+        if canonical in result:
+            if policy == RENAME_PREFER_CANONICAL:
+                result.pop(alias)
+                _logger.warning("%s: dropped field %s because %s is present", context, alias, canonical)
+                continue
+            raise AgentLoopError(  # shape-check: delegated
+                f"{context} has both `{alias}` and `{canonical}`; use only `{canonical}`."
+            )
+        result = {(canonical if key == alias else key): entry for key, entry in result.items()}
+        _logger.warning("%s: renamed field %s -> %s", context, alias, canonical)
+    return result
+
+
+def _expect_known_keys_lenient(
+    value: dict[str, object],
+    *,
+    context: str,
+    required: Collection[str],
+    optional: Collection[str] = frozenset(),
+    renames: Collection[tuple[str, str, str]] = (),
+) -> dict[str, object]:
+    """Lenient twin of ``_expect_exact_keys`` for agent-response sites (#2114).
+
+    Applies ``renames``, raises the missing-required error, then drops each
+    unknown key whose name is not protected and whose value is a string,
+    logging a warning.  Any other unknown key raises the existing
+    unknown-field error.  Returns a new dict; the input is never mutated, so
+    stored response text and digests of it are unaffected.
+    """
+    known = set(required) | set(optional)
+    if response_keys_strict():
+        # Inside a semantic plan-patch operation: no rename, no drop.
+        _expect_exact_keys(value, context=context, required=set(required), optional=set(optional))  # shape-check: delegated
+        return dict(value)
+    result = _apply_key_renames(  # shape-check: delegated
+        value,
+        context=context,
+        renames=[rename for rename in renames if rename[0] not in known],
+    )
+    missing = sorted(set(required) - set(result))
+    if missing:
+        raise AgentLoopError(f"{context} is missing required field(s): {', '.join(missing)}")  # shape-check: delegated
+    unknown = sorted(key for key in result if key not in known)
+    strict = [key for key in unknown if is_protected_response_key(key) or not isinstance(result[key], str)]
+    if strict:
+        raise AgentLoopError(f"{context} has unknown field(s): {', '.join(strict)}")  # shape-check: delegated
+    for key in unknown:
+        _logger.warning("%s: dropped unknown field %s", context, key)
+        result.pop(key)
+    return result
+
+
+def partition_item_id_buckets(
+    buckets: Mapping[str, object],
+    allowed: Collection[str],
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """Drop well-formed item IDs outside ``allowed`` from each bucket (#2114).
+
+    Shared by the coder-response degradation path and the live coder
+    follow-up validator.  Non-list buckets and non-string entries are kept for
+    the parser to judge.  A dropped ID must take its notes, sub-items and
+    dispute evidence with it; callers apply that rule.  Dropped IDs keep
+    first-seen order without repeats.  Never raises.
+    """
+    allowed_set = set(allowed)
+    kept: dict[str, object] = {}
+    dropped: list[str] = []
+    for name, values in buckets.items():
+        if not isinstance(values, (list, tuple)):
+            kept[name] = values
+            continue
+        kept_values = []
+        for entry in values:
+            if isinstance(entry, str) and entry not in allowed_set:
+                if entry not in dropped:
+                    dropped.append(entry)
+                continue
+            kept_values.append(entry)
+        kept[name] = type(values)(kept_values) if isinstance(values, tuple) else kept_values
+    return kept, tuple(dropped)
+
 
 def _expect_int(value: object, *, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):

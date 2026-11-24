@@ -89,6 +89,11 @@ def _resolved(*ids: str) -> list[dict[str, str]]:
     return [{"item_id": item_id, "disposition": "resolved", "note": "Done."} for item_id in ids]
 
 
+def _conflicting(item_id: str) -> list[dict[str, str]]:
+    # #2114: byte-identical repeats collapse; only differing repeats reject.
+    return [*_resolved(item_id), {"item_id": item_id, "disposition": "resolved", "note": "Other."}]
+
+
 def _payload(text: str) -> dict:
     return json.JSONDecoder().raw_decode(text.lstrip())[0]
 
@@ -332,7 +337,10 @@ def test_duplicates_split_between_dropped_and_rejected(kind):
     parsed = validate(_resolved("item-1", "item-9", "item-9"), carried)
     assert parsed.ignored_prior_disposition_ids == ("item-9",)
     with pytest.raises(AgentLoopError, match="more than once: item-1"):
-        validate(_resolved("item-1", "item-1"), carried)
+        validate(_conflicting("item-1"), carried)
+    collapsed = validate(_resolved("item-1", "item-1"), carried)
+    dispositions = getattr(collapsed, "dispositions", None) or getattr(collapsed, "prior_plan_item_dispositions", None)
+    assert dispositions is not None and [item.item_id for item in dispositions] == ["item-1"]
 
 
 def test_duplicate_carried_patch_disposition_is_a_payload_rejection():
@@ -340,7 +348,7 @@ def test_duplicate_carried_patch_disposition_is_a_payload_rejection():
 
     with pytest.raises(SemanticPatchPayloadRejection, match="more than once: item-1"):
         _validate_plan_revision_patch_payload(
-            _payload(_patch_text(_resolved("item-1", "item-1"))), unresolved_items=(_item("item-1"),)
+            _payload(_patch_text(_conflicting("item-1"))), unresolved_items=(_item("item-1"),)
         )
 
 

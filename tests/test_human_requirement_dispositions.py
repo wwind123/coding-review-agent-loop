@@ -47,7 +47,8 @@ def test_signed_requirement_requires_exact_structured_disposition():
         ([], "missing"),
         ([{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "x"},
           {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "y"}], "duplicate"),
-        ([{"requirement_id": "Requirement 2", "disposition": "addressed", "evidence": "x"}], "unknown"),
+        # #2114: an unsurfaced ID is dropped, leaving the surfaced one uncovered.
+        ([{"requirement_id": "Requirement 2", "disposition": "addressed", "evidence": "x"}], "missing"),
     ],
 )
 def test_invalid_requirement_coverage_is_rejected(dispositions, message):
@@ -396,16 +397,16 @@ def test_disposition_naming_reviewer_owned_id_gets_out_of_scope_message(surfaced
     assert "must be empty when no signed human requirements" not in message
 
 
-def test_truly_unknown_disposition_id_keeps_unknown_message():
-    with pytest.raises(AgentLoopError, match="contains unknown requirement ID") as error:
-        validate_human_requirement_dispositions(
-            [_disposition(_CODER_ID), _disposition(_UNKNOWN_ID)],
-            surfaced_requirement_ids=(_CODER_ID,),
-            context="coder_followup.human_requirement_dispositions",
-            reviewer_owned_requirement_ids=(_OWNED_ID,),
-        )
-    assert "outside coder scope" not in str(error.value)
-    assert _UNKNOWN_ID in str(error.value)
+def test_truly_unknown_disposition_id_is_dropped_2114(caplog):
+    caplog.set_level("WARNING")
+    kept = validate_human_requirement_dispositions(
+        [_disposition(_CODER_ID), _disposition(_UNKNOWN_ID)],
+        surfaced_requirement_ids=(_CODER_ID,),
+        context="coder_followup.human_requirement_dispositions",
+        reviewer_owned_requirement_ids=(_OWNED_ID,),
+    )
+    assert [item.requirement_id for item in kept] == [_CODER_ID]
+    assert _UNKNOWN_ID in caplog.text
 
 
 def test_mixed_reviewer_owned_and_unknown_disposition_ids_report_both():
@@ -464,15 +465,24 @@ def test_all_reviewer_owned_empty_acknowledgement_validates():
 
 
 def test_early_return_branch_keeps_generic_text_for_non_owned_labels():
+    # The legacy markdown path (no dispositions) still rejects; with
+    # dispositions the list is derived from them instead (#2114).
     with pytest.raises(AgentLoopError, match="even though no signed human requirements were surfaced"):
         validate_structured_human_requirements_acknowledgement(
             [_UNKNOWN_ID],
-            dispositions=(),
             checked_discussion_directly=False,
             surfaced_requirement_ids=(),
             requires_direct_discussion_ack=False,
             reviewer_owned_requirement_ids=(_OWNED_ID,),
         )
+    validate_structured_human_requirements_acknowledgement(
+        [_UNKNOWN_ID],
+        dispositions=(),
+        checked_discussion_directly=False,
+        surfaced_requirement_ids=(),
+        requires_direct_discussion_ack=False,
+        reviewer_owned_requirement_ids=(_OWNED_ID,),
+    )
 
 
 def test_partially_surfaced_reviewer_owned_addressed_id_uses_general_branch():
@@ -491,7 +501,6 @@ def test_partially_surfaced_reviewer_owned_addressed_id_uses_general_branch():
     with pytest.raises(AgentLoopError, match="referenced unknown signed human requirement IDs"):
         validate_structured_human_requirements_acknowledgement(
             [_CODER_ID, _UNKNOWN_ID],
-            dispositions=(_disposition(_CODER_ID),),
             checked_discussion_directly=False,
             surfaced_requirement_ids=(_CODER_ID,),
             requires_direct_discussion_ack=False,

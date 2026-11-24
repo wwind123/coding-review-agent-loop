@@ -2388,9 +2388,11 @@ def test_2064_legacy_signed_input_supersession_record_still_resumes_into_next_ro
 
 # --- #2086: resume after a degraded or synthesized coder record ------------
 
+# An unknown ID alone is dropped live since #2114; the live-target tests_run
+# entry supplies the rejection that produces the degraded record.
 _UNKNOWN_ITEM_FOLLOWUP_2086 = structured_coder_followup(
     summary="Added the test.", addressed_items=["item-1", "item-99"],
-    tests_run=["pytest tests/test_foo.py"], reviewer="OpenAI Codex",
+    tests_run=["pytest tests/test_foo.py https://live.example"], reviewer="OpenAI Codex",
 )
 
 

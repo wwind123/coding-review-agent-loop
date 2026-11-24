@@ -171,6 +171,79 @@ exact. The only identifier-list
 outer-shape exception is the opt-in `normalize_outer_shape` for
 `depends_on_stage_ids`; each element is still a strict ID.
 
+### Harmless extras (#2114)
+
+Extra content that asserts nothing is dropped or aliased instead of costing a
+re-ask. The rule applies to the parsed value only: stored text is never
+rewritten, so a resume re-parse gives the same result. Identities and digests
+come from parsed values or the orchestrator's canonical payload, never from
+raw agent JSON.
+
+- `_expect_known_keys_lenient` (in `protocol_common.py`) is an opt-in twin of
+  `_expect_exact_keys`. It drops an unknown key with a warning only when the
+  value is a string and the name is not protected. Any other unknown key
+  raises the existing unknown-field error. Protected names are
+  `PROTECTED_RESPONSE_KEY_NAMES` (envelope fields, `item_id`/`id`/
+  `disposition`, requirement labels, `pr_number`, head SHAs, evidence and
+  matrix identity fields, receipt, dispatch, managed-CI and tool-stamped
+  recommendation fields). Names that contain `<`/`>`, `agent_`, `signature`,
+  `managed_ci`, `provenance`, `marker`, `nonce` or `dispatch` are also
+  protected. These sites opt in: the `pr_review`, `plan_review`,
+  `coder_followup`, `issue_implementation`, `task_result`, `plan_revision` and
+  `plan_state` envelopes, the `human_requirements` objects, review item
+  dispositions, human-requirement dispositions, execution child stages, and
+  the complete risk-matrix envelope and rows.
+- These sites stay strict: `agent_unavailable`, semantic plan-patch operations
+  (parsed inside `strict_response_keys`, so every shared parser they reach,
+  such as replacement requirement dispositions or execution-recommendation
+  child stages, keeps exact keys with no drop, rename or duplicate collapse)
+  and their matrix rows and metadata, `risk_test_matrix_changes`,
+  `architecture_impact`, every authentication-or-forgery parser, and records
+  the orchestrator writes.
+- Renames come in two kinds. `blocking_items` and `same_pr_followups` in a plan
+  review are renamed to the plan keys before finding normalization, so the
+  findings are kept; an alias next to its canonical key rejects. In review item
+  dispositions, `reason` and then `rationale` become `note` when `note` is
+  absent. A string alias next to an existing `note` is dropped with a warning.
+  A non-string alias (null, a list, a number) always rejects, with or without
+  `note`. A `rationale` that is itself a known key is never renamed.
+- A plan-review disposition loses `sub_item_dispositions` with a
+  `ParseDegradation` record (`ParsedPlanReview.disposition_degradations`), and
+  the parent disposition stays authoritative. A plan finding drops a string or
+  string-list `fix_scope`, the PR scheduler hint. The PR-only authority tag
+  `evidence_row_ids` is a reserved collision on any plan finding, including
+  one renamed from `blocking_items`, so it is rejected and never folded.
+- Human requirements: a surplus `checked_discussion_directly: true` is a
+  warning. When dispositions are present, `addressed_ids` is derived from the
+  surfaced `addressed` dispositions. Live parsers carry the derived tuple,
+  while a historical decode keeps the submitted list.
+  `filter_surfaced_requirement_dispositions` drops dispositions for unsurfaced
+  IDs before any blocked-state or conflict decision. Legacy labels,
+  reviewer-owned IDs, missing coverage and conflicting duplicates still reject.
+  Every caller that keeps a parsed record (the plan-review, plan-state and
+  plan-revision acceptance paths, and their recovery reader) stores the kept
+  tuple that `validate_human_requirement_dispositions` returns. Semantic-patch
+  dispositions stay strict: assembly publishes them verbatim, so an unsurfaced
+  ID there still rejects.
+- Context-dependent checks run only in live validators. Every context-free
+  reader of an already-accepted response passes `historical_decode=True`:
+  `parse_historical_structured_*`, and the post-authentication
+  claim-correction reader (`_parse_fresh_correction_claims`), which takes only
+  the claim set. So an accepted approved follow-up beside an unsurfaced
+  blocked disposition, or an implementation PR beside one, decodes with a
+  warning.
+- Duplicates: entries that are equal on every parsed field collapse with a
+  warning. This covers review dispositions (including
+  `evidence_requirement_ids`), requirement dispositions, IDs repeated within
+  one coder bucket and repeated `addressed_ids`. Any differing field, or the
+  same ID in two coder buckets, still rejects.
+- On the coder side, a note keyed to an unlisted ID is dropped. In the live
+  validator, an ID outside the ledger is dropped through
+  `partition_item_id_buckets` (shared with the post-push degradation path),
+  together with its notes, sub-items and dispute evidence. It is recorded in
+  `StructuredCoderFollowup.dropped_unknown_items` and logged by the PR loop.
+  Missing classification still rejects.
+
 ### The same-agent re-ask rule (#2066)
 
 No second model reformats a rejected response. A deterministic validation

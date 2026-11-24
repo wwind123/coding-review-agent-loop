@@ -258,7 +258,7 @@ def test_validate_coder_followup_response_uses_disposition_aware_requirement_led
     assert parsed.human_requirements.addressed_ids == ()
 
 
-def test_validate_coder_followup_response_rejects_mismatched_requirement_ledger():
+def test_validate_coder_followup_response_derives_mismatched_requirement_ledger_2114():
     requirement = HumanReviewRequirement(
         source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
         url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Please use the absolute URL.",
@@ -271,15 +271,16 @@ def test_validate_coder_followup_response_rejects_mismatched_requirement_ledger(
             "evidence": "Implemented the requested change.",
         }],
     )
-    with pytest.raises(AgentLoopError, match="must contain every requirement with an `addressed` disposition"):
-        _validate_coder_followup_response(
-            response,
-            unresolved_items=(UnresolvedReviewItem(
-                item_id="item-1", reviewer="OpenAI Codex", source_round=1,
-                text="Add a regression test.", status="blocking",
-            ),),
-            human_requirements=(requirement,), architecture_status_mode="legacy",
-        )
+    # #2114: addressed_ids is derived from the `addressed` dispositions.
+    parsed = _validate_coder_followup_response(
+        response,
+        unresolved_items=(UnresolvedReviewItem(
+            item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+            text="Add a regression test.", status="blocking",
+        ),),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
+    )
+    assert parsed.human_requirements.addressed_ids == (requirement.requirement_id,)
 
 def test_validate_coder_followup_response_rejects_issue_acceptance_criteria_as_human_requirement():
     response = structured_coder_followup(
@@ -305,7 +306,7 @@ def test_validate_coder_followup_response_rejects_issue_acceptance_criteria_as_h
             human_requirements=(), architecture_status_mode="legacy",
         )
 
-def test_validate_coder_followup_response_rejects_requirement_label_when_none_surfaced():
+def test_validate_coder_followup_response_ignores_requirement_label_when_none_surfaced_2114():
     response = structured_coder_followup(
         state="blocking",
         addressed_items=["item-1"],
@@ -315,20 +316,21 @@ def test_validate_coder_followup_response_rejects_requirement_label_when_none_su
         reviewer="OpenAI Codex",
     )
 
-    with pytest.raises(AgentLoopError, match="no signed human requirements were surfaced"):
-        _validate_coder_followup_response(
-            response,
-            unresolved_items=(
-                UnresolvedReviewItem(
-                    item_id="item-1",
-                    reviewer="Anthropic Claude",
-                    source_round=1,
-                    text="Add a regression test.",
-                    status="blocking",
-                ),
+    # #2114: with dispositions present the list is derived (empty here).
+    parsed = _validate_coder_followup_response(
+        response,
+        unresolved_items=(
+            UnresolvedReviewItem(
+                item_id="item-1",
+                reviewer="Anthropic Claude",
+                source_round=1,
+                text="Add a regression test.",
+                status="blocking",
             ),
-            human_requirements=(), architecture_status_mode="legacy",
-        )
+        ),
+        human_requirements=(), architecture_status_mode="legacy",
+    )
+    assert parsed.human_requirements.addressed_ids == ()
 
 def test_validate_coder_followup_response_accepts_surfaced_requirement_label():
     requirement = HumanReviewRequirement(
@@ -398,7 +400,8 @@ def test_validate_coder_followup_response_rejects_mixed_valid_and_invalid_requir
     ("addressed_items", "remaining_items", "message"),
     [
         (["item-1"], ["item-1"], "listed unresolved reviewer item IDs more than once"),
-        (["item-9"], [], "referenced unknown unresolved reviewer item IDs"),
+        # #2114: an unknown ID is dropped; the uncovered ledger then rejects.
+        (["item-9"], [], "did not classify all unresolved reviewer items"),
         (["item-1"], [], "did not classify all unresolved reviewer items"),
     ],
 )
@@ -688,12 +691,6 @@ def test_validate_human_requirements_acknowledgement_accepts_multiple_bullet_sty
             ("Requirement 1", "Requirement 2"),
             False,
             "did not address all surfaced signed human requirement IDs",
-        ),
-        (
-            f"Implemented.\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n### Human requirements\n- Requirement 1: handled.\n- Requirement 1: repeated.\n<!-- AGENT_STATE: blocking -->",
-            ("Requirement 1",),
-            False,
-            "listed signed human requirement IDs more than once",
         ),
         (
             f"Implemented.\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n### Human requirements\n- Requirement 99: handled.\n<!-- AGENT_STATE: blocking -->",
