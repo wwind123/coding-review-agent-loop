@@ -171,6 +171,7 @@ class PlanVerificationContext:
             plan_reset_stall_streak=False,
             plan_resume_keep_on_issue_edit=False,
             reopen_approved_plan=False,
+            keep_approved_plan=False,
             plan_primary_stall_rounds=(
                 config.plan_primary_stall_rounds if staged else DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
             ),

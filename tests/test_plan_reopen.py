@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -801,3 +804,200 @@ def test_reopen_superseded_hashes_ignore_unadmitted_boundaries(tmp_path):
     assert plan_reopen.reopen_superseded_execution_hashes(
         runner, config=config, issue_number=56, comments=live,
     ) == (plan_hash,)
+
+
+# --- #2138: --keep-approved-plan and the edited-approved-plan gate entries -----------
+
+
+def test_keep_approved_plan_parses_only_with_issue_plan_first_and_not_with_reopen(capsys):
+    """`cli-exclusivity-and-scope`: CLI validation; refusals read and post nothing."""
+    from agent_loop_helpers import FakeRunner
+    from coding_review_agent_loop.cli import build_parser, main
+    from coding_review_agent_loop.config import config_from_args
+
+    parser = build_parser()
+    base = ["issue", "56", "--repo", "OWNER/REPO"]
+    assert parser.parse_args([*base, "--plan-first"]).keep_approved_plan is False
+    with_flag = parser.parse_args([*base, "--plan-first", "--keep-approved-plan"])
+    assert with_flag.keep_approved_plan is True
+    assert config_from_args(with_flag, FakeRunner()).keep_approved_plan is True
+
+    assert main([*base, "--keep-approved-plan"]) == 1
+    assert "--keep-approved-plan requires --plan-first" in capsys.readouterr().err
+    assert main(["pr", "7", "--repo", "OWNER/REPO", "--keep-approved-plan"]) == 1
+    assert "--keep-approved-plan requires issue --plan-first" in capsys.readouterr().err
+    assert main([
+        *base, "--plan-first", "--keep-approved-plan", "--reopen-approved-plan",
+    ]) == 1
+    err = capsys.readouterr().err
+    assert "--keep-approved-plan" in err and "--reopen-approved-plan" in err
+    assert "cannot be combined" in err
+    # Combining it with the unapproved-plan opt-out is allowed.
+    combined = parser.parse_args([
+        *base, "--plan-first", "--keep-approved-plan", "--plan-resume-keep-on-issue-edit",
+    ])
+    assert config_from_args(combined, FakeRunner()).keep_approved_plan is True
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["issue", "56", "--plan-first", "--keep-approved-plan", "--reopen-approved-plan"],
+     "--keep-approved-plan cannot be combined with --reopen-approved-plan"),
+    (["issue", "56", "--keep-approved-plan"], "--keep-approved-plan requires --plan-first"),
+    (["pr", "7", "--keep-approved-plan"], "--keep-approved-plan requires issue --plan-first"),
+    (["issue", "56", "--reopen-approved-plan"], "--reopen-approved-plan requires --plan-first"),
+    (["pr", "7", "--reopen-approved-plan"], "--reopen-approved-plan requires issue --plan-first"),
+    (["issue", "56", "--plan-first", "--reopen-approved-plan",
+      "--plan-resume-keep-on-issue-edit"],
+     "cannot be combined with --plan-resume-keep-on-issue-edit"),
+])
+def test_approved_plan_option_refusals_happen_before_any_config_or_github_read(
+    monkeypatch, capsys, argv, expected
+):
+    """`cli-exclusivity-and-scope`: no --repo, so config would detect the repo via gh."""
+    import coding_review_agent_loop.cli as cli_module
+    from coding_review_agent_loop.runner import Runner
+
+    def forbidden_config(*_a, **_k):
+        raise AssertionError("config_from_args must not run on a parse refusal")
+
+    def forbidden_command(*_a, **_k):
+        raise AssertionError("no GitHub read or post on a parse refusal")
+
+    monkeypatch.setattr(cli_module, "config_from_args", forbidden_config)
+    monkeypatch.setattr(Runner, "run", forbidden_command)
+    assert cli_module.main(argv) == 1
+    assert expected in capsys.readouterr().err
+
+
+def test_keep_flag_is_reset_in_derived_configs_and_recovery_commands(tmp_path):
+    """`cli-exclusivity-and-scope`: approving-board swap, isolated provider, rerun commands."""
+    from coding_review_agent_loop.managed_ci_recovery_commands import _render_recovery_command
+    from coding_review_agent_loop.semantic_dedupe import _isolated_provider_config
+
+    config = make_config(
+        tmp_path, reviewer=("codex", "claude"), keep_approved_plan=True,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--plan-first", "--keep-approved-plan",
+            "--reviewer", "codex",
+        ),
+    )
+    isolated, isolated_dir = _isolated_provider_config(config, "claude", "")
+    try:
+        assert isolated.keep_approved_plan is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+    for target in ("issue", "pr"):
+        rendered = _render_recovery_command(
+            config, target=target, identifier=7, managed_ci=True,
+            preserve_managed_options=True,
+        )
+        assert "--keep-approved-plan" not in rendered
+    # The invocation value survives the approving-board swap and its restore.
+    assert "keep_approved_plan" in plan_execution._PLAN_BOARD_CONFIG_FIELDS
+    swapped = replace(config, keep_approved_plan=False)
+    assert plan_execution._restore_invocation_board(swapped, config).keep_approved_plan is True
+
+
+def test_child_planning_cycle_does_not_inherit_the_keep_flag(tmp_path, monkeypatch, capsys):
+    """`cli-exclusivity-and-scope`: the parent's flag never keeps a child plan."""
+    from test_child_plan_provenance import _capture_child_planning_config
+
+    _parent, child_config, err = _capture_child_planning_config(
+        tmp_path, monkeypatch, capsys, keep_approved_plan=True,
+    )
+    assert child_config.keep_approved_plan is False
+    assert err.count("does not inherit --keep-approved-plan") == 1
+
+
+_DISPATCH_TARGETS = frozenset({
+    "recover_issue_execution", "run_plan_first_loop", "_run_plan_first_loop",
+})
+_GATE = "apply_edited_approved_plan_gate"
+
+
+def _called_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _dispatch_entry_inventory(src_dir: Path) -> dict[str, tuple[int, list[int], list[int]]]:
+    """``module:function`` -> (gate call lines, dispatch call lines) outside issue_recovery."""
+    found: dict[str, tuple[int, list[int], list[int]]] = {}
+    for path in sorted(src_dir.rglob("*.py")):
+        if path.name == "issue_recovery.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            gates: list[int] = []
+            dispatches: list[int] = []
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    name = _called_name(inner)
+                    if name in _DISPATCH_TARGETS:
+                        dispatches.append(inner.lineno)
+                    elif name == _GATE:
+                        gates.append(inner.lineno)
+            if dispatches:
+                found[node.name] = (node.lineno, gates, dispatches)
+    return found
+
+
+def test_every_plan_first_dispatch_entry_calls_the_edited_approved_plan_gate_first():
+    """`gate-entry-inventory`: a new ungated plan-first entry fails this test."""
+    src_dir = Path(plan_reopen.__file__).resolve().parent
+    inventory = _dispatch_entry_inventory(src_dir)
+    assert set(inventory) == {"run_issue_loop", "_run_child_planning_cycle"}
+    for name, (_line, gates, dispatches) in inventory.items():
+        assert gates, f"{name} dispatches plan-first work without {_GATE}"
+        assert min(gates) < min(dispatches), (
+            f"{name} must call {_GATE} before recovery or the plan loop"
+        )
+
+
+def test_dispatch_entry_inventory_flags_an_ungated_entry(tmp_path):
+    """`gate-entry-inventory`: the scanner itself detects ungated and late-gated callers."""
+    (tmp_path / "issue_recovery.py").write_text(
+        "def recover_issue_execution():\n    run_plan_first_loop()\n", encoding="utf-8",
+    )
+    (tmp_path / "entry.py").write_text(
+        "def gated():\n    apply_edited_approved_plan_gate()\n    recover_issue_execution()\n"
+        "def ungated():\n    run_plan_first_loop()\n"
+        "def late():\n    _run_plan_first_loop()\n    apply_edited_approved_plan_gate()\n",
+        encoding="utf-8",
+    )
+    inventory = _dispatch_entry_inventory(tmp_path)
+    assert set(inventory) == {"gated", "ungated", "late"}
+    assert inventory["ungated"][1] == []
+    late_gates, late_dispatches = inventory["late"][1], inventory["late"][2]
+    assert min(late_gates) > min(late_dispatches)
+
+
+def test_edited_approved_plan_notes_and_stop_carry_no_reserved_marker():
+    """`scope-issue-note`: both note variants and the stop are plain prose."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError, parse_human_decision
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+
+    stop = plan_reopen.ApprovedShortcutEditDecision(
+        kind=plan_reopen.EDIT_DECISION_NOT_HANDED_OFF, plan_hash="a" * 16,
+        recorded_digest="1" * 16, current_digest="2" * 16,
+    )
+    handed = replace(
+        stop, kind=plan_reopen.EDIT_DECISION_HANDED_OFF,
+        handoff_reason="an issue-PR handoff record names PR #77",
+    )
+    for decision in (stop, handed):
+        note = plan_reopen.render_edited_approved_plan_issue_note(56, decision)
+        assert scan_reserved_markers(note) == ()
+        assert "1" * 16 in note and "2" * 16 in note
+    error = plan_reopen.render_edited_approved_plan_stop(56, stop)
+    assert isinstance(error, HumanDecisionRequiredError)
+    parts = parse_human_decision(str(error))
+    assert parts is not None and parts.safe_to_automate is False
+    assert "--keep-approved-plan" in parts.clear and "--reopen-approved-plan" in parts.clear

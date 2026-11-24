@@ -1406,15 +1406,21 @@ def _m2010_approved_history(tmp_path):
 def test_m2010_approved_shortcut_hints_at_the_reopen_option_only_on_a_digest_change(
     tmp_path, edited
 ):
-    """`no-flag-unchanged-hint`: the approved shortcut is taken exactly as before."""
+    """`no-flag-unchanged-hint`: the approved shortcut is taken exactly as before.
+
+    Since #2138 an edited relaunch needs --keep-approved-plan to reach the
+    shortcut; the shortcut's log line still carries the reopen hint.
+    """
     history = _m2010_approved_history(tmp_path)
     runner, result, messages = _m1390_rerun(
         tmp_path, history, issue_payload=_M1390_EDIT if edited else None,
+        config=_m1390_config(tmp_path, max_rounds=5, keep_approved_plan=edited),
     )
 
     assert result == 0
     assert _m1390_boundaries(runner) == []
     assert _m1103_agent_calls(runner) == []
+    assert _m2138_notes(runner) == []
     shortcut = [m for m in messages if "planning is not reopened" in m]
     assert len(shortcut) == 1
     hint = (
@@ -1529,3 +1535,334 @@ def test_m2010_identical_plan_in_the_new_scope_needs_new_scope_approval(tmp_path
         next(r for r in _plan_round_records(SimpleNamespace(issue_comments=history))
              if r.role == "coder").canonical_plan
     ) == before.plan_hash
+
+
+# --- Edited approved plan: stop by default (#2138) --------------------------------
+
+_M2138_NOTE_MARK = "changed after plan `"
+
+
+def _m2138_notes(runner):
+    return [
+        str(comment["body"]) for comment in runner.issue_comments
+        if _M2138_NOTE_MARK in str(comment["body"])
+    ]
+
+
+def _m2138_plan_hash(history):
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    coder = [
+        r for r in _plan_round_records(SimpleNamespace(issue_comments=history))
+        if r.role == "coder"
+    ]
+    return approved_plan_hash(coder[-1].canonical_plan)
+
+
+def _m2138_pr_handoff(plan_hash):
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+
+    return {
+        "author": {"login": _M1390_ACTOR[0]}, "_rest_author_id": _M1390_ACTOR[1],
+        "createdAt": "2026-05-23T02:00:00Z",
+        "body": format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            flow="approved-plan-implementation", plan_hash=plan_hash,
+        ),
+    }
+
+
+def _m2138_rerun(
+    tmp_path, history, *, recovery=None, config=None, implement_after_approval=False,
+    **runner_kwargs,
+):
+    """Rerun issue #56; spy on recovery entry and on every log line."""
+    import coding_review_agent_loop.plan_reopen as plan_reopen
+
+    runner = _m1390_runner(history, **runner_kwargs)
+    calls = []
+    real_recover = issue_loop.recover_issue_execution
+
+    def spy(runner_arg, **kwargs):
+        calls.append(kwargs)
+        if recovery == "forbidden":
+            raise AssertionError("issue recovery must not run")
+        return real_recover(runner_arg, **kwargs)
+
+    with patch_object_in(
+        (plan_first_loop_module, plan_execution, plan_reopen), "log",
+        wraps=plan_first_loop_module.log,
+    ) as logged, patch.object(issue_loop, "recover_issue_execution", spy):
+        try:
+            result = run_issue_loop(
+                runner, issue_number=56,
+                config=config or _m1390_config(tmp_path, max_rounds=5), plan_first=True,
+                implement_after_approval=implement_after_approval,
+            )
+        except AgentLoopError as exc:
+            result = exc
+    return runner, result, calls, [str(call.args[-1]) for call in logged.call_args_list]
+
+
+def test_m2138_edited_approved_plan_stops_before_any_agent_call_and_notes_once(tmp_path):
+    """`edited-approved-stop`, `edited-approved-restart-dedupe`."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    runner, result, calls, _messages = _m2138_rerun(
+        tmp_path, history, recovery="forbidden", issue_payload=_M1390_EDIT,
+    )
+
+    assert isinstance(result, HumanDecisionRequiredError)
+    assert result.EXIT_CODE == 4
+    message = str(result)
+    assert plan_hash in message
+    assert _m1390_digest() in message and _m1390_digest(**_M1390_EDIT) in message
+    assert "--reopen-approved-plan" in message and "--keep-approved-plan" in message
+    assert "No agent was invoked" in message
+    assert calls == []
+    assert _m1103_agent_calls(runner) == []
+    new = runner.issue_comments[len(history):]
+    assert len(new) == 1
+    note = str(new[0]["body"])
+    assert _M2138_NOTE_MARK in note
+    assert "--reopen-approved-plan" in note and "--keep-approved-plan" in note
+    assert _m1390_digest() in note and _m1390_digest(**_M1390_EDIT) in note
+    assert scan_reserved_markers(note) == ()
+    assert _m1390_boundaries(runner) == []
+
+    # A second relaunch raises the same stop and posts no duplicate note.
+    after_stop = list(runner.issue_comments)
+    again, result, calls, _messages = _m2138_rerun(
+        tmp_path, after_stop, recovery="forbidden", issue_payload=_M1390_EDIT,
+    )
+    assert isinstance(result, HumanDecisionRequiredError)
+    assert calls == []
+    assert again.issue_comments == after_stop
+    assert len(_m2138_notes(again)) == 1
+
+
+def test_m2138_keep_approved_plan_continues_without_a_note(tmp_path):
+    """`edited-approved-keep`: continues to the approved shortcut as today."""
+    history = _m2010_approved_history(tmp_path)
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT,
+        config=_m1390_config(tmp_path, max_rounds=5, keep_approved_plan=True),
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    assert _m2138_notes(runner) == []
+    assert _m1103_agent_calls(runner) == []
+    assert any("--keep-approved-plan kept approved plan" in m for m in messages)
+    assert sum("planning is not reopened" in m for m in messages) == 1
+
+
+def test_m2138_keep_approved_plan_continues_into_implementation_of_the_approved_plan(
+    tmp_path, monkeypatch,
+):
+    """`edited-approved-keep`: with implementation requested, the approved plan is implemented."""
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    implemented = []
+
+    def implement(_runner, **kwargs):
+        implemented.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue", implement)
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT, implement_after_approval=True,
+        config=_m1390_config(tmp_path, max_rounds=5, keep_approved_plan=True),
+    )
+
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    assert result == 0, result
+    assert len(calls) == 1
+    assert len(implemented) == 1
+    assert implemented[0]["issue_number"] == 56
+    # The implementation seam receives the existing approved plan, not a new one.
+    assert approved_plan_hash(implemented[0]["approved_plan"]) == plan_hash
+    assert _m2138_notes(runner) == []
+    assert _m1390_boundaries(runner) == []
+    assert _m1103_agent_calls(runner) == []
+    assert any("--keep-approved-plan kept approved plan" in m for m in messages)
+
+
+def test_m2138_reopen_approved_plan_still_opens_a_fresh_scope(tmp_path):
+    """`edited-approved-reopen`: #2010 behavior, no edited-issue stop or note."""
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT,
+        config=_m1390_config(tmp_path, max_rounds=5, reopen_approved_plan=True),
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    assert result == 0
+    assert _m2138_notes(runner) == []
+    boundaries = _m1390_boundaries(runner)
+    assert len(boundaries) == 1
+    assert f"The approved plan `{plan_hash}` was superseded by operator request" in str(
+        boundaries[0]["body"]
+    )
+    assert len(calls) == 1
+    assert any(
+        f"superseding approved plan {plan_hash} by operator request" in m for m in messages
+    )
+
+
+@pytest.mark.parametrize("digest", ["unchanged", "unknown"])
+def test_m2138_unchanged_or_unknown_digest_continues_without_stop_or_note(
+    tmp_path, monkeypatch, digest
+):
+    """`unchanged-or-unknown-digest`: no stop, no note, the unchanged log line."""
+    import coding_review_agent_loop.plan_issue_scope as plan_issue_scope
+
+    history = _m2010_approved_history(tmp_path)
+    if digest == "unknown":
+        monkeypatch.setattr(
+            plan_issue_scope, "recorded_plan_issue_digest", lambda *_a, **_k: None,
+        )
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT if digest == "unknown" else None,
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    assert _m2138_notes(runner) == []
+    assert runner.issue_comments == history
+    shortcut = [m for m in messages if "planning is not reopened" in m]
+    assert len(shortcut) == 1 and "--reopen-approved-plan" not in shortcut[0]
+
+
+def test_m2138_handed_off_plan_reaching_the_shortcut_continues_and_notes_once(
+    tmp_path, monkeypatch,
+):
+    """`handed-off-changed-digest`: a comment-level hand-off continues with one note."""
+    import coding_review_agent_loop.plan_reopen as plan_reopen
+
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    monkeypatch.setattr(
+        plan_reopen, "comment_handoff_reason",
+        lambda *_a, **_k: f"a decomposition summary records child stages for plan {plan_hash}",
+    )
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT,
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    notes = _m2138_notes(runner)
+    assert len(notes) == 1
+    assert "already handed off" in notes[0]
+    assert "may now disagree with the edited issue body" in notes[0]
+    assert "--keep-approved-plan" not in notes[0]
+    assert sum("planning is not reopened" in m for m in messages) == 1
+
+    again, result, _calls, _messages = _m2138_rerun(
+        tmp_path, list(runner.issue_comments), issue_payload=_M1390_EDIT,
+    )
+    assert result == 0
+    assert len(_m2138_notes(again)) == 1
+
+
+def test_m2138_handed_off_plan_recovered_into_the_pr_loop_still_gets_the_note(tmp_path):
+    """`handed-off-pr-recovery-note`: the note is posted before PR recovery, once."""
+    import coding_review_agent_loop.issue_recovery as issue_recovery
+
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    history = [*history, _m2138_pr_handoff(plan_hash)]
+    pr_calls = []
+
+    def fake_pr_loop(_runner, **kwargs):
+        pr_calls.append(kwargs)
+        return 0
+
+    pr_payload = {
+        "number": 77, "body": "Fixes #56", "state": "OPEN",
+        "url": "https://github.com/OWNER/REPO/pull/77",
+    }
+    with patch.object(issue_recovery, "run_pr_loop", fake_pr_loop):
+        runner, result, calls, _messages = _m2138_rerun(
+            tmp_path, history, issue_payload=_M1390_EDIT, pr_payload=pr_payload,
+            implement_after_approval=True,
+        )
+        assert result == 0, result
+        assert len(calls) == 1
+        assert len(pr_calls) == 1 and pr_calls[0]["pr_number"] == 77
+        notes = _m2138_notes(runner)
+        assert len(notes) == 1 and "PR #77" in notes[0]
+        assert _m1103_agent_calls(runner) == []
+
+        again, result, _calls, _messages = _m2138_rerun(
+            tmp_path, list(runner.issue_comments), issue_payload=_M1390_EDIT,
+            pr_payload=pr_payload, implement_after_approval=True,
+        )
+    assert result == 0
+    assert len(pr_calls) == 2
+    assert len(_m2138_notes(again)) == 1
+
+
+def test_m2138_unreadable_handoff_records_fail_closed_to_the_stop(tmp_path, monkeypatch):
+    """`handoff-unreadable-fail-closed`: the decision kind and the loop stop."""
+    import coding_review_agent_loop.plan_reopen as plan_reopen
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    def unreadable(*_a, **_k):
+        raise AgentLoopError("malformed hand-off record")
+
+    monkeypatch.setattr(plan_reopen, "comment_handoff_reason", unreadable)
+    decision = plan_reopen.approved_shortcut_edit_decision(
+        (), issue_number=56, repo="OWNER/REPO", plan_hash="a" * 16,
+        recorded_digest="1" * 16, current_digest="2" * 16,
+    )
+    assert decision.kind == plan_reopen.EDIT_DECISION_HANDOFF_UNREADABLE
+    assert decision.stops and decision.changed
+    for recorded, kind in (
+        (None, plan_reopen.EDIT_DECISION_UNKNOWN_DIGEST),
+        ("2" * 16, plan_reopen.EDIT_DECISION_UNCHANGED),
+    ):
+        same = plan_reopen.approved_shortcut_edit_decision(
+            (), issue_number=56, repo="OWNER/REPO", plan_hash="a" * 16,
+            recorded_digest=recorded, current_digest="2" * 16,
+        )
+        assert same.kind == kind and not same.stops and not same.changed
+
+    history = _m2010_approved_history(tmp_path)
+    runner, result, calls, _messages = _m2138_rerun(
+        tmp_path, history, recovery="forbidden", issue_payload=_M1390_EDIT,
+    )
+    assert isinstance(result, HumanDecisionRequiredError)
+    assert "malformed hand-off record" in str(result)
+    assert calls == []
+    assert len(_m2138_notes(runner)) == 1
+
+
+def test_m2138_dry_run_checks_nothing_and_posts_nothing(tmp_path):
+    """`dry-run-stop`: the gate logs a no-op; no note and no stop."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    history = _m2010_approved_history(tmp_path)
+    runner, result, _calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT,
+        config=_m1390_config(tmp_path, max_rounds=5, dry_run=True),
+    )
+
+    assert not isinstance(result, HumanDecisionRequiredError)
+    # The dry-run preview continues to its normal end, not to some later error.
+    assert result == 0, result
+    assert any(
+        "dry run; the edited-approved-plan check performs no check and posts nothing" in m
+        for m in messages
+    )
+    assert sum("planning is not reopened" in m for m in messages) == 1
+    assert _m2138_notes(runner) == []
+    assert _m1103_agent_calls(runner) == []

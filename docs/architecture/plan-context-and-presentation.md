@@ -245,6 +245,29 @@ scope. Plan startup never posts an operator reopen: reaching it with an approved
 plan and the flag (outside dry run) is an internal error. The floor preflight
 calls the same inventory and decision, refuses with the same message and judges
 the board at the new scope start. Under `--dry-run` the gate is a logged no-op.
+
+**Edited approved plan stops by default (#2138).** A second read-only gate,
+`plan_reopen.apply_edited_approved_plan_gate`, runs at every entry that
+dispatches plan-first recovery or the plan loop, strictly before either:
+`run_issue_loop` (beside the reopen gate) and
+`plan_execution._run_child_planning_cycle` (once, before its fresh/resume
+split, with the child config). It first compares the recorded issue digest
+(read-only `plan_scope_decision`, comments only) with the current digest; an
+unknown or equal digest returns at once without classifying approval. Otherwise
+it classifies the current scope's plan and, for an approved plan, makes the
+comment-level decision `approved_shortcut_edit_decision` (the same
+`comment_handoff_reason` check the shortcut's log hint uses, no GitHub search).
+Not handed off, or hand-off records unreadable (fail closed), raises a
+`HumanDecisionRequiredError` naming both digests, `--reopen-approved-plan` and
+`--keep-approved-plan`, after posting one plain-prose issue note. A handed-off
+plan posts the handed-off note and continues on whatever route recovery takes.
+Notes are deduplicated against an identical note from the trusted actor among
+the admitted comments. `--keep-approved-plan` (per invocation, reset in child
+planning, carried across the approving-board swap, never in rendered recovery
+commands, mutually exclusive with `--reopen-approved-plan`) skips the stop and
+the note. The reopen option and dry run make the gate a logged no-op. An AST
+inventory test pins the set of entry callers of `recover_issue_execution` and
+the plan-first loop outside `issue_recovery.py` to these two gated functions.
 Execution decisions and topology checkpoints posted before the newest admitted
 operator-reopen boundary are unrealized by construction.
 `plan_reopen.reopen_superseded_execution_hashes` adds their hashes, including

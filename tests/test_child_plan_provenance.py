@@ -5569,8 +5569,12 @@ def test_m1390_edited_child_under_signed_supersession_keeps_its_plan_in_prefligh
     real_decision = plan_issue_scope_module.plan_scope_decision
 
     def spy(*args, **kwargs):
+        import inspect
+
         decision = real_decision(*args, **kwargs)
-        decisions.append(decision)
+        # The #2138 edited-approved-plan gate reads only the recorded digest.
+        if inspect.stack()[1].function != "apply_edited_approved_plan_gate":
+            decisions.append(decision)
         return decision
 
     monkeypatch.setattr(plan_issue_scope_module, "plan_scope_decision", spy)
@@ -5706,7 +5710,12 @@ def test_parent_and_child_planning_recovery_share_checks(
         "number": 77, "body": "Fixes #56" + ("\nCloses #55" if case == "parent-close" else ""),
         "state": "OPEN", "url": "https://github.com/OWNER/REPO/pull/77",
     })
-    config = world.config()
+    # The world's child text differs from the text its plan was approved under,
+    # so without a hand-off the #2138 edited-approved-plan gate stops: the child
+    # entry keeps the plan with --keep-approved-plan, and the parent entry (which
+    # never passes that option to child planning) must stop before any dispatch.
+    edited_stop = case == "no-pr" and entry == "parent"
+    config = world.config(keep_approved_plan=case == "no-pr" and entry == "child")
     def invoke():
         if entry == "child":
             return issue_loop.run_issue_loop(world.runner, issue_number=56, config=config, plan_first=True)
@@ -5729,6 +5738,12 @@ def test_parent_and_child_planning_recovery_share_checks(
         )
     if case in {"inadmissible", "parent-close"}:
         with pytest.raises(AgentLoopError):
+            invoke()
+        assert calls == [] and plans == []
+    elif edited_stop:
+        from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+        with pytest.raises(HumanDecisionRequiredError, match="--keep-approved-plan"):
             invoke()
         assert calls == [] and plans == []
     else:

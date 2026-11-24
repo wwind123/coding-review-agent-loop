@@ -561,6 +561,13 @@ and nothing is posted. The flag applies to that invocation only and is never
 carried into child planning or recovery commands. See
 [reopening an approved plan](docs/local_agent_loop.md#reopening-an-approved-plan-2010).
 
+If the issue changed after its plan was approved and the plan was not handed
+off yet, a relaunch stops before implementation, invokes no agent, exits 4 and
+posts one comment on the issue naming both ways forward: `--reopen-approved-plan`,
+or `--keep-approved-plan` to continue with the approved plan for an edit that
+does not change scope. A handed-off plan continues, with a note on the issue.
+See [edited issue after plan approval](docs/local_agent_loop.md#edited-issue-after-plan-approval-2138).
+
 ### Implement a task without an issue
 
 ```bash

@@ -125,7 +125,14 @@ def _run_child_planning_cycle(
         plan_reset_stall_streak=False,
         plan_resume_keep_on_issue_edit=False,
         reopen_approved_plan=False,
+        keep_approved_plan=False,
     )
+    if config.keep_approved_plan:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --keep-approved-plan",
+        )
     if config.reopen_approved_plan:
         log(
             config,
@@ -159,6 +166,15 @@ def _run_child_planning_cycle(
         config,
         f"Issue #{parent_issue}: child #{child_issue_number} requires its own reviewed plan; "
         "starting the child plan-first cycle with policy auto before any implementation coder",
+    )
+    # The shared edited-approved-plan gate (#2138), before child recovery and
+    # plan-loop dispatch on both paths.  The child config never carries the
+    # parent's --keep-approved-plan, so an edited child stops here.
+    from .plan_reopen import apply_edited_approved_plan_gate
+
+    apply_edited_approved_plan_gate(
+        runner, config=child_config, issue_number=child_issue_number,
+        issue_context=child_issue_context, parent_issue_context=parent_issue_context,
     )
     if resume:
         from .issue_recovery import recover_issue_execution
@@ -560,6 +576,7 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "plan_reset_stall_streak",
     "plan_resume_keep_on_issue_edit",
     "reopen_approved_plan",
+    "keep_approved_plan",
     "plan_primary_stall_rounds",
     "plan_step_back_rounds",
     "plan_step_back_escalation_rounds",
