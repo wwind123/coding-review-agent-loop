@@ -2107,3 +2107,211 @@ def test_measurement_allowlist_accepts_argv_sequences_2052(measure_layout):
         ["du", "-sk", str(measure_layout.outside), "tests"],
         assigned_workdir=measure_layout.checkout,
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2134: standard device paths are not outside-checkout paths.
+# ---------------------------------------------------------------------------
+
+_DEVICE_REDIRECTS = [
+    "> /dev/null",
+    "2>/dev/null",
+    ">/dev/null 2>&1",
+    "> /dev/null 2>&1",
+    "< /dev/null",
+    "> /dev/stdout",
+    "2> /dev/stderr",
+    ">/dev/stderr",
+    ">'/dev/null'",
+    '2>"/dev/null"',
+]
+_MANAGED_BASELINE = (
+    "agent-loop run-tests --memory-dir /cache -- "
+    "python3 -m pytest /tmp/scratch-main/tests/ -q"
+)
+
+
+def _partition_2134(command, workdir):
+    return workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=workdir
+    )
+
+
+@pytest.mark.parametrize("redirect", _DEVICE_REDIRECTS)
+def test_device_redirect_on_in_checkout_test_is_kept(tmp_path, redirect):
+    command = f"python -m pytest tests/ {redirect}"
+
+    partition = _partition_2134(command, tmp_path)
+
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+    validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+
+
+@pytest.mark.parametrize("command", [
+    "sh -c 'pytest tests > /dev/null'",
+    "pytest tests /dev/null",
+    'unset X; "${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --timeout-seconds 120 '
+    "-- .venv/bin/python -m pytest tests/test_x.py > /dev/null",
+    '"${AGENT_LOOP_EXECUTABLE:-agent-loop}" run-tests --timeout-seconds 120 '
+    "-- .venv/bin/python -m pytest tests/test_x.py >/dev/null 2>&1",
+    "agent-loop run-tests -- python3 -m pytest tests >'/dev/null'",
+])
+def test_device_redirect_shell_and_managed_forms_are_kept(tmp_path, command):
+    partition = _partition_2134(command, tmp_path)
+
+    assert partition.in_checkout == (command,)
+    validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+
+
+@pytest.mark.parametrize("baseline", [
+    "python -m pytest /tmp/scratch-main/tests",
+    "python -m pytest -- /tmp/scratch-main/tests",
+    _MANAGED_BASELINE,
+    "pwd; " + _MANAGED_BASELINE,
+])
+@pytest.mark.parametrize("redirect", _DEVICE_REDIRECTS)
+def test_device_redirect_on_outside_baseline_matches_baseline(tmp_path, baseline, redirect):
+    command = f"{baseline} {redirect}"
+
+    expected = _partition_2134(baseline, tmp_path)
+    partition = _partition_2134(command, tmp_path)
+
+    assert expected.out_of_checkout == (baseline,)
+    assert partition.in_checkout == expected.in_checkout == ()
+    assert partition.out_of_checkout == (command,)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=tmp_path
+    ) is workdir_guard.command_targets_outside_workdir(
+        baseline, assigned_workdir=tmp_path
+    ) is True
+
+
+def test_device_redirect_with_inside_and_outside_targets_names_only_real_path(tmp_path):
+    command = "python -m pytest tests/ /tmp/x 2>/dev/null"
+
+    with pytest.raises(AgentLoopError, match="as separate commands") as exc_info:
+        _partition_2134(command, tmp_path)
+
+    message = str(exc_info.value)
+    assert "('/tmp/x')" in message
+    assert "/dev/null'" not in message.split("in command")[0]
+
+
+@pytest.mark.parametrize("command", [
+    "pytest tests > /dev/sda",
+    "pytest tests /dev/sda",
+    "pytest tests 2> /dev/tty",
+    "pytest tests /dev/tty",
+    "pytest tests > /dev/../dev/null",
+    "/dev/null tests",
+])
+def test_other_device_paths_and_program_role_stay_refused(tmp_path, command):
+    with pytest.raises(AgentLoopError):
+        _partition_2134(command, tmp_path)
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+
+
+@pytest.mark.parametrize("command", [
+    "make -C /dev/null test",
+    "pytest --directory /dev/null",
+    "pytest --directory=/dev/null",
+])
+def test_device_working_directory_keeps_outside_handling(tmp_path, command):
+    # The working-directory role is still logged: the strict validator refuses
+    # it and the display partition never keeps it as in-checkout evidence.
+    with pytest.raises(AgentLoopError, match="/dev/null"):
+        validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+    assert _partition_2134(command, tmp_path).in_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "du -sk /tmp/scratch-main > /dev/null",
+    "du -sk /tmp/scratch-main < /dev/null",
+])
+def test_measurement_with_device_redirect_stays_refused(tmp_path, command):
+    with pytest.raises(AgentLoopError, match="as separate commands"):
+        _partition_2134(command, tmp_path)
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("pytest tests 2>&1", [["pytest", "tests", "2>&1"]]),
+    ("pytest tests >&2", [["pytest", "tests", ">&2"]]),
+    ("pytest tests 2>&-", [["pytest", "tests", "2>&-"]]),
+    ("a & b", [["a"], ["b"]]),
+    ("a && b", [["a"], ["b"]]),
+    ("pytest tests 2>& rm x", [["pytest", "tests", "2>"], ["rm", "x"]]),
+    ("pytest tests 2>&rm x", [["pytest", "tests", "2>"], ["rm", "x"]]),
+    ("cmd 2> & 1", [["cmd", "2>"], ["1"]]),
+    ("cmd '2>'&1", [["cmd", "2>"], ["1"]]),
+    ("pytest /tmp/base '2>' & 1", [["pytest", "/tmp/base", "2>"], ["1"]]),
+])
+def test_fd_duplication_joining_is_narrow(text, expected):
+    clauses = workdir_guard._clauses_for_entry(text, "structured")
+
+    assert [clause.tokens for clause in clauses] == expected
+
+
+@pytest.mark.parametrize("command", [
+    "pytest /tmp/base '>/dev/null'",
+    'pytest /tmp/base ">" /dev/null',
+    "pytest /tmp/base \\>/dev/null",
+    "pytest /tmp/base '2>' & 1",
+    _MANAGED_BASELINE + " '>/dev/null'",
+])
+def test_quoted_redirect_literals_keep_mixed_classification(tmp_path, command):
+    # The literal is still an inside relative operand, so the run is mixed.
+    with pytest.raises(AgentLoopError, match="as separate commands"):
+        _partition_2134(command, tmp_path)
+    assert not workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=tmp_path
+    )
+
+
+def test_argv_redirect_literal_is_not_redirect_syntax(tmp_path):
+    argv = ["pytest", "/tmp/base", ">/dev/null"]
+
+    assert not workdir_guard.command_targets_outside_workdir(argv, assigned_workdir=tmp_path)
+    assert workdir_guard.command_targets_outside_workdir(
+        ["pytest", "/tmp/base"], assigned_workdir=tmp_path
+    )
+
+
+@pytest.mark.parametrize("redirect", ["'/dev/null'", '"/dev/null"'])
+def test_glued_quoted_device_target_is_a_redirect(tmp_path, redirect):
+    inside = f"pytest tests >{redirect}"
+    outside = f"pytest /tmp/base 2>{redirect}"
+
+    assert _partition_2134(inside, tmp_path).in_checkout == (inside,)
+    validate_test_commands_within_workdir([inside], assigned_workdir=tmp_path)
+    assert _partition_2134(outside, tmp_path).out_of_checkout == (outside,)
+
+
+def test_managed_inner_kinds_align_with_whole_word_fd_dup():
+    command = _MANAGED_BASELINE + " >/dev/null 2>&1"
+    inner = shlex.split(command)[5:]
+
+    kinds = workdir_guard._managed_inner_redirect_kinds(command, inner)
+
+    assert inner[-2:] == [">/dev/null", "2>&1"]
+    assert kinds is not None and kinds[-2:] == ["glued-device", "fd-dup"]
+    assert workdir_guard._managed_inner_redirect_kinds(command, ["other", "argv"]) is None
+    assert workdir_guard._join_preserving_redirects(["a", ">"], None) == "a '>'"
+
+
+@pytest.mark.parametrize("text", [
+    "pytest tests > /dev/null 2>&1",
+    "pytest tests >'/dev/null' '>/dev/null' \">\" x",
+    "pytest '' 'a b' 2>\"/dev/stderr\" <  /dev/stdin >&2",
+])
+def test_join_preserving_redirects_round_trips(text):
+    tokens, kinds = workdir_guard._annotated_tokens(text)
+
+    rejoined = workdir_guard._join_preserving_redirects(tokens, kinds)
+
+    assert workdir_guard._annotated_tokens(rejoined) == (tokens, kinds)
+
+
+def test_annotated_tokens_falls_back_on_unlexable_text():
+    assert workdir_guard._annotated_tokens("pytest 'unterminated") is None

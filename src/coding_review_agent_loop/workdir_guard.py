@@ -356,6 +356,17 @@ def _normalize_reported_path(raw_path: str) -> Path | None:
     return None
 
 
+# Standard streams a redirect or operand may name without testing anything
+# outside the checkout (#2134).  Compared literally, never canonicalized:
+# /dev/stdout resolves to /proc/self/fd/1, and other spellings such as
+# /dev/../dev/null, /dev/fd/1 or /dev/tty keep the ordinary path handling.
+_STANDARD_DEVICE_PATHS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"})
+
+
+def _is_standard_device_path(raw_path: str) -> bool:
+    return raw_path.strip().strip("`'\".,") in _STANDARD_DEVICE_PATHS
+
+
 # ---------------------------------------------------------------------------
 # Token-level predicates shared by the path pass and the URL pass.
 # ---------------------------------------------------------------------------
@@ -622,6 +633,20 @@ class _Clause:
     # shell -c script, and whether the text has a subshell or substitution.
     shell_depth: int = 0
     in_subshell: bool = False
+    # Per-token redirect provenance derived from source text (#2134):
+    # "operator", "glued-device", "fd-dup", or None for an ordinary word.
+    # None for the whole clause means no token is redirect syntax.
+    redirect_kinds: tuple[RedirectKind, ...] | None = None
+
+
+RedirectKind = Literal["operator", "glued-device", "fd-dup"] | None
+
+
+def _clause_redirect_kinds(clause: _Clause) -> tuple[RedirectKind, ...]:
+    kinds = clause.redirect_kinds
+    if kinds is None or len(kinds) != len(clause.tokens):
+        return (None,) * len(clause.tokens)
+    return kinds
 
 
 def _tokenize(text: str) -> list[str]:
@@ -637,18 +662,166 @@ def _tokenize(text: str) -> list[str]:
         return text.split()
 
 
+_SHELL_WHITESPACE = " \t\r\n"
+_REDIRECT_OPERATOR_RE = re.compile(r"\d*(?:>>?|<)")
+_FD_DUP_OPERATOR_RE = re.compile(r"\d*[<>]")
+_FD_DUP_TARGET_RE = re.compile(r"\d+|-")
+
+
+def _strict_tokenize(text: str) -> list[str] | None:
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _scan_shell_words(text: str) -> list[tuple[str, int, int]] | None:
+    """Lex like :func:`_tokenize`, keeping each token's source offsets.
+
+    Returns ``(decoded, start, end)`` triples, or ``None`` for text the
+    scanner cannot lex the way shlex does.
+    """
+    words: list[tuple[str, int, int]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch in _SHELL_WHITESPACE:
+            i += 1
+            continue
+        start = i
+        if ch in _SHELL_PUNCTUATION_CHARS:
+            while i < n and text[i] in _SHELL_PUNCTUATION_CHARS:
+                i += 1
+            words.append((text[start:i], start, i))
+            continue
+        decoded: list[str] = []
+        while i < n:
+            ch = text[i]
+            if ch in _SHELL_WHITESPACE or ch in _SHELL_PUNCTUATION_CHARS:
+                break
+            if ch == "'":
+                end = text.find("'", i + 1)
+                if end < 0:
+                    return None
+                decoded.append(text[i + 1 : end])
+                i = end + 1
+            elif ch == '"':
+                i += 1
+                while True:
+                    if i >= n:
+                        return None
+                    inner = text[i]
+                    if inner == '"':
+                        i += 1
+                        break
+                    if inner == "\\" and i + 1 < n and text[i + 1] in '"\\':
+                        decoded.append(text[i + 1])
+                        i += 2
+                        continue
+                    decoded.append(inner)
+                    i += 1
+            elif ch == "\\":
+                if i + 1 >= n:
+                    return None
+                decoded.append(text[i + 1])
+                i += 2
+            else:
+                decoded.append(ch)
+                i += 1
+        words.append(("".join(decoded), start, i))
+    return words
+
+
+def _redirect_kind(raw: str, decoded: str) -> RedirectKind:
+    """Classify a token as redirect syntax from its raw, unquoted source."""
+    if _REDIRECT_OPERATOR_RE.fullmatch(raw):
+        return "operator"
+    match = _REDIRECT_OPERATOR_RE.match(raw)
+    if match and decoded[match.end() :] in _STANDARD_DEVICE_PATHS:
+        # An unquoted operator glued to a (possibly quoted) device target.
+        return "glued-device"
+    return None
+
+
+def _annotated_tokens(text: str) -> tuple[list[str], list[RedirectKind]] | None:
+    """Tokens of ``text`` with redirect provenance taken from its source.
+
+    Contiguous, unquoted fd duplication (``2>&1``, ``>&2``, ``2>&-``) is
+    joined into one ``fd-dup`` token so it never splits a clause.  Returns
+    ``None`` when the source cannot be lexed exactly like :func:`_tokenize`;
+    callers then keep today's behaviour with no provenance.
+    """
+    words = _scan_shell_words(text)
+    if words is None or [word for word, _, _ in words] != _strict_tokenize(text):
+        return None
+    tokens: list[str] = []
+    kinds: list[RedirectKind] = []
+    ends: list[int] = []
+    index = 0
+    while index < len(words):
+        word, start, end = words[index]
+        if (
+            word == "&" and text[start:end] == "&" and tokens
+            and index + 1 < len(words)
+            and ends[-1] == start and words[index + 1][1] == end
+            and _FD_DUP_OPERATOR_RE.fullmatch(text[words[index - 1][1] : ends[-1]])
+            and _FD_DUP_TARGET_RE.fullmatch(text[words[index + 1][1] : words[index + 1][2]])
+        ):
+            next_end = words[index + 1][2]
+            joined_start = words[index - 1][1]
+            tokens[-1] = text[joined_start:next_end]
+            kinds[-1] = "fd-dup"
+            ends[-1] = next_end
+            index += 2
+            continue
+        raw = text[start:end]
+        tokens.append(word)
+        kinds.append(
+            None if word and set(raw) <= _SHELL_PUNCTUATION_CHARS else _redirect_kind(raw, word)
+        )
+        ends.append(end)
+        index += 1
+    return tokens, kinds
+
+
+def _join_preserving_redirects(
+    tokens: Sequence[str], kinds: Sequence[RedirectKind] | None
+) -> str:
+    """Serialize tokens so re-lexing restores the same tokens and kinds.
+
+    Redirect syntax is emitted unquoted; every other token is quoted, so a
+    literal that merely looks like a redirect stays a literal.
+    """
+    if kinds is None or len(kinds) != len(tokens):
+        return shlex.join(tokens)
+    return " ".join(
+        token if kind is not None else shlex.quote(token)
+        for token, kind in zip(tokens, kinds)
+    )
+
+
 def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
-    tokens = _tokenize(text)
+    annotated = _annotated_tokens(text)
+    if annotated is None:
+        tokens = _tokenize(text)
+        token_kinds: list[RedirectKind] = [None] * len(tokens)
+    else:
+        tokens, token_kinds = annotated
     in_subshell = any(
         token and set(token) <= _SHELL_PUNCTUATION_CHARS and ("(" in token or ")" in token)
         for token in tokens
     )
     clauses: list[_Clause] = []
     current: list[str] = []
+    current_kinds: list[RedirectKind] = []
     command_by_contract = True
 
     def flush(next_by_contract: bool) -> None:
-        nonlocal current, command_by_contract
+        nonlocal current, current_kinds, command_by_contract
         if current:
             clauses.append(
                 _Clause(
@@ -656,16 +829,19 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
                     mode=mode,
                     command_by_contract=command_by_contract if mode == "structured" else False,
                     in_subshell=in_subshell,
+                    redirect_kinds=tuple(current_kinds),
                 )
             )
         current = []
+        current_kinds = []
         command_by_contract = next_by_contract
 
-    for token in tokens:
-        if token and set(token) <= _SHELL_PUNCTUATION_CHARS:
+    for token, kind in zip(tokens, token_kinds):
+        if token and set(token) <= _SHELL_PUNCTUATION_CHARS and kind is None:
             flush(True)
             continue
         current.append(token)
+        current_kinds.append(kind)
         if not token:
             continue
         last_char = token[-1]
@@ -760,12 +936,14 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
         raise AgentLoopError("Cannot validate malformed quoted shell command in test report.") from exc
     # Keep the launcher, environment, and positional arguments under the normal
     # checks. Only the -c operand is executable text rather than a path argument.
+    kinds = _clause_redirect_kinds(clause)
     outer = _Clause(
         tokens=clause.tokens[:index] + clause.tokens[index + 1 :],
         mode=clause.mode,
         command_by_contract=clause.command_by_contract,
         shell_depth=clause.shell_depth,
         in_subshell=clause.in_subshell,
+        redirect_kinds=kinds[:index] + kinds[index + 1 :],
     )
     expanded = [outer]
     for inner in _split_into_clauses(script, "structured"):
@@ -1039,6 +1217,11 @@ def _check_path_role(
     assigned: Path,
     path_violations: list[str] | None = None,
 ) -> None:
+    if role == "argument" and _is_standard_device_path(raw_path):
+        # A redirect to or from a standard stream, or such an operand, tests
+        # nothing outside the checkout (#2134).  Program and working-directory
+        # uses keep the ordinary check.
+        return
     path = _normalize_reported_path(raw_path)
     if path is None:
         return
@@ -1463,6 +1646,22 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     if log.cwd_depth > clause.shell_depth:
         # The shell -c script that moved the directory has exited.
         log.cwd_unknown = True
+    # A redirect to or from a standard stream is neither an inside nor an
+    # outside target (#2134).  Only source-derived redirect syntax counts; a
+    # quoted literal such as '>/dev/null' remains an ordinary operand.
+    kinds = _clause_redirect_kinds(clause)
+    redirect_indices: set[int] = set()
+    for position, kind in enumerate(kinds):
+        if kind in {"glued-device", "fd-dup"}:
+            redirect_indices.add(position)
+        elif (
+            kind == "operator" and position + 1 < len(tokens)
+            and _is_standard_device_path(tokens[position + 1])
+        ):
+            redirect_indices.update({position, position + 1})
+    if tokens and len(redirect_indices) == len(tokens):
+        # Nothing but standard-stream redirects, e.g. the tail of ``&>``.
+        return
     _, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
@@ -1512,6 +1711,9 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     for index in range(head + 1, len(tokens)):
         token = tokens[index]
         previous = tokens[index - 1]
+        if index in redirect_indices or _is_standard_device_path(token):
+            # A literal device operand cannot be a checkout or baseline target.
+            continue
         if terminated:
             # After ``--`` every token is an operand, never an option value.
             cleaned = _strip_wrap(token)
@@ -1588,7 +1790,8 @@ def _validate_command_contents(
     ordinary_clauses: list[_Clause] = []
     for clause in clauses:
         if not _validate_managed_command(
-            shlex.join(clause.tokens), assigned=assigned,
+            _join_preserving_redirects(clause.tokens, clause.redirect_kinds),
+            assigned=assigned,
             origin="structured" if clause.mode in {"structured", "code"} else "response",
             path_violations=path_violations, display_partition=display_partition,
         ):
@@ -1662,13 +1865,40 @@ def _validate_managed_command(
                 path_violations=path_violations, display_partition=display_partition,
             )
         _validate_single_command(
-            shlex.join(managed.inner_argv),
+            _join_preserving_redirects(
+                managed.inner_argv, _managed_inner_redirect_kinds(command, managed.inner_argv)
+            ),
             assigned=assigned,
             origin=origin,
             path_violations=path_violations, display_partition=display_partition,
         )
         return True
     return False
+
+
+def _managed_inner_redirect_kinds(
+    command: str, inner_argv: Sequence[str]
+) -> list[RedirectKind] | None:
+    """Redirect kinds for the wrapper's inner argv, when they align exactly.
+
+    The inner argv must be the exact token-for-token suffix of the annotated
+    source tokens with no shell punctuation in it; otherwise there is no
+    provenance and the inner command is serialized as plain literals.
+    """
+    annotated = _annotated_tokens(command)
+    if annotated is None or not inner_argv:
+        return None
+    tokens, kinds = annotated
+    count = len(inner_argv)
+    if count > len(tokens) or tokens[-count:] != list(inner_argv):
+        return None
+    suffix_kinds = kinds[-count:]
+    if any(
+        token and set(token) <= _SHELL_PUNCTUATION_CHARS and kind is None
+        for token, kind in zip(tokens[-count:], suffix_kinds)
+    ):
+        return None
+    return suffix_kinds
 
 
 def _validate_single_command(
