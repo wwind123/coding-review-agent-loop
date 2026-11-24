@@ -1661,6 +1661,38 @@ def test_m2138_keep_approved_plan_continues_without_a_note(tmp_path):
     assert sum("planning is not reopened" in m for m in messages) == 1
 
 
+def test_m2138_keep_approved_plan_continues_into_implementation_of_the_approved_plan(
+    tmp_path, monkeypatch,
+):
+    """`edited-approved-keep`: with implementation requested, the approved plan is implemented."""
+    history = _m2010_approved_history(tmp_path)
+    plan_hash = _m2138_plan_hash(history)
+    implemented = []
+
+    def implement(_runner, **kwargs):
+        implemented.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(plan_execution, "_implement_approved_issue", implement)
+    runner, result, calls, messages = _m2138_rerun(
+        tmp_path, history, issue_payload=_M1390_EDIT, implement_after_approval=True,
+        config=_m1390_config(tmp_path, max_rounds=5, keep_approved_plan=True),
+    )
+
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    assert result == 0, result
+    assert len(calls) == 1
+    assert len(implemented) == 1
+    assert implemented[0]["issue_number"] == 56
+    # The implementation seam receives the existing approved plan, not a new one.
+    assert approved_plan_hash(implemented[0]["approved_plan"]) == plan_hash
+    assert _m2138_notes(runner) == []
+    assert _m1390_boundaries(runner) == []
+    assert _m1103_agent_calls(runner) == []
+    assert any("--keep-approved-plan kept approved plan" in m for m in messages)
+
+
 def test_m2138_reopen_approved_plan_still_opens_a_fresh_scope(tmp_path):
     """`edited-approved-reopen`: #2010 behavior, no edited-issue stop or note."""
     history = _m2010_approved_history(tmp_path)
@@ -1825,8 +1857,12 @@ def test_m2138_dry_run_checks_nothing_and_posts_nothing(tmp_path):
     )
 
     assert not isinstance(result, HumanDecisionRequiredError)
+    # The dry-run preview continues to its normal end, not to some later error.
+    assert result == 0, result
     assert any(
         "dry run; the edited-approved-plan check performs no check and posts nothing" in m
         for m in messages
     )
+    assert sum("planning is not reopened" in m for m in messages) == 1
     assert _m2138_notes(runner) == []
+    assert _m1103_agent_calls(runner) == []

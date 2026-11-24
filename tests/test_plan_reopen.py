@@ -839,19 +839,34 @@ def test_keep_approved_plan_parses_only_with_issue_plan_first_and_not_with_reope
     assert config_from_args(combined, FakeRunner()).keep_approved_plan is True
 
 
-def test_keep_approved_plan_parse_refusal_makes_no_github_call(monkeypatch, capsys):
-    """`cli-exclusivity-and-scope`: the refusal happens before any runner command."""
+@pytest.mark.parametrize("argv, expected", [
+    (["issue", "56", "--plan-first", "--keep-approved-plan", "--reopen-approved-plan"],
+     "--keep-approved-plan cannot be combined with --reopen-approved-plan"),
+    (["issue", "56", "--keep-approved-plan"], "--keep-approved-plan requires --plan-first"),
+    (["pr", "7", "--keep-approved-plan"], "--keep-approved-plan requires issue --plan-first"),
+    (["issue", "56", "--reopen-approved-plan"], "--reopen-approved-plan requires --plan-first"),
+    (["pr", "7", "--reopen-approved-plan"], "--reopen-approved-plan requires issue --plan-first"),
+    (["issue", "56", "--plan-first", "--reopen-approved-plan",
+      "--plan-resume-keep-on-issue-edit"],
+     "cannot be combined with --plan-resume-keep-on-issue-edit"),
+])
+def test_approved_plan_option_refusals_happen_before_any_config_or_github_read(
+    monkeypatch, capsys, argv, expected
+):
+    """`cli-exclusivity-and-scope`: no --repo, so config would detect the repo via gh."""
     import coding_review_agent_loop.cli as cli_module
+    from coding_review_agent_loop.runner import Runner
 
-    def forbidden(*_a, **_k):
+    def forbidden_config(*_a, **_k):
+        raise AssertionError("config_from_args must not run on a parse refusal")
+
+    def forbidden_command(*_a, **_k):
         raise AssertionError("no GitHub read or post on a parse refusal")
 
-    monkeypatch.setattr(cli_module, "run_issue_loop", forbidden)
-    assert cli_module.main([
-        "issue", "56", "--repo", "OWNER/REPO", "--plan-first", "--keep-approved-plan",
-        "--reopen-approved-plan",
-    ]) == 1
-    assert "cannot be combined" in capsys.readouterr().err
+    monkeypatch.setattr(cli_module, "config_from_args", forbidden_config)
+    monkeypatch.setattr(Runner, "run", forbidden_command)
+    assert cli_module.main(argv) == 1
+    assert expected in capsys.readouterr().err
 
 
 def test_keep_flag_is_reset_in_derived_configs_and_recovery_commands(tmp_path):
