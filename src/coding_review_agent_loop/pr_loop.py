@@ -141,7 +141,6 @@ from .github import (
     post_pr_comment,
     post_trusted_pr_comment,
     read_rest_issue_comments,
-    post_frozen_round_bodies,
     round_publication,
     reject_forged_protocol_markers,
     validate_open_issue,
@@ -153,7 +152,6 @@ from .github import (
     observation_run_urls,
     rerun_ordinary_failed_jobs,
 )
-from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
     find_latest_issue_pr_handoff,
     post_issue_pr_handoff_comment,
@@ -318,7 +316,6 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
-from .partial_round_recovery import RecoveryVisibilityContext
 from .round_closure_writer import (
     RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, closure_round_limit_note, decide_round_closure,
     excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
@@ -399,7 +396,7 @@ from .response_validation import (
     _surfaced_reviewer_requirement_ids,
     _reviewer_requirement_identity_ids,
     _reviewer_requirement_coverage_matches,
-    _resumed_pr_reviewer_matches_requirements, admit_classification_resumes,
+    _resumed_pr_reviewer_matches_requirements, posted_review_rejection_reason,
     _drop_repeated_carried_future_followups,
     _validate_followup_workdir_report,
 )
@@ -3863,7 +3860,16 @@ def run_pr_loop(
                 )
                 and (seat_binding is None or record.metadata.seat_binding == seat_binding)
             }
-            classification_resume_kinds, posted_rejection_reasons = admit_classification_resumes(completed_by_name, resumed_by_name, human_requirements, approved_plan_context, reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None, seat_binding=seat_binding, items=prior_unresolved_items, round_number=round_number, head_sha=current_pr_subject, reconciled=current_resume is not None and current_resume.reconciliation_record is not None)
+            # A posted review resume rejects is unreplayable: its round closes (#2064).
+            posted_rejection_reasons = {
+                name: posted_review_rejection_reason(
+                    record, human_requirements, approved_plan_context,
+                    reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None,
+                    seat_binding=seat_binding,
+                    round_reconciled=current_resume is not None and current_resume.reconciliation_record is not None,
+                )
+                for name, record in completed_by_name.items() if name not in resumed_by_name
+            }
             # Staged-policy panel evidence (#840).  Derived from comment-ordered
             # history before any resume, approval, or scheduling decision uses
             # reviewer records, so premature secondary work cannot count.
@@ -4208,18 +4214,7 @@ def run_pr_loop(
                 ), human_requirements, prior_unresolved_items, reviewer_name), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
 
             def _pr_publication(reviewer_name: str):
-                return round_publication(
-                    runner, config=config, spool=pr_round_spool,
-                    reviewer_name=reviewer_name, flow="pr", round_number=round_number,
-                    subject=current_pr_subject, surface_kind="pr", number=pr_number,
-                    validation_context=publication_context_digest(
-                        head=current_pr_subject,
-                        surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
-                        **({"review_scope": capture_scopes[reviewer_name]} if reviewer_name in capture_scopes else {}),
-                        **({"capture_boundary": capture_boundary_index} if capture_boundary_index >= 0 else {}),
-                        **({"seat_binding": seat_binding} if seat_binding is not None else {}),
-                    ),
-                )
+                return round_publication(spool=pr_round_spool, reviewer_name=reviewer_name)
 
             pr_spool_preflight_done = [False]
 
@@ -4297,13 +4292,12 @@ def run_pr_loop(
                     turn_names={agent_display_name(r) for r in configured_reviewers if _pr_reviewer_prelaunch_kind(r) == "turn"},
                     rejection_reasons={**posted_rejection_reasons, **{name: "it was recorded before any qualified panel opening"
                                                                       for name in prepanel_unqualified_reviews}}, spool=pr_round_spool,
-                    validators_for=_pr_review_validators, publication_for=_pr_publication,
-                    comment_id_for=lambda record: getattr(pr_comments[record.index], "comment_id", None) if 0 <= record.index < len(pr_comments) else None)
+                    validators_for=_pr_review_validators,
+                    comment_id_for=lambda record: getattr(pr_comments[record.index], "comment_id", None) if 0 <= record.index < len(pr_comments) else None,
+                    resumed_names=set(resumed_by_name))
                 decision = decide_round_closure(round_number=round_number, reviewer_order=order,
                                                 publications=found.publications, fresh_turns=found.fresh_turns)
                 if decision is None:
-                    for name in found.stale_unpublished:  # A verified unpublished stale carrier is discarded.
-                        pr_round_spool.remove(name)
                     return None
 
                 base = _pr_closure_base()
@@ -4390,16 +4384,7 @@ def run_pr_loop(
                     if resumed_by_name.get(agent_display_name(reviewer)) is not None
                 ]
                 _preflight_spooled_publications(
-                    runner, config=config, spool=pr_round_spool, reviewers=configured_reviewers,
-                    validators_for=_pr_review_validators, publication_for=_pr_publication,
-                    published_names=published,
-                    post_frozen=lambda plan: post_frozen_round_bodies(
-                        runner, config=config, surface_kind="pr", number=pr_number, plan=plan
-                    ),
-                    selected_reviewers=[
-                        reviewer for reviewer in configured_reviewers
-                        if agent_display_name(reviewer) in selected_names
-                    ],
+                    spool=pr_round_spool, reviewers=configured_reviewers, published_names=published,
                 )
 
             scheduler_metadata_recovery_full_board = False
@@ -5081,7 +5066,7 @@ def run_pr_loop(
                     phase = (
                         EVIDENCE_RESPONSE_PHASE if evidence_pass is not None else "authoritative"
                     )
-                # Freeze spooled publications for verbatim recovery (#1258).
+                # Mark a spooled publication as begun before its first post (#1258, #2064).
                 publication_hook = (
                     {"publication": _pr_publication(reviewer_name)}
                     if phase == "publication" and identity is not None
@@ -5231,7 +5216,8 @@ def run_pr_loop(
                 )
             )
             pr_round_public_peers = pr_today_peers
-            pr_recovery_context: RecoveryVisibilityContext | None = None
+            # (primary reviewer, launching names) for the visibility guard.
+            pr_recovery_context: tuple[str | None, tuple[str, ...]] | None = None
             if selective_policy and scheduler_decision is not None:
                 def _derive_pr_visibility_evidence(records: Sequence[PostedRoundRecord]) -> PrPanelEvidence:
                     return _derive_pr_panel_evidence(
@@ -5240,16 +5226,10 @@ def run_pr_loop(
                         required_reviewers=scheduler_contract.required_reviewers,
                     )
 
-                pr_recovery_context = RecoveryVisibilityContext(
-                    primary_reviewer=(
-                        scheduler_contract.primary_reviewer
-                        if scheduler_capabilities.requires_primary else None
-                    ),
-                    launch_phase=pr_launch_phase,
-                    launching=tuple(sorted(selected_reviewer_names)),
-                    derive_evidence=_derive_pr_visibility_evidence,
-                    target_opening=scheduler_capabilities.requires_primary,
-                    removed_opening_fingerprint=(None, None, None),
+                pr_recovery_context = (
+                    scheduler_contract.primary_reviewer
+                    if scheduler_capabilities.requires_primary else None,
+                    tuple(sorted(selected_reviewer_names)),
                 )
             if (
                 pr_recovery_context is not None
@@ -5339,9 +5319,9 @@ def run_pr_loop(
                     ),
                     flow="pr", round_number=round_number, subject=current_pr_subject,
                     reviewer_names=[agent_display_name(r) for r in configured_reviewers],
-                    primary_reviewer=pr_recovery_context.primary_reviewer,
+                    primary_reviewer=pr_recovery_context[0],
                     launch_phase=pr_launch_phase,
-                    launching=pr_recovery_context.launching,
+                    launching=pr_recovery_context[1],
                     checkpoint_index=latest_round_checkpoint_index(
                         pr_visibility_records, flow="pr",
                         round_number=round_number, subject=current_pr_subject,
@@ -5894,14 +5874,10 @@ def run_pr_loop(
                 classify = classify_review if human_evidence.freeze else (lambda parsed, text, **_: (dataclasses_replace(parsed, requirement_evidence=()), text))
                 parsed_review, review_output = classify(parsed_review, review_output,
                     requirements=human_requirements, items=prior_unresolved_items, reviewer_name=reviewer_name, previous=classified_review_carriers,
-                    **({"pinned_review": parsed_review, "force_continuation": classification_resume_kinds[reviewer_name] == "pending"} if resumed_record is not None and reviewer_name in classification_resume_kinds else {}),
                     invoke=lambda prompt: _run_validated_agent(runner, agent=reviewer, config=config, prompt=prompt,
                         **_pr_review_validators(reviewer_name), usage_context=usage_context, **CLASSIFICATION_INVOKE_OPTIONS))
                 review_state = parsed_review.state
                 if review_output != classification_input: early_published_pr_reviewers.discard(reviewer)
-                if review_output != classification_input and resumed_record is not None and resumed_record.metadata.phase != "publication" and reviewer_name in classification_resume_kinds:
-                    # Persist an admitted settlement's reconciled classification with its finding IDs and acquisition identity (#2035).
-                    _post_pr_reviewer_comment(reviewer_name, parsed_review, review_output=review_output, model_used=review_model_used, identity=resumed_record.metadata, acquisition_outcome=review_acquisition_outcome, acquisition_returncode=review_acquisition_returncode, new_items=tuple(resumed_record.metadata.new_items))
                 classified_review_carriers[reviewer_name] = parsed_review
                 if carried_approval_record is None:
                     round_review_models[reviewer_name] = review_model_used

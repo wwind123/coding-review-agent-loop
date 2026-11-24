@@ -130,31 +130,6 @@ def test_live_child_surface_guards_only_parse_admitted_controls(tmp_path, truste
         assert collect() == ()
 
 
-def test_live_plan_recovery_excludes_foreign_reviews_and_attachments(tmp_path):
-    from coding_review_agent_loop.partial_round_recovery import compute_partial_round_recovery
-    from test_partial_round_recovery import _History, _meta, _big_text, ROUND, HEAD, REVIEWERS
-    from coding_review_agent_loop.round_state import _resume_plan_round
-
-    history = _History()
-    history.add_record(replace(_meta(role='coder', agent='Claude'), flow='plan'))
-    history.add_record(replace(_meta(), flow='plan'))
-    history.add_record(replace(_meta(agent='Gemini'), flow='plan'), author='outsider')
-    history.orphan(replace(_meta(agent='Gemini'), flow='plan',
-                           canonical_reviewer_response=_big_text(20)), author='outsider')
-    runner = FakeRunner(authenticated_actor=('bot', 4242), issue_comments=[
-        {'body': c.body, 'author': {'login': c.author}, '_rest_author_id': c.author_id,
-         'id': c.comment_id, 'createdAt': c.created_at} for c in history.comments])
-    config = make_config(tmp_path)
-    comments = acquire(runner, config, 56)
-    recovery = compute_partial_round_recovery(
-        snapshot=comments, read_rest=lambda: acquire(runner, config, 56),
-        flow='plan', round_number=ROUND, subject=HEAD, reviewer_names=REVIEWERS,
-        resume=lambda remaining: _resume_plan_round(remaining, configured_reviewers=('codex', 'gemini')))
-    assert recovery.verified
-    assert {target.comment_id for target in recovery.targets} == {comments[1].comment_id}
-    assert not recovery.uncertain
-
-
 @pytest.mark.parametrize('reader', ['hashes', 'announcement-exists'])
 @pytest.mark.parametrize('login,user_id,trusted,eligible', [
     ('loop', 42, (), True),

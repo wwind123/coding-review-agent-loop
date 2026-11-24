@@ -252,8 +252,8 @@ def _legacy_round(config, kind, *, number=7, round_number=1, subject="abc"):
         number=number, round_number=round_number, subject=subject,
     )
     legacy.store("Codex", _SPOOL_FIELDS)
-    if kind == "carrier":
-        legacy.store_publication("Codex", {"frozen": True})
+    if kind == "began":
+        legacy.mark_publication_began("Codex")
     elif kind == "malformed":
         path = legacy.directory / "Codex.json"
         payload = _spool_json.loads(path.read_text(encoding="utf-8"))
@@ -286,11 +286,11 @@ def test_spool_lands_in_private_root_outside_reachable_trees(spool_config, mask)
     assert _spool_mode(spool.directory) == 0o700
     record = spool.directory / "Codex.json"
     assert _spool_mode(record) == 0o600
-    assert spool.publication_state("Codex") == ("fresh", None)
+    assert spool.publication_state("Codex") == "fresh"
     assert spool.load("Codex")["text"] == "Codex approves."
 
 
-@pytest.mark.parametrize("kind", ["fresh", "carrier", "malformed"])
+@pytest.mark.parametrize("kind", ["fresh", "began", "malformed"])
 def test_legacy_round_is_migrated_with_unchanged_classification(spool_config, kind):
     config = spool_config
     legacy = _legacy_round(config, kind)
@@ -304,12 +304,12 @@ def test_legacy_round_is_migrated_with_unchanged_classification(spool_config, ki
     assert (spool.root / legacy_directory.name).is_dir()
     assert spool.publication_state("Codex") == before
     assert spool.load("Codex") == loaded_before
-    assert before[0] == kind
+    assert before == kind
 
 
 def test_round_present_in_both_locations_fails_closed(spool_config):
     config = spool_config
-    legacy = _legacy_round(config, "carrier")
+    legacy = _legacy_round(config, "began")
     spool = _round_spool(config)
     (spool.root / legacy.directory.name).mkdir()
     legacy_dir = legacy.directory
@@ -328,7 +328,7 @@ def test_round_present_in_both_locations_fails_closed(spool_config):
 @pytest.mark.parametrize("legacy_mode", [0o755, 0o775], ids=["mode-755", "umask-002-mode-775"])
 def test_retained_legacy_round_is_hidden_but_still_migrates(spool_config, legacy_mode):
     config = spool_config
-    retained = _legacy_round(config, "carrier", number=99, subject="retained")
+    retained = _legacy_round(config, "began", number=99, subject="retained")
     legacy_root = retained.root
     # Older versions created the root with the process umask.
     legacy_root.chmod(legacy_mode)
@@ -340,11 +340,11 @@ def test_retained_legacy_round_is_hidden_but_still_migrates(spool_config, legacy
         _spool_os.listdir(legacy_root)
     assert _spool_mode(legacy_root) == 0o300
     record = legacy_root / retained.digest / "Codex.json"
-    assert _spool_json.loads(record.read_text(encoding="utf-8"))["publication"] == {"frozen": True}
+    assert set(_spool_json.loads(record.read_text(encoding="utf-8"))["publication"]) == {"began_at"}
 
     # Later, a rerun of the retained round migrates it with its classification.
     rerun = _round_spool(config, number=99, subject="retained")
-    assert rerun.publication_state("Codex") == before == ("carrier", {"frozen": True})
+    assert rerun.publication_state("Codex") == before == "began"
     assert not (legacy_root / retained.digest).exists()
 
 
@@ -710,7 +710,7 @@ class _Spool:
         self.states, self.records, self.removed = states, records or {}, []
 
     def publication_state(self, name):
-        return self.states.get(name, ("absent", None))
+        return self.states.get(name, "absent")
 
     def load(self, name):
         return self.records.get(name)
@@ -719,7 +719,7 @@ class _Spool:
         self.removed.append(name)
 
 
-def _classify(spool, *, publication_for, turn_names=("Codex", "Gemini"), published=None, rejected=None,
+def _classify(spool, *, turn_names=("Codex", "Gemini"), published=None, rejected=None,
               replay=lambda **kwargs: object(), monkeypatch=None):
     from coding_review_agent_loop.round_closure_writer import classify_round_reviewers
 
@@ -729,57 +729,75 @@ def _classify(spool, *, publication_for, turn_names=("Codex", "Gemini"), publish
         SimpleNamespace(), config=SimpleNamespace(), surface="pr", number=77, round_number=3,
         reviewers=["codex", "gemini"], turn_names=set(turn_names),
         published_records=published or {}, rejected_records=rejected or {}, rejection_reasons={},
-        spool=spool, validators_for=lambda name: {}, publication_for=publication_for,
+        spool=spool, validators_for=lambda name: {},
         comment_id_for=lambda record: getattr(record, "comment_id", None),
     )
 
 
-def test_classification_read_failure_is_retryable_and_never_a_closure(monkeypatch):
-    """`read-failure-no-closure`: a failed listing or actor read raises before any post."""
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
-    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+@pytest.mark.parametrize("state, cause", [
+    ("began", "its same-round publication began and may be partly public"),
+    ("legacy", "its spool record predates the publication protocol and may be partly public"),
+    ("malformed", "its spool record is malformed or unreadable"),
+])
+def test_classification_never_resumes_a_possibly_public_spool_record(monkeypatch, state, cause):
+    """`former-resume-paths-rollover` at the classifier (#2064): no carrier resume.
 
-    def gate_read_fails(name):
-        return SimpleNamespace(gate=lambda **kwargs: (_ for _ in ()).throw(
-            PublicationResumeStop("the conversation could not be read completely (HTTP 502).", category="read")))
+    A record whose publication began (or may have) is both a publication and a
+    fresh-turn need, so the round closes; nothing is read from GitHub, and the
+    replayable peer is never counted as needing a turn.
+    """
+    spool = _Spool({"Codex": state, "Gemini": "fresh"},
+                   {"Codex": {"text": "x"}, "Gemini": {"text": "y"}})
+    found = _classify(spool, monkeypatch=monkeypatch)
+    assert found.publications == {"Codex": None}
+    assert found.fresh_turns == {"Codex": cause}
+    from coding_review_agent_loop.round_closure_writer import decide_round_closure
 
-    spool = _Spool({"Codex": ("carrier", {})}, {"Codex": {"text": "x"}})
-    with pytest.raises(RoundStateReadError) as error:
-        _classify(spool, publication_for=gate_read_fails, monkeypatch=monkeypatch)
-    assert "rerun once GitHub comment reads succeed" in str(error.value)
-    assert "delet" not in str(error.value).lower()
+    decision = decide_round_closure(round_number=3, reviewer_order=["Codex", "Gemini"],
+                                    publications=found.publications, fresh_turns=found.fresh_turns)
+    assert decision is not None and decision.unreplayable == (("Codex", cause),)
     assert spool.removed == []
 
 
-def test_classification_counts_public_or_unverifiable_carriers_and_not_verified_unpublished_ones(monkeypatch):
-    """`spool-carrier-closes` / `no-published-no-rollover` at the classifier."""
-    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+def test_classification_of_a_fresh_record_with_an_invalid_response_is_an_ordinary_fresh_turn(monkeypatch):
+    """`no-published-no-rollover`: an invalid never-published record is no publication."""
+    spool = _Spool({"Gemini": "fresh"}, {"Gemini": {"text": "y"}})
+    found = _classify(spool, monkeypatch=monkeypatch, replay=lambda **kwargs: None)
+    assert found.publications == {}
+    assert found.fresh_turns == {
+        "Codex": "no spooled outcome for this round exists on this host",
+        "Gemini": "its spooled outcome no longer validates against this run",
+    }
 
-    def publication_for(name):
-        if name == "Codex":  # a structural carrier failure: cannot exclude publication
-            return SimpleNamespace(gate=lambda **k: (_ for _ in ()).throw(PublicationResumeStop("gap", category="structural")))
-        return SimpleNamespace(gate=lambda **k: SimpleNamespace(already_public=frozenset(), bodies=("a", "b")))
 
-    spool = _Spool({"Codex": ("carrier", {}), "Gemini": ("carrier", {})},
-                   {"Codex": {"text": "x"}, "Gemini": {"text": "y"}})
-    found = _classify(spool, publication_for=publication_for, monkeypatch=monkeypatch,
-                      replay=lambda **kwargs: None if kwargs["reviewer"] == "gemini" else object())
-    assert found.publications == {"Codex": None}
-    assert found.fresh_turns["Codex"] == "its frozen same-round publication cannot be resumed"
-    # Gemini's carrier is verified unpublished: an invalid response is an ordinary fresh turn.
-    assert found.fresh_turns["Gemini"] == "its spooled outcome no longer validates against this run"
-    assert found.stale_unpublished == ["Gemini"]
-    malformed = _classify(_Spool({"Gemini": ("malformed", None)}), publication_for=publication_for,
-                          monkeypatch=monkeypatch)
-    assert malformed.publications == {"Gemini": None}
-    assert malformed.fresh_turns["Gemini"] == "its spool record is malformed or unreadable"
+def test_preflight_closes_a_begun_publication_and_drops_a_published_reviewers_stale_record(tmp_path):
+    """The spool preflight never resumes or posts a begun publication (#2064)."""
+    from coding_review_agent_loop.round_closure_writer import RoundIncompleteSignal
+
+    spool = review_rounds.ReviewRoundSpool(
+        root=tmp_path, repo="OWNER/REPO", surface="pr", number=77, round_number=3, subject="abc")
+    spool.store("Codex", {"text": "Codex approves."})
+    spool.mark_publication_began("Codex")
+    # The anchor is public and resume admitted it: the stale record is discarded.
+    review_rounds._preflight_spooled_publications(
+        spool=spool, reviewers=["codex"], published_names=["Codex"])
+    assert spool.publication_state("Codex") == "absent"
+    spool.store("Codex", {"text": "Codex approves."})
+    spool.mark_publication_began("Codex")
+    spool.store("Gemini", {"text": "Gemini approves."})
+    with pytest.raises(RoundIncompleteSignal) as signal:
+        review_rounds._preflight_spooled_publications(spool=spool, reviewers=["codex", "gemini"])
+    assert signal.value.published == ("Codex",)
+    assert signal.value.unreplayable == (("Codex", "its same-round publication began and may be partly public"),)
+    assert "delet" not in str(signal.value).lower()
+    assert spool.publication_state("Codex") == "began"  # kept, never re-posted
 
 
 def test_rejected_own_publication_always_needs_a_fresh_turn_even_with_a_valid_spool(monkeypatch):
     """`single-reviewer-own-rejected`: content-valid spool data never makes it replayable."""
     record = SimpleNamespace(comment_id=41)
-    spool = _Spool({"Codex": ("fresh", None)}, {"Codex": {"text": "still valid"}})
-    found = _classify(spool, publication_for=lambda name: None, turn_names=("Codex",),
+    spool = _Spool({"Codex": "fresh"}, {"Codex": {"text": "still valid"}})
+    found = _classify(spool, turn_names=("Codex",),
                       rejected={"Codex": record}, monkeypatch=monkeypatch)
     assert found.publications == {"Codex": 41}
     assert found.fresh_turns == {"Codex": "its own published review was rejected by resume"}
@@ -809,7 +827,7 @@ def test_former_refusal_sites_raise_the_closure_signal_before_invoking_anyone(tm
     for error in (sequential.value, launch.value):
         message = str(error)
         assert "round 4" in message and "delet" not in message.lower()
-        assert not isinstance(error, review_rounds.PartialReviewRoundError)
+        assert not hasattr(review_rounds, "PartialReviewRoundError")
 
 
 def test_shared_pr_reconstruction_matches_resume_and_follows_the_published_state():

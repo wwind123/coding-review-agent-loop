@@ -1095,46 +1095,6 @@
       "occurrence": 1
     },
     {
-      "module": "partial_round_recovery",
-      "function": "_compute",
-      "call": "_extract_round_metadata_records(comments, flow=flow)",
-      "family": "rounds",
-      "provenance": "partial_round_recovery._compute: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. _compute consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline.",
-      "occurrence": 1
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_compute::check",
-      "call": "_extract_round_metadata_records(remaining, flow=flow)",
-      "family": "rounds",
-      "provenance": "partial_round_recovery._compute::check: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. _compute::check consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline.",
-      "occurrence": 1
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_frame",
-      "call": "_extract_round_metadata_records(comments, flow=flow)",
-      "family": "rounds",
-      "provenance": "partial_round_recovery._frame: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. _frame consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline.",
-      "occurrence": 1
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_plan",
-      "call": "_extract_round_metadata_records(comments, flow=flow)",
-      "family": "rounds",
-      "provenance": "partial_round_recovery._plan: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. _plan consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline.",
-      "occurrence": 1
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "compute_partial_round_recovery",
-      "call": "_extract_round_metadata_records(comments, flow=flow)",
-      "family": "rounds",
-      "provenance": "partial_round_recovery.compute_partial_round_recovery: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. compute_partial_round_recovery consumes immutable observed comments from the live plan/PR loop. Plan startup and fresh reads use issue admission; _plan_round_recovery admits the complete REST callback before this dynamic-flow reducer. PR recovery retains its existing authenticated boundary; raw codec fixtures are offline.",
-      "occurrence": 1
-    },
-    {
       "module": "phase_progress",
       "function": "record_staged_completion",
       "call": "find_staged_completion_records(history, parent_issue=parent_issue, plan_hash=outcome.plan_hash, mode=outcome.mode)",
@@ -3143,30 +3103,6 @@
       "admission": "panel_evidence receives admitted plan history from plan_first_loop; carried approvals use invocation-only round extraction and restoration_rounds_from_comments separately uses admitted amendment controls."
     },
     {
-      "module": "partial_round_recovery",
-      "function": "_comment_key",
-      "classification": "reader",
-      "admission": "partial_round_recovery compares admitted snapshots with a fresh REST acquisition supplied by live PR/plan callers; original IDs and bodies are retained for exact deletion targets, not new authority."
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_compute::check",
-      "classification": "reader",
-      "admission": "partial_round_recovery compares admitted snapshots with a fresh REST acquisition supplied by live PR/plan callers; original IDs and bodies are retained for exact deletion targets, not new authority."
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_plan",
-      "classification": "reader",
-      "admission": "partial_round_recovery compares admitted snapshots with a fresh REST acquisition supplied by live PR/plan callers; original IDs and bodies are retained for exact deletion targets, not new authority."
-    },
-    {
-      "module": "partial_round_recovery",
-      "function": "_snapshot_covered",
-      "classification": "reader",
-      "admission": "partial_round_recovery compares admitted snapshots with a fresh REST acquisition supplied by live PR/plan callers; original IDs and bodies are retained for exact deletion targets, not new authority."
-    },
-    {
       "module": "phase_progress",
       "function": "find_staged_completion_records",
       "classification": "reader",
@@ -3527,30 +3463,6 @@
       "admission": "prompts.build_task_clarification_prompt presents raw discussion or offline export; text is not an authority grant."
     },
     {
-      "module": "publication_resume",
-      "function": "RoundPublication::_check_legacy",
-      "classification": "reader",
-      "admission": "RoundPublication._check_legacy: publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
-    },
-    {
-      "module": "publication_resume",
-      "function": "RoundPublication::_freeze",
-      "classification": "reader",
-      "admission": "RoundPublication._freeze: publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
-    },
-    {
-      "module": "publication_resume",
-      "function": "_metadata",
-      "classification": "reader",
-      "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
-    },
-    {
-      "module": "publication_resume",
-      "function": "classify_frozen_sequence",
-      "classification": "reader",
-      "admission": "publication_resume receives admitted PR/plan round records from lifecycle callers; frozen sequence identity and legacy comparisons preserve invocation-only round authority."
-    },
-    {
       "module": "review_images",
       "function": "mask_visual_protocol_bodies",
       "classification": "acquisition",
@@ -3759,24 +3671,6 @@
       "function": "extract_declared_out_of_scope",
       "classification": "presentation",
       "admission": "scope_declarations.extract_declared_out_of_scope reads raw body text for presentation, diagnostics or candidate prose; no round approval, child routing or protocol authorization is selected here."
-    },
-    {
-      "module": "signed_input_supersession",
-      "function": "edit_history_proves_unedited",
-      "classification": "reader",
-      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
-    },
-    {
-      "module": "signed_input_supersession",
-      "function": "read_pr_comment_edit_states",
-      "classification": "acquisition",
-      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
-    },
-    {
-      "module": "signed_input_supersession",
-      "function": "review_comment_ids",
-      "classification": "reader",
-      "admission": "signed_input_supersession reads the live PR loop's admitted observation (pr_round_ingestion protocol bodies, invocation-actor only) to locate a rejected review's own anchor and sidecar comment IDs, and a bounded GraphQL edit-history acquisition for those IDs; unreadable, changed-after-admission or incomplete input fails closed to the existing partial-round refusal and never grants authority."
     },
     {
       "module": "split_materialization",

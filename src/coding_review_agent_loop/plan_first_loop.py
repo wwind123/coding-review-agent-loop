@@ -92,10 +92,8 @@ from .github import (
     IssueContext,
     get_issue_context,
     post_issue_comment,
-    post_frozen_round_bodies,
     round_publication,
 )
-from .publication_resume import context_digest as publication_context_digest
 from .logging import log
 from .finding_history import (
     PHASE_PLAN as _HISTORY_PHASE_PLAN,
@@ -196,7 +194,6 @@ from .plan_review_scheduling import (
     plan_undecodable_history_message,
     select_plan_reviewers,
 )
-from .partial_round_recovery import RecoveryVisibilityContext
 from .round_visibility import latest_round_checkpoint_index, same_round_public_publications, visible_peer_names
 from .unresolved_items import (
     preserve_failed_seat_items,
@@ -2103,17 +2100,7 @@ def _run_plan_first_loop_body(
             ))
 
         def _plan_publication(reviewer_name: str):
-            return round_publication(
-                runner, config=config, spool=plan_round_spool,
-                reviewer_name=reviewer_name, flow="plan", round_number=round_number,
-                subject=current_plan_subject, surface_kind="issue", number=issue_number,
-                validation_context=publication_context_digest(
-                    candidate=(
-                        current_plan_key.as_dict() if staged_planning else current_plan_subject
-                    ),
-                    surfaced=sorted(str(item) for item in plan_hr_ids),
-                ),
-            )
+            return round_publication(spool=plan_round_spool, reviewer_name=reviewer_name)
 
         plan_spool_preflight_done = [False]
 
@@ -2127,13 +2114,7 @@ def _run_plan_first_loop_body(
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
             ]
             _preflight_spooled_publications(
-                runner, config=config, spool=plan_round_spool, reviewers=configured_reviewers,
-                validators_for=_plan_review_validators, publication_for=_plan_publication,
-                published_names=published,
-                post_frozen=lambda plan: post_frozen_round_bodies(
-                    runner, config=config, surface_kind="issue", number=issue_number, plan=plan
-                ),
-                selected_reviewers=round_reviewers,
+                spool=plan_round_spool, reviewers=configured_reviewers, published_names=published,
             )
 
         round_reviewers = tuple(configured_reviewers)
@@ -2695,17 +2676,14 @@ def _run_plan_first_loop_body(
                     reviewers=configured_reviewers, published_records=published, rejected_records=rejected,
                     turn_names={agent_display_name(r) for r in round_reviewers if agent_display_name(r) not in resumed_by_name},
                     rejection_reasons={}, spool=plan_round_spool, validators_for=_plan_review_validators,
-                    publication_for=_plan_publication, comment_id_for=comment_id)
+                    comment_id_for=comment_id, resumed_names=set(resumed_by_name))
                 publications, fresh_turns = found.publications, found.fresh_turns
             else:
                 publications = {name: (comment_id(completed[name]) if name in completed else None) for name in signal.published}
                 fresh_turns = dict(signal.unreplayable)
-                found = None
             decision = decide_round_closure(round_number=round_number, reviewer_order=order,
                                             publications=publications, fresh_turns=fresh_turns)
             if decision is None:
-                for name in (found.stale_unpublished if found is not None else ()):
-                    plan_round_spool.remove(name)  # A verified unpublished stale carrier is discarded.
                 return None
             closed = close_incomplete_round(
                 runner, config=config, decision=decision, flow="plan", subject=current_plan_subject,
@@ -3147,7 +3125,6 @@ def _run_plan_first_loop_body(
             and record.metadata.phase == "publication"
         )
         plan_round_public_peers = plan_today_peers
-        plan_recovery_context: RecoveryVisibilityContext | None = None
         if staged_planning and plan_scheduler_decision is not None:
             def _derive_plan_visibility_evidence(
                 records: Sequence[PostedRoundRecord],
@@ -3158,12 +3135,6 @@ def _run_plan_first_loop_body(
                     required_reviewers=plan_reviewer_names,
                 )
 
-            plan_recovery_context = RecoveryVisibilityContext(
-                primary_reviewer=plan_primary_name,
-                launch_phase=plan_scheduler_decision.phase,
-                launching=tuple(sorted(plan_selected_names)),
-                derive_evidence=_derive_plan_visibility_evidence,
-            )
             if plan_posted_checkpoint is not None:
                 # Same visibility rule as the PR guard (#1156): every same-round
                 # review already public counts, whatever its scheduler phase and
@@ -3203,7 +3174,7 @@ def _run_plan_first_loop_body(
                     reviewer_names=[agent_display_name(r) for r in configured_reviewers],
                     primary_reviewer=plan_primary_name,
                     launch_phase=plan_scheduler_decision.phase,
-                    launching=plan_recovery_context.launching,
+                    launching=tuple(sorted(plan_selected_names)),
                     checkpoint_index=latest_round_checkpoint_index(
                         plan_visibility_records, flow="plan",
                         round_number=round_number, subject=current_plan_subject,

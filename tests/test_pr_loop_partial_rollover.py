@@ -667,3 +667,101 @@ def test_closure_keeps_the_managed_ci_qualification_checkpoint_readable(tmp_path
     assert checkpoints[0] == checkpoint
     assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == ["Codex", "Gemini"]
     _no_deletion_advice(runner)
+
+
+# --- #2064 stage 3: the removed resume paths now roll the round over ---------
+
+
+def test_review_formerly_admitted_by_classification_only_resume_rolls_the_round_over(tmp_path):
+    """`former-resume-paths-rollover` (classification-only resume removed, #2081).
+
+    Every review of round 1 is published, then Codex's signed-source
+    classification exhausts its re-ask.  The old release admitted Codex's
+    published review for a classification-only continuation; now resume
+    rejects it, so the reviewer is unreplayable: round 1 closes with one
+    closed-incomplete record, Codex is not re-run in round 1, and round 2
+    reviews the full board.  No stop, no deletion advice.
+    """
+    from coding_review_agent_loop.github import _parse_pr_human_requirements
+    from coding_review_agent_loop.protocol import human_requirements_resolved
+    from pr_loop_test_helpers import _association, _classified_review, _pr_records
+    from test_pr_loop_resume import _CLASSIFY, _classification_failed_round
+
+    assert not hasattr(response_validation, "classification_resume_kind")
+    assert not hasattr(response_validation, "admit_classification_resumes")
+    runner, config, rids = _classification_failed_round(tmp_path)
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    codex = [r for r in _pr_records(runner) if r.metadata.agent == "Codex"][-1]
+    assert codex.metadata.phase == "publication" and not human_requirements_resolved(codex.body)
+    assert not response_validation._resumed_pr_reviewer_matches_requirements(codex, requirements)
+    before = len(runner.commands)
+    runner.codex_outputs = [_classified_review([_association(rid, "code") for rid in rids], hr=True)]
+    runner.gemini_outputs = [_classified_review([_association(rid, "code") for rid in rids],
+                                                reviewer="Google Gemini", hr=True)]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    (closure,) = _closures(runner)
+    assert closure.round_number == 1
+    assert [e["agent"] for e in closure.round_closure["published"]] == ["Codex", "Gemini"]
+    assert [e["agent"] for e in closure.round_closure["unreplayable"]] == ["Codex"]
+    rerun = runner.commands[before:]
+    codex_prompts = [cmd[-1] for cmd, _cwd in rerun if cmd[:1] == ["codex"]]
+    assert len(codex_prompts) == 1 and _CLASSIFY not in codex_prompts[0]  # a fresh round-2 turn
+    assert sum(1 for cmd, _cwd in rerun if cmd[:1] == ["gemini"]) == 1
+    reviewer_rounds = [r.metadata.round_number for r in _pr_records(runner)
+                       if r.metadata.role == "reviewer" and r.metadata.agent == "Codex"]
+    assert reviewer_rounds == [1, 2]
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    _no_deletion_advice(runner)
+
+
+@pytest.mark.parametrize("review_parallel", [True, False], ids=["parallel", "sequential"])
+def test_partly_public_publication_rolls_the_round_over_without_posting_its_suffix(tmp_path, review_parallel):
+    """`former-resume-paths-rollover` (publication-carrier resume removed, #2081).
+
+    Codex's overflowing round-1 review publishes its sidecars and the outage
+    hits before its anchor.  The old release resumed the frozen carrier and
+    posted the missing suffix; now the begun publication is unreplayable: the
+    rerun posts one closed-incomplete record, never the anchor, and launches no
+    reviewer in round 1 -- even a sequential rerun of the withheld round.
+    """
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import attachment_keys
+    from test_review_parallel import _overflow_pr_runner, _run_until_closure
+
+    runner, markers = _overflow_pr_runner((11,))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real = github_module._post_comment_body
+    state = {"anchor": None}
+
+    def fail_codex_anchor(runner_, *, config, command, body, claimed=None, body_index=None):
+        if markers[0] in str(body) and not attachment_keys(str(body)):
+            state["anchor"] = str(body)
+            raise KeyboardInterrupt
+        return real(runner_, config=config, command=command, body=body, claimed=claimed,
+                    body_index=body_index)
+
+    with patch_object_in((github_module,), "_post_comment_body", side_effect=fail_codex_anchor):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert state["anchor"] is not None
+    sidecars = [c["body"] for c in runner.pr_payload["comments"] if attachment_keys(c["body"])]
+    assert sidecars  # the publication is partly public
+    marks = [json.loads(p.read_text(encoding="utf-8")).get("publication") for p in _spool_files(config)]
+    assert [set(m) for m in marks if m is not None] == [{"began_at"}]
+    launches_before = len(runner.reviewer_launches)
+    comments_before = len(runner.pr_payload["comments"])
+    rerun_config = dataclasses.replace(config, review_parallel=review_parallel)
+
+    _run_until_closure(lambda: run_pr_loop(runner, pr_number=77, config=rerun_config))
+
+    assert runner.reviewer_launches[launches_before:] == []
+    assert len(runner.pr_payload["comments"]) == comments_before + 1  # only the closure record
+    assert not any(c["body"] == state["anchor"] for c in runner.pr_payload["comments"])
+    assert [c["body"] for c in runner.pr_payload["comments"] if attachment_keys(c["body"])] == sidecars
+    (closure,) = _closures(runner)
+    assert closure.round_number == 1
+    unreplayable = {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
+    assert "Codex" in unreplayable and "began" in unreplayable["Codex"]
+    _no_deletion_advice(runner)

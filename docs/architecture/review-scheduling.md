@@ -215,8 +215,8 @@ at either one resumes as an unsettled round that still reconstructs each
 published reviewer's numbered items, owners, and obligations. A PR round follows
 the same rule: only an actual reconciliation summary marks it reconciled, and its
 `scheduler-prelaunch` summary (also the secondary-audit panel opening) is a
-pre-reviewer checkpoint. The partial-round refusal relies on this to list the
-comments whose deletion lets a half-published round rerun. Resume also
+pre-reviewer checkpoint. The round-closure decision relies on this to treat a
+half-published unreconciled round as incomplete and roll it over (#2064). Resume also
 rebuilds the transition classifier's authenticated inputs — the durable
 `semantic-patch-v1` payload and the cross-cutting contracts of the state that
 patch was bound to — from the coder records themselves, so an interruption

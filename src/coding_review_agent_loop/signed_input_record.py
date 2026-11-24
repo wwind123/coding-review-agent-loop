@@ -1,12 +1,18 @@
-"""The signed-input supersession record payload (#2054).
+"""Legacy reader for the signed-input supersession record payload (#2054).
 
 A tool-owned Orchestrator summary with phase ``signed-input-supersession``
-closes an unreconciled PR round whose published reviews were rejected only
-because the signed requirement set grew since publication.  The payload is
-audit data: the round, head, superseded reviewer records, the old and new
-surfaced requirement IDs and the item-number high-water mark.  It is decoded
-strictly; a malformed payload decodes as ``None`` and the record then never
-closes a round, so the existing partial-round refusal keeps applying.
+closed an unreconciled PR round whose published reviews were rejected only
+because the signed requirement set grew since publication.  Since #2064 no
+code path writes this record: the closed-incomplete round record replaced it.
+Existing records are still read as "round closed" for one release window.
+
+LEGACY: remove this reader (and the round-metadata field) after one release
+window (#2064).
+
+The payload is audit data: the round, head, superseded reviewer records, the
+old and new surfaced requirement IDs and the item-number high-water mark.  It
+is decoded strictly; a malformed payload decodes as ``None`` and the record
+then never closes a round.
 """
 
 from __future__ import annotations

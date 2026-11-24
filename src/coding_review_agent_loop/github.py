@@ -79,7 +79,6 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from . import github_retry
-from .publication_resume import PreparedPublication, RoundPublication
 from .review_spool import ReviewRoundSpool
 from .github_retry import (
     DEFAULT_POLICY,
@@ -3088,69 +3087,50 @@ def verify_human_requirement_authors(
     return deduplicate_human_requirements(admitted)
 
 
+class RoundPublication:
+    """Publication hook for one spooled reviewer's round comment (#1258, #2064).
+
+    Just before the first body is posted, the reviewer's spool record is marked
+    as begun.  A rerun never resumes a begun publication: the reviewer is
+    unreplayable, so its round closes as incomplete and review continues in
+    the next round.  Nothing is frozen, listed or re-posted.
+    """
+
+    def __init__(self, spool: ReviewRoundSpool, reviewer_name: str) -> None:
+        self.spool = spool
+        self.reviewer_name = reviewer_name
+
+    def prepare(self, bodies: Sequence[object]) -> None:
+        state = self.spool.publication_state(self.reviewer_name)
+        if state == "absent":
+            return
+        if state not in {"fresh", "legacy"}:
+            from .round_closure_writer import round_incomplete_signal
+
+            # Defensive: the launcher closes the round before replaying a
+            # begun or malformed record, so this is never reached.
+            raise round_incomplete_signal(
+                surface=self.spool.surface, number=self.spool.number,
+                round_number=self.spool.round_number, published=(self.reviewer_name,),
+                unreplayable=((self.reviewer_name, "its same-round publication already began"),),
+            )
+        self.spool.mark_publication_began(self.reviewer_name)
+
+
 def _apply_publication(
     publication: RoundPublication | None,
     config: AgentLoopConfig,
     bodies: Sequence[object],
-) -> tuple[Sequence[object], frozenset[int]]:
-    """Freeze the composed bodies or substitute the frozen ones (#1258)."""
+) -> None:
+    """Mark the spooled publication as begun before the first post (#1258)."""
     if publication is None or config.dry_run:
-        return bodies, frozenset()
-    prepared = publication.prepare(bodies)
-    return prepared.bodies, prepared.already_public
+        return
+    publication.prepare(bodies)
 
 
-def round_publication(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    spool: ReviewRoundSpool,
-    reviewer_name: str,
-    flow: str,
-    round_number: int,
-    subject: str,
-    surface_kind: str,
-    number: int,
-    validation_context: str,
-) -> RoundPublication:
-    """Build the freeze/resume hook for one spooled reviewer's round comment."""
-    surface = comment_thread_surface(surface_kind, number)
-    return RoundPublication(
-        spool=spool,
-        reviewer_name=reviewer_name,
-        flow=flow,
-        round_number=round_number,
-        subject=subject,
-        validation_context=validation_context,
-        surface=surface,
-        resolve_actor=lambda: resolve_authenticated_github_actor(runner, config=config),
-        list_comments=lambda actor: read_complete_comment_listing(
-            runner, config=config, surface=surface, actor=actor
-        ),
-        config=config,
-    )
-
-
-def post_frozen_round_bodies(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    surface_kind: str,
-    number: int,
-    plan: "PreparedPublication",
-) -> int:
-    """Post exactly the frozen bodies not yet public, in order; return how many."""
-    command = [PR_THREAD_SURFACE if surface_kind == PR_THREAD_SURFACE else "issue", "comment", str(number)]
-    claimed: set[int] = set()
-    posted = 0
-    for index, body in enumerate(plan.bodies, start=1):
-        if index in plan.already_public:
-            continue
-        _post_comment_body(
-            runner, config=config, command=command, body=body, claimed=claimed, body_index=index
-        )
-        posted += 1
-    return posted
+def round_publication(*, spool: ReviewRoundSpool, reviewer_name: str) -> RoundPublication:
+    """Build the publication hook for one spooled reviewer's round comment."""
+    return RoundPublication(spool, reviewer_name)
 
 
 def post_pr_comment(
@@ -3169,10 +3149,8 @@ def post_pr_comment(
     claimed: set[int] = set()
     for prepared in bodies:
         prepared.validate_for_surface(PR_COMMENT_SURFACE)
-    outgoing, already_public = _apply_publication(publication, config, bodies)
-    for index, prepared in enumerate(outgoing, start=1):
-        if index in already_public:
-            continue
+    _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(bodies, start=1):
         _post_comment_body(
             runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared,
             claimed=claimed, body_index=index,
@@ -3195,10 +3173,8 @@ def post_issue_comment(
     claimed: set[int] = set()
     for prepared in bodies:
         prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
-    outgoing, already_public = _apply_publication(publication, config, bodies)
-    for index, prepared in enumerate(outgoing, start=1):
-        if index in already_public:
-            continue
+    _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(bodies, start=1):
         _post_comment_body(
             runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared,
             claimed=claimed, body_index=index,

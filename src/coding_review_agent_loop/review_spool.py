@@ -25,6 +25,7 @@ locations hold the round, the spool fails closed.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -41,9 +42,10 @@ from .scratch import make_private_dirs, mkdir_private
 SPOOL_SCHEMA_VERSION = 1
 
 # Written into every record stored from #1258 on.  A record carrying it and no
-# publication carrier provably never began publishing, because the carrier is
-# always persisted before the first post; a record without it is legacy, with
-# unknown publication progress.
+# publication mark provably never began publishing, because the mark is always
+# persisted before the first post; a record without it is legacy, with unknown
+# publication progress.  A publication that began is never resumed: the
+# reviewer is unreplayable and its round closes as incomplete (#2064).
 CARRIER_PROTOCOL = 1
 
 # ValidatedAgentResponse fields that are persisted verbatim.  Usage metadata is
@@ -122,7 +124,7 @@ class ReviewRoundSpool:
     def _migrate_legacy(self, directory: Path) -> None:
         """Move this round's legacy directory into ``root``; fail closed on conflict.
 
-        A legacy record may be a frozen publication carrier, so it is never
+        A legacy record may mark a begun publication, so it is never
         ignored: both locations present, or a failed rename, raises instead
         of falling back to a fresh reviewer turn (#1258 semantics).
         """
@@ -159,37 +161,42 @@ class ReviewRoundSpool:
             },
         )
 
-    def store_publication(self, reviewer_name: str, carrier: dict[str, object]) -> None:
-        """Atomically add a frozen publication carrier to a reviewer's response record.
+    def mark_publication_began(self, reviewer_name: str) -> None:
+        """Atomically record that this reviewer's publication is about to begin.
 
-        Everything else in the record is preserved.  Raises ``ValueError`` when
-        there is no readable response record to attach the carrier to.
+        Everything else in the record is preserved.  A record with the mark may
+        be partly public, so it is never replayed again: the round closes as
+        incomplete instead (#2064).  Raises ``ValueError`` when there is no
+        readable response record to mark.
         """
         payload = self._read_payload(reviewer_name)
         if payload is None or not isinstance(payload.get("response"), dict):
-            raise ValueError(f"No spooled response record for {reviewer_name} to freeze.")
-        payload = {**payload, "carrier_protocol": CARRIER_PROTOCOL, "publication": carrier}
+            raise ValueError(f"No spooled response record for {reviewer_name} to mark.")
+        began_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        payload = {**payload, "carrier_protocol": CARRIER_PROTOCOL, "publication": {"began_at": began_at}}
         self._replace(reviewer_name, payload)
 
-    def publication_state(self, reviewer_name: str) -> tuple[str, dict[str, object] | None]:
+    def publication_state(self, reviewer_name: str) -> str:
         """Classify a record's publication progress.
 
         ``absent``: no record that belongs to this reviewer and round.
-        ``legacy``: a readable response record written before the carrier
-        protocol.  ``fresh``: a protocol record whose carrier was never frozen.
-        ``carrier``: a frozen carrier (returned).  ``malformed``: a record that
-        has a ``publication`` field of any kind (including ``null``) but is not
-        a readable protocol response record with a mapping carrier.  Carrier
-        presence is detected independently of response readability, so an
-        unreadable response can never hide earlier publication.
+        ``legacy``: a readable response record written before the publication
+        protocol, with unknown progress.  ``fresh``: a protocol record whose
+        publication never began.  ``began``: a record whose publication began
+        (including a pre-#2064 frozen carrier), so it may be partly public.
+        ``malformed``: a record that has a ``publication`` field of any kind
+        (including ``null``) but is not a readable protocol response record
+        with a mapping mark.  Publication state is detected independently of
+        response readability, so an unreadable response can never hide
+        earlier publication.
         """
         if not self._path(reviewer_name).exists():
-            return "absent", None
+            return "absent"
         payload = self._read_payload(reviewer_name)
         if payload is None:
             # The file exists but cannot be decoded into a mapping: it may hide a
-            # frozen publication carrier, so it is never treated as absent.
-            return "malformed", None
+            # begun publication, so it is never treated as absent.
+            return "malformed"
         if (
             payload.get("schema_version") != SPOOL_SCHEMA_VERSION
             or any(payload.get(key) != value for key, value in self._identity().items())
@@ -199,29 +206,22 @@ class ReviewRoundSpool:
             # with a damaged schema or identity is not "foreign": when it still
             # carries publication state it may hide a published prefix.
             if "publication" in payload or "carrier_protocol" in payload:
-                return "malformed", None
-            return "absent", None
+                return "malformed"
+            return "absent"
         if "publication" in payload:
-            publication = payload.get("publication")
             if (
-                not isinstance(publication, dict)
+                not isinstance(payload.get("publication"), dict)
                 or payload.get("carrier_protocol") != CARRIER_PROTOCOL
                 or self.load(reviewer_name) is None
                 or "response" not in payload
             ):
-                return "malformed", None
-            return "carrier", publication
+                return "malformed"
+            return "began"
         if self.load(reviewer_name) is None or "response" not in payload:
-            return "absent", None
+            return "absent"
         if payload.get("carrier_protocol") == CARRIER_PROTOCOL:
-            return "fresh", None
-        return "legacy", None
-
-    def record_mtime(self, reviewer_name: str) -> float | None:
-        try:
-            return self._path(reviewer_name).stat().st_mtime
-        except OSError:
-            return None
+            return "fresh"
+        return "legacy"
 
     def store_failure(self, reviewer_name: str, *, message: str, failure_category: str | None) -> None:
         """Atomically persist a failure that settled the reviewer as unavailable."""
