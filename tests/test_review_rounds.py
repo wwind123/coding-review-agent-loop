@@ -864,3 +864,33 @@ def test_shared_plan_reconstruction_uses_the_legacy_fallback_and_mints_every_lis
     assert output == legacy and parsed.state == "blocking"
     minted = mint_plan_review_items(parsed, round_number=2, next_item_number=3, prior_items=())
     assert [(i.item_id, i.status, i.text) for i in minted] == [("item-3", "blocking", "Add a migration step.")]
+
+
+def test_no_caller_unpacks_the_spool_publication_state_string():
+    """``ReviewRoundSpool.publication_state`` returns a plain string since #2081.
+
+    Every source caller must consume it as one value; a tuple unpack (the
+    pre-#2081 ``(state, carrier)`` shape) would raise at runtime.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(review_rounds.__file__).parent
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "publication_state"):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, (ast.Tuple, ast.List)) for target in targets):
+                offenders.append(f"{path.name}:{node.lineno}")
+    callers = [
+        path.name for path in sorted(src.rglob("*.py"))
+        if ".publication_state(" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
+    assert "pr_loop.py" in callers  # the seat-reconfiguration caller is scanned

@@ -765,3 +765,41 @@ def test_partly_public_publication_rolls_the_round_over_without_posting_its_suff
     unreplayable = {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
     assert "Codex" in unreplayable and "began" in unreplayable["Codex"]
     _no_deletion_advice(runner)
+
+
+@pytest.mark.parametrize("state", ["fresh", "began"])
+def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path, state):
+    """A spooled response saved under another seat binding (#2081 review item-1).
+
+    ``publication_state`` returns a plain string since #2081.  A never-published
+    (fresh) response is discarded and the reviewer reviews under the new binding;
+    a begun publication still refuses recovery.  Neither path may crash on the
+    return type.
+    """
+    from agent_loop_helpers import FakeRunner
+
+    old = {"version": 1, "seats": [{"seat": "codex", "model": "old-model"}]}
+    new = {"version": 1, "seats": [{"seat": "codex", "model": "new-model"}]}
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(summary="Codex reviews under the new seat.")],
+        gemini_outputs=[structured_pr_review(summary="Gemini approves.", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+                         pr_seat_binding_override=new)
+    spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
+    spool.store("Codex", {"text": structured_pr_review(summary="Stale under the old seat."),
+                          "seat_binding": old})
+    if state == "began":
+        spool.mark_publication_began("Codex")
+    assert spool.publication_state("Codex") == state
+
+    if state == "fresh":
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert spool.publication_state("Codex") == "absent"
+        assert "codex" in [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
+        assert not any("Stale under the old seat." in body for body in runner.comments)
+    else:
+        with pytest.raises(AgentLoopError, match="under another seat binding; refusing recovery"):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert spool.publication_state("Codex") == "began"
+        assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["gemini"])]
