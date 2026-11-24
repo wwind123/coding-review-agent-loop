@@ -17,11 +17,14 @@ import json
 import pytest
 
 import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_loop
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.failed_seats import (
     failed_seat_continuation_allowed,
     force_select_failed_seats,
+    pending_failed_seat_retries,
 )
 from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
@@ -46,7 +49,9 @@ from coding_review_agent_loop.unresolved_items import (
     _apply_unresolved_item_dispositions,
     preserve_failed_seat_items,
 )
+from pr_loop_test_helpers import _EVIDENCE_TEXT, _evidence_review, _release_records, _signed
 from agent_loop_helpers import (
+    patch_attr_in,
     FakeRunner,
     make_config,
     structured_coder_followup,
@@ -339,6 +344,96 @@ def test_pr_resume_after_continued_round_keeps_frozen_item(tmp_path):
     assert not _merged(runner)
 
 
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
+def test_pr_carried_blocker_without_new_finding_continues(tmp_path, parallel):
+    """Rows pr-parallel-block-plus-rejected / pr-sequential-block-plus-rejected:
+    the healthy seat raises no new finding and only keeps its carried item blocking."""
+    codex, claude, gemini = _round_one_both_block()
+    codex.append(structured_pr_review(state="blocking", reviewer=CODEX, prior_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": "The retry path still lacks the guard; add it and a test."},
+        {"item_id": "item-2", "disposition": "resolved"},
+    ]))
+    runner = FakeRunner(codex_outputs=codex, claude_outputs=claude, gemini_outputs=gemini)
+    config = make_config(tmp_path, coder="gemini", reviewer=("codex", "claude"), max_rounds=3, review_parallel=parallel)
+
+    # The round-2 coder turn has no scripted answer: reaching it proves continuation.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    records = _pr_records(runner)
+    assert _reconciliation(records, 2).failed_reviewer_seats == ("Claude",)
+    dispatch = next(r for r in records if r.phase == "coder-dispatch" and r.round_number == 3)
+    ledger = {item.item_id: item for item in dispatch.prior_items}
+    assert ledger["item-1"].status == "blocking" and ledger["item-2"].status == "blocking"
+    assert ledger["item-2"].reviewer == "Claude"
+    assert len(_calls(runner, "gemini")) == 2
+
+
+def test_pr_evidence_pass_with_failed_seat_keeps_the_stop(tmp_path):
+    """Row pr-guards-keep-stop (evidence pass): a blocker plus a failed seat stops before any terminal record."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer=GEMINI)],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-2"])],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3)
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)  # one clean round ends in a freeze
+
+    runner.pr_payload["comments"].append(_signed("Live suite at this head: 10 passed, 1 failed.", 1))
+    runner.codex_outputs.append(_evidence_review(
+        state="blocking", blocking=["The submodule gate is bypassable, as the signed run shows."],
+        dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "Rerun the suite at the fix head."}],
+        hr=True,
+    ))
+    # Gemini has no scripted answer for the evidence pass: it fails deterministically.
+    before = len(_pr_records(runner))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    pass_records = _pr_records(runner)[before:]
+    assert _calls(runner, "claude") == []  # no coder dispatch
+    assert _release_records(runner) == []  # no evidence terminal record
+    assert not any(r.failed_reviewer_seats for r in pass_records)
+    assert not any("continues to the coder" in body for body in runner.comments)
+    assert not _merged(runner)
+
+
+def test_pr_restart_reconstructs_a_pending_failed_seat_retry(tmp_path, monkeypatch):
+    """Row pr-block-plus-unavailable-retry (restart): a selective scheduler still force-selects the failed seat."""
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
+                  lambda *a, **k: TransitionClassification("narrow", "scoped fix"))
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="blocking", reviewer=CODEX,
+                                            blocking_items=[{"text": "cleanup gap", "fix_scope": ["src/worker.py"]}])],
+        gemini_outputs=[structured_pr_review(state="approved", reviewer=GEMINI)],
+        antigravity_outputs=[],  # Antigravity fails in round 1 and owns no item
+        claude_outputs=[],  # the coder turn is interrupted
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate", max_rounds=4,
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _reconciliation(_pr_records(runner), 1).failed_reviewer_seats == ("Antigravity",)
+
+    # A fresh process has no in-memory retry set: it is rebuilt from the record.
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    runner.codex_outputs.append(structured_pr_review(
+        state="approved", reviewer=CODEX, prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}]))
+    runner.antigravity_outputs.append(structured_pr_review(
+        state="approved", reviewer="Antigravity", prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prelaunch = next(r for r in _pr_records(runner) if r.round_number == 2 and r.phase == "scheduler-prelaunch")
+    assert "Antigravity" in prelaunch.scheduler_selected_reviewers
+    assert any("failed seat re-invoked after a continued round: Antigravity" in reason
+               for reason in prelaunch.scheduler_reasons)
+
+
 # ---------------------------------------------------------------------------
 # Plan loop
 # ---------------------------------------------------------------------------
@@ -412,6 +507,27 @@ def test_plan_blocker_plus_failed_seat_continues_with_frozen_items(tmp_path, par
     _assert_gemini_plan_item_frozen(runner)
 
 
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
+def test_plan_carried_blocker_without_new_finding_continues(tmp_path, parallel):
+    """Row plan-block-plus-failed: the healthy seat only keeps its carried item blocking."""
+    claude, codex, gemini = _plan_round_one()
+    codex.append(structured_plan_review(state="blocking", reviewer=CODEX, prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": "The rollout step still lacks an owner; name one."},
+        {"item_id": "item-2", "disposition": "resolved"},
+    ]))
+    runner = FakeRunner(claude_outputs=claude, codex_outputs=codex, gemini_outputs=gemini)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=4, review_parallel=parallel)
+
+    # The planner's second revision has no scripted answer: reaching it proves continuation.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(_calls(runner, "claude")) == 3
+    reconciliation = _reconciliation(_plan_records(runner), 2)
+    assert reconciliation.failed_reviewer_seats == ("Gemini",)
+    assert "item-2" not in {d.item_id for d in reconciliation.dispositions}
+
+
 @pytest.mark.parametrize("order", [("gemini", "codex"), ("codex", "gemini")], ids=["incomplete-first", "incomplete-last"])
 def test_plan_sequential_incomplete_review_in_either_order(tmp_path, order):
     """Row plan-sequential-incomplete-both-orders."""
@@ -446,7 +562,13 @@ def test_plan_sequential_incomplete_review_in_either_order(tmp_path, order):
 
 @pytest.mark.parametrize("case", ["other-approves", "single-reviewer"])
 def test_plan_incomplete_review_without_a_healthy_blocker_still_stops(tmp_path, case):
-    """Row plan-sequential-incomplete-both-orders (stop half)."""
+    """Rows plan-sequential-incomplete-both-orders (stop half) and plan-sequential-reconciliation-record.
+
+    With another seat approving, the stop is kept but the sequential round
+    still posts a reconciliation record naming the failed seat. A rerun then
+    re-invokes only that seat in the same round (no rollover, no fresh turn
+    for the approver) and posts a fresh record for the retried settlement.
+    """
     incomplete = structured_plan_review(
         state="blocking", reviewer=GEMINI,
         summary="Review incomplete; unable to verify the retry path without further inspection.",
@@ -463,8 +585,21 @@ def test_plan_incomplete_review_without_a_healthy_blocker_still_stops(tmp_path, 
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert len(_calls(runner, "claude")) == 1
-    # No durable failed-seat record is invented on the stop path.
-    assert not any(r.failed_reviewer_seats for r in _plan_records(runner))
+    reconciliations = [r for r in _plan_records(runner) if r.phase == "reconciliation"]
+    if case == "single-reviewer":
+        # A single-seat board raises at once, exactly as before.
+        assert reconciliations == []
+        return
+    assert [r.failed_reviewer_seats for r in reconciliations] == [("Gemini",)]
+    assert not any("continues to the planner revision" in body for body in runner.comments)
+
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer=GEMINI))
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"claude", "codex", "gemini"}]
+    assert rerun_agents == ["gemini"]
+    latest = [r for r in _plan_records(runner) if r.phase == "reconciliation" and r.round_number == 1][-1]
+    assert latest.failed_reviewer_seats == ()
 
 
 @pytest.mark.parametrize("case", ["other-approves", "single-reviewer", "quota-reset"])
@@ -502,6 +637,38 @@ def test_plan_sequential_round_without_failures_posts_no_reconciliation_record(t
     config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3, review_parallel=False)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert not [r for r in _plan_records(runner) if r.phase == "reconciliation"]
+
+
+def test_plan_sequential_resume_retries_the_failed_seat_in_the_same_round(tmp_path):
+    """Row pr-resume-after-continued-round (plan, sequential): interrupted before the planner record."""
+    claude, codex, gemini = _plan_round_one()
+    codex.append(_codex_plan_blocks_and_clears_gemini())
+    runner = FakeRunner(claude_outputs=claude, codex_outputs=codex, gemini_outputs=gemini)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=False)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _reconciliation(_plan_records(runner), 2).failed_reviewer_seats == ("Gemini",)
+
+    # Gemini fails again on the rerun; the planner revision now has an answer.
+    runner.claude_outputs.append(structured_plan_revision(summary="Second revision.", prior_plan_item_dispositions=[
+        {"item_id": "item-2", "disposition": "resolved"},
+        {"item_id": "item-3", "disposition": "resolved"},
+    ]))
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    records = _plan_records(runner)
+    rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"claude", "codex", "gemini"}]
+    # Round 2 is retried for Gemini only (Codex's review is resumed), then
+    # the planner revision runs and round 3 starts.
+    assert rerun_agents[:2] == ["gemini", "claude"]
+    planner = next(r for r in records if r.role == "coder" and r.round_number == 3)
+    ledger = {item.item_id: item for item in planner.prior_items}
+    assert ledger["item-2"].status == "blocking" and ledger["item-2"].reviewer == "Gemini"
+    assert "item-1" not in ledger and "item-3" in ledger
+    assert len([i for i in planner.prior_items if i.item_id == "item-3"]) == 1
+    assert not any(r.agent == "Gemini" and r.state == "approved" for r in records if r.role == "reviewer")
 
 
 def test_plan_resume_after_continued_round_keeps_frozen_item(tmp_path):
@@ -603,6 +770,18 @@ def test_selective_policy_force_selects_a_failed_seat_next_round():
     assert forced.paused_reviewers == ()
     assert "failed seat re-invoked" in forced.reason
     assert force_select_failed_seats(decision, set(), ("Codex", "Claude")) is decision
+
+
+def test_pending_failed_seat_retries_follow_the_latest_reconciliation():
+    def record(index, role, agent, seats=()):
+        return PostedRoundRecord(index=index, body="", metadata=PostedRoundMetadata(
+            flow="pr", role=role, agent=agent, round_number=1, subject="abc",
+            phase="reconciliation" if role == "summary" else "publication", failed_reviewer_seats=seats))
+    failed = record(1, "summary", "Orchestrator", ("Claude", "Gemini"))
+    assert pending_failed_seat_retries([failed]) == {"Claude", "Gemini"}
+    assert pending_failed_seat_retries([failed, record(2, "reviewer", "Claude")]) == {"Gemini"}
+    assert pending_failed_seat_retries([failed, record(2, "summary", "Orchestrator")]) == frozenset()
+    assert pending_failed_seat_retries([]) == frozenset()
 
 
 def test_failed_reviewer_seats_round_trips_bounded_and_defaults_empty():

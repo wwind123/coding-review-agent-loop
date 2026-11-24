@@ -485,16 +485,18 @@ from .native_evidence import _append_recorded_evidence_requests
 
 
 def _round_failed_seats(records: Sequence[round_metadata.PostedRoundRecord]) -> tuple[str, ...]:
-    """Failed seats named by the round's reconciliation summaries (#2129).
+    """Failed seats named by the round's latest reconciliation summary (#2129).
 
-    Legacy reconciliation records, and rounds without one, yield ``()``.
+    A plan round retried for its failed seats posts a fresh reconciliation
+    record, which supersedes the earlier one.  Legacy reconciliation records,
+    and rounds without one, yield ``()``.
     """
-    seats: list[str] = []
-    for record in records:
+    latest = None
+    for record in records:  # callers pass records in history order
         metadata = record.metadata
         if metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata):
-            seats.extend(seat for seat in metadata.failed_reviewer_seats if seat not in seats)
-    return tuple(seats)
+            latest = metadata
+    return tuple(latest.failed_reviewer_seats) if latest is not None else ()
 
 
 def _aggregate_record_dispositions(

@@ -126,8 +126,10 @@ def peer_blocked_settlement(
 
     Failed seats settle in the round (instead of withholding the healthy
     peers' outcomes for an independent rerun) only when continuation is
-    allowed and a healthy peer returned a blocking review with actionable
-    content.  ``retry_types`` (for example settings-lock waits) always keep
+    allowed and a healthy peer returned a completed blocking review (``blocks``
+    mirrors ordinary settlement: new findings, a carried item kept blocking,
+    or a substantive blocking summary all count; an incomplete review does
+    not).  ``retry_types`` (for example settings-lock waits) always keep
     the withheld rerun.
     """
 
@@ -152,3 +154,49 @@ def peer_blocked_settlement(
         )
 
     return settle
+
+
+def plan_round_retries_failed_seats(current_resume, *, round_reviewers, resumed, records, subject) -> bool:
+    """Whether a reconciled plan round is retried for its recorded failed seats.
+
+    True when the resumed round is reconciled, some round reviewer has no
+    resumed review, and every such reviewer is a failed seat named by the
+    round's latest reconciliation record.  ``records`` is called lazily.
+    """
+    if current_resume is None or not current_resume.reconciled:
+        return False
+    missing = {name for name in round_reviewers if name not in resumed}
+    if not missing:
+        return False
+    from .round_state import _round_failed_seats
+
+    failed = _round_failed_seats([
+        record for record in records()
+        if record.metadata.round_number == current_resume.round_number
+        and record.metadata.subject == subject
+    ])
+    return missing <= set(failed)
+
+
+def pending_failed_seat_retries(records) -> frozenset[str]:
+    """Failed seats still owed a retry, reconstructed from durable records.
+
+    The latest PR reconciliation summary names the seats that failed in its
+    round.  A named seat is still pending until it publishes a reviewer
+    record after that summary, so a restart (or a closed-round rollover)
+    keeps force-selecting it under selective policies.  Selecting an extra
+    reviewer is always safe, so this hint never removes a seat.
+    """
+    records = list(records)  # history order
+    latest = None
+    for position, record in enumerate(records):
+        metadata = record.metadata
+        if metadata.role == "summary" and metadata.phase == "reconciliation":
+            latest = position
+    if latest is None or not records[latest].metadata.failed_reviewer_seats:
+        return frozenset()
+    reviewed_after = {
+        record.metadata.agent for record in records[latest + 1:]
+        if record.metadata.role == "reviewer"
+    }
+    return frozenset(seat for seat in records[latest].metadata.failed_reviewer_seats if seat not in reviewed_after)

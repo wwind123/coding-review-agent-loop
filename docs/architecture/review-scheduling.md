@@ -457,8 +457,9 @@ coder (PR) or planner revision (plan). The shared rule lives in
   settled ledger and the round's reconciliation record, which therefore agree.
 - **Durable record.** The round's reconciliation record names the failed seats
   in the bounded `failed_reviewer_seats` metadata field and the comment lists
-  each seat's failure category and frozen items. A continued sequential round
-  (PR or plan) now posts that record too. Resume, history replay and the
+  each seat's failure category and frozen items. A continued sequential PR
+  round posts that record too, and a sequential plan round posts it whenever
+  a seat failed, including on the stop path. Resume, history replay and the
   board-change carry-over apply the same freeze from that field (see
   [Round state and resume](round-state-and-resume.md)).
 - **Never approving.** A failed seat never enters an approval set; the
@@ -467,18 +468,26 @@ coder (PR) or planner revision (plan). The shared rule lives in
   the carried-panel no-dispatch shortcut and the migration re-probe.
 - **Invoked again.** The seat is not quarantined for the run: the next round
   invokes it again, and a selective (PR or staged plan) scheduler force-selects
-  it with a logged reason.
+  it with a logged reason. A PR restart rebuilds the pending retry from the
+  latest reconciliation record until the seat publishes a review.
+- **Plan resume.** A rerun of a reconciled sequential plan round whose only
+  missing reviews are the recorded failed seats re-invokes those seats in the
+  same round, resumes the healthy reviews and posts a fresh reconciliation
+  record; the latest record of a round is the one recovery reads. Parallel
+  rounds keep the reviewer-only rollover, because a same-round retry would let
+  the failed seat read its peers' published verdicts.
 - **Parallel independence.** A parallel round normally withholds healthy
   peers' outcomes until a failed seat completes an independent rerun. When a
-  healthy peer returned an actionable blocking review and continuation is
-  allowed, the failure settles in the round instead; settings-lock waits keep
-  the withheld rerun.
+  healthy peer returned a completed blocking review (a new finding, a carried
+  item kept blocking, or a substantive summary) and continuation is allowed,
+  the failure settles in the round instead; settings-lock waits keep the
+  withheld rerun.
 - **Stop kept.** The existing error, message and incomplete-review comment
   are unchanged for single-reviewer boards, when no healthy seat blocked (every
   other seat approved), for quota-reset errors, in evidence passes, in the
   final allowed round, and when settlement leaves no must-fix item. A
-  sequential round that stops keeps today's shape and posts no reconciliation
-  record, so its resume is unchanged.
+  sequential PR round that stops keeps today's shape and posts no
+  reconciliation record.
 
 ## Completely approved resume
 

@@ -148,7 +148,7 @@ from .comment_rendering import (
     render_canonical_plan_state,
 )
 from .config import phased_delivery_guard_active
-from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement, plan_round_retries_failed_seats
 from .round_metadata import (
     bound_failed_reviewer_seats,
     reset_plan_board_stamp,
@@ -2665,7 +2665,18 @@ def _run_plan_first_loop_body(
         # Reuse existing obligations; publish no approvals for a known-invalid plan.
         if ownership_review_failure is not None:
             round_reviewers = tuple(r for r in configured_reviewers if agent_display_name(r) in resumed_by_name)
-        if ownership_review_failure is None and not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and any(
+        # A sequential round whose reconciliation record names failed seats
+        # (#2129) is not rolled over when only those seats are missing: the
+        # rerun re-invokes them in the same round, resumes the healthy reviews,
+        # and posts a fresh reconciliation record for the retried settlement.
+        # Parallel rounds keep the rollover: a same-round retry would let the
+        # failed seat read its peers' published verdicts.
+        plan_failed_seat_retry = not config.review_parallel and plan_round_retries_failed_seats(
+            current_resume, round_reviewers=[agent_display_name(r) for r in round_reviewers],
+            resumed=resumed_by_name, records=lambda: plan_history_records(),
+            subject=current_plan_subject,
+        )
+        if ownership_review_failure is None and not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and not plan_failed_seat_retry and any(
             agent_display_name(reviewer) not in resumed_by_name
             for reviewer in round_reviewers
         ):
@@ -3282,7 +3293,7 @@ def _run_plan_first_loop_body(
                     retry_bound=_plan_retry_bound,
                     settle_failures=peer_blocked_settlement(
                         parse=_plan_publication_parsed, name=agent_display_name,
-                        blocks=lambda p: p.state == "blocking" and bool(p.items.blocking or p.items.same_plan),
+                        blocks=lambda p: p.state == "blocking" and not _is_incomplete_plan_review(p),
                         configured_reviewer_count=len(round_reviewers), round_number=round_number,
                         allowed_rounds=plan_round_limit),
                     max_workers=None if config.review_parallel else 1,
@@ -3525,7 +3536,12 @@ def _run_plan_first_loop_body(
                         new_items=tuple(reviewer_new_unresolved_items),
                     )
             else:
-                round_new_unresolved_items.extend(reviewer_new_unresolved_items)
+                # A reconciled round already restored its settled new items; a
+                # failed-seat retry (#2129) resumes the same reviews again.
+                known_new_ids = {item.item_id for item in round_new_unresolved_items}
+                round_new_unresolved_items.extend(
+                    item for item in reviewer_new_unresolved_items if item.item_id not in known_new_ids
+                )
 
         if plan_baseline_records is not None:
             # Live measurement of drip-fed findings (#1505), one line per reviewer.
@@ -3552,6 +3568,35 @@ def _run_plan_first_loop_body(
         same_model_note = same_model_panel_note(round_review_models)
         if same_model_note is not None:
             log(config, f"Planning round {round_number}: {same_model_note}")
+        if staged_planning and current_resume is not None:
+            # A reviewer paused on its carried exact-plan approval is not
+            # re-run, but its completed review of this very round still
+            # dispositioned the carried items: a restart of a completed round
+            # applies them instead of reopening the plan (#1377).  Collected before
+            # the failed-seat freeze below, so the settled ledger and the
+            # reconciliation record share one filtered map (#2129).
+            reviewed_this_round = {
+                name for name, _output in (*approved_review_outputs, *blocking_reviews)
+            }
+            for record in current_resume.completed_reviews:
+                metadata = record.metadata
+                if (
+                    metadata.agent in reviewed_this_round
+                    or metadata.agent not in plan_qualifying_approvals
+                    or metadata.state != "approved"
+                    or metadata.subject != current_plan_subject
+                ):
+                    continue
+                for disposition in metadata.dispositions:
+                    _record_prior_item_disposition(
+                        prior_dispositions,
+                        disposition,
+                        flow="plan",
+                        round_number=round_number,
+                        subject=current_plan_subject,
+                        reviewer_name=metadata.agent,
+                    )
+
         # Failed seats (#2129): freeze their carried items against every healthy
         # seat's disposition, live and (via the record) on resume.
         plan_failed_seats = dict(plan_fatal_errors)
@@ -3561,12 +3606,9 @@ def _run_plan_first_loop_body(
             configured_reviewer_count=len(round_reviewers),
             blocking_seats=[name for name, _output in blocking_reviews], failed_seats=plan_failed_seats,
             failures=plan_failed_seats.values(), round_number=round_number, allowed_rounds=plan_round_limit)
-        if plan_fatal_errors and not plan_round_parallel and not plan_continuation_allowed:
-            # A sequential stop keeps today's shape: no reconciliation record.
-            raise next((e for _n, e in plan_fatal_errors if isinstance(e, QuotaResetExceededError)), plan_fatal_errors[0][1])
         if (
-            plan_round_parallel or same_model_note is not None or plan_continuation_allowed
-        ) and not (current_resume is not None and current_resume.reconciled):
+            plan_round_parallel or same_model_note is not None or plan_failed_seats or plan_failed_seat_retry
+        ) and not (current_resume is not None and current_resume.reconciled and not plan_failed_seat_retry):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
@@ -3603,33 +3645,6 @@ def _run_plan_first_loop_body(
                 if isinstance(error, QuotaResetExceededError):
                     raise error
             raise plan_fatal_errors[0][1]
-
-        if staged_planning and current_resume is not None:
-            # A reviewer paused on its carried exact-plan approval is not
-            # re-run, but its completed review of this very round still
-            # dispositioned the carried items: a restart of a completed round
-            # applies them instead of reopening the plan (#1377).
-            reviewed_this_round = {
-                name for name, _output in (*approved_review_outputs, *blocking_reviews)
-            }
-            for record in current_resume.completed_reviews:
-                metadata = record.metadata
-                if (
-                    metadata.agent in reviewed_this_round
-                    or metadata.agent not in plan_qualifying_approvals
-                    or metadata.state != "approved"
-                    or metadata.subject != current_plan_subject
-                ):
-                    continue
-                for disposition in metadata.dispositions:
-                    _record_prior_item_disposition(
-                        prior_dispositions,
-                        disposition,
-                        flow="plan",
-                        round_number=round_number,
-                        subject=current_plan_subject,
-                        reviewer_name=metadata.agent,
-                    )
 
         # The round's reviews are in.  Before its outcome creates the next
         # round (a planner revision or a reviewer-only phase advance) or

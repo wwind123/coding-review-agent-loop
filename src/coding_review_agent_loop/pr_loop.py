@@ -87,7 +87,7 @@ from .round_state import (
     startup_force_full_latch,
 )
 from .round_metadata import reset_pr_board_stamp, set_pr_board_stamp, reset_human_checks_stamp, set_human_checks_stamp
-from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, finalization_wording, force_select_failed_seats, peer_blocked_settlement
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, finalization_wording, force_select_failed_seats, peer_blocked_settlement, pending_failed_seat_retries
 from .human_evidence_mode import HUMAN_CHECKS_FLOW, HumanEvidenceRun
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
@@ -4694,7 +4694,7 @@ def run_pr_loop(
                             if name not in selected_reviewer_names
                         ),
                     )
-                elif pr_force_reinvoke_seats:
+                elif pr_force_reinvoke_seats := pr_force_reinvoke_seats | pending_failed_seat_retries(historical_records):
                     scheduler_decision = force_select_failed_seats(
                         scheduler_decision, pr_force_reinvoke_seats, scheduler_contract.required_reviewers)
                     selected_reviewer_names = set(scheduler_decision.selected_reviewers)
@@ -5533,7 +5533,7 @@ def run_pr_loop(
                             retry_bound=_pr_retry_bound,
                             settle_failures=peer_blocked_settlement(
                                 parse=_pr_publication_parsed, name=agent_display_name, retry_types=(AgentSettingsLockWaitTimeout,),
-                                blocks=lambda p: p.state == "blocking" and bool(p.blocking_items or p.followups.same_pr),
+                                blocks=lambda p: p.state == "blocking" and not _is_incomplete_pr_review(p),
                                 configured_reviewer_count=len(configured_reviewers), round_number=round_number,
                                 allowed_rounds=allowed_rounds, evidence_pass=evidence_pass),
                             unresolved_conversion_boundary=pr_conversion_boundary_unresolved, posted_rejection_reasons=posted_rejection_reasons,
