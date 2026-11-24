@@ -200,9 +200,8 @@ ledger uses the ordinary `prior_items` and `new_items` fields. A malformed or
 mis-bound payload, or a reserved obligation number that names a different
 item of the record's own ledger, never closes a round; such a closure-phase
 summary also never counts as a reconciliation, so the round stays open for
-ordinary settlement. Only records admitted by the unchanged author
-authentication are read. `is_round_closure_boundary` is the
-one closure predicate: the new record on either flow, or a legacy PR
+ordinary settlement. Only author-authenticated records are read.
+`is_round_closure_boundary` is the one closure predicate: the new record on either flow, or a legacy PR
 `signed-input-supersession` record, which keeps closing rounds for one release
 window. On the PR flow the record closes round N like a reconciliation with no
 completed reviews; its reviewer records are inert for resume, panel evidence,
@@ -211,23 +210,21 @@ scheduler checkpoint in the round is inert, and the closed-round rollover
 settles the ledger with no dispositions (prior items stay open), appends the
 record's new items and restores its evidence obligations at their reserved
 numbers, so a restart from the record alone rebuilds the same ledger. An
-unrecorded head advance after a closure recovers the same ledger from the
-record rather than from the round's coder record; a validated closure is a
-coherent handoff even when its ledger is empty, so such a push resumes as an
-ordinary fresh review instead of refusing. On the
+unrecorded head advance after a closure recovers the ledger from the record,
+not the round's coder record; a validated closure, even with an empty ledger,
+is a coherent handoff, so the push resumes as a fresh review. On the
 plan flow `plan_round_closure.py` treats the record as settling its round:
 `project_plan_history` drops the round's plan reviews from every projected
 reader (resume, panel evidence, carried approvals, visibility) and
 `select_plan_round_anchor` anchors the ledger at the record; plan approval
 carry still lets a closed plan review supersede that reviewer's earlier
-approval with a non-qualifying entry, exactly as the PR approval reader does
-(its live callers pass raw history, which carry projects itself),
-so resume rolls
-over to round N+1 on the unchanged plan. Published reviews stay on GitHub as
+approval with a non-qualifying entry, as the PR approval reader does (callers
+pass raw history; carry projects it), so resume rolls over to round N+1 on
+the unchanged plan. Published reviews stay on GitHub as
 history and never approve.
 
-Since stage 2 (#2080) `round_closure_writer.py` writes the record on both
-flows. At round start, before any spool preflight, checkpoint or launch,
+Since #2080 `round_closure_writer.py` writes the record on both flows. At
+round start, before any spool preflight, checkpoint or launch,
 `decide_round_closure` closes round N when it holds any publication and any
 configured reviewer needs a fresh round-N turn. A publication is a public
 same-round publication by the shared visibility rule (any scheduler phase, minus
@@ -245,12 +242,14 @@ review with helpers shared with resume and settlement, by published verdict:
 minted IDs are kept, provisional checkpoints are numbered above the high-water
 mark, then evidence obligations; an unreadable response stops retryably. It
 posts before the spool is discarded; the #1553 or reconciled-plan rollover
-continues to N+1, where carried secondary-owned findings are carried
-obligations, and at `--max-rounds` the limit stop follows the record. Former
+continues to N+1. The record is a freshness boundary: every earlier review of
+the flow is history, so the full board reviews again behind the primary gate.
+Carried secondary-owned findings are carried obligations; at `--max-rounds`
+the limit stop after the record names N+1. Former
 refusal sites raise `RoundIncompleteSignal` before any launch; the handler uses
 the same writer (a reconciled round re-enters its rollover; an excluded pass
-stops fail-closed). Read failures and an unadmitted conversion boundary are
-retryable `RoundStateReadError` stops; structural carrier failures close.
+stops fail-closed). Read failures and an unadmitted conversion boundary
+stop retryably (`RoundStateReadError`); structural carrier failures close.
 The refusal and supersession writer never fire; nothing deletes a comment. A
 reconciled round with a blocking pre-panel review keeps its pre-panel stop.
 Stage 3 removes the retained deletion-list, carrier and classification code.

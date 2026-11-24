@@ -4361,7 +4361,8 @@ def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
     seen = []
 
     def extract(comments, *, flow):
-        if any("final-secondary-sweep" in str(getattr(c, "body", "")) for c in comments):
+        # History refreshed after the round-2 closure record (#2064) is undecodable.
+        if any("closed, incomplete" in str(getattr(c, "body", "")) for c in comments):
             seen.append(flow)
             raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
         return real_extract(comments, flow=flow)
@@ -6153,3 +6154,38 @@ def test_read_failure_while_publishing_keeps_outcomes_spooled_and_a_rerun_replay
     assert runner.reviewer_launches == launches_before  # replayed, not re-run
     assert [_published_count(runner, marker) for marker in markers] == [1, 1]
     assert not [r for r in _comment_records(runner, surface="pr", flow="pr") if r.phase == "round-closed-incomplete"]
+
+
+
+@pytest.mark.parametrize("surface", ["pr", "plan"])
+def test_closure_requires_fresh_reviews_from_the_full_board_including_an_earlier_primary(tmp_path, surface):
+    """#2064 item-7: the primary approved in round 1 and the panel partially
+    published in round 2.  After the closure (and a restart, since the closure
+    run stops right after posting the record) the primary's round-1 approval
+    no longer carries: round 3 opens a fresh primary phase and the panel
+    follows, so every configured reviewer reviews again after the closure."""
+    if surface == "pr":
+        runner, config = _panel_pr_runner(), _panel_pr_config(tmp_path)
+        _interrupt_panel_pr_round(runner, config)
+        run = lambda: run_pr_loop(runner, pr_number=77, config=config)
+        flow, records_surface = "pr", "pr"
+    else:
+        runner, config = _panel_plan_runner(), _panel_plan_config(tmp_path)
+        _interrupt_panel_plan_round(runner, config)
+        run = lambda: run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        flow, records_surface = "plan", "issue"
+    for path in _spool_files(config):
+        path.unlink()
+    _run_until_closure(run, surface=records_surface)
+    closure = _closure(runner, surface=records_surface, round_number=2, published=["Gemini"])
+    launches_before = list(runner.reviewer_launches)
+
+    assert run() == 0
+
+    assert sorted(runner.reviewer_launches[len(launches_before):]) == ["agy", "codex", "gemini"]
+    later = [r for r in _records(runner, flow=flow, surface=records_surface) if r.round_number > 2]
+    phases = [r.scheduler_phase for r in later if r.phase == "scheduler-prelaunch"]
+    assert phases[0] == "primary"  # the primary gate is preserved after the closure
+    fresh = {r.agent for r in later if r.role == "reviewer"}
+    assert fresh == {"Codex", "Gemini", "Antigravity"}
+    assert closure.round_number == 2

@@ -240,11 +240,18 @@ def is_round_closure_boundary(metadata: object) -> bool:
     return is_round_closed_incomplete(metadata) or is_supersession_boundary(metadata)
 
 
-def closed_round_reviewer_indexes(records: Sequence[object], *, flow: str) -> frozenset[int]:
-    """Indexes of ``flow`` reviewer records closed by a later boundary of their round.
+def closed_round_reviewer_indexes(records: Sequence[object], *, flow: str, freshness: bool = True) -> frozenset[int]:
+    """Indexes of ``flow`` reviewer records closed by a later closure boundary.
 
     Every reviewer record with the same round number and subject published
-    before the boundary is history only.
+    before the boundary is history only.  A closed-incomplete record (#2064)
+    is also a freshness boundary: round N+1 needs fresh reviews from the full
+    board, so every earlier reviewer record of the flow, from any round, is
+    history only as well and can no longer carry an approval or satisfy the
+    primary gate.  A legacy supersession record closes only its own round.
+    ``freshness=False`` returns only the same-round closure (the no-progress
+    window, which already breaks at a closed round, still observes earlier
+    settled rounds).
     """
     boundaries = [
         (record.index, record.metadata.round_number, record.metadata.subject)  # type: ignore[attr-defined]
@@ -254,16 +261,25 @@ def closed_round_reviewer_indexes(records: Sequence[object], *, flow: str) -> fr
     ]
     if not boundaries:
         return frozenset()
+    boundary = max(
+        (record.index for record in records  # type: ignore[attr-defined]
+         if freshness and record.metadata.flow == flow  # type: ignore[attr-defined]
+         and is_round_closed_incomplete(record.metadata)),  # type: ignore[attr-defined]
+        default=-1,
+    )
     return frozenset(
         record.index  # type: ignore[attr-defined]
         for record in records
         if record.metadata.flow == flow  # type: ignore[attr-defined]
         and record.metadata.role == "reviewer"  # type: ignore[attr-defined]
-        and any(
-            record.index < index  # type: ignore[attr-defined]
-            and record.metadata.round_number == round_number  # type: ignore[attr-defined]
-            and record.metadata.subject == subject  # type: ignore[attr-defined]
-            for index, round_number, subject in boundaries
+        and (
+            record.index < boundary  # type: ignore[attr-defined]
+            or any(
+                record.index < index  # type: ignore[attr-defined]
+                and record.metadata.round_number == round_number  # type: ignore[attr-defined]
+                and record.metadata.subject == subject  # type: ignore[attr-defined]
+                for index, round_number, subject in boundaries
+            )
         )
     )
 

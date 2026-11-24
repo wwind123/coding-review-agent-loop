@@ -440,11 +440,21 @@ def test_budget_exhausted_posts_the_closure_then_the_round_limit_stop(tmp_path, 
 
     (record,) = _closures(runner)
     assert record.metadata.round_number == 1
-    assert str(stop.value).startswith("PR #77") and "round" in str(stop.value)
+    message = str(stop.value)
+    assert message.startswith("PR #77")
+    assert "after round 1" in message  # the existing blocker detail is kept
+    assert "Round 1 was closed incomplete" in message
+    assert "require round 2, beyond --max-rounds" in message
     assert "Delete these" not in str(stop.value)
     assert not _supersessions(runner)
     assert _agent_commands(runner, before) == []
     assert not any("Delete these" in c for c in runner.comments)
+    # A rerun at the same limit resumes the closed round from its record and
+    # stops with the same named round, posting nothing.
+    comments_before = len(runner.comments)
+    with pytest.raises(AgentLoopError, match="require round 2, beyond --max-rounds"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(runner.comments) == comments_before
     # Resuming with a higher limit proceeds in round 2 without a second record.
     assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=3)) == 0
     assert len(_closures(runner)) == 1

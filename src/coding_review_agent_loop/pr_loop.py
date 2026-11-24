@@ -320,7 +320,7 @@ from .review_scheduling import (
 )
 from .partial_round_recovery import RecoveryVisibilityContext
 from .round_closure_writer import (
-    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, decide_round_closure,
+    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, closure_round_limit_note, decide_round_closure,
     excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
 )
 from .round_visibility import (
@@ -3129,6 +3129,7 @@ def run_pr_loop(
                      for item in (*record.metadata.prior_items, *record.metadata.new_items)
                      if item.item_id.startswith("item-") and item.item_id[5:].isdigit()), default=1))
 
+        closed_incomplete_round: int | None = None  # set by a closed-incomplete rollover (#2064)
         for round_number in round_sequence:
             # The effective-board floor is checked at every round (pure, no I/O).
             check_lineage_floor(
@@ -3156,7 +3157,7 @@ def run_pr_loop(
                             else initial_pr_context.metadata.head_sha
                         ),
                         sub_item_stall_rounds=config.no_progress_rounds,
-                    )
+                    ) + closure_round_limit_note(closed_incomplete_round, round_number)
                 )
             coder_name = agent_display_name(config.coder)
             pre_review_tests_passed = False
@@ -5039,6 +5040,7 @@ def run_pr_loop(
                     restored_fallback_reasons,
                 ) = closed_round_pre_scheduler
                 pending_automatic_fallback_reasons[:] = list(restored_fallback_reasons)
+                closed_incomplete_round = round_number if is_round_closed_incomplete(closed_reconciliation) else None
                 resumed_round = None
                 current_resume = None
                 log(

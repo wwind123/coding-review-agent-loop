@@ -627,3 +627,14 @@ def close_incomplete_round(
             int(getattr(current_resume, "next_unresolved_item_number", 1)), high_water + 1,
         ),
     )
+
+
+def closure_round_limit_note(closed_round: int | None, next_round: int) -> str:
+    """Round-limit suffix naming the fresh round a closed-incomplete round requires (#2064)."""
+    if closed_round is None or closed_round + 1 != next_round:
+        return ""
+    return (
+        f" Round {closed_round} was closed incomplete; fresh reviews from the full board "
+        f"require round {next_round}, beyond --max-rounds. Rerun with a higher --max-rounds "
+        f"to continue in round {next_round}."
+    )
