@@ -72,9 +72,12 @@ _ARCHITECTURE_FLOW_ALIAS_KEYS = ("execution_flows", "data_flows")
 REVIEW_KINDS = frozenset({"plan_review", "pr_review"})
 
 # Bucket names carried by each review kind.  Order is (blocking, same-scope,
-# future); the first two are the current-scope buckets.
+# future[, non-blocking implementation notes (#2145)]); the first two are the
+# current-scope buckets.
 REVIEW_FINDING_BUCKETS = {
-    "plan_review": ("blocking_plan_issues", "same_plan_followups", "future_followups"),
+    "plan_review": (
+        "blocking_plan_issues", "same_plan_followups", "future_followups", "implementation_notes",
+    ),
     "pr_review": ("blocking_items", "same_pr_followups", "future_followups"),
 }
 REVIEW_DISPOSITION_FIELD = {
@@ -95,6 +98,7 @@ REVIEW_ACTIVE_DISPOSITIONS = {
 REVIEW_KIND_UNIQUE_FIELDS = {
     "plan_review": frozenset({
         "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+        "implementation_notes",
     }),
     "pr_review": frozenset({
         "blocking_items", "same_pr_followups", "prior_item_dispositions",
@@ -120,7 +124,7 @@ GROUNDING_STOP_WORDS = frozenset({
 # enum values.  Repair may supply these words while rewriting an envelope.
 REVIEW_SCHEMA_VOCABULARY = frozenset({
     "blocking_plan_issues", "same_plan_followups", "blocking_items",
-    "same_pr_followups", "future_followups", "prior_plan_item_dispositions",
+    "same_pr_followups", "future_followups", "implementation_notes", "prior_plan_item_dispositions",
     "prior_item_dispositions", "summary", "state", "kind", "schema_version",
     "item_id", "disposition", "note", "reviewer", "architecture_impact",
     "human_requirement_dispositions",
@@ -1754,6 +1758,54 @@ def validate_repair_preservation(
             require(match is not None, field)
             available.pop(match)
             available_tags.pop(match)
+    if source["kind"] == "plan_review":
+        _require_implementation_notes_preserved(source, target, require)
+
+
+def _require_implementation_notes_preserved(source: dict, target: dict, require) -> None:
+    """Repair keeps every plan implementation note (#2145).
+
+    A note whose concern is also a blocking or same-plan finding in the source
+    may be dropped (the blocking entry wins); every other note must survive in
+    the repaired ``implementation_notes`` list, never vanish.
+    """
+    notes = source.get("implementation_notes")
+    if not isinstance(notes, list):
+        return
+
+    def flat(entry: object, context: str) -> str | None:
+        if isinstance(entry, str):
+            return entry
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return _flatten_plan_review_finding(entry, item_context=context)
+        except AgentLoopError:
+            return None
+
+    blocking_texts = {
+        _normalized_review_item_text(text)
+        for field in ("blocking_plan_issues", "same_plan_followups")
+        for entry in (source.get(field) if isinstance(source.get(field), list) else [])
+        if (text := flat(entry, field)) is not None
+    }
+    target_notes = target.get("implementation_notes", [])
+    candidates = [
+        text
+        for entry in (target_notes if isinstance(target_notes, list) else [])
+        if (text := flat(entry, "implementation_notes")) is not None
+    ]
+    for entry in notes:
+        text = flat(entry, "implementation_notes")
+        if text is None:
+            continue
+        fragments = _fragments(text)
+        if not fragments or _normalized_review_item_text(text) in blocking_texts:
+            continue
+        require(
+            any(_contains_fragments(candidate, fragments) for candidate in candidates),
+            "implementation_notes",
+        )
 
 
 def _plan_finding_prose_view(entry: object) -> object:

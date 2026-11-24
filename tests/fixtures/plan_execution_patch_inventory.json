@@ -260,6 +260,7 @@
   {"path": "tests/test_plan_first_loop_reviewer_boards.py::test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding", "dependency": "post_issue_comment", "covered": ["architecture_contract", "validated_agent", "response_validation", "discuss_loop", "execution_policy", "child_plan_binding", "plan_first_loop"]},
   {"path": "tests/test_plan_first_loop_staged.py::_dispatch_staged", "dependency": "get_issue_context", "covered": ["discuss_loop", "execution_policy", "child_plan_binding", "pr_loop_support", "pr_loop", "plan_first_loop", "issue_loop", "plan_execution"]},
   {"path": "tests/test_plan_first_loop_staged.py::_m1268_carried_history", "dependency": "_decompose_approved_plan", "covered": ["plan_execution"]},
+  {"path": "tests/test_plan_first_loop_staged.py::test_direct_child_dispatch_inherits_parent_notes_and_planning_children_do_not", "dependency": "_implement_approved_issue", "covered": ["plan_execution"]},
   {"path": "tests/test_plan_first_loop_staged.py::test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approve", "dependency": "_decompose_approved_plan", "covered": ["plan_execution"]},
   {"path": "tests/test_plan_first_loop_staged.py::test_staged_dry_run_never_resolves_missed_close", "dependency": "_dispatch_decomposition_child", "covered": ["issue_loop", "plan_execution"]},
   {"path": "tests/test_plan_first_loop_staged.py::test_staged_dry_run_never_resolves_missed_close", "dependency": "resolve_staged_phase_progress", "covered": ["plan_execution"]},

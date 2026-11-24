@@ -1938,3 +1938,119 @@ def test_non_antigravity_transport_text_is_untouched(tmp_path, monkeypatch):
     )
     config = make_config(tmp_path, semantic_followup_backend="claude")
     assert default_semantic_transport("p", FakeRunner(), config, 30.0).text == fenced
+
+
+# --- #2145: non-blocking plan implementation notes in the approval comment ---
+
+
+def _collected_notes(*texts, **fields):
+    from coding_review_agent_loop.plan_implementation_notes import (
+        PlanImplementationNote,
+        PlanImplementationNotes,
+    )
+
+    return PlanImplementationNotes(
+        notes=tuple(PlanImplementationNote(text, ("Codex", "Claude")) for text in texts),
+        approving_round=2,
+        **fields,
+    )
+
+
+def test_notes_are_listed_but_never_filed_as_issues(tmp_path):
+    """Matrix row `no-issue-filing`."""
+    from coding_review_agent_loop.followups import PlanApprovedFollowupSource
+
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/901"])
+    config = make_config(tmp_path, approved_followups="issue", semantic_followup_dedupe=False)
+    note = "Update the pinned inventory in tests/test_help_registry.py."
+
+    assert _publish_plan_approved_followups(
+        runner,
+        config=config,
+        issue_number=884,
+        approved_plan="Approved plan summary.",
+        plan_hash="5bc5e322dc57a74d",
+        plan_subject="subject-884",
+        issue_comments=[],
+        sources=[PlanApprovedFollowupSource(
+            item_id="item-1", reviewer="codex", source_round=1,
+            text="Split the transport rewrite into its own stage.",
+        )],
+        source_context=_source(parent=884),
+        implementation_notes=_collected_notes(note),
+    ) is True
+
+    assert len(runner.issues) == 1
+    assert note not in runner.issues[0]["title"] + runner.issues[0]["body"]
+    announcement = runner.comments[-1]
+    assert "Filed future follow-up issues:" in announcement
+    assert "Implementation notes from plan review (non-blocking" in announcement
+    assert f"- {note} (Codex, Claude)" in announcement
+
+
+def test_approval_comment_lists_notes_once_across_a_rerun(tmp_path):
+    """Matrix row `approval-comment-lists`: with no future follow-ups, then a rerun."""
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    posted: list[str] = []
+    config = make_config(tmp_path, approved_followups="summarize")
+    notes = _collected_notes("Refresh the golden file.", omitted=3)
+    kwargs = dict(
+        config=config,
+        issue_number=941,
+        approved_plan="\n".join(f"Step {index}: " + "detail " * 40 for index in range(2_000)),
+        plan_hash="abc123def4567890",
+        plan_subject="subject-941",
+        sources=[],
+        source_context=_source(parent=941),
+        allow_issue_filing=False,
+        implementation_notes=notes,
+    )
+    assert _publish_plan_approved_followups(_capturing_runner(posted), issue_comments=[], **kwargs)
+    [body] = posted
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "- Refresh the golden file. (Codex, Claude)" in body
+    assert "(3 more note(s) omitted; see the plan review comments.)" in body
+    assert body.index("Implementation notes from plan review") < body.index("AGENT_PLAN_APPROVED_FOLLOWUPS")
+
+    rerun = _publish_plan_approved_followups(
+        _capturing_runner(posted), issue_comments=[SimpleNamespace(body=body)], **kwargs
+    )
+    assert rerun is False
+    assert len(posted) == 1
+
+
+def test_reapproved_identical_plan_in_a_new_scope_posts_one_supplement(tmp_path):
+    """Matrix row `reapproval-new-scope` (announcement side)."""
+    posted: list[str] = []
+    config = make_config(tmp_path, approved_followups="summarize")
+    old_announcement = SimpleNamespace(
+        body="Planning complete.\n\n<!-- AGENT_PLAN_APPROVED_FOLLOWUPS: issue=941 "
+        "plan=abc123def4567890 mode=summarize -->\n-- coding-review-agent-loop",
+    )
+    notes = _collected_notes(
+        "New-scope note.", scope_boundary_index=3, announcement_indexes=(1,),
+    )
+    kwargs = dict(
+        config=config, issue_number=941, approved_plan="Approved plan.",
+        plan_hash="abc123def4567890", plan_subject="subject-941", sources=[],
+        source_context=_source(parent=941), allow_issue_filing=False,
+    )
+    assert _publish_plan_approved_followups(
+        _capturing_runner(posted), issue_comments=[old_announcement],
+        implementation_notes=notes, **kwargs,
+    ) is False
+    [supplement] = posted
+    assert supplement.startswith("Implementation notes from plan review (current planning scope, round 2).")
+    assert "- New-scope note. (Codex, Claude)" in supplement
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" not in supplement
+
+    rerun_notes = _collected_notes(
+        "New-scope note.", scope_boundary_index=3, announcement_indexes=(1,),
+        post_boundary_trusted_bodies=(supplement.strip(),),
+    )
+    _publish_plan_approved_followups(
+        _capturing_runner(posted), issue_comments=[old_announcement],
+        implementation_notes=rerun_notes, **kwargs,
+    )
+    assert len(posted) == 1

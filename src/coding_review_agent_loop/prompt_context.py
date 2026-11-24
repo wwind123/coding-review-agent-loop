@@ -589,7 +589,25 @@ def format_approved_plan_context(
     *,
     max_chars: int | None = None,
 ) -> str:
-    """Render the lossless plan channel independently of issue history."""
+    """Render the lossless plan channel independently of issue history.
+
+    Advisory implementation notes from plan review (#2145) follow the plan
+    channel in their own fixed-bounded section, outside ``max_chars``: they
+    never displace plan identity, scope or matrix semantics.
+    """
+    from .plan_implementation_notes import render_prompt_section
+
+    return _format_approved_plan_channel(plan_context, max_chars=max_chars) + render_prompt_section(
+        plan_context
+    )
+
+
+def _format_approved_plan_channel(
+    plan_context: ApprovedPlanContext | None,
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """The plan channel alone: identity, scope, matrix and canonical text."""
     if plan_context is None:
         return "Approved implementation plan context\n\nNo approved plan is bound to this PR.\n"
     lines = [
@@ -711,7 +729,7 @@ def format_approved_plan_context(
                 risk_test_matrix_payload=None,
                 risk_test_matrix_changes_payload=(),
             )
-            return format_approved_plan_context(unavailable, max_chars=max_chars)
+            return _format_approved_plan_channel(unavailable, max_chars=max_chars)
     if plan_context.availability == "omitted" and not plan_context.matrix_available:
         omission = (
             "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "

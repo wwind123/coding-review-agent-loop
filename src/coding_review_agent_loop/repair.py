@@ -231,6 +231,7 @@ terminates for human resolution; do not invent a new escalation field or state.
   "blocking_plan_issues": [],
   "same_plan_followups": [],
   "future_followups": [],
+  "implementation_notes": [],
   "prior_plan_item_dispositions": [
     {"item_id": "item-1", "disposition": "resolved"}
   ],
@@ -500,7 +501,7 @@ The active planning human-requirements context above is authoritative. Do not us
 -- <Coder Name>
 
 ## ARRAY FIELD TYPES (Format A/B/D):
-- blocking_items, same_pr_followups, future_followups, blocking_plan_issues, same_plan_followups, plan_steps -> STRINGS
+- blocking_items, same_pr_followups, future_followups, blocking_plan_issues, same_plan_followups, implementation_notes, plan_steps -> STRINGS
 - Exception: a plan_review finding given as an object with a `provenance` key ("revision_introduced" or "pre_existing") keeps that object form and its `provenance` value unchanged.
 - prior_item_dispositions, prior_plan_item_dispositions -> OBJECTS {"item_id":..., "disposition":..., "note":...}
 - For PR reviews, carried `blocking`/`same-pr` dispositions require an actionable note explaining the remaining defect, evidence, and needed change. Copy an explanation only when the original response clearly ties it to that item; preserve the summary too. Never invent evidence, assign an ambiguous summary to an item, or change a status just to satisfy this requirement. If the original contains no such explanation, leave it missing so validation fails actionably.
@@ -544,6 +545,7 @@ The active planning human-requirements context above is authoritative. Do not us
 - If the same plan-review concern or paraphrase appears in blocking_plan_issues and same_plan_followups, keep blocking_plan_issues and drop the duplicate same_plan_followups entry.
 - If the same plan-review concern or paraphrase appears in same_plan_followups and future_followups, keep same_plan_followups/current-plan work and drop the duplicate future_followups entry.
 - If the same plan-review concern or paraphrase appears in blocking_plan_issues and future_followups, keep blocking_plan_issues and drop the duplicate future_followups entry.
+- If the same plan-review concern or paraphrase appears in blocking_plan_issues or same_plan_followups and also in implementation_notes, keep the blocking_plan_issues or same_plan_followups entry and drop the duplicate implementation_notes entry. Keep every other implementation_notes entry unchanged; never move a blocking or same-plan concern into implementation_notes.
 
 ## DEDUPE RULES (Format A):
 - Same-PR follow-ups and Future follow-ups are mutually exclusive.

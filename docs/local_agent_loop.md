@@ -3198,7 +3198,43 @@ same planning round. Plan reviews use explicit sections:
 ### Blocking plan issues
 ### Same-plan follow-ups
 ### Future follow-ups
+### Implementation notes (non-blocking; for the implementer)
 ```
+
+### Implementation notes
+
+Plan reviewers may list non-blocking `implementation_notes` (#2145). A
+finding qualifies only if it is in scope under the blocking-scope criteria,
+needs no change to the plan's design, steps or acceptance criteria, and would
+be found anyway by building the change or running the tests: an exact-list
+or inventory update in a test or fixture, a snapshot or golden-file refresh,
+or another file that must change in step with one the plan names. A plan need
+not enumerate every such file. Design, correctness, requirement coverage and
+risk concerns still go in `blocking_plan_issues` or `same_plan_followups`;
+when in doubt, the finding blocks.
+
+- Notes never block. A review with only notes may be `approved`, and notes are
+  allowed in blocking reviews too. They are not carried items and do not make
+  the planner revise the plan.
+- Each review keeps at most 10 notes of at most 1000 characters; extras are
+  dropped or truncated with a logged degradation, never a rejection.
+- On approval the orchestrator collects the notes of every round in the
+  approved planning scope, de-duplicated with merged reviewer attribution and
+  bounded to 20 notes and 6000 characters. The plan approval comment lists
+  them. They are never filed as issues, even with `--approved-followups issue`.
+- The implementer and the PR reviewers receive the same bounded
+  `Implementation notes from plan review` section as non-binding context,
+  including after a PR-loop restart. A note the implementer did not address is
+  an ordinary PR review finding, not an automatic block.
+- A direct-implementation child of a staged plan receives its parent plan's
+  notes, labeled with their origin; a child that runs its own plan review sees
+  only its own notes.
+- When identical plan text is reapproved in a new planning scope (after an
+  issue edit or `--reopen-approved-plan`), the original announcement is not
+  repeated; one notes-only supplement lists the current scope's notes.
+- If the plan history cannot be authenticated, the section says the notes are
+  unavailable and why; the run continues.
+- Older plan review records without notes read as an empty list.
 
 ### Persisted planning-validation diagnostics
 

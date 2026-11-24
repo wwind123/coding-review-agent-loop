@@ -1233,6 +1233,7 @@ def test_pinned_grounding_vocabulary_cannot_drift():
     assert _rp.REVIEW_KIND_UNIQUE_FIELDS == {
         "plan_review": frozenset({
             "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+            "implementation_notes",
         }),
         "pr_review": frozenset({
             "blocking_items", "same_pr_followups", "prior_item_dispositions",
@@ -1240,6 +1241,7 @@ def test_pinned_grounding_vocabulary_cannot_drift():
     }
     # Derived exempt sets stay tied to their single source of truth.
     assert "blocking_plan_issues" in _rp.REVIEW_SCHEMA_VOCABULARY
+    assert "implementation_notes" in _rp.REVIEW_SCHEMA_VOCABULARY
     assert {"protocol", "record"} <= _rp.NEUTRALIZATION_LABEL_TOKENS
     from coding_review_agent_loop.protocol_markers import RESERVED_MARKER_REGISTRY
     expected_labels = set()
@@ -3086,3 +3088,51 @@ def test_coder_dispositions_preservation_still_fails_on_lost_row():
     source = _coder(human_requirement_dispositions=[_ROW])
     with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
         check(source, _coder(human_requirement_dispositions=[]))
+
+
+# --- Plan implementation notes through repair (#2145) -------------------------
+
+
+def test_repair_preserves_implementation_notes():
+    """Matrix row `repair-reask-preserves`."""
+    source = _plan_review(
+        state="approved",
+        implementation_notes=["Update the pinned inventory in tests/test_help_registry.py."],
+    )
+    check(source, _plan_review(
+        state="approved",
+        implementation_notes=["Update the pinned inventory in tests/test_help_registry.py."],
+    ))
+
+
+def test_repair_cannot_drop_an_implementation_note():
+    source = _plan_review(
+        blocking_plan_issues=["The retry loop never terminates."],
+        implementation_notes=["Update the pinned inventory in tests/test_help_registry.py."],
+    )
+    rejects(
+        source,
+        _plan_review(blocking_plan_issues=["The retry loop never terminates."]),
+        match="implementation_notes",
+    )
+
+
+def test_repair_keeps_a_concern_listed_twice_only_in_the_blocking_list():
+    """Matrix row `repair-reask-preserves`: the blocking entry wins a duplicate."""
+    source = _plan_review(
+        blocking_plan_issues=["Update the fixture inventory."],
+        implementation_notes=["Update the fixture inventory.", "Refresh the snapshot file."],
+    )
+    check(source, _plan_review(
+        blocking_plan_issues=["Update the fixture inventory."],
+        implementation_notes=["Refresh the snapshot file."],
+    ))
+
+
+def test_repair_cannot_move_a_blocking_concern_into_the_notes():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(
+        source,
+        _plan_review(implementation_notes=["The retry loop never terminates."]),
+        match="blocking_plan_issues",
+    )

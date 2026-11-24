@@ -1199,3 +1199,96 @@ def test_2064_closed_primary_block_never_revives_an_older_carried_plan_approval(
     # The stale approval no longer lets the seam skip the review: the primary
     # is freshly scheduled (the contrast test invokes only the planner).
     assert "codex" in _m1103_agent_calls(resumed)
+
+
+# --- #2145: direct-execution children inherit the parent plan's notes --------
+
+
+@pytest.mark.parametrize("disposition", ["direct-implementation", "requires-child-planning"])
+def test_direct_child_dispatch_inherits_parent_notes_and_planning_children_do_not(
+    tmp_path, monkeypatch, disposition,
+):
+    """Matrix row `direct-child-notes`.
+
+    The shared child dispatch hands a direct-implementation child the parent
+    plan's notes, labeled with their parent origin, for its implementer and
+    PR reviewer prompts.  A planning-route child runs its own plan review and
+    receives no parent notes.  No identity, issue body or handoff changes.
+    """
+    import dataclasses as _dc
+
+    import coding_review_agent_loop.execution_policy as execution_policy
+    import coding_review_agent_loop.plan_execution as plan_execution
+    import coding_review_agent_loop.validated_agent as validated_agent
+    from coding_review_agent_loop.plan_implementation_notes import (
+        PlanImplementationNote,
+        PlanImplementationNotes,
+        with_plan_implementation_notes,
+    )
+    from coding_review_agent_loop.prompts import build_issue_implementation_prompt, build_review_prompt
+    from agent_loop_helpers import FakeRunner, make_config
+    from test_child_plan_provenance import fresh_child_contexts, fresh_staged_matrix_plan
+
+    plan = fresh_staged_matrix_plan()
+    if disposition != "direct-implementation":
+        plan = plan.replace(
+            '"execution_disposition": "direct-implementation"',
+            f'"execution_disposition": "{disposition}"', 1,
+        )
+    child, parent = fresh_child_contexts(
+        plan, inherited_matrix_row_ids=("row-stage-one",),
+        handoff_execution_disposition=None if disposition == "direct-implementation" else disposition,
+    )
+    fresh_child = execution_policy._resolve_fresh_child_provenance(
+        issue_context=child, parent_issue_context=parent,
+    )
+    assert fresh_child is not None
+    note = "Parent note: update the pinned stage inventory test."
+    parent_context = with_plan_implementation_notes(
+        fresh_child.parent_plan_context,
+        PlanImplementationNotes(notes=(PlanImplementationNote(note, ("Codex",)),)),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        plan_execution, "_implement_approved_issue",
+        lambda runner, **kwargs: captured.update(kwargs) or 0,
+    )
+    planning_kwargs: list[dict] = []
+    config = make_config(tmp_path)
+
+    assert plan_execution._dispatch_decomposition_child(
+        FakeRunner(),
+        run_plan_first_loop=lambda runner, **kwargs: planning_kwargs.append(kwargs) or 0,
+        config=config, memory=None,
+        usage_context=validated_agent._new_usage_context(config),
+        parent_issue=55, approved_plan=fresh_child.approved_plan,
+        plan_hash=fresh_child.plan_hash, plan_subject=fresh_child.plan_subject,
+        recommendation=fresh_child.recommendation,
+        approved_plan_context=parent_context,
+        created=fresh_child.created, phase_index=fresh_child.phase_index,
+        route=fresh_child.route, child_issue_context=child, parent_issue_context=parent,
+        coder_session_id=None,
+        existing_handoff=fresh_child.handoff if disposition == "direct-implementation" else None,
+    ) == 0
+
+    if disposition != "direct-implementation":
+        assert fresh_child.route.is_planning
+        assert captured == {} and len(planning_kwargs) == 1
+        assert note not in repr(planning_kwargs[0])
+        return
+    child_context = captured["approved_plan_context"]
+    assert child_context.implementation_notes == (f"{note} (Codex)",)
+    assert child_context.implementation_notes_origin == "parent plan #55"
+    # Plan identity is untouched and nothing is written into the child issue.
+    assert child_context.plan_hash == fresh_child.plan_hash
+    assert child_context == _dc.replace(child_context, implementation_notes=())
+    assert note not in child.body
+    implementation_prompt = build_issue_implementation_prompt(
+        56, fresh_child.approved_plan, config, approved_plan_context=child_context,
+    )
+    review_prompt = build_review_prompt(
+        77, 1, config, reviewer="codex", approved_plan_context=child_context,
+    )
+    for prompt in (implementation_prompt, review_prompt):
+        assert f"- {note} (Codex)" in prompt
+        assert "These notes come from the parent plan #55" in prompt

@@ -1001,3 +1001,62 @@ def test_edited_approved_plan_notes_and_stop_carry_no_reserved_marker():
     parts = parse_human_decision(str(error))
     assert parts is not None and parts.safe_to_automate is False
     assert "--keep-approved-plan" in parts.clear and "--reopen-approved-plan" in parts.clear
+
+
+# --- #2145: implementation notes when an identical plan is reapproved ---------
+
+
+def _approval_with_notes(*notes: str) -> str:
+    import json as _json
+
+    return (
+        _json.dumps({
+            "schema_version": 1, "kind": "plan_review", "state": "approved",
+            "summary": "Plan review complete.", "blocking_plan_issues": [],
+            "same_plan_followups": [], "future_followups": [],
+            "implementation_notes": list(notes), "prior_plan_item_dispositions": [],
+            "human_requirement_dispositions": [],
+        })
+        + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+    )
+
+
+def test_identical_plan_reapproved_in_a_new_scope_posts_one_notes_supplement(tmp_path):
+    """Matrix row `reapproval-new-scope`."""
+    from coding_review_agent_loop.plan_implementation_notes import SUPPLEMENT_HEADING_PREFIX
+
+    first = _m1390_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[_approval_with_notes("Old-scope note: refresh the archived fixture.")],
+    )
+    assert run_issue_loop(first, issue_number=56, config=_m1390_config(tmp_path), plan_first=True) == 0
+    history = list(first.issue_comments)
+    announcements = [c for c in history if "AGENT_PLAN_APPROVED_FOLLOWUPS:" in str(c["body"])]
+    assert len(announcements) == 1
+    assert "Old-scope note" in str(announcements[0]["body"])
+
+    runner, result, _calls, _messages = _rerun(
+        tmp_path, history,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[_approval_with_notes("New-scope note: update the inventory test.")],
+    )
+
+    assert result == 0
+    new_comments = [str(c["body"]) for c in runner.issue_comments[len(history):]]
+    # The plan text is identical, so the announcement is not re-posted and no
+    # issue is filed; one notes-only supplement shows the current scope.
+    assert not any("AGENT_PLAN_APPROVED_FOLLOWUPS:" in body for body in new_comments)
+    supplements = [body for body in new_comments if body.startswith(SUPPLEMENT_HEADING_PREFIX)]
+    assert len(supplements) == 1
+    assert "New-scope note: update the inventory test. (Codex)" in supplements[0]
+    assert "Old-scope note" not in supplements[0]
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+    # A same-scope restart posts nothing new.
+    restarted, result, _calls, _messages = _rerun(
+        tmp_path, list(runner.issue_comments), config_overrides={"reopen_approved_plan": False},
+    )
+    assert result == 0
+    later = [str(c["body"]) for c in restarted.issue_comments[len(runner.issue_comments):]]
+    assert not any(body.startswith(SUPPLEMENT_HEADING_PREFIX) for body in later)
+    assert not any("AGENT_PLAN_APPROVED_FOLLOWUPS:" in body for body in later)

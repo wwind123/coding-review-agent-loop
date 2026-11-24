@@ -228,6 +228,7 @@ from .architecture_contract import (
     _architecture_mode_validators,
     _resumed_review_architecture,
 )
+from .plan_implementation_notes import resumed_implementation_notes
 from .validated_agent import (
     _run_validated_agent,
 )
@@ -3059,6 +3060,8 @@ def _run_plan_first_loop_body(
                         acquisition_returncode=acquisition_returncode,
                         **_architecture_metadata_fields(config, result=parsed),
                         **ignored_disposition_metadata_fields(parsed),
+                        # Non-blocking notes (#2145) ride on the reviewer record.
+                        implementation_notes=tuple(note.text for note in parsed.implementation_notes),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                         plan_sweep=_plan_sweep_requested(reviewer_name),
                         **_baseline_metadata_fields(_plan_rendered_baseline(reviewer_name)),
@@ -3340,6 +3343,11 @@ def _run_plan_first_loop_body(
                     architecture_impact=resumed_impact,
                     architecture_impact_degradations=resumed_records,
                     ignored_prior_disposition_ids=resumed_record.metadata.ignored_prior_disposition_ids,
+                    # Restored once from the record (#2145); a record written
+                    # before notes were persisted re-parses its response.
+                    implementation_notes=resumed_implementation_notes(
+                        resumed_record.metadata, structured_review, reviewer=reviewer_name,
+                    ),
                 )
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")

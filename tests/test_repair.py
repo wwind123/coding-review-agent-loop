@@ -4710,10 +4710,12 @@ def _prose_source_1626(kind):
 # dc2d68ae1f) for the same input: the flag-unset prompt must not change.
 # Re-pinned for #2120, which intentionally replaced only the issue
 # implementation repair guidance that told the coder to null a positive PR
-# beside a blocked signed requirement.
+# beside a blocked signed requirement.  Re-pinned for #2145, which added the
+# plan-review `implementation_notes` field, string-type rule and dedupe rule
+# to the shared Format B section.
 _PRE_1626_PROMPT_DIGESTS = {
-    "coder_followup": "e7410cf07b19d19acb5b6424a9dcfc06d9d7b4bb40f291ffca15ea5565f97b39",
-    "issue_implementation": "90de56f4849a666c1ba96385e0c41bff7ddbd3173a5d26445d67a4da500874f9",
+    "coder_followup": "0bf1f6296d8b3b4c0094ffce60e5846a55b53e24bb9f0b5d7da62653d94c3956",
+    "issue_implementation": "376e5f72c5dd8a56e59c16e9a38e3d91f865c1d93d8e087dab1477b3384f29e3",
 }
 _RECEIPTS_1626 = (
     {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass-1", "outcome": "passed"},

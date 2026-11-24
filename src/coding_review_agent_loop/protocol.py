@@ -477,6 +477,18 @@ class ParsedPlanReview:
     # Parser-derived (#2114): PR-only disposition fields dropped from a plan
     # review, such as ``sub_item_dispositions``.
     disposition_degradations: tuple[ParseDegradation, ...] = field(default=(), compare=False)
+    # Non-blocking implementation notes (#2145).  Deliberately not on
+    # ``PlanReviewItems``: notes never reach the unresolved-item ledger,
+    # dispositions, scheduling or approval.  Absent means ``()``.
+    implementation_notes: tuple[ApprovedFollowup, ...] = ()
+    implementation_note_degradations: tuple[ParseDegradation, ...] = field(default=(), compare=False)
+
+
+# Per-review implementation-note bounds (#2145).  Overflow degrades with a
+# recorded ParseDegradation; it never rejects the review.
+MAX_IMPLEMENTATION_NOTES_PER_REVIEW = 10
+MAX_IMPLEMENTATION_NOTE_CHARS = 1000
+IMPLEMENTATION_NOTE_TRUNCATION_SUFFIX = " [truncated]"
 
 
 @dataclass(frozen=True)
@@ -1919,6 +1931,7 @@ REVIEW_FINDING_RESERVED_KEYS: frozenset[str] = frozenset(
         "future_followups",
         "blocking_plan_issues",
         "same_plan_followups",
+        "implementation_notes",
         "prior_item_dispositions",
         "prior_plan_item_dispositions",
         "human_requirement_dispositions",
@@ -3852,7 +3865,8 @@ def parse_structured_plan_review(
         payload, context="plan_review", renames=PLAN_REVIEW_FINDING_KEY_RENAMES,
     )
     payload = _normalize_review_finding_shapes(
-        payload, ("blocking_plan_issues", "same_plan_followups", "future_followups"),
+        payload,
+        ("blocking_plan_issues", "same_plan_followups", "future_followups", "implementation_notes"),
         context="plan_review", pr_findings=False,
     )
     payload = _expect_known_keys_lenient(  # shape-check: fatal:unparseable-envelope
@@ -3865,7 +3879,7 @@ def parse_structured_plan_review(
             "summary",
             "prior_plan_item_dispositions",
         },
-        optional={"blocking_plan_issues", "same_plan_followups", "future_followups", "human_requirement_dispositions", "architecture_impact"},
+        optional={"blocking_plan_issues", "same_plan_followups", "future_followups", "implementation_notes", "human_requirement_dispositions", "architecture_impact"},
     )
     state = _expect_state(payload["state"], context="plan_review.state")  # shape-check: fatal:no-conservative-reading
     summary = review_freeform_summary_text(
@@ -3885,6 +3899,11 @@ def parse_structured_plan_review(
         payload,
         "future_followups",
         context="plan_review.future_followups",
+    )
+    raw_implementation_notes = _expect_plan_review_finding_list(  # shape-check: fatal:no-conservative-reading
+        payload,
+        "implementation_notes",
+        context="plan_review.implementation_notes",
     )
     raw_dispositions, ignored_ids = _partition_live_dispositions(
         payload["prior_plan_item_dispositions"], carried_item_ids
@@ -3953,7 +3972,63 @@ def parse_structured_plan_review(
         parsed = dataclasses.replace(parsed, ignored_prior_disposition_ids=ignored_ids)
     if disposition_degradations:
         parsed = dataclasses.replace(parsed, disposition_degradations=tuple(disposition_degradations))
+    notes, note_degradations = _bound_plan_implementation_notes(  # shape-check: fatal:authentication-or-forgery
+        raw_implementation_notes,
+        excluded_texts=(*blocking_items, *same_plan_followups),
+    )
+    if notes or note_degradations:
+        parsed = dataclasses.replace(
+            parsed,
+            implementation_notes=tuple(ApprovedFollowup(reviewer=reviewer, text=text) for text in notes),
+            implementation_note_degradations=note_degradations,
+        )
     return parsed
+
+
+def _bound_plan_implementation_notes(
+    notes: Sequence[str],
+    *,
+    excluded_texts: Sequence[str] = (),
+    context: str = "plan_review.implementation_notes",
+) -> tuple[tuple[str, ...], tuple[ParseDegradation, ...]]:
+    """Bound one plan review's implementation notes deterministically (#2145).
+
+    Never rejects.  A note duplicating one of the same review's blocking or
+    same-plan items is dropped (the blocking entry wins), as is a repeated
+    note.  At most ``MAX_IMPLEMENTATION_NOTES_PER_REVIEW`` notes are kept, each
+    truncated to ``MAX_IMPLEMENTATION_NOTE_CHARS`` with a visible suffix, and
+    every loss is recorded as a degradation.
+    """
+    excluded = {_normalized_review_item_text(text) for text in excluded_texts}
+    kept: list[str] = []
+    seen: set[str] = set()
+    degradations: list[ParseDegradation] = []
+    for index, raw in enumerate(notes):
+        text = raw.strip()
+        key = _normalized_review_item_text(text)
+        if not key or key in seen:
+            continue
+        rule = (
+            "note-duplicates-a-blocking-finding" if key in excluded
+            else "more-than-ten-notes" if len(kept) >= MAX_IMPLEMENTATION_NOTES_PER_REVIEW
+            else None
+        )
+        if rule is not None:
+            degradations.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                element_path=f"{context}[{index}]", rule=rule, observed=text, outcome="note-dropped",
+            ))
+            continue
+        if len(text) > MAX_IMPLEMENTATION_NOTE_CHARS:
+            degradations.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                element_path=f"{context}[{index}]", rule="note-longer-than-1000-characters",
+                observed=text, outcome="note-truncated",
+            ))
+            text = text[:MAX_IMPLEMENTATION_NOTE_CHARS].rstrip() + IMPLEMENTATION_NOTE_TRUNCATION_SUFFIX
+        seen.add(key)
+        kept.append(text)
+    for record in degradations:
+        _logger.warning("%s: %s (%s)", record.element_path, record.outcome, record.rule)
+    return tuple(kept), tuple(degradations)
 
 
 def validate_structured_coder_followup(

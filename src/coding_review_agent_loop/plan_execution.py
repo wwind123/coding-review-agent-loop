@@ -68,6 +68,11 @@ from .followups import (
 )
 from .round_metadata import ApprovedPlanContext, _plan_subject, scope_approved_plan_matrix
 from .round_state import _extract_round_metadata_records, make_approved_plan_context
+from .plan_implementation_notes import (
+    inherit_parent_plan_implementation_notes,
+    load_plan_implementation_notes,
+    with_plan_implementation_notes,
+)
 from .plan_growth import plan_growth_approval_verdict
 from .response_validation import _describe_requirement_set_change
 from .execution_policy import (
@@ -330,11 +335,17 @@ def _dispatch_decomposition_child(
             ),
             override_digest=route.override_digest if recommendation is not None else None,
         )
-    child_plan_context = make_approved_plan_context(
-        approved_plan,
-        source_locator=f"issue #{parent_issue} topology checkpoint phase {phase_index}",
-        expected_hash=plan_hash,
-        expected_subject=plan_subject,
+    # A direct-execution child has no plan review of its own, so it inherits
+    # the parent plan's implementation notes, labeled with their origin (#2145).
+    child_plan_context = inherit_parent_plan_implementation_notes(
+        make_approved_plan_context(
+            approved_plan,
+            source_locator=f"issue #{parent_issue} topology checkpoint phase {phase_index}",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        ),
+        approved_plan_context,
+        parent_issue=parent_issue,
     )
     child_plan_context = scope_approved_plan_matrix(
         child_plan_context,
@@ -771,11 +782,20 @@ def _execute_approved_plan(
         current_plan_sidecar.canonical_json if current_plan_sidecar is not None else None,
         plan_growth_assessment,
     )
-    approved_plan_context = make_approved_plan_context(
-        current_plan,
-        source_locator=f"issue #{issue_number} approved-plan round",
-        expected_hash=plan_hash,
-        expected_subject=plan_subject,
+    # Advisory notes of the approved scope (#2145): collected once, attached
+    # to the context and listed in the approval comment; never filed.
+    approval_notes = load_plan_implementation_notes(
+        runner, config=config, plan_issue_number=issue_number,
+        comments=issue_context.comments, plan_subject=plan_subject, plan_hash=plan_hash,
+    )
+    approved_plan_context = with_plan_implementation_notes(
+        make_approved_plan_context(
+            current_plan,
+            source_locator=f"issue #{issue_number} approved-plan round",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        ),
+        approval_notes,
     )
     if approved_plan_context.matrix_available:
         # Cross the approval boundary through the same immutable
@@ -987,6 +1007,7 @@ def _execute_approved_plan(
         ),
         allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
         usage_context=usage_context,
+        implementation_notes=approval_notes,
     )
     # Terminal entry deferral permits planning, not split writes. Keep
     # ordinary plan-only split behavior only without that handoff.
