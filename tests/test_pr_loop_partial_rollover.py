@@ -579,3 +579,91 @@ def test_closure_ledger_keeps_an_authoritative_sequential_review_findings(tmp_pa
     assert [(i.item_id, i.text) for i in closure.new_items] == [("item-1", "Bound the retry loop.")]
     assert closure.round_closure["item_number_high_water"] == 1
     _no_deletion_advice(runner)
+
+
+# --- managed-ci-binding-kept ------------------------------------------------------
+
+
+def _managed_checkpoint_comment(config):
+    """A managed-CI qualifying checkpoint opening round 1 at HEAD (as in the #2035 fixture)."""
+    from coding_review_agent_loop.qualification_checkpoint import QualificationCheckpoint
+    from coding_review_agent_loop.unresolved_items import UnresolvedReviewItem
+
+    acquisition = {
+        name: (inv.configured_model, inv.resolved_effort, provider)
+        for name, provider in (("Codex", "codex"), ("Gemini", "gemini"))
+        for inv in [pr_loop.resolve_invocation(config, provider=provider, role="reviewer")]
+    }
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed on the previous head.", status="blocking",
+        source_status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
+        failed_head_sha="old-head", candidate_head_sha=HEAD,
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci", obligation_identity=item.obligation_identity,
+        lifecycle="qualifying", failed_head_sha="old-head", candidate_head_sha=HEAD,
+        base_branch="main",
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(acquisition),
+        approval_digest=pr_loop_support._qualification_digest(("Codex", "Gemini")),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))),
+        qualification_attempt_id="123/1", allowed_rounds=config.max_rounds,
+    )
+    body = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=HEAD,
+            prior_items=(item,), state="blocking", phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint, architecture_contract_version=1,
+        ),
+    )
+    return body, checkpoint
+
+
+def test_closure_keeps_the_managed_ci_qualification_checkpoint_readable(tmp_path, monkeypatch):
+    """`managed-ci-binding-kept`: round 1 opens on a managed-CI qualification
+    checkpoint and is partially published.  The closure posts one record and
+    deletes nothing: the checkpoint comment stays verbatim and still decodes
+    with the same binding, before and after the rollover into round 2."""
+    from coding_review_agent_loop.managed_ci_types import ManagedCiContract
+
+    markers = ("Codex reviews the qualifying head.", "Gemini reviews the qualifying head.")
+    done = [{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers, slow_reviewer="gemini",
+        codex_outputs=[structured_pr_review(summary=summary, prior_item_dispositions=done)
+                       for summary in (markers[0], "Codex approves round two.")],
+        gemini_outputs=[structured_pr_review(summary=summary, reviewer="Google Gemini", prior_item_dispositions=done)
+                        for summary in (markers[1], "Gemini approves round two.")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+                         managed_ci=True, max_rounds=3)
+    body, checkpoint = _managed_checkpoint_comment(config)
+    runner.pr_payload["comments"].insert(0, {"author": {"login": "coding-review-agent-loop"}, "body": body})
+    contract = ManagedCiContract(protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha=HEAD)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    _interrupt_pr(runner, config, markers, at=2)
+    assert sum(_published_count(runner, marker) for marker in markers) == 1
+    for path in _spool_files(config):
+        path.unlink()
+    seen = _spy_closure(monkeypatch, runner)
+
+    try:
+        run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError:
+        pass  # managed qualification after round 2 is out of this row's scope
+
+    assert len(seen) == 1
+    (closure,) = _closures(runner)
+    assert closure.round_number == 1
+    assert runner.pr_payload["comments"][0]["body"] == body
+    records = _comment_records(runner, surface="pr", flow="pr")
+    checkpoints = [r.qualification_checkpoint for r in records if r.phase == "qualification-checkpoint"]
+    assert checkpoints[0] == checkpoint
+    assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == ["Codex", "Gemini"]
+    _no_deletion_advice(runner)
