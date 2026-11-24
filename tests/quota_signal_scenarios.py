@@ -447,7 +447,6 @@ def main():
             '_stub_tool_provenance', '_agent_commands_available',
             '_isolate_worker_budget_environment', '_isolate_workdir_claims',
             '_reset_quota_wait_state', '_isolate_store_locks',
-            '_round_publication_needs_an_actor_surface',
         )
         for name_fixture in fixtures:
             fixture = getattr(conftest, name_fixture).__wrapped__

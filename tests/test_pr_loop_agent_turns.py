@@ -929,16 +929,21 @@ def test_resumed_acknowledged_pr_review_is_rebuilt_from_round_metadata(
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
-def test_resumed_unacknowledged_classified_pr_review_resumes_from_round_metadata(
+def test_resumed_unacknowledged_classified_pr_review_is_never_resumed_by_classification(
     tmp_path, monkeypatch, parallel
 ):
-    # The unacknowledged posted review already classifies every signed source,
-    # so in an open round with an unchanged requirement set it resumes as
-    # classification-complete (#2035) instead of re-running the reviewer.  The
-    # resumed carrier, and any acknowledgement-repair carrier, keep the null
-    # assessment and its record from round metadata, never a stale source.
+    # The unacknowledged posted review is rejected by resume: classification-only
+    # resume (#2035) is removed (#2064).  A sequential (authoritative) record keeps
+    # its same-round re-run; a published (parallel) one closes the round as
+    # incomplete without re-running the reviewer in it, and the closure rebuilds
+    # the review from round metadata (null assessment and its record), never a
+    # stale source.
     run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=False, parallel=parallel)
+    if not parallel:
+        assert run.reinvoked == 1
+        return
     assert run.reinvoked == 0
+    assert "round 2" in str(run.outcome)  # the --max-rounds stop after the closure names round 2
     ((impact, records),) = run.resumed
     assert impact is None
     assert [r.outcome for r in records] == ["degraded-to-undetermined"]

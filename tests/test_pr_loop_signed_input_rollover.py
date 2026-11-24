@@ -16,11 +16,10 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.pr_loop as pr_loop
-from coding_review_agent_loop import response_validation, signed_input_supersession as sis
+from coding_review_agent_loop import response_validation
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.github import _parse_pr_human_requirements
-from coding_review_agent_loop.publication_resume import PublicationCarrier, classify_frozen_sequence
 from coding_review_agent_loop.review_spool import ReviewRoundSpool
 from coding_review_agent_loop.round_closure import ROUND_CLOSED_INCOMPLETE_PHASE
 from coding_review_agent_loop.signed_input_record import (
@@ -360,24 +359,16 @@ def test_edited_review_with_retained_carrier_closes_the_round(tmp_path, monkeypa
     _follow_hint(runner)
     _queue_fresh_round(runner)
     spool = _round_spool(tmp_path, config)
-    state, raw = spool.publication_state("Codex")
-    assert state == "carrier"
-    # The edited public body no longer matches its frozen bytes.
-    listing = SimpleNamespace(
-        comment_id=_cid(runner.pr_payload["comments"][index]),
-        body=runner.pr_payload["comments"][index]["body"],
-        created=PublicationCarrier.from_dict(raw).prepared_at)
-    import datetime
-    listing.created = datetime.datetime.fromisoformat(listing.created)
-    result = classify_frozen_sequence(PublicationCarrier.from_dict(raw), [listing])
-    assert (result.kind, result.matched_count) == ("prefix", 0)
+    # A begun publication record is kept, but it is never verified or resumed (#2064).
+    assert spool.publication_state("Codex") == "began"
+    assert "quietly edited" in runner.pr_payload["comments"][index]["body"]
     before = len(runner.commands)
 
     # Formerly a carrier stop pointing at the recovery list (#1258).
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     _assert_closed_and_rolled_over(runner, before)
-    assert spool.publication_state("Codex")[0] == "absent"  # the round spool is discarded
+    assert spool.publication_state("Codex") == "absent"  # the round spool is discarded
 
 
 @pytest.mark.parametrize("variant", ["edited-history", "missing-history", "metadata-mismatch",
@@ -462,189 +453,7 @@ def test_budget_exhausted_posts_the_closure_then_the_round_limit_stop(tmp_path, 
     assert sorted(r.metadata.agent for r in round_two) == ["Codex", "Gemini"]
 
 
-# --- unit: round-level decision ---------------------------------------------
-
-
-class _Spool:
-    def __init__(self, states):
-        self.states = states
-        self.removed = []
-
-    def publication_state(self, name):
-        return self.states.get(name, ("absent", None))
-
-    def remove(self, name):  # pragma: no cover - must never be called
-        self.removed.append(name)
-
-
-def _decision_inputs(tmp_path, monkeypatch):
-    runner, config = _conflict_stop(tmp_path, monkeypatch)
-    _follow_hint(runner)
-    requirements = _parse_pr_human_requirements(runner.pr_payload)
-    records = {r.metadata.agent: r for r in _pr_records(runner) if r.metadata.role == "reviewer"}
-    comments = [SimpleNamespace(body=c["body"], comment_id=_cid(c) or 900 + i)
-                for i, c in enumerate(runner.pr_payload["comments"])]
-    from coding_review_agent_loop.round_state import _resume_pr_round
-    resume = _resume_pr_round([SimpleNamespace(body=c.body) for c in comments], head_sha=HEAD,
-                              configured_reviewers=pr_loop.reviewers(config))
-    assert resume.round_number == 1 and resume.reconciliation_record is None
-    assert {r.metadata.agent for r in resume.completed_reviews} == {"Codex", "Gemini"}
-    posted = []
-
-    def call(completed, *, spool=None, seat_binding=None, edit_states=None, **overrides):
-        monkeypatch.setattr(sis, "read_pr_comment_edit_states",
-                            lambda *a, **k: edit_states if edit_states is not None
-                            else {c.comment_id: () for c in comments})
-        kwargs = dict(
-            config=config, pr_number=77, comments=comments, current_resume=resume, round_number=1,
-            allowed_rounds=3, head_sha=HEAD, human_requirements=requirements, approved_plan_context=None,
-            acquisition_contract=None, seat_binding=seat_binding, prior_items=(),
-            configured_reviewer_names=["Codex", "Gemini"], completed_by_name=dict(completed),
-            resumed_by_name={}, rejection_reasons={name: "growth" for name in completed},
-            spool=spool or _Spool({}), bound_metadata=lambda **f: pr_loop.PostedRoundMetadata(**f),
-            post_comment=lambda *a, **k: posted.append(k["body"]), unresolved_items=(), blocked=False,
-        )
-        kwargs.update(overrides)
-        return sis.supersede_for_signed_growth(runner, **kwargs)
-
-    return records, resume, posted, call
-
-
-def test_unit_pure_growth_closes_the_round(tmp_path, monkeypatch):
-    records, resume, posted, call = _decision_inputs(tmp_path, monkeypatch)
-    closed = call(records)
-    assert len(posted) == 1 and closed is not resume
-    assert closed.completed_reviews == () and closed.reconciled
-    assert closed.reconciliation_record.metadata.phase == SIGNED_INPUT_SUPERSESSION_PHASE
-
-
-def test_unit_mixed_rejection_reasons_keep_the_refusal(tmp_path, monkeypatch):
-    records, resume, posted, call = _decision_inputs(tmp_path, monkeypatch)
-    seat = {"seat": "current"}
-    rebound = {
-        "Codex": dataclasses.replace(records["Codex"], metadata=dataclasses.replace(
-            records["Codex"].metadata, seat_binding=seat)),
-        "Gemini": dataclasses.replace(records["Gemini"], metadata=dataclasses.replace(
-            records["Gemini"].metadata, seat_binding={"seat": "old"})),
-    }
-    assert call(rebound, seat_binding=seat) is resume and posted == []
-    # A blocked route (recovery, conflict, evidence or conversion pass) never rolls over.
-    assert call(records, blocked=True) is resume and posted == []
-    # No published review at all: nothing was rejected, so nothing rolls over.
-    assert call({}) is resume and posted == []
-    # A one-reviewer board has no same-round peer: today's fresh turn applies.
-    assert call({"Codex": records["Codex"]}, configured_reviewer_names=["Codex"]) is resume and posted == []
-    # A reviewer not rejected at all (resumed) keeps the ordinary path.
-    assert call(records, resumed_by_name={"Codex": records["Codex"]}) is resume and posted == []
-
-
-@pytest.mark.parametrize("state", ["carrier", "malformed", "legacy"])
-def test_unit_partly_public_or_unknown_spool_of_unpublished_reviewer_keeps_stop(tmp_path, monkeypatch, state):
-    records, resume, posted, call = _decision_inputs(tmp_path, monkeypatch)
-    board = ["Codex", "Gemini", "Claude"]
-    spool = _Spool({"Claude": (state, {"bodies": ["sidecar"]} if state == "carrier" else None)})
-    # Codex and Gemini are public; Claude's carrier may be partly public
-    # without its anchor, so its PublicationResumeStop must stay in charge.
-    assert call(records, spool=spool, configured_reviewer_names=board) is resume
-    assert posted == [] and spool.removed == []
-    # Control: a provably unpublished third reviewer does not block rollover.
-    assert call(records, spool=_Spool({"Claude": ("fresh", None)}), configured_reviewer_names=board) is not resume
-    assert len(posted) == 1
-
-
-def test_unit_unproven_publications_and_budget(tmp_path, monkeypatch):
-    records, resume, posted, call = _decision_inputs(tmp_path, monkeypatch)
-    # Unreadable history (missing comment) and a fresh spool beside a public anchor.
-    assert call(records, edit_states={}) is resume
-    assert call(records, spool=_Spool({"Codex": ("fresh", None)})) is resume
-    assert call(records, spool=_Spool({"Codex": ("malformed", None)})) is resume
-    assert posted == []
-    with pytest.raises(AgentLoopError, match="after round 1"):
-        call(records, allowed_rounds=1)
-    assert posted == []
-
-
 # --- unit: growth classifier and integrity gate ------------------------------
-
-
-def test_unit_growth_classifier_cases(tmp_path, monkeypatch):
-    records, _resume, _posted, _call = _decision_inputs(tmp_path, monkeypatch)
-    record = records["Codex"]
-
-    def classify(rec, reqs, **kw):
-        args = dict(seat_binding=None, round_number=1, head_sha=HEAD, reconciled=False)
-        args.update(kw)
-        return response_validation.signed_input_growth_rejection(rec, reqs, **args)
-
-    live = _live_requirements(tmp_path)
-    old_ids = tuple(record.metadata.surfaced_reviewer_requirement_ids)
-    assert len(old_ids) == 1
-    superset = list(live)
-    assert classify(record, superset)
-    equal = [r for r in live if r.requirement_id in old_ids]
-    assert not classify(record, equal)
-    removed = [r for r in live if r.requirement_id not in old_ids]
-    assert not classify(record, removed)
-    legacy = dataclasses.replace(record, metadata=dataclasses.replace(
-        record.metadata, surfaced_reviewer_requirement_ids=("1",)))
-    assert not classify(legacy, superset)
-    assert not classify(record, superset, reconciled=True)
-    assert not classify(record, superset, round_number=2)
-    assert not classify(record, superset, head_sha="f" * 40)
-    assert not classify(record, superset, seat_binding={"seat": "x"})
-    assert not response_validation.signed_input_growth_rejection(
-        record, superset, None, {"Codex": ("other-model", "high")},
-        seat_binding=None, round_number=1, head_sha=HEAD, reconciled=False)
-
-
-def _live_requirements(tmp_path):
-    runner = FakeRunner()
-    runner.pr_payload["comments"].append(_signed("A human must accept the policy run.", 1))
-    runner.pr_payload["comments"].append(
-        _signed("The policy run is accepted; keep the policy check code-actionable.", 2))
-    return _parse_pr_human_requirements(runner.pr_payload)
-
-
-def test_unit_integrity_gate_cases():
-    import datetime
-    body = "frozen body"
-    carrier = PublicationCarrier(
-        bodies=("sidecar body", body), body_sha256=(
-            __import__("hashlib").sha256(b"sidecar body").hexdigest(),
-            __import__("hashlib").sha256(body.encode()).hexdigest()),
-        prepared_at="2026-11-21T10:00:00+00:00", actor_id=1, actor_login="bot",
-        baseline_ids=(), response_sha256="x", validation_context_digest="y").to_dict()
-    at = datetime.datetime(2026, 11, 21, 10, 1, tzinfo=datetime.timezone.utc)
-    sidecar = SimpleNamespace(comment_id=11, body="sidecar body", created=at)
-    anchor = SimpleNamespace(comment_id=12, body=body, created=at)
-    edited = SimpleNamespace(comment_id=12, body="edited", created=at)
-    assert sis.carrier_proves_unedited(carrier, [sidecar, anchor], (11, 12))
-    # Edited anchor: not complete.
-    assert not sis.carrier_proves_unedited(carrier, [sidecar, edited], (11, 12))
-    # Edited sidecar (prefix-zero shape) and disorder.
-    assert not sis.carrier_proves_unedited(carrier, [anchor], (11, 12))
-    swapped = [SimpleNamespace(comment_id=12, body="sidecar body", created=at),
-               SimpleNamespace(comment_id=11, body=body, created=at)]
-    assert not sis.carrier_proves_unedited(carrier, swapped, (11, 12))
-    # Matched comments must be exactly the record's own comments.
-    assert not sis.carrier_proves_unedited(carrier, [sidecar, anchor], (12,))
-    assert not sis.carrier_proves_unedited({"bodies": []}, [sidecar, anchor], (11, 12))
-    assert not sis.carrier_proves_unedited(carrier, None, (11, 12))
-    # Edit history: only a proven never-edited history passes.
-    assert sis.edit_history_proves_unedited({11: (), 12: ()}, (11, 12))
-    assert not sis.edit_history_proves_unedited({11: (), 12: None}, (11, 12))
-    assert not sis.edit_history_proves_unedited({11: ()}, (11, 12))
-    assert not sis.edit_history_proves_unedited({11: (), 12: (("t", "d"),)}, (11, 12))
-    assert not sis.edit_history_proves_unedited({}, ())
-
-
-def test_unit_changed_after_admission_is_unproven():
-    from coding_review_agent_loop.pr_round_ingestion import AdmittedPrComment
-    from coding_review_agent_loop.round_metadata import PostedRoundRecord
-    comment = AdmittedPrComment(author="bot", created_at=None, body="changed", comment_id=5, author_id=1,
-                                invocation_actor_id=1, admitted_body="original", admitted_protocol_body="original")
-    record = PostedRoundRecord(index=0, metadata=None, body="original")
-    assert sis.review_comment_ids([comment], record) is None
 
 
 def test_unit_supersession_payload_decoding():
@@ -869,7 +678,7 @@ def test_single_reviewer_board_whose_own_review_is_rejected_closes_the_round(tmp
     runner, config = _single_reviewer_publication(tmp_path, monkeypatch, carrier=carrier)
     spool = _round_spool(tmp_path, config)
     if carrier:
-        assert spool.publication_state("Codex")[0] == "carrier"
+        assert spool.publication_state("Codex") == "began"
     _follow_hint(runner)
     rids = _rids(runner)
     runner.codex_outputs = [_classified_review([_association(r, "code") for r in rids], hr=True)]
@@ -889,6 +698,6 @@ def test_single_reviewer_board_whose_own_review_is_rejected_closes_the_round(tmp
     assert [r.metadata.round_number for r in reviews if r.index < record.index] == [1]
     assert _agent_commands(runner)[before:] == ["codex"]
     assert [c["body"] for c in runner.pr_payload["comments"][:len(kept)]] == kept
-    assert spool.publication_state("Codex")[0] == "absent"
+    assert spool.publication_state("Codex") == "absent"
     assert _no_deletes(runner)
     assert not any("Delete these" in c or "partial-round recovery" in c for c in runner.comments)

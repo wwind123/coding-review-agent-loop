@@ -4317,14 +4317,16 @@ Execution model:
     resume accepted it or rejected it (for example after the signed requirement
     set changed, or a review recorded before any qualified panel opening). A
     sequential round's reviews are not peers of each other, so an interrupted
-    sequential round still resumes in the same round. A spool carrier that is
-    partly or fully public, or a malformed spool record whose publication state
-    cannot be excluded, also counts as a publication. A reviewer whose own published
+    sequential round still resumes in the same round. A spool record whose
+    publication began (it is marked just before the first post, so it may be
+    partly public), a record from an older release with unknown publication
+    progress, or a malformed spool record also counts as a publication, and
+    such a record is never resumed: its reviewer is unreplayable. A reviewer whose own published
     review was rejected always takes its fresh turn in the next round, even
     when its spool still holds a valid response. The record names the
     published reviewers (with comment IDs) and the unreplayable reviewers (with
     a short cause: no spooled outcome on this host, an outcome that no longer
-    validates, a malformed spool record, a carrier that cannot be resumed, or a
+    validates, a malformed spool record, a publication that already began, or a
     rejected own review). It carries the round's ledger, built from every
     completed review of the round: prior items stay open,
     the published reviews' findings become prior items of the next round under
@@ -4342,13 +4344,10 @@ Execution model:
     there. Nothing is deleted and no comment needs to be deleted, so managed-CI
     qualification records and their authorization binding stay intact.
   - A round with no published review is not closed: an unreplayable reviewer
-    simply takes its ordinary fresh turn in that round. A frozen carrier whose
-    complete actor-bound listing shows no public body is not a publication;
-    when its response no longer validates, the stale carrier is discarded and
-    the reviewer runs fresh in the same round.
-  - A failed GitHub comment, listing or identity read while deciding this (or
-    while posting a completed round's frozen bodies), and an evidence-conversion
-    record that could not be admitted as a trusted boundary, stop retryably:
+    simply takes its ordinary fresh turn in that round.
+  - A failed GitHub comment or identity read while deciding this, and an
+    evidence-conversion record that could not be admitted as a trusted
+    boundary, stop retryably:
     nothing is posted, no closure record is written, the spool is kept, and a
     rerun once reads succeed continues. Inside a recovery, conflict, evidence or
     conversion pass, which keep their own routes, a reviewer that would face a
@@ -4357,17 +4356,15 @@ Execution model:
     any qualified panel opening keeps its pre-panel safety stop
     (`--pr-review-force-full`). Signed-input growth (#2054) now takes the same
     closure; an existing `signed-input-supersession` record from an older
-    release still closes its round.
-  - A posted review whose only gap is the signed-source classification step
-    (#2035) is not refused. Classification runs after the round's reviews are
-    published, so a run that stopped there (for example, a reviewer's
-    classification exhausted its one judgement re-ask) leaves every independent
-    verdict public. When the round is unreconciled and the surfaced signed
-    requirement set is unchanged, a rerun resumes that review and redoes only
-    its classification. The published verdict and blocking findings are kept,
-    and a classification answer that changes them stops for a human decision
-    before any coder runs. Nothing needs deleting and no `--managed-ci-fresh`
-    is required.
+    release still closes its round (that reader is kept for one release
+    window).
+  - This closure is the only remedy for a partially published round (#2064).
+    There is no comment-deletion recovery list, no resume of a partly public
+    publication, and no classification-only resume: a posted review whose
+    signed-source classification never completed (#2035) is rejected by resume
+    like any other, so its round closes and the reviewer reviews again in the
+    next round. Nothing needs deleting and no `--managed-ci-fresh` is
+    required.
   - This closure covers only a round that was interrupted before its
     reconciliation. A PR round whose reconciliation is posted is closed
     (#1553): when a rerun needs a fresh reviewer turn there (for example, a
@@ -5578,13 +5575,11 @@ response semantics apply. A restart between the conversion record and the repeat
 reviews resumes the repeat; a reviewer that already reviewed after the conversion is
 resumed normally. The conversion record is a same-round visibility boundary (#1664):
 reviews posted before it belong to the pre-conversion pass, so they never make the
-repeat a partially published round, are never resumed as repeat reviews, and are never
-listed for deletion. A reviewer whose withheld pre-conversion outcome is still spooled
-is invoked fresh, because staging the repeat discards that spool. Within the repeat the
-partial-publish guard is unchanged: once one repeat-pass review is public, a reviewer
-that still needs a fresh turn is refused, and the recovery listing names only records
-posted after the conversion. If the conversion record cannot be located in the
-comment history when the stop is rendered, the stop gives no deletion list. A
+repeat a partially published round and are never resumed as repeat reviews. A reviewer
+whose withheld pre-conversion outcome is still spooled is invoked fresh, because staging
+the repeat discards that spool. Within the repeat the partial-publish guard is unchanged:
+once one repeat-pass review is public, a reviewer that still needs a fresh turn stops the
+run fail-closed (the repeat keeps its own route), with no deletion advice. A
 conversion record not authored by the authenticated orchestrator account, or whose
 audit is rejected, sets no boundary. A review that raises nothing new is evidence-only and approving, so
 the run reaches the final freeze; a new code finding dispatches the coder instead.
@@ -10238,7 +10233,8 @@ anchors, and the managed-CI audit comments.
   `GitHubAmbiguousWriteError` with the attempt history. Exhaustion raises
   `GitHubTransientExhaustedError`. Both state whether the last attempt is
   verified absent or unknown, name the surface and body index, and say that a
-  rerun resumes from the spool without re-invoking reviewers.
+  rerun never re-invokes the round's reviewers: an unposted spooled outcome is
+  replayed, and a begun publication closes the round as incomplete (#2064).
 - **Round transport.** Bodies are posted strictly in order; reconciliation runs
   inside each body, so a sidecar accepted despite a 5xx is recovered before the
   next body, and adopted IDs are claimed so two identical bodies cannot match
@@ -10252,50 +10248,31 @@ anchors, and the managed-CI audit comments.
 ### Resuming a spooled review publication
 
 A parallel review round keeps each reviewer's validated response in a private
-local spool (#1025). Just before its first post, the exact prepared bodies are
-frozen into that reviewer's record together with the authenticated actor, a
-digest of the response, a digest of the validation context (the head or plan
-candidate and the surfaced requirements) and a baseline of already-identical
-comments. A rerun, at any later time, never recomposes those bodies and never
-re-invokes the reviewer:
+local spool (#1025). Just before its first post, that reviewer's record is
+marked as begun (a local mark only; nothing is frozen or listed). A begun
+publication is never resumed (#2064):
 
 - Every existing record is checked first, before a new scheduler checkpoint and
-  before any reviewer launches, including a reviewer whose anchor is already
-  public (its carrier is never discarded unchecked, and a legacy record is
-  migration-checked even when its anchor is public). Every record is gated and
-  classified first; only when all pass is any verified missing suffix posted. A
-  spool file that exists but cannot be decoded, or a `publication` field that is null,
-  not a mapping, or beside an unreadable response, is malformed and stops the run, as is a record carrying publication state whose schema or identity (for example the subject) is damaged: it is never treated as absent or foreign. If some reviewer still needs a fresh
-  turn, posting waits for the round to settle, and a carrier that is already
-  partly public (sidecars without an anchor) closes the round instead
-  (#2064), because the fresh reviewer would read those attachments. Whether a reviewer needs a fresh
-  turn is decided from validated replayability: a not-yet-public reviewer whose
-  spooled response is readable but no longer validates counts as a fresh turn.
-- Publication does not begin without a usable carrier: if the authenticated actor
-  or a complete pre-publication baseline listing is unavailable, the run stops
-  retryably before the first post with the validated response still spooled.
-- Listings are compared exactly after the single known host footer is removed, so
-  a stored body with a doubled footer is neither adopted nor counted public, and a
-  listing comment without a text body makes the listing incomplete.
-- It re-runs the normal validation of the spooled response, checks the response
-  and context digests and the anchor's round metadata, and requires the same
-  authenticated actor ID. A failed read stops retryably with the record kept;
-  any mismatch closes an unreconciled round with a closed-incomplete record
-  (#2064), with nothing else posted and no reviewer launched.
-- It then classifies the whole frozen sequence against a complete listing bound
-  to the original actor. All bodies public: nothing is posted and the record is
-  removed. A strictly public prefix: only the missing suffix is posted verbatim.
-  A gap (an absent body followed by a public later one) or an ambiguous or
-  out-of-order match closes an unreconciled round with a closed-incomplete
-  record (#2064); an unreadable listing stops retryably without posting.
-  A reconciled planning round is closed history: recovery lists no comments or
-  attachments for deletion. Necessary fresh reviews advance to the next round
-  within the configured round budget, without another planner turn.
-- Records written before this protocol are legacy and carry no actor. A complete
-  listing of every author must show no round-transport sidecar and no anchor for
-  this reviewer and round created after the record was written; otherwise the
-  possible earlier publication closes the round (#2064), and an incomplete
-  listing stops retryably.
+  before any reviewer launches. A record whose publication began, a record from
+  an older release with unknown publication progress, a spool file that exists
+  but cannot be decoded, a `publication` field that is null or not a mapping, or
+  a record carrying publication state whose schema or identity (for example the
+  subject) is damaged may be partly public, so it is never treated as absent,
+  replayed or re-posted. Unless resume already admitted that reviewer's public
+  anchor (the publication completed and the stale record is discarded), its
+  reviewer is unreplayable and the unreconciled round closes with a
+  closed-incomplete record and rolls over to the next round, with nothing else
+  posted and no reviewer launched in the closed round.
+- A record whose publication never began is replayed through the normal
+  validation of the spooled response; whether a reviewer needs a fresh turn is
+  decided from validated replayability: a not-yet-public reviewer whose spooled
+  response is readable but no longer validates counts as a fresh turn.
+- Older releases froze the prepared bodies and resumed a missing suffix; those
+  frozen records are read as begun publications, so the round closes instead.
+  No comment needs to be deleted.
+- A reconciled planning round is closed history: necessary fresh reviews
+  advance to the next round within the configured round budget, without
+  another planner turn.
 
 ### Issue creation, labels, ready transitions and merge
 

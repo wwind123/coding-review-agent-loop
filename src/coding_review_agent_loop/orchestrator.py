@@ -689,12 +689,6 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
-from .partial_round_recovery import (
-    PartialRoundRecovery,
-    RecoveryTarget,
-    RecoveryVisibilityContext,
-    compute_partial_round_recovery,
-)
 from .round_visibility import latest_round_checkpoint_index, visible_peer_names
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
@@ -1004,7 +998,6 @@ from .review_rounds import (
     _spooled_response_fields,
     _incomplete_plan_review_error,
     _incomplete_pr_review_error,
-    PartialReviewRoundError,
     _replay_unavailable_cause,
     _partial_round_refusal,
     _replay_spooled_failure,

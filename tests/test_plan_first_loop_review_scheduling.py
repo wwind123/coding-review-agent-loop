@@ -3005,7 +3005,7 @@ def _round_one_plan_spool(runner, config):
         config, surface="issue", number=56, round_number=1, subject=codex.subject)
 
 
-# --- item-5: plan-loop own-publication and carrier-stop-routing workflows ------------
+# --- item-5: plan-loop own-publication workflows ------------------------------------
 
 
 @pytest.mark.parametrize("review_parallel", [True, False], ids=["parallel", "sequential"])
@@ -3058,73 +3058,3 @@ def test_plan_own_rejected_publication_closes_and_discards_the_replayable_peer(t
     assert not any("Delete these" in body for body in runner.comments)
 
 
-@pytest.mark.parametrize("failure", ["listing", "actor"])
-def test_plan_carrier_read_failure_at_classification_is_retryable_and_keeps_the_spool(
-    tmp_path, monkeypatch, failure
-):
-    """`carrier-stop-routing` (plan, round start): no closure, nothing posted, spool kept;
-    a rerun with healthy reads then closes the round normally."""
-    import dataclasses as _dc
-    from coding_review_agent_loop import plan_first_loop, publication_resume
-    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
-    from test_review_parallel import _exhausted_plan, _spool_files
-
-    runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
-    runner.issue_comments = [c for c in runner.issue_comments if "Gemini independent plan approval." not in c["body"]]
-    for path in _spool_files(config):
-        if path.name == "Gemini.json":
-            path.unlink()  # Gemini needs a fresh turn beside the partly public carrier
-    spooled = {path: path.read_bytes() for path in _spool_files(config)}
-    comments_before = len(runner.issue_comments)
-    launches_before = list(runner.reviewer_launches)
-    with monkeypatch.context() as patch_:
-        if failure == "listing":
-            patch_.setattr(publication_resume.RoundPublication, "_complete", lambda self, actor: (_ for _ in ()).throw(
-                self._stop("the conversation could not be read completely (HTTP 502).", category="read")))
-        else:
-            real = plan_first_loop.round_publication
-
-            def actor_fails(*args, **kwargs):
-                def unavailable():
-                    raise AgentLoopError("actor lookup failed (HTTP 502)")
-                return _dc.replace(real(*args, **kwargs), resolve_actor=unavailable)
-
-            patch_.setattr(plan_first_loop, "round_publication", actor_fails)
-        with pytest.raises(RoundStateReadError, match="rerun once GitHub comment reads succeed"):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-
-    assert len(runner.issue_comments) == comments_before
-    assert not _plan_closures(runner)
-    assert runner.reviewer_launches == launches_before
-    assert {path: path.read_bytes() for path in _spool_files(config)} == spooled
-
-
-def test_plan_read_failure_while_publishing_keeps_outcomes_spooled_and_a_rerun_replays_them(tmp_path, monkeypatch):
-    """`carrier-stop-routing` (plan, publication time): retryable, outcomes kept and replayed."""
-    from coding_review_agent_loop import publication_resume
-    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
-    from test_review_parallel import _plan_partial_round_runner, _published_count, _spool_files
-    from agent_loop_helpers import make_config
-
-    runner, markers = _plan_partial_round_runner()
-    runner.authenticated_actor = ("agent-bot", 7)
-    runner.serve_rest_issue_comments = True
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-
-    def freeze_read_fails(self, bodies):
-        raise self._stop("a publication carrier could not be frozen because the pre-publication "
-                         "baseline listing is incomplete (HTTP 502).", category="read")
-
-    with monkeypatch.context() as patch_:
-        patch_.setattr(publication_resume.RoundPublication, "_freeze", freeze_read_fails)
-        with pytest.raises(RoundStateReadError):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert not any(_published_count(runner, marker) for marker in markers)
-    assert len(_spool_files(config)) == 2
-    launches_before = list(runner.reviewer_launches)
-
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-
-    assert runner.reviewer_launches == launches_before  # replayed, not re-run
-    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
-    assert not _plan_closures(runner)

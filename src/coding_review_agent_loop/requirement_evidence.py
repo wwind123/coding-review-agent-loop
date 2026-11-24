@@ -1,5 +1,5 @@
 """Reviewer-owned signed-source routing; classification never grants acceptance."""
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from .errors import AgentLoopError, MissingJudgementFieldError, render_human_decision
 from .github import HumanReviewRequirement
@@ -364,20 +364,11 @@ CLASSIFICATION_INVOKE_OPTIONS = {
 }
 
 
-def _pinned_signature(review):
-    """The published verdict and findings a restored review must keep (#2035)."""
-    return (review.state, tuple(" ".join(str(item.text).split()) for item in review.blocking_items))
-
-
-def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke, previous=None,
-                    force_continuation=False, pinned_review=None):
+def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke, previous=None):
     """Settle unacknowledged source routing with one bounded semantic continuation.
 
-    ``force_continuation`` runs the continuation even when no existing trigger
-    fires (a published review whose classification never completed).
-    ``pinned_review`` applies to every continuation that runs: a review restored
-    from a published record may change only its classification once its peers
-    are public, so a changed verdict or finding stops for a human decision.
+    A published review is never restored for a classification-only
+    continuation: resume rejects it and its round closes as incomplete (#2064).
     """
     from .protocol import human_requirements_resolved
     classified = {e["requirement_id"] for e in parsed.requirement_evidence}
@@ -390,7 +381,7 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
             p["requirement_id"] == e["requirement_id"] and p["role"] != e["role"]
             for _, p in previous_entries)]
 
-    if (force_continuation and requirements) or conflicts_with_previous(parsed) or (requirements and missing
+    if conflicts_with_previous(parsed) or (requirements and missing
             and (parsed.requirement_evidence or not human_requirements_resolved(text))):
         import json
         from .errors import HumanDecisionRequiredError
@@ -408,27 +399,8 @@ def classify_review(parsed, text, *, requirements, items, reviewer_name, invoke,
             "This is a real semantic reviewer turn; do not invent instructions. Agreement is decided by role; "
             "leftover wording need not match other reviewers. " + SUPERSEDED_GUIDANCE + "\nSigned sources: "
             + json.dumps(sources) + "\nPrior classifications to reconcile: " + json.dumps(prior) + "\nPrior items: " + repr(items) + "\nPrevious review:\n" + text)
-        if pinned_review is not None:
-            prompt += ("\nThis review is already published and its peers are public: its verdict "
-                "(state) and blocking_items are final and must be returned unchanged. Supply only "
-                "requirement_evidence (and any linked exact-head evidence request)"
-                + (", reconciling your role with the prior classifications above." if prior else "."))
         response = invoke(prompt)
         parsed, text = response.marker_value, response.text
-        if pinned_review is not None:
-            if _pinned_signature(parsed) != _pinned_signature(pinned_review):
-                raise HumanDecisionRequiredError.decision(
-                    what=(
-                        f"{reviewer_name}'s review was restored from its published record, and its "
-                        "signed-source classification continuation changed the published verdict or "
-                        "findings. A restored review cannot change its verdict or findings after its "
-                        "peers are public; no coder was dispatched."),
-                    clear=("Post a new follow-up signed comment that clarifies the signed sources, "
-                           "then rerun the same command."),
-                    safe_to_automate=False,
-                    automation_note="the clarifying signed comment must come from a human.")
-            parsed = replace(pinned_review, requirement_evidence=parsed.requirement_evidence,
-                             exact_head_evidence_requests=parsed.exact_head_evidence_requests)
         if {r.requirement_id for r in requirements} - {e["requirement_id"] for e in parsed.requirement_evidence}:
             raise HumanDecisionRequiredError.decision(
                 what="Signed-source classification remained absent; no coder was dispatched for human evidence.",

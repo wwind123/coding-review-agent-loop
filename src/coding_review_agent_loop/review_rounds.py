@@ -1,4 +1,4 @@
-"""Review outcome classification, round-ledger helpers, reviewer-turn launch, spool replay and partial-round refusal.
+"""Review outcome classification, round-ledger helpers, reviewer-turn launch, spool replay and the round-incomplete invariants.
 
 Extracted from ``orchestrator.py`` as a pure move (#1181, #1195); the
 orchestrator re-exports every name defined here.
@@ -45,13 +45,11 @@ from .round_state import (
     _live_round_resolved_item_ids,
     _extract_round_metadata_records,
 )
-from .publication_resume import PublicationResumeStop
 from .round_closure_writer import (
     RoundIncompleteSignal,
     RoundStateReadError,
     round_incomplete_signal,
     round_state_read_error,
-    route_publication_stop,
 )
 from . import quota_wait
 from .scratch import make_private_dirs
@@ -912,105 +910,42 @@ def _replay_spooled_review(
     )
 
 
+_UNRESUMABLE_PUBLICATION_CAUSES = {
+    "began": "its same-round publication began and may be partly public",
+    "legacy": "its spool record predates the publication protocol and may be partly public",
+    "malformed": "its spool record is malformed or unreadable",
+}
+
+
 def _preflight_spooled_publications(
-    runner: Runner,
     *,
-    config: AgentLoopConfig,
     spool: ReviewRoundSpool,
     reviewers: Sequence[AgentName],
-    validators_for: Callable[[str], dict[str, object]],
-    publication_for: Callable[[str], object],
     published_names: Sequence[str] = (),
-    post_frozen: Callable[[object], object] | None = None,
-    selected_reviewers: Sequence[AgentName] | None = None,
 ) -> None:
     """Check every existing spool record before any checkpoint or reviewer launch (#1258).
 
-    A frozen carrier is revalidated in the current context, then bound to its
-    response, validation context and original actor, and its whole sequence is
-    classified against a complete listing.  A legacy record is checked across
-    every author.  Any failure raises with the record kept, nothing posted and
-    nothing launched: a failed read is a retryable ``RoundStateReadError``, any
-    other carrier failure a ``RoundIncompleteSignal`` that closes the round
-    (#2064).  Reviewers whose anchor is already public are still
-    checked, so a rerun can never discard a carrier unchecked.
-
-    The missing suffix of a verified carrier is posted here (before a new
-    checkpoint) unless some selected reviewer still needs a fresh turn, which
-    must not run beside a newly public peer body (#1025).  Fresh-turn necessity
-    is decided here from *validated replayability*: a selected reviewer that is
-    not already public needs a fresh turn unless its spooled outcome is a
-    settled failure or its spooled response still validates in this context.
+    A publication that began is never resumed (#2064): a record marked as
+    begun, a legacy record with unknown progress, or a malformed record may
+    hide a partly public publication, so unless that reviewer's anchor is
+    already public (resume admitted it and the stale record is discarded) the
+    round is incomplete and ``RoundIncompleteSignal`` closes it.  Nothing is
+    posted and no reviewer is launched here.
     """
     published = set(published_names)
-    plans: list[tuple[str, object]] = []
-    # Phase 1: gate and classify EVERY record.  Nothing is posted until all pass,
-    # so a later refusing record can never follow an earlier record's posts.
     for reviewer in reviewers:
         name = agent_display_name(reviewer)
-        state, _raw = spool.publication_state(name)
+        state = spool.publication_state(name)
         if state in {"absent", "fresh"}:
             continue
-        if state == "carrier":
-            fields = spool.load(name)
-            replayed = (
-                _replay_spooled_review(
-                    runner, config=config, reviewer=reviewer, fields=fields,
-                    validators=validators_for(name),
-                )
-                if fields is not None and "failure" not in fields
-                else None
-            )
-            if replayed is None:
-                raise round_incomplete_signal(
-                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
-                    published=(*sorted(published), name),
-                    unreplayable=((name, "its frozen same-round publication no longer validates"),),
-                )
-        try:
-            plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
-        except PublicationResumeStop as exc:
-            raise route_publication_stop(
-                exc, surface=spool.surface, number=spool.number, round_number=spool.round_number,
-                reviewer_name=name, published=sorted(published),
-            ) from exc
-        if plan is not None:
-            plans.append((name, plan))
-    defer_posting = False
-    fresh_name = ""
-    for reviewer in selected_reviewers if selected_reviewers is not None else reviewers:
-        name = agent_display_name(reviewer)
-        fresh_name = name
         if name in published:
+            spool.remove(name)
             continue
-        outcome = spool.load(name)
-        if outcome is None:
-            defer_posting = True
-        elif "failure" not in outcome and _replay_spooled_review(
-            runner, config=config, reviewer=reviewer, fields=outcome,
-            validators=validators_for(name),
-        ) is None:
-            defer_posting = True
-        if defer_posting:
-            break
-    partial = [
-        name for name, plan in plans
-        if 0 < len(plan.already_public) < len(plan.bodies)  # type: ignore[attr-defined]
-    ]
-    if defer_posting and partial:
-        # Public sidecars carry no round metadata, so the peer-visibility guard
-        # cannot see them; a fresh turn now would read them.
         raise round_incomplete_signal(
             surface=spool.surface, number=spool.number, round_number=spool.round_number,
-            published=(*sorted(published), *partial),
-            unreplayable=((fresh_name, "it needs a fresh turn beside a partly public carrier"),),
+            published=(*sorted(published), name),
+            unreplayable=((name, _UNRESUMABLE_PUBLICATION_CAUSES[state]),),
         )
-    if defer_posting or post_frozen is None:
-        return
-    # Phase 2: every gate passed, so publish the verified suffixes.
-    for _name, plan in plans:
-        if len(plan.already_public) < len(plan.bodies):  # type: ignore[attr-defined]
-            post_frozen(plan)
 
 
 def _spooled_ignored_disposition_ids(value: object) -> tuple[str, ...] | None:
@@ -1063,10 +998,6 @@ def _incomplete_pr_review_error(reviewer_name: str) -> AgentLoopError:
     )
 
 
-class PartialReviewRoundError(AgentLoopError):
-    """Retained until #2064 stage 3; no review path raises it any more."""
-
-
 def _replay_unavailable_cause(
     spool: ReviewRoundSpool,
     reviewer_name: str,
@@ -1078,7 +1009,7 @@ def _replay_unavailable_cause(
     """Why this reviewer's withheld outcome cannot be replayed (#1142).
 
     ``own_posted_reason`` names the failing resume predicate for a posted review
-    that a classification-only resume could not admit either (#2035).
+    (#2035); the round then closes as incomplete (#2064).
     """
     if own_posted:
         because = f" (resume rejected it because {own_posted_reason})" if own_posted_reason else ""
@@ -1300,19 +1231,19 @@ def _launch_reviewer_turns(
             if reviewer in already_posted:
                 spool.remove(reviewer_name)
                 continue
+            state = spool.publication_state(reviewer_name)
+            if state in _UNRESUMABLE_PUBLICATION_CAUSES:
+                # A begun publication may already be partly public: it is never
+                # replayed or resumed, and a fresh turn would read its own
+                # sidecars.  Close the round instead (#1258, #2064).
+                raise round_incomplete_signal(
+                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                    published=(*sorted(agent_display_name(p) for p in public_peers if p != reviewer),
+                               reviewer_name),
+                    unreplayable=((reviewer_name, _UNRESUMABLE_PUBLICATION_CAUSES[state]),),
+                )
             fields = spool.load(reviewer_name)
             if fields is None:
-                if spool.publication_state(reviewer_name)[0] == "malformed" and not any(
-                    peer != reviewer for peer in public_peers
-                ):
-                    # An undecodable record may hide a published prefix: close
-                    # rather than launch a fresh turn beside it (#1258, #2064).
-                    # With a public peer the invariant below closes the round.
-                    raise round_incomplete_signal(
-                        surface=spool.surface, number=spool.number, round_number=spool.round_number,
-                        published=(reviewer_name,),
-                        unreplayable=((reviewer_name, "its spool record is malformed or unreadable"),),
-                    )
                 continue
             replay_fallbacks.append(reviewer)
             failure = _replay_spooled_failure(fields, reviewer_name)
@@ -1321,16 +1252,6 @@ def _launch_reviewer_turns(
                 if failure is not None
                 else replay_turn(reviewer, fields)
             )
-            if result is None and spool.publication_state(reviewer_name)[0] in {"carrier", "malformed"}:
-                # A frozen publication may already be partly public: a fresh
-                # turn would read its own sidecars, and an unvalidated body must
-                # never be published.  Close the round instead (#1258, #2064).
-                raise round_incomplete_signal(
-                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
-                    published=(*sorted(agent_display_name(p) for p in public_peers if p != reviewer),
-                               reviewer_name),
-                    unreplayable=((reviewer_name, "its frozen same-round publication no longer validates"),),
-                )
             if result is not None:
                 results[reviewer] = result
                 replayed.add(reviewer)
@@ -1446,13 +1367,16 @@ def _launch_reviewer_turns(
         for reviewer, result in results.items():
             try:
                 published_now = on_completion(reviewer, result)
-            except PublicationResumeStop as exc:
-                # A read failure keeps every unpublished outcome spooled for a
-                # rerun; a structural carrier failure closes the round (#2064).
-                raise route_publication_stop(
-                    exc, surface=spool.surface, number=spool.number,
-                    round_number=spool.round_number, reviewer_name=agent_display_name(reviewer),
-                    published=(*sorted(agent_display_name(p) for p in public_peers), *posted_now),
+            except RoundIncompleteSignal as exc:
+                # Defensive: a begun publication is closed before replay (#2064).
+                raise round_incomplete_signal(
+                    surface=spool.surface, number=spool.number,
+                    round_number=spool.round_number,
+                    published=tuple(dict.fromkeys((
+                        *sorted(agent_display_name(p) for p in public_peers), *posted_now,
+                        agent_display_name(reviewer),
+                    ))),
+                    unreplayable=exc.unreplayable,
                     before_publication=not posted_now,
                 ) from exc
             if published_now:

@@ -1152,126 +1152,14 @@ def _requirement_identity_set_equal(
 ) -> bool:
     """Exact digest-identity equality; stricter than approval coverage (#2035).
 
-    A classification-only resume must not straddle a signed requirement that was
-    added, edited or withdrawn after publication, so a superset never matches.
-    Legacy positional labels never match.
+    Names a signed requirement added, edited or withdrawn after publication in
+    a posted review's rejection reason, so a superset never matches.  Legacy
+    positional labels never match.
     """
     persisted = {str(item) for item in persisted_ids}
     if any(not re.fullmatch(r"hr-[0-9a-f]{64}", item) for item in persisted):
         return False
     return set(_reviewer_requirement_identity_ids(human_requirements)) == persisted
-
-
-def classification_resume_kind(
-    record: PostedRoundRecord,
-    human_requirements: Sequence[HumanReviewRequirement],
-    approved_plan_context: ApprovedPlanContext | None = None,
-    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
-    *,
-    items: Sequence[object] = (),
-    round_number: int | None = None,
-    head_sha: str | None = None,
-) -> str | None:
-    """Admit a published review whose only gap is signed-source classification (#2035).
-
-    Returns ``"complete"`` when the record's validated associations already
-    cover every current source (any phase, so a settlement written after a
-    successful classification stays resumable), ``"pending"`` for a
-    publication-phase record whose classification never completed, and
-    ``None`` otherwise.  Callers exclude reconciled rounds and check the seat
-    binding; a record the ordinary predicate accepts is never reclassified.
-    """
-    from .review_scope import is_complete_code_review
-    from .requirement_evidence import parse_associations, validate_associations
-
-    metadata = record.metadata
-    if not human_requirements:
-        return None
-    if round_number is not None and metadata.round_number != round_number:
-        return None
-    if head_sha is not None and metadata.subject != head_sha:
-        return None
-    # A complete code review is always capture-resumable; scoped evidence
-    # reviews never carry the classification step.
-    if not is_complete_code_review(metadata):
-        return None
-    if not _resumed_pr_reviewer_identity_matches(
-        record, approved_plan_context, reviewer_acquisition_contract
-    ):
-        return None
-    if _resumed_pr_reviewer_matches_requirements(
-        record, human_requirements, approved_plan_context, reviewer_acquisition_contract
-    ):
-        return None
-    if not _requirement_identity_set_equal(
-        human_requirements, metadata.surfaced_reviewer_requirement_ids
-    ):
-        return None
-    try:
-        associations = parse_associations(list(metadata.requirement_evidence))
-    except AgentLoopError:
-        return None
-    current = {requirement.requirement_id for requirement in human_requirements}
-    classified = {entry["requirement_id"] for entry in associations}
-    if classified == current:
-        try:
-            validate_associations(
-                _AssociationCarrier(associations, tuple(metadata.evidence_requests)),
-                human_requirements, items, metadata.agent,
-            )
-        except AgentLoopError:
-            return None
-        return "complete"
-    if metadata.phase == "publication" and not current <= classified:
-        return "pending"
-    return None
-
-
-@dataclass(frozen=True)
-class _AssociationCarrier:
-    requirement_evidence: tuple[dict, ...]
-    exact_head_evidence_requests: tuple[str, ...]
-
-
-def admit_classification_resumes(
-    completed_by_name: Mapping[str, PostedRoundRecord],
-    resumed_by_name: dict[str, PostedRoundRecord],
-    human_requirements: Sequence[HumanReviewRequirement],
-    approved_plan_context: ApprovedPlanContext | None,
-    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None,
-    *,
-    seat_binding: object,
-    items: Sequence[object],
-    round_number: int,
-    head_sha: str,
-    reconciled: bool,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Merge classification-only resumes into ``resumed_by_name`` (#2035).
-
-    Returns each admitted reviewer's kind and, for every posted review still
-    rejected, the reason the partial-round refusal names.  A reconciled round
-    admits neither kind, so the closed-round gate keeps today's behaviour.
-    """
-    kinds: dict[str, str] = {}
-    reasons: dict[str, str] = {}
-    for name, record in completed_by_name.items():
-        if name in resumed_by_name:
-            continue
-        kind = None
-        if not reconciled and (seat_binding is None or record.metadata.seat_binding == seat_binding):
-            kind = classification_resume_kind(
-                record, human_requirements, approved_plan_context, reviewer_acquisition_contract,
-                items=items, round_number=round_number, head_sha=head_sha,
-            )
-        if kind is not None:
-            resumed_by_name[name] = record
-            kinds[name] = kind
-            continue
-        reasons[name] = posted_review_rejection_reason(
-            record, human_requirements, approved_plan_context, reviewer_acquisition_contract,
-            seat_binding=seat_binding, round_reconciled=reconciled,
-        )
-    return kinds, reasons
 
 
 def posted_review_rejection_reason(
@@ -1283,7 +1171,7 @@ def posted_review_rejection_reason(
     seat_binding: object = None,
     round_reconciled: bool = False,
 ) -> str:
-    """Name why resume rejected a posted review, for the partial-round refusal (#2035)."""
+    """Name why resume rejected a posted review, for the round's closed-incomplete record (#2035, #2064)."""
     if round_reconciled:
         return "the round is already reconciled"
     if seat_binding is not None and record.metadata.seat_binding != seat_binding:
@@ -1309,51 +1197,6 @@ def posted_review_rejection_reason(
     if human_requirements:
         return "its recorded signed-source classification is invalid for the current sources"
     return "it no longer matches this run's review contract"
-
-
-def signed_input_growth_rejection(
-    record: PostedRoundRecord,
-    human_requirements: Sequence[HumanReviewRequirement],
-    approved_plan_context: ApprovedPlanContext | None = None,
-    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
-    *,
-    seat_binding: object = None,
-    round_number: int,
-    head_sha: str,
-    reconciled: bool,
-) -> bool:
-    """Whether resume rejected this posted review only because the signed set grew (#2054).
-
-    True only for a complete code review of this round and head, in an
-    unreconciled round, whose seat binding and non-classification identity
-    (plan, acquisition, evidence consistency) still match, and whose persisted
-    digest IDs are a strict subset of the live set.  A withdrawn or edited
-    source (a persisted ID missing from the live set), legacy labels or any
-    other failing predicate keep the partial-round refusal.  Metadata alone
-    never proves the published body is unedited; callers also apply the
-    publication-integrity gate.
-    """
-    from .review_scope import is_complete_code_review
-
-    metadata = record.metadata
-    if reconciled or not human_requirements:
-        return False
-    if metadata.round_number != round_number or metadata.subject != head_sha:
-        return False
-    if not is_complete_code_review(metadata):
-        return False
-    if seat_binding is not None and metadata.seat_binding != seat_binding:
-        return False
-    if _resumed_pr_reviewer_identity_rejection(
-        record, approved_plan_context, reviewer_acquisition_contract
-    ) is not None:
-        return False
-    persisted = [str(item) for item in metadata.surfaced_reviewer_requirement_ids]
-    # An empty persisted set (published before any signed source) is growth too.
-    if any(not re.fullmatch(r"hr-[0-9a-f]{64}", item) for item in persisted):
-        return False
-    live = set(_reviewer_requirement_identity_ids(human_requirements))
-    return set(persisted) < live
 
 
 def _validate_plan_revision_response(

@@ -634,7 +634,7 @@ def test_1553_conflict_resume_keeps_the_coder_route_in_the_closed_round(tmp_path
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
 
-    assert not isinstance(excinfo.value, review_rounds.PartialReviewRoundError)
+    assert not hasattr(review_rounds, "PartialReviewRoundError")
     assert _agent_sequence(runner)[before_agents:] == ["claude"]
     # Only the coder's own dispatch record follows: no scheduler checkpoint,
     # reviewer record or reconciliation, in round 2 or a rolled-over round.
@@ -653,7 +653,7 @@ def test_1553_rollover_at_the_round_limit_stops_with_the_round_limit_diagnostic(
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, max_rounds=2))
 
-    assert not isinstance(excinfo.value, review_rounds.PartialReviewRoundError)
+    assert not hasattr(review_rounds, "PartialReviewRoundError")
     assert "Delete these" not in str(excinfo.value)
     expected = pr_loop._round_limit_diagnostic(
         pr_number=77, round_number=2, items=[], current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",

@@ -10,9 +10,10 @@ preflight, scheduler checkpoint or reviewer launch:
 
 A *publication* is a published withheld-round review (resumed or rejected by
 resume), a reviewer's own published review that resume rejected, or a spool
-record that may be public: a frozen carrier with public bodies according to
-a complete actor-bound listing, or a malformed record whose publication state
-cannot be excluded.  A verified unpublished carrier is not a publication.
+record that may be public: a record whose publication began, a legacy record
+with unknown publication progress, or a malformed record whose publication
+state cannot be excluded.  Such a record is never resumed, so its reviewer
+also needs a fresh turn.
 
 A reviewer *needs a fresh turn* when its own published round-N review was
 rejected by resume (always, whatever its spool holds), or when it would take
@@ -125,28 +126,6 @@ def round_state_read_error(*, surface: str, number: int, round_number: int, deta
     )
 
 
-def route_publication_stop(exc: AgentLoopError, *, surface: str, number: int, round_number: int,
-                           reviewer_name: str, published: Sequence[str] = (),
-                           before_publication: bool = True) -> AgentLoopError:
-    """Route a retained carrier-machinery stop by category (#2064 stage 2).
-
-    ``read`` (a failed listing, actor or age read) becomes a retryable
-    :class:`RoundStateReadError` with the spool kept; ``structural`` (a
-    malformed, mismatched or possibly public carrier) becomes a
-    :class:`RoundIncompleteSignal` that closes the round.
-    """
-    category = getattr(exc, "category", "structural")
-    if category == "read":
-        return round_state_read_error(surface=surface, number=number, round_number=round_number,
-                                      detail=str(exc))
-    return round_incomplete_signal(
-        surface=surface, number=number, round_number=round_number,
-        published=tuple(dict.fromkeys((*published, reviewer_name))),
-        unreplayable=((reviewer_name, "its frozen same-round publication cannot be resumed"),),
-        before_publication=before_publication,
-    )
-
-
 # -- decision -----------------------------------------------------------------
 
 
@@ -191,16 +170,17 @@ def decide_round_closure(
     )
 
 
-_CARRIER_STATES = frozenset({"carrier", "legacy"})
+_POSSIBLY_PUBLIC_STATES = {
+    "began": "its same-round publication began and may be partly public",
+    "legacy": "its spool record predates the publication protocol and may be partly public",
+    "malformed": "its spool record is malformed or unreadable",
+}
 
 
 @dataclass
 class RoundClassification:
     publications: dict[str, int | None]
     fresh_turns: dict[str, str]
-    # Verified unpublished carriers whose response no longer validates: their
-    # stale record is discarded when the round does not close.
-    stale_unpublished: list[str]
 
 
 def classify_round_reviewers(
@@ -217,22 +197,25 @@ def classify_round_reviewers(
     rejection_reasons: Mapping[str, str],
     spool: object,
     validators_for: Callable[[str], dict[str, object]],
-    publication_for: Callable[[str], object],
     comment_id_for: Callable[[object], int | None],
+    resumed_names: Collection[str] = (),
 ) -> RoundClassification:
-    """Collect the round's publications and fresh-turn needs (reads, no posts).
+    """Collect the round's publications and fresh-turn needs (local reads, no posts).
 
     ``published_records`` are resumed public withheld-round reviews,
     ``rejected_records`` the reviewers' own published reviews resume rejected,
-    and ``turn_names`` the reviewers the round would otherwise invoke.
+    and ``turn_names`` the reviewers the round would otherwise invoke.  A
+    spool record whose publication began (or may have) is never resumed: it
+    is both a publication and a fresh-turn need, so the round closes.  The
+    exception is a reviewer in ``resumed_names``: resume admitted its public
+    anchor (the last body), so its publication completed and the record is
+    stale (the spool preflight discards it).
     """
     from .agents.registry import agent_display_name
-    from .publication_resume import PublicationResumeStop
     from .review_rounds import _replay_spooled_review
 
     publications: dict[str, int | None] = {}
     fresh: dict[str, str] = {}
-    stale: list[str] = []
     for name, record in (*published_records.items(), *rejected_records.items()):
         publications[name] = comment_id_for(record)
     for name in rejected_records:
@@ -242,36 +225,18 @@ def classify_round_reviewers(
         )
     for reviewer in reviewers:
         name = agent_display_name(reviewer)  # type: ignore[arg-type]
-        if name in published_records or name in rejected_records:
+        if name in published_records or name in rejected_records or name in resumed_names:
             continue
-        state, _raw = spool.publication_state(name)  # type: ignore[attr-defined]
-        verified_unpublished = False
-        if state == "malformed":
-            # An undecodable record may hide a published prefix (#1258).
+        state = spool.publication_state(name)  # type: ignore[attr-defined]
+        if state in _POSSIBLY_PUBLIC_STATES:
             publications.setdefault(name, None)
-            fresh[name] = "its spool record is malformed or unreadable"
+            fresh[name] = _POSSIBLY_PUBLIC_STATES[state]
             continue
-        if state in _CARRIER_STATES:
-            try:
-                plan = publication_for(name).gate()  # type: ignore[attr-defined]
-            except PublicationResumeStop as exc:
-                if getattr(exc, "category", "structural") == "read":
-                    raise round_state_read_error(
-                        surface=surface, number=number, round_number=round_number, detail=str(exc)
-                    ) from exc
-                publications.setdefault(name, None)
-                fresh[name] = "its frozen same-round publication cannot be resumed"
-                continue
-            if plan is not None and plan.already_public:
-                publications.setdefault(name, None)
-            elif state == "carrier":
-                verified_unpublished = True
-        if name not in turn_names and name not in publications:
+        if name not in turn_names:
             continue
         fields = spool.load(name)  # type: ignore[attr-defined]
         if fields is None:
-            if name in turn_names:
-                fresh[name] = "no spooled outcome for this round exists on this host"
+            fresh[name] = "no spooled outcome for this round exists on this host"
             continue
         if fields.get("failure") is not None:
             continue
@@ -281,9 +246,7 @@ def classify_round_reviewers(
         )
         if replayed is None:
             fresh[name] = "its spooled outcome no longer validates against this run"
-            if verified_unpublished:
-                stale.append(name)
-    return RoundClassification(publications, fresh, stale)
+    return RoundClassification(publications, fresh)
 
 
 # -- shared reconstruction (resume and writer) ---------------------------------
