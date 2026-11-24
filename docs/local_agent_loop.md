@@ -4819,7 +4819,9 @@ does not see the edit again.
 
 #### Reopening an approved plan (#2010)
 
-An approved plan is never reopened implicitly, even after an issue edit. When
+An approved plan is never reopened implicitly, even after an issue edit (an
+edit after approval stops the run instead; see
+[edited issue after plan approval](#edited-issue-after-plan-approval-2138)). When
 an approved plan can no longer be implemented as written (for example a cost
 guard stopped the coder, and you narrowed the issue), rerun with
 `--reopen-approved-plan`:
@@ -4871,13 +4873,65 @@ edited first.
 - The flag applies to that invocation only. Child planning and rendered
   recovery commands never carry it, and it cannot be combined with
   `--plan-resume-keep-on-issue-edit`.
-- Without the flag, when the issue digest changed since approval, the
-  `planning is not reopened` log line names both digests and suggests
-  `--reopen-approved-plan` (or says the plan was already handed off).
+- Without the flag, an issue edit after approval stops the run unless the plan
+  was already handed off or you pass `--keep-approved-plan`; see
+  [edited issue after plan approval](#edited-issue-after-plan-approval-2138).
+  When the run continues, the `planning is not reopened` log line names both
+  digests and suggests `--reopen-approved-plan` (or says the plan was already
+  handed off).
 
 The boundary record uses schema version 2 with reason `operator-reopen`.
 Releases before #2010 ignore a version 2 record as malformed and would resume
 the superseded plan, so take care when rolling back after a reopen.
+
+#### Edited issue after plan approval (#2138)
+
+If the issue title or body changed after its plan was approved, and the plan has
+not been handed off yet, a plan-first relaunch stops before implementation. It
+invokes no agent, exits with code 4 (an operator decision), and posts one short
+comment on the issue. The stop message and the comment give the recorded and
+current issue digests and name the two ways forward:
+
+- `--reopen-approved-plan` starts a fresh planning scope, so the plan reviewers
+  see the change (see [above](#reopening-an-approved-plan-2010)).
+- `--keep-approved-plan` continues with the approved plan as before, for edits
+  that do not change scope (typo fixes, added links). The run logs that it kept
+  the plan and posts nothing.
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first --keep-approved-plan
+```
+
+The check runs before issue recovery, so it applies whichever route recovery
+would take. "Handed off" here means a hand-off record in the issue's own
+comments: an issue-PR handoff, a one-shot implementation handoff, a
+decomposition summary, a phase or split-stage handoff, or a split
+materialization. A child created before its parent's summary, or a legacy
+closing PR without a handoff record, is not seen by this check, so the run
+stops conservatively; `--keep-approved-plan` clears that stop. A hand-off
+record that cannot be read also stops the run.
+
+- **Already handed off.** The run continues as before, but posts a note on the
+  issue that it changed after approval and that the pull request or child
+  stages may now disagree with the edited body. This applies on every recovery
+  route, including a relaunch that resumes the existing PR directly.
+- **Unknown or unchanged digest.** Nothing changes: no stop and no comment.
+  Planning histories without a recorded digest cannot detect an edit.
+- **Dry run.** The issue context is synthetic, so the run only logs
+  `dry run; the edited-approved-plan check performs no check and posts nothing`.
+- **Child issues.** The same check runs when a parent run plans or resumes a
+  child issue. Child planning never inherits `--keep-approved-plan`, so an
+  edited child whose plan is approved stops the parent run. To continue, rerun
+  the child issue directly with `--keep-approved-plan` or
+  `--reopen-approved-plan`.
+
+Each comment is posted once: a relaunch that finds the same comment from the
+orchestrator account does not post it again. `--keep-approved-plan` applies to
+that invocation only, requires `issue --plan-first`, is never carried into
+child planning or rendered recovery commands, and cannot be combined with
+`--reopen-approved-plan`. It can be combined with
+`--plan-resume-keep-on-issue-edit`, which governs plans that are not yet
+approved.
 
 Planning histories written before this release carry an issue digest only on
 `primary-then-panel` scheduler checkpoints. An all-reviewers history from before

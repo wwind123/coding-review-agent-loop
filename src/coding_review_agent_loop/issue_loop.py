@@ -387,6 +387,17 @@ def run_issue_loop(
                 issue_context=issue_context, parent_issue_context=parent_issue_context,
             )
 
+        if plan_first:
+            # The shared edited-approved-plan gate (#2138), strictly before
+            # recovery: an edited issue whose approved plan was not handed off
+            # stops here, before any agent call, unless --keep-approved-plan.
+            from .plan_reopen import apply_edited_approved_plan_gate
+
+            apply_edited_approved_plan_gate(
+                runner, config=config, issue_number=issue_number,
+                issue_context=issue_context, parent_issue_context=parent_issue_context,
+            )
+
         recovery = recover_issue_execution(
             runner, config=config, issue_number=issue_number,
             issue_context=issue_context, parent_issue_context=parent_issue_context,

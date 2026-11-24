@@ -95,7 +95,7 @@ _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file
 _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS = frozenset(
     {
         "--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit", "--pr-convert-evidence-rows",
-        "--reopen-approved-plan",
+        "--reopen-approved-plan", "--keep-approved-plan",
         # Advisory triage runs once, before a fresh run's first agent turn (#1434).
         "--triage", "--triage-model", "--triage-history",
     }

@@ -1363,6 +1363,19 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--keep-approved-plan",
+            dest="keep_approved_plan",
+            action="store_true",
+            help=(
+                "With issue --plan-first, continue with the issue's completely approved plan "
+                "although the issue title or body changed since approval (#2138). Without "
+                "it (or --reopen-approved-plan), such a relaunch stops before any agent "
+                "call. Meant for edits that do not change scope. Cannot be combined with "
+                "--reopen-approved-plan. Applies to this invocation only and is not "
+                "inherited by child planning or recovery commands."
+            ),
+        )
+        subparser.add_argument(
             "--plan-growth-gate",
             choices=("enforce", "off"),
             default="enforce",
@@ -3229,6 +3242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AgentLoopError("--plan-resume-keep-on-issue-edit requires issue --plan-first.")
         if args.command != "issue" and getattr(args, "reopen_approved_plan", False):
             raise AgentLoopError("--reopen-approved-plan requires issue --plan-first.")
+        if args.command != "issue" and getattr(args, "keep_approved_plan", False):
+            raise AgentLoopError("--keep-approved-plan requires issue --plan-first.")
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")
         if getattr(args, "supersede_expected_closing_contract", False):
@@ -3302,6 +3317,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "--reopen-approved-plan cannot be combined with "
                         "--plan-resume-keep-on-issue-edit: one supersedes the plan, the "
                         "other keeps it."
+                    )
+            if getattr(args, "keep_approved_plan", False):
+                if not args.plan_first:
+                    raise AgentLoopError("--keep-approved-plan requires --plan-first.")
+                if getattr(args, "reopen_approved_plan", False):
+                    raise AgentLoopError(
+                        "--keep-approved-plan cannot be combined with --reopen-approved-plan: "
+                        "one keeps the approved plan, the other supersedes it."
                     )
             if (args.triage_model or args.triage_history is not None) and not args.triage:
                 raise AgentLoopError("--triage-model and --triage-history require --triage.")

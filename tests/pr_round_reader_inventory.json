@@ -3234,6 +3234,12 @@
     },
     {
       "module": "plan_reopen",
+      "function": "_post_note_once",
+      "classification": "presentation",
+      "admission": "plan_reopen._post_note_once compares raw body text of comments admitted by plan_board_state.admitted_issue_comments, authored by the authenticated invocation actor ID, against the plain-prose edited-approved-plan note (#2138) only to avoid posting it twice; a match can only suppress a duplicate note, never select a plan, a route or an approval."
+    },
+    {
+      "module": "plan_reopen",
       "function": "approved_plan_handoff_reason",
       "classification": "reader",
       "admission": "plan_reopen reads only comments admitted by plan_board_state.admitted_issue_comments (complete REST history bound to the invocation actor) and live GitHub search/PR reads; a record, PR or child identity found can only refuse a --reopen-approved-plan request, never authorize one."

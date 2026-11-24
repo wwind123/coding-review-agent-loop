@@ -14,13 +14,28 @@ authenticated schema-version-2 planning-scope boundary naming the superseded
 plan hash, so recovery and planning see only the new, empty scope.  The
 option is per invocation: child planning and rendered recovery commands never
 inherit it.
+
+Edited approved plans stop by default (#2138).  A second read-only gate,
+:func:`apply_edited_approved_plan_gate`, runs at every entry that dispatches
+plan-first recovery or the plan loop (``run_issue_loop`` and parent-driven
+child planning), strictly before either.  When the current scope's plan is
+completely approved, the recorded issue title/body digest is known and
+differs from the current one, and the issue's own comments show no hand-off
+(:func:`approved_shortcut_edit_decision`), it posts one deduplicated
+plain-prose note on the issue and raises a ``HumanDecisionRequiredError``
+naming both digests and both ways forward: ``--reopen-approved-plan`` or the
+per-invocation ``--keep-approved-plan``, which continues with the approved
+plan and is never inherited by child planning or recovery commands.  An
+unreadable hand-off record stops too.  A handed-off plan gets the same kind of
+note and continues.  An unknown or unchanged digest and dry run do nothing.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, HumanDecisionRequiredError
 from .logging import log
 
 _INVENTORY_ERRORS = (AgentLoopError, OSError, ValueError, KeyError, TypeError)
@@ -112,21 +127,16 @@ def approved_shortcut_reopen_hint(
     unknown recorded digest gives no hint).  Only the cheap comment-level
     hand-off check runs here; it makes no GitHub search.
     """
-    if recorded_digest is None or recorded_digest == current_digest:
-        return ""
-    changed = (
-        f"; the issue title/body changed since approval (recorded digest {recorded_digest}, "
-        f"current digest {current_digest})"
+    decision = approved_shortcut_edit_decision(
+        comments, issue_number=issue_number, repo=repo, plan_hash=plan_hash,
+        recorded_digest=recorded_digest, current_digest=current_digest,
     )
-    try:
-        handed_off = comment_handoff_reason(
-            comments, issue_number=issue_number, repo=repo, plan_hash=plan_hash,
-        )
-    except AgentLoopError as exc:
-        handed_off = f"its hand-off records cannot be read: {exc}"
-    if handed_off is not None:
+    if not decision.changed:
+        return ""
+    changed = f"; the issue title/body changed since approval ({_digest_clause(decision)})"
+    if decision.kind != EDIT_DECISION_NOT_HANDED_OFF:
         return (
-            f"{changed}, but the plan was already handed off ({handed_off}), so "
+            f"{changed}, but the plan was already handed off ({decision.handoff_reason}), so "
             "--reopen-approved-plan cannot reopen it"
         )
     return (
@@ -473,3 +483,280 @@ def _bodies_by_position(comments: Sequence[object]):
     for comment in comments:
         body = record_body(comment)
         yield body if isinstance(body, str) else ""
+
+
+# --- Edited approved plan: stop by default (#2138) ----------------------------
+
+EDIT_DECISION_UNCHANGED = "unchanged"
+EDIT_DECISION_UNKNOWN_DIGEST = "unknown-digest"
+EDIT_DECISION_NOT_HANDED_OFF = "changed-not-handed-off"
+EDIT_DECISION_HANDED_OFF = "changed-handed-off"
+EDIT_DECISION_HANDOFF_UNREADABLE = "changed-handoff-unreadable"
+_EDIT_STOP_KINDS = frozenset({EDIT_DECISION_NOT_HANDED_OFF, EDIT_DECISION_HANDOFF_UNREADABLE})
+
+
+@dataclass(frozen=True)
+class ApprovedShortcutEditDecision:
+    """Whether the issue text changed under an approved plan, and its hand-off state."""
+
+    kind: str
+    plan_hash: str | None
+    recorded_digest: str | None
+    current_digest: str
+    handoff_reason: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        return self.kind not in {EDIT_DECISION_UNCHANGED, EDIT_DECISION_UNKNOWN_DIGEST}
+
+    @property
+    def stops(self) -> bool:
+        """True when a relaunch without an option must stop before any agent call."""
+        return self.kind in _EDIT_STOP_KINDS
+
+
+def approved_shortcut_edit_decision(
+    comments: Sequence[object],
+    *,
+    issue_number: int,
+    repo: str | None,
+    plan_hash: str | None,
+    recorded_digest: str | None,
+    current_digest: str,
+) -> ApprovedShortcutEditDecision:
+    """Classify an issue title/body edit under an approved plan (#2138).
+
+    Only the cheap comment-level hand-off check runs (no GitHub search).  An
+    unreadable hand-off record yields ``changed-handoff-unreadable``, which
+    stops like ``changed-not-handed-off``: an unverifiable record never lets
+    the run silently implement a stale plan.
+    """
+    if recorded_digest is None:
+        kind = EDIT_DECISION_UNKNOWN_DIGEST
+    elif recorded_digest == current_digest:
+        kind = EDIT_DECISION_UNCHANGED
+    else:
+        kind = ""
+    if kind:
+        return ApprovedShortcutEditDecision(
+            kind=kind, plan_hash=plan_hash, recorded_digest=recorded_digest,
+            current_digest=current_digest,
+        )
+    try:
+        reason = comment_handoff_reason(
+            comments, issue_number=issue_number, repo=repo, plan_hash=plan_hash,
+        )
+    except AgentLoopError as exc:
+        return ApprovedShortcutEditDecision(
+            kind=EDIT_DECISION_HANDOFF_UNREADABLE, plan_hash=plan_hash,
+            recorded_digest=recorded_digest, current_digest=current_digest,
+            handoff_reason=f"its hand-off records cannot be read: {exc}",
+        )
+    return ApprovedShortcutEditDecision(
+        kind=EDIT_DECISION_HANDED_OFF if reason is not None else EDIT_DECISION_NOT_HANDED_OFF,
+        plan_hash=plan_hash, recorded_digest=recorded_digest,
+        current_digest=current_digest, handoff_reason=reason,
+    )
+
+
+def _digest_clause(decision: ApprovedShortcutEditDecision) -> str:
+    return (
+        f"recorded digest {decision.recorded_digest}, current digest "
+        f"{decision.current_digest}"
+    )
+
+
+def render_edited_approved_plan_stop(
+    issue_number: int, decision: ApprovedShortcutEditDecision,
+) -> HumanDecisionRequiredError:
+    """The operator stop for an edited issue whose approved plan was not handed off."""
+    unreadable = (
+        f" The plan's hand-off state could not be verified ({decision.handoff_reason}), so "
+        "the run stops instead of implementing it."
+        if decision.kind == EDIT_DECISION_HANDOFF_UNREADABLE
+        else ""
+    )
+    return HumanDecisionRequiredError.decision(
+        what=(
+            f"Issue #{issue_number}: the issue title/body changed after plan "
+            f"{decision.plan_hash} was approved ({_digest_clause(decision)}), and the plan "
+            f"has not been handed off.{unreadable} No agent was invoked. Choose one: "
+            "--reopen-approved-plan starts a fresh planning scope so the plan reviewers "
+            "see the change; --keep-approved-plan continues with the approved plan, for "
+            "edits that do not change scope (typo fixes, added links)."
+        ),
+        clear=(
+            f"Rerun `agent-loop issue {issue_number} --plan-first --reopen-approved-plan`, "
+            "or add `--keep-approved-plan` instead if the edit does not change scope."
+        ),
+        safe_to_automate=False,
+        automation_note=(
+            "whether the edit changes the approved scope is an operator judgment."
+        ),
+    )
+
+
+def render_edited_approved_plan_issue_note(
+    issue_number: int, decision: ApprovedShortcutEditDecision,
+) -> str:
+    """The plain-prose issue comment for an edited approved plan (no protocol records)."""
+    head = (
+        f"Issue #{issue_number}'s title or body changed after plan `{decision.plan_hash}` "
+        f"was approved ({_digest_clause(decision)})."
+    )
+    if decision.kind == EDIT_DECISION_HANDED_OFF:
+        return (
+            f"{head}\n\n"
+            f"The plan was already handed off ({decision.handoff_reason}), so the run "
+            "continues with the approved plan. The pull request or child stages may now "
+            "disagree with the edited issue body; reconcile them, or file a follow-up issue "
+            "for the changed requirement.\n"
+        )
+    return (
+        f"{head}\n\n"
+        "The run stopped before implementation; no agent was invoked. To proceed, rerun "
+        "with one of:\n\n"
+        "- `--reopen-approved-plan` to start a fresh planning scope, so the plan reviewers "
+        "see the change;\n"
+        "- `--keep-approved-plan` to continue with the approved plan, for edits that do not "
+        "change scope (typo fixes, added links).\n"
+    )
+
+
+def _post_note_once(
+    runner: object,
+    *,
+    config: object,
+    issue_number: int,
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+    note: str,
+) -> None:
+    """Post ``note`` unless the trusted actor already posted the same note."""
+    from .github import post_issue_comment
+
+    expected = note.strip()
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if (
+            trusted_actor is not None
+            and getattr(comment, "author_id", None) == trusted_actor[1]
+            and isinstance(body, str)
+            and expected in body
+        ):
+            log(
+                config,
+                f"Issue #{issue_number}: the edited-approved-plan note is already posted; "
+                "not posting it again",
+            )
+            return
+    post_issue_comment(
+        runner,  # type: ignore[arg-type]
+        config=config,  # type: ignore[arg-type]
+        issue_number=issue_number,
+        body=note,
+    )
+
+
+def apply_edited_approved_plan_gate(
+    runner: object,
+    *,
+    config: object,
+    issue_number: int,
+    issue_context: object,
+    parent_issue_context: object | None = None,
+) -> None:
+    """The shared pre-recovery edited-approved-plan gate (#2138).
+
+    Called at every entry that dispatches plan-first recovery or the plan
+    loop, strictly before either.  When the current scope's plan is
+    completely approved, the recorded issue digest is known and differs from
+    the current one, and the issue's own comments show no hand-off, it posts
+    one deduplicated note and raises the operator stop, unless
+    ``--keep-approved-plan`` keeps the plan.  A handed-off plan gets the
+    handed-off note and continues.  ``--reopen-approved-plan`` is owned by
+    :func:`apply_operator_reopen`; dry run checks nothing and posts nothing.
+    """
+    if getattr(config, "reopen_approved_plan", False):
+        log(
+            config,
+            f"Issue #{issue_number}: --reopen-approved-plan owns this relaunch; the "
+            "edited-approved-plan stop does not apply",
+        )
+        return
+    keep = bool(getattr(config, "keep_approved_plan", False))
+    if getattr(config, "dry_run", False):
+        log(
+            config,
+            f"Issue #{issue_number}: dry run; the edited-approved-plan check performs no "
+            "check and posts nothing",
+        )
+        return
+    from dataclasses import replace as dataclasses_replace
+
+    from .panel_evidence import plan_issue_text_digest
+    from .plan_board_state import admitted_issue_comments
+    from .plan_issue_scope import plan_scope_decision
+    from .plan_verification import build_plan_approval_inputs, classify_plan_approval
+
+    comments, trusted_actor = admitted_issue_comments(
+        runner, config=config, issue_number=issue_number,
+        comments=getattr(issue_context, "comments", ()),
+    )
+    current_digest = plan_issue_text_digest(issue_context)  # type: ignore[arg-type]
+    scope = plan_scope_decision(
+        comments, trusted_actor, current_digest, False,
+        plan_approved=True, issue_number=issue_number, repo=getattr(config, "repo", None),
+    )
+    if scope.recorded_digest is None or scope.recorded_digest == current_digest:
+        return
+    admitted_context = dataclasses_replace(issue_context, comments=comments)  # type: ignore[type-var]
+    classification = classify_plan_approval(
+        comments,
+        config=config,
+        issue_number=issue_number,
+        trusted_actor=trusted_actor,
+        inputs=build_plan_approval_inputs(
+            runner, config=config, issue_context=admitted_context,
+            parent_issue_context=parent_issue_context,
+        ),
+    )
+    if not classification.approved:
+        if keep:
+            log(
+                config,
+                f"Issue #{issue_number}: --keep-approved-plan has no effect: the current "
+                f"planning scope has no completely approved plan ({classification.state})",
+            )
+        return
+    decision = approved_shortcut_edit_decision(
+        comments,
+        issue_number=issue_number,
+        repo=getattr(config, "repo", None),
+        plan_hash=classification.plan_hash,
+        recorded_digest=scope.recorded_digest,
+        current_digest=current_digest,
+    )
+    if decision.changed and keep:
+        log(
+            config,
+            f"Issue #{issue_number}: --keep-approved-plan kept approved plan "
+            f"{decision.plan_hash} although the issue title/body changed since approval "
+            f"({_digest_clause(decision)})",
+        )
+        return
+    if decision.kind == EDIT_DECISION_HANDED_OFF:
+        log(
+            config,
+            f"Issue #{issue_number}: the issue title/body changed since approved plan "
+            f"{decision.plan_hash} was handed off ({decision.handoff_reason}); continuing "
+            "and noting the change on the issue",
+        )
+    if decision.changed:
+        _post_note_once(
+            runner, config=config, issue_number=issue_number, comments=comments,
+            trusted_actor=trusted_actor,
+            note=render_edited_approved_plan_issue_note(issue_number, decision),
+        )
+    if decision.stops:
+        raise render_edited_approved_plan_stop(issue_number, decision)
