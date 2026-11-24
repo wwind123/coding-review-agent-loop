@@ -423,6 +423,12 @@ class PostedRoundMetadata:
     # spills it losslessly); omitted when empty so other records stay
     # byte-stable.  Only the orchestrator writes it.
     ignored_prior_disposition_ids: tuple[str, ...] = ()
+    # Reviewer seats that failed this round (#2129): a deterministic rejection
+    # after re-asks, an unavailable seat, or an incomplete review.  Written
+    # only on reconciliation summaries; recovery and history replay freeze
+    # these seats' carried items.  Bounded; omitted when empty so legacy and
+    # failure-free records stay byte-stable.
+    failed_reviewer_seats: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -2504,6 +2510,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["human_checks"] = [dict(entry) for entry in metadata.human_checks]
     if metadata.ignored_prior_disposition_ids:
         payload["ignored_prior_disposition_ids"] = list(metadata.ignored_prior_disposition_ids)
+    if metadata.failed_reviewer_seats:
+        payload["failed_reviewer_seats"] = list(metadata.failed_reviewer_seats)
     if metadata.evidence_freeze is not None:
         payload["evidence_freeze"] = metadata.evidence_freeze.as_dict()
     if metadata.evidence_release is not None:
@@ -2867,6 +2875,36 @@ def decode_ignored_prior_disposition_ids(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+MAX_FAILED_REVIEWER_SEATS = 32
+MAX_FAILED_REVIEWER_SEAT_CHARS = 200
+
+
+def bound_failed_reviewer_seats(names: Sequence[str]) -> tuple[str, ...]:
+    """Unique, bounded failed-seat display names in first-seen order (#2129)."""
+    unique: list[str] = []
+    for name in names:
+        name = str(name).strip()[:MAX_FAILED_REVIEWER_SEAT_CHARS]
+        if name and name not in unique:
+            unique.append(name)
+    return tuple(unique[:MAX_FAILED_REVIEWER_SEATS])
+
+
+def decode_failed_reviewer_seats(value: object) -> tuple[str, ...]:
+    """Decode the #2129 failed-seat list, failing closed on any malformed entry."""
+    if (
+        not isinstance(value, list)
+        or len(value) > MAX_FAILED_REVIEWER_SEATS
+        or any(
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > MAX_FAILED_REVIEWER_SEAT_CHARS
+            for name in value
+        )
+    ):
+        raise ValueError("failed_reviewer_seats must be a bounded list of seat names")
+    return tuple(value)
+
+
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the optional #1068 evidence fields; absent is legacy.
 
@@ -2894,6 +2932,8 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
         fields["ignored_prior_disposition_ids"] = decode_ignored_prior_disposition_ids(
             payload["ignored_prior_disposition_ids"]
         )
+    if "failed_reviewer_seats" in payload:
+        fields["failed_reviewer_seats"] = decode_failed_reviewer_seats(payload["failed_reviewer_seats"])
     if "evidence_freeze" in payload:
         fields["evidence_freeze"] = EvidenceFreezeRecord.from_mapping(payload["evidence_freeze"])
     if "evidence_release" in payload:

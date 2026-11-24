@@ -148,7 +148,9 @@ from .comment_rendering import (
     render_canonical_plan_state,
 )
 from .config import phased_delivery_guard_active
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement
 from .round_metadata import (
+    bound_failed_reviewer_seats,
     reset_plan_board_stamp,
     set_plan_board_stamp,
     prior_plan_execution_mode,
@@ -206,6 +208,7 @@ from .partial_round_recovery import (
 )
 from .round_visibility import latest_round_checkpoint_index, visible_peer_names
 from .unresolved_items import (
+    preserve_failed_seat_items,
     _apply_unresolved_item_dispositions,
     _collect_prior_compact_summaries,
     bound_compact_prior_summaries,
@@ -215,6 +218,7 @@ from .unresolved_items import (
     carried_item_repeated_by,
 )
 from .agent_failure import (
+    _capture_agent_invocation,
     ValidatedAgentResponse,
     _metadata_identity_fields,
 )
@@ -1956,6 +1960,7 @@ def _run_plan_first_loop_body(
             f"{config.plan_execution_mode} since the last recorded round",
         )
 
+    plan_force_reinvoke_seats: set[str] = set()  # failed seats of a continued round (#2129)
     for round_number in range(start_round_number, plan_round_limit + 1):
         if plan_approved_shortcut and round_number != start_round_number:
             raise approval_shortcut_disagreement(
@@ -2510,6 +2515,11 @@ def _run_plan_first_loop_body(
                     name == plan_primary_name or plan_panel_evidence.opened
                 ),
             )
+            if plan_force_reinvoke_seats and plan_scheduler_decision is not None:
+                # A failed seat of a continued round is invoked again (#2129).
+                plan_scheduler_decision = force_select_failed_seats(
+                    plan_scheduler_decision, plan_force_reinvoke_seats, plan_reviewer_names)
+            plan_force_reinvoke_seats = set()
             plan_selected_names = set(plan_scheduler_decision.selected_reviewers) if plan_scheduler_decision else set()
             round_reviewers = tuple(
                 reviewer for reviewer in configured_reviewers
@@ -3270,6 +3280,11 @@ def _run_plan_first_loop_body(
                     public_peers=plan_round_public_peers,
                     recovery=_plan_round_recovery,
                     retry_bound=_plan_retry_bound,
+                    settle_failures=peer_blocked_settlement(
+                        parse=_plan_publication_parsed, name=agent_display_name,
+                        blocks=lambda p: p.state == "blocking" and bool(p.items.blocking or p.items.same_plan),
+                        configured_reviewer_count=len(round_reviewers), round_number=round_number,
+                        allowed_rounds=plan_round_limit),
                     max_workers=None if config.review_parallel else 1,
                     configured_order=round_reviewers,
                     config=config,
@@ -3366,7 +3381,7 @@ def _run_plan_first_loop_body(
                         requirement_scope="planning requirements",
                     ), architecture_status_mode=mode,
                 ))
-                review_response = _same_round_replay_or_invoke(
+                review_response, sequential_failure = _capture_agent_invocation(lambda reviewer=reviewer, sequential_plan_validators=sequential_plan_validators: _same_round_replay_or_invoke(
                     runner,
                     config=config,
                     reviewer=reviewer,
@@ -3396,7 +3411,16 @@ def _run_plan_first_loop_body(
                         operation_description="plan review",
                         reask_on_missing_judgement_field=True,
                     ),
-                )
+                ))
+                if sequential_failure is not None:
+                    if len(round_reviewers) == 1:
+                        raise sequential_failure
+                    # The remaining seats still run (#2129); decided after the round.
+                    log(config, f"Planning round {round_number}: {reviewer_name} failed "
+                        f"({failure_category(sequential_failure)}); continuing with the remaining reviewers")
+                    plan_fatal_errors.append((reviewer_name, sequential_failure))
+                    continue
+                assert review_response is not None
                 review_output = review_response.text
                 review_model_used = review_response.model_used
                 review_acquisition_outcome = review_response.acquisition_outcome
@@ -3423,7 +3447,7 @@ def _run_plan_first_loop_body(
                     "stopping without a coder follow-up",
                 )
                 incomplete_review_error = _incomplete_plan_review_error(reviewer_name)
-                if plan_round_parallel:
+                if plan_round_parallel or len(round_reviewers) > 1:
                     plan_fatal_errors.append((reviewer_name, incomplete_review_error))
                     continue
                 raise incomplete_review_error
@@ -3528,17 +3552,35 @@ def _run_plan_first_loop_body(
         same_model_note = same_model_panel_note(round_review_models)
         if same_model_note is not None:
             log(config, f"Planning round {round_number}: {same_model_note}")
+        # Failed seats (#2129): freeze their carried items against every healthy
+        # seat's disposition, live and (via the record) on resume.
+        plan_failed_seats = dict(plan_fatal_errors)
+        prior_dispositions, frozen_failed_item_ids = preserve_failed_seat_items(
+            plan_ledger_view(prior_unresolved_items), prior_dispositions, tuple(plan_failed_seats))
+        plan_continuation_allowed = failed_seat_continuation_allowed(
+            configured_reviewer_count=len(round_reviewers),
+            blocking_seats=[name for name, _output in blocking_reviews], failed_seats=plan_failed_seats,
+            failures=plan_failed_seats.values(), round_number=round_number, allowed_rounds=plan_round_limit)
+        if plan_fatal_errors and not plan_round_parallel and not plan_continuation_allowed:
+            # A sequential stop keeps today's shape: no reconciliation record.
+            raise next((e for _n, e in plan_fatal_errors if isinstance(e, QuotaResetExceededError)), plan_fatal_errors[0][1])
         if (
-            plan_round_parallel or same_model_note is not None
+            plan_round_parallel or same_model_note is not None or plan_continuation_allowed
         ) and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
                 body=_attach_round_metadata(
                     f"Plan review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
-                    f"Finalization {'stops' if plan_fatal_errors else 'continues'} after reconciliation."
-                    + (f" {same_model_note}." if same_model_note else ""),
+                    "Finalization " + finalization_wording(
+                        stops=bool(plan_fatal_errors), continuation_allowed=plan_continuation_allowed,
+                        failed=tuple(plan_failed_seats),
+                    ).replace("to the coder", "to the planner revision") + " after reconciliation."
+                    + (f" {same_model_note}." if same_model_note else "")
+                    + (" " + describe_failed_seats(plan_failed_seats, prior_items=plan_ledger_view(prior_unresolved_items),
+                                                   frozen_item_ids=frozen_failed_item_ids) if plan_failed_seats else ""),
                     bound_plan_metadata(
+                        failed_reviewer_seats=bound_failed_reviewer_seats(tuple(plan_failed_seats)),
                         flow="plan", role="summary", agent="Orchestrator", round_number=round_number,
                         subject=_plan_subject(current_plan), prior_items=prior_unresolved_items,
                         dispositions=tuple(
@@ -3549,7 +3591,10 @@ def _run_plan_first_loop_body(
                 ),
             )
 
-        if plan_fatal_errors:
+        if plan_fatal_errors and plan_continuation_allowed:
+            log(config, f"Planning round {round_number}: deferring the stop for failed seat(s) "
+                f"{', '.join(plan_failed_seats)}; another seat blocked this round")
+        elif plan_fatal_errors:
             # Every healthy reviewer above was already applied (comment
             # posted, items numbered) in configured order, so a rerun resumes
             # them instead of re-invoking (#594). Raise only now: quota resets
@@ -3629,6 +3674,14 @@ def _run_plan_first_loop_body(
             item.item_id for item in round_new_unresolved_items
         )
         must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-plan"}]
+        if plan_fatal_errors and not must_fix_items:
+            raise plan_fatal_errors[0][1]
+        if plan_fatal_errors:
+            all_approved = False
+            plan_force_reinvoke_seats = set(plan_failed_seats)
+            plan_round_spool.discard()
+            log(config, f"Planning round {round_number}: continuing to the planner revision with failed seat(s) "
+                f"{', '.join(plan_failed_seats)}; their carried items stay unchanged and they are invoked again next round")
         if all_approved and not must_fix_items and issue_context.human_requirements:
             hr_ids = _surfaced_reviewer_requirement_ids(
                 issue_context.human_requirements,

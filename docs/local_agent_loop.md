@@ -456,11 +456,20 @@ them. Both routes above are the intended migration path.
 
 ### Removing an unavailable reviewer from an in-flight run
 
-When a required PR reviewer becomes unavailable and the board has more than one
-reviewer, the PR run stops in the round where it is detected (#1129), after the
-other reviewers finish that round and before any evidence terminal record,
-coder turn, CI wait, qualification, or merge, even when peers left must-fix
-items. The `AgentLoopError` and an incomplete-review PR comment name the
+When a required PR reviewer becomes unavailable (or its response is still
+rejected after its re-asks, or it reports an incomplete review) while another
+reviewer blocked in the same round, the round continues to the coder: the
+failed reviewer's carried items stay unchanged, the round's reconciliation
+comment names it as failed, and it is invoked again in the next round (#2129).
+Plan review rounds follow the same rule. A failed reviewer is never counted as
+approving.
+
+Otherwise, when a required PR reviewer becomes unavailable and the board has
+more than one reviewer, the PR run stops in the round where it is detected
+(#1129), after the other reviewers finish that round and before any evidence
+terminal record, coder turn, CI wait, qualification, or merge. This applies
+when every other reviewer approved, in an evidence pass, in the final allowed
+round, on a quota reset, and when no must-fix item remains. The `AgentLoopError` and an incomplete-review PR comment name the
 reviewer, its failure category, the detection round, the healthy and blocking
 reviewers, and the open must-fix count. The remedy depends on the policy:
 restore the backend and rerun unchanged (every policy); for scheduler-contract

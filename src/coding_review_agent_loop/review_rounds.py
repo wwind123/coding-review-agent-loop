@@ -1293,8 +1293,16 @@ def _launch_reviewer_turns(
     recovery: Callable[[], PartialRoundRecovery] | None = None,
     unresolved_conversion_boundary: bool = False,
     posted_rejection_reasons: Mapping[str, str] | None = None,
+    settle_failures: Callable[
+        [Mapping[AgentName, _ReviewerTurnResult], Mapping[AgentName, AgentLoopError]], bool
+    ] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
+
+    ``settle_failures`` (#2129) receives the settled results and the
+    ``retry_bound`` errors.  When it returns true, the failed seats settle in
+    this round (a healthy peer blocked, so the round continues) instead of
+    withholding the healthy peers' outcomes for an independent rerun.
 
     ``run_turn`` must never let an exception escape; it is responsible for
     capturing any failure into the returned ``_ReviewerTurnResult`` so the
@@ -1449,6 +1457,8 @@ def _launch_reviewer_turns(
             error = retry_bound(reviewer, result)
             if error is not None:
                 retry_errors[reviewer] = error
+    if retry_errors and settle_failures is not None and settle_failures(settled, retry_errors):
+        retry_errors = {}
     for reviewer, result in settled.items():
         if reviewer in replayed or reviewer in retry_errors:
             continue

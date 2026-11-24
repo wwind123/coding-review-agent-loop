@@ -61,6 +61,7 @@ from .protocol_discuss import (
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .unresolved_items import (
     _apply_unresolved_item_dispositions,
+    preserve_failed_seat_items,
     _is_machine_obligation,
     release_evidence_freeze,
 )
@@ -483,15 +484,43 @@ def _append_active_pr_new_items(
 from .native_evidence import _append_recorded_evidence_requests
 
 
+def _round_failed_seats(records: Sequence[round_metadata.PostedRoundRecord]) -> tuple[str, ...]:
+    """Failed seats named by the round's reconciliation summaries (#2129).
+
+    Legacy reconciliation records, and rounds without one, yield ``()``.
+    """
+    seats: list[str] = []
+    for record in records:
+        metadata = record.metadata
+        if metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata):
+            seats.extend(seat for seat in metadata.failed_reviewer_seats if seat not in seats)
+    return tuple(seats)
+
+
 def _aggregate_record_dispositions(
     records: Sequence[round_metadata.PostedRoundRecord],
+    *,
+    prior_items: Sequence[UnresolvedReviewItem] = (),
+    failed_seats: Sequence[str] = (),
 ) -> dict[str, list[ReviewItemDisposition]]:
+    """Aggregate reviewer-record dispositions, freezing failed seats' items.
+
+    ``failed_seats`` comes from the round's authenticated reconciliation
+    record (#2129).  Every disposition of a ``prior_items`` entry owned or
+    co-owned by a failed seat is dropped, exactly as the live settlement
+    did, so resume and history replay carry the item unchanged.  With no
+    failed seats the aggregate is unchanged.
+    """
     dispositions_by_item: dict[str, list[ReviewItemDisposition]] = {}
     for record in records:
         if scope_present(record.metadata):
             continue
         for disposition in record.metadata.dispositions:
             dispositions_by_item.setdefault(disposition.item_id, []).append(disposition)
+    if failed_seats:
+        dispositions_by_item, _frozen = preserve_failed_seat_items(
+            prior_items, dispositions_by_item, failed_seats
+        )
     return dispositions_by_item
 
 
@@ -525,7 +554,9 @@ def _canonically_resolved_history_item_ids(
                 active[item.item_id] = item
                 resolved.discard(item.item_id)
         dispositions_by_item = _aggregate_record_dispositions(
-            [record for record in group if is_complete_code_review(record.metadata)]
+            [record for record in group if is_complete_code_review(record.metadata)],
+            prior_items=tuple(active.values()),
+            failed_seats=_round_failed_seats(group),
         )
         candidates = [
             item for item in active.values() if item.item_id in dispositions_by_item
@@ -595,7 +626,9 @@ def _replay_history_items(
             for item in record.metadata.prior_items:
                 appear(item)
         dispositions_by_item = _aggregate_record_dispositions(
-            [record for record in group if is_complete_code_review(record.metadata)]
+            [record for record in group if is_complete_code_review(record.metadata)],
+            prior_items=tuple(active.values()),
+            failed_seats=_round_failed_seats(group),
         )
         candidates = [
             item for item in active.values() if item.item_id in dispositions_by_item
@@ -1472,7 +1505,11 @@ def _recover_unrecorded_pr_head_advance(
         round_number = latest_coder_record.metadata.round_number
         recovered_items, _future_items = _apply_unresolved_item_dispositions(
             latest_coder_record.metadata.prior_items,
-            _aggregate_record_dispositions(reviewer_records_after_coder),
+            _aggregate_record_dispositions(
+                reviewer_records_after_coder,
+                prior_items=latest_coder_record.metadata.prior_items,
+                failed_seats=_round_failed_seats(new_item_records_after_coder),
+            ),
             retain_future=False,
             reconciliation_mode=reconciliation_mode,
             round_number=round_number,
@@ -1489,7 +1526,11 @@ def _recover_unrecorded_pr_head_advance(
         round_number = anchor_metadata.round_number
         recovered_items, _future_items = _apply_unresolved_item_dispositions(
             anchor_metadata.prior_items,
-            _aggregate_record_dispositions(all_reviewer_records),
+            _aggregate_record_dispositions(
+                all_reviewer_records,
+                prior_items=anchor_metadata.prior_items,
+                failed_seats=_round_failed_seats(all_new_item_records),
+            ),
             retain_future=False,
             reconciliation_mode=reconciliation_mode,
             round_number=round_number,

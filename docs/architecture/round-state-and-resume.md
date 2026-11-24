@@ -315,6 +315,8 @@ between GitHub and local artifacts:
 | Evidence-conversion authority | Capture classifications, conversion audits, attempt pairings and signed-evidence references in round metadata; admitted only from comments authored by the authenticated orchestrator actor, with REST identity hydration on resume and on every rereading consumer. |
 | Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
 
+Replay freezes failed seats' items ([review scheduling](review-scheduling.md)).
+
 Durable comment carriers persist a bounded visible label outside the unchanged
 hidden record, composed only from trusted vocabulary and already-authenticated
 record fields, so labels are deterministic and historical marker-only comments

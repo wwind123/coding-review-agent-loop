@@ -2320,6 +2320,39 @@ def _record_prior_item_disposition(
     prior_dispositions[disposition.item_id].append(disposition)
 
 
+def preserve_failed_seat_items(
+    prior_items: Sequence[UnresolvedReviewItem],
+    dispositions_by_item: Mapping[str, Sequence[ReviewItemDisposition]],
+    failed_seats: Collection[str],
+) -> tuple[dict[str, list[ReviewItemDisposition]], tuple[str, ...]]:
+    """Freeze the carried items of reviewer seats that failed this round (#2129).
+
+    Returns a copy of ``dispositions_by_item`` in which every disposition
+    (including its sub-item dispositions) filed under the ID or any alias of
+    a prior item whose owner set contains a failed seat is dropped, plus the
+    frozen item IDs in ledger order.  The owner set is ``resolution_owners``,
+    or ``(reviewer,)`` when that is empty.  Reconciliation then carries a
+    frozen item exactly as it was, so a healthy seat can never resolve, defer
+    or edit a failed seat's item.  Keys are kept (mapped to empty lists) so
+    callers that index the map by carried item ID still work.  With no failed
+    seats the result equals the input.
+    """
+    filtered = {key: list(values) for key, values in dispositions_by_item.items()}
+    failed = set(failed_seats)
+    if not failed:
+        return filtered, ()
+    frozen: list[str] = []
+    for item in prior_items:
+        owners = tuple(item.resolution_owners) or (item.reviewer,)
+        if failed.isdisjoint(owners):
+            continue
+        frozen.append(item.item_id)
+        for key in (item.item_id, *item.alias_item_ids):
+            if key in filtered:
+                filtered[key] = []
+    return filtered, tuple(frozen)
+
+
 def format_sub_item_lines(item: UnresolvedReviewItem) -> list[str]:
     """Per-sub-item lines with a ``k/K resolved`` count; empty without sub-items."""
     if not item.sub_items:

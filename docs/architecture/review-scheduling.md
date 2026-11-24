@@ -438,6 +438,48 @@ receives real runs, and the real-run pair (`review_contract_runs.json` and
 documented data-only
 [freezing procedure](../local_agent_loop.md#freezing-a-real-run).
 
+## Failed reviewer seats in a blocked round
+
+A reviewer seat *fails* in a round when its response is still rejected after
+its same-agent re-asks (a deterministic failure), when it is unavailable
+(transient or agent-unavailable), or when it reports an incomplete review. In
+both the PR loop and the plan loop, parallel or sequential, in any reviewer
+order, a failed seat no longer stops the round when another seat in the same
+round blocked: the remaining seats still run, and the round continues to the
+coder (PR) or planner revision (plan). The shared rule lives in
+`failed_seats.py`.
+
+- **Carried-item freeze.** Every disposition this round of an item owned or
+  co-owned by a failed seat (by item ID or alias, including sub-item
+  dispositions) is dropped before settlement by
+  `unresolved_items.preserve_failed_seat_items`, so a healthy seat can never
+  resolve, defer or edit a failed seat's item. The filtered map feeds both the
+  settled ledger and the round's reconciliation record, which therefore agree.
+- **Durable record.** The round's reconciliation record names the failed seats
+  in the bounded `failed_reviewer_seats` metadata field and the comment lists
+  each seat's failure category and frozen items. A continued sequential round
+  (PR or plan) now posts that record too. Resume, history replay and the
+  board-change carry-over apply the same freeze from that field (see
+  [Round state and resume](round-state-and-resume.md)).
+- **Never approving.** A failed seat never enters an approval set; the
+  all-approved, qualification and merge gates still require an exact-head
+  approval from every required seat. It is treated like an unavailable seat for
+  the carried-panel no-dispatch shortcut and the migration re-probe.
+- **Invoked again.** The seat is not quarantined for the run: the next round
+  invokes it again, and a selective (PR or staged plan) scheduler force-selects
+  it with a logged reason.
+- **Parallel independence.** A parallel round normally withholds healthy
+  peers' outcomes until a failed seat completes an independent rerun. When a
+  healthy peer returned an actionable blocking review and continuation is
+  allowed, the failure settles in the round instead; settings-lock waits keep
+  the withheld rerun.
+- **Stop kept.** The existing error, message and incomplete-review comment
+  are unchanged for single-reviewer boards, when no healthy seat blocked (every
+  other seat approved), for quota-reset errors, in evidence passes, in the
+  final allowed round, and when settlement leaves no must-fix item. A
+  sequential round that stops keeps today's shape and posts no reconciliation
+  record, so its resume is unchanged.
+
 ## Completely approved resume
 
 Completely approved plans are an exception to fresh-review rollover. Startup

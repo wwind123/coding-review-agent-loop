@@ -1935,6 +1935,7 @@ def carry_over_anchor_round(
     from .round_state import (
         _aggregate_record_dispositions,
         _max_unresolved_item_number_from_records,
+        _round_failed_seats,
     )
     from .unresolved_items import _apply_unresolved_item_dispositions, _upsert_evidence_obligation
 
@@ -1961,7 +1962,17 @@ def carry_over_anchor_round(
     active = {"blocking", same_status}
     items, _future = _apply_unresolved_item_dispositions(
         prior_items,
-        _aggregate_record_dispositions(completed_reviews),
+        # A failed seat named by the anchor round's reconciliation record keeps
+        # its carried items frozen across this carry-over too (#2129).
+        _aggregate_record_dispositions(
+            completed_reviews,
+            prior_items=prior_items,
+            failed_seats=_round_failed_seats([
+                record for record in records
+                if record.metadata.round_number == round_number
+                and record.metadata.subject in {review.metadata.subject for review in completed_reviews}
+            ]),
+        ),
         same_status=same_status,
         retain_future=False,
         reconciliation_mode=reconciliation_mode,

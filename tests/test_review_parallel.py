@@ -2348,7 +2348,9 @@ def test_pr_loop_parallel_unavailable_reviewer_with_blocking_peer_stops_in_round
             )
         ],
     )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, max_rounds=3)
+    # The final allowed round keeps the stop even beside a blocking peer
+    # (#2129); earlier rounds continue to the coder instead.
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, max_rounds=1)
 
     with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)

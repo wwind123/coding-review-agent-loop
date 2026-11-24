@@ -2848,7 +2848,11 @@ def test_all_reviewers_flag_removal_rerun_proceeds_without_the_removed_reviewer(
 
 
 def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detection(tmp_path):
-    """Row incomplete-review-with-peer-blocking (markerless prose = incomplete review)."""
+    """Row incomplete-review-with-peer-blocking (markerless prose = incomplete review).
+
+    In the final allowed round the stop is kept even though a peer blocked
+    (#2129); earlier rounds continue to the coder instead.
+    """
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
@@ -2866,7 +2870,7 @@ def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detect
             )
         ],
     )
-    config = make_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=3)
+    config = make_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=1)
     runner.antigravity_outputs = [
         structured_pr_review(state="approved", summary="ok", reviewer="Antigravity")
     ]

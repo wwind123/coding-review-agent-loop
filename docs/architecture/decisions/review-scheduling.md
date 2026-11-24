@@ -16,3 +16,4 @@ never rewritten or deleted. The detail doc describes the current design.
 
 - Converted captures invalidate only preceding approvals; scope-only latches preserve carry across non-capture digest changes and fresh semantic approval survives restart (#1734).
 - Completely approved resumes bypass both reviewer-only advances and fresh-turn publication, while live approval qualification still refuses before any new round or agent turn (#1805).
+- A failed reviewer seat (rejected after re-asks, unavailable or incomplete) no longer stops a round in which another seat blocked: the round continues with the seat's carried items frozen, the seat named in the reconciliation record, never counted as approving and invoked again next round; every other stop condition is kept (#2129).
