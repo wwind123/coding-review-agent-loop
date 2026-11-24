@@ -156,44 +156,55 @@ def peer_blocked_settlement(
     return settle
 
 
-def plan_round_retries_failed_seats(current_resume, *, round_reviewers, resumed, records, subject) -> bool:
-    """Whether a reconciled plan round still owes a failed-seat settlement.
+def plan_failed_seat_retry_state(current_resume, *, round_reviewers, resumed, records, subject):
+    """``(retry, unsettled)`` for a reconciled plan round with failed seats.
 
-    The round's latest reconciliation record names failed seats ``F`` and
-    every round reviewer without a resumed review is in ``F``.  Two cases
-    qualify: a failed seat is still missing (it is retried in the same round),
-    or a failed seat already published a review after that record but the
-    replacement reconciliation was interrupted (it is resumed and the fresh
-    record is posted before the round advances).  A round whose reviews were
-    published in parallel never qualifies: a same-round retry would let the
-    failed seat read its peers' published verdicts, so it keeps the
-    reviewer-only rollover.  ``records`` is called lazily.
+    The round's records are split at its latest reconciliation record.  That
+    record names the failed seats ``F``; reviews published after it belong to
+    an unfinished replacement settlement (a retry), reviews before it to the
+    original round.  ``retry`` is true when every round reviewer without a
+    resumed review is in ``F`` and either a failed seat is still missing or a
+    failed seat already published after the record.  A round whose original
+    reviews (before the record) were published in parallel never retries: a
+    same-round retry would let the failed seat read its peers' published
+    verdicts.  ``unsettled`` names the reviewers whose reviews were published
+    after the record, so their findings are minted exactly once by the
+    replacement settlement.  ``records`` is called lazily.
     """
     if current_resume is None or not current_resume.reconciled:
-        return False
+        return False, frozenset()
     missing = {name for name in round_reviewers if name not in resumed}
     round_records = [
         record for record in records()
         if record.metadata.round_number == current_resume.round_number
         and record.metadata.subject == subject
     ]
-    if any(r.metadata.role == "reviewer" and r.metadata.phase == "publication" for r in round_records):
-        return False
     latest = None
     for position, record in enumerate(round_records):
         metadata = record.metadata
         if metadata.role == "summary" and metadata.phase == "reconciliation":
             latest = position
     if latest is None:
-        return False
+        return False, frozenset()
+    if any(r.metadata.role == "reviewer" and r.metadata.phase == "publication"
+           for r in round_records[:latest]):
+        return False, frozenset()
     failed = set(round_records[latest].metadata.failed_reviewer_seats)
     if not failed or not missing <= failed:
-        return False
-    reviewed_after = {
+        return False, frozenset()
+    reviewed_after = frozenset(
         record.metadata.agent for record in round_records[latest + 1:]
         if record.metadata.role == "reviewer"
-    }
-    return bool(missing) or bool(failed & reviewed_after)
+    )
+    retry = bool(missing) or bool(failed & reviewed_after)
+    return retry, (reviewed_after if retry else frozenset())
+
+
+def plan_round_retries_failed_seats(current_resume, *, round_reviewers, resumed, records, subject) -> bool:
+    """Whether a reconciled plan round still owes a failed-seat settlement (see above)."""
+    return plan_failed_seat_retry_state(
+        current_resume, round_reviewers=round_reviewers, resumed=resumed, records=records, subject=subject,
+    )[0]
 
 
 def pending_failed_seat_retries(records) -> frozenset[str]:

@@ -853,14 +853,21 @@ def test_history_replay_and_head_advance_recovery_apply_the_freeze(failed_seats)
 
 
 @pytest.mark.parametrize("final_parallel", [False, True], ids=["final-sequential", "final-parallel"])
-def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path, monkeypatch, final_parallel):
+@pytest.mark.parametrize("retry_parallel", [False, True], ids=["retry-sequential", "retry-parallel"])
+def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(
+    tmp_path, monkeypatch, retry_parallel, final_parallel,
+):
     """Row pr-resume-after-continued-round (plan): a retry interrupted before its fresh record.
 
     Gemini failed in round 2 (recorded). The rerun retries Gemini, which now
-    resolves its own item, but the process stops before the replacement
-    reconciliation record. The next rerun resumes both reviews, posts the
-    replacement record (no failed seats) and settles with Gemini's
-    dispositions, so the live ledger and the durable replay agree.
+    resolves its own item and raises a new finding, but the process stops
+    before the replacement reconciliation record. The next rerun resumes both
+    reviews, mints Gemini's new finding exactly once, posts the replacement
+    record (no failed seats) and settles with Gemini's dispositions, so the
+    live ledger and the durable replay agree. The retry and the final restart
+    each run in either review mode: eligibility and minting come from the
+    recorded round (reviews after the failed-seat record are the unfinished
+    retry), never from an invocation's flag.
     """
     import coding_review_agent_loop.plan_first_loop as plan_first_loop
 
@@ -872,10 +879,13 @@ def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert _reconciliation(_plan_records(runner), 2).failed_reviewer_seats == ("Gemini",)
 
-    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer=GEMINI, prior_plan_item_dispositions=[
-        {"item_id": "item-1", "disposition": "resolved"},
-        {"item_id": "item-2", "disposition": "resolved"},
-    ]))
+    runner.gemini_outputs.append(structured_plan_review(
+        state="blocking", reviewer=GEMINI, blocking_plan_issues=["Gemini retry gap four."],
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "resolved"},
+            {"item_id": "item-2", "disposition": "resolved"},
+        ]))
+    retry = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=5, review_parallel=retry_parallel)
     real_post = plan_first_loop.post_issue_comment
 
     def stop_before_replacement(*args, **kwargs):
@@ -885,12 +895,13 @@ def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path
 
     monkeypatch.setattr(plan_first_loop, "post_issue_comment", stop_before_replacement)
     with pytest.raises(KeyboardInterrupt):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        run_issue_loop(runner, issue_number=56, config=retry, plan_first=True)
     monkeypatch.setattr(plan_first_loop, "post_issue_comment", real_post)
     assert any(r.agent == "Gemini" and r.round_number == 2 for r in _plan_records(runner) if r.role == "reviewer")
 
     runner.claude_outputs.append(structured_plan_revision(summary="Second revision.", prior_plan_item_dispositions=[
         {"item_id": "item-3", "disposition": "resolved"},
+        {"item_id": "item-4", "disposition": "resolved"},
     ]))
     start = len(runner.commands)
     # The final restart may run in either mode: eligibility comes from the
@@ -905,8 +916,14 @@ def test_plan_interrupted_retry_finishes_its_replacement_reconciliation(tmp_path
     round_two = [r for r in records if r.phase == "reconciliation" and r.round_number == 2]
     assert [r.failed_reviewer_seats for r in round_two] == [("Gemini",), ()]
     planner = next(r for r in records if r.role == "coder" and r.round_number == 3)
-    ledger = {item.item_id for item in planner.prior_items}
-    assert "item-2" not in ledger and "item-1" not in ledger and "item-3" in ledger
+    ledger = [item for item in planner.prior_items]
+    ids = [item.item_id for item in ledger]
+    assert "item-2" not in ids and "item-1" not in ids and "item-3" in ids
+    # Gemini's new retry finding reaches the replacement record and the
+    # planner ledger exactly once.
+    gemini_new = [item for item in ledger if item.text == "Gemini retry gap four."]
+    assert len(gemini_new) == 1 and gemini_new[0].reviewer == "Gemini"
+    assert [i.text for i in round_two[-1].new_items].count("Gemini retry gap four.") == 1
     # Durable replay of the round agrees with the live settlement.
     assert _round_failed_seats_for(records, 2) == ()
 

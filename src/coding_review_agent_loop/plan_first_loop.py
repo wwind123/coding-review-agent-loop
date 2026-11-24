@@ -148,7 +148,7 @@ from .comment_rendering import (
     render_canonical_plan_state,
 )
 from .config import phased_delivery_guard_active
-from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement, plan_round_retries_failed_seats
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement, plan_failed_seat_retry_state
 from .round_metadata import (
     bound_failed_reviewer_seats,
     reset_plan_board_stamp,
@@ -2673,7 +2673,7 @@ def _run_plan_first_loop_body(
         # way. Eligibility comes from the recorded round, never from this
         # invocation's parallel flag; rounds recorded in parallel keep the
         # rollover (a same-round retry would read published peer verdicts).
-        plan_failed_seat_retry = plan_round_retries_failed_seats(
+        plan_failed_seat_retry, plan_retry_unsettled = plan_failed_seat_retry_state(
             current_resume, round_reviewers=[agent_display_name(r) for r in round_reviewers],
             resumed=resumed_by_name, records=lambda: plan_history_records(),
             subject=current_plan_subject,
@@ -3490,7 +3490,12 @@ def _run_plan_first_loop_body(
             # when their saved approval qualifies for the approved shortcut.
             if resumed_record is None or (
                 resumed_record.metadata.phase == "publication"
-                and not (current_resume is not None and current_resume.reconciled)
+                and (
+                    not (current_resume is not None and current_resume.reconciled)
+                    # A retry publication after the failed-seat record is not
+                    # settled yet: mint its findings once (#2129).
+                    or reviewer_name in plan_retry_unsettled
+                )
             ):
                 for item in parsed_review.items.blocking:
                     tracked_item = _next_unresolved_item(
