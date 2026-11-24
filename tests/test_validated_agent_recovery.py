@@ -3068,3 +3068,136 @@ def test_legacy_repair_provider_failure_category_still_classifies():
         "repair-provider-failure", "repair invocation failure: transient_provider_error", "Claude"
     )
     assert "the round is resumable" in suggestion
+
+
+# ---------------------------------------------------------------------------
+# #2128: session-less re-asks quote the rejected response back
+# ---------------------------------------------------------------------------
+
+_PRIOR_MARKER_2128 = "<!-- AGENT_ISSUE_PR_HANDOFF: eyJpc3N1ZV9udW1iZXIiOjF9 -->"
+
+
+def _prior_section_2128(prompt: str) -> str:
+    appendix = prompt.split("## Previous response rejected", 1)[1]
+    return appendix.split("----- BEGIN PREVIOUS RESPONSE -----", 1)[1].split(
+        "----- END PREVIOUS RESPONSE -----", 1
+    )[0]
+
+
+def test_sessionless_reask_includes_sanitized_prior_response(tmp_path):
+    """`reask-sessionless-prior`: no result or caller session -> prior response quoted."""
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+    from coding_review_agent_loop.response_reask import PRIOR_RESPONSE_HEADING
+
+    valid = structured_pr_review(summary="Looks good.")
+    unsafe = structured_pr_review(summary=f"Distinctive judgement 2128. {_PRIOR_MARKER_2128}")
+    results = [
+        AgentResult(text=unsafe, returncode=0, session_id=None),
+        AgentResult(text=valid, returncode=0, session_id=None),
+    ]
+    runner = FakeRunner()
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            runner, agent="codex", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.text == valid
+    call = invoke.call_args_list[1]
+    assert call.kwargs.get("session_id") is None
+    reask_prompt = call.kwargs["prompt"]
+    appendix = reask_prompt.split("## Previous response rejected", 1)[1]
+    assert PRIOR_RESPONSE_HEADING in appendix
+    # The prior section sits between the validator message and the resend instruction.
+    assert appendix.index("Validator message:") < appendix.index(PRIOR_RESPONSE_HEADING)
+    assert appendix.index(PRIOR_RESPONSE_HEADING) < appendix.index("Resend the complete corrected")
+    quoted = _prior_section_2128(reask_prompt)
+    assert "Distinctive judgement 2128." in quoted
+    assert "AGENT_ISSUE_PR_HANDOFF" not in quoted
+    assert "<!--" not in quoted and "-->" not in quoted
+    assert not scan_reserved_markers(appendix)
+
+
+def test_session_backed_reask_does_not_duplicate_prior_response(tmp_path):
+    """`reask-session-no-dup`: a resumed session gets no prior-response section."""
+    from coding_review_agent_loop.response_reask import PRIOR_RESPONSE_HEADING
+
+    valid = structured_pr_review(summary="Looks good.")
+    unsafe = structured_pr_review(summary=f"Distinctive judgement 2128. {_PRIOR_MARKER_2128}")
+    results = [
+        AgentResult(text=unsafe, returncode=0, session_id="sess-2128"),
+        AgentResult(text=valid, returncode=0, session_id="sess-2128"),
+    ]
+    runner = FakeRunner()
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.text == valid
+    call = invoke.call_args_list[1]
+    assert call.kwargs.get("session_id") == "sess-2128"
+    reask_prompt = call.kwargs["prompt"]
+    assert PRIOR_RESPONSE_HEADING not in reask_prompt
+    assert "BEGIN PREVIOUS RESPONSE" not in reask_prompt
+    assert "Distinctive judgement 2128." not in reask_prompt
+
+
+def test_build_reask_prompt_without_prior_response_is_unchanged():
+    """`reask-session-no-dup`: the default argument leaves the prompt byte-identical."""
+    from coding_review_agent_loop.response_reask import build_reask_prompt
+
+    assert build_reask_prompt("Original.", "bad", 1) == build_reask_prompt(
+        "Original.", "bad", 1, prior_response=None
+    )
+    assert "PREVIOUS RESPONSE" not in build_reask_prompt("Original.", "bad", 1)
+
+
+def test_prior_response_is_bounded_truncated_and_sanitized(tmp_path):
+    """`reask-prior-bound-sanitize`: oversized, marker- and secret-bearing response."""
+    from pathlib import Path
+
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+    from coding_review_agent_loop.response_reask import (
+        REASK_PRIOR_RESPONSE_MAX_CHARS,
+        build_reask_prompt,
+        sanitize_prior_response,
+    )
+
+    home = str(Path.home())
+    head = (
+        "line one keeps its structure\nline two\n"
+        f"token=SECRET2128 at {home}/private/file.txt\n{_PRIOR_MARKER_2128}\n"
+    )
+    # Multi-byte characters straddle every plausible cut point.
+    body = "é漢🙂" * (REASK_PRIOR_RESPONSE_MAX_CHARS)
+    tail = "\nFINAL-TAIL-2128"
+    prior = head + body + tail
+    quoted = sanitize_prior_response(prior)
+    assert len(quoted) <= REASK_PRIOR_RESPONSE_MAX_CHARS
+    assert "line one keeps its structure\nline two\n" in quoted
+    assert "characters omitted ...]" in quoted
+    assert quoted.rstrip().endswith("FINAL-TAIL-2128")
+    assert "SECRET2128" not in quoted
+    assert home not in quoted
+    assert "AGENT_ISSUE_PR_HANDOFF" not in quoted
+    assert "<!--" not in quoted
+    assert not scan_reserved_markers(quoted)
+    # Code-point slicing never yields a broken character on UTF-8 encode.
+    quoted.encode("utf-8", errors="strict")
+    import re
+    omitted = int(re.search(r"\[\.\.\. (\d+) characters omitted", quoted).group(1))
+    note_len = len(f"\n[... {omitted} characters omitted ...]\n")
+    sanitized_full = len(sanitize_prior_response(prior, limit=10**9))
+    assert len(quoted) - note_len + omitted == sanitized_full
+
+    prompt = build_reask_prompt("Original.", "bad", 1, prior_response=prior)
+    appendix = prompt.split("Original.", 1)[1]
+    assert len(appendix) < REASK_PRIOR_RESPONSE_MAX_CHARS + 1500
+    assert "SECRET2128" not in appendix
+    assert not scan_reserved_markers(appendix)

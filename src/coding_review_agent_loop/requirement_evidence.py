@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 
 from .errors import AgentLoopError, MissingJudgementFieldError, render_human_decision
 from .github import HumanReviewRequirement
+from .protocol_markers import sanitize_untrusted_prose
 
 
 def normalize_empty_text(entry):
@@ -73,6 +74,32 @@ def _inconsistent(index, entry, rule, no_requests=False):
                                       observed_preview=message)
 
 
+_ENTRY_KEYS = ("requirement_id", "role", "request", "answered_item_ids", "leftover_instructions")
+_PREVIEW_CHARS = 60
+
+
+def _value_preview(value: object) -> str:
+    """Bounded, single-line, marker-free echo of a rejected value (#2128)."""
+    text = value if isinstance(value, str) else type(value).__name__
+    text = " ".join(sanitize_untrusted_prose(text).replace("`", "'").split())
+    if len(text) > _PREVIEW_CHARS:
+        text = text[:_PREVIEW_CHARS] + "\u2026"
+    return f"`{text}`"
+
+
+def _entry_keys_message(index: int, entry: dict) -> str:
+    """Name the missing and unexpected keys of one requirement_evidence entry (#2128)."""
+    keys = {key for key in entry if isinstance(key, str)}
+    missing = [key for key in _ENTRY_KEYS if key not in keys]
+    unexpected = sorted(_value_preview(key) for key in entry if key not in _ENTRY_KEYS)
+    parts = [f"requirement_evidence[{index}] entries require exactly {', '.join(_ENTRY_KEYS)}"]
+    if missing:
+        parts.append(f"missing: {', '.join(missing)}")
+    if unexpected:
+        parts.append(f"unexpected: {', '.join(unexpected[:10])}")
+    return "; ".join(parts)
+
+
 def parse_associations(value, *, emitted_requests=None):
     """Parse reviewer classifications; role/field violations take the judgement re-ask.
 
@@ -84,12 +111,16 @@ def parse_associations(value, *, emitted_requests=None):
         raise AgentLoopError("requirement_evidence must be an array")
     result = []
     for index, entry in enumerate(value):
-        if not isinstance(entry, dict) or set(entry) != {
-            "requirement_id", "role", "request", "answered_item_ids", "leftover_instructions"
-        }:
-            raise AgentLoopError("requirement_evidence entries require requirement_id, role, request, answered_item_ids and leftover_instructions")
+        if not isinstance(entry, dict):
+            raise AgentLoopError(
+                f"requirement_evidence[{index}] must be an object (got {type(entry).__name__}); "
+                f"entries require {', '.join(_ENTRY_KEYS)}")
+        if set(entry) != set(_ENTRY_KEYS):
+            raise AgentLoopError(_entry_keys_message(index, entry))
         if not isinstance(entry["role"], str) or entry["role"] not in ROLES:
-            raise AgentLoopError("Unknown requirement_evidence role")
+            raise AgentLoopError(
+                f"Unknown requirement_evidence[{index}].role "
+                f"(got {_value_preview(entry['role'])}); allowed values: {', '.join(sorted(ROLES))}")
         entry = normalize_empty_text(entry)
         for field in ("requirement_id", "request", "leftover_instructions"):
             if not isinstance(entry[field], str):

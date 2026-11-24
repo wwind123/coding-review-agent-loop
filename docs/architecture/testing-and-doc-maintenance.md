@@ -265,6 +265,22 @@ provider, quota, timeout and unsupported-model failures keep their own retry
 paths without spending a re-ask. A plain-prose response that names an auth or
 billing stop is a provider failure, not a re-ask cause.
 
+When the re-ask cannot resume a session (Codex, Antigravity, or any result
+and caller without a session id), it is a fresh turn that has not seen its own
+rejected response, so the re-ask prompt also quotes that response
+(`response_reask.sanitize_prior_response`) between the validator message and
+the resend instruction (#2128). The quote keeps line structure, redacts secrets
+and local paths, replaces reserved protocol records and names with their safe
+labels, neutralizes HTML comment delimiters, and is bounded by
+`REASK_PRIOR_RESPONSE_MAX_CHARS`: an oversized response keeps its head and a
+short tail around an explicit omission note. A session-backed re-ask omits it,
+so the prompt is unchanged and nothing is duplicated.
+
+Enum and entry-shape rejections in the risk-matrix and `requirement_evidence`
+parsers name the item index, the received value (bounded and sanitized) and the
+allowed values or the missing and unexpected keys, so the re-ask can say what
+to send (#2128).
+
 Typed defects keep a targeted hint section ahead of the generic re-ask
 appendix: the missing carried item IDs (`MissingPriorItemDispositionError`),
 the judgement field and its allowed values (`MissingJudgementFieldError`),
