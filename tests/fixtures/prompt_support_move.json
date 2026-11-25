@@ -80,7 +80,7 @@
     "MANAGED_RECEIPT_REVIEWER_GUIDANCE": "2be97ff7da9e48a74020242bf8ce955aee2ee9f4bfd0741556a0046b3dd24d2e",
     "PRE_COLLECTION_CODER_GUIDANCE": "1b4a622cbf1061bd16c12338566077836e1d495b5fd5d3cba340cffb90e7a560",
     "FIXTURE_CODER_GUIDANCE": "ba16ab4716e3d7e7b9cb8b373ce9fc702aa027e006ca43237b8e56a1f5c24828",
-    "_coder_test_reporting_guidance": "82e5b39a7c109f3c59813704f1afaafc4a6fb71df7329d2abec441f872b72991",
+    "_coder_test_reporting_guidance": "f61f92fa23a02fb17388ce68a6c77e472a95f4463fd84bd11868c9908eeef162",
     "_coder_local_test_scope_guidance": "26d5bb5d9d545cc6d816dcf74c2eb045a69d55cddeb2ddd5a2c9f7f00e5fd30d",
     "_coder_shell_stdin_guidance": "0355373d889a7108d5079fe7c0ef4f5a6380ce0079175173dad50fdefca0b00b",
     "_claude_shell_limit_guidance": "1c2aaa7809338416752ec4d8a228fa94378514683f202a325635b65b0063018f",

@@ -32,6 +32,36 @@ VALIDATOR_MESSAGE_MAX_CHARS = 2000
 REASK_PRIOR_RESPONSE_MAX_CHARS = 24000
 # Characters of the rejected response's tail kept after truncation.
 REASK_PRIOR_RESPONSE_TAIL_CHARS = 2000
+# Issue #2157: clauses for a coder re-ask that resumes its session.  Work the
+# previous turn started in the background may still be running; the agent may
+# wait on it, but starting or finishing implementation work belongs only to
+# the one-time completion-recovery continuation.
+REASK_BACKGROUND_WAIT_CLAUSE = (
+    "Background work you started in the previous turn (subagents, Agent/Task "
+    "tools, shell commands) may still be running. Before you resend, you may wait "
+    "for that existing work to finish, using only that work's own result or wait "
+    "mechanism (reading a subagent's or task's final output, or one bounded "
+    "blocking wait on that job). Do not poll in a loop."
+)
+REASK_NO_NEW_WORK_CLAUSE = (
+    "Do not start new work: no new subagents, Agent/Task calls, tests or other "
+    "commands, no file edits, and no commits or pushes."
+)
+REASK_REPORT_FINAL_STATE_CLAUSE = (
+    "When that work has finished or is no longer running, report the real final "
+    "state in the required format. Put unfinished work in the response's "
+    "remaining items, not in an interim progress message, and do not complete "
+    "unfinished work yourself in this re-ask."
+)
+REASK_HEAD_GUARD_CLAUSE = (
+    "The checkout head is compared before and after this re-ask, and a moved head "
+    "ends the turn."
+)
+REASK_CODER_NO_COMMAND_LINE = (
+    "Do not modify, commit or push anything, do not run tests or other commands, "
+    "and do not touch the checkout: only resend the response. " + REASK_HEAD_GUARD_CLAUSE
+)
+
 PRIOR_RESPONSE_HEADING = (
     "Your previous (rejected) response, for reference — keep its judgements:"
 )
@@ -144,7 +174,9 @@ def build_reask_prompt(
     allowed values, evidence reason, contract field).  A coder re-ask forbids
     touching the checkout; a fresh-evidence coder re-ask (a non-citable
     observation) instead allows rerunning the covering test through the test
-    wrapper, while still forbidding commits and pushes.
+    wrapper, while still forbidding commits and pushes.  A session-backed coder
+    re-ask may also wait on background work the previous turn started (#2157),
+    but never start new work or finish the implementation.
     """
     detail = sanitize_validator_message(validator_message, config=config) or "(no detail)"
     lines = [
@@ -173,15 +205,25 @@ def build_reask_prompt(
         "Keep every judgement, claim and item from your previous response unless the "
         "validator message requires a change.",
     ]
+    # A session-backed re-ask resumes a turn that may have left background
+    # work running (#2157); a session-less one is a fresh turn with none.
+    resumed = prior_response is None
     if coder and fresh_evidence:
+        if resumed:
+            lines.append(REASK_BACKGROUND_WAIT_CLAUSE)
         lines.append(
             "You may rerun the covering test through the test wrapper as instructed above. "
             "Do not edit files, commit, push, or otherwise change the checkout or the PR."
         )
-    elif coder:
-        lines.append(
-            "Do not modify, commit or push anything, do not run tests or other commands, "
-            "and do not touch the checkout: only resend the response. The checkout head is "
-            "compared before and after this re-ask, and a moved head ends the turn."
+    elif coder and resumed:
+        lines.extend(
+            [
+                REASK_BACKGROUND_WAIT_CLAUSE,
+                REASK_NO_NEW_WORK_CLAUSE,
+                REASK_REPORT_FINAL_STATE_CLAUSE,
+                REASK_HEAD_GUARD_CLAUSE,
+            ]
         )
+    elif coder:
+        lines.append(REASK_CODER_NO_COMMAND_LINE)
     return "\n".join(lines) + "\n"

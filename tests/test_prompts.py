@@ -674,8 +674,44 @@ def test_coder_test_reporting_guidance_forbids_background_completion_work(tmp_pa
 
     for prompt in prompts:
         assert "run the relevant tests you can run" in prompt
-        assert "in the foreground and wait for them to finish" in prompt
-        assert "Do not launch them in the background" in prompt
+        assert "in the foreground and wait for it to finish" in prompt
+        assert "Do not start background work" in prompt
+
+
+def test_coder_prompts_carry_the_all_background_work_rule_in_both_forms(tmp_path):
+    """`prompt-rule-both-forms` (#2157): one shared rule for every kind of work."""
+    from coding_review_agent_loop.prompt_support import (
+        FOREGROUND_WORK_RULE,
+        QUOTED_COMMAND_REVIEW_RULE,
+    )
+
+    config = make_config(tmp_path)
+    coder_prompts = {
+        "issue-implementation (structured)": build_issue_implementation_prompt(56, "1. Fix it.", config),
+        "issue (structured)": build_issue_prompt(56, config),
+        "pr-fix (structured)": build_followup_prompt(77, 1, "Needs tests.", config),
+        "task (prose)": build_task_prompt("Fix the bug.", config),
+        "completion recovery": build_completion_recovery_prompt(config),
+    }
+    for label, prompt in coder_prompts.items():
+        assert FOREGROUND_WORK_RULE in prompt, label
+    assert "every subagent or Agent/Task tool call" in FOREGROUND_WORK_RULE
+    assert "other shell commands" in FOREGROUND_WORK_RULE
+    assert (
+        "Parallel subagents are allowed only if this turn waits for every one of them "
+        "to finish before it writes the terminal response."
+    ) in FOREGROUND_WORK_RULE
+    # Shared wording with the reviewer rule, so there is one rule, not two.
+    assert "do not start background work" in QUOTED_COMMAND_REVIEW_RULE
+    assert "Do not start background work" in FOREGROUND_WORK_RULE
+    assert "instead of deferring to a background task" in QUOTED_COMMAND_REVIEW_RULE
+    assert "instead of deferring to a background task" in FOREGROUND_WORK_RULE
+    # Foreground parallel subagents stay legal; subagents are not banned.
+    assert "Do not use subagents" not in FOREGROUND_WORK_RULE
+
+    review = build_review_prompt(77, 1, config, reviewer="codex")
+    assert FOREGROUND_WORK_RULE not in review
+    assert QUOTED_COMMAND_REVIEW_RULE in review
 
 
 def test_completion_recovery_prompt_includes_workdir_and_scratch_guidance(tmp_path):
@@ -6819,7 +6855,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     and the remote-tracking review diff base from #1977, and the superseded
     signed-source classification guidance from #2101, and the keep-the-PR
     blocked-requirement guidance from #2120, and the plan-review
-    implementation-notes list and guidance from #2145.
+    implementation-notes list and guidance from #2145, and the shared
+    all-background-work coder rule from #2157.
     """
     import json as _golden_json
     import os as _golden_os

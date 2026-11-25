@@ -448,9 +448,9 @@ An operator-configured `--test-python` interpreter is validated, exported to
 every coder as `AGENT_LOOP_TEST_PYTHON`, import-checked at each coder-prompt
 render and, in sandboxed mode, becomes the single granted test invocation. Claude
 coder turns get `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` sized by
-`run_tests_foreground_budget_seconds` (watchdog ceiling, host-wait bound,
-parent overhead, headroom); every other backend and role carries an `unknown`
-shell-cap fact. Broker-owned detached runs are deferred. See
+`run_tests_foreground_budget_seconds` and a forced
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (#2157); other roles and backends
+get only an `unknown` shell-cap fact. Broker-owned detached runs are deferred. See
 [Running a long or full suite](../local_agent_loop.md#running-a-long-or-full-suite).
 
 A containment-aware test-worker budget (`test_workers.py`) is derived after

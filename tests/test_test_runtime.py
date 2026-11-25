@@ -8664,3 +8664,73 @@ def test_explainer_and_recognizer_agree_within_supported_families_2036(
         assert explanation is not None and "unrecognized" not in explanation
     if explanation is not None:
         assert not recognized
+
+
+# ---------------------------------------------------------------- #2157
+
+
+@pytest.mark.parametrize("ambient_value", [None, "0", "1", ""])
+def test_claude_coder_disables_background_tasks_over_any_ambient_value(tmp_path, ambient_value):
+    """`coder-env-switch`: exported as 1, overriding any ambient value."""
+    config = make_config(tmp_path)
+    ambient = {} if ambient_value is None else {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": ambient_value}
+    env = runtime.agent_shell_environment(config, "claude", "coder", ambient=ambient)
+    assert env[runtime.CLAUDE_DISABLE_BACKGROUND_TASKS_ENV] == "1"
+    assert runtime.CLAUDE_DISABLE_BACKGROUND_TASKS_ENV == "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+    assert {**ambient, **env}["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+
+
+@pytest.mark.parametrize(
+    "provider, role",
+    [
+        ("claude", "reviewer"),
+        ("claude", "planner"),
+        ("claude", "plan_reviewer"),
+        ("claude", "repair"),
+        ("claude", None),
+        ("codex", "coder"),
+        ("gemini", "coder"),
+        ("antigravity", "coder"),
+    ],
+)
+def test_other_roles_and_backends_do_not_disable_background_tasks(tmp_path, provider, role):
+    """`reviewer-env-unchanged`: only the exact Claude coder carries the switch."""
+    config = make_config(tmp_path)
+    env = runtime.agent_shell_environment(config, provider, role, ambient={})
+    assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in env
+    assert env == {"AGENT_LOOP_SHELL_CAP_MS": "unknown"}
+
+
+def test_claude_backend_coder_invocation_disables_background_tasks(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.claude import BACKEND as CLAUDE
+
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0")
+    config = make_config(tmp_path)
+    runner = _env_runner(claude_outputs=['{"result":"ok"}', '{"result":"ok"}'])
+    CLAUDE.run(runner, config, "Implement", run_id="r", role="coder")
+    coder_env = runner.agent_envs[-1]
+    coder_command = list(runner.commands[-1][0])
+    assert coder_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    CLAUDE.run(runner, config, "Review", run_id="r", role="reviewer")
+    reviewer_env = runner.agent_envs[-1]
+    reviewer_command = list(runner.commands[-1][0])
+    assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in reviewer_env
+    # The switch travels only in the environment, never on the command line.
+    assert not any("BACKGROUND" in str(part) for part in coder_command + reviewer_command)
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex", "gemini", "antigravity"])
+@pytest.mark.parametrize("role", ["coder", "reviewer", None])
+def test_every_orchestrator_shell_fact_is_an_environment_identity_exclusion(tmp_path, provider, role):
+    """#1343/#2157: no backend- or role-specific shell fact may split identity.
+
+    Generalizes the BASH_*_TIMEOUT_MS exclusion: every variable that
+    agent_shell_environment authors, including the Claude coder's
+    background-tasks switch, is an exact-name identity exclusion.
+    """
+    from coding_review_agent_loop.local_test_evidence import ENVIRONMENT_EXCLUSIONS
+
+    config = make_config(tmp_path, test_python=sys.executable)
+    env = runtime.agent_shell_environment(config, provider, role, ambient={})
+    assert set(env) <= ENVIRONMENT_EXCLUSIONS
+    assert runtime.CLAUDE_DISABLE_BACKGROUND_TASKS_ENV in ENVIRONMENT_EXCLUSIONS
