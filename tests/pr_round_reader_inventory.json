@@ -3535,6 +3535,12 @@
       "admission": "review_images_state.reduce_history consumes invocation-only admitted History supplied by pr_loop_support; incomplete identity coverage refuses before visual state reduction."
     },
     {
+      "module": "review_step_back",
+      "function": "plan_step_back_candidate_rounds_in_history",
+      "classification": "reader",
+      "admission": "review_step_back.plan_step_back_candidate_rounds_in_history is a pure projection over plan round records the plan loop already admitted through plan_history_records (#2098); it replays each primary segment via plan_step_back_episodes_in_history for the reviewer step-back notice and selects no approval, routing or protocol authorization."
+    },
+    {
       "module": "round_metadata",
       "function": "_authenticated_canonical_plan_success_exists",
       "classification": "reader",

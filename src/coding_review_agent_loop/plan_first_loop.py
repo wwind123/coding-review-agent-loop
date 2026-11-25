@@ -85,6 +85,7 @@ from .errors import (
     AgentInvocationError,
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
+    HumanDecisionRequiredError,
     QuotaResetExceededError,
     reraise_human_decision,
 )
@@ -188,6 +189,7 @@ from .plan_review_scheduling import (
     PlanReviewSchedulingContract,
     PlanSchedulerSnapshot,
     classify_plan_transition,
+    surfaced_requirement_id_digest,
     make_plan_contract,
     plan_history_fallback_reason,
     plan_policy_capabilities,
@@ -242,8 +244,6 @@ from .panel_evidence import (
     _carried_plan_approvals,
     _classify_staged_plan_history,
     plan_issue_text_digest,
-    plan_primary_blocking_streak_detail,
-    plan_primary_stall_message,
     _planner_candidate_rounds,
     _plan_growth_candidate_count,
     _plan_growth_gate_violation,
@@ -252,18 +252,14 @@ from .panel_evidence import (
     _plan_revision_descriptor,
 )
 from .review_step_back import (
-    BLOCKING_CLASSES,
-    DISPOSITION_DEFER_EPISODE,
-    DISPOSITION_DEFER_PENDING,
-    DISPOSITION_ESCALATED,
+    PLAN_STEP_BACK_ROUNDS,
+    PLAN_SWEEP_ROUNDS,
     PlanStepBackAnchor,
     PlanStepBackContext,
-    StallStepBackDisposition,
     PlanBaseline,
     RenderedBaseline,
     derive_plan_step_back_state,
     derive_plan_sweep_state,
-    entry_payload_for_plan,
     first_plan_review_round,
     plan_round_provenance_counts,
     plan_sweep_due,
@@ -271,13 +267,18 @@ from .review_step_back import (
     reviewer_previous_plan_baseline,
     select_provenance_baseline,
     mandatory_plan_findings_since,
-    plan_growth_crossing_round,
-    plan_stall_step_back_disposition,
     plan_step_back_anchor,
-    plan_step_back_candidate_rounds,
-    reintroduced_dissolved_items,
-    render_step_back_human_decision,
+    plan_step_back_candidate_rounds_in_history,
+    plan_step_back_episodes_in_history,
     step_back_alternative_summary,
+)
+from .no_progress import (
+    PLAN_BLOCKING_STATUSES,
+    blocking_item_ids,
+    no_progress_decision,
+    plan_no_progress_observations,
+    render_no_progress_item_lines,
+    render_no_progress_message,
 )
 from .review_rounds import (
     _is_incomplete_plan_review,
@@ -507,9 +508,13 @@ def _run_plan_first_loop_body(
         raise PlanPrePanelSafetyError(message)
 
     def stop_plan_pre_panel_decision(
-        exc: PlanPrePanelHumanDecisionError, *, round_number: int | None
+        exc: HumanDecisionRequiredError, *, round_number: int | None
     ) -> NoReturn:
-        """Post a human-decision planning stop once, then re-raise the same error (#2069)."""
+        """Post a human-decision planning stop once, then re-raise the same error (#2069).
+
+        Any human-decision error is accepted, including the plan no-progress
+        stop (#2098); it writes no round record.
+        """
         label = f"round {round_number}" if round_number is not None else "startup"
         message = str(exc)
         log(config, f"Planning {label}: {message}")
@@ -528,80 +533,26 @@ def _run_plan_first_loop_body(
         return f"Plan-growth measurements: {describe()}." if callable(describe) else ""
 
     def plan_step_back_state(
-        records: Sequence[PostedRoundRecord], *, panel_opening_index: int | None
+        records: Sequence[PostedRoundRecord],
+        *,
+        panel_opening_index: int | None,
+        live_round: int | None = None,
     ):
-        """The primary's step-back state, or ``None`` when degraded or disabled (#1251)."""
-        if config.plan_step_back_rounds <= 0 or plan_primary_name is None:
+        """The primary's replay-derived step-back state, or ``None`` (#1251, #2098).
+
+        ``None`` only when no primary reviewer is configured.  Legacy
+        ``step_back_entries`` are never read, so a malformed legacy entry no
+        longer degrades the planning history.
+        """
+        if PLAN_STEP_BACK_ROUNDS <= 0 or plan_primary_name is None:
             return None
-        state = derive_plan_step_back_state(
+        return derive_plan_step_back_state(
             records,
             primary=plan_primary_name,
             panel_opening_index=panel_opening_index,
             current_issue_digest=plan_issue_digest,
-        )
-        if state.degraded:
-            log(
-                config,
-                "Planning step-back suppressed: a malformed step-back history entry "
-                "degrades the planning history",
-            )
-            return None
-        return state
-
-    def plan_step_back_escalation(
-        records: Sequence[PostedRoundRecord],
-        *,
-        panel_opening_index: int | None,
-        assessment: object | None,
-        measurements: str | None,
-        post_review: bool = False,
-    ) -> PlanPrePanelHumanDecisionError | None:
-        """Human-decision stop once the primary rejected the step-back, else ``None``."""
-        state = plan_step_back_state(records, panel_opening_index=panel_opening_index)
-        if (
-            state is None
-            or state.episode is None
-            or state.escalation_count < config.plan_step_back_escalation_rounds
-        ):
-            return None
-        anchor = plan_step_back_anchor(records, state.episode)
-        return PlanPrePanelHumanDecisionError(render_step_back_human_decision(
-            phase="plan",
-            measurements=plan_step_back_measurements(assessment, measurements),
-            step_back_round=state.episode.candidate_round,
-            blocks=state.escalation_count,
-            threshold=config.plan_step_back_escalation_rounds,
-            alternative=step_back_alternative_summary(records, state.episode),
-            dissolved=anchor.dissolved_ids,
-            reintroduced=reintroduced_dissolved_items(records, state.episode, anchor),
-            post_review=post_review,
-        ))
-
-    def _stall_step_back_disposition() -> StallStepBackDisposition:
-        """What the reached stall limit does about the plan step-back (#1275)."""
-        crossing = (
-            plan_growth_crossing_round(
-                plan_records,
-                config=config,
-                current_round=current_plan_sidecar.round_number,
-            )
-            if current_plan_sidecar is not None
-            else None
-        )
-        return plan_stall_step_back_disposition(
-            plan_step_back_state(
-                plan_records, panel_opening_index=plan_panel_evidence.opening_index
-            ),
-            round_number=round_number,
-            crossing_round=crossing,
-            growth_gate_enforced=plan_growth_gate_enforced(config),
-            step_back_rounds=config.plan_step_back_rounds,
-            escalation_rounds=config.plan_step_back_escalation_rounds,
-            candidate_strategy=(
-                plan_strategy(current_plan_sidecar.canonical_json)
-                if current_plan_sidecar is not None
-                else None
-            ),
+            config=config,
+            live_round=live_round,
         )
 
     if inherited_matrix_binding is not None:
@@ -2062,7 +2013,10 @@ def _run_plan_first_loop_body(
                 current_plan, _current_execution_recommendation(current_plan, issue_context.comments)
             )
 
-        stall_deferred_for_step_back = False
+        plan_reset_round = False
+        # The staged branch's fresh raw history for this round, reused by the
+        # no-progress detector so it adds no GitHub read (#2098).
+        round_raw_plan_records: tuple[PostedRoundRecord, ...] | None = None
         step_back_candidate_review = False
         step_back_review_anchor: PlanStepBackAnchor | None = None
         pre_round_step_back_episode = None
@@ -2180,6 +2134,116 @@ def _run_plan_first_loop_body(
                 )
                 + "; no panel review is scheduled on it",
             )
+        def _check_plan_no_progress() -> None:
+            """Stop with exit 4 when K completed rounds and the live plan are unchanged."""
+            if (
+                # K completed rounds are needed, so nothing is read before them.
+                round_number <= config.no_progress_rounds
+                or plan_reset_round
+                or ownership_review_failure is not None
+                or staged_mode_revision
+                or plan_operator_force_full
+                or plan_approved_shortcut
+                or (current_resume is not None and current_resume.completed_reviews)
+            ):
+                return
+            if staged_planning and plan_history_class != PLAN_HISTORY_INTACT:
+                log(
+                    config,
+                    f"Planning round {round_number}: no-progress detector skipped: degraded "
+                    f"planning history ({plan_history_class or 'unclassified'})",
+                )
+                return
+            live_blocking = blocking_item_ids(
+                prior_unresolved_items, statuses=PLAN_BLOCKING_STATUSES
+            )
+            if not live_blocking:
+                return
+            try:
+                raw_records = (
+                    round_raw_plan_records
+                    if round_raw_plan_records is not None
+                    else plan_history_records(
+                        refresh=True, round_number=round_number, include_idle_checkpoints=True
+                    )
+                )
+            except PlanPrePanelSafetyError:
+                raise
+            except AgentLoopError as exc:
+                log(
+                    config,
+                    f"Planning round {round_number}: no-progress detector skipped: "
+                    f"planning history unreadable ({exc})",
+                )
+                return
+            reset_floor = max(
+                (
+                    record.metadata.round_number
+                    for record in raw_records
+                    if record.metadata.role == "summary"
+                    and record.metadata.phase == "scheduler-prelaunch"
+                    and record.metadata.scheduler_metadata_status == "valid"
+                    and record.metadata.scheduler_stall_reset
+                ),
+                default=0,
+            )
+            projected = project_plan_history(raw_records)
+            decision = no_progress_decision(
+                plan_no_progress_observations(
+                    projected,
+                    current_issue_digest=plan_issue_digest,
+                    current_requirement_digest=surfaced_requirement_id_digest(plan_hr_ids),
+                    requirements_surfaced=bool(plan_hr_ids),
+                    reset_floor_round=reset_floor,
+                ),
+                live_subject=current_plan_subject,
+                live_blocking_ids=live_blocking,
+                k=config.no_progress_rounds,
+                through_round=round_number - 1,
+            )
+            if decision is None:
+                return
+            item_texts = {
+                str(item.item_id): str(getattr(item, "text", "") or "")
+                for item in prior_unresolved_items
+            }
+            describe = getattr(plan_growth_assessment, "describe", None)
+            plan_size = f"{len(current_plan)} characters" + (
+                f"; plan-growth measurements: {describe()}" if callable(describe) else ""
+            )
+            alternative: tuple[int, str] | None = None
+            # Every primary segment, so an episode from before the panel
+            # opening still supplies its alternative after it.
+            episodes = (
+                plan_step_back_episodes_in_history(
+                    projected,
+                    primary=plan_primary_name,
+                    current_issue_digest=plan_issue_digest,
+                    config=config,
+                )
+                if plan_primary_name is not None
+                else ()
+            )
+            if episodes:
+                for episode in reversed(episodes):
+                    summary = step_back_alternative_summary(projected, episode)
+                    if summary is not None and summary.strip():
+                        alternative = (episode.candidate_round, summary)
+                        break
+            message = render_no_progress_message(
+                lead="",
+                subject_label="plan",
+                subject=decision.subject,
+                k=decision.k,
+                rounds=decision.rounds,
+                item_lines=render_no_progress_item_lines(decision.blocking_ids, item_texts),
+                approach_alternative=alternative,
+                plan_size=plan_size,
+            )
+            stop_plan_pre_panel_decision(
+                PlanPrePanelHumanDecisionError(message), round_number=round_number
+            )
+
         if staged_planning and not growth_skip_panel:
             assert plan_scheduler_contract is not None
             incomplete_key = current_plan_key.incompleteness_reason()
@@ -2193,6 +2257,7 @@ def _run_plan_first_loop_body(
             raw_plan_records = plan_history_records(
                 refresh=True, round_number=round_number, include_idle_checkpoints=True
             )
+            round_raw_plan_records = raw_plan_records
             plan_records = project_plan_history(raw_plan_records)
             plan_panel_evidence = _derive_plan_panel_evidence(
                 plan_records,
@@ -2222,37 +2287,43 @@ def _run_plan_first_loop_body(
             plan_history_class = plan_history.history_class
             step_back_history_intact = plan_history_class == PLAN_HISTORY_INTACT
             step_back_history_class = str(plan_history_class)
-            if config.plan_step_back_rounds > 0 and plan_primary_name is not None and ownership_review_failure is None:
-                step_back_candidate_review = (
-                    current_plan_sidecar.round_number
-                    if current_plan_sidecar is not None
-                    else round_number
-                ) in plan_step_back_candidate_rounds(plan_records)
-            if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
-                # A contradictory persisted key can supply neither an approval
-                # nor a panel opening.
-                plan_qualifying_approvals = ()
             plan_reset_round = (
                 config.plan_reset_stall_streak
                 and not plan_reset_checkpoint_written
                 and plan_scheduler_contract is not None
             )
-            if plan_reset_round and config.plan_primary_stall_rounds > 0:
+            if plan_reset_round:
                 log(
                     config,
-                    f"Planning round {round_number}: stall streak reset by operator "
+                    f"Planning round {round_number}: no-progress window reset by operator "
                     "(--plan-reset-stall-streak)",
                 )
-            if (
-                config.plan_step_back_rounds > 0
-                and plan_primary_name is not None
-                and step_back_history_intact
-                and not plan_panel_evidence.opened
-            ):
-                pre_round_state = plan_step_back_state(
+            pre_round_state = (
+                plan_step_back_state(
                     plan_records, panel_opening_index=plan_panel_evidence.opening_index
                 )
-                if pre_round_state is not None and pre_round_state.episode is not None:
+                if plan_primary_name is not None and step_back_history_intact
+                else None
+            )
+            if plan_primary_name is not None and ownership_review_failure is None:
+                # Across the panel opening too, so panel reviewers of the
+                # step-back candidate keep the notice.
+                step_back_candidate_review = (
+                    current_plan_sidecar.round_number
+                    if current_plan_sidecar is not None
+                    else round_number
+                ) in plan_step_back_candidate_rounds_in_history(
+                    plan_records,
+                    primary=plan_primary_name,
+                    current_issue_digest=plan_issue_digest,
+                    config=config,
+                )
+            if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
+                # A contradictory persisted key can supply neither an approval
+                # nor a panel opening.
+                plan_qualifying_approvals = ()
+            if pre_round_state is not None and not plan_panel_evidence.opened:
+                if pre_round_state.episode is not None:
                     pre_round_step_back_episode = pre_round_state.episode
                     # A reset on this round closes the episode before reviewers run.
                     if not plan_reset_round:
@@ -2261,7 +2332,7 @@ def _run_plan_first_loop_body(
                         )
             plan_baseline_records = tuple(plan_records)
             if (
-                config.plan_sweep_rounds > 0
+                PLAN_SWEEP_ROUNDS > 0
                 and plan_primary_name is not None
                 and not plan_panel_evidence.opened
             ):
@@ -2275,7 +2346,7 @@ def _run_plan_first_loop_body(
                     log(
                         config,
                         f"Planning round {round_number}: primary sweep not requested: the "
-                        "stall-streak reset retires earlier rounds",
+                        "no-progress window reset retires earlier rounds",
                     )
                 else:
                     sweep_state = derive_plan_sweep_state(
@@ -2285,17 +2356,7 @@ def _run_plan_first_loop_body(
                         current_issue_digest=plan_issue_digest,
                     )
                     sweep_streak = sweep_state.streak_before(round_number)
-                    if sweep_state.degraded:
-                        log(
-                            config,
-                            f"Planning round {round_number}: primary sweep suppressed: a "
-                            "malformed step-back history entry degrades the planning history",
-                        )
-                    elif plan_sweep_due(
-                        sweep_state,
-                        round_number=round_number,
-                        sweep_rounds=config.plan_sweep_rounds,
-                    ):
+                    if plan_sweep_due(sweep_state, round_number=round_number):
                         first_round = sweep_state.streak_first_round(round_number)
                         assert first_round is not None
                         plan_sweep_classes = plan_sweep_finding_classes(
@@ -2304,117 +2365,8 @@ def _run_plan_first_loop_body(
                         log(
                             config,
                             f"Planning round {round_number}: primary sweep requested (streak "
-                            f"{sweep_streak} >= {config.plan_sweep_rounds})",
+                            f"{sweep_streak} >= {PLAN_SWEEP_ROUNDS})",
                         )
-            if (
-                config.plan_step_back_rounds > 0
-                and ownership_review_failure is None
-                and not staged_mode_revision
-                and not plan_reset_round
-                and plan_primary_name is not None
-                and not plan_panel_evidence.opened
-                and not plan_operator_force_full
-                and plan_primary_name not in plan_qualifying_approvals
-                and not (
-                    current_resume is not None
-                    and any(
-                        record.metadata.agent == plan_primary_name
-                        for record in current_resume.completed_reviews
-                    )
-                )
-            ):
-                # Independent of --plan-primary-stall-rounds: only
-                # --plan-step-back-rounds 0 disables the step-back stop.  It runs
-                # before the stall stop, which a pending or active step-back defers.
-                if not step_back_history_intact:
-                    log(
-                        config,
-                        f"Planning round {round_number}: step-back stop suppressed: degraded "
-                        f"planning history ({step_back_history_class})",
-                    )
-                else:
-                    step_back_stop = plan_step_back_escalation(
-                        plan_records,
-                        panel_opening_index=plan_panel_evidence.opening_index,
-                        assessment=plan_growth_assessment,
-                        measurements=plan_growth_measurements,
-                    )
-                    if step_back_stop is not None:
-                        stop_plan_pre_panel_decision(step_back_stop, round_number=round_number)
-            if (
-                config.plan_primary_stall_rounds > 0
-                and ownership_review_failure is None
-                and not staged_mode_revision
-                and not plan_reset_round
-                and plan_primary_name is not None
-                and not plan_panel_evidence.opened
-                and not plan_operator_force_full
-                and plan_primary_name not in plan_qualifying_approvals
-                and not (
-                    current_resume is not None
-                    and any(
-                        record.metadata.agent == plan_primary_name
-                        for record in current_resume.completed_reviews
-                    )
-                )
-            ):
-                if plan_history_class != PLAN_HISTORY_INTACT:
-                    log(
-                        config,
-                        f"Planning round {round_number}: stall stop suppressed: degraded "
-                        f"planning history ({plan_history_class})",
-                    )
-                else:
-                    plan_primary_streak = plan_primary_blocking_streak_detail(
-                        plan_records,
-                        primary=plan_primary_name,
-                        panel_opening_index=plan_panel_evidence.opening_index,
-                        current_issue_digest=plan_issue_digest,
-                        current_execution_mode=config.plan_execution_mode,
-                    )
-                    if plan_primary_streak.count >= config.plan_primary_stall_rounds:
-                        disposition = _stall_step_back_disposition()
-                        if disposition.kind == DISPOSITION_DEFER_PENDING:
-                            stall_deferred_for_step_back = True
-                            log(
-                                config,
-                                f"Planning round {round_number}: stall stop deferred: "
-                                f"pending plan step-back ({disposition.reason})",
-                            )
-                        elif disposition.kind == DISPOSITION_DEFER_EPISODE:
-                            log(
-                                config,
-                                f"Planning round {round_number}: stall stop deferred: "
-                                f"{disposition.reason}",
-                            )
-                        else:
-                            # Before the prelaunch checkpoint and every agent turn,
-                            # so the stop writes no record a resume could read as
-                            # a checkpoint, an approval, or a panel opening.
-                            escalation = (
-                                plan_step_back_escalation(
-                                    plan_records,
-                                    panel_opening_index=plan_panel_evidence.opening_index,
-                                    assessment=plan_growth_assessment,
-                                    measurements=plan_growth_measurements,
-                                )
-                                if disposition.kind == DISPOSITION_ESCALATED
-                                else None
-                            )
-                            stop_plan_pre_panel_decision(
-                                escalation
-                                if escalation is not None
-                                else PlanPrePanelHumanDecisionError(plan_primary_stall_message(
-                                    streak=plan_primary_streak.count,
-                                    threshold=config.plan_primary_stall_rounds,
-                                    plan_chars=len(current_plan),
-                                    legacy_undigested=plan_primary_streak.edit_cannot_clear(
-                                        config.plan_primary_stall_rounds
-                                    ),
-                                    step_back_status=disposition.reason,
-                                )),
-                                round_number=round_number,
-                            )
             plan_classification = classify_plan_transition(
                 plan_previous_key,
                 current_plan_key,
@@ -2485,6 +2437,10 @@ def _run_plan_first_loop_body(
                 reviewer for reviewer in configured_reviewers
                 if agent_display_name(reviewer) in plan_selected_names
             )
+        # One no-progress detector (#2098), outside the staged branch so it
+        # runs under every review policy, before the scheduler prelaunch
+        # checkpoint and every agent turn: the stop writes no round record.
+        _check_plan_no_progress()
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
         }
@@ -2830,13 +2786,9 @@ def _run_plan_first_loop_body(
                     if plan_scheduler_decision.phase == "primary"
                     else None
                 ),
-                scheduler_stall_reset=(
-                    plan_reset_round and plan_scheduler_decision.phase == "primary"
-                ),
-                scheduler_step_back_deferral=(
-                    stall_deferred_for_step_back
-                    and plan_scheduler_decision.phase == "primary"
-                ),
+                # The no-progress window reset (#2098) is persisted in
+                # whichever staged phase receives it.
+                scheduler_stall_reset=plan_reset_round,
                 scheduler_execution_mode=config.plan_execution_mode,
                 **_architecture_metadata_fields(config),
             )
@@ -2867,7 +2819,7 @@ def _run_plan_first_loop_body(
                     plan_posted_checkpoint,
                 ),
             )
-            if plan_reset_round and plan_scheduler_decision.phase == "primary":
+            if plan_reset_round:
                 plan_reset_checkpoint_written = True
         try:
             _plan_spool_preflight()
@@ -4019,14 +3971,12 @@ def _run_plan_first_loop_body(
                 run_plan_first_loop=_run_plan_first_loop,
             )
 
-        # The round's reviews are already posted, so refresh the durable history:
-        # the pre-round comment snapshot cannot hold them, and the trigger and the
-        # stop must land on exactly the K-th and M-th block.  The stop is checked
-        # before the generic max-rounds exit so the M-th block at the limit still
-        # posts the human-decision diagnostic.
+        # The round's reviews are already posted, so refresh the durable history
+        # for the step-back prompt decision: the pre-round comment snapshot
+        # cannot hold them.  Step-back is a prompt only and never stops (#2098).
         step_back_records: tuple[PostedRoundRecord, ...] | None = None
         if (
-            config.plan_step_back_rounds > 0
+            PLAN_STEP_BACK_ROUNDS > 0
             and staged_planning
             and plan_primary_name is not None
             and current_plan_sidecar is not None
@@ -4048,16 +3998,6 @@ def _run_plan_first_loop_body(
                 step_back_records = plan_history_records(
                     refresh=True, round_number=round_number
                 )
-                step_back_stop = plan_step_back_escalation(
-                    step_back_records,
-                    panel_opening_index=plan_panel_evidence.opening_index,
-                    assessment=plan_growth_assessment,
-                    measurements=plan_growth_measurements,
-                    post_review=True,
-                )
-                if step_back_stop is not None:
-                    # Before the planner turn, so no further planner turn runs.
-                    stop_plan_pre_panel_decision(step_back_stop, round_number=round_number)
 
         if round_number == plan_round_limit:
             if growth_guard_revision is not None:
@@ -4181,55 +4121,37 @@ def _run_plan_first_loop_body(
             plan_automatic_force_full = True
         step_back_context: PlanStepBackContext | None = None
         if step_back_records is not None and current_plan_sidecar is not None:
+            # The live decision runs the same replay as resume, with this round
+            # as the live round, so fresh and resumed runs route identically.
             step_back_state = plan_step_back_state(
-                step_back_records, panel_opening_index=plan_panel_evidence.opening_index
+                step_back_records,
+                panel_opening_index=plan_panel_evidence.opening_index,
+                live_round=round_number,
             )
-            if (
-                step_back_state is not None
-                and step_back_state.episode is None
-                and step_back_state.reviews
-                and step_back_state.reviews[-1].round_number == round_number
-            ):
-                crossing_round = plan_growth_crossing_round(
-                    step_back_records,
-                    config=config,
-                    current_round=current_plan_sidecar.round_number,
+            trigger = step_back_state.live_trigger if step_back_state is not None else None
+            if trigger is not None:
+                step_back_context = PlanStepBackContext(
+                    measurements=plan_step_back_measurements(
+                        plan_growth_assessment, plan_growth_measurements
+                    ),
+                    findings=mandatory_plan_findings_since(
+                        step_back_records,
+                        primary=plan_primary_name,
+                        first_round=trigger.crossing_round,
+                    ),
+                    execution_mode=config.plan_execution_mode,
+                    streak=trigger.streak,
                 )
-                if crossing_round is not None:
-                    before = step_back_state.streak_before(crossing_round, round_number)
-                    streak = max(step_back_state.streak_since(crossing_round), before)
-                    # A step-back pending at this round (judged from earlier rounds)
-                    # is granted on any blocking primary review, repeat-only too.
-                    pending = (
-                        before >= config.plan_step_back_rounds
-                        and step_back_state.reviews[-1].classification in BLOCKING_CLASSES
-                    )
-                    if pending or (
-                        step_back_state.streak_since(crossing_round)
-                        >= config.plan_step_back_rounds
-                    ):
-                        step_back_context = PlanStepBackContext(
-                            measurements=plan_step_back_measurements(
-                                plan_growth_assessment, plan_growth_measurements
-                            ),
-                            findings=mandatory_plan_findings_since(
-                                step_back_records,
-                                primary=plan_primary_name,
-                                first_round=crossing_round,
-                            ),
-                            execution_mode=config.plan_execution_mode,
-                            streak=streak,
-                        )
-                        log(
-                            config,
-                            f"Planning round {round_number}: step-back revision: the plan "
-                            f"crossed a growth signal at round {crossing_round} and the "
-                            f"primary blocked {streak} consecutive round(s) on new findings",
-                        )
+                log(
+                    config,
+                    f"Planning round {round_number}: step-back revision: the plan "
+                    f"crossed a growth signal at round {trigger.crossing_round} and the "
+                    f"primary blocked {trigger.streak} consecutive round(s) on new findings",
+                )
         step_back_anchor: PlanStepBackAnchor | None = None
         if (
             step_back_context is None
-            and config.plan_step_back_rounds > 0
+            and PLAN_STEP_BACK_ROUNDS > 0
             and plan_primary_name is not None
             and step_back_history_intact
             and not plan_panel_evidence.opened
@@ -4683,14 +4605,8 @@ def _run_plan_first_loop_body(
                         plan_supersession.superseded_hash
                         if plan_supersession is not None else None
                     ),
-                    # Orchestrator-written, reviewer-owned, never from agent output.
-                    step_back_entries=(
-                        (entry_payload_for_plan(
-                            reviewer=plan_primary_name, trigger_round=round_number
-                        ),)
-                        if step_back_context is not None and plan_primary_name is not None
-                        else ()
-                    ),
+                    # No plan step_back_entries are written (#2098): the
+                    # episode is re-derived by replay from review records.
             )
         except ValueError as exc:
             # A contradictory metadata record must not escape as a bare

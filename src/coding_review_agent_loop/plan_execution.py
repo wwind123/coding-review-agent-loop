@@ -594,10 +594,6 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "plan_resume_keep_on_issue_edit",
     "reopen_approved_plan",
     "keep_approved_plan",
-    "plan_primary_stall_rounds",
-    "plan_step_back_rounds",
-    "plan_step_back_escalation_rounds",
-    "plan_sweep_rounds",
     "plan_sweep_reasoning_effort",
     "plan_provenance_baseline_max_chars",
 )

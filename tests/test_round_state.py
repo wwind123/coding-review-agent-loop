@@ -1741,7 +1741,7 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
         _encode_round_metadata,
     )
 
-    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    runner, _config, _error = _m1103_stalled_runner(tmp_path)
     base = _m1112_first_primary_payload(runner)
     assert _decode_round_metadata_mapping(base).scheduler_metadata_status == "valid"
     good_digest = base["scheduler_issue_digest"]
@@ -1756,7 +1756,8 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
     assert status(scheduler_issue_digest=None) == "invalid"
     assert status(scheduler_stall_reset=False) == "invalid"
     assert status(scheduler_stall_reset="yes") == "invalid"
-    assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "invalid"
+    # The reset restarts the no-progress window in any staged phase (#2098).
+    assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "valid"
     # Plan board identity fields are flow-scoped (#1377): a PR-flow record
     # carrying them is malformed, so compare the scheduler status without them.
     with pytest.raises(AgentLoopError, match="only valid on plan-flow records"):
@@ -1787,7 +1788,7 @@ def test_step_back_deferral_marker_is_strictly_validated(tmp_path):
         _encode_round_metadata,
     )
 
-    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    runner, _config, _error = _m1103_stalled_runner(tmp_path)
     base = _m1112_first_primary_payload(runner)
 
     def decoded(**changes):
@@ -1821,7 +1822,7 @@ def test_planning_checkpoint_mode_round_trips_and_tolerates_unknown_values(tmp_p
     )
     from coding_review_agent_loop.round_transport import encode_mapping
 
-    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    runner, _config, _error = _m1103_stalled_runner(tmp_path)
     checkpoint = next(r for r in _plan_round_records(runner) if r.phase == "scheduler-prelaunch")
     assert checkpoint.scheduler_metadata_status == "valid"
     assert checkpoint.scheduler_execution_mode == "plan-only"

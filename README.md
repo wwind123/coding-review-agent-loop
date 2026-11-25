@@ -1736,38 +1736,34 @@ a reviewer-only round with no planner turn. Every required reviewer must still
 approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
-cannot recover an unreadable planning history. `--plan-primary-stall-rounds N`
-(default 8, `0` disables) stops the run with a diagnostic once the primary has
-blocked N consecutive completed primary-phase rounds with no exact-plan
-approval, instead of spending the rest of `--max-rounds`; the panel is never
-convened automatically. Editing the issue title or body starts a fresh plan in a
-new planning scope by default, which leaves the stalled rounds behind. Under
-`--plan-resume-keep-on-issue-edit` the edit instead retires rounds reviewed
-against earlier text (a comment alone does not, and rounds recorded before
-issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
-`--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
-with `--plan-review-force-full` or a higher threshold. A staged plan under `plan-only` or
+cannot recover an unreadable planning history. Under every plan review policy the
+plan loop stops for a human decision (exit 4) once `--no-progress-rounds` K
+(default 3) consecutive completed planning rounds ended with the same plan hash and
+the same non-empty set of blocking item IDs and the current plan still matches; the
+message names the unchanged items, the plan hash, K and the plan size. The panel is
+never convened automatically. Editing the issue title or body starts a fresh plan in a
+new planning scope by default; a newly signed planning requirement also restarts the
+window. Under `primary-then-panel` the one-shot `--plan-reset-stall-streak` restarts the
+window durably from the next checkpoint; otherwise rerun with a larger
+`--no-progress-rounds` or with `--plan-review-force-full`. A staged plan under `plan-only` or
 `implement-one-shot` can never satisfy the phased-delivery guard, so the run stops on the
 first such round for a human decision: use `--plan-execution-mode decompose-only` (the
 review-before-implementation mode for work that may be staged) or pass `--plan-narrow-staged`
 to have the planner narrow it to one deliverable once (independent remainder goes in the
-recorded-only typed `deferred_work`). Changing `--plan-execution-mode` on resume retires
-stall streaks recorded under the old mode; pre-change history needs
-`--plan-reset-stall-streak`. `--plan-step-back-rounds K` (default 2, `0` disables) acts earlier on the "new edge
-case every round" pattern: once the one-shot plan has crossed a plan-growth signal and
-the primary has blocked K consecutive rounds on new mandatory findings, the next planner
+recorded-only typed `deferred_work`). Plan step-back stays a prompt technique and
+never stops the run: once the one-shot plan has crossed a plan-growth signal and the
+primary has blocked two consecutive rounds on new mandatory findings, the next planner
 turn must propose a materially simpler design (or a split, or under `implement-one-shot`
-a re-file-as-staged caveat) instead of patching the newest finding, and
-`--plan-step-back-escalation-rounds M` (default 2) stops for a human decision once the
-primary has blocked M rounds after it. A reached `--plan-primary-stall-rounds` stop is
-deferred while a step-back is pending or an episode is active, so a stalled history
-still gets its step-back, and the stall message says why the step-back did not apply
-otherwise. `--plan-sweep-rounds K` (default 2, `0` disables) is independent of the
-plan-growth gate: once the primary has blocked K consecutive primary-phase rounds with
-new mandatory findings, its next review is asked for one exhaustive sweep of the whole
-plan, siblings of the classes it already raised included. Repeats of unresolved items
+a re-file-as-staged caveat) instead of patching the newest finding. The plan sweep is
+independent of the plan-growth gate: once the primary has blocked two consecutive
+primary-phase rounds with new mandatory findings, its next review is asked for one
+exhaustive sweep of the whole plan, siblings of the classes it already raised included.
+Repeats of unresolved items
 (re-emitted text included), future follow-ups and, on reviews after the primary's first,
-findings it tagged `revision_introduced` do not count; it never stops a run.
+findings it tagged `revision_introduced` do not count; it never stops a run. The retired
+plan thresholds `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`,
+`--plan-primary-stall-rounds` and `--plan-sweep-rounds` are accepted and ignored for one
+release with a deprecation notice.
 `--plan-sweep-reasoning-effort LEVEL` (off by default) runs only that sweep turn at a
 higher Codex or Claude effort. Plan reviewers tag new mandatory findings with an
 optional `provenance` (`revision_introduced` or `pre_existing`) against a previous-plan
@@ -1794,7 +1790,7 @@ excerpt and the PR size when they apply. The retired `--pr-step-back-rounds`,
 `--pr-step-back-line-window`, `--pr-non-convergence-rounds` and `--sub-item-stall-rounds`
 are accepted and ignored for one release with a deprecation notice. See
 [PR no-progress stop](docs/local_agent_loop.md#pr-no-progress-stop). `--pr-human-evidence freeze|advisory|off` (default `advisory`) decides how reviewers' exact-head evidence requests are handled: `advisory` collects them into a non-blocking "Human checks requested" list posted at approval (with `--auto-merge` and a non-empty list the PR is left approved and unmerged and the run exits 0), `off` drops them, and `freeze` keeps the blocking evidence freeze; the evidence stall and row conversion below run only under `freeze` ([details](docs/local_agent_loop.md#exact-head-human-evidence-mode---pr-human-evidence)). `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. `--pr-evidence-capture-attempts N` (default 2, `0` disables) first converts a row whose evidence was only capture-limited (incomplete capture, unverified launch, unknown selectors; never an authoritative failure) for N consecutive coder attempts into an exact-head human evidence obligation answered at the final evidence freeze, and `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]` converts named unsatisfied rows on demand before any agent runs. When every unchanged item is evidence the evidence stall may own, the no-progress stop defers so the evidence stall decides first. Evidence no agent session or runner can produce belongs only in `exact_head_evidence_requests`. A child-planning cycle inherits `--plan-review-policy`,
-`--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`, `--plan-sweep-rounds`, `--plan-sweep-reasoning-effort`, and `--plan-provenance-baseline-max-chars` but never the parent's `--plan-review-force-full`
+`--primary-plan-reviewer`, `--plan-sweep-reasoning-effort`, and `--plan-provenance-baseline-max-chars` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted

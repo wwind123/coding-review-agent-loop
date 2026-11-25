@@ -1264,24 +1264,18 @@ def test_resumed_run_reaches_the_same_sweep_decision(tmp_path, compact):
     )
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [{"plan_sweep_rounds": 0}, {"plan_review_policy": "all-reviewers", "primary_plan_reviewer": None}],
-)
-def test_disabled_or_full_board_planning_never_sweeps(tmp_path, overrides):
-    """`disabled-and-policy`: K=0 or the full-board policy keeps today's prompts."""
+def test_full_board_planning_never_sweeps(tmp_path):
+    """`disabled-and-policy`: the full-board policy keeps today's prompts."""
     claude, codex = _m1505_three_blocking_rounds()
-    values = dict(overrides)
-    full_board = values.get("plan_review_policy") == "all-reviewers"
-    if full_board:
-        values["reviewer"] = ("codex",)
-    runner, _messages = _m1505_run(tmp_path, claude=claude, codex=codex, **values)
+    runner, _messages = _m1505_run(
+        tmp_path, claude=claude, codex=codex,
+        plan_review_policy="all-reviewers", primary_plan_reviewer=None, reviewer=("codex",),
+    )
     reviews = _m1251_prompts(runner, "codex")
     assert len(reviews) == 3
     assert not any(_SWEEP_HEADING in prompt for prompt in reviews)
     assert not any(record.plan_sweep for record in _plan_round_records(runner))
-    if full_board:
-        assert not any("Finding provenance" in prompt for prompt in reviews)
+    assert not any("Finding provenance" in prompt for prompt in reviews)
 
 
 def _m1505_repeat_script(*, mixed):

@@ -243,10 +243,14 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
             raise ValueError("invalid scheduler issue digest")
         stall_reset = False
         if "scheduler_stall_reset" in payload:
-            if payload["scheduler_stall_reset"] is not True or phase != "primary":
+            # The no-progress window reset (#2098) is persisted in whichever
+            # staged phase receives it, so any valid phase may carry it.
+            if payload["scheduler_stall_reset"] is not True or phase is None:
                 raise ValueError("invalid scheduler stall reset marker")
             stall_reset = True
         step_back_deferral = False
+        # Legacy step-back deferral marker (#1275): still validated, never read
+        # by a plan decision (#2098).
         if "scheduler_step_back_deferral" in payload:
             if payload["scheduler_step_back_deferral"] is not True or phase != "primary":
                 raise ValueError("invalid scheduler step-back deferral marker")

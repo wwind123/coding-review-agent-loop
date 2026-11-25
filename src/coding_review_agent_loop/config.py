@@ -83,12 +83,6 @@ MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 3600
 DEFAULT_MAX_ROUNDS = 10
 # Capture-root retention in days; 0 disables pruning (#1572).
 DEFAULT_SUBPROCESS_LOG_RETENTION_DAYS = 14
-# Primary-phase plan stall stop threshold (#1103); 0 disables it.
-DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
-DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
-DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
-# Plan sweep trigger (#1505): K consecutive new-finding primary blocks; 0 disables.
-DEFAULT_PLAN_SWEEP_ROUNDS = 2
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
 # Evidence conversion (#1325): N consecutive capture-limited coder attempts.
 DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS = 2
@@ -301,24 +295,10 @@ class AgentLoopConfig:
     plan_review_policy: str = "all-reviewers"
     primary_plan_reviewer: AgentName | None = None
     plan_review_force_full: bool = False
-    # Primary-phase stall stop (#1103): consecutive completed blocking primary
-    # plan reviews, with no exact-plan primary approval, after which a
-    # primary-then-panel run stops instead of re-invoking the primary.  0
-    # disables the stop.
-    plan_primary_stall_rounds: int = DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
-    # Plan step-back turn (#1251): once a one-shot plan has crossed a growth
-    # signal and the primary has blocked this many consecutive rounds on new
-    # findings, the next planner turn is a simplify-or-re-scope revision.  0
-    # disables it.  After it, this many further primary blocks (the block of the
-    # step-back candidate itself counts as the first) stop for a human decision.
-    plan_step_back_rounds: int = DEFAULT_PLAN_STEP_BACK_ROUNDS
-    plan_step_back_escalation_rounds: int = DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
-    # Plan sweep (#1505): independent of the plan-growth gate, once the primary
-    # has blocked this many consecutive primary-phase rounds with new mandatory
-    # findings, its next review is asked for one exhaustive pass.  0 disables
-    # it.  ``plan_sweep_reasoning_effort`` (empty = off) raises the effort of
-    # that sweep turn only.
-    plan_sweep_rounds: int = DEFAULT_PLAN_SWEEP_ROUNDS
+    # The plan step-back and sweep prompts (#1251, #1505) use internal
+    # thresholds (review_step_back.PLAN_STEP_BACK_ROUNDS/PLAN_SWEEP_ROUNDS) and
+    # never stop the run (#2098).  ``plan_sweep_reasoning_effort`` (empty =
+    # off) raises the effort of the sweep turn only.
     plan_sweep_reasoning_effort: str = ""
     # Finding-provenance baseline hard budget (#1516): the largest previous-plan
     # baseline payload (diff, compact diff or full previous plan) a later plan
@@ -332,11 +312,12 @@ class AgentLoopConfig:
     # reviewer evidence requests into a non-blocking human-checks list,
     # ``off`` drops them, and ``freeze`` keeps the blocking evidence freeze.
     pr_human_evidence: str = "advisory"
-    # The PR no-progress window (#2097); it also paces the advisory sub-item
-    # stall report that ``--sub-item-stall-rounds`` used to set.
+    # The PR and plan no-progress window (#2097, #2098); it also paces the
+    # advisory sub-item stall report that ``--sub-item-stall-rounds`` used to set.
     no_progress_rounds: int = DEFAULT_NO_PROGRESS_ROUNDS
-    # One-shot operator retirement of the stall streak (#1112): the run's first
-    # primary-phase checkpoint is stamped as a durable streak boundary.  Never
+    # One-shot operator reset of the plan no-progress window (#1112, #2098):
+    # the run's first staged checkpoint (any phase) is stamped as a durable
+    # window boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
     plan_reset_stall_streak: bool = False
     # Per-invocation opt-out (#1390): keep resuming an unapproved plan after
@@ -892,49 +873,6 @@ class AgentLoopConfig:
                 "phased-delivery guard (plan-only or implement-one-shot); "
                 f"'{self.plan_execution_mode}' already accepts staged plans."
             )
-        stall_rounds = self.plan_primary_stall_rounds
-        if (
-            isinstance(stall_rounds, bool)
-            or not isinstance(stall_rounds, int)
-            or stall_rounds < 0
-        ):
-            raise AgentLoopError(
-                "--plan-primary-stall-rounds must be a non-negative integer (0 disables it)."
-            )
-        if (
-            stall_rounds != DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
-            and self.plan_review_policy != "primary-then-panel"
-        ):
-            raise AgentLoopError(
-                "--plan-primary-stall-rounds requires --plan-review-policy primary-then-panel."
-            )
-        step_back_rounds = self.plan_step_back_rounds
-        if (
-            isinstance(step_back_rounds, bool)
-            or not isinstance(step_back_rounds, int)
-            or step_back_rounds < 0
-        ):
-            raise AgentLoopError(
-                "--plan-step-back-rounds must be a non-negative integer (0 disables it)."
-            )
-        escalation_rounds = self.plan_step_back_escalation_rounds
-        if (
-            isinstance(escalation_rounds, bool)
-            or not isinstance(escalation_rounds, int)
-            or escalation_rounds < 1
-        ):
-            raise AgentLoopError(
-                "--plan-step-back-escalation-rounds must be a positive integer."
-            )
-        sweep_rounds = self.plan_sweep_rounds
-        if (
-            isinstance(sweep_rounds, bool)
-            or not isinstance(sweep_rounds, int)
-            or sweep_rounds < 0
-        ):
-            raise AgentLoopError(
-                "--plan-sweep-rounds must be a non-negative integer (0 disables it)."
-            )
         baseline_max_chars = self.plan_provenance_baseline_max_chars
         if (
             isinstance(baseline_max_chars, bool)
@@ -960,17 +898,10 @@ class AgentLoopConfig:
                 "--plan-sweep-reasoning-effort requires --plan-review-policy primary-then-panel."
             )
         for flag, value, default in (
-            ("--plan-sweep-rounds", sweep_rounds, DEFAULT_PLAN_SWEEP_ROUNDS),
             (
                 "--plan-provenance-baseline-max-chars",
                 baseline_max_chars,
                 DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
-            ),
-            ("--plan-step-back-rounds", step_back_rounds, DEFAULT_PLAN_STEP_BACK_ROUNDS),
-            (
-                "--plan-step-back-escalation-rounds",
-                escalation_rounds,
-                DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
             ),
         ):
             if value != default and self.plan_review_policy != "primary-then-panel":
@@ -2233,18 +2164,23 @@ def warn_deprecated_repair_flags(args: argparse.Namespace) -> str | None:
     return notice
 
 
-# PR convergence-stop thresholds retired by the single no-progress detector
-# (#2097): accepted and ignored for one release, with a one-line notice.
+# PR and plan convergence-stop thresholds retired by the single no-progress
+# detector (#2097, #2098): accepted and ignored for one release, with a
+# one-line notice.
 DEPRECATED_CONVERGENCE_FLAG_DESTS = (
     ("pr_step_back_rounds", "--pr-step-back-rounds"),
     ("pr_step_back_line_window", "--pr-step-back-line-window"),
     ("pr_non_convergence_rounds", "--pr-non-convergence-rounds"),
     ("sub_item_stall_rounds", "--sub-item-stall-rounds"),
+    ("plan_step_back_rounds", "--plan-step-back-rounds"),
+    ("plan_step_back_escalation_rounds", "--plan-step-back-escalation-rounds"),
+    ("plan_primary_stall_rounds", "--plan-primary-stall-rounds"),
+    ("plan_sweep_rounds", "--plan-sweep-rounds"),
 )
 
 
 def deprecated_convergence_flags(args: argparse.Namespace) -> tuple[str, ...]:
-    """The retired PR convergence flags an invocation passed, in table order."""
+    """The retired convergence flags an invocation passed, in table order."""
     return tuple(
         flag for dest, flag in DEPRECATED_CONVERGENCE_FLAG_DESTS
         if getattr(args, dest, None) is not None
@@ -2259,7 +2195,8 @@ def warn_deprecated_convergence_flags(args: argparse.Namespace) -> str | None:
     notice = (
         "agent-loop: deprecated flag(s) ignored: " + ", ".join(flags)
         + ". One no-progress detector (--no-progress-rounds) replaces the PR step-back, "
-        "non-convergence and unchanged-head stops; these flags will be removed in a later "
+        "non-convergence and unchanged-head stops and the plan step-back, escalation, "
+        "primary-stall and sweep thresholds; these flags will be removed in a later "
         "release."
     )
     print(notice, file=sys.stderr)
@@ -2888,16 +2825,6 @@ def config_from_args(
             else getattr(args, "primary_plan_reviewer", None)
         ),
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
-        plan_primary_stall_rounds=_arg_or_default(
-            args, "plan_primary_stall_rounds", DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
-        ),
-        plan_step_back_rounds=_arg_or_default(
-            args, "plan_step_back_rounds", DEFAULT_PLAN_STEP_BACK_ROUNDS
-        ),
-        plan_step_back_escalation_rounds=_arg_or_default(
-            args, "plan_step_back_escalation_rounds", DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
-        ),
-        plan_sweep_rounds=_arg_or_default(args, "plan_sweep_rounds", DEFAULT_PLAN_SWEEP_ROUNDS),
         plan_sweep_reasoning_effort=getattr(args, "plan_sweep_reasoning_effort", None) or "",
         plan_provenance_baseline_max_chars=_arg_or_default(
             args, "plan_provenance_baseline_max_chars", DEFAULT_PROVENANCE_BASELINE_MAX_CHARS

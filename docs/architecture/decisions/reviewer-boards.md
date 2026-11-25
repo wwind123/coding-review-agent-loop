@@ -14,3 +14,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Neutral staged plan advances recover existing history through a narrow read-only lineage exception; substantive records, pending links and amendment activation retain their validation and authority boundaries (#1827).
 
 - 2026-11-08: Final integration records per-family admission ownership and historical replay consequences, with recursive reader inventory review and repeated lifecycle restart regressions; existing author sets and root invariants remain unchanged (#1976, #1959).
+
+- 2026-11-24: A primary epoch now bounds the plan no-progress window and the step-back and sweep replays instead of the removed primary stall streak (#2098).

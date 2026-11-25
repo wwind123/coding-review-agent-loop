@@ -1104,7 +1104,7 @@ def _m1090_legacy_history(*reviews):
     return comments
 
 
-# --- Primary-phase stall stop and contract identity (#1103) ------------------
+# --- Primary-phase blocking runs and contract identity (#1103) ---------------
 
 
 
@@ -1112,13 +1112,17 @@ def _m1103_agent_calls(runner):
     return [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
 
 
-def _m1103_stalled_runner(tmp_path, *, threshold=2, rounds=2):
-    """A live run whose primary blocks every round until the stall stop."""
+def _m1103_stalled_runner(tmp_path, *, rounds=2):
+    """A live run whose primary blocks every round until the round limit.
+
+    The primary-stall stop is gone (#2098); each round blocks on a fresh
+    finding, so the run ends at ``max_rounds`` with the round-limit error.
+    """
     fresh, base = _m1103_fresh_base()
     codex, claude, _base = _m1103_blocking_chain(1, rounds, base=base)
     runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
-    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=threshold)
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
+    config = _staged_plan_config(tmp_path, max_rounds=rounds)
+    with pytest.raises(AgentLoopError, match="still reported blocking") as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return runner, config, excinfo.value
 

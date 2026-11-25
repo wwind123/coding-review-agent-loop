@@ -3231,7 +3231,7 @@ def test_plan_primary_change_restarts_the_primary_phase_and_carries_the_panel_it
     start = len(runner.commands)
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_issue_loop(
-            runner, issue_number=56, config=staged("antigravity", plan_primary_stall_rounds=1),
+            runner, issue_number=56, config=staged("antigravity"),
             plan_first=True,
         )
     (payload,) = _plan_link_payloads(runner)
@@ -4415,14 +4415,13 @@ def test_legacy_keyless_fallback_through_managed_recovery(
 def test_primary_change_after_an_old_primary_streak_reopens_the_panel_for_the_owner(tmp_path):
     """Item-9.s5 / row plan-primary-change-midrun: the old primary blocks two rounds,
     approves, and the panel opens with a secondary finding; the primary then moves to
-    Antigravity under --plan-primary-stall-rounds 3.  The new primary's first block
-    never trips the stall stop (2 + 1 would), the carried finding keeps its owner and
-    blocks approval, and the panel reopens after the new primary's approval."""
+    Antigravity.  The new primary's first block earns an ordinary revision, the
+    carried finding keeps its owner and blocks approval, and the panel reopens after
+    the new primary's approval."""
     def staged(primary):
         return _plan_cfg(
             tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
-            primary_plan_reviewer=primary, plan_primary_stall_rounds=3, review_parallel=False,
-            max_rounds=10,
+            primary_plan_reviewer=primary, review_parallel=False, max_rounds=10,
         )
 
     def last_coder_round():
@@ -4466,8 +4465,7 @@ def test_primary_change_after_an_old_primary_streak_reopens_the_panel_for_the_ow
     assert any(m.phase == "plan-phase-advance" and m.round_number == 4 for m in records)
     assert [i.item_id for m in records if m.agent == "Gemini" for i in m.new_items] == ["item-3"]
 
-    # Primary change: the new primary blocks once.  Counting the old primary's
-    # streak would reach the stall threshold of 3; the run revises instead.
+    # Primary change: the new primary blocks once and the run revises.
     start = len(runner.commands)
     runner.antigravity_outputs.append(_review(
         "antigravity", state="blocking", blocking_plan_issues=["Name the metric."],
@@ -4509,77 +4507,11 @@ def test_primary_change_after_an_old_primary_streak_reopens_the_panel_for_the_ow
     assert len(_plan_links(runner)) == 1
 
 
-@pytest.mark.parametrize("next_primary", ["codex", "antigravity"])
-def test_primary_change_mid_streak_restarts_the_stall_count(tmp_path, next_primary):
-    """Item-9.s5: Codex blocks two consecutive primary rounds under
-    --plan-primary-stall-rounds 2.  Resuming with Codex trips the stall stop before
-    round 3; after a primary change, the new primary starts a fresh streak, reviews
-    and the run revises instead."""
-    def staged(primary):
-        return _plan_cfg(
-            tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
-            primary_plan_reviewer=primary, plan_primary_stall_rounds=2, review_parallel=False,
-            max_rounds=10,
-        )
-
-    runner = _plan_runner(
-        claude_outputs=[structured_v1_plan_state()],
-        codex_outputs=[structured_plan_review(
-            state="blocking", summary="x", blocking_plan_issues=["Name the owner."],
-        )],
-    )
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
-    coder_round = [r for r in _plan_records(runner) if r.metadata.role == "coder"][-1].metadata.round_number
-    runner.claude_outputs.append(_semantic_patch(
-        runner, round_number=coder_round, summary="Owner.", item_id="item-1",
-    ))
-    runner.codex_outputs.append(_review(
-        "codex", state="blocking", blocking_plan_issues=["Name the deadline."],
-    ))
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
-    assert [
-        (r.metadata.round_number, r.metadata.state)
-        for r in _plan_records(runner) if r.metadata.agent == "Codex"
-    ] == [(1, "blocking"), (2, "blocking")]
-    still_open = [{"item_id": "item-2", "disposition": "blocking", "note": "Still open."}]
-    third_block = dict(
-        state="blocking", blocking_plan_issues=["Name the metric."], dispositions=still_open,
-    )
-    start = len(runner.commands)
-    if next_primary == "codex":
-        # The pending round-2 revision runs; round 3 then stops on the streak
-        # before Codex is invoked again.
-        coder_round = [
-            r for r in _plan_records(runner) if r.metadata.role == "coder"
-        ][-1].metadata.round_number
-        runner.claude_outputs.append(_semantic_patch(
-            runner, round_number=coder_round, summary="Deadline.", item_id="item-2",
-        ))
-        runner.codex_outputs.append(_review("codex", **third_block))
-        with pytest.raises(AgentLoopError, match="stall"):
-            run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
-        assert _plan_agents(runner, start) == ["claude"]
-        return
-    runner.antigravity_outputs.append(_review("antigravity", **third_block))
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_issue_loop(runner, issue_number=56, config=staged("antigravity"), plan_first=True)
-    # One link, a primary-only round on the new primary, and a planner revision:
-    # the old primary's two blocks did not count towards the new streak.
-    (payload,) = _plan_link_payloads(runner)
-    assert payload["new_board"]["primary"] == "Antigravity"
-    assert _plan_agents(runner, start) == ["agy", "claude"]
-
-
-@pytest.mark.parametrize("next_primary", ["codex", "gemini"])
-def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, next_primary):
+def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path):
     """Item-9.s5: Codex's crossed-plan blocks earn a step-back revision at round 5 and
-    Codex rejects it, so --plan-step-back-escalation-rounds 1 stops for a human
-    decision.  Resuming with Codex stops again before any agent turn.  After a
-    primary change, the episode and its escalation count belong to the old primary:
-    Gemini reviews the candidate, its single block neither escalates nor earns a
-    step-back, and the run revises without approving."""
+    Codex rejects it.  After a primary change, the episode belongs to the old
+    primary: Gemini reviews the candidate, its single block earns no step-back, and
+    the run revises without approving.  (The escalation stop is gone, #2098.)"""
     from coding_review_agent_loop.review_step_back import derive_plan_step_back_state
     from issue_loop_test_helpers import (
         _STEP_BACK_MARKER,
@@ -4592,8 +4524,7 @@ def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, 
         return _plan_cfg(
             tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
             primary_plan_reviewer=primary, max_rounds=8, plan_growth_max_chars=4500,
-            plan_growth_max_revisions=3, plan_step_back_escalation_rounds=1,
-            review_parallel=False,
+            plan_growth_max_revisions=3, review_parallel=False,
         )
 
     fresh, base0 = _m1103_fresh_base()
@@ -4605,21 +4536,17 @@ def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, 
         claude_outputs=[fresh, *claude1, justify, *claude_rest[:-1]],
         codex_outputs=[*codex1, *codex2, *codex_rest],
     )
-    with pytest.raises(AgentLoopError, match="human decision required"):
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
         run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
     records = _plan_records(runner)
-    (step_back,) = [r.metadata for r in records if r.metadata.step_back_entries]
-    assert (step_back.round_number, step_back.step_back_entries) == (
-        5, ({"phase": "plan", "reviewer": "Codex", "trigger_round": 4},),
-    )
-    old = derive_plan_step_back_state(records, primary="Codex")
-    assert old.episode is not None and old.escalation_count == 1
+    planner_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[0] == "claude"]
+    # The revision after round 4 is the step-back turn (it publishes candidate 5).
+    assert [_STEP_BACK_MARKER in prompt for prompt in planner_prompts] == [
+        False, False, False, False, True, False,
+    ]
+    old = derive_plan_step_back_state(records, primary="Codex", config=staged("codex"))
+    assert old.episode is not None
     start, comments_before = len(runner.commands), len(runner.issue_comments)
-    if next_primary == "codex":
-        with pytest.raises(AgentLoopError, match="human decision required"):
-            run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
-        assert _plan_agents(runner, start) == []
-        return
 
     runner.gemini_outputs.append(_review(
         "gemini", state="blocking", blocking_plan_issues=["Name the metric."],
@@ -4635,10 +4562,9 @@ def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, 
     planner_prompt = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] == "claude"][-1]
     assert _STEP_BACK_MARKER not in planner_prompt
     records = _plan_records(runner)
-    new = derive_plan_step_back_state(records, primary="Gemini")
-    assert new.episode is None and new.escalation_count == 0
+    new = derive_plan_step_back_state(records, primary="Gemini", config=staged("gemini"))
+    assert new.episode is None
     assert [r.classification for r in new.reviews] == ["new-finding"]
-    assert sum(1 for r in records if r.metadata.step_back_entries) == 1
     assert not any(r.metadata.phase == "plan-phase-advance" for r in records)
     assert not any(
         "human decision required" in c["body"]

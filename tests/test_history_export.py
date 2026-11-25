@@ -34,15 +34,16 @@ from coding_review_agent_loop.history_export import (
     render_csv,
     render_json,
 )
+from coding_review_agent_loop.errors import render_human_decision
 from coding_review_agent_loop.panel_evidence import (
+    PLAN_PRIMARY_STALL_PREFIX,
     plan_issue_text_digest_for,
-    plan_primary_stall_message,
 )
 from coding_review_agent_loop.plan_first_loop import render_plan_scheduling_diagnostic
 from coding_review_agent_loop.pr_loop import render_pr_scheduling_diagnostic
 from coding_review_agent_loop.protocol import AgentUnavailable
 from coding_review_agent_loop.protocol_markers import named_reserved_marker_tokens
-from coding_review_agent_loop.review_step_back import render_step_back_human_decision
+from coding_review_agent_loop.review_step_back import PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
@@ -178,10 +179,42 @@ def approved_plan_comments(start: int = 1, round_number: int = 1, **coder_fields
     )
 
 
+def _legacy_stop(what: str) -> str:
+    """The three-part shape the retired plan stops posted (#2069, retired by #2098)."""
+    return render_human_decision(
+        what=what, clear="Narrow the issue text, then rerun the same command.",
+        safe_to_automate=False, automation_note="this is a human judgement.",
+    )
+
+
 def step_back_stop_message() -> str:
-    return render_step_back_human_decision(
-        phase="plan", measurements="Plan-growth measurements: 3 steps.", step_back_round=2,
-        blocks=2, threshold=2, alternative="Narrow the scope.",
+    """Bytes of a legacy plan step-back stop; old comments keep their label."""
+    return _legacy_stop(
+        PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
+        + "2 (a simplify-or-re-scope revision), and the primary plan reviewer has since "
+        "blocked 2 round(s), reaching --plan-step-back-escalation-rounds 2."
+    )
+
+
+def plan_primary_stall_message(*, streak: int, threshold: int, plan_chars: int) -> str:
+    """Bytes of a legacy primary-stall stop; old comments keep their label."""
+    return _legacy_stop(
+        PLAN_PRIMARY_STALL_PREFIX
+        + f"{streak} consecutive primary-phase planning round(s) with no exact-plan primary "
+        f"approval, reaching --plan-primary-stall-rounds {threshold} (current canonical "
+        f"plan: {plan_chars} characters)."
+    )
+
+
+def _plan_no_progress_stop_message() -> str:
+    from coding_review_agent_loop.no_progress import (
+        render_no_progress_item_lines,
+        render_no_progress_message,
+    )
+
+    return render_no_progress_message(
+        lead="", subject_label="plan", subject="e" * 64, k=3, rounds=(2, 3, 4),
+        item_lines=render_no_progress_item_lines(("item-1",)), plan_size="1200 characters",
     )
 
 
@@ -1570,6 +1603,7 @@ def test_three_part_human_decision_diagnostics_keep_their_reason_labels():
     from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
 
     plan_cases = (
+        (_plan_no_progress_stop_message(), "plan-no-progress"),
         (step_back_stop_message(), "plan-step-back"),
         (plan_primary_stall_message(streak=3, threshold=3, plan_chars=1200), "plan-primary-stall"),
     )
@@ -1593,3 +1627,26 @@ def test_three_part_human_decision_diagnostics_keep_their_reason_labels():
         assert (stop.kind, stop.reason, stop.round_number, stop.terminal) == (
             KIND_HUMAN_DECISION_STOP, reason, 5, True,
         )
+
+
+def test_the_plan_no_progress_stop_is_never_labelled_as_the_pr_stop():
+    """`plan-history-classify`: plan vs PR no-progress, and the legacy plan labels."""
+    plan = recognize_diagnostic(
+        render_plan_scheduling_diagnostic("round 5", _plan_no_progress_stop_message())
+    )
+    assert (plan.kind, plan.reason, plan.round_number, plan.terminal) == (
+        KIND_HUMAN_DECISION_STOP, "plan-no-progress", 5, True,
+    )
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+
+    pr = recognize_diagnostic(
+        render_pr_human_decision_diagnostic("round 5", _no_progress_stop_message())
+    )
+    assert pr.reason == "pr-no-progress"
+    # Old comments carrying the retired plan stops keep their labels.
+    for message, reason in (
+        (step_back_stop_message(), "plan-step-back"),
+        (plan_primary_stall_message(streak=8, threshold=8, plan_chars=900), "plan-primary-stall"),
+    ):
+        legacy = recognize_diagnostic(render_plan_scheduling_diagnostic("round 3", message))
+        assert (legacy.kind, legacy.reason) == (KIND_HUMAN_DECISION_STOP, reason)

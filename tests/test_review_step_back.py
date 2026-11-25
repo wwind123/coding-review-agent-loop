@@ -9,7 +9,6 @@ import re
 import pytest
 
 from agent_loop_helpers import long_plan_revision_pair, make_config, structured_v1_plan_state
-from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
 from coding_review_agent_loop.review_step_back import (
     CLASS_APPROVED,
@@ -17,10 +16,6 @@ from coding_review_agent_loop.review_step_back import (
     CLASS_NEW_FINDING,
     CLASS_OTHER,
     CLASS_REPEAT_ONLY,
-    DISPOSITION_DEFER_EPISODE,
-    DISPOSITION_DEFER_PENDING,
-    DISPOSITION_ESCALATED,
-    DISPOSITION_NOT_APPLICABLE,
     PlanStepBackContext,
     PrimaryReview,
     StepBackEntry,
@@ -31,10 +26,8 @@ from coding_review_agent_loop.review_step_back import (
     entry_payload_for_plan,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
-    plan_stall_step_back_disposition,
     plan_step_back_candidate_rounds,
     render_plan_step_back_guidance,
-    render_step_back_human_decision,
     step_back_alternative_summary,
 )
 from coding_review_agent_loop.round_metadata import (
@@ -233,76 +226,23 @@ def test_a_later_record_for_a_round_supersedes_an_earlier_one():
 
 
 def _episode_records(*extra_reviews):
-    """Step-back published at round 3 (triggered by round 2's review)."""
+    """A legacy step-back entry on the round-3 candidate (triggered by round 2).
+
+    The episode is derived by replay now (#2098); the entry is never read.
+    """
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     return [*_chain([1, 2]), _coder(10, 3, entries=[entry]), *extra_reviews]
+
+
+def _episode(*, trigger_round=2, candidate_round=3, record_index=10):
+    """A step-back episode whose candidate is the round-3 planner record."""
+    return StepBackEntry("plan", PRIMARY, trigger_round, candidate_round, record_index)
 
 
 def test_no_entry_means_no_episode():
     state = _derive(_chain([1, 2]), primary=PRIMARY)
     assert state.episode is None
-    assert state.escalation_count == 0
-
-
-def test_episode_counts_the_step_back_candidates_own_block_first():
-    records = _episode_records(_review(11, 3, items=[_new(3)]))
-    state = _derive(records, primary=PRIMARY)
-    assert state.episode is not None
-    assert (state.episode.candidate_round, state.episode.trigger_round) == (3, 2)
-    assert state.escalation_count == 1
-
-
-def test_new_repeat_new_after_a_step_back_keeps_one_episode_and_counts_all():
-    """`plan-episode-new-repeat-new`: repeat-only never closes the episode."""
-    records = _episode_records(
-        _review(11, 3, items=[_new(3)]),
-        _review(12, 4),
-        _review(13, 5, items=[_new(5)]),
-    )
-    state = _derive(records, primary=PRIMARY)
-    assert state.episode is not None
-    assert state.escalation_count == 3
-    # The streak never spans the start of an episode.
-    assert state.streak_since(1) == 1
-
-
-def test_reviews_before_the_step_back_candidate_do_not_count_toward_escalation():
-    state = _derive(_episode_records(), primary=PRIMARY)
-    assert state.episode is not None
-    assert state.escalation_count == 0
-
-
-def test_primary_approval_closes_the_episode():
-    records = _episode_records(_review(11, 3, state="approved"))
-    state = _derive(records, primary=PRIMARY)
-    assert state.episode is None
-    assert state.escalation_count == 0
-
-
-def test_panel_opening_closes_the_episode():
-    records = _episode_records(_review(11, 3, items=[_new(3)]))
-    state = _derive(records, primary=PRIMARY, panel_opening_index=11)
-    assert state.episode is None
-
-
-def test_entry_owned_by_another_reviewer_does_not_open_the_primarys_episode():
-    entry = entry_payload_for_plan(reviewer="Gemini", trigger_round=2)
-    records = [*_chain([1, 2]), _coder(10, 3, entries=[entry])]
-    assert _derive(records, primary=PRIMARY).episode is None
-
-
-def test_the_newest_entry_wins():
-    first = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
-    second = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=5)
-    records = [
-        *_chain([1, 2]),
-        _coder(10, 3, entries=[first]),
-        _coder(20, 6, entries=[second]),
-        _review(21, 6, items=[_new(6)]),
-    ]
-    state = _derive(records, primary=PRIMARY)
-    assert state.episode.candidate_round == 6
-    assert state.escalation_count == 1
+    assert state.episodes == ()
 
 
 # --- reset and issue edit (`plan-episode-reset`) -----------------------------
@@ -316,7 +256,6 @@ def test_operator_reset_retires_earlier_rounds_and_the_episode():
     ]
     state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
     assert state.episode is None
-    assert state.escalation_count == 0
     assert [review.round_number for review in state.reviews] == [5]
     assert state.streak_since(1) == 1
 
@@ -338,7 +277,7 @@ def test_rounds_without_a_recorded_digest_are_not_retired_by_an_edit():
     state = _derive(
         records, primary=PRIMARY, current_issue_digest="fedcba9876543210"
     )
-    assert state.episode is not None
+    assert [review.round_number for review in state.reviews] == [1, 2, 3]
 
 
 def test_phase_advance_record_is_a_history_boundary():
@@ -385,13 +324,6 @@ def test_malformed_entries_decode_as_degraded_not_as_an_error(value):
     assert metadata.step_back_entries == ()
 
 
-def test_degraded_history_suppresses_the_state_with_a_flag():
-    bad = _coder(10, 3, status="invalid")
-    state = _derive([*_chain([1, 2]), bad], primary=PRIMARY)
-    assert state.degraded
-    assert state.episode is None
-
-
 def test_entry_validation_rejects_a_malformed_entry_at_construction():
     with pytest.raises(ValueError):
         PostedRoundMetadata(
@@ -426,10 +358,17 @@ def test_pr_shaped_entries_validate():
     assert metadata.step_back_status == "valid"
 
 
-def test_candidate_rounds_reads_only_valid_plan_entries():
-    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
-    records = [_coder(1, 3, entries=[entry]), _coder(2, 4), _coder(3, 5, status="invalid")]
-    assert plan_step_back_candidate_rounds(records) == frozenset({3})
+def test_candidate_rounds_are_the_derived_episodes_candidate_rounds():
+    assert plan_step_back_candidate_rounds(None) == frozenset()
+    state = StepBackState(
+        reviews=(),
+        episode=None,
+        episodes=(_episode(), _episode(trigger_round=5, candidate_round=6, record_index=20)),
+    )
+    assert plan_step_back_candidate_rounds(state) == frozenset({3, 6})
+    # Legacy entries are never read.
+    legacy = _derive(_episode_records(), primary=PRIMARY)
+    assert plan_step_back_candidate_rounds(legacy) == frozenset()
 
 
 # --- growth crossing -------------------------------------------------------
@@ -511,8 +450,7 @@ def test_alternative_summary_is_read_from_the_stored_structured_response():
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     raw = json.dumps({"summary": "simpler design: round boundaries only"}) + "\n<!-- X -->"
     records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
-    state = _derive(records, primary=PRIMARY)
-    assert step_back_alternative_summary(records, state.episode) == (
+    assert step_back_alternative_summary(records, _episode()) == (
         "simpler design: round boundaries only"
     )
 
@@ -521,27 +459,7 @@ def test_alternative_summary_tolerates_missing_or_unreadable_responses():
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     for raw in (None, "not json"):
         records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
-        state = _derive(records, primary=PRIMARY)
-        assert step_back_alternative_summary(records, state.episode) is None
-
-
-def test_human_decision_message_has_measurements_round_excerpt_and_options():
-    message = render_step_back_human_decision(
-        phase="plan",
-        measurements="Measurements: 130744 chars.",
-        step_back_round=3,
-        blocks=2,
-        threshold=2,
-        alternative="A" * 5000,
-    )
-    assert "Measurements: 130744 chars." in message
-    assert "round 3" in message
-    assert "--plan-step-back-escalation-rounds 2" in message
-    assert "--plan-step-back-rounds 0" in message and "--plan-reset-stall-streak" in message
-    assert "narrow the issue text" in message
-    assert "--plan-execution-mode auto" in message
-    # The excerpt is bounded.
-    assert message.count("A") <= 2000
+        assert step_back_alternative_summary(records, _episode()) is None
 
 
 def test_guidance_offers_staging_only_outside_implement_one_shot():
@@ -560,25 +478,8 @@ def test_guidance_offers_staging_only_outside_implement_one_shot():
     assert "[item-1] x" in one_shot and "Patching the newest finding" in one_shot
 
 
-def test_unknown_phase_is_rejected_by_the_message_renderer():
-    with pytest.raises(ValueError):
-        render_step_back_human_decision(
-            phase="pr", measurements="", step_back_round=1, blocks=1, threshold=1,
-            alternative=None,
-        )
-
-
-def test_agent_loop_error_is_the_config_error_type(tmp_path):
-    with pytest.raises(AgentLoopError):
-        make_config(
-            tmp_path,
-            reviewer=("codex", "gemini"),
-            plan_step_back_rounds=-1,
-        )
-
-
-def test_reset_checkpoint_in_the_step_back_candidates_own_round_closes_the_episode():
-    """A reset recorded after the step-back turn closes it, even in the same round."""
+def test_reset_checkpoint_in_the_step_back_candidates_own_round_retires_earlier_rounds():
+    """A reset recorded after the step-back turn retires the rounds before it."""
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     records = [
         *_chain([1, 2]),
@@ -588,21 +489,8 @@ def test_reset_checkpoint_in_the_step_back_candidates_own_round_closes_the_episo
     ]
     state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
     assert state.episode is None
-    assert state.escalation_count == 0
     # The reset round's own review still counts toward a fresh streak.
     assert [review.round_number for review in state.reviews] == [3]
-
-
-def test_a_non_reset_checkpoint_in_the_candidates_round_keeps_the_episode():
-    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
-    records = [
-        *_chain([1, 2]),
-        _coder(10, 3, entries=[entry]),
-        _checkpoint(11, 3, digest=DIGEST),
-        _review(12, 3, items=[_new(3)]),
-    ]
-    state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
-    assert state.episode is not None and state.escalation_count == 1
 
 
 def test_reviews_without_a_qualifying_primary_checkpoint_are_not_counted():
@@ -641,38 +529,6 @@ def test_a_same_round_re_checkpoint_under_the_edited_issue_keeps_its_review():
     state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
     assert [review.round_number for review in state.reviews] == [4, 5]
     assert state.streak_since(1) == 2
-
-
-def test_an_edit_closes_an_episode_published_before_its_first_checkpoint():
-    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=4)
-    records = [
-        _checkpoint(1, 4, digest=OLD_DIGEST),
-        _review(2, 4, items=[_new(4)]),
-        _coder(3, 5, entries=[entry]),
-        _checkpoint(4, 5, digest=NEW_DIGEST),
-        _review(5, 5, items=[_new(5)]),
-    ]
-    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
-    assert state.episode is None and state.escalation_count == 0
-    assert [review.round_number for review in state.reviews] == [5]
-    # Without an edit the same history keeps the episode and counts the block.
-    same = derive_plan_step_back_state(records[:3], primary=PRIMARY, current_issue_digest=OLD_DIGEST)
-    assert same.episode is not None
-
-
-def test_an_episode_published_after_the_edit_is_not_closed_by_it():
-    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=4)
-    records = [
-        _checkpoint(1, 3, digest=OLD_DIGEST),
-        _review(2, 3, items=[_new(3)]),
-        _checkpoint(3, 4, digest=NEW_DIGEST),
-        _review(4, 4, items=[_new(4)]),
-        _coder(5, 5, entries=[entry]),
-        _checkpoint(6, 5, digest=NEW_DIGEST),
-        _review(7, 5, items=[_new(5)]),
-    ]
-    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
-    assert state.episode is not None and state.escalation_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1267,20 +1123,9 @@ def test_non_publication_records_use_their_own_items_and_ignore_reconciliations(
     assert classify_review(review.metadata) == CLASS_NEW_FINDING
 
 
-def test_escalation_count_includes_an_unresolved_block():
+def test_approved_publication_classifies_as_approved_without_a_reconciliation():
     records = _parallel_chain([6]) + [
-        _coder(10, 7, entries=[entry_payload_for_plan(reviewer=PRIMARY, trigger_round=6)]),
-        _checkpoint(11, 7, digest=DIGEST),
-        _publication(12, 7),
-    ]
-    state = _derive(records, primary=PRIMARY)
-    assert state.episode is not None
-    assert state.escalation_count == 1
-
-
-def test_approved_publication_closes_the_episode_without_a_reconciliation():
-    records = _parallel_chain([6]) + [
-        _coder(10, 7, entries=[entry_payload_for_plan(reviewer=PRIMARY, trigger_round=6)]),
+        _coder(10, 7),
         _checkpoint(11, 7, digest=DIGEST),
         _publication(12, 7, state="approved"),
     ]
@@ -1316,85 +1161,17 @@ def test_pr_cluster_trigger_fires_on_parallel_publication_plus_reconciliation_ro
     ) is None
 
 
-# --- stall-stop disposition (#1275) -----------------------------------------
+# --- new-finding streak over a derived state --------------------------------
 
 
-def _state(*, rounds=(3, 4), episode_round=None, escalation=0, deferrals=(), degraded=False):
+def _state(*, rounds=(3, 4), episode_round=None):
     reviews = tuple(PrimaryReview(n, n, CLASS_NEW_FINDING) for n in rounds)
     episode = (
         StepBackEntry("plan", PRIMARY, episode_round - 1, episode_round, 0)
         if episode_round is not None
         else None
     )
-    return StepBackState(
-        degraded=degraded,
-        reviews=reviews,
-        episode=episode,
-        escalation_count=escalation,
-        deferral_rounds=tuple(deferrals),
-    )
-
-
-def _disposition(state, **overrides):
-    values = {
-        "round_number": 5,
-        "crossing_round": 3,
-        "growth_gate_enforced": True,
-        "step_back_rounds": 2,
-        "escalation_rounds": 3,
-    }
-    values.update(overrides)
-    return plan_stall_step_back_disposition(state, **values)
-
-
-@pytest.mark.parametrize(
-    ("state", "overrides", "kind", "needle"),
-    [
-        (_state(), {"step_back_rounds": 0}, DISPOSITION_NOT_APPLICABLE, "step-back disabled"),
-        (None, {}, DISPOSITION_NOT_APPLICABLE, "history degraded"),
-        (_state(degraded=True), {}, DISPOSITION_NOT_APPLICABLE, "history degraded"),
-        (_state(episode_round=5, escalation=3), {}, DISPOSITION_ESCALATED, "3/3"),
-        (_state(episode_round=5, escalation=1), {}, DISPOSITION_DEFER_EPISODE, "1/3"),
-        (_state(), {"growth_gate_enforced": False}, DISPOSITION_NOT_APPLICABLE, "gate is off"),
-        (_state(), {"crossing_round": None}, DISPOSITION_NOT_APPLICABLE, "crosses no plan-growth"),
-        (_state(deferrals=(4,)), {}, DISPOSITION_NOT_APPLICABLE, "already deferred at round 4"),
-        (_state(rounds=(4,)), {}, DISPOSITION_NOT_APPLICABLE, "only 1 new-finding"),
-        (_state(), {}, DISPOSITION_DEFER_PENDING, "2 new-finding"),
-        (_state(rounds=(3, 4, 5, 6, 7, 8)), {"round_number": 9}, DISPOSITION_DEFER_PENDING, "6 new-finding"),
-    ],
-)
-def test_stall_disposition_precedence(state, overrides, kind, needle):
-    result = _disposition(state, **overrides)
-    assert result.kind == kind
-    assert needle in result.reason
-
-
-def test_stall_disposition_reasons_are_distinct_and_deferrals_before_the_crossing_are_ignored():
-    reasons = {
-        _disposition(_state(), step_back_rounds=0).reason,
-        _disposition(None).reason,
-        _disposition(_state(), growth_gate_enforced=False).reason,
-        _disposition(_state(), crossing_round=None).reason,
-        _disposition(_state(deferrals=(4,))).reason,
-        _disposition(_state(rounds=(4,))).reason,
-    }
-    assert len(reasons) == 6 and all(reasons)
-    # A deferral before the crossing, or at the current round, is not a spent one.
-    assert _disposition(_state(deferrals=(2,))).kind == DISPOSITION_DEFER_PENDING
-    assert _disposition(_state(deferrals=(5,))).kind == DISPOSITION_DEFER_PENDING
-
-
-def test_stall_disposition_names_a_non_one_shot_candidate_instead_of_no_crossing():
-    """#2025: a staged candidate is never a growth crossing; say so, not "no signal"."""
-    staged = _disposition(_state(), crossing_round=None, candidate_strategy="staged")
-    assert staged.kind == DISPOSITION_NOT_APPLICABLE
-    assert "staged plan" in staged.reason and "one-shot" in staged.reason
-    assert "crosses no plan-growth signal" not in staged.reason
-    for strategy in ("one-shot", None):
-        result = _disposition(_state(), crossing_round=None, candidate_strategy=strategy)
-        assert result.reason == "the current candidate crosses no plan-growth signal"
-    # A real crossing is unaffected by the strategy hint.
-    assert _disposition(_state(), candidate_strategy="staged").kind == DISPOSITION_DEFER_PENDING
+    return StepBackState(reviews=reviews, episode=episode)
 
 
 def test_streak_before_ignores_reviews_at_or_after_the_round():
@@ -1404,72 +1181,6 @@ def test_streak_before_ignores_reviews_at_or_after_the_round():
     assert state.streak_before(3, 4) == 1
     assert state.streak_before(3, 3) == 0
     assert state.streak_before(4, 6) == 2
-
-
-def test_deferral_rounds_follow_the_same_retirement_rules():
-    base = [_checkpoint(0, 3, digest=DIGEST), _review(1, 3, items=[_new(3)])]
-
-    def derive(records, **kwargs):
-        return derive_plan_step_back_state(records, primary=PRIMARY, **kwargs)
-
-    marked = [*base, _checkpoint(2, 4, digest=DIGEST, deferral=True)]
-    assert derive(marked).deferral_rounds == (4,)
-    # Operator reset retires rounds before the reset checkpoint's round.
-    reset = [*marked, _checkpoint(3, 5, digest=DIGEST, reset=True)]
-    assert derive(reset).deferral_rounds == ()
-    kept = [*marked, _checkpoint(3, 4, digest=DIGEST, reset=True)]
-    assert derive(kept).deferral_rounds == (4,)
-    # An issue edit retires the mismatching deferral and everything before it.
-    assert derive(marked, current_issue_digest="f" * 16).deferral_rounds == ()
-    assert derive(marked, current_issue_digest=DIGEST).deferral_rounds == (4,)
-    # A panel opening ends the primary phase.
-    assert derive(marked, panel_opening_index=2).deferral_rounds == ()
-    assert derive(marked, panel_opening_index=3).deferral_rounds == (4,)
-    # A phase advance (boundary) retires everything before it.
-    advance = PostedRoundRecord(
-        index=3,
-        metadata=PostedRoundMetadata(
-            flow="plan", role="summary", agent="Orchestrator", round_number=4,
-            subject="plan", phase="plan-phase-advance",
-        ),
-        body="",
-    )
-    assert derive([*marked, advance]).deferral_rounds == ()
-    # A non-primary phase checkpoint never counts.
-    other = [*base, _checkpoint(2, 4, digest=DIGEST, deferral=True, phase="secondary-audit")]
-    assert derive(other).deferral_rounds == ()
-
-
-def test_deferral_retired_by_an_intervening_unmarked_digest_boundary():
-    """A -> B -> A: a round-4 deferral under A is retired by the unmarked B checkpoint."""
-    other = "f" * 16
-    records = [
-        _checkpoint(0, 3, digest=DIGEST),
-        _review(1, 3, items=[_new(3)]),
-        _checkpoint(2, 4, digest=DIGEST, deferral=True),
-        _review(3, 4, items=[_new(4)]),
-        _checkpoint(4, 5, digest=other),
-        _review(5, 5, items=[_new(5)]),
-        _checkpoint(6, 6, digest=DIGEST),
-        _review(7, 6, items=[_new(6)]),
-        _checkpoint(8, 7, digest=DIGEST),
-        _review(9, 7, items=[_new(7)]),
-    ]
-    state = derive_plan_step_back_state(
-        records, primary=PRIMARY, current_issue_digest=DIGEST
-    )
-    assert state.deferral_rounds == ()
-    result = plan_stall_step_back_disposition(
-        state, round_number=8, crossing_round=6, growth_gate_enforced=True,
-        step_back_rounds=2, escalation_rounds=3,
-    )
-    assert result.kind == DISPOSITION_DEFER_PENDING
-    # Without the edit in between, the same deferral still counts.
-    kept = derive_plan_step_back_state(
-        [r for r in records if r.index not in (4, 5)],
-        primary=PRIMARY, current_issue_digest=DIGEST,
-    )
-    assert kept.deferral_rounds == (4,)
 
 
 # --- episode anchor (#1278) ------------------------------------------------
@@ -1499,8 +1210,8 @@ def _anchor_records(dispositions, *, summary="simpler design: drop caches", late
 
 
 def _anchor_for(records):
-    state = _derive(records, primary=PRIMARY)
-    return state.episode, plan_step_back_anchor(records, state.episode)
+    episode = _episode()
+    return episode, plan_step_back_anchor(records, episode)
 
 
 def test_anchor_prefers_dissolved_prefixed_notes():
@@ -1581,34 +1292,6 @@ def test_reintroduced_items_report_beyond_cap_dedupe_and_ignore_candidate_round(
     )
     episode, anchor = _anchor_for(own)
     assert reintroduced_dissolved_items(own, episode, anchor) == ()
-
-
-def test_human_decision_defaults_are_legacy_and_anchor_variants_render():
-    base = dict(
-        phase="plan", measurements="M.", step_back_round=3, blocks=2, threshold=2,
-        alternative="alt",
-    )
-    legacy = render_step_back_human_decision(**base)
-    assert "No reviewer and no planner turn were invoked." in legacy
-    assert "Dissolved by the step-back" not in legacy
-    none_declared = render_step_back_human_decision(**base, dissolved=("a",), reintroduced=())
-    assert "Dissolved by the step-back: 1 item(s) [a]" in none_declared
-    assert "none declared (undeclared reintroductions are not detected)" in none_declared
-    assert "No reviewer and no planner turn were invoked." in none_declared
-    many = render_step_back_human_decision(
-        **base, dissolved=tuple(f"i{n}" for n in range(30)),
-        reintroduced=(("i29", 4, "need it"),),
-    )
-    assert "(+10 more)" in many and "[i29] at round 4 (need it)" in many
-    post = render_step_back_human_decision(
-        **base, dissolved=("a",), reintroduced=(), post_review=True
-    )
-    assert "This round's reviews were posted" in post
-    assert "No reviewer and no planner turn were invoked" not in post
-    unrecorded = render_step_back_human_decision(**base, dissolved=(), reintroduced=())
-    assert "Dissolved by the step-back: (not recorded)" in unrecorded
-    with pytest.raises(ValueError):
-        render_step_back_human_decision(**base, post_review=True)
 
 
 def test_guidance_asks_for_dissolved_prefix():
@@ -1901,19 +1584,11 @@ def test_sweep_retirement_matches_the_step_back_rules():
         )
 
 
-def test_degraded_history_suppresses_the_sweep():
-    records = [*_two_counting_rounds(), _coder(10, 3, status="invalid")]
-    state = _sweep(records)
-    assert state.degraded
-    assert not plan_sweep_due(state, round_number=3, sweep_rounds=2)
-
-
 def test_step_back_state_is_unchanged_by_the_shared_walk_and_sweep_fields():
     """`growth-independence` (B): provenance and sweep fields never move the step-back."""
-    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     plain = [
         *_chain([1, 2]),
-        _coder(10, 3, entries=[entry]),
+        _coder(10, 3),
         _checkpoint(11, 3, digest=DIGEST),
         _review(12, 3, items=[_new(3)]),
     ]
@@ -1932,8 +1607,6 @@ def test_step_back_state_is_unchanged_by_the_shared_walk_and_sweep_fields():
         for record in plain
     ]
     expected = derive_plan_step_back_state(plain, primary=PRIMARY, current_issue_digest=DIGEST)
-    assert expected.episode is not None and expected.episode.candidate_round == 3
-    assert expected.escalation_count == 1
     assert [r.classification for r in expected.reviews] == [CLASS_NEW_FINDING] * 3
     assert (
         derive_plan_step_back_state(tagged, primary=PRIMARY, current_issue_digest=DIGEST)
@@ -1944,15 +1617,11 @@ def test_step_back_state_is_unchanged_by_the_shared_walk_and_sweep_fields():
 def test_sweep_is_independent_of_the_plan_growth_gate(tmp_path):
     """`growth-independence` (A): no crossing, so no step-back, yet the sweep is due."""
     records = _two_counting_rounds()
-    step_back = plan_stall_step_back_disposition(
-        derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=DIGEST),
-        round_number=3,
-        crossing_round=None,
-        growth_gate_enforced=True,
-        step_back_rounds=2,
-        escalation_rounds=2,
+    step_back = derive_plan_step_back_state(
+        records, primary=PRIMARY, current_issue_digest=DIGEST,
+        config=make_config(tmp_path), live_round=2,
     )
-    assert step_back.kind == DISPOSITION_NOT_APPLICABLE
+    assert step_back.live_trigger is None and step_back.episode is None
     assert plan_sweep_due(_sweep(records), round_number=3, sweep_rounds=2)
 
 
@@ -2575,3 +2244,179 @@ def test_pr_step_back_guidance_offers_both_choices_and_keeps_the_cluster_block()
     assert "[item-1] (round 3) gap one" in guidance
 
 
+
+
+# --- replay-derived plan step-back episodes (#2098) ---------------------------
+
+from coding_review_agent_loop import review_step_back as _rsb  # noqa: E402
+from coding_review_agent_loop.review_step_back import (  # noqa: E402
+    PLAN_STEP_BACK_ROUNDS,
+    derive_plan_sweep_state,
+    plan_step_back_candidate_rounds,
+    plan_step_back_trigger_holds,
+)
+
+_REPLAY_CONFIG = object()
+
+
+@pytest.fixture
+def _crossed_from_round_one(monkeypatch):
+    """Every candidate crossed a growth signal from round 1 (crossings are recomputed)."""
+    monkeypatch.setattr(
+        _rsb, "plan_growth_crossing_round",
+        lambda records, *, config, current_round: 1,
+    )
+
+
+def _replay_history(classes, *, planner_after=None, entries=None, status=None, deferral=False):
+    """Round n: primary checkpoint, primary review of ``classes[n-1]``, planner record n+1."""
+    records = []
+    index = 0
+    for n, kind in enumerate(classes, start=1):
+        records.append(_checkpoint(index, n, digest=DIGEST, deferral=deferral))
+        if kind == "new":
+            records.append(_review(index + 1, n, items=[_new(n)]))
+        elif kind == "repeat":
+            records.append(_review(index + 1, n))
+        else:
+            records.append(_review(index + 1, n, state="approved"))
+        if planner_after is None or n < planner_after:
+            records.append(_coder(index + 2, n + 1, entries=entries or (), status=status))
+        index += 3
+    return records
+
+
+def _replay(records, **kwargs):
+    return derive_plan_step_back_state(
+        records, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG, **kwargs
+    )
+
+
+def test_the_trigger_predicate_is_shared_and_uses_the_internal_threshold():
+    assert PLAN_STEP_BACK_ROUNDS == 2
+    reviews = _replay_history(["new", "new"])
+    state = derive_plan_step_back_state(reviews, primary=PRIMARY, current_issue_digest=DIGEST)
+    # No config means no growth crossing, so nothing is derived.
+    assert state.episodes == () and state.episode is None
+    assert plan_step_back_trigger_holds(state.reviews, round_number=2, floor=1) == 2
+    assert plan_step_back_trigger_holds(state.reviews, round_number=2, floor=2) is None
+
+
+def test_an_open_episode_admits_no_second_trigger(_crossed_from_round_one):
+    """`plan-step-back-once`: two further new-finding blocks keep the original episode."""
+    records = _replay_history(["new", "new", "new", "new", "new"])
+    state = _replay(records, live_round=5)
+    assert [(e.trigger_round, e.candidate_round) for e in state.episodes] == [(2, 3)]
+    assert state.episode is not None and state.episode.candidate_round == 3
+    assert state.live_trigger is None
+    assert plan_step_back_candidate_rounds(state) == frozenset({3})
+    # The anchor still reads the original episode's candidate record.
+    assert plan_step_back_anchor(records, state.episode).candidate_round == 3
+
+
+def test_a_fresh_prefix_replay_routes_like_the_resumed_replay(_crossed_from_round_one):
+    """`plan-step-back-once`: the live decision at r equals the full replay's trigger at r."""
+    classes = ["new", "new", "new", "approved", "new", "new", "repeat", "new"]
+    records = _replay_history(classes)
+    full = _replay(records)
+    full_triggers = {episode.trigger_round for episode in full.episodes}
+    for r in range(1, len(classes) + 1):
+        review_index = next(
+            rec.index for rec in records
+            if rec.metadata.role == "reviewer" and rec.metadata.round_number == r
+        )
+        prefix = [rec for rec in records if rec.index <= review_index]
+        live = _replay(prefix, live_round=r)
+        assert (live.live_trigger is not None) == (r in full_triggers), r
+        assert [e.trigger_round for e in live.episodes] == sorted(
+            t for t in full_triggers if t < r
+        ), r
+    # The approval at round 4 closed the first episode; the trigger re-armed from
+    # fresh blocks after it (floor = the closed episode's candidate round).
+    assert sorted(full_triggers) == [2, 6]
+
+
+def test_a_trigger_without_a_following_planner_record_opens_no_episode(_crossed_from_round_one):
+    records = _replay_history(["new", "new", "new"], planner_after=2)
+    state = _replay(records)
+    assert state.episodes == ()
+
+
+@pytest.mark.parametrize("closer", ["reset", "issue-edit", "panel"])
+def test_closure_events_end_the_derived_episode(_crossed_from_round_one, closer):
+    records = _replay_history(["new", "new", "new"])
+    kwargs = {}
+    if closer == "reset":
+        records.append(_checkpoint(100, 4, digest=DIGEST, reset=True))
+    elif closer == "issue-edit":
+        records.append(_checkpoint(100, 4, digest="fedcba9876543210"))
+    else:
+        kwargs["panel_opening_index"] = 99
+    state = _replay(records, **kwargs)
+    assert state.episode is None
+
+
+@pytest.mark.parametrize("variant", ["valid", "malformed", "deferral"])
+def test_legacy_step_back_fields_never_change_the_replay(_crossed_from_round_one, variant):
+    """`plan-resume-legacy`: absent, valid and malformed entries route identically."""
+    classes = ["new", "new", "repeat", "new", "new"]
+    baseline = _replay_history(classes)
+    if variant == "valid":
+        legacy = _replay_history(
+            classes, entries=({"phase": "plan", "reviewer": PRIMARY, "trigger_round": 1},)
+        )
+    elif variant == "malformed":
+        legacy = _replay_history(classes, status="invalid")
+    else:
+        legacy = _replay_history(classes, deferral=True)
+    for live_round in (None, 5):
+        assert _replay(legacy, live_round=live_round) == _replay(baseline, live_round=live_round)
+    assert derive_plan_sweep_state(
+        legacy, primary=PRIMARY, current_issue_digest=DIGEST
+    ) == derive_plan_sweep_state(baseline, primary=PRIMARY, current_issue_digest=DIGEST)
+
+
+def test_the_plan_derivation_never_reads_legacy_step_back_fields():
+    """`plan-step-back-once`: no read of ``step_back_entries``/``step_back_status``."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(_rsb)
+    loads = [
+        node.attr for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+        and node.attr in {"step_back_entries", "step_back_status", "scheduler_step_back_deferral"}
+    ]
+    assert loads == []
+
+
+def test_candidate_rounds_survive_the_panel_opening_phase_advance(_crossed_from_round_one):
+    """The panel reviewers of a step-back candidate keep the notice after the advance."""
+    from coding_review_agent_loop.review_step_back import (
+        plan_step_back_candidate_rounds_in_history,
+    )
+
+    records = _replay_history(["new", "new", "approved"])
+    advance = PostedRoundRecord(
+        index=50,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=4,
+            subject="plan", phase="plan-phase-advance",
+        ),
+        body="",
+    )
+    with_advance = [*records, advance]
+    assert _replay(with_advance).episodes == ()
+    assert plan_step_back_candidate_rounds_in_history(
+        with_advance, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
+    ) == frozenset({3})
+    from coding_review_agent_loop.review_step_back import plan_step_back_episodes_in_history
+
+    episodes = plan_step_back_episodes_in_history(
+        with_advance, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
+    )
+    # The no-progress message reads the alternative from this merged history.
+    assert [(e.trigger_round, e.candidate_round) for e in episodes] == [(2, 3)]
+    assert plan_step_back_episodes_in_history(
+        records, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
+    ) == episodes
