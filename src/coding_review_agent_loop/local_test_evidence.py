@@ -155,6 +155,8 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "AGENT_LOOP_SHELL_CAP_MS",
         "BASH_DEFAULT_TIMEOUT_MS",
         "BASH_MAX_TIMEOUT_MS",
+        # Claude-coder-only background-tasks switch (#2157), same class.
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
         # Worker-budget control values and wrapper-private plugin state.
         "AGENT_LOOP_TEST_WORKERS",
         "AGENT_LOOP_TEST_WORKER_ENFORCEMENT",

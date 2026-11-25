@@ -10640,9 +10640,10 @@ journal row.
   watchdog ceiling itself is unchanged, and admission wait is never counted
   against the target.
 
-`AGENT_LOOP_TEST_PYTHON`, `AGENT_LOOP_SHELL_CAP_MS`, `BASH_DEFAULT_TIMEOUT_MS`
-and `BASH_MAX_TIMEOUT_MS` are exact-name environment-identity exclusions, so a
-Claude coder's numeric cap and another backend's `unknown` produce the same
+`AGENT_LOOP_TEST_PYTHON`, `AGENT_LOOP_SHELL_CAP_MS`, `BASH_DEFAULT_TIMEOUT_MS`,
+`BASH_MAX_TIMEOUT_MS` and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` are exact-name
+environment-identity exclusions, so a Claude coder's numeric cap and
+background-tasks switch and another backend's `unknown` produce the same
 identity. Changing interpreters changes the command argv, so a failure under
 one interpreter is not superseded by a pass under another; use one interpreter
 consistently.
