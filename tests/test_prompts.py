@@ -6410,6 +6410,41 @@ _CRITERIA_CLAUSES_1389 = (
     "unless the finding text explicitly names which of (i)-(iii) it falls under and why.",
 )
 
+# #2164: (ii) needs a defect reachable today; hypothetical-future robustness is hardening.
+_REACHABLE_TODAY_CLAUSES_2164 = (
+    "touches that is reachable with the current code, inputs, data, and callers,",
+    "must name the concrete current trigger (the input, call path, or state that fails today);",
+    "inputs, data, config, markers, or callers that might change in the future are hardening, "
+    "not (ii) correctness bugs, and labelling them (ii) does not make them eligible:",
+    "'a future edit to X could break Y'",
+    "'if a second entry is added'",
+    "'values above N that do not exist today'",
+    "the only exception is when the issue or a signed human requirement asks for that "
+    "robustness, and the finding then cites it under (i).",
+    "including one whose only remaining concern is a hypothetical future input, edit, or caller, "
+    "as `future` (or `resolved` when nothing remains) rather than keeping it active.",
+    "A real defect in the new or changed code that is reachable today (wrong output, a crash, a "
+    "test that fails today) still blocks under (ii) however small it is; this rule narrows only "
+    "what counts as reachable.",
+)
+
+
+@pytest.mark.parametrize(
+    ("flow", "blocking_list", "followup_list"),
+    [
+        ("pr", "blocking_items", "same_pr_followups"),
+        ("plan", "blocking_plan_issues", "same_plan_followups"),
+    ],
+)
+def test_blocking_scope_guidance_states_reachable_today_rule_per_flow(flow, blocking_list, followup_list):
+    guidance = _prompt_owner._reviewer_blocking_scope_guidance(flow)
+    flat = " ".join(guidance.split())
+    for clause in _CRITERIA_CLAUSES_1389 + _REACHABLE_TODAY_CLAUSES_2164:
+        assert clause in flat
+    assert f"`{blocking_list}` or `{followup_list}`" in flat
+    # The text is a pure function of ``flow`` (stable compact prefixes).
+    assert _prompt_owner._reviewer_blocking_scope_guidance(flow) == guidance
+
 
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize(
@@ -6420,7 +6455,7 @@ def test_pr_review_prompt_states_blocking_criteria_and_future_on_blocking(
 ):
     config = make_config(tmp_path, approved_followups=approved_followups)
     flat = " ".join(build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact).split())
-    for clause in _CRITERIA_CLAUSES_1389:
+    for clause in _CRITERIA_CLAUSES_1389 + _REACHABLE_TODAY_CLAUSES_2164:
         assert clause in flat
     assert _prompt_owner._reviewer_blocking_scope_guidance("pr") in build_review_prompt(
         77, 2, config, reviewer="codex", compact_context=compact
@@ -6444,7 +6479,7 @@ def test_plan_review_prompt_states_criteria_same_design_and_eligibility_order(tm
     config = make_config(tmp_path)
     prompt = build_plan_review_prompt(1389, 2, "Plan.", config, reviewer="codex", compact_context=compact)
     flat = " ".join(prompt.split())
-    for clause in _CRITERIA_CLAUSES_1389:
+    for clause in _CRITERIA_CLAUSES_1389 + _REACHABLE_TODAY_CLAUSES_2164:
         assert clause in flat
     assert _prompt_owner._reviewer_blocking_scope_guidance("plan") in prompt
     assert "missing edge cases within the issue's scope" in flat or compact
@@ -6837,7 +6872,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     signed-source classification guidance from #2101, and the keep-the-PR
     blocked-requirement guidance from #2120, and the plan-review
     implementation-notes list and guidance from #2145, and the shared
-    all-background-work coder rule from #2157.
+    all-background-work coder rule from #2157, and the reachable-today
+    blocking-scope criterion from #2164.
     """
     import json as _golden_json
     import os as _golden_os
