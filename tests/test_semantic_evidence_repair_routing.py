@@ -382,7 +382,8 @@ def test_resend_only_reask_after_fresh_evidence_keeps_the_fresh_catalog(tmp_path
     assert invoke.call_count == 3
     resend_prompt = invoke.call_args_list[2].kwargs["prompt"]
     assert "re-ask 2 of 2" in resend_prompt
-    assert "Do not modify, commit or push anything" in resend_prompt
+    # #2157: the session-backed resend-only re-ask forbids new work and commits.
+    assert "no file edits, and no commits or pushes" in resend_prompt
     assert response.acquisition_test_turn_id == "t2"
     assert response.acquisition_test_observations == (_obs_for("turn2:obs-1", "t2"),)
     claims = response.marker_value.risk_test_matrix_claims.claims
@@ -422,7 +423,8 @@ def test_catalog_collision_is_a_resend_only_reask_with_the_primary_catalog(tmp_p
     assert invoke.call_count == 2
     prompt = invoke.call_args_list[1].kwargs["prompt"]
     assert "catalog-collision" in prompt or "collid" in prompt.lower()
-    assert "Do not modify, commit or push anything" in prompt
+    # #2157: the session-backed resend-only re-ask forbids new work and commits.
+    assert "no file edits, and no commits or pushes" in prompt
     # The resend-only dispatch's catalog is never the active acquisition.
     assert response.acquisition_test_turn_id == "t1"
 

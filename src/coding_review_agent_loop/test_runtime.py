@@ -2377,6 +2377,10 @@ ENV_SHELL_CAP_MS = "AGENT_LOOP_SHELL_CAP_MS"
 SHELL_CAP_UNKNOWN = "unknown"
 CLAUDE_BASH_DEFAULT_ENV = "BASH_DEFAULT_TIMEOUT_MS"
 CLAUDE_BASH_MAX_ENV = "BASH_MAX_TIMEOUT_MS"
+# Issue #2157: Claude Code's switch that turns off ``run_in_background`` on
+# Bash and subagent tools (and auto-backgrounding) while foreground parallel
+# subagents still block until they finish.
+CLAUDE_DISABLE_BACKGROUND_TASKS_ENV = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
 
 
 def run_tests_foreground_budget_seconds(ceiling: float, env: Mapping[str, str] | None = None) -> int:
@@ -2422,7 +2426,9 @@ def agent_shell_environment(
     Bash limits are raised to the whole run-tests foreground budget (keeping a
     larger operator value), and the cap fact is the effective *default* -- the
     limit of a Bash call made without a timeout.  Every other backend and
-    every read-only Claude role carries ``unknown``.
+    every read-only Claude role carries ``unknown``.  The Claude coder also
+    gets ``CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`` (#2157), so it cannot end
+    its turn while background work it started is still running.
     """
     from .agent_permissions import PERMISSION_CLASS_READ_ONLY, permission_class_for_role
 
@@ -2441,6 +2447,8 @@ def agent_shell_environment(
     environment[CLAUDE_BASH_DEFAULT_ENV] = str(default_ms)
     environment[CLAUDE_BASH_MAX_ENV] = str(maximum_ms)
     environment[ENV_SHELL_CAP_MS] = str(default_ms)
+    # Orchestrator-owned like the shell cap: overrides any ambient value.
+    environment[CLAUDE_DISABLE_BACKGROUND_TASKS_ENV] = "1"
     return environment
 
 

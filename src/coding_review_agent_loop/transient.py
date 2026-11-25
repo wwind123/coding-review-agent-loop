@@ -643,7 +643,13 @@ BACKGROUNDED_COMPLETION_RE = re.compile(
     r"\b(?:you(?:'|')?ll|i(?:'|')?ll|we(?:'|')?ll) (?:get|be) notified\b|"
     r"\bwill (?:get|be) notified\b|"
     r"\blet me wait for\b|"
-    r"\bonce (?:the |it )?(?:background )?(?:test|build|suite).{0,40}finish"
+    r"\bonce (?:the |it )?(?:background )?(?:test|build|suite).{0,40}finish|"
+    # Issue #2092/#2157: an interim message while subagents or tasks still run,
+    # e.g. "Group C is done. Waiting for group A."  Bounded windows only.
+    r"\bwait(?:ing)? (?:for|on) (?:the |the other |other |remaining )?"
+    r"(?:\w+ ){0,2}(?:group|subagent|sub-agent|agent|task|job|worker)s?\b|"
+    r"\b(?:subagent|sub-agent|agent|task|group|worker|job)s?\b[^.\n]{0,40}?"
+    r"\b(?:is |are )?(?:still running|still in progress|in progress)\b"
 )
 
 

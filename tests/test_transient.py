@@ -1057,3 +1057,26 @@ def test_agy_log_reason_leaves_existing_reasons_unchanged() -> None:
     assert transient.classify_antigravity_quota_exhaustion(capacity_only) is None
     credits = transient.AntigravityCapacityClassification(True, "", "credits too low", reason="credits")
     assert transient.classify_antigravity_quota_exhaustion(credits).reset_source == "cooldown"
+
+
+def test_subagent_wait_phrases_match() -> None:
+    """`regex-false-positive` (#2092/#2157): interim subagent/task waits match."""
+    for text in (
+        "Group C is done. Waiting for group A.",
+        "subagent B is still running",
+        "Waiting on the remaining subagents to report back.",
+        "Two agents are still in progress; I will report when they finish.",
+        "waiting for the other task group",
+    ):
+        assert transient.looks_like_backgrounded_completion(text), text
+
+
+def test_ordinary_final_summaries_do_not_match_subagent_wait_phrases() -> None:
+    for text in (
+        "All groups are done.",
+        "waiting for review is not required",
+        "Split the deletion into three groups and committed each group.",
+        "The subagent finished; every task completed and the PR is open.",
+        "Please wait while I review the diff.",
+    ):
+        assert not transient.looks_like_backgrounded_completion(text), text

@@ -2576,9 +2576,9 @@ def build_completion_recovery_prompt(
         include_coverage_map=coverage_map_applies(approved_plan_context),
     )
     return f"""Your previous turn on this same implementation ended without a valid
-terminal response, and its text suggested required work (tests, a build, or
-similar) was left running in the background instead of being finished before
-the turn ended. This is a one-time, bounded continuation of that same session;
+terminal response, and its text suggested required work (tests, a build,
+subagents, Agent/Task tool work, or similar) was left running in the background
+instead of being finished before the turn ended. This is a one-time, bounded continuation of that same session;
 the orchestrator will not send another one after this turn.
 {prompt_support._coder_workdir_guidance(config)}
 {prompt_support._scratch_file_guidance()}
@@ -2590,7 +2590,9 @@ only foreground work from here: do not poll or wait on that old background job
 task-output file. If you know its process ID, terminate it once (a single
 `kill <pid>`, not a loop) and then re-run the command you actually need in the
 foreground under the bounded timeout below, waiting for it to finish; launch
-nothing new in the background. Then commit, push, and open the pull request if
+nothing new in the background. If a subagent or task group did not finish,
+inspect the checkout and complete that group's work yourself in the
+foreground. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
 {prompt_support._coder_test_reporting_guidance(structured=True)}{prompt_support._coder_local_test_scope_guidance(config, structured=True)}{prompt_support._coder_ci_wait_guidance()}{prompt_support._coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{prompt_support._coder_documentation_guidance()}{prompt_support._coder_github_body_file_guidance()}
 {human_requirements_context.block}

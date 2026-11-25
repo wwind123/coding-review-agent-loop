@@ -9705,13 +9705,17 @@ and is never salvaged as a public response. Empty, stale, malformed, and
 wrong-role artifacts continue through the normal retry/failure path; accepted
 failed exits record their outcome and return code in resume metadata.
 
-Coder prompts for a direct issue implementation explicitly forbid launching
-required tests or other completion work (builds, commits, pushes, PR creation)
-in the background and ending the turn early; the coder must finish that work
-in the foreground and wait for it before responding. If a Claude
+Coder prompts explicitly forbid launching any work in the background and
+ending the turn early: tests, builds, commits, pushes, PR creation, other shell
+commands, and subagents or Agent/Task tool calls must all run in the foreground
+and finish before the coder responds. Parallel subagents are allowed only when
+the turn waits for every one of them before writing its terminal response.
+Claude coder turns also run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`
+(reviewers and other read-only roles are unchanged). If a Claude
 implementation turn still ends this way — no valid `AGENT_PR`/`AGENT_STATE`/
 `AGENT_CLARIFY` marker, and text like "I'll wait for the background test run
-to finish" or "you'll be notified when it's done" — the loop performs one
+to finish", "you'll be notified when it's done" or "Waiting for group A." —
+the loop performs one
 bounded `claude --resume <session>` completion-recovery pass instead of
 failing immediately. The resume turn is told to inspect the existing checkout,
 finish only foreground work, and either complete the PR or end with a real
@@ -10362,7 +10366,13 @@ A re-asked coder is told not to modify, commit or push the checkout, and the
 checkout head is read before and after the re-ask. A moved head ends the turn
 with an error naming both heads and the re-asked response is never accepted;
 the PR loop then records the pushed head as it does for any rejected
-follow-up that pushed. When the rejection says a cited test observation is not
+follow-up that pushed. A re-ask that resumes the coder's session also says that
+background work the previous turn started (subagents, Agent/Task tools, shell
+commands) may still be running: the coder may wait for that existing work
+through its own result or wait mechanism, but must not start new work, edit,
+commit, push or finish unfinished work, and reports the real final state with
+unfinished work as remaining items (#2157). A session-less re-ask is a fresh
+turn and keeps the plain resend-only wording. When the rejection says a cited test observation is not
 citable (a non-passing selector, missing launch integrity or an outside-checkout
 receipt command), the re-ask instead asks the coder to rerun the covering test
 through the test wrapper and cite the new observation; commits and pushes stay

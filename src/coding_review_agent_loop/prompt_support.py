@@ -528,6 +528,24 @@ FIXTURE_CODER_GUIDANCE = (
 )
 
 
+# Issue #2157: one foreground rule for every kind of work a coder turn starts
+# (tests, builds, shell commands, subagents, Agent/Task tool calls).  The
+# phrasing reuses QUOTED_COMMAND_REVIEW_RULE ("do not start background work",
+# "instead of deferring to a background task") so coder and reviewer read
+# the same rule; the reviewer constant itself is unchanged.
+FOREGROUND_WORK_RULE = (
+    "Run all work in this turn in the foreground and wait for it to finish "
+    "before ending this turn: tests, builds, commits, pushes, PR creation, other "
+    "shell commands, and every subagent or Agent/Task tool call. Parallel "
+    "subagents are allowed only if this turn waits for every one of them to "
+    "finish before it writes the terminal response. Do not start background "
+    "work, and do not end the turn saying you will wait for it; end this turn "
+    "with the terminal response instead of "
+    "deferring to a background task. A turn that ends without a real terminal "
+    "marker because work is still running in the background cannot be validated."
+)
+
+
 def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
     if structured:
         reporting = (
@@ -544,12 +562,7 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
             "explain why in that `Tests:` line."
         )
     return (
-        f"{reporting} Run tests and any other required "
-        "completion work (builds, commits, pushes, PR creation) in the "
-        "foreground and wait for them to finish before ending this turn. Do not "
-        "launch them in the background and end the turn saying you will wait for "
-        "them; a turn that ends without a real terminal marker because required "
-        "work is still running in the background cannot be validated. "
+        f"{reporting} {FOREGROUND_WORK_RULE} "
         "Stage intended new files before required tests so tracked/staged salvage can preserve them. "
         "Default managed checkouts are removed when the run ends; recover from saved salvage artifacts. "
         "Explicit checkouts keep their existing lifecycle. "

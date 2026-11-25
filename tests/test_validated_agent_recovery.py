@@ -687,7 +687,10 @@ def test_resend_only_coder_reask_keeps_the_primary_acquisition_catalog(tmp_path,
     assert seen_catalogs and all(catalog == (acquisition_observation,) for catalog in seen_catalogs)
     reask_call = invoke.call_args_list[1].kwargs
     assert reask_call["session_id"] == "coder-session"
-    assert "Do not modify, commit or push anything" in reask_call["prompt"]
+    # #2157: a session-backed coder re-ask may wait on existing background
+    # work but still forbids new work, edits, commits and pushes.
+    assert "may still be running" in reask_call["prompt"]
+    assert "no file edits, and no commits or pushes" in reask_call["prompt"]
 
 
 def test_claude_completion_recovery_keeps_original_acquisition_catalog(
@@ -2260,7 +2263,8 @@ def test_tests_run_correction_is_resend_only_and_inherits_the_primary_catalog(tm
     reask = invoke.call_args_list[1].kwargs
     assert reask['session_id'] == 'coder-session'
     assert 'Previous response not accepted: tests_run report' in reask['prompt']
-    assert 'Do not modify, commit or push anything' in reask['prompt']
+    # #2157: the session-backed re-ask forbids new work, edits and commits.
+    assert 'no file edits, and no commits or pushes' in reask['prompt']
 
 
 def test_followup_workdir_composition_preserves_operational_errors(tmp_path, monkeypatch):
@@ -2674,8 +2678,9 @@ def test_coder_reask_with_an_unchanged_head_is_accepted(tmp_path, monkeypatch):
     # The head is read before and after the re-ask; neither read is skipped.
     assert len(reads) == 2
     reask_prompt = invoke.call_args_list[1].kwargs["prompt"]
-    assert "Do not modify, commit or push anything" in reask_prompt
-    assert "do not touch the checkout" in reask_prompt
+    # #2157: a session-backed coder re-ask forbids new work and keeps the head guard.
+    assert "no file edits, and no commits or pushes" in reask_prompt
+    assert "a moved head ends the turn" in reask_prompt
 
 
 def test_coder_reask_that_moved_the_head_fails_closed(tmp_path, monkeypatch):
@@ -3201,3 +3206,150 @@ def test_prior_response_is_bounded_truncated_and_sanitized(tmp_path):
     assert len(appendix) < REASK_PRIOR_RESPONSE_MAX_CHARS + 1500
     assert "SECRET2128" not in appendix
     assert not scan_reserved_markers(appendix)
+
+
+# ---------------------------------------------------------------- #2157
+
+
+def _reask_appendix(prompt: str) -> str:
+    return prompt.split("Original.", 1)[1]
+
+
+def test_session_resumed_coder_reask_permits_only_waiting_on_existing_work():
+    """`format-reask-session` (#2157): consistent wait instructions, head guard kept."""
+    from coding_review_agent_loop.response_reask import (
+        REASK_BACKGROUND_WAIT_CLAUSE,
+        REASK_CODER_NO_COMMAND_LINE,
+        REASK_HEAD_GUARD_CLAUSE,
+        REASK_NO_NEW_WORK_CLAUSE,
+        REASK_REPORT_FINAL_STATE_CLAUSE,
+        build_reask_prompt,
+    )
+
+    appendix = _reask_appendix(build_reask_prompt("Original.", "bad", 1, coder=True))
+    assert "background work you started in the previous turn" in appendix.lower()
+    assert "may still be running" in appendix
+    assert REASK_BACKGROUND_WAIT_CLAUSE in appendix
+    assert "using only that work's own result or wait mechanism" in appendix
+    assert "Do not poll in a loop." in appendix
+    assert REASK_NO_NEW_WORK_CLAUSE in appendix
+    assert "no new subagents, Agent/Task calls, tests or other commands" in appendix
+    assert "no file edits, and no commits or pushes" in appendix
+    assert REASK_REPORT_FINAL_STATE_CLAUSE in appendix
+    assert "do not complete unfinished work yourself in this re-ask" in appendix
+    assert "remaining items" in appendix
+    assert REASK_HEAD_GUARD_CLAUSE in appendix
+    # The blanket resend-only line would contradict the wait permission.
+    assert "do not run tests or other commands" not in appendix
+    assert REASK_CODER_NO_COMMAND_LINE not in appendix
+
+
+def test_session_resumed_fresh_evidence_coder_reask_adds_the_wait_clause():
+    from coding_review_agent_loop.response_reask import (
+        REASK_BACKGROUND_WAIT_CLAUSE,
+        build_reask_prompt,
+    )
+
+    appendix = _reask_appendix(
+        build_reask_prompt("Original.", "bad", 1, coder=True, fresh_evidence=True)
+    )
+    assert REASK_BACKGROUND_WAIT_CLAUSE in appendix
+    assert "rerun the covering test through the test wrapper" in appendix
+    assert "Do not edit files, commit, push, or otherwise change the checkout or the PR." in appendix
+
+
+def test_session_less_and_non_coder_reasks_carry_no_wait_clause():
+    from coding_review_agent_loop.response_reask import (
+        REASK_BACKGROUND_WAIT_CLAUSE,
+        REASK_CODER_NO_COMMAND_LINE,
+        build_reask_prompt,
+    )
+
+    fresh_turn = build_reask_prompt("Original.", "bad", 1, coder=True, prior_response="prev")
+    assert REASK_BACKGROUND_WAIT_CLAUSE not in fresh_turn
+    assert REASK_CODER_NO_COMMAND_LINE in fresh_turn
+    assert (
+        "Do not modify, commit or push anything, do not run tests or other commands, "
+        "and do not touch the checkout: only resend the response. The checkout head is "
+        "compared before and after this re-ask, and a moved head ends the turn."
+    ) in fresh_turn
+    fresh_evidence_turn = build_reask_prompt(
+        "Original.", "bad", 1, coder=True, fresh_evidence=True, prior_response="prev"
+    )
+    assert REASK_BACKGROUND_WAIT_CLAUSE not in fresh_evidence_turn
+    for prior in (None, "prev"):
+        reviewer = build_reask_prompt("Original.", "bad", 1, prior_response=prior)
+        assert REASK_BACKGROUND_WAIT_CLAUSE not in reviewer
+        assert "may still be running" not in reviewer
+        assert "checkout head is compared" not in reviewer
+
+
+def test_claude_coder_interim_subagent_wait_routes_to_completion_recovery(tmp_path):
+    """`interim-routes-recovery` (#2092/#2157): the one-time continuation runs first."""
+    interim = AgentResult(
+        text="Group C is done. Waiting for group A.",
+        returncode=0,
+        session_id="claude-session",
+    )
+    recovery_text = structured_issue_implementation(pr_number=78)
+    recovered = AgentResult(text=recovery_text, returncode=0, session_id="claude-session")
+
+    def validate(text):
+        if text == recovery_text:
+            return validate_structured_issue_implementation(text)
+        raise AgentLoopError("not an issue_implementation response")
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result",
+        side_effect=[interim, recovered],
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(),
+            agent="claude",
+            config=make_config(tmp_path, coder="claude"),
+            prompt="Finish the implementation.",
+            marker_description="structured issue implementation",
+            validate=validate,
+            role="coder",
+            completion_recovery=CompletionRecoveryPolicy(issue_number=56),
+        )
+
+    assert response.marker_value.pr_number == 78
+    assert invoke.call_count == 2
+    continuation = invoke.call_args_list[1].kwargs
+    assert continuation["session_id"] == "claude-session"
+    prompt = continuation["prompt"]
+    # The completion-recovery continuation, not the format re-ask.
+    assert "one-time, bounded continuation" in prompt
+    assert "Previous response rejected (re-ask" not in prompt
+    assert "subagents" in prompt
+    assert "complete that group's work yourself in the" in prompt
+
+
+def test_valid_response_mentioning_agents_never_triggers_completion_recovery(tmp_path):
+    """A validated final summary about groups/tasks does not start a continuation."""
+    valid = structured_issue_implementation(
+        pr_number=79,
+        summary="All groups are done; the subagent tasks finished and nothing is in progress.",
+    )
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result",
+        side_effect=[AgentResult(text=valid, returncode=0, session_id="claude-session")],
+    ) as invoke, patch.object(
+        validated_agent, "_attempt_claude_completion_recovery",
+        side_effect=AssertionError("recovery must not run"),
+    ):
+        response = _run_validated_agent(
+            FakeRunner(),
+            agent="claude",
+            config=make_config(tmp_path, coder="claude"),
+            prompt="Finish the implementation.",
+            marker_description="structured issue implementation",
+            validate=validate_structured_issue_implementation,
+            role="coder",
+            completion_recovery=CompletionRecoveryPolicy(issue_number=56),
+        )
+
+    assert response.marker_value.pr_number == 79
+    assert invoke.call_count == 1
