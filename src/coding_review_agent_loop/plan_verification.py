@@ -139,10 +139,6 @@ class PlanVerificationContext:
         """
         from .agents.registry import agent_display_name
         from .config import (
-            DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
-            DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
-            DEFAULT_PLAN_STEP_BACK_ROUNDS,
-            DEFAULT_PLAN_SWEEP_ROUNDS,
             DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
         )
         from .reviewer_seats import SeatAgent
@@ -172,19 +168,6 @@ class PlanVerificationContext:
             plan_resume_keep_on_issue_edit=False,
             reopen_approved_plan=False,
             keep_approved_plan=False,
-            plan_primary_stall_rounds=(
-                config.plan_primary_stall_rounds if staged else DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
-            ),
-            plan_step_back_rounds=(
-                config.plan_step_back_rounds if staged else DEFAULT_PLAN_STEP_BACK_ROUNDS
-            ),
-            plan_step_back_escalation_rounds=(
-                config.plan_step_back_escalation_rounds
-                if staged else DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
-            ),
-            plan_sweep_rounds=(
-                config.plan_sweep_rounds if staged else DEFAULT_PLAN_SWEEP_ROUNDS
-            ),
             plan_sweep_reasoning_effort=(
                 config.plan_sweep_reasoning_effort if staged else ""
             ),

@@ -377,22 +377,11 @@ def _stall_items():
 
 
 def _renderer_fixtures():
-    from coding_review_agent_loop import review_step_back as sb
-
     return {
         ("no_progress", "render_no_progress_message"): (
             (), {"lead": "PR #77: ", "subject_label": "head", "subject": "e" * 40, "k": 3,
                  "rounds": (2, 3, 4), "item_lines": ("- [item-1] still broken",)},
             "PR #77: human decision required: no progress across ",
-        ),
-        ("review_step_back", "render_step_back_human_decision"): (
-            (), {"phase": "plan", "measurements": "m.", "step_back_round": 2, "blocks": 3,
-                 "threshold": 3, "alternative": "simpler"},
-            sb.PLAN_STEP_BACK_HUMAN_DECISION_PREFIX,
-        ),
-        ("panel_evidence", "plan_primary_stall_message"): (
-            (), {"streak": 3, "threshold": 3, "plan_chars": 10},
-            "the primary plan reviewer has blocked ",
         ),
         ("pr_loop_support", "render_evidence_stall_decision"): (
             (77, "a" * 40, "f" * 64, {"row-a": "x"}, 2), {},

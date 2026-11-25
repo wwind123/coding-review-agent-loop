@@ -24,7 +24,7 @@ from .board_amendment import (
     stale_unread_amendment_locator,
 )
 from .decomposition import approved_plan_hash
-from .errors import AgentLoopError, render_human_decision
+from .errors import AgentLoopError
 from .github import IssueContext, HumanReviewRequirement
 from .issue_pr_handoff import IssuePrHandoffMetadata
 from .logging import log
@@ -1034,25 +1034,6 @@ def _classify_staged_plan_history(
     )
 
 
-@dataclass(frozen=True)
-class PlanPrimaryStreak:
-    """Stall streak plus the newest counted rounds that lack an issue digest."""
-
-    count: int
-    # Newest consecutive counted rounds with no recorded issue digest: an
-    # issue edit ends the streak at the first digested round, so this is the
-    # count an edit leaves behind.
-    undigested_prefix: int = 0
-
-    @property
-    def legacy_undigested(self) -> bool:
-        return self.undigested_prefix > 0
-
-    def edit_cannot_clear(self, threshold: int) -> bool:
-        """Whether the undigested rounds alone keep the stop tripped after an edit."""
-        return threshold > 0 and self.undigested_prefix >= threshold
-
-
 def normalize_plan_issue_text(text: str | None) -> str:
     """CRLF-to-LF and per-line trailing-whitespace normalization of #1112."""
     return "\n".join(
@@ -1078,209 +1059,9 @@ def plan_issue_text_digest(issue_context: IssueContext) -> str:
     return plan_issue_text_digest_for(issue_context.title, issue_context.body)
 
 
-def plan_primary_blocking_streak(
-    records: Sequence[PostedRoundRecord],
-    *,
-    primary: str,
-    panel_opening_index: int | None = None,
-    current_issue_digest: str | None = None,
-) -> int:
-    """Integer form of :func:`plan_primary_blocking_streak_detail`."""
-    return plan_primary_blocking_streak_detail(
-        records,
-        primary=primary,
-        panel_opening_index=panel_opening_index,
-        current_issue_digest=current_issue_digest,
-    ).count
-
-
-def plan_primary_blocking_streak_detail(
-    records: Sequence[PostedRoundRecord],
-    *,
-    primary: str,
-    panel_opening_index: int | None = None,
-    current_issue_digest: str | None = None,
-    current_execution_mode: str | None = None,
-) -> PlanPrimaryStreak:
-    """Consecutive completed blocking primary plan reviews (#1103).
-
-    A round whose checkpoint recorded a different execution mode than
-    ``current_execution_mode`` ends the streak before it counts, exactly like
-    an issue-digest mismatch: that review judged another execution contract
-    (#1268).  Rounds with no recorded mode count.
-
-    Two further boundaries retire older rounds (#1112): a round whose
-    checkpoint recorded a different issue digest than ``current_issue_digest``
-    (that review judged other issue text) ends the streak before it counts, and
-    a checkpoint carrying the operator reset marker ends it after counting that
-    round's own review, or immediately when its review never completed.
-    Rounds with no recorded digest count.  ``undigested_prefix`` counts the
-    newest consecutive counted rounds with none: an issue edit ends the streak
-    at the newest digested round, so those rounds are exactly what an edit
-    leaves counting.
-
-    Counts, newest round first, the rounds whose primary review ended
-    ``blocking`` and follows a valid ``primary``-phase scheduler checkpoint of
-    the same round.  A round with a valid primary-phase checkpoint but no
-    primary review (interrupted, or the primary was unavailable) is skipped:
-    it neither counts nor resets.  Everything else ends the streak: any
-    primary approval (whatever its key), any other review state, a missing or
-    invalid checkpoint, a non-primary phase, an invalid scheduler record or a
-    phase-advance record positioned after the round's checkpoint, and anything
-    at or after a qualified panel opening.  Degraded history can therefore
-    only shorten the streak, never lengthen it.
-    """
-    ordered = sorted(records, key=lambda item: item.index)
-    # The newest history boundary: nothing at or before it may count.
-    boundary_index = max(
-        (
-            record.index
-            for record in ordered
-            if record.metadata.scheduler_metadata_status == "invalid"
-            or (
-                record.metadata.role == "summary"
-                and record.metadata.phase == "plan-phase-advance"
-            )
-        ),
-        default=-1,
-    )
-    checkpoints: dict[int, list[PostedRoundRecord]] = {}
-    reviews: dict[int, PostedRoundRecord] = {}
-    for record in ordered:
-        metadata = record.metadata
-        if metadata.role == "summary" and metadata.phase == "scheduler-prelaunch":
-            checkpoints.setdefault(metadata.round_number, []).append(record)
-        elif metadata.role == "reviewer" and metadata.agent == primary:
-            # A later record for the same round supersedes an earlier one.
-            reviews[metadata.round_number] = record
-
-    def usable_primary_checkpoint(checkpoint: PostedRoundRecord | None) -> bool:
-        return (
-            checkpoint is not None
-            and checkpoint.index > boundary_index
-            and (panel_opening_index is None or checkpoint.index < panel_opening_index)
-            and checkpoint.metadata.scheduler_metadata_status == "valid"
-            and checkpoint.metadata.scheduler_phase == "primary"
-        )
-
-    def has_reset(round_checkpoints: list[PostedRoundRecord]) -> bool:
-        return any(
-            usable_primary_checkpoint(record) and record.metadata.scheduler_stall_reset
-            for record in round_checkpoints
-        )
-
-    streak = 0
-    undigested_prefix = 0
-    for number in sorted(set(checkpoints) | set(reviews), reverse=True):
-        review = reviews.get(number)
-        round_checkpoints = checkpoints.get(number, [])
-        if review is None:
-            if usable_primary_checkpoint(
-                round_checkpoints[-1] if round_checkpoints else None
-            ):
-                if has_reset(round_checkpoints):
-                    break
-                continue
-            break
-        if panel_opening_index is not None and review.index >= panel_opening_index:
-            break
-        checkpoint = next(
-            (
-                record
-                for record in reversed(round_checkpoints)
-                if record.index < review.index
-            ),
-            None,
-        )
-        if not usable_primary_checkpoint(checkpoint) or review.metadata.state != "blocking":
-            break
-        recorded_digest = checkpoint.metadata.scheduler_issue_digest
-        if (
-            recorded_digest is not None
-            and current_issue_digest is not None
-            and recorded_digest != current_issue_digest
-        ):
-            break
-        recorded_mode = checkpoint.metadata.scheduler_execution_mode
-        if (
-            recorded_mode is not None
-            and current_execution_mode is not None
-            and recorded_mode != current_execution_mode
-        ):
-            break
-        # An edit changes the current digest and ends the streak at the newest
-        # digested round, so only the undigested *newest* counted rounds are
-        # out of an edit's reach.
-        if recorded_digest is None and undigested_prefix == streak:
-            undigested_prefix += 1
-        streak += 1
-        if has_reset(round_checkpoints):
-            break
-    return PlanPrimaryStreak(count=streak, undigested_prefix=undigested_prefix)
-
-
-# Leading bytes of the primary-phase stall stop; history_export recognizes the
-# posted diagnostic through this constant.
+# Leading bytes of the retired primary-phase stall stop (#2098); history_export
+# still recognizes legacy diagnostics through this constant.
 PLAN_PRIMARY_STALL_PREFIX = "the primary plan reviewer has blocked "
-
-
-def plan_primary_stall_message(
-    *,
-    streak: int,
-    threshold: int,
-    plan_chars: int,
-    legacy_undigested: bool = False,
-    step_back_status: str | None = None,
-) -> str:
-    """Operator diagnostic for the primary-phase stall stop (#1103, #1112)."""
-    step_back_note = (
-        f" Plan step-back did not apply: {step_back_status}."
-        if step_back_status
-        else ""
-    )
-    legacy_note = (
-        " The newest counted rounds predate issue-text tracking and by themselves "
-        "reach the threshold, so editing the issue cannot retire them or clear "
-        "this stop and --plan-reset-stall-streak is required."
-        if legacy_undigested
-        else ""
-    )
-    what = (
-        PLAN_PRIMARY_STALL_PREFIX
-        + f"{streak} consecutive primary-phase "
-        f"planning round(s) with no exact-plan primary approval, reaching "
-        f"--plan-primary-stall-rounds {threshold} (current canonical plan: "
-        f"{plan_chars} characters). The secondary plan panel was not convened, "
-        "because it opens only after an exact-plan primary approval; no reviewer and "
-        "no planner turn were invoked. To continue: edit the issue title or body "
-        "to narrow it (rounds reviewed against earlier issue text stop counting; a "
-        "comment alone does not change the issue text and does not clear this stop); "
-        "rerun with --plan-reset-stall-streak to retire the counted rounds, for "
-        "example after narrowing the issue by comment; rerun with "
-        "--plan-review-force-full to authorize the complete plan board; or raise "
-        "--plan-primary-stall-rounds (or pass 0 to disable this stop). Retiring the "
-        "streak resumes with the primary review of the current candidate plan, which "
-        "the planner then revises against the narrowed issue. If you changed "
-        "--plan-execution-mode since these rounds and they predate execution-mode "
-        "recording, rerun with --plan-reset-stall-streak to retire them."
-        + legacy_note
-        + step_back_note
-    )
-    return render_human_decision(
-        what=what,
-        clear=(
-            "Rerun the same command with --plan-reset-stall-streak to retire the counted "
-            "rounds; the other options are listed above."
-            if legacy_undigested
-            else "Edit the issue title or body to narrow it, then rerun the same command; "
-            "the other options are listed above."
-        ),
-        safe_to_automate=False,
-        automation_note=(
-            "narrowing the issue, retiring the streak or widening the board is a human "
-            "judgement."
-        ),
-    )
 
 
 def _planner_candidate_rounds(comments: Sequence[object]) -> set[int]:

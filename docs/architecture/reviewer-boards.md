@@ -404,9 +404,9 @@ startup.
 - **Primary epoch.** Under `primary-then-panel`, a change of the primary seat,
   its binding or a seat's role sets a plan primary epoch at the link's
   effective round. Plan history before it is excluded from panel evidence,
-  carried approvals, the primary stall streak and the step-back counters. So
-  the next round is primary-only on the new primary, and the old primary's
-  blocking reviews never trip `--plan-primary-stall-rounds`. Eligible
+  carried approvals, the plan no-progress window and the step-back and sweep
+  replays. So the next round is primary-only on the new primary, and the old
+  primary's blocking reviews never count toward the no-progress stop. Eligible
   pre-epoch secondary-owned items are carried obligations
   (`PlanSchedulerSnapshot.carried_obligations`). They are exempt only from the
   pre-panel safety stop and keep blocking approval.

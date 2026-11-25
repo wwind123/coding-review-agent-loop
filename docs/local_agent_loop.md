@@ -275,7 +275,7 @@ the summary, or a child without an issue number) is an ordinary failure
 
 Every human-decision stop exits 4. This includes malformed or misplaced signed
 reviewer-board amendments, child-disposition overrides and child-plan
-supersession records, and the plan step-back and primary-stall stops. The
+supersession records, and the plan no-progress stop. The
 message after the `agent-loop: HUMAN DECISION REQUIRED` header always has
 three parts:
 
@@ -880,7 +880,7 @@ signature is needed. A rerun with the same board posts nothing new.
   posts it again.
 - **Primary changes.** Under `primary-then-panel`, a new primary plan reviewer
   restarts the primary-only phase on the current plan. The old primary's
-  blocking reviews do not count towards `--plan-primary-stall-rounds`, and
+  blocking reviews do not count towards the plan no-progress window, and
   open secondary findings keep their owners until the panel reopens.
 - **The floor.** With `--min-reviewers` or `--min-distinct-providers`, the plan
   board is checked before the record is posted and at every planning round. A
@@ -4837,7 +4837,7 @@ By default it then starts a fresh plan in a new planning scope:
   and a scope starting at round 4, planning stops after round 8.
 - The earlier plan and its reviews stay in the issue history, but they no longer
   feed the planner or reviewer prompts. They also no longer feed resume, the
-  stall streak, step-back state, force-full replay or approval checks.
+  no-progress window, step-back state, force-full replay or approval checks.
   Reviewer-board changes and signed board amendments still apply.
 
 Only a boundary comment written by the authenticated orchestrator account
@@ -4998,8 +4998,8 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first \
 `primary-then-panel`. `--primary-plan-reviewer` is required by the staged
 policy, must be on the configured `--reviewer` board, and needs at least one
 secondary. `--plan-review-force-full` is the operator override, and
-`--plan-primary-stall-rounds` bounds the primary phase (see
-[Primary-phase stall stop](#primary-phase-stall-stop)). All of them
+the plan no-progress detector bounds the primary phase (see
+[Plan no-progress stop](#plan-no-progress-stop)). All of them
 validate independently of `--pr-review-policy`, `--primary-reviewer`, and
 `--pr-review-force-full`, so a run may stage planning with full-board PR review
 or the reverse. Omitting them preserves today's full-board planning behavior
@@ -5085,118 +5085,89 @@ reason, never the board. Broad and narrow transitions both select the primary
 alone; a broad one is labelled `strict pre-panel fallback:`. Only an exact-key
 primary approval opens the panel.
 
-#### Primary-phase stall stop
+#### Plan no-progress stop
 
-Under `primary-then-panel`, a primary reviewer that keeps blocking holds the
-run in the `primary` phase: every revision needs a fresh exact-plan primary
-approval before the panel can open. `--plan-primary-stall-rounds N` (default
-`8`, `0` disables) bounds that loop. Before scheduling a round, the loop counts
-consecutive *completed* primary reviews that ended `blocking`, newest first,
-from durable round records. A review counts only when it follows a valid
-`primary`-phase scheduler checkpoint of the same round. A round whose checkpoint
-was posted but whose primary review never completed is skipped, neither counted
-nor reset. Any primary approval resets the count, whatever key it approved,
-including a growth-gated approval that opened no panel. The count also ends at
-an invalid or missing checkpoint, at a non-primary phase, at a phase-advance
-record, and at a qualified panel opening.
+Under every plan review policy the plan loop shares the PR loop's single
+no-progress detector (#2098, stage 2 of #2067; see
+[PR no-progress stop](#pr-no-progress-stop)). Before scheduling a round, and
+before any scheduler checkpoint or agent turn, the loop derives one observation
+per completed planning round from durable records: the plan hash that round
+reviewed and the blocking item IDs (`blocking` and `same-plan`) the planner was
+then asked to fix. When the `--no-progress-rounds` K (default 3) most recent
+completed rounds share the same plan hash and the same non-empty set of
+blocking IDs, and the current plan and blocking IDs still match, the run stops
+for a human decision (exit 4). It posts one `Plan review scheduling diagnostic`
+that names the unchanged items, the plan hash, K, the plan size and, when one
+exists, the newest step-back alternative summary, and it writes no round record.
+The panel is never convened automatically.
 
-When the count reaches `N` with no qualified opening, no operator force-full,
-and no primary approval of the current key, the run stops before the next
-primary turn. It posts a plain `Plan review scheduling diagnostic` naming the
-streak, the threshold, and the current canonical plan size, and writes no
-scheduler checkpoint, latch, or panel-opening record. The stop is suppressed
-for any round whose planning history is degraded (`absent`, `invalid`, or
-`contradictory-key`), so the conservative primary-only fallback runs
-unchanged. The panel is never convened automatically. To continue:
+The window restarts, so no stop follows, when the plan or its blocking IDs
+change, at a reviewer-only phase advance, a closed-incomplete round, an issue
+edit, or a newly signed planning requirement (a round counts only with
+affirmative evidence that it was reviewed under the same requirement set, so
+keyless legacy rounds do not count once a requirement is surfaced). Degraded
+`primary-then-panel` history (`absent`, `invalid`, or `contradictory-key`)
+skips the detector with a log line. Under `primary-then-panel` every planner
+revision is a semantic patch and a no-op patch is rejected, so the window fills
+there only from persisted histories with repeated plan hashes; a planner that
+keeps rewording an unchanged design is bounded only by `--max-rounds`. To
+continue after the stop:
 
-- edit the issue title or body to narrow it. By default the next run starts a
-  fresh plan in a new planning scope (see
-  [Edited issues during planning](#edited-issues-during-planning-1390)), which
-  leaves the stalled rounds behind. Under `--plan-resume-keep-on-issue-edit` the
-  plan is kept and the streak rule of #1112 applies: each primary-phase
-  scheduler checkpoint records a digest of the issue title and body the run
-  loaded, and the count stops at the newest round whose digest differs from the
-  current issue text, so rounds reviewed against earlier text stop counting.
-  A comment alone does not change the issue text and does not clear this stop,
-  because loop-posted comments share the operator's account and cannot be
-  authenticated as operator intent;
-- rerun with `--plan-reset-stall-streak` (one-shot, requires
-  `primary-then-panel`) to skip the stop for that invocation's first primary
-  round and stamp its checkpoint as a durable streak boundary, so older
-  rounds stop counting as soon as that checkpoint posts, even if the primary
-  review is interrupted, and later flagless reruns do not stop until `N` new
-  blocking rounds accumulate. Use it after narrowing by comment. If the run is
-  interrupted before the checkpoint posts, nothing was written and the stop
-  fires again. Child planning, isolated providers, and rendered recovery
-  commands never carry the flag;
-- rerun with `--plan-review-force-full` to authorize the complete board (an
-  operator-sourced opening); or
-- rerun with a higher `--plan-primary-stall-rounds`, or `0`, to keep revising in
-  the primary phase.
+- rerun with a larger `--no-progress-rounds` (the run stays bounded by
+  `--max-rounds`);
+- narrow the scope with a signed human decision, or edit the issue title or
+  body (by default the next run starts a fresh plan in a new planning scope, see
+  [Edited issues during planning](#edited-issues-during-planning-1390));
+- under `primary-then-panel`, rerun with `--plan-reset-stall-streak`
+  (one-shot). It skips the detector for that invocation's first staged round
+  and stamps that round's prelaunch checkpoint, in whichever phase (primary or
+  post-panel), as a durable window boundary, so rounds numbered below it never
+  count again, also on later flagless reruns. Child planning, isolated
+  providers, and rendered recovery commands never carry the flag; or
+- rerun with `--plan-review-force-full` to authorize the complete board.
 
-Retiring the streak does not discard the stalled plan: the next round is the
-primary review of the current candidate, which the planner then revises against
-the narrowed issue. Rounds recorded before issue-text tracking carry no digest
-and keep counting, so an edit cannot retire them; when the newest undigested
-rounds by themselves reach the threshold, the diagnostic says they
-predate issue-text tracking and `--plan-reset-stall-streak` is required. When older
-digested rounds supply the rest of the streak, an edit still clears the stop
-and the diagnostic does not claim otherwise. Rounds under new issue text accumulate normally and re-trip the stop.
+Because the decision is recomputed from durable records, rerunning with unchanged
+flags stops again at the same point before any agent turn. The retired
+`--plan-primary-stall-rounds`, `--plan-step-back-rounds`,
+`--plan-step-back-escalation-rounds` and `--plan-sweep-rounds` are accepted and
+ignored for one release with one deprecation notice; history export labels the
+stop `plan-no-progress` and keeps the `plan-primary-stall` and `plan-step-back`
+labels for older comments.
 
-Because the count is recomputed from durable records, rerunning with unchanged
-flags and unchanged issue text stops again at the same point before any agent
-turn.
+**Upgrade note:** planning runs that stopped at the primary stall (default 8) or
+the step-back escalation now run until K identical plan rounds or
+`--max-rounds`.
 
-**Upgrade note:** an in-flight `primary-then-panel` run that already has eight
-or more trailing blocking primary rounds stops at its next round after
-upgrading. Pass a higher `--plan-primary-stall-rounds` or `0` to continue it.
+#### Plan step-back turn
 
-#### Plan step-back turn and early human decision
-
-The stall stop fires only after the time is spent. A run can also deadlock
-long before it, when the plan has grown past a plan-growth signal and the
+A run can deadlock when the plan has grown past a plan-growth signal and the
 primary raises a **new** edge case every round: each planner revision patches
 that one case and the plan grows. Under `--plan-review-policy primary-then-panel`
-two flags make the loop act on that pattern earlier. The trigger is code; the
-content of the alternative stays with the planner and the reviewers.
+the loop acts on that pattern with a prompt; it never stops the run. The trigger
+is code; the content of the alternative stays with the planner and the reviewers.
 
-- `--plan-step-back-rounds K` (default 2, `0` disables). When the current one-shot
-  plan has crossed a plan-growth signal and the primary has blocked K consecutive
-  rounds on **new** mandatory findings since the crossing, the next planner turn
-  is a dedicated simplify-or-re-scope revision. It must not patch the newest
-  finding: it proposes a materially simpler alternative design (or, when
-  `--plan-execution-mode` is `auto`, `plan-only`, or `implement-by-phase`, a split
-  into stages, with scope-ledger preservation still enforced), states the
-  trade-offs, and says which prior findings the alternative dissolves or defers.
-  Under `implement-one-shot` a split cannot become staged execution in the same
-  run, so the planner offers a simpler one-shot design or an explicit caveat
-  recommending that the issue be re-filed as staged work. Reviewers of that
-  candidate are told to judge the alternative on its merits. Blocks that only
-  repeat an unresolved finding, and findings classified as future follow-ups,
-  do not count.
-- `--plan-step-back-escalation-rounds M` (default 2, minimum 1). After a step-back,
-  once the primary has blocked M rounds since it (the block of the step-back
-  candidate itself is the first, so `1` stops as soon as the simplify turn is
-  rejected), the run stops with a human-decision-required diagnostic instead of
-  running on to the stall stop. It shows the current growth
-  measurements, the step-back round, and an excerpt of the latest alternative. No
-  planner turn runs after it, and the stop writes no record a resume could read as
-  a checkpoint. A pending step-back (crossed plan, K new-finding blocks in earlier rounds) or an
-  active episode below M defers `--plan-primary-stall-rounds`, so a stalled history
-  gets its step-back turn on resume (the deferral is recorded once on the round's
-  checkpoint); otherwise the stall message names why the step-back did not apply.
+When the current one-shot plan has crossed a plan-growth signal and the primary
+has blocked two consecutive rounds on **new** mandatory findings since the
+crossing (an internal threshold), the next planner turn is a dedicated
+simplify-or-re-scope revision. It must not patch the newest finding: it proposes
+a materially simpler alternative design (or, when `--plan-execution-mode` is
+`auto`, `plan-only`, or `implement-by-phase`, a split into stages, with
+scope-ledger preservation still enforced), states the trade-offs, and says which
+prior findings the alternative dissolves or defers. Under `implement-one-shot` a
+split cannot become staged execution in the same run, so the planner offers a
+simpler one-shot design or an explicit caveat recommending that the issue be
+re-filed as staged work. Reviewers of that candidate are told to judge the
+alternative on its merits, and the revision goes to review like any other. Blocks
+that only repeat an unresolved finding, and findings classified as future
+follow-ups, do not count. A step-back already pending from earlier rounds is
+granted on any blocking primary review, repeat-only included.
 
-To continue after the stop, pick one: continue patching (rerun with
-`--plan-step-back-rounds 0`, or `--plan-reset-stall-streak`, which also ends the
-episode); adopt the simpler alternative (narrow the issue text, which ends the
-episode through the issue-digest change); or split (rerun with
-`--plan-execution-mode auto`, or re-file the issue as staged work). A primary
-approval of the step-back candidate, a panel opening, a reset, or an issue edit
-ends the episode and re-arms the trigger from fresh blocks. Both flags require
-`--plan-review-policy primary-then-panel` when set to a non-default value, and
-child-planning cycles inherit them. The approval-time plan-growth gate is
-unchanged: a crossed one-shot plan still cannot be approved without a reviewed
-`one_shot_growth_justification`.
+The step-back episode is re-derived by replaying the primary reviews, never from
+recorded entries. While an episode is open no second step-back is requested; a
+primary approval of the step-back candidate, a panel opening, a reset, or an
+issue edit ends the episode and re-arms the trigger from fresh blocks. The
+approval-time plan-growth gate is unchanged: a crossed one-shot plan still cannot
+be approved without a reviewed `one_shot_growth_justification`.
 
 **Episode anchor (#1278).** While a step-back episode is active, the simplified
 design stays the anchor. The orchestrator derives it from the step-back
@@ -5217,29 +5188,24 @@ dissolved item <ID>` or is `satisfiable within the simplified design`. That is
 the reviewer's judgement only; findings are never filtered or reclassified on
 it. Prompts show notes for the first 12 dissolved IDs and bare IDs up to 100, but
 matching and reporting always use the complete ID set. A reset round's reviewer
-prompts carry no anchor, and the anchor ends with the episode. At the
-human-decision stop the message lists the dissolved items and every item a later
-revision declared reintroduced, with its round and reason. Detection depends on
-the declaration: a silent reintroduction is not detected, and the message says
-`none declared (undeclared reintroductions are not detected)` instead of
-claiming nothing came back. When the stop fires after the round's reviews were
-posted, the message says so rather than claiming no reviewer turn ran.
+prompts carry no anchor, and the anchor ends with the episode. Detection of a
+reversal depends on the declaration: a silent reintroduction is not detected.
 
-The state is derived from durable round records, so a resumed run triggers and
-stops at exactly the same K and M. The orchestrator records the step-back turn
-as a reviewer-owned `step_back_entries` field on the planner record; a malformed
-entry suppresses the trigger and the stop with a log line rather than failing the
-run.
+The state is derived from durable review records by replay, so a fresh run and a
+resumed run request the same step-back. Legacy `step_back_entries` on old planner
+records are still decoded but never read, and no longer written; a malformed
+legacy entry no longer suppresses anything.
 
 #### Plan sweep trigger and finding provenance
 
 The step-back arms only after a one-shot plan crosses a plan-growth signal, so a
 primary that raises new findings round after round on a plan that stays below
-the signals is never stopped by it (#1505). Under `--plan-review-policy
-primary-then-panel` two more flags address that pattern. Neither stops a run.
+the signals is never reached by it (#1505). Under `--plan-review-policy
+primary-then-panel` the sweep addresses that pattern. It never stops a run.
 
-- `--plan-sweep-rounds K` (default 2, `0` disables). Once the primary has
-  blocked K consecutive primary-phase rounds with new mandatory findings, its
+- The sweep request (an internal threshold of two; the retired
+  `--plan-sweep-rounds` is ignored). Once the primary has
+  blocked two consecutive primary-phase rounds with new mandatory findings, its
   next review prompt carries a sweep request. The request lists the finding
   classes it already raised (the newest 12 IDs and first lines, with an
   `and N more` line for the rest) and asks for one exhaustive pass over the
@@ -5247,9 +5213,9 @@ primary-then-panel` two more flags address that pattern. Neither stops a run.
   of the listed classes, in that review. The blocking-scope rules, the
   same-plan/future classification and the approval rules are unchanged. The
   request is repeated on every later primary round while the streak continues.
-  It is independent of the plan-growth gate and of `--plan-step-back-rounds`;
-  when both apply in one round the reviewer sees the step-back notice and the
-  sweep request, and the step-back counts are unaffected. The planner and the
+  It is independent of the plan-growth gate and of the step-back; when both
+  apply in one round the reviewer sees the step-back notice and the sweep
+  request. The planner and the
   secondary panel never see it, and it stops once the panel opens.
 - `--plan-sweep-reasoning-effort LEVEL` (off by default). Runs only the
   primary's sweep turn at this effort, in a fresh provider session, and its
@@ -5258,12 +5224,12 @@ primary-then-panel` two more flags address that pattern. Neither stops a run.
   rejected before any agent turn otherwise; a Gemini or Antigravity primary
   ignores it with a log line.
 
-Both flags require `--plan-review-policy primary-then-panel` when set to a
-non-default value, and child-planning cycles inherit them. The same applies to
+`--plan-sweep-reasoning-effort` requires `--plan-review-policy primary-then-panel`
+when set, and child-planning cycles inherit it. The same applies to
 `--plan-provenance-baseline-max-chars`, described under finding provenance
 below.
 
-A review counts toward K when the primary blocked and at least one of its new
+A review counts toward the sweep streak when the primary blocked and at least one of its new
 `blocking`/`same-plan` items counts. Future follow-ups never count, and neither
 does a new finding whose normalized text repeats a carried unresolved item: the
 orchestrator marks it at minting with `repeat_of` (the duplicate stays an
@@ -5798,10 +5764,9 @@ staged. Every plan prompt (issue plan, review, and revision, including the compa
 and semantic-patch forms) states the current execution mode and what approval does
 as an authoritative runtime fact. Planning round records and scheduler checkpoints
 record the mode. Resuming under a different mode adds a "changed from X to Y" notice
-to the prompts and ends the primary stall streak at any checkpoint recorded under
-the other mode. Histories written before the mode was recorded carry none, so they
-are not retired automatically: rerun with `--plan-reset-stall-streak` after changing
-the mode.
+to the prompts. A mode change does not restart the plan no-progress window by
+itself; rerun with `--plan-reset-stall-streak` after changing the mode to restart
+it.
 
 Decomposition modes and split materialization select one child-issue path.
 They share a parent-wide flat cap; decomposition modes reject the split flag
@@ -6263,7 +6228,8 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   the scheduler contract's required reviewers), otherwise every seat seen; a
   seat that never posted is still expected.
 - Human-decision stops are the planning scheduling diagnostics that carry the
-  step-back or primary-stall human-decision text, and the PR scheduling
+  plan no-progress (`plan-no-progress`) text or the legacy step-back or
+  primary-stall human-decision text, and the PR scheduling
   diagnostics that carry the PR no-progress (`pr-no-progress`), evidence-stall
   (`pr-evidence-stall`) or evidence-freeze (`pr-evidence-freeze`) text, plus the
   retired PR step-back sibling (`pr-step-back-sibling`), non-convergence

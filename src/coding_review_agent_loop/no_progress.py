@@ -1,7 +1,8 @@
-"""One record-derived no-progress detector for the review loops (#2067, #2097).
+"""One record-derived no-progress detector for the review loops (#2067, #2097, #2098).
 
 The detector replaces the PR step-back sibling, non-convergence,
-approach-alternative and unchanged-head stops with one rule: stop when the K
+approach-alternative and unchanged-head stops, and the plan step-back
+escalation and primary-stall stops (#2098), with one rule: stop when the K
 most recent completed rounds share the same subject (the PR head SHA, or the
 canonical plan hash) and the same non-empty set of blocking item IDs, and the
 live candidate still equals that repeated observation.
@@ -36,8 +37,9 @@ if TYPE_CHECKING:
 
 DEFAULT_NO_PROGRESS_ROUNDS = 3
 
-# Leading bytes of the no-progress stop after the ``PR #N: `` prefix; history
-# export recognizes them as ``pr-no-progress``.
+# Leading bytes of the no-progress stop (after the ``PR #N: `` prefix on the PR
+# side, with no lead on the plan side); history
+# export recognizes them as ``pr-no-progress`` or ``plan-no-progress``.
 NO_PROGRESS_PREFIX_TEXT = "human decision required: no progress across "
 
 NO_PROGRESS_SHOWN_ITEMS = 20
@@ -45,6 +47,8 @@ NO_PROGRESS_ITEM_TEXT_LIMIT = 240
 NO_PROGRESS_EXCERPT_LIMIT = 2000
 
 _BLOCKING_STATUSES = frozenset({"blocking", "same-pr"})
+# The plan loop's blocking ledger statuses (#2098).
+PLAN_BLOCKING_STATUSES = frozenset({"blocking", "same-plan"})
 
 
 @dataclass(frozen=True)
@@ -66,15 +70,19 @@ class NoProgressDecision:
     k: int
 
 
-def is_blocking_ledger_item(item: object) -> bool:
+def is_blocking_ledger_item(
+    item: object, *, statuses: frozenset[str] = _BLOCKING_STATUSES
+) -> bool:
     """Whether a ledger item counts toward the no-progress blocking set.
 
     Blocking and same-PR findings count.  Future items, inert tombstones and
     converted findings, and machine or human exact-head obligations (CI
     failures, evidence requests, requirement acknowledgements) do not, which
     matches the reviewer-owned mandatory set step-back tracking uses.
+    ``statuses`` defaults to the PR set; the plan loop passes
+    :data:`PLAN_BLOCKING_STATUSES`.
     """
-    if getattr(item, "status", None) not in _BLOCKING_STATUSES:
+    if getattr(item, "status", None) not in statuses:
         return False
     if getattr(item, "authority", None) is not None:
         return False
@@ -83,10 +91,14 @@ def is_blocking_ledger_item(item: object) -> bool:
     return not bool(getattr(item, "is_inert_ledger_record", False))
 
 
-def blocking_item_ids(items: Iterable[object]) -> frozenset[str]:
+def blocking_item_ids(
+    items: Iterable[object], *, statuses: frozenset[str] = _BLOCKING_STATUSES
+) -> frozenset[str]:
     """The no-progress blocking ID set of a ledger."""
     return frozenset(
-        str(item.item_id) for item in items if is_blocking_ledger_item(item)  # type: ignore[attr-defined]
+        str(item.item_id)  # type: ignore[attr-defined]
+        for item in items
+        if is_blocking_ledger_item(item, statuses=statuses)
     )
 
 
@@ -213,6 +225,100 @@ def pr_no_progress_observations(
     return tuple(observations[number] for number in sorted(observations))
 
 
+def plan_no_progress_observations(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    current_issue_digest: str | None,
+    current_requirement_digest: str,
+    requirements_surfaced: bool,
+    reset_floor_round: int = 0,
+) -> tuple[NoProgressObservation, ...]:
+    """One observation per completed planning round, derived from durable records (#2098).
+
+    Round N is observed through the newest plan planner (``coder``) record
+    numbered N+1: its ``prior_plan_subject`` is the plan round N reviewed and
+    its ``prior_items`` the settled round-end ledger the planner was asked to
+    fix.  No scheduler record is needed, so ordinary all-reviewers history
+    qualifies.  Round N is not an observation, which breaks any window
+    through it, when:
+
+    * round N has a closure boundary or an unvalidated closure summary;
+    * round N has no complete, non-inert review before that planner record;
+    * the reviews' subjects are not exactly ``{prior_plan_subject}``;
+    * the planner record names an issue digest other than the live one;
+    * the requirement binding rejects it: with a non-empty live requirement
+      set every review must carry a candidate key whose surfaced-requirement
+      digest equals ``current_requirement_digest`` (keyless rounds are
+      excluded); with an empty live set a review whose key records a
+      different digest is excluded; or
+    * N is below ``reset_floor_round``.
+
+    A reviewer-only phase-advance round has no planner record N+1, so it
+    never observes.
+    """
+    ordered = sorted(
+        (record for record in records if getattr(record.metadata, "flow", None) == "plan"),
+        key=lambda record: record.index,
+    )
+    inert = closed_round_reviewer_indexes(ordered, flow="plan", freshness=False)
+    closed_rounds = {
+        record.metadata.round_number
+        for record in ordered
+        if is_round_closure_boundary(record.metadata)
+        or is_unvalidated_closure_summary(record.metadata)
+    }
+    reviews: dict[int, list["PostedRoundRecord"]] = {}
+    planners: dict[int, "PostedRoundRecord"] = {}
+    for record in ordered:
+        metadata = record.metadata
+        if metadata.role == "coder":
+            planners[metadata.round_number] = record
+        elif is_complete_code_review(metadata) and record.index not in inert:
+            reviews.setdefault(metadata.round_number, []).append(record)
+
+    def requirement_bound(review: "PostedRoundRecord") -> bool:
+        key = review.metadata.plan_candidate_key
+        digest = key.get("surfaced_requirement_id_digest") if isinstance(key, dict) else None
+        if requirements_surfaced:
+            return digest == current_requirement_digest
+        return digest is None or digest == current_requirement_digest
+
+    observations: list[NoProgressObservation] = []
+    for planner_round, planner in planners.items():
+        review_round = planner_round - 1
+        if review_round < 1 or review_round < reset_floor_round:
+            continue
+        if review_round in closed_rounds:
+            continue
+        subject = planner.metadata.prior_plan_subject
+        if not subject:
+            continue
+        recorded_digest = planner.metadata.plan_issue_digest
+        if (
+            recorded_digest is not None
+            and current_issue_digest is not None
+            and recorded_digest != current_issue_digest
+        ):
+            continue
+        round_reviews = [
+            review for review in reviews.get(review_round, ()) if review.index < planner.index
+        ]
+        if not round_reviews:
+            continue
+        if {str(review.metadata.subject or "") for review in round_reviews} != {subject}:
+            continue
+        if not all(requirement_bound(review) for review in round_reviews):
+            continue
+        observations.append(
+            NoProgressObservation(
+                review_round,
+                str(subject),
+                blocking_item_ids(planner.metadata.prior_items, statuses=PLAN_BLOCKING_STATUSES),
+            )
+        )
+    return tuple(sorted(observations, key=lambda observation: observation.round_number))
+
+
 def defers_to_evidence_stall(
     item_rows: Mapping[str, Sequence[str]], unsatisfied_rows: frozenset[str] | None
 ) -> bool:
@@ -285,6 +391,7 @@ def render_no_progress_message(
     citation_diagnosis: str | None = None,
     approach_alternative: tuple[int, str] | None = None,
     pr_size: str | None = None,
+    plan_size: str | None = None,
 ) -> str:
     """The single no-progress human-decision message (exit 4).
 
@@ -304,6 +411,8 @@ def render_no_progress_message(
             "Total PR size (a scope-growth signal; compare it with the issue's suggested "
             f"direction): {pr_size}"
         )
+    if plan_size:
+        sections.append(f"Plan size: {plan_size}")
     if evidence and evidence.strip():
         sections.append("Latest coder turn evidence:" + evidence.rstrip())
     if citation_diagnosis:

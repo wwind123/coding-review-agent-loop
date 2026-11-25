@@ -401,8 +401,9 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="K",
             help=(
                 "Stop for a human decision (exit 4) once K consecutive completed PR "
-                "review rounds ended with the same head and the same non-empty set of "
-                "blocking item IDs; the message names the unchanged items. It also paces "
+                "review rounds ended with the same head, or K planning rounds with the same "
+                "plan hash, and the same non-empty set of blocking item IDs; the message "
+                "names the unchanged items. It also paces "
                 "the advisory sub-item stall report "
                 f"(default: {DEFAULT_NO_PROGRESS_ROUNDS}; minimum 1, so --max-rounds stays "
                 "the outer bound)."
@@ -1199,50 +1200,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "instead."
             ),
         )
-        subparser.add_argument(
-            "--plan-primary-stall-rounds",
-            type=int,
-            default=None,
-            metavar="N",
-            help=(
-                "Under --plan-review-policy primary-then-panel, stop the run with a "
-                "diagnostic once N consecutive completed primary plan reviews have "
-                "blocked with no exact-plan primary approval (default: 8; 0 disables). "
-                "The secondary panel is never convened automatically. Editing the issue "
-                "title or body retires rounds reviewed against earlier text (rounds "
-                "recorded before issue-text tracking cannot be retired this way); a "
-                "comment alone does not. Rerun with --plan-reset-stall-streak, "
-                "--plan-review-force-full, or a higher threshold to continue."
-            ),
-        )
-        subparser.add_argument(
-            "--plan-step-back-rounds",
-            type=int,
-            default=None,
-            metavar="K",
-            help=(
-                "Under --plan-review-policy primary-then-panel, once a one-shot plan has "
-                "crossed a plan-growth signal and the primary has blocked K consecutive "
-                "rounds on new mandatory findings, make the next planner turn a "
-                "simplify-or-re-scope revision instead of another patch (default: 2; 0 "
-                "disables). Findings that only repeat an unresolved item, or that are "
-                "future follow-ups, do not count."
-            ),
-        )
-        subparser.add_argument(
-            "--plan-sweep-rounds",
-            type=int,
-            default=None,
-            metavar="K",
-            help=(
-                "Under --plan-review-policy primary-then-panel, once the primary has blocked "
-                "K consecutive primary-phase rounds with new mandatory findings, ask its next "
-                "review for one exhaustive sweep of the whole plan (default: 2; 0 disables). "
-                "Independent of the plan-growth gate and of --plan-step-back-rounds; it never "
-                "stops a run. Repeats of unresolved items (including re-emitted text), future "
-                "follow-ups and later-review findings tagged revision_introduced do not count."
-            ),
-        )
+        _deprecated_ignored_option(subparser, "--plan-primary-stall-rounds", "--no-progress-rounds")
+        _deprecated_ignored_option(subparser, "--plan-step-back-rounds", "--no-progress-rounds")
+        _deprecated_ignored_option(subparser, "--plan-sweep-rounds", "--no-progress-rounds")
         subparser.add_argument(
             "--plan-provenance-baseline-max-chars",
             type=int,
@@ -1268,19 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "ignore it with a log line."
             ),
         )
-        subparser.add_argument(
-            "--plan-step-back-escalation-rounds",
-            type=int,
-            default=None,
-            metavar="M",
-            help=(
-                "Under --plan-review-policy primary-then-panel, after a step-back turn, stop "
-                "for a human decision once the primary has blocked M rounds since it "
-                "(default: 2, minimum 1). The block of the step-back candidate itself is the "
-                "first, so 1 stops as soon as the simplify turn is rejected. This fires "
-                "before --plan-primary-stall-rounds."
-            ),
-        )
+        _deprecated_ignored_option(subparser, "--plan-step-back-escalation-rounds", "--no-progress-rounds")
         _deprecated_ignored_option(subparser, "--pr-step-back-rounds", "--no-progress-rounds")
         _deprecated_ignored_option(subparser, "--pr-step-back-line-window", "--no-progress-rounds")
         subparser.add_argument(
@@ -1330,10 +1278,11 @@ def build_parser() -> argparse.ArgumentParser:
             dest="plan_reset_stall_streak",
             action="store_true",
             help=(
-                "One-shot: under --plan-review-policy primary-then-panel, skip the primary "
-                "stall stop for this invocation's first primary-phase round and stamp that "
-                "round's checkpoint as a durable streak boundary, retiring the earlier "
-                "blocking primary rounds. Not inherited by child planning or recovery "
+                "One-shot: under --plan-review-policy primary-then-panel, restart the plan "
+                "no-progress window (--no-progress-rounds): skip the detector for this "
+                "invocation's first staged round and stamp that round's checkpoint (in any "
+                "phase) as a durable window boundary, so earlier rounds no longer count on "
+                "this or any later run. Not inherited by child planning or recovery "
                 "commands."
             ),
         )

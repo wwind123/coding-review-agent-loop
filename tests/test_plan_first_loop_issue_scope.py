@@ -436,18 +436,19 @@ def _m1390_staged_approvals():
 
 
 def _m1390_staged_stalled_history(tmp_path):
-    """A primary-then-panel plan whose primary blocked until the stall stop."""
+    """A primary-then-panel plan whose primary blocked two rounds; the round-3
+    primary review is unscripted, so the run stops there."""
     fresh, base = _m1103_fresh_base()
     codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
     runner = _m1390_runner(claude_outputs=[fresh, *claude], codex_outputs=codex)
-    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=2)
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError):
+    config = _staged_plan_config(tmp_path, max_rounds=8)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return list(runner.issue_comments), config
 
 
 def test_m1390_rescope_isolates_staged_scheduler_history(tmp_path):
-    """`boundary-filters-staged-history`: the archived stalled streak, panel
+    """`boundary-filters-staged-history`: the archived blocking history, panel
     state and calls-avoided count never bind the fresh scope."""
     history, config = _m1390_staged_stalled_history(tmp_path)
     archived = _plan_round_records(SimpleNamespace(issue_comments=history))
@@ -457,18 +458,14 @@ def test_m1390_rescope_isolates_staged_scheduler_history(tmp_path):
         if record.phase == "scheduler-prelaunch"
     )
     assert archived_avoided >= 2
-    # Without the rescope, the archived streak trips the stall stop at once.
-    stalled, error, _messages = _m1390_rerun(tmp_path, history, config=config)
-    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
 
-    runner, result, messages = _m1390_rerun(
+    runner, result, _messages = _m1390_rerun(
         tmp_path, history, config=config, issue_payload=_M1390_EDIT,
         **_m1390_staged_approvals(),
     )
 
     assert result == 0
     assert len(_m1390_boundaries(runner)) == 1
-    assert not any("blocked 2 consecutive" in message for message in messages)
     fresh_scope = _plan_round_records(
         SimpleNamespace(issue_comments=runner.issue_comments[len(history):])
     )
@@ -837,11 +834,9 @@ def test_m1390_rescope_never_inherits_an_archived_panel_opening(tmp_path):
     assert all(item.reviewer != "Antigravity" for r in fresh for item in r.prior_items)
 
 
-def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(tmp_path):
-    """`boundary-filters-staged-history` (step-back, stall streak, growth count)."""
-    first, _error = _m1251_run(
-        tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=5
-    )
+def test_m1390_rescope_never_inherits_archived_step_back_or_growth_count(tmp_path):
+    """`boundary-filters-staged-history` (step-back episode, growth count)."""
+    first, _error = _m1251_run(tmp_path, last_round=5, max_rounds=5)
     # This scenario replays the same invocation account, as real resume requires.
     for comment in first.issue_comments:
         if comment.get("author", {}).get("login") == "coding-review-agent-loop":
@@ -849,17 +844,15 @@ def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(t
             comment["_rest_author_id"] = _M1390_ACTOR[1]
     history = list(first.issue_comments)
     archived = _plan_round_records(SimpleNamespace(issue_comments=history))
-    assert any(record.step_back_entries for record in archived)
+    # The archived scope issued a step-back turn.
+    assert any(_STEP_BACK_MARKER in prompt for prompt in _m1251_prompts(first, "claude"))
     archived_candidates = [r for r in archived if r.role == "coder"]
     assert len(archived_candidates) == 5
-    # Tight thresholds every archived signal would trip: an escalation after one
-    # rejected step-back, a three-round stall streak, and three planner revisions.
+    # A tight growth threshold the archived candidates would trip: three planner
+    # revisions.
     config = _staged_plan_config(
         tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
-        plan_step_back_escalation_rounds=1, plan_primary_stall_rounds=3,
     )
-    stopped, error, _messages = _m1390_rerun(tmp_path, history, config=config)
-    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
 
     runner, result, _messages = _m1390_rerun(
         tmp_path, history, config=config, issue_payload=_M1390_EDIT,
@@ -870,7 +863,6 @@ def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(t
     assert len(_m1390_boundaries(runner)) == 1
     fresh = _plan_round_records(SimpleNamespace(issue_comments=runner.issue_comments[len(history):]))
     assert [r.round_number for r in fresh if r.role == "coder"] == [6]
-    assert not any(r.step_back_entries for r in fresh)
     assert _m1103_agent_calls(runner) == ["claude", "codex", "gemini"]
     planner_prompt = _m1251_prompts(runner, "claude")[0]
     assert _STEP_BACK_MARKER not in planner_prompt
@@ -1089,7 +1081,7 @@ def test_m1390_staged_budget_exhausts_with_a_pending_phase_advance_at_the_scope_
         codex.append(structured_plan_review(state="approved"))
     runner, result, _messages = _m1390_rerun(
         tmp_path, history,
-        config=replace(config, max_rounds=max_rounds, plan_primary_stall_rounds=0),
+        config=replace(config, max_rounds=max_rounds),
         issue_payload=_M1390_EDIT,
         claude_outputs=claude, codex_outputs=codex,
         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],

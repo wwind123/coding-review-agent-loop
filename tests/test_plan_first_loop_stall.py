@@ -55,382 +55,369 @@ from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noq
 import coding_review_agent_loop.validated_agent as validated_agent_module
 
 
-def test_primary_stall_stop_fires_before_the_next_primary_turn(tmp_path):
-    """`stall-stop-threshold`: plain diagnostic, no secondary, no checkpoint."""
-    runner, _config, error = _m1103_stalled_runner(tmp_path, threshold=2)
+# --- One plan no-progress detector (#2098) ---------------------------------
+#
+# The plan step-back escalation and primary-stall stops are gone.  The shared
+# detector stops with exit 4 at round start, before any record or agent turn,
+# when K completed rounds share the plan subject and the non-empty blocking
+# IDs and the live plan and IDs still equal them.
 
-    message = str(error)
-    assert "blocked 2 consecutive primary-phase" in message
-    assert "--plan-primary-stall-rounds 2" in message
-    assert "--plan-review-force-full" in message
-    assert "secondary plan panel was not convened" in message
-    # Two primary turns, two planner revisions after the fresh plan, and no
-    # secondary reviewer ever.
-    assert _m1103_agent_calls(runner) == [
-        "claude", "codex", "claude", "codex", "claude",
-    ]
-    records = _plan_round_records(runner)
-    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
-    assert [record.round_number for record in prelaunch] == [1, 2]
-    assert all(record.scheduler_phase == "primary" for record in prelaunch)
-    assert not any(record.scheduler_force_full for record in prelaunch)
-    diagnostics = [
+from coding_review_agent_loop.agents.registry import agent_display_name  # noqa: E402,F401
+from coding_review_agent_loop.errors import HumanDecisionRequiredError  # noqa: E402
+from coding_review_agent_loop.no_progress import (  # noqa: E402
+    NO_PROGRESS_PREFIX_TEXT,
+    plan_no_progress_observations as _real_plan_observations,
+)
+from agent_loop_helpers import structured_plan_revision, structured_plan_state  # noqa: E402
+
+_NP_KEEP_ITEM = [{"item_id": "item-1", "disposition": "blocking"}]
+
+
+def _np_reviews(rounds, *, reviewer="OpenAI Codex"):
+    """Round 1 blocks with item-1; every later review keeps item-1 blocking."""
+    first = structured_plan_review(
+        state="blocking", blocking_plan_issues=["Close the gap."], reviewer=reviewer
+    )
+    keep = structured_plan_review(
+        state="blocking", prior_plan_item_dispositions=_NP_KEEP_ITEM, reviewer=reviewer
+    )
+    return [first] + [keep] * (rounds - 1)
+
+
+def _np_revision(steps=("Update the code.", "Run the relevant tests.")):
+    """A legacy full-state planner revision that keeps item-1 open."""
+    return structured_plan_revision(
+        plan_steps=list(steps),
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Out of scope."}
+        ],
+    )
+
+
+def _np_all_reviewers_run(tmp_path, *, revisions, reviews, max_rounds=8, comments=()):
+    runner = _FakeRunner(
+        issue_comments=list(comments),
+        claude_outputs=[structured_plan_state(), *revisions],
+        codex_outputs=list(reviews),
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=max_rounds)
+    error = None
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except (AgentLoopError, HumanDecisionRequiredError) as exc:
+        error = exc
+    return runner, config, error
+
+
+def _np_diagnostics(runner, round_number):
+    return [
         comment["body"]
         for comment in runner.issue_comments
-        if comment["body"].startswith("Plan review scheduling diagnostic (round 3)")
+        if comment["body"].startswith(f"Plan review scheduling diagnostic (round {round_number})")
     ]
+
+
+def _np_subject(runner, round_number):
+    return next(
+        record.subject
+        for record in _plan_round_records(runner)
+        if record.role == "coder" and record.round_number == round_number
+    )
+
+
+def _np_assert_no_progress(error, *, subject, rounds, k=3):
+    assert isinstance(error, HumanDecisionRequiredError), error
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
+    assert HumanDecisionRequiredError.EXIT_CODE == 4
+    message = str(error)
+    assert message.startswith(NO_PROGRESS_PREFIX_TEXT)
+    assert f"rounds {rounds[0]}-{rounds[-1]}" in message
+    assert f"the same plan `{subject}`" in message
+    assert f"--no-progress-rounds {k}" in message
+    assert "- [item-1] Close the gap." in message
+    assert "Plan size: " in message and " characters" in message
+    # Not one of the retired plan stops.
+    assert "primary plan reviewer has blocked" not in message
+    assert "stepped back at round" not in message
+
+
+def test_plan_no_progress_stops_after_k_unchanged_rounds_under_all_reviewers(tmp_path):
+    """`plan-k-unchanged`: ordinary all-reviewers records (no scheduler, no key)."""
+    runner, _config, error = _np_all_reviewers_run(
+        tmp_path, revisions=[_np_revision()] * 4, reviews=_np_reviews(4)
+    )
+
+    subject = _np_subject(runner, 2)
+    _np_assert_no_progress(error, subject=subject, rounds=(2, 4))
+    # Four reviews and four planner revisions; round 5 starts no agent turn.
+    assert _m1103_agent_calls(runner) == ["claude", "codex"] * 4 + ["claude"]
+    records = _plan_round_records(runner)
+    assert not any(record.round_number == 5 and record.role != "coder" for record in records)
+    assert not any(record.scheduler_contract for record in records)
+    assert not any(record.plan_candidate_key for record in records if record.role == "reviewer")
+    diagnostics = _np_diagnostics(runner, 5)
     assert len(diagnostics) == 1
-    # Plain audit text: no round metadata a resume could read as a checkpoint.
     assert "AGENT_LOOP_META" not in diagnostics[0]
 
 
-def test_primary_stall_stop_rerun_is_deterministic_and_overridable(tmp_path):
-    """`stall-resume-deterministic`: same flags stop again; overrides proceed."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+def test_plan_no_progress_resume_stops_again_without_any_turn(tmp_path):
+    """`plan-k-unchanged` on resume: a pure derivation from the persisted rounds."""
+    runner, config, _error = _np_all_reviewers_run(
+        tmp_path, revisions=[_np_revision()] * 4, reviews=_np_reviews(4)
+    )
     history = list(runner.issue_comments)
-
     rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    _np_assert_no_progress(excinfo.value, subject=_np_subject(runner, 2), rounds=(2, 4))
     assert _m1103_agent_calls(rerun) == []
-    # The rerun wrote no new checkpoint; only the stopped run's two remain.
-    assert [
-        record.round_number
-        for record in _plan_round_records(rerun)
-        if record.phase == "scheduler-prelaunch"
-    ] == [1, 2]
-
-    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
-    for overrides, expected_phase in (
-        ({"plan_primary_stall_rounds": 3}, "primary"),
-        ({"plan_primary_stall_rounds": 0}, "primary"),
-        ({"plan_review_force_full": True}, "full-board"),
-    ):
-        proceeding = _FakeRunner(
-            issue_comments=list(history),
-            codex_outputs=[
-                structured_plan_review(
-                    state="approved", prior_plan_item_dispositions=resolved
-                )
-            ],
-            gemini_outputs=[
-                structured_plan_review(
-                    state="approved",
-                    reviewer="Google Gemini",
-                    prior_plan_item_dispositions=resolved,
-                )
-            ],
+    assert len(_plan_round_records(rerun)) == len(_plan_round_records(runner))
+    # A larger window continues to review (option 1 of the message).
+    proceeding = _FakeRunner(
+        issue_comments=list(history),
+        codex_outputs=_np_reviews(2)[1:],
+    )
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
+        run_issue_loop(
+            proceeding, issue_number=56,
+            config=replace(config, no_progress_rounds=4, max_rounds=5), plan_first=True,
         )
-        try:
-            run_issue_loop(
-                proceeding,
-                issue_number=56,
-                config=replace(config, **overrides),
-                plan_first=True,
-            )
-        except AgentLoopError:
-            pass
-        round_three = [
-            record
-            for record in _plan_round_records(proceeding)
-            if record.phase == "scheduler-prelaunch" and record.round_number == 3
-        ]
-        assert round_three, overrides
-        assert round_three[0].scheduler_phase == expected_phase, overrides
-        assert "codex" in _m1103_agent_calls(proceeding)
-        if expected_phase == "primary":
-            # The panel is never auto-convened: round 3 is primary-only.
-            assert round_three[0].scheduler_selected_reviewers == ("Codex",)
-        else:
-            assert round_three[0].scheduler_force_full_source == "operator"
+    assert _m1103_agent_calls(proceeding) == ["codex"]
 
 
-def test_primary_stall_stop_does_not_count_an_interrupted_round(tmp_path):
-    """`stall-interrupted-round-not-counted`: the prelaunch checkpoint is not a turn."""
-    fresh, base = _m1103_fresh_base()
-    codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
-    runner = _FakeRunner(claude_outputs=[fresh, claude[0]], codex_outputs=[codex[0]])
-    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=2)
-    real_post = architecture_contract.post_issue_comment
+def test_plan_no_progress_reviews_a_changed_live_plan_first(tmp_path):
+    """`plan-live-hash-changed`: P,P,P completed and the live plan is P2."""
+    changed = _np_revision(("Update the code differently.", "Run the relevant tests."))
+    runner, _config, error = _np_all_reviewers_run(
+        tmp_path,
+        revisions=[_np_revision()] * 3 + [changed],
+        reviews=_np_reviews(5),
+        max_rounds=5,
+    )
+    assert not isinstance(error, HumanDecisionRequiredError), error
+    assert "still reported blocking plan issues after round 5" in str(error)
+    assert _m1103_agent_calls(runner).count("codex") == 5
+    assert _np_diagnostics(runner, 5) == []
 
-    def interrupt_after_round_two_checkpoint(*args, **kwargs):
-        result = real_post(*args, **kwargs)
-        metadata = _m943_decoded(kwargs["body"])
-        if (
-            metadata is not None
-            and metadata.phase == "scheduler-prelaunch"
-            and metadata.round_number == 2
-        ):
-            raise KeyboardInterrupt
-        return result
 
-    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
-        side_effect=interrupt_after_round_two_checkpoint,
-    ):
-        with pytest.raises(KeyboardInterrupt):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert _m1103_agent_calls(runner) == ["claude", "codex", "claude"]
-
-    runner.codex_outputs = [codex[1]]
-    runner.claude_outputs = [claude[1]]
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    # The interrupted round's primary turn ran before the stop fired.
-    assert _m1103_agent_calls(runner) == ["claude", "codex", "claude", "codex", "claude"]
-    assert any(
-        comment["body"].startswith("Plan review scheduling diagnostic (round 3)")
-        for comment in runner.issue_comments
+def test_plan_max_rounds_is_reached_first_when_the_plan_keeps_changing(tmp_path):
+    """`plan-max-rounds`: the existing round-limit exit, no no-progress message."""
+    revisions = [
+        _np_revision((f"Revision {n}.", "Run the relevant tests.")) for n in range(1, 4)
+    ]
+    runner, _config, error = _np_all_reviewers_run(
+        tmp_path, revisions=revisions, reviews=_np_reviews(4), max_rounds=4
+    )
+    assert not isinstance(error, HumanDecisionRequiredError), error
+    assert "still reported blocking plan issues after round 4" in str(error)
+    assert NO_PROGRESS_PREFIX_TEXT not in str(error)
+    assert not any(
+        NO_PROGRESS_PREFIX_TEXT in comment["body"] for comment in runner.issue_comments
     )
 
 
-def test_primary_stall_stop_is_suppressed_across_degraded_history(tmp_path):
-    """`stall-degraded-history-boundary`: an invalid record resets the streak."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    subject = next(
-        record.subject
-        for record in reversed(_plan_round_records(runner))
-        if record.role == "coder"
+def test_plan_newly_signed_requirement_restarts_a_keyless_window(tmp_path):
+    """`plan-requirement-change`: keyless legacy rounds stop counting."""
+    runner, config, _error = _np_all_reviewers_run(
+        tmp_path, revisions=[_np_revision()] * 4, reviews=_np_reviews(4)
     )
-    # Ordered after every posted comment and before anything the rerun posts.
-    from coding_review_agent_loop.round_transport import (
-        decode_mapping,
-        encode_mapping,
-    )
-
-    invalid = _invalid_plan_scheduler_comment(
-        subject, created_at=f"2026-05-23T00:00:{len(history):02d}Z"
-    )
-    payload_text = re.search(r"AGENT_LOOP_META: (\S+) -->", invalid["body"]).group(1)
-    payload = dict(decode_mapping(payload_text), round_number=3)
-    invalid["body"] = invalid["body"].replace(payload_text, encode_mapping(payload))
-    history.append(invalid)
-
-    _fresh, base = _m1103_fresh_base()
-    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
-    # The degraded round's ledger carries no prior item to disposition.
-    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base, resolve_first=False)
-    rerun = _FakeRunner(issue_comments=history, codex_outputs=codex, claude_outputs=claude)
-    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, issue_recovery, plan_execution,), "log",
-        wraps=agent_failure.log,
-    ) as logged:
-        with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
-    assert any(
-        "stall stop suppressed: degraded planning history (invalid)" in str(call.args[-1])
-        for call in logged.call_args_list
-    )
-    # The degraded round ran the conservative primary-only fallback, and the
-    # stop needed two further valid blocking rounds after the boundary.
-    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
-    prelaunch = {
-        record.round_number: record
-        for record in _plan_round_records(rerun)
-        if record.phase == "scheduler-prelaunch"
-        and record.scheduler_metadata_status == "valid"
+    signed = {
+        "author": {"login": "maintainer"},
+        "createdAt": "2026-05-24T00:00:00Z",
+        "body": "Also preserve the audit trail.\n\n-- Human Reviewer",
     }
-    assert prelaunch[3].scheduler_phase == "primary"
-    assert prelaunch[3].scheduler_selected_reviewers == ("Codex",)
-    assert "strict pre-panel fallback:" in " ".join(prelaunch[3].scheduler_reasons)
-    assert prelaunch[4].scheduler_phase == "primary"
-    assert 5 not in prelaunch
-    assert any(
-        comment["body"].startswith("Plan review scheduling diagnostic (round 5)")
-        for comment in rerun.issue_comments
+    history = [*runner.issue_comments, signed]
+    rerun = _FakeRunner(issue_comments=list(history))
+    try:
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    except (AgentLoopError, HumanDecisionRequiredError, IndexError) as exc:
+        assert not str(exc).startswith(NO_PROGRESS_PREFIX_TEXT), exc
+    # The requirement set changed, so the live plan goes to review first.
+    assert "codex" in _m1103_agent_calls(rerun)
+    assert not any(
+        NO_PROGRESS_PREFIX_TEXT in comment["body"]
+        for comment in rerun.issue_comments[len(history):]
     )
 
 
-def test_primary_approval_at_the_threshold_opens_the_panel(tmp_path):
-    """`stall-approval-precedence`: N-1 blocking reviews then an approval."""
-    fresh, base = _m1103_fresh_base()
-    codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
-    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
-    runner = _FakeRunner(
-        claude_outputs=[fresh, *claude],
-        codex_outputs=[
-            *codex,
-            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved),
-        ],
-        gemini_outputs=[
+# Under primary-then-panel every planner revision is a semantic patch, and the
+# assembler rejects a payload-identical patch, so a live staged run can never
+# return a byte-identical plan.  These tests keep every window rule real
+# (reviews, planner records, closures, issue digest, requirement binding and
+# the reset floor) and only normalize the observed subject to the live plan,
+# which isolates the staged wiring: the history-integrity gate, the reset
+# window and the placement before the prelaunch checkpoint.
+
+
+def _np_patch_observations(monkeypatch):
+    def observations(records, **kwargs):
+        live = next(
+            record.metadata.subject
+            for record in sorted(records, key=lambda item: item.index, reverse=True)
+            if record.metadata.role == "coder"
+        )
+        return tuple(
+            replace(observation, subject=live)
+            for observation in _real_plan_observations(records, **kwargs)
+        )
+
+    monkeypatch.setattr(plan_first_loop_module, "plan_no_progress_observations", observations)
+
+
+def _np_staged_chain(first_round, last_round, *, base):
+    """Staged primary reviews keeping item-1 blocking, and chained planner patches."""
+    codex, claude = [], []
+    for n in range(first_round, last_round + 1):
+        codex.append(
             structured_plan_review(
-                state="approved",
-                reviewer="Google Gemini",
-                prior_plan_item_dispositions=resolved,
+                state="blocking",
+                blocking_plan_issues=["Close the gap."] if n == 1 else None,
+                prior_plan_item_dispositions=None if n == 1 else _NP_KEEP_ITEM,
             )
-        ],
-    )
-    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=3)
+        )
+        patch_payload = {
+            "schema_version": 1,
+            "kind": "plan_revision_patch",
+            "semantic_patch_contract_version": 1,
+            "state": "blocking",
+            "summary": f"Keep the gap open, revision {n}.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "blocking", "note": "Out of scope."}
+            ],
+            "base_round_number": n,
+            "base_state_identity": base.state_identity,
+            "operations": [
+                {
+                    "op": "replace",
+                    "field": "plan_steps",
+                    "value": [f"Implement the reviewed scope, revision {n}."],
+                }
+            ],
+        }
+        base = AuthenticatedPlanState.from_plan(
+            assemble_plan_revision(base, patch_payload), round_number=n + 1
+        )
+        claude.append(
+            json.dumps(patch_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+        )
+    return codex, claude, base
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    prelaunch = [
-        record
+def _np_prelaunch_rounds(runner):
+    return [
+        record.round_number
         for record in _plan_round_records(runner)
         if record.phase == "scheduler-prelaunch"
     ]
-    assert [record.scheduler_phase for record in prelaunch] == [
-        "primary",
-        "primary",
-        "primary",
-        "secondary-audit",
-    ]
-    assert prelaunch[3].scheduler_selected_reviewers == ("Gemini",)
-    assert prelaunch[2].plan_candidate_key == prelaunch[3].plan_candidate_key
-    assert not any(
-        comment["body"].startswith("Plan review scheduling diagnostic")
-        for comment in runner.issue_comments
-    )
 
 
-def test_growth_gated_primary_approval_resets_the_stall_streak(tmp_path):
-    """`stall-growth-gated-approval-resets` through the live loop.
-
-    Rounds 1-2 block and round 3's primary approves under default growth
-    thresholds; the run stops before the panel.  The rerun lowers the
-    scope-item threshold, so the approved candidate now fails the growth
-    gate: round 4 opens no panel and starts with a planner revision.  With a
-    threshold of 2, the two earlier blocking reviews would already stop the
-    run, so the primary turns in rounds 4 and 5 prove the approval reset the
-    streak; the stop fires before round 6.
-    """
+def test_plan_no_progress_stops_before_the_staged_prelaunch_checkpoint(tmp_path, monkeypatch):
+    """`plan-k-unchanged` under primary-then-panel: no checkpoint, no turn, posted once."""
+    _np_patch_observations(monkeypatch)
     fresh, base = _m1103_fresh_base()
-    codex, claude, base = _m1103_blocking_chain(1, 2, base=base)
-    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
-    history_runner = _FakeRunner(
-        claude_outputs=[fresh, *claude],
-        codex_outputs=[
-            *codex,
-            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved),
-        ],
-    )
+    codex, claude, _base = _np_staged_chain(1, 3, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = _staged_plan_config(tmp_path, max_rounds=8)
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    _np_assert_no_progress(excinfo.value, subject=_np_subject(runner, 4), rounds=(1, 3))
+    assert _m1103_agent_calls(runner) == ["claude"] + ["codex", "claude"] * 3
+    assert _np_prelaunch_rounds(runner) == [1, 2, 3]
+    assert len(_np_diagnostics(runner, 4)) == 1
+
+
+def test_plan_no_progress_is_skipped_over_degraded_staged_history(tmp_path, monkeypatch):
+    """`plan-empty-or-degraded`: a non-intact history never stops and names the class."""
+    _np_patch_observations(monkeypatch)
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _np_staged_chain(1, 4, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=list(codex))
+    config = _staged_plan_config(tmp_path, max_rounds=3)
     with pytest.raises(AgentLoopError):
-        run_issue_loop(
-            history_runner,
-            issue_number=56,
-            config=_staged_plan_config(tmp_path, max_rounds=3, plan_primary_stall_rounds=3),
-            plan_first=True,
-        )
-    assert _m1103_agent_calls(history_runner) == [
-        "claude", "codex", "claude", "codex", "claude", "codex",
-    ]
-    history = list(history_runner.issue_comments)
-    history_records = _plan_round_records(history_runner)
-    assert not any(record.phase == "plan-phase-advance" for record in history_records)
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    history = list(runner.issue_comments)
+    from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
 
-    justify_payload = {
-        "schema_version": 1,
-        "kind": "plan_revision_patch",
-        "semantic_patch_contract_version": 1,
-        "state": "blocking",
-        "summary": "Justify one-shot.",
-        "prior_plan_item_dispositions": [],
-        "base_round_number": 3,
-        "base_state_identity": base.state_identity,
-        "operations": [
-            {
-                "op": "replace",
-                "field": "one_shot_growth_justification",
-                "value": {
-                    "crossed_signals": ["scope-items"],
-                    "rationale": "The scope items share one seam and cannot ship separately.",
-                },
-            }
-        ],
-    }
-    base = AuthenticatedPlanState.from_plan(
-        assemble_plan_revision(base, justify_payload), round_number=4
+    invalid = _invalid_plan_scheduler_comment(
+        _np_subject(runner, 3), created_at=f"2026-05-23T00:00:{len(history):02d}Z"
     )
-    # Item IDs continue from the history: round 4's finding is item-3.
-    codex, claude, _base = _m1103_blocking_chain(
-        4, 5, base=base, resolve_first=False, item_offset=1
+    payload_text = re.search(r"AGENT_LOOP_META: (\S+) -->", invalid["body"]).group(1)
+    invalid["body"] = invalid["body"].replace(
+        payload_text, encode_mapping(dict(decode_mapping(payload_text), round_number=4))
     )
-    # The approved round's ledger still carries item-2 into the next review.
-    codex[0] = structured_plan_review(
-        state="blocking",
-        summary="Gap 4 remains.",
-        blocking_plan_issues=["Close gap 4."],
-        prior_plan_item_dispositions=resolved,
-    )
-    rerun = _FakeRunner(
-        issue_comments=history,
-        claude_outputs=[
-            json.dumps(justify_payload)
-            + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
-            *claude,
-        ],
-        codex_outputs=codex,
-    )
-    config = _staged_plan_config(
-        tmp_path,
-        max_rounds=8,
-        plan_primary_stall_rounds=2,
-        plan_growth_max_scope_items=1,
-        # An active step-back episode would defer the stall stop (#1275).
-        plan_step_back_rounds=0,
-    )
-    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, issue_recovery, plan_execution,), "log", wraps=agent_failure.log) as logged:
-        with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
-
-    # Round 4 opened with the growth-gated approval: no reviewer and no panel
-    # ran on it, only a planner revision carrying the growth notice.
+    history.append(invalid)
+    rerun = _FakeRunner(issue_comments=history, codex_outputs=codex[3:], claude_outputs=claude[2:])
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop, issue_recovery, plan_execution,), "log",
+        wraps=agent_failure.log,
+    ) as logged:
+        try:
+            run_issue_loop(
+                rerun, issue_number=56, config=replace(config, max_rounds=4), plan_first=True
+            )
+        except (AgentLoopError, IndexError) as exc:
+            assert not str(exc).startswith(NO_PROGRESS_PREFIX_TEXT), exc
     assert any(
-        "the primary approved a candidate that fails the plan-growth gate" in str(call.args[-1])
+        "no-progress detector skipped: degraded planning history (invalid)"
+        in str(call.args[-1])
         for call in logged.call_args_list
     )
-    planner_prompts = [cmd[-1] for cmd, _cwd in rerun.commands if cmd[0] == "claude"]
-    assert "Orchestrator plan-growth notice" in planner_prompts[0]
-    # Two primary turns the pre-approval streak alone would have prevented,
-    # and never a secondary.
-    assert _m1103_agent_calls(rerun) == ["claude", "codex", "claude", "codex", "claude"]
-    new_records = _plan_round_records(rerun)[len(history_records):]
-    assert [record.round_number for record in new_records if record.role == "coder"] == [
-        4, 5, 6,
-    ]
-    reviews = [record for record in new_records if record.role == "reviewer"]
-    assert [(record.round_number, record.agent, record.state) for record in reviews] == [
-        (4, "Codex", "blocking"),
-        (5, "Codex", "blocking"),
-    ]
-    # The growth-gated candidate got no checkpoint of its own: the round-4
-    # checkpoint follows the revision, and no panel phase was ever scheduled.
-    first_coder = next(i for i, r in enumerate(new_records) if r.role == "coder")
-    prelaunch = [
-        (index, record)
-        for index, record in enumerate(new_records)
-        if record.phase == "scheduler-prelaunch"
-    ]
-    assert [record.round_number for _index, record in prelaunch] == [4, 5]
-    assert all(index > first_coder for index, _record in prelaunch)
-    assert all(record.scheduler_phase == "primary" for _index, record in prelaunch)
-    assert all(
-        record.scheduler_selected_reviewers == ("Codex",) for _index, record in prelaunch
+    assert not any(
+        NO_PROGRESS_PREFIX_TEXT in comment["body"] for comment in rerun.issue_comments
     )
-    assert not any(record.scheduler_force_full for _index, record in prelaunch)
-    assert not any(record.phase == "plan-phase-advance" for record in new_records)
-    # The stop fired only after two further blocking primary reviews.
-    diagnostics = [
-        comment["body"]
-        for comment in rerun.issue_comments
-        if comment["body"].startswith("Plan review scheduling diagnostic")
-    ]
-    assert len(diagnostics) == 1
-    assert diagnostics[0].startswith("Plan review scheduling diagnostic (round 6)")
-    assert "AGENT_LOOP_META" not in diagnostics[0]
+    # The degraded round still goes to review.
+    assert _m1103_agent_calls(rerun)[:1] == ["codex"]
 
 
-def test_zero_stall_threshold_runs_to_the_round_budget(tmp_path):
-    """0 disables the stop: the run exhausts --max-rounds as before."""
+def test_plan_reset_flag_restarts_the_window_and_the_floor_persists(tmp_path, monkeypatch):
+    """`plan-reset-window`: the reset round never stops; later resumes keep the floor."""
+    _np_patch_observations(monkeypatch)
     fresh, base = _m1103_fresh_base()
-    codex, claude, _base = _m1103_blocking_chain(1, 3, base=base)
+    codex, claude, base = _np_staged_chain(1, 2, base=base)
     runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
-    config = _staged_plan_config(tmp_path, max_rounds=3, plan_primary_stall_rounds=0)
-
-    with pytest.raises(AgentLoopError, match="still reported blocking plan issues") as excinfo:
+    config = _staged_plan_config(tmp_path, max_rounds=3)
+    # Rounds 1 and 2 completed (K-1 identical rounds), round 3 reached the cap.
+    codex_three, claude_three, base = _np_staged_chain(3, 3, base=base)
+    runner.codex_outputs.extend(codex_three)
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert not isinstance(excinfo.value, plan_first_loop_module.PlanPrePanelSafetyError)
-    assert _m1103_agent_calls(runner).count("codex") == 3
-    assert "gemini" not in _m1103_agent_calls(runner)
+    history = list(runner.issue_comments)
+
+    # Without the reset, rounds 1-3 stop round 4 once round 3 is revised.
+    later_codex, later_claude, _end = _np_staged_chain(4, 6, base=base)
+    no_reset = _FakeRunner(
+        issue_comments=list(history), claude_outputs=list(claude_three),
+        codex_outputs=list(later_codex),
+    )
+    with pytest.raises(HumanDecisionRequiredError, match="rounds 1-3"):
+        run_issue_loop(no_reset, issue_number=56, config=replace(config, max_rounds=10), plan_first=True)
+    assert "codex" not in _m1103_agent_calls(no_reset)
+    reset_run = _FakeRunner(
+        issue_comments=list(history),
+        claude_outputs=[*claude_three, *later_claude],
+        codex_outputs=list(later_codex),
+    )
+    reset_config = replace(config, max_rounds=10, plan_reset_stall_streak=True)
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_issue_loop(reset_run, issue_number=56, config=reset_config, plan_first=True)
+    reset_checkpoints = [
+        record.round_number
+        for record in _plan_round_records(reset_run)
+        if record.phase == "scheduler-prelaunch" and record.scheduler_stall_reset
+    ]
+    # The resumed round 3 is the invocation's first staged round, so it carries
+    # the reset and never stops itself.
+    assert reset_checkpoints == [3]
+    # Rounds before the reset checkpoint's round are dropped: rounds 3-5 stop 6.
+    _np_assert_no_progress(excinfo.value, subject=_np_subject(reset_run, 6), rounds=(3, 5))
+    assert _m1103_agent_calls(reset_run).count("codex") == 2
+
+    # A later resume without the flag keeps the persisted floor.
+    flagless = _FakeRunner(issue_comments=list(reset_run.issue_comments))
+    with pytest.raises(HumanDecisionRequiredError) as again:
+        run_issue_loop(flagless, issue_number=56, config=replace(config, max_rounds=10), plan_first=True)
+    assert "rounds 3-5" in str(again.value)
+    assert _m1103_agent_calls(flagless) == []
 
 
 def _m1103_narrative_runner():
@@ -555,251 +542,6 @@ def test_resume_after_a_narrative_only_patch_reconstructs_the_narrow_classificat
 
 
 # --- Stall streak retirement: issue-text edit and reset flag (#1112) ---------
-
-
-def _m1112_primary_checkpoints(runner):
-    return [
-        record
-        for record in _plan_round_records(runner)
-        if record.phase == "scheduler-prelaunch" and record.scheduler_phase == "primary"
-    ]
-
-
-def _m1112_rerun(history, config, *, issue_payload=None, comments=(), **runner_kwargs):
-    runner = _FakeRunner(
-        issue_comments=[*history, *comments],
-        issue_payload=issue_payload,
-        **runner_kwargs,
-    )
-    error = None
-    try:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    except AgentLoopError as exc:
-        error = exc
-    return runner, error
-
-
-def _m1112_approvals():
-    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
-    return {
-        "codex_outputs": [
-            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved)
-        ],
-        "gemini_outputs": [
-            structured_plan_review(
-                state="approved",
-                reviewer="Google Gemini",
-                prior_plan_item_dispositions=resolved,
-            )
-        ],
-    }
-
-
-def test_stalled_checkpoints_record_the_issue_digest(tmp_path):
-    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    digests = {record.scheduler_issue_digest for record in _m1112_primary_checkpoints(runner)}
-    assert len(digests) == 1 and re.fullmatch(r"[0-9a-f]{16}", digests.pop())
-    assert not any(r.scheduler_stall_reset for r in _plan_round_records(runner))
-
-
-def test_issue_edit_retires_the_stalled_streak(tmp_path):
-    """`edit-retires-streak`, under the keep-the-plan opt-out (#1390)."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    old_digest = _m1112_primary_checkpoints(runner)[0].scheduler_issue_digest
-
-    rerun, _error = _m1112_rerun(
-        history,
-        replace(config, plan_resume_keep_on_issue_edit=True),
-        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
-        **_m1112_approvals(),
-    )
-    assert "codex" in _m1103_agent_calls(rerun)
-    new_checkpoints = [
-        record
-        for record in _m1112_primary_checkpoints(rerun)
-        if record.round_number == 3
-    ]
-    assert new_checkpoints
-    assert new_checkpoints[0].scheduler_issue_digest not in (None, old_digest)
-    assert not any(r.scheduler_force_full for r in _plan_round_records(rerun))
-    assert not any(r.scheduler_stall_reset for r in _plan_round_records(rerun))
-
-
-def test_issue_edit_with_blocking_primary_opens_no_panel(tmp_path):
-    """`edit-retires-streak`: retirement itself never opens the panel (opt-out, #1390)."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    config = replace(config, plan_resume_keep_on_issue_edit=True)
-    history = list(runner.issue_comments)
-    _fresh, base = _m1103_fresh_base()
-    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
-    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
-
-    rerun = _FakeRunner(
-        issue_comments=list(history),
-        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
-        codex_outputs=codex,
-        claude_outputs=claude,
-    )
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
-    # Two new blocking rounds ran under the new text, then the stop re-tripped.
-    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
-    records = _plan_round_records(rerun)
-    assert not any(r.scheduler_force_full for r in records)
-    assert not any(r.scheduler_stall_reset for r in records)
-    assert not any(
-        r.scheduler_phase in {"secondary-audit", "remediation", "final-secondary-sweep", "full-board"}
-        for r in records
-    )
-    assert not any(
-        r.role == "reviewer" and r.agent != "Codex" for r in records
-    )
-
-
-def test_unchanged_issue_with_new_comment_still_stops(tmp_path):
-    """`unchanged-rerun-stops`."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    before = len(_plan_round_records(runner))
-
-    rerun, error = _m1112_rerun(
-        history,
-        config,
-        comments=[{"author": "operator", "body": "Please narrow the scope."}],
-    )
-    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
-    assert _m1103_agent_calls(rerun) == []
-    assert "a comment alone does not" in str(error)
-    assert len(_plan_round_records(rerun)) == before
-
-
-def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path):
-    """`legacy-undigested`."""
-    with patch_object_in((panel_evidence, plan_first_loop_module, issue_loop), "plan_issue_text_digest", lambda _ctx: None):
-        runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    assert all(
-        record.scheduler_issue_digest is None for record in _m1112_primary_checkpoints(runner)
-    )
-
-    rerun, error = _m1112_rerun(
-        history, config, issue_payload={"body": "Edited after the stall."}
-    )
-    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
-    assert _m1103_agent_calls(rerun) == []
-    assert "predate issue-text tracking" in str(error)
-    assert "--plan-reset-stall-streak" in str(error)
-
-
-def _m1112_crash_at_checkpoint(history, config, *, after_post):
-    """A flagged run killed at its first scheduler checkpoint post."""
-    runner = _FakeRunner(issue_comments=list(history), **_m1112_approvals())
-    real_post = architecture_contract.post_issue_comment
-
-    def crashing_post(*args, **kwargs):
-        if "Plan review scheduling audit" in str(kwargs.get("body", "")):
-            if after_post:
-                real_post(*args, **kwargs)
-            raise KeyboardInterrupt("simulated crash at the prelaunch checkpoint")
-        return real_post(*args, **kwargs)
-
-    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", crashing_post):
-        with pytest.raises(KeyboardInterrupt):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    return runner
-
-
-def _m1112_no_panel_or_force_full(runner):
-    records = _plan_round_records(runner)
-    assert not any(r.scheduler_force_full for r in records)
-    assert not any(
-        r.scheduler_phase in {"secondary-audit", "full-board"} for r in records
-    )
-    assert "gemini" not in _m1103_agent_calls(runner)
-
-
-def test_reset_flag_durably_retires_the_streak(tmp_path):
-    """`reset-flag-durable`: the reset checkpoint bounds later flagless reruns."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    _fresh, base = _m1103_fresh_base()
-    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
-    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
-
-    flagged = _FakeRunner(
-        issue_comments=list(history), codex_outputs=codex, claude_outputs=claude
-    )
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-        run_issue_loop(
-            flagged,
-            issue_number=56,
-            config=replace(config, plan_reset_stall_streak=True),
-            plan_first=True,
-        )
-    # The flagged run gets rounds 3 and 4 (two new blocking rounds), and only
-    # the invocation's first primary checkpoint carries the marker.
-    assert _m1103_agent_calls(flagged) == ["codex", "claude", "codex", "claude"]
-    marked = [r for r in _plan_round_records(flagged) if r.scheduler_stall_reset]
-    assert [r.round_number for r in marked] == [3]
-    assert marked[0].scheduler_phase == "primary"
-    _m1112_no_panel_or_force_full(flagged)
-
-    # A flagless rerun of that history stops again only because N new blocking
-    # rounds followed the reset checkpoint, never the two older ones.
-    later = _FakeRunner(issue_comments=list(flagged.issue_comments))
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-        run_issue_loop(later, issue_number=56, config=config, plan_first=True)
-    assert _m1103_agent_calls(later) == []
-
-
-def test_reset_interrupted_before_checkpoint_stops_again(tmp_path):
-    """`reset-interrupted-before-checkpoint`: nothing durable, still stops."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    crashed = _m1112_crash_at_checkpoint(
-        history, replace(config, plan_reset_stall_streak=True), after_post=False
-    )
-    assert crashed.issue_comments == history
-    assert not any(r.scheduler_stall_reset for r in _plan_round_records(crashed))
-
-    rerun, error = _m1112_rerun(crashed.issue_comments, config)
-    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
-    assert "blocked 2" in str(error)
-    assert _m1103_agent_calls(rerun) == []
-
-
-def test_reset_interrupted_after_checkpoint_resumes_the_primary_review(tmp_path):
-    """`reset-interrupted-after-checkpoint`: the posted marker is a boundary."""
-    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
-    history = list(runner.issue_comments)
-    crashed = _m1112_crash_at_checkpoint(
-        history, replace(config, plan_reset_stall_streak=True), after_post=True
-    )
-    marked = [r for r in _plan_round_records(crashed) if r.scheduler_stall_reset]
-    assert [r.round_number for r in marked] == [3]
-    assert _m1103_agent_calls(crashed) == []
-
-    rerun, error = _m1112_rerun(crashed.issue_comments, config, **_m1112_approvals())
-    assert not (
-        isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
-        and "blocked" in str(error)
-    )
-    assert "codex" in _m1103_agent_calls(rerun)
-    # No second reset marker and no panel or force-full before primary approval.
-    assert [
-        r.round_number for r in _plan_round_records(rerun) if r.scheduler_stall_reset
-    ] == [3]
-    records = _plan_round_records(rerun)
-    assert not any(r.scheduler_force_full for r in records)
-    # The resumed round runs primary-only; the panel opens only after the
-    # primary's own approval, never on the reset.
-    round_three = [
-        r for r in records
-        if r.phase == "scheduler-prelaunch" and r.round_number == 3
-    ]
-    assert round_three
-    assert all(r.scheduler_phase == "primary" for r in round_three)
 
 
 def test_all_reviewers_policy_writes_no_digest_or_reset_fields(tmp_path):

@@ -298,6 +298,12 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
             continue
         message = match.group("message")
         round_number = _label_round(match.group("label"))
+        if kind == KIND_PLANNING_STOP and message.startswith(NO_PROGRESS_PREFIX_TEXT):
+            # The plan no-progress stop (#2098) has no ``PR #N: `` lead; it is
+            # checked before the shared PR checks so it is never pr-no-progress.
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "plan-no-progress", round_number, terminal=True
+            )
         if message.startswith(PLAN_STEP_BACK_HUMAN_DECISION_PREFIX):
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "plan-step-back", round_number, terminal=True

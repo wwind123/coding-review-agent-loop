@@ -4937,9 +4937,6 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
 from unittest.mock import patch as _m1278_patch  # noqa: E402
 
 import coding_review_agent_loop.plan_first_loop as _m1278_plan_loop  # noqa: E402
-from coding_review_agent_loop.review_step_back import (  # noqa: E402
-    derive_plan_step_back_state as _m1278_derive,
-)
 from coding_review_agent_loop.round_metadata import (
     _decode_round_metadata as _m1278_decode,
     _encode_round_metadata as _m1278_encode,
@@ -4952,10 +4949,11 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     """The signed re-plan applies to an approved plan, so approval already closed any episode.
 
     The history is planned under primary-then-panel so the step-back machinery is live.
-    A step-back entry is injected on the plan's candidate (an episode opens), the primary
-    then approved it (the episode closes) and the signed authorization names that plan.
-    The supersession revision receives its own rationale directive with no planner
-    anchor, no anchor log line and no second step-back entry.
+    A legacy step-back entry is injected on the plan's candidate; the episode is derived
+    by replay now (#2098), so the entry is ignored.  The primary approved the plan and
+    the signed authorization names it.  The supersession revision receives its own
+    rationale directive with no planner anchor, no anchor log line and no new
+    step-back entry.
     """
     world = _M936World(tmp_path, monkeypatch, weak=False, staged=True)
     entry = {"phase": "plan", "reviewer": "Codex", "trigger_round": 1}
@@ -4980,13 +4978,6 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     assert injected == 1
     world.comments = comments
     world.comments[-1] = comment(world.signed_record(rationale="Reduce scope to the seam writers."))
-
-    records = _extract_round_metadata_records(world.comments, flow="plan")
-    primary = next(r.metadata.agent for r in records if r.metadata.role == "reviewer")
-    first_reviewer = min(r.index for r in records if r.metadata.role == "reviewer")
-    before_approval = [r for r in records if r.index < first_reviewer]
-    assert _m1278_derive(before_approval, primary=primary).episode is not None
-    assert _m1278_derive(list(records), primary=primary).episode is None
 
     patch_text = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
     with patch_object_in((_m1278_plan_loop, plan_execution), "log", wraps=_m1278_plan_loop.log) as logged:

@@ -200,10 +200,6 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
         # clone is a deterministic configuration/programming defect (#884).
         try:
             from .config import (
-                DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
-                DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
-                DEFAULT_PLAN_STEP_BACK_ROUNDS,
-                DEFAULT_PLAN_SWEEP_ROUNDS,
                 DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
             )
 
@@ -237,10 +233,6 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
                 "plan_resume_keep_on_issue_edit": False,
                 "reopen_approved_plan": False,
                 "keep_approved_plan": False,
-                "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
-                "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
-                "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
-                "plan_sweep_rounds": DEFAULT_PLAN_SWEEP_ROUNDS,
                 "plan_sweep_reasoning_effort": "",
                 "plan_provenance_baseline_max_chars": DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
             }

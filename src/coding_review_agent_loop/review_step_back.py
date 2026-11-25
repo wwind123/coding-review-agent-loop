@@ -9,12 +9,13 @@ Two concepts are kept deliberately separate:
 
 * the **trigger streak**: consecutive ``new-finding`` primary reviews, which
   opens an episode; and
-* the **active episode**: opened by a step-back turn, it governs escalation and
-  suppresses a second step-back until an orchestrator-observed event closes it.
+* the **active episode**: opened by a step-back turn, it suppresses a second
+  step-back until an orchestrator-observed event closes it.
 
-Everything is derived from the durable round-metadata records, so a live run and
-a resumed run agree at exactly K and M.  A malformed entry marks the history
-*degraded*: the trigger and the escalation are suppressed, never the run.
+Everything is derived from the durable review records by replay, so a live run
+and a resumed run agree.  Step-back is a prompt technique only and never stops
+the run (#2098); legacy ``step_back_entries``/``step_back_status`` are decoded
+and never read by a plan decision.
 """
 
 from __future__ import annotations
@@ -28,8 +29,6 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-
-from .errors import render_human_decision
 
 from .plan_assembly import decode_assembled_plan_sidecar
 from .plan_growth import (
@@ -65,13 +64,17 @@ _MANDATORY_STATUSES = {
     PHASE_PR: frozenset({"blocking", "same-pr"}),
 }
 
+# Internal prompt thresholds (#2098); the former --plan-step-back-rounds and
+# --plan-sweep-rounds defaults.  Neither ever stops the run.
+PLAN_STEP_BACK_ROUNDS = 2
+PLAN_SWEEP_ROUNDS = 2
+
 ALTERNATIVE_EXCERPT_LIMIT = 2000
 # Episode anchor display bounds (#1278).  They cap rendering only; membership
 # always uses the complete dissolved-ID tuple.
 ANCHOR_NOTE_LIMIT = 240
 _ANCHOR_NOTED_IDS = 12
 _ANCHOR_SHOWN_IDS = 100
-_STOP_DISSOLVED_LIMIT = 20
 
 
 _USE_RECORD_ITEMS = object()
@@ -145,7 +148,7 @@ def classify_review(
 
 @dataclass(frozen=True)
 class StepBackEntry:
-    """A reviewer-owned step-back entry recorded on the step-back turn."""
+    """A derived plan step-back episode: trigger round and its candidate record."""
 
     phase: str
     reviewer: str
@@ -161,47 +164,57 @@ class PrimaryReview:
     classification: str
 
 
+def _new_finding_streak(
+    reviews: Sequence[PrimaryReview], *, floor: int, before_round: int | None = None
+) -> int:
+    """Consecutive newest-first ``new-finding`` reviews at or after ``floor``.
+
+    Reviews of rounds ``>= before_round`` are ignored when it is given.  A
+    repeat-only review, an approval or the floor ends the streak.
+    """
+    count = 0
+    for review in reversed(reviews):
+        if before_round is not None and review.round_number >= before_round:
+            continue
+        if review.round_number < floor or review.classification != CLASS_NEW_FINDING:
+            break
+        count += 1
+    return count
+
+
 @dataclass(frozen=True)
 class StepBackState:
-    """History-derived step-back state for one tracked reviewer."""
+    """History-derived step-back state for the primary plan reviewer."""
 
-    degraded: bool
     reviews: tuple[PrimaryReview, ...]
     episode: StepBackEntry | None
-    escalation_count: int
-    # Rounds whose round-start stall stop was deferred for a pending step-back
-    # (#1275), from usable primary checkpoints that survive the same retirement
-    # rules as the counted reviews.
-    deferral_rounds: tuple[int, ...] = ()
+    # Every derived episode, oldest first (closed ones included).
+    episodes: tuple[StepBackEntry, ...] = ()
+    # The live trigger decision for ``live_round`` when one was asked for.
+    live_trigger: "PlanStepBackTrigger | None" = None
 
     def streak_before(self, first_round: int, before_round: int) -> int:
         """Like :meth:`streak_since`, ignoring reviews of rounds ``>= before_round``."""
         floor = first_round if self.episode is None else max(
             first_round, self.episode.candidate_round
         )
-        count = 0
-        for review in reversed(self.reviews):
-            if review.round_number >= before_round:
-                continue
-            if review.round_number < floor or review.classification != CLASS_NEW_FINDING:
-                break
-            count += 1
-        return count
+        return _new_finding_streak(self.reviews, floor=floor, before_round=before_round)
 
     def streak_since(self, first_round: int) -> int:
-        """Consecutive newest-first ``new-finding`` reviews at or after ``first_round``.
-
-        A repeat-only review, an approval, or the start of an episode ends it.
-        """
+        """Consecutive newest-first ``new-finding`` reviews at or after ``first_round``."""
         floor = first_round if self.episode is None else max(
             first_round, self.episode.candidate_round
         )
-        count = 0
-        for review in reversed(self.reviews):
-            if review.round_number < floor or review.classification != CLASS_NEW_FINDING:
-                break
-            count += 1
-        return count
+        return _new_finding_streak(self.reviews, floor=floor)
+
+
+@dataclass(frozen=True)
+class PlanStepBackTrigger:
+    """A step-back trigger admitted at a primary review round."""
+
+    round_number: int
+    crossing_round: int
+    streak: int
 
 
 @dataclass(frozen=True)
@@ -213,12 +226,10 @@ class _PrimaryWalk:
     """
 
     ordered: tuple["PostedRoundRecord", ...]
-    degraded: bool
     boundary_index: int
     retired_through: int
     reset_indices: tuple[int, ...]
     all_checkpoints: tuple[tuple[int, str | None], ...]
-    deferrals: tuple[tuple[int, int, str | None], ...]
     reviews: tuple[PrimaryReview, ...]
 
 
@@ -232,15 +243,15 @@ def _walk_primary_reviews(
 ) -> _PrimaryWalk:
     """Walk the primary's latest-per-round reviews under the shared retirement rules.
 
-    Retirement mirrors the primary stall streak: a review whose latest preceding
-    same-round checkpoint recorded a different issue digest retires itself and
-    everything before it, and the operator reset marker retires the rounds
-    *before* the checkpoint's round.  A panel opening, an invalid scheduler
-    record or a phase-advance record ends the primary phase, so nothing at or
-    before it counts.  ``classify(ordered, record)`` names each counted review.
+    A review whose latest preceding same-round checkpoint recorded a different
+    issue digest retires itself and everything before it, and the operator
+    reset marker on a primary-phase checkpoint retires the rounds *before* the
+    checkpoint's round.  A panel opening, an invalid scheduler record or a
+    phase-advance record ends the primary phase, so nothing at or before it
+    counts.  ``classify(ordered, record)`` names each counted review.  Legacy
+    step-back bookkeeping and deferral markers are never read (#2098).
     """
     ordered = tuple(sorted(records, key=lambda item: item.index))
-    degraded = any(record.metadata.step_back_status == "invalid" for record in ordered)
     boundary_index = max(
         (
             record.index
@@ -256,11 +267,10 @@ def _walk_primary_reviews(
     retired_through = 0
     reset_indices: list[int] = []
     # Indices of the usable primary-phase checkpoints of each round: a counted
-    # review must follow one of its own round (as the primary stall streak does).
+    # review must follow one of its own round.
     checkpoint_indices: dict[int, list[tuple[int, str | None]]] = {}
     # Every usable primary checkpoint in order, for episode digest closure.
     all_checkpoints: list[tuple[int, str | None]] = []
-    deferrals: list[tuple[int, int, str | None]] = []
     for record in ordered:
         metadata = record.metadata
         if (
@@ -278,12 +288,6 @@ def _walk_primary_reviews(
         if metadata.scheduler_stall_reset:
             reset_indices.append(record.index)
             retired_through = max(retired_through, metadata.round_number - 1)
-        if metadata.scheduler_step_back_deferral and (
-            panel_opening_index is None or record.index < panel_opening_index
-        ):
-            deferrals.append(
-                (record.index, metadata.round_number, metadata.scheduler_issue_digest)
-            )
 
     latest_review: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
@@ -316,10 +320,8 @@ def _walk_primary_reviews(
             and current_issue_digest is not None
             and recorded != current_issue_digest
         ):
-            # The latest checkpoint before this review (not any same-round
-            # checkpoint) names the issue text it judged: an edit retires this
-            # review and everything before it, while a fresh re-checkpoint of the
-            # same round under the edited issue keeps its own review.
+            # The latest checkpoint before this review names the issue text it
+            # judged: an edit retires this review and everything before it.
             counted.clear()
             continue
         counted.append(
@@ -331,13 +333,77 @@ def _walk_primary_reviews(
         )
     return _PrimaryWalk(
         ordered=ordered,
-        degraded=degraded,
         boundary_index=boundary_index,
         retired_through=retired_through,
         reset_indices=tuple(reset_indices),
         all_checkpoints=tuple(all_checkpoints),
-        deferrals=tuple(deferrals),
         reviews=tuple(counted),
+    )
+
+
+def plan_step_back_trigger_holds(
+    reviews: Sequence[PrimaryReview],
+    *,
+    round_number: int,
+    floor: int,
+    step_back_rounds: int = PLAN_STEP_BACK_ROUNDS,
+) -> int | None:
+    """The one shared trigger predicate; returns the streak when it holds.
+
+    ``reviews`` are the counted primary reviews through ``round_number``, whose
+    newest entry must be that round's review.  It holds when the new-finding
+    streak since ``floor`` reaches ``step_back_rounds``, or when the streak
+    before the round reached it and the round's review is blocking (a pending
+    step-back is granted on a repeat-only block too).
+    """
+    if not reviews or reviews[-1].round_number != round_number:
+        return None
+    since = _new_finding_streak(reviews, floor=floor)
+    before = _new_finding_streak(reviews, floor=floor, before_round=round_number)
+    pending = before >= step_back_rounds and reviews[-1].classification in BLOCKING_CLASSES
+    if pending or since >= step_back_rounds:
+        return max(since, before)
+    return None
+
+
+def _episode_closed(
+    episode: StepBackEntry,
+    *,
+    reviews_through: Sequence[PrimaryReview],
+    checkpoints: Sequence[tuple[int, str | None]],
+    reset_indices: Sequence[int],
+    current_issue_digest: str | None,
+    horizon_index: int | None,
+) -> bool:
+    """Whether an existing closure event ends ``episode`` by ``horizon_index``.
+
+    Closure events: a primary approval at or after the candidate round, an
+    issue edit (a checkpoint with another digest from the trigger round's
+    checkpoint on), or a reset checkpoint recorded after the step-back record.
+    Only records before ``horizon_index`` (when given) count, so a replay of a
+    history prefix and of the full history agree at every round.
+    """
+
+    def visible(index: int) -> bool:
+        return horizon_index is None or index < horizon_index
+
+    if any(
+        review.classification == CLASS_APPROVED
+        and review.round_number >= episode.candidate_round
+        for review in reviews_through
+    ):
+        return True
+    if current_issue_digest is not None:
+        before = [digest for index, digest in checkpoints if index < episode.record_index]
+        digests = ([before[-1]] if before else []) + [
+            digest
+            for index, digest in checkpoints
+            if index > episode.record_index and visible(index)
+        ]
+        if any(d is not None and d != current_issue_digest for d in digests):
+            return True
+    return any(
+        index > episode.record_index and visible(index) for index in reset_indices
     )
 
 
@@ -347,11 +413,21 @@ def derive_plan_step_back_state(
     primary: str,
     panel_opening_index: int | None = None,
     current_issue_digest: str | None = None,
+    config: object | None = None,
+    live_round: int | None = None,
 ) -> StepBackState:
-    """Derive the primary's streak inputs and active episode from plan records.
+    """Replay the primary's step-back episodes from plan review records (#2098).
 
-    Retirement follows :func:`_walk_primary_reviews`.  An approval by the
-    primary closes the episode.
+    Walks the counted primary reviews in round order with at most one open
+    episode.  At each review round ``r`` the existing closure rules are applied
+    first; while an episode stays open no trigger is admitted, so the original
+    episode and its anchor persist.  Otherwise the growth crossing ``c`` is
+    recomputed and the shared predicate is applied from
+    ``max(c, last closed episode's candidate round)``.  A trigger at ``r`` opens
+    an episode with candidate round ``r+1`` only when a planner record numbered
+    ``r+1`` exists.  ``live_round`` evaluates the trigger at the live round
+    (whose planner record does not exist yet) with the same predicate.  The
+    panel opening closes any open episode.  ``step_back_entries`` is never read.
     """
     walk = _walk_primary_reviews(
         records,
@@ -362,95 +438,79 @@ def derive_plan_step_back_state(
             record.metadata, new_items=effective_new_items(ordered, record)
         ),
     )
-    ordered = walk.ordered
-    degraded = walk.degraded
-    boundary_index = walk.boundary_index
-    retired_through = walk.retired_through
-    reset_indices = walk.reset_indices
-    all_checkpoints = walk.all_checkpoints
-    deferrals = list(walk.deferrals)
-    reviews = walk.reviews
-
-    episode: StepBackEntry | None = None
-    for record in ordered:
+    planner_index: dict[int, int] = {}
+    for record in walk.ordered:
         metadata = record.metadata
         if (
-            metadata.role != "coder"
-            or metadata.step_back_status != "valid"
-            or record.index <= boundary_index
-            or (panel_opening_index is not None and record.index >= panel_opening_index)
+            metadata.role == "coder"
+            and record.index > walk.boundary_index
+            and (panel_opening_index is None or record.index < panel_opening_index)
         ):
+            planner_index[metadata.round_number] = record.index
+    reviews = walk.reviews
+    episodes: list[StepBackEntry] = []
+    episode: StepBackEntry | None = None
+    last_closed_candidate = 0
+    live_trigger: PlanStepBackTrigger | None = None
+    for position, review in enumerate(reviews):
+        through = reviews[: position + 1]
+        if episode is not None and _episode_closed(
+            episode,
+            reviews_through=through,
+            checkpoints=walk.all_checkpoints,
+            reset_indices=walk.reset_indices,
+            current_issue_digest=current_issue_digest,
+            horizon_index=review.index,
+        ):
+            last_closed_candidate = episode.candidate_round
+            episode = None
+        if episode is not None:
             continue
-        for entry in metadata.step_back_entries:
-            if entry.get("phase") != PHASE_PLAN or entry.get("reviewer") != primary:
-                continue
-            if metadata.round_number <= retired_through:
-                continue
-            episode = StepBackEntry(
-                phase=PHASE_PLAN,
-                reviewer=primary,
-                trigger_round=int(entry["trigger_round"]),
-                candidate_round=metadata.round_number,
-                record_index=record.index,
-            )
-    if panel_opening_index is not None:
-        # Opening the panel ends the primary phase, and with it the episode.
+        crossing = (
+            plan_growth_crossing_round(records, config=config, current_round=review.round_number)
+            if config is not None
+            else None
+        )
+        if crossing is None:
+            continue
+        streak = plan_step_back_trigger_holds(
+            through,
+            round_number=review.round_number,
+            floor=max(crossing, last_closed_candidate),
+        )
+        if streak is None:
+            continue
+        if live_round is not None and review.round_number == live_round:
+            live_trigger = PlanStepBackTrigger(review.round_number, crossing, streak)
+            continue
+        candidate_index = planner_index.get(review.round_number + 1)
+        if candidate_index is None:
+            continue
+        episode = StepBackEntry(
+            phase=PHASE_PLAN,
+            reviewer=primary,
+            trigger_round=review.round_number,
+            candidate_round=review.round_number + 1,
+            record_index=candidate_index,
+        )
+        episodes.append(episode)
+    if episode is not None and (
+        panel_opening_index is not None
+        or _episode_closed(
+            episode,
+            reviews_through=reviews,
+            checkpoints=walk.all_checkpoints,
+            reset_indices=walk.reset_indices,
+            current_issue_digest=current_issue_digest,
+            horizon_index=None,
+        )
+    ):
         episode = None
-    if episode is not None and current_issue_digest is not None:
-        # An issue edit closes the episode.  The turn was produced under the issue
-        # text of the latest checkpoint before its record (the trigger round's), so
-        # check that one, which covers an edit between publication and the
-        # candidate's first checkpoint, and every checkpoint after it.
-        before = [
-            digest for index, digest in all_checkpoints if index < episode.record_index
-        ]
-        digests = ([before[-1]] if before else []) + [
-            digest for index, digest in all_checkpoints if index > episode.record_index
-        ]
-        if any(d is not None and d != current_issue_digest for d in digests):
-            episode = None
-    if episode is not None and any(index > episode.record_index for index in reset_indices):
-        # A reset checkpoint recorded after the step-back turn closes the episode
-        # even when it carries the same round number as the step-back candidate.
-        episode = None
-    escalation_count = 0
-    if episode is not None:
-        closing = [
-            review
-            for review in reviews
-            if review.classification == CLASS_APPROVED
-            and review.round_number >= episode.candidate_round
-        ]
-        if closing:
-            episode = None
-        else:
-            escalation_count = sum(
-                1
-                for review in reviews
-                if review.round_number >= episode.candidate_round
-                and review.classification
-                in {CLASS_NEW_FINDING, CLASS_REPEAT_ONLY, CLASS_BLOCKING_UNRESOLVED}
-            )
-    # An issue edit retires every deferral recorded at or before the latest primary
-    # checkpoint (marked or not) whose issue digest differs from the current one.
-    if current_issue_digest is not None:
-        mismatched = [
-            index
-            for index, digest in all_checkpoints
-            if digest is not None and digest != current_issue_digest
-        ]
-        if mismatched:
-            latest = max(mismatched)
-            deferrals = [entry for entry in deferrals if entry[0] > latest]
-    deferral_rounds = tuple(
-        sorted({number for _index, number, _digest in deferrals if number > retired_through})
-    )
     return StepBackState(
-        degraded=degraded,
         reviews=reviews,
         episode=episode,
-        escalation_count=escalation_count,
-        deferral_rounds=deferral_rounds,
+        episodes=tuple(episodes),
+        live_trigger=live_trigger,
     )
 
 
@@ -535,7 +595,6 @@ def first_plan_review_round(
 class PlanSweepState:
     """History-derived sweep streak of the primary plan reviewer (#1505)."""
 
-    degraded: bool
     reviews: tuple[PrimaryReview, ...]
 
     def _streak(self, round_number: int) -> list[PrimaryReview]:
@@ -586,17 +645,17 @@ def derive_plan_sweep_state(
             first_review=record.metadata.round_number == first_round,
         ),
     )
-    return PlanSweepState(degraded=walk.degraded, reviews=walk.reviews)
+    return PlanSweepState(reviews=walk.reviews)
 
 
 def plan_sweep_due(
     state: PlanSweepState | None,
     *,
     round_number: int,
-    sweep_rounds: int,
+    sweep_rounds: int = PLAN_SWEEP_ROUNDS,
 ) -> bool:
     """Whether round ``round_number``'s primary review gets the sweep request."""
-    if sweep_rounds <= 0 or state is None or state.degraded:
+    if sweep_rounds <= 0 or state is None:
         return False
     return state.streak_before(round_number) >= sweep_rounds
 
@@ -1132,92 +1191,6 @@ def plan_round_provenance_counts(
     }
 
 
-DISPOSITION_DEFER_PENDING = "defer-pending"
-DISPOSITION_DEFER_EPISODE = "defer-episode"
-DISPOSITION_ESCALATED = "escalated"
-DISPOSITION_NOT_APPLICABLE = "not-applicable"
-
-
-@dataclass(frozen=True)
-class StallStepBackDisposition:
-    """What a reached primary stall limit does about the plan step-back (#1275)."""
-
-    kind: str
-    reason: str
-
-
-def plan_stall_step_back_disposition(
-    state: StepBackState | None,
-    *,
-    round_number: int,
-    crossing_round: int | None,
-    growth_gate_enforced: bool,
-    step_back_rounds: int,
-    escalation_rounds: int,
-    candidate_strategy: str | None = None,
-) -> StallStepBackDisposition:
-    """Fixed-precedence decision the round-start stall stop consults.
-
-    ``candidate_strategy`` is the current candidate's execution strategy; it
-    only refines the not-applicable reason, because growth crossings count
-    one-shot candidates alone (#2025).
-
-    Eligibility is judged from rounds before ``round_number`` so the answer does
-    not change when that round's own primary review is posted.  The stall streak
-    is deliberately not an input: an eligible history above the threshold is
-    granted too.
-    """
-    na = DISPOSITION_NOT_APPLICABLE
-    if step_back_rounds <= 0:
-        return StallStepBackDisposition(na, "step-back disabled (--plan-step-back-rounds 0)")
-    if state is None or state.degraded:
-        return StallStepBackDisposition(na, "planning step-back history degraded")
-    episode = state.episode
-    if episode is not None:
-        if state.escalation_count >= escalation_rounds:
-            return StallStepBackDisposition(
-                DISPOSITION_ESCALATED,
-                f"step-back episode from round {episode.candidate_round} reached "
-                f"{state.escalation_count}/{escalation_rounds} escalation block(s)",
-            )
-        return StallStepBackDisposition(
-            DISPOSITION_DEFER_EPISODE,
-            f"step-back episode from round {episode.candidate_round} at "
-            f"{state.escalation_count}/{escalation_rounds} escalation block(s)",
-        )
-    if not growth_gate_enforced:
-        return StallStepBackDisposition(na, "plan-growth gate is off")
-    if crossing_round is None:
-        if candidate_strategy is not None and candidate_strategy != "one-shot":
-            return StallStepBackDisposition(
-                na,
-                f"the current candidate is a {candidate_strategy} plan; plan step-back "
-                "applies only to a one-shot candidate that crosses a plan-growth signal",
-            )
-        return StallStepBackDisposition(
-            na, "the current candidate crosses no plan-growth signal"
-        )
-    for deferred in state.deferral_rounds:
-        if crossing_round <= deferred < round_number:
-            return StallStepBackDisposition(
-                na,
-                f"a step-back was already deferred at round {deferred} and no step-back "
-                "turn followed (an orchestrator-owned revision took precedence)",
-            )
-    streak = state.streak_before(crossing_round, round_number)
-    if streak < step_back_rounds:
-        return StallStepBackDisposition(
-            na,
-            f"only {streak} new-finding primary block(s) since the crossing at round "
-            f"{crossing_round}, below --plan-step-back-rounds {step_back_rounds}",
-        )
-    return StallStepBackDisposition(
-        DISPOSITION_DEFER_PENDING,
-        f"growth signal crossed at round {crossing_round}; {streak} new-finding "
-        "primary block(s) before this round",
-    )
-
-
 def plan_growth_crossing_round(
     records: Sequence["PostedRoundRecord"],
     *,
@@ -1333,96 +1306,9 @@ def render_plan_step_back_review_notice() -> str:
     )
 
 
-# Leading bytes of the plan step-back human-decision stop; history_export
-# recognizes the posted diagnostic through this constant.
+# Leading bytes of the retired plan step-back human-decision stop (#2098);
+# history_export still recognizes legacy diagnostics through this constant.
 PLAN_STEP_BACK_HUMAN_DECISION_PREFIX = "human decision required: the planner stepped back at round "
-
-
-def render_step_back_human_decision(
-    *,
-    phase: str,
-    measurements: str,
-    step_back_round: int,
-    blocks: int,
-    threshold: int,
-    alternative: str | None,
-    dissolved: Sequence[str] = (),
-    reintroduced: Sequence[tuple[str, int, str]] | None = None,
-    post_review: bool = False,
-) -> str:
-    """Human-decision-required diagnostic after a step-back that did not converge.
-
-    ``reintroduced`` is ``None`` for the legacy message.  When provided (the
-    episode anchor was derived), the message also reports the dissolved items and
-    the planner-declared reintroductions (#1278).
-    """
-    excerpt = (alternative or "").strip()
-    if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
-        excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
-    if phase != PHASE_PLAN:
-        raise ValueError(f"unsupported step-back phase: {phase}")
-    if post_review and reintroduced is None:
-        raise ValueError("post_review requires the episode anchor report")
-    timing = "No reviewer and no planner turn were invoked. "
-    anchor_report = ""
-    if reintroduced is not None:
-        if post_review:
-            timing = (
-                "This round's reviews were posted; no further planner or reviewer "
-                "turn will be invoked. "
-            )
-        anchor_report = _render_anchor_report(dissolved, reintroduced) + " "
-    what = (
-        PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
-        + f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
-        f"reviewer has since blocked {blocks} round(s), reaching "
-        f"--plan-step-back-escalation-rounds {threshold} (the stall stop is deferred "
-        "while a step-back is pending or in progress). "
-        f"{timing}"
-        f"{measurements} Latest alternative (excerpt of the step-back candidate "
-        f"summary): {excerpt or '(not recorded)'} {anchor_report}Decide one of: continue patching "
-        "(rerun with --plan-step-back-rounds 0, or with --plan-reset-stall-streak, "
-        "which also ends the episode); adopt the simpler alternative (narrow the "
-        "issue text; an issue edit ends the episode); or split (rerun with "
-        "--plan-execution-mode auto, or re-file the issue as staged work)."
-    )
-    return render_human_decision(
-        what=what,
-        clear=(
-            "Narrow the issue text to the simpler alternative (an issue edit ends the "
-            "episode), then rerun the same command; the other options are listed above."
-        ),
-        safe_to_automate=False,
-        automation_note=(
-            "choosing between continuing, simplifying and splitting is a human judgement."
-        ),
-    )
-
-
-def _render_anchor_report(
-    dissolved: Sequence[str], reintroduced: Sequence[tuple[str, int, str]]
-) -> str:
-    if dissolved:
-        shown = ", ".join(dissolved[:_STOP_DISSOLVED_LIMIT])
-        extra = len(dissolved) - _STOP_DISSOLVED_LIMIT
-        tail = f", (+{extra} more)" if extra > 0 else ""
-        dissolved_text = f"{len(dissolved)} item(s) [{shown}{tail}]"
-    else:
-        dissolved_text = "(not recorded)"
-    if reintroduced:
-        entries = "; ".join(
-            f"[{item_id}] at round {round_number} ({reason or 'no reason given'})"
-            for item_id, round_number, reason in reintroduced
-        )
-        reintroduced_text = entries
-    else:
-        reintroduced_text = (
-            "none declared (undeclared reintroductions are not detected)"
-        )
-    return (
-        f"Dissolved by the step-back: {dissolved_text}. "
-        f"Reintroduced since the step-back (planner-declared): {reintroduced_text}."
-    )
 
 
 def entry_payload_for_plan(*, reviewer: str, trigger_round: int) -> Mapping[str, object]:
@@ -1430,17 +1316,43 @@ def entry_payload_for_plan(*, reviewer: str, trigger_round: int) -> Mapping[str,
     return {"phase": PHASE_PLAN, "reviewer": reviewer, "trigger_round": trigger_round}
 
 
-def plan_step_back_candidate_rounds(records: Sequence["PostedRoundRecord"]) -> frozenset[int]:
-    """Planner rounds whose candidate was published by a step-back turn."""
-    return frozenset(
-        record.metadata.round_number
-        for record in records
-        if record.metadata.role == "coder"
-        and record.metadata.step_back_status == "valid"
-        and any(
-            entry.get("phase") == PHASE_PLAN for entry in record.metadata.step_back_entries
+def plan_step_back_candidate_rounds(state: StepBackState | None) -> frozenset[int]:
+    """Planner rounds whose candidate a derived step-back episode published (#2098)."""
+    if state is None:
+        return frozenset()
+    return frozenset(episode.candidate_round for episode in state.episodes)
+
+
+def plan_step_back_candidate_rounds_in_history(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    current_issue_digest: str | None,
+    config: object,
+) -> frozenset[int]:
+    """Every replay-derived step-back candidate round, across history boundaries.
+
+    A phase-advance or invalid scheduler record ends the primary walk, so the
+    episodes of each primary segment are replayed from the records before that
+    boundary.  A step-back candidate keeps its reviewer notice after the panel
+    opens on it, as the recorded entry used to provide.
+    """
+    ordered = sorted(records, key=lambda item: item.index)
+    cuts: list[int | None] = [
+        record.index
+        for record in ordered
+        if record.metadata.scheduler_metadata_status == "invalid"
+        or (record.metadata.role == "summary" and record.metadata.phase == "plan-phase-advance")
+    ]
+    cuts.append(None)
+    rounds: set[int] = set()
+    for cut in cuts:
+        prefix = [record for record in ordered if cut is None or record.index < cut]
+        state = derive_plan_step_back_state(
+            prefix, primary=primary, current_issue_digest=current_issue_digest, config=config
         )
-    )
+        rounds.update(episode.candidate_round for episode in state.episodes)
+    return frozenset(rounds)
 
 
 def mandatory_plan_findings_since(

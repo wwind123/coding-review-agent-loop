@@ -149,9 +149,9 @@ class PlanPrePanelSafetyError(AgentLoopError):
 class PlanPrePanelHumanDecisionError(PlanPrePanelSafetyError, HumanDecisionRequiredError):
     """A pre-panel planning stop that is a human decision boundary (#2069).
 
-    The plan step-back and primary-stall stops keep their pre-panel safety
-    semantics (``except PlanPrePanelSafetyError`` still matches) and exit 4
-    like every other human-decision stop.
+    The plan no-progress stop (#2098) keeps the pre-panel safety semantics
+    (``except PlanPrePanelSafetyError`` still matches) and exits 4 like every
+    other human-decision stop.
     """
 
 

@@ -425,7 +425,7 @@ def test_staged_plan_under_plan_only_stops_on_round_one(tmp_path, policy):
     """`plan-only-staged-fresh`: no reviewer, revision, or checkpoint turn."""
     runner = _FakeRunner(claude_outputs=[_m1268_staged_raw()])
     config = (
-        _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=8)
+        _staged_plan_config(tmp_path, max_rounds=8)
         if policy == "primary-then-panel"
         else make_config(tmp_path, reviewer=("codex", "gemini"))
     )
@@ -513,9 +513,7 @@ def test_narrow_staged_blocking_primary_reaches_a_directive_revision_then_stops(
             )
         ],
     )
-    config = _staged_plan_config(
-        tmp_path, max_rounds=8, plan_primary_stall_rounds=1, plan_narrow_staged=True
-    )
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
 
     with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -618,7 +616,8 @@ def _m1268_issue_urls():
 
 
 def _m1268_stalled_staged_history(tmp_path, *, record_mode):
-    """A staged candidate whose primary blocked up to the stall limit.
+    """A staged candidate whose primary blocked two rounds; round 3's review is
+    unscripted, so the run stops there.
 
     Planned under decompose-only (where a staged candidate is allowed), then
     rewritten to record ``record_mode`` (``None`` models pre-change history).
@@ -626,9 +625,9 @@ def _m1268_stalled_staged_history(tmp_path, *, record_mode):
     codex, claude, _base = _m1103_blocking_chain(1, 2, base=_m1268_base())
     runner = _FakeRunner(claude_outputs=[_m1268_staged_raw(), *claude], codex_outputs=codex)
     config = _staged_plan_config(
-        tmp_path, max_rounds=8, plan_primary_stall_rounds=2, plan_execution_mode="decompose-only"
+        tmp_path, max_rounds=8, plan_execution_mode="decompose-only"
     )
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return _m1268_rewrite_modes(list(runner.issue_comments), record_mode), config
 
@@ -650,7 +649,7 @@ def _m1268_resumed_runner(history):
 
 
 def test_round_metadata_records_the_execution_mode(tmp_path):
-    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    runner, _config, _error = _m1103_stalled_runner(tmp_path)
     records = _plan_round_records(runner)
     assert {r.plan_execution_mode for r in records if r.role in {"coder", "reviewer"}} == {
         "plan-only"
@@ -661,7 +660,7 @@ def test_round_metadata_records_the_execution_mode(tmp_path):
 
 
 def test_resume_under_a_changed_mode_retires_the_stall_streak(tmp_path):
-    """`resume-mode-changed`: no stall stop, the carried item resolves, children are created."""
+    """`resume-mode-changed`: the carried item resolves, children are created."""
     history, config = _m1268_stalled_staged_history(tmp_path, record_mode="plan-only")
     proceeding = _m1268_resumed_runner(history)
 
@@ -675,23 +674,9 @@ def test_resume_under_a_changed_mode_retires_the_stall_streak(tmp_path):
     assert _m1103_agent_calls(proceeding) == ["codex", "gemini"]
 
 
-def test_resume_without_a_mode_change_still_stalls(tmp_path):
-    history, config = _m1268_stalled_staged_history(tmp_path, record_mode="decompose-only")
-    rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
-        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
-    assert _m1103_agent_calls(rerun) == []
-
-
-def test_resume_over_legacy_unrecorded_history_names_the_reset_flag(tmp_path):
-    """`resume-legacy-stalled`: no silent retirement; the flag recovers."""
+def test_resume_over_legacy_unrecorded_history_proceeds_with_the_reset_flag(tmp_path):
+    """`resume-legacy-stalled`: the reset flag resumes over unrecorded-mode history."""
     history, config = _m1268_stalled_staged_history(tmp_path, record_mode=None)
-
-    rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
-        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
-    assert "--plan-reset-stall-streak" in str(excinfo.value)
-    assert _m1103_agent_calls(rerun) == []
 
     proceeding = _m1268_resumed_runner(history)
     result = run_issue_loop(
@@ -836,10 +821,9 @@ def test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approv
 
 def test_planner_revisions_carry_guidance_and_in_memory_history_without_step_back(tmp_path):
     """#1273 `planner-live-history`: no step-back records, no extra GitHub read."""
-    runner, _error = _m1251_run(
-        tmp_path, last_round=4, max_rounds=4, plan_step_back_rounds=0,
-        plan_step_back_escalation_rounds=1,
-    )
+    # The round-4 revision would be the step-back turn; the round limit ends the
+    # run before it, so every revision is an ordinary one.
+    runner, _error = _m1251_run(tmp_path, last_round=4, max_rounds=4)
     revisions = [
         prompt for prompt in _m1251_prompts(runner, "claude")
         if "Proactive generalization" in prompt
@@ -861,10 +845,7 @@ def test_planner_history_failure_is_advisory_and_keeps_the_guidance(tmp_path, mo
         raise RuntimeError("projection exploded")
 
     monkeypatch.setattr(finding_history, "project_finding", boom)
-    runner, error = _m1251_run(
-        tmp_path, last_round=3, max_rounds=3, plan_step_back_rounds=0,
-        plan_step_back_escalation_rounds=1,
-    )
+    runner, error = _m1251_run(tmp_path, last_round=3, max_rounds=3)
     revisions = [
         prompt for prompt in _m1251_prompts(runner, "claude")
         if "Proactive generalization" in prompt
@@ -954,8 +935,7 @@ def test_real_planner_step_back_turn_logs_a_step_back_directed_generalization(
     tmp_path, capsys
 ):
     runner, _error = _m1251_run(
-        tmp_path, last_round=4, max_rounds=5, plan_step_back_escalation_rounds=5,
-        quiet=False,
+        tmp_path, last_round=4, max_rounds=5, quiet=False,
         claude_transform=lambda output: output.replace(
             '"summary": "Close gap 4."', f'"summary": "{_DECLARATION}"'
         ),
@@ -995,10 +975,7 @@ def test_history_adds_no_github_reads_under_either_planning_policy(tmp_path, mon
     def counts(label):
         # Fresh directories per call: the second pass must not see the first's state.
         compat = _m1273_run_all_reviewers(tmp_path / label / "c", declare=False, rounds=3)
-        staged, _error = _m1251_run(
-            tmp_path / label / "s", last_round=3, max_rounds=3, plan_step_back_rounds=0,
-            plan_step_back_escalation_rounds=1,
-        )
+        staged, _error = _m1251_run(tmp_path / label / "s", last_round=3, max_rounds=3)
         return _non_agent_command_count(compat), _non_agent_command_count(staged)
 
     with_history = counts("with-history")

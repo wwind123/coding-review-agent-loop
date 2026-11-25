@@ -676,25 +676,21 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     ):
         assert flag in text
         assert flag in readme
-    # #1112: edit-based retirement, the comment-only limit, legacy rounds.
-    assert "edit the issue title or body" in text
-    assert "comment alone does not" in text
-    assert "predate issue-text tracking" in text
-    # #1103: the stall stop, its upgrade note, and the contract identity.
-    assert "#### Primary-phase stall stop" in text
+    # #2098: the plan no-progress stop replaces the primary-phase stall stop.
+    assert "#### Plan no-progress stop" in text
+    assert "#### Primary-phase stall stop" not in text
     assert "**Upgrade note:**" in text
     assert "contract identity" in text
+    assert "accepted and\nignored for one release" in text
     architecture = _architecture_set_text()
-    assert "primary-phase stall stop" in architecture
+    assert "primary-phase stall stop and the step-back escalation stop were removed" in architecture
     assert "--plan-primary-stall-rounds" in architecture
     assert "scheduler_issue_digest" in architecture
     assert "scheduler_stall_reset" in architecture
     assert "scheduler_step_back_deferral" in architecture
-    assert "whichever of that stop and the stall stop is reached first" not in architecture
+    assert "plan_no_progress_observations" in architecture
     assert "Whichever stop is reached first wins" not in readme
-    assert "Comment-only narrowing never retires" in architecture
-    assert "cannot retire them" in readme
-    assert "a comment alone does not" in readme
+    assert "newly signed planning requirement also restarts the\nwindow" in readme
     for phase in (
         "`primary`",
         "`secondary-audit`",
@@ -1026,12 +1022,15 @@ def test_operator_docs_document_the_plan_step_back_mechanism():
     readme = (root / "README.md").read_text()
     architecture = _architecture_set_text()
 
+    # #2098: step-back is a prompt only; both thresholds are deprecated.
     for flag in ("--plan-step-back-rounds", "--plan-step-back-escalation-rounds"):
         assert flag in text and flag in readme and flag in architecture
-    assert "#### Plan step-back turn and early human decision" in text
-    assert "human-decision-required" in text
+    assert "#### Plan step-back turn\n" in text
+    assert "#### Plan step-back turn and early human decision" not in text
+    assert "never stops the run" in readme
     assert "re-filed as staged work" in text
     assert "`review_step_back.py`" in architecture
+    assert "replays" in architecture and "derive_plan_step_back_state" in architecture
     assert "step_back_entries" in architecture and "step_back_entries" in text
 
 

@@ -161,10 +161,7 @@ def main_exit_for(argv):
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"plan_sweep_rounds": 1}, "--plan-sweep-rounds requires --plan-review-policy primary-then-panel"),
         ({"plan_sweep_reasoning_effort": "high"}, "--plan-sweep-reasoning-effort requires"),
-        ({"plan_sweep_rounds": -1}, "--plan-sweep-rounds must be a non-negative integer"),
-        ({"plan_sweep_rounds": True}, "--plan-sweep-rounds must be a non-negative integer"),
         ({"plan_sweep_reasoning_effort": "turbo"}, "--plan-sweep-reasoning-effort value 'turbo'"),
     ],
 )
@@ -191,16 +188,16 @@ def test_sweep_flags_reach_the_config_from_the_cli(tmp_path):
     ]
     parser = build_parser()
     defaults = config_from_args(parser.parse_args(base_argv), _FakeRunner())
-    assert (defaults.plan_sweep_rounds, defaults.plan_sweep_reasoning_effort) == (2, "")
+    assert defaults.plan_sweep_reasoning_effort == ""
+    # `--plan-sweep-rounds` still parses but is deprecated and ignored (#2098).
     config = config_from_args(
         parser.parse_args(
             [*base_argv, "--plan-sweep-rounds", "1", "--plan-sweep-reasoning-effort", "high"]
         ),
         _FakeRunner(),
     )
-    assert (config.plan_sweep_rounds, config.plan_sweep_reasoning_effort) == (1, "high")
-    with pytest.raises(AgentLoopError, match="--plan-sweep-rounds must be"):
-        config_from_args(parser.parse_args([*base_argv, "--plan-sweep-rounds", "-1"]), _FakeRunner())
+    assert config.plan_sweep_reasoning_effort == "high"
+    assert not hasattr(config, "plan_sweep_rounds")
 
 
 RETENTION_FLAG = "--subprocess-log-retention-days"

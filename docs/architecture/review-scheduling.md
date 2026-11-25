@@ -1,6 +1,6 @@
 # Review scheduling
 
-How reviewers are chosen for each PR head and each candidate plan: the shared pre-round snapshot and no-execution policy, selective intermediate and `primary-then-panel` PR review, signed board amendments, staged issue plan review with its exact-plan candidate key and reviewer-only phase-advance round, the transition classifier, the primary-phase stall stop, the staged-plan mode conflict, the plan step-back episode, planning scheduler metadata, frozen policy evaluation and the shared reviewer exhaustiveness rule.
+How reviewers are chosen for each PR head and each candidate plan: the shared pre-round snapshot and no-execution policy, selective intermediate and `primary-then-panel` PR review, signed board amendments, staged issue plan review with its exact-plan candidate key and reviewer-only phase-advance round, the transition classifier, the plan no-progress bound and reset window, the staged-plan mode conflict, the replay-derived plan step-back prompt, planning scheduler metadata, frozen policy evaluation and the shared reviewer exhaustiveness rule.
 
 Source paths: `src/coding_review_agent_loop/capture_acceptance.py`, `src/coding_review_agent_loop/capture_dispatch.py`, `src/coding_review_agent_loop/review_scope.py`, `src/coding_review_agent_loop/code_approval.py`, `src/coding_review_agent_loop/review_scheduling.py`, `src/coding_review_agent_loop/plan_review_scheduling.py`, `src/coding_review_agent_loop/review_rounds.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/review_evaluation.py`, `src/coding_review_agent_loop/prompts.py`, `tests/test_review_scheduling.py`, `tests/test_plan_review_scheduling.py`, `tests/test_review_step_back.py`, `tests/test_review_evaluation.py`, `tests/test_pr_loop_review_scheduling.py`.
 
@@ -253,25 +253,21 @@ on both the live and the resume path and is never persisted. The exact-plan
 candidate key stays full-content, so a narrative edit still invalidates carried
 approvals. Before a qualified opening, classification changes only the audit
 reason, never the primary-only board. A primary reviewer that never approves
-can therefore hold a run in the primary phase indefinitely. The
-**primary-phase stall stop** (`--plan-primary-stall-rounds`, default 8, `0`
-disables) bounds that. Before a round is scheduled, the loop derives from
-durable records how many consecutive completed primary reviews ended blocking.
-Each counted review must follow a valid primary-phase checkpoint of its round.
-Any approval, an invalid or missing checkpoint, a non-primary phase, a
-phase-advance record, or a panel opening ends the count, and a round with no
-completed primary review is skipped. At the threshold the run stops with a
-plain diagnostic before the prelaunch checkpoint. The stop is suppressed while
-planning history is degraded, writes no scheduler record, and never opens the
-panel. Two optional planning-only checkpoint fields retire the streak:
-`scheduler_issue_digest` (issue title/body digest; a differing digest ends the
-count, an absent one counts as legacy) and `scheduler_stall_reset` (set by the
-one-shot `--plan-reset-stall-streak` on the invocation's first primary
-checkpoint; a durable boundary even without a completed review). Both are omitted
-when unset and invalid on PR-flow records. Comment-only narrowing never retires
-the streak, because loop-posted comments share the operator's account and cannot
-be authenticated as operator intent; it is routed to the reset flag. `--plan-review-force-full` stays the only way to convene the panel
-without an exact-plan primary approval.
+could therefore hold a run in the primary phase indefinitely. Since #2098 the
+**plan no-progress detector** bounds that under every review policy (see
+[findings and convergence](findings-and-convergence.md)):
+the primary-phase stall stop and the step-back escalation stop were removed, and
+`--plan-primary-stall-rounds` is accepted and ignored for one release. Two
+optional planning-only checkpoint fields remain: `scheduler_issue_digest` (issue
+title/body digest, read by the step-back and sweep retirement rules) and
+`scheduler_stall_reset`. The one-shot `--plan-reset-stall-streak` stamps
+`scheduler_stall_reset` on the invocation's first staged prelaunch checkpoint in
+whichever phase receives it (primary or post-panel; the decoder accepts the
+marker on any valid phase), skips the detector on that round, and makes every
+later run drop observations numbered below the newest reset checkpoint's round.
+Both fields are omitted when unset and invalid on PR-flow records.
+`--plan-review-force-full` stays the only way to convene the panel without an
+exact-plan primary approval.
 
 **Staged-plan mode conflict.** `plan-only` and `implement-one-shot` apply
 the phased-delivery guard (`config.phased_delivery_guard_active`). At the start of
@@ -280,62 +276,49 @@ review policy is covered), a candidate whose v1 recommendation is `staged` stops
 for a human decision through `stop_plan_pre_panel`: no reviewer or revision turn,
 and no checkpoint, approval, or panel-opening record. `--plan-narrow-staged`
 replaces the stop with an orchestrator-owned revision obligation modeled on the
-growth guard: it blocks approval and reviewer-only advance, bypasses the
-pre-panel step-back and stall stops for that round, is delivered once per
-invocation, and is not a reviewer item. Planner and reviewer round records carry
+growth guard: it blocks approval and reviewer-only advance, skips the plan
+no-progress detector for that round, is delivered once per invocation, and is
+not a reviewer item. Planner and reviewer round records carry
 `plan_execution_mode` and planning checkpoints carry `scheduler_execution_mode`
-(both omitted when unset, unknown values decode to none); a checkpoint recorded
-under a different mode ends the primary stall streak like an issue-digest
-mismatch, and unrecorded legacy history needs `--plan-reset-stall-streak`.
+(both omitted when unset, unknown values decode to none).
 
-**Plan step-back episode** (`--plan-step-back-rounds` K, default 2, `0`
-disables; `--plan-step-back-escalation-rounds` M, default 2, minimum 1). The
-stall stop fires only after the time is spent, so a second, earlier mechanism
-targets the "new edge case every round" pattern. Under `primary-then-panel`,
+**Plan step-back prompt** (internal threshold
+`review_step_back.PLAN_STEP_BACK_ROUNDS` = 2; `--plan-step-back-rounds` and
+`--plan-step-back-escalation-rounds` are accepted and ignored for one release).
+Step-back targets the "new edge case every round" pattern and is a prompt
+technique only: it never stops the run (#2098). Under `primary-then-panel`,
 `review_step_back.classify_review` reads the primary's *historical* review record
 for a round (never the surviving unresolved ledger) and calls it `new-finding`
 when the review blocked and introduced at least one `blocking` or `same-plan`
 item it owns, `repeat-only` when it blocked with only carried-forward items or
-future follow-ups, and `approved` otherwise. The **trigger streak** counts
-consecutive `new-finding` primary reviews since the current contiguous run of
-crossed one-shot plan candidates began (growth crossings are recomputed from each
-candidate's canonical plan and assembled sidecar and are never persisted). At the
-revision boundary, after refreshing the durable history so the round's own review
-is included, a streak of K makes the next planner turn a simplify-or-re-scope
-revision: `step_back_context` replaces the "address the reviewer items" framing
-in the semantic-patch, compact, and full planner prompts, and
+future follow-ups, and `approved` otherwise. Growth crossings are recomputed from
+each candidate's canonical plan and assembled sidecar and are never persisted.
+`derive_plan_step_back_state` **replays** the counted primary reviews in round
+order with at most one open episode. At each review round r it first applies the
+closure rules to an open episode (an exact-plan primary approval at or after its
+candidate round, a changed `scheduler_issue_digest`, a `scheduler_stall_reset`
+checkpoint after the candidate record, or the panel opening), counting only
+records before review r so a prefix replay and a full replay agree. While an
+episode stays open no trigger is admitted, so the original episode and its anchor
+persist. Otherwise one shared predicate, `plan_step_back_trigger_holds`, applies
+from max(crossing, last closed episode's candidate round): the new-finding streak
+since then reaches K, or the streak before r reached K and review r is blocking.
+A trigger at r opens an episode with candidate round r+1 only when a planner
+record numbered r+1 exists. The live post-review decision runs the same replay
+with the current round as the live round, so a fresh run and a resume route
+identically. A trigger makes the next planner turn a simplify-or-re-scope
+revision: `step_back_context` replaces the "address the reviewer items" framing,
 `step_back_review_notice` tells every reviewer of that candidate to judge the
-alternative on its merits. The orchestrator records the turn as one optional
-reviewer-owned round-metadata field on the planner record,
-`step_back_entries` (`{phase, reviewer, trigger_round}`; the PR-phase shape adds
-`trigger_head` and `anchor`). It is never taken from agent output; an absent
-field is legacy, and a malformed one marks step-back history degraded, which
-suppresses the trigger and the stop with a log line instead of failing the run.
-The **active episode** is derived separately from the newest entry: only an
-exact-plan primary approval, a `scheduler_stall_reset` checkpoint, a changed
-`scheduler_issue_digest`, or a panel opening closes it, so a repeat-only review
-neither closes it nor permits a second step-back. The escalation count is the
-number of blocking primary reviews of any classification on the step-back
-candidate or later (the candidate's own block is the first). At M the loop
-stops through `stop_plan_pre_panel` with a human-decision diagnostic (growth
-measurements, the step-back round, a bounded excerpt of the step-back summary,
-the dissolved items, planner-declared reintroductions, and the continue, adopt, or split options) before invoking any planner turn,
-before the stall stop. A step-back pending at round R (no episode, a crossed
-one-shot candidate, and at least K new-finding primary blocks since the crossing
-in rounds before R) defers a reached primary stall stop at any stall streak, and
-any blocking primary review of round R, repeat-only included, triggers the step-back
-turn. The optional planning-only primary checkpoint field
-`scheduler_step_back_deferral` (written next to `scheduler_stall_reset`, strict
-`true` only, primary phase only, omitted when unset) records that deferral and bounds
-it to one per pending episode: a later stalled round whose earlier deferral produced
-no step-back turn stops with the stall message. An active episode below M also defers
-the stall stop, so M ends the run in a human decision. Otherwise the stall diagnostic
-appends why the step-back did not apply (disabled, degraded history, gate off, no
-crossing, already deferred, or below K). The same derivation
-runs at round start, so live and resumed runs trigger and stop at exactly K and
-M. The approval-time growth gate and scope-ledger preservation are unchanged.
+alternative on its merits, and an open episode adds the anchor guidance to later
+revisions. Legacy `step_back_entries`, `step_back_status` and the
+`scheduler_step_back_deferral` checkpoint marker are still decoded, never read
+by a plan decision, and no longer written; a malformed legacy entry no longer
+degrades planning history. Replay may treat a round as a step-back candidate when
+an orchestrator guard revision displaced the step-back turn; the effect is
+prompt-only and identical on fresh and resumed runs.
 
-**Plan sweep trigger** (`--plan-sweep-rounds` K, default 2, `0` disables;
+**Plan sweep trigger** (internal threshold `review_step_back.PLAN_SWEEP_ROUNDS` =
+2; `--plan-sweep-rounds` is accepted and ignored for one release;
 `--plan-sweep-reasoning-effort`, off by default). The step-back arms only on a
 crossed one-shot plan, so a primary can drip-feed new findings on a plan that
 never crosses a growth signal. Under `primary-then-panel`,
@@ -355,8 +338,7 @@ opened, the primary's round-R prompt carries `render_plan_sweep_guidance` (the
 finding classes from the streak's first round, bounded to 12 lines) in the
 volatile part of the full and compact plan review prompts, and the orchestrator
 writes the optional reviewer-record field `plan_sweep` (strict `true`, omitted
-when unset, malformed decodes as absent without degrading step-back or stall
-history). There is no episode, no planner turn and no stop, and the step-back
+when unset, malformed decodes as absent). There is no episode, no planner turn and no stop, and the step-back
 counts are unaffected when both apply. The effort override builds a turn-local
 config (or seat copy) for that one primary turn in a fresh provider session; it
 is validated against the primary's backend before any agent turn and ignored with

@@ -692,3 +692,228 @@ def test_the_persisted_count_round_trips_and_is_omitted_when_absent():
 
     assert "uncited_acquisition_receipts" not in decode_mapping(_encode_round_metadata(without))
     assert decode_mapping(_encode_round_metadata(with_count))["uncited_acquisition_receipts"] == 40
+
+
+# --- the plan loop (#2098, stage 2 of #2067) ----------------------------------
+
+from coding_review_agent_loop.no_progress import (  # noqa: E402
+    PLAN_BLOCKING_STATUSES,
+    plan_no_progress_observations,
+)
+from coding_review_agent_loop.plan_review_scheduling import (  # noqa: E402
+    surfaced_requirement_id_digest,
+)
+
+P = "c" * 64
+P2 = "d" * 64
+DIGEST = "0123456789abcdef"
+NO_REQUIREMENTS = surfaced_requirement_id_digest(())
+WITH_REQUIREMENT = surfaced_requirement_id_digest(("Requirement 1",))
+
+
+def _plan_item(item_id, status="blocking", **changes):
+    return UnresolvedReviewItem(
+        item_id=item_id, reviewer="Codex", source_round=1, text=f"text of {item_id}",
+        status=status, **changes,
+    )
+
+
+def _plan_review(index, round_number, subject=P, *, key_digest=None, agent="Codex"):
+    key = (
+        {"subject": subject, "surfaced_requirement_id_digest": key_digest}
+        if key_digest is not None else None
+    )
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="reviewer", agent=agent, round_number=round_number,
+            subject=subject, state="blocking", plan_candidate_key=key,
+        ),
+        body="",
+    )
+
+
+def _planner(index, round_number, prior_subject=P, *, issue_digest=DIGEST, items=None):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=round_number,
+            subject=prior_subject, prior_plan_subject=prior_subject,
+            plan_issue_digest=issue_digest,
+            prior_items=tuple(
+                items if items is not None
+                else (_plan_item("item-1"), _plan_item("item-2", status="same-plan"))
+            ),
+        ),
+        body="",
+    )
+
+
+def _plan_history(rounds=3, **review_kwargs):
+    records = []
+    for n in range(1, rounds + 1):
+        records.append(_plan_review(10 * n, n, **review_kwargs))
+        records.append(_planner(10 * n + 5, n + 1))
+    return records
+
+
+def _observe(records, *, requirements=False, issue_digest=DIGEST, reset_floor=0):
+    return plan_no_progress_observations(
+        records,
+        current_issue_digest=issue_digest,
+        current_requirement_digest=WITH_REQUIREMENT if requirements else NO_REQUIREMENTS,
+        requirements_surfaced=requirements,
+        reset_floor_round=reset_floor,
+    )
+
+
+def _plan_decision(records, **kwargs):
+    return no_progress_decision(
+        _observe(records, **kwargs), live_subject=P, live_blocking_ids=IDS, k=3,
+        through_round=3,
+    )
+
+
+def test_plan_statuses_count_same_plan_and_keep_the_pr_default_unchanged():
+    items = [_plan_item("item-1"), _plan_item("item-2", status="same-plan"),
+             _plan_item("item-3", status="same-pr"), _plan_item("item-4", status="future")]
+    assert blocking_item_ids(items, statuses=PLAN_BLOCKING_STATUSES) == IDS
+    assert blocking_item_ids(items) == frozenset({"item-1", "item-3"})
+
+
+def test_plan_observations_come_from_the_planner_record_after_each_round():
+    """`plan-k-unchanged` (unit): no scheduler record or candidate key is needed."""
+    observations = _observe(_plan_history())
+    assert observations == (Obs(1, P, IDS), Obs(2, P, IDS), Obs(3, P, IDS))
+    assert _plan_decision(_plan_history()) == np.NoProgressDecision(P, IDS, (1, 2, 3), 3)
+
+
+def _break_window(records, breaker):
+    if breaker == "phase-advance":
+        # Reviewer-only round 2: no planner record numbered 3.
+        return [r for r in records if not (r.metadata.role == "coder" and r.metadata.round_number == 3)]
+    if breaker == "closure":
+        payload = build_round_closure_payload(
+            flow="plan", round_number=2, subject=P, published=[("Codex", None)],
+            unreplayable=[("Codex", "published review could not be replayed")],
+            item_number_high_water=2,
+        )
+        return [*records, PostedRoundRecord(
+            index=26, metadata=PostedRoundMetadata(
+                flow="plan", role="summary", agent="Orchestrator", round_number=2,
+                subject=P, phase=ROUND_CLOSED_INCOMPLETE_PHASE, round_closure=payload,
+            ), body="",
+        )]
+    if breaker == "no-review":
+        return [r for r in records if not (r.metadata.role == "reviewer" and r.metadata.round_number == 2)]
+    if breaker == "issue-edit":
+        return [
+            _planner(r.index, 3, issue_digest="fedcba9876543210")
+            if r.metadata.role == "coder" and r.metadata.round_number == 3 else r
+            for r in records
+        ]
+    if breaker == "other-subject":
+        return [
+            _plan_review(r.index, 2, P2)
+            if r.metadata.role == "reviewer" and r.metadata.round_number == 2 else r
+            for r in records
+        ]
+    raise AssertionError(breaker)
+
+
+@pytest.mark.parametrize(
+    "breaker", ["phase-advance", "closure", "no-review", "issue-edit", "other-subject"]
+)
+def test_a_non_observation_round_breaks_the_plan_window(breaker):
+    """`plan-window-broken`: phase advance, closure, missing planner record, issue edit."""
+    records = _break_window(_plan_history(), breaker)
+    assert 2 not in {observation.round_number for observation in _observe(records)}
+    assert _plan_decision(records) is None
+
+
+def test_an_undigested_legacy_planner_record_still_observes():
+    records = [
+        _planner(r.index, r.metadata.round_number, issue_digest=None)
+        if r.metadata.role == "coder" else r
+        for r in _plan_history()
+    ]
+    assert len(_observe(records)) == 3
+
+
+@pytest.mark.parametrize(
+    "key_digest,requirements,observed",
+    [
+        (None, False, True),                 # keyless, nothing surfaced: counts
+        (NO_REQUIREMENTS, False, True),      # keyed empty set, nothing surfaced
+        (WITH_REQUIREMENT, False, False),    # bound to a requirement since withdrawn
+        (None, True, False),                 # keyless legacy round, requirement surfaced
+        (NO_REQUIREMENTS, True, False),      # reviewed before the requirement existed
+        (WITH_REQUIREMENT, True, True),      # affirmative matching evidence
+    ],
+)
+def test_requirement_binding_is_conservative(key_digest, requirements, observed):
+    """`plan-requirement-change` (unit): a newly signed requirement restarts the window."""
+    observations = _observe(_plan_history(key_digest=key_digest), requirements=requirements)
+    assert (len(observations) == 3) is observed
+    assert (_plan_decision(_plan_history(key_digest=key_digest), requirements=requirements)
+            is not None) is observed
+
+
+def test_the_reset_floor_drops_earlier_rounds_in_any_phase():
+    """`plan-reset-window` (unit): rounds below the newest reset checkpoint are dropped."""
+    records = _plan_history(5)
+    assert [o.round_number for o in _observe(records, reset_floor=3)] == [3, 4, 5]
+    assert no_progress_decision(
+        _observe(records, reset_floor=4), live_subject=P, live_blocking_ids=IDS, k=3,
+        through_round=5,
+    ) is None
+
+
+def test_plan_legacy_step_back_entries_never_change_the_observations():
+    """`plan-resume-legacy` (unit): absent, valid and malformed entries are inert."""
+    from dataclasses import replace as dc_replace
+
+    base = _plan_history()
+
+    def with_entries(**fields):
+        return [
+            PostedRoundRecord(index=r.index, metadata=dc_replace(r.metadata, **fields), body="")
+            if r.metadata.role == "coder" else r
+            for r in base
+        ]
+
+    valid = ({"phase": "plan", "reviewer": "Codex", "trigger_round": 1},)
+    decisions = {
+        name: (_observe(records), _plan_decision(records))
+        for name, records in (
+            ("absent", base),
+            ("valid", with_entries(step_back_entries=valid)),
+            # A malformed entry decodes as an invalid status with no entries.
+            ("malformed", with_entries(step_back_status="invalid")),
+        )
+    }
+    assert decisions["absent"] == decisions["valid"] == decisions["malformed"]
+
+
+@pytest.mark.parametrize("name", ("plan_first_loop.py", "review_step_back.py", "panel_evidence.py"))
+def test_no_plan_decision_path_reads_legacy_step_back_fields(name):
+    """`plan-resume-legacy` (static guard)."""
+    assert _legacy_decision_reads((SRC / name).read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_the_plan_message_names_the_plan_hash_and_size_only_when_given(present):
+    """`plan-k-unchanged` (unit): plan size and the step-back alternative are optional."""
+    message = render_no_progress_message(
+        lead="", subject_label="plan", subject=P, k=3, rounds=(2, 3, 4),
+        item_lines=render_no_progress_item_lines(IDS),
+        plan_size="1200 characters" if present else None,
+        approach_alternative=(3, "split the parser.") if present else None,
+    )
+    assert message.startswith(
+        f"{NO_PROGRESS_PREFIX_TEXT}3 consecutive completed round(s): rounds 2-4 ended with "
+        f"the same plan `{P}` and the same blocking items (--no-progress-rounds 3)."
+    )
+    assert ("Plan size: 1200 characters" in message) is present
+    assert ("Step-back approach alternative proposed at round 3" in message) is present
+    assert "Total PR size" not in message
