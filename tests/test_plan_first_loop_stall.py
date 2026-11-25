@@ -769,3 +769,314 @@ def test_issue_loop_plan_first_resume_reparses_alias_keyed_requirement_dispositi
 
     agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
     assert agent_commands == []
+
+
+# --- staged resumes over persisted repeated-hash history (real extractor) -----
+
+
+def _np_payload_rewrite(comments, transform):
+    """Apply ``transform(mapping) -> mapping`` to every round metadata payload."""
+    from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
+
+    rewritten = []
+    for comment in comments:
+        body = comment["body"]
+        match = re.search(r"AGENT_LOOP_META: (\S+) -->", body)
+        if match is not None:
+            payload = transform(decode_mapping(match.group(1)))
+            body = body.replace(match.group(1), encode_mapping(payload))
+        rewritten.append(dict(comment, body=body))
+    return rewritten
+
+
+def _np_repeated_staged_history(tmp_path, *, rounds=3, live_changed=False):
+    """A valid staged history whose ``rounds`` completed rounds all reviewed one plan.
+
+    A live staged planner cannot return a byte-identical plan (a no-op semantic
+    patch is rejected), so a real run is stopped at the next round's prelaunch
+    checkpoint and every earlier plan identity in the persisted round metadata
+    (subject, prior subject and candidate-key components) is mapped to the live
+    candidate's.  The result is the record shape a repeated plan would persist;
+    the detector then reads it with the real observation extractor.
+
+    With ``live_changed`` the earlier identities are mapped to round
+    ``rounds``'s reviewed candidate instead, so the completed rounds repeat one
+    plan P while the live candidate is the changed P2.
+    """
+    from coding_review_agent_loop.panel_evidence import _plan_candidate_key_for
+    from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
+
+    fresh, base = _m1103_fresh_base()
+    codex, claude, base = _np_staged_chain(1, rounds, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=list(codex))
+    config = _staged_plan_config(tmp_path, max_rounds=8)
+    real_post = architecture_contract.post_issue_comment
+
+    def stop_at_next_checkpoint(*args, **kwargs):
+        metadata = _m943_decoded(kwargs["body"])
+        if (
+            metadata is not None
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.round_number == rounds + 1
+        ):
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
+        side_effect=stop_at_next_checkpoint,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    records = _plan_round_records(runner)
+    live = next(r for r in reversed(records) if r.role == "coder")
+    assert live.round_number == rounds + 1
+    if live_changed:
+        target = next(
+            r for r in records
+            if r.role == "reviewer" and r.round_number == rounds and r.plan_candidate_key
+        )
+        target_subject, target_key = target.subject, dict(target.plan_candidate_key)
+    else:
+        target_subject = live.subject
+        target_key = _plan_candidate_key_for(
+            plan_subject=live.subject,
+            sidecar=decode_assembled_plan_sidecar(live.assembled_plan_sidecar),
+            surfaced_requirement_ids=(),
+        ).as_dict()
+    mapping: dict[str, str] = {}
+    for record in records:
+        if live_changed and record.role == "coder" and record.round_number == rounds + 1:
+            continue
+        for value in (record.subject, record.prior_plan_subject):
+            if value and value != target_subject:
+                mapping[value] = target_subject
+        for key in (record.plan_candidate_key, record.scheduler_plan_previous_key):
+            for name, value in (key or {}).items():
+                if isinstance(value, str) and value != target_key.get(name):
+                    mapping[value] = target_key[name]
+    if live_changed:
+        # The live candidate's own identity is never rewritten.
+        mapping.pop(live.subject, None)
+
+    # Self-authenticating candidate content (the sidecar checks its own
+    # aggregate identity) keeps its bytes; only identity references move.
+    kept = {"assembled_plan_sidecar", "canonical_plan", "raw_structured_coder_response", "raw_patch_provenance"}
+
+    def remap(payload):
+        result = {}
+        planner = payload.get("role") == "coder"
+        for name, value in payload.items():
+            # A planner record's own identity fields are bound to its sidecar;
+            # only the subject it was asked to revise is an identity reference.
+            if name in kept or (planner and name != "prior_plan_subject"):
+                result[name] = value
+                continue
+            text = json.dumps(value)
+            for old, new in mapping.items():
+                text = text.replace(old, new)
+            result[name] = json.loads(text)
+        return result
+
+    history = _np_payload_rewrite(runner.issue_comments, remap)
+    return history, config, (target_subject if live_changed else live.subject)
+
+
+def test_plan_no_progress_stops_a_staged_resume_over_repeated_history(tmp_path):
+    """`plan-k-unchanged` under primary-then-panel with the real observation extractor."""
+    history, config, subject = _np_repeated_staged_history(tmp_path)
+    rerun = _FakeRunner(issue_comments=list(history))
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    _np_assert_no_progress(excinfo.value, subject=subject, rounds=(1, 3))
+    assert _m1103_agent_calls(rerun) == []
+    # No new checkpoint, reviewer record or planner record for round 4.
+    assert not any(
+        record.round_number == 4 and record.role != "coder"
+        for record in _plan_round_records(rerun)
+    )
+    assert len(_plan_round_records(rerun)) == len(_plan_round_records(_FakeRunner(issue_comments=history)))
+    assert len(_np_diagnostics(rerun, 4)) == 1
+
+
+def test_plan_staged_resume_after_a_new_signed_requirement_reviews_first(tmp_path):
+    """`plan-requirement-change` under primary-then-panel: the issue digest is
+    unchanged, the surfaced requirement set changed, so the plan is reviewed."""
+    history, config, _subject = _np_repeated_staged_history(tmp_path)
+    signed = {
+        "author": {"login": "maintainer"},
+        "createdAt": "2026-05-24T00:00:00Z",
+        "body": "Also preserve the audit trail.\n\n-- Human Reviewer",
+    }
+    seeded = [*history, signed]
+    rerun = _FakeRunner(issue_comments=list(seeded))
+    try:
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    except (AgentLoopError, HumanDecisionRequiredError, IndexError, StopIteration) as exc:
+        assert not str(exc).startswith(NO_PROGRESS_PREFIX_TEXT), exc
+    assert _m1103_agent_calls(rerun)[:1] == ["codex"]
+    assert not any(
+        NO_PROGRESS_PREFIX_TEXT in comment["body"] for comment in rerun.issue_comments[len(seeded):]
+    )
+
+
+def test_plan_staged_resume_reviews_a_changed_live_plan_first(tmp_path):
+    """`plan-live-hash-changed` (resume, primary-then-panel, real extractor)."""
+    history, config, repeated = _np_repeated_staged_history(tmp_path, live_changed=True)
+    # Control: the completed rounds really repeat one plan and one ID set,
+    # and only the live candidate differs.
+    persisted = _plan_round_records(_FakeRunner(issue_comments=history))
+    assert {r.subject for r in persisted if r.role == "reviewer"} == {repeated}
+    planners = {r.round_number: r for r in persisted if r.role == "coder"}
+    assert [planners[n].prior_plan_subject for n in (2, 3, 4)] == [repeated] * 3
+    assert all(
+        {item.item_id for item in planners[n].prior_items} == {"item-1"} for n in (2, 3, 4)
+    )
+    assert planners[4].subject != repeated
+
+    _fresh, base = _m1103_fresh_base()
+    _c, _cl, base = _np_staged_chain(1, 3, base=base)
+    codex, claude, _base = _np_staged_chain(4, 4, base=base)
+    rerun = _FakeRunner(issue_comments=list(history), codex_outputs=codex, claude_outputs=claude)
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
+        run_issue_loop(rerun, issue_number=56, config=replace(config, max_rounds=4), plan_first=True)
+    # P2 went to review at round 4; no no-progress stop before it.
+    assert _m1103_agent_calls(rerun) == ["codex"]
+    assert not any(NO_PROGRESS_PREFIX_TEXT in c["body"] for c in rerun.issue_comments)
+
+
+def test_plan_resume_reviews_a_changed_live_plan_first_under_all_reviewers(tmp_path):
+    """`plan-live-hash-changed` (resume, all-reviewers): P,P,P persisted, then the
+    resumed planner turn publishes P2, which is reviewed before any stop."""
+    runner, config, error = _np_all_reviewers_run(
+        tmp_path, revisions=[_np_revision()] * 3, reviews=_np_reviews(4), max_rounds=4
+    )
+    assert "still reported blocking plan issues after round 4" in str(error)
+    changed = _np_revision(("Update the code differently.", "Run the relevant tests."))
+    rerun = _FakeRunner(
+        issue_comments=list(runner.issue_comments),
+        claude_outputs=[changed], codex_outputs=_np_reviews(2)[1:],
+    )
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues after round 5"):
+        run_issue_loop(rerun, issue_number=56, config=replace(config, max_rounds=5), plan_first=True)
+    assert _m1103_agent_calls(rerun) == ["claude", "codex"]
+    assert not any(NO_PROGRESS_PREFIX_TEXT in c["body"] for c in rerun.issue_comments)
+
+
+def test_plan_empty_live_blocking_set_never_stops(tmp_path):
+    """`plan-empty-or-degraded`: K identical plan rounds whose ledger holds only
+    future follow-ups never stop; the run reaches the round limit."""
+    future = structured_plan_review(
+        state="blocking", future_followups=["Consider a later cleanup."]
+    )
+    keep_future = structured_plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "future"}],
+    )
+    runner, _config, error = _np_all_reviewers_run(
+        tmp_path,
+        revisions=[structured_plan_revision(plan_steps=["Update the code.", "Run the relevant tests."])] * 5,
+        reviews=[future] + [keep_future] * 5,
+        max_rounds=6,
+    )
+    assert not isinstance(error, HumanDecisionRequiredError), error
+    assert NO_PROGRESS_PREFIX_TEXT not in str(error)
+    records = _plan_round_records(runner)
+    # Rounds 2-5 reviewed one repeated plan (round 1 reviewed the fresh plan).
+    planners = [r for r in records if r.role == "coder" and r.round_number >= 3]
+    # The plan really repeats and the persisted ledgers carry no blocking item.
+    assert len({r.prior_plan_subject for r in planners}) == 1 and len(planners) >= 3
+    assert all(
+        all(item.status not in {"blocking", "same-plan"} for item in r.prior_items)
+        for r in planners
+    )
+    assert _m1103_agent_calls(runner).count("codex") == 6
+    assert not any(NO_PROGRESS_PREFIX_TEXT in c["body"] for c in runner.issue_comments)
+
+
+def _np_panel_patches(base_rounds, *, base, item_id="item-1"):
+    """Planner patches keeping ``item_id`` open; each publishes the next listed round."""
+    outputs = []
+    for n, published in zip(base_rounds, base_rounds[1:]):
+        payload = {
+            "schema_version": 1,
+            "kind": "plan_revision_patch",
+            "semantic_patch_contract_version": 1,
+            "state": "blocking",
+            "summary": f"Keep the panel gap open, revision {n}.",
+            "prior_plan_item_dispositions": [
+                {"item_id": item_id, "disposition": "blocking", "note": "Out of scope."}
+            ],
+            "base_round_number": n,
+            "base_state_identity": base.state_identity,
+            "operations": [{
+                "op": "replace", "field": "plan_steps",
+                "value": [f"Implement the reviewed scope, panel revision {n}."],
+            }],
+        }
+        base = AuthenticatedPlanState.from_plan(
+            assemble_plan_revision(base, payload), round_number=published
+        )
+        outputs.append(json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude")
+    return outputs
+
+
+def test_plan_reset_received_after_the_panel_opens_restarts_the_window(tmp_path, monkeypatch):
+    """`plan-reset-window` after the panel opens: the reset is stamped on a
+    post-panel checkpoint, consumed once, and its floor persists on a flagless resume."""
+    _np_patch_observations(monkeypatch)
+    fresh, base = _m1103_fresh_base()
+    # Round 1: the primary approves; round 2 is the reviewer-only panel round,
+    # where Gemini blocks; every later revision keeps that item open.
+    gemini_first = structured_plan_review(
+        state="blocking", reviewer="Google Gemini", blocking_plan_issues=["Close the gap."]
+    )
+    gemini_keep = structured_plan_review(
+        state="blocking", reviewer="Google Gemini", prior_plan_item_dispositions=_NP_KEEP_ITEM
+    )
+    patches = _np_panel_patches([1, 3, 4, 5, 6, 7, 8], base=base)
+    # The first approval is of the fresh plan; later primary reviews (when the
+    # scheduler selects the primary) must account for the panel's item too.
+    approvals = [structured_plan_review(state="approved")] + [
+        structured_plan_review(state="blocking", prior_plan_item_dispositions=_NP_KEEP_ITEM)
+    ] * 10
+    runner = _FakeRunner(
+        claude_outputs=[fresh, *patches], codex_outputs=list(approvals),
+        gemini_outputs=[gemini_first] + [gemini_keep] * 10,
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=3)
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    history = list(runner.issue_comments)
+    used = sum(1 for cmd, _cwd in runner.commands if cmd[0] == "claude") - 1
+
+    def resumed(*, reset):
+        return _FakeRunner(
+            issue_comments=list(history), claude_outputs=patches[used:],
+            codex_outputs=list(approvals), gemini_outputs=[gemini_keep] * 10,
+        ), replace(config, max_rounds=10, plan_reset_stall_streak=reset)
+
+    # Without the reset the window through rounds 2-4 stops round 5.
+    no_reset, no_reset_config = resumed(reset=False)
+    with pytest.raises(HumanDecisionRequiredError, match="rounds 2-4"):
+        run_issue_loop(no_reset, issue_number=56, config=no_reset_config, plan_first=True)
+
+    reset_run, reset_config = resumed(reset=True)
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_issue_loop(reset_run, issue_number=56, config=reset_config, plan_first=True)
+    checkpoints = [
+        r for r in _plan_round_records(reset_run)
+        if r.phase == "scheduler-prelaunch" and r.scheduler_stall_reset
+    ]
+    # Consumed once, on a post-panel (non-primary) checkpoint that decodes valid.
+    assert len(checkpoints) == 1
+    assert checkpoints[0].scheduler_metadata_status == "valid"
+    assert checkpoints[0].scheduler_phase != "primary"
+    floor = checkpoints[0].round_number
+    assert f"rounds {floor}-{floor + 2}" in str(excinfo.value)
+    assert floor > 2
+
+    flagless = _FakeRunner(issue_comments=list(reset_run.issue_comments))
+    with pytest.raises(HumanDecisionRequiredError, match=f"rounds {floor}-{floor + 2}"):
+        run_issue_loop(flagless, issue_number=56, config=replace(config, max_rounds=10), plan_first=True)
+    assert _m1103_agent_calls(flagless) == []

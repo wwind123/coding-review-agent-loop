@@ -1323,19 +1323,20 @@ def plan_step_back_candidate_rounds(state: StepBackState | None) -> frozenset[in
     return frozenset(episode.candidate_round for episode in state.episodes)
 
 
-def plan_step_back_candidate_rounds_in_history(
+def plan_step_back_episodes_in_history(
     records: Sequence["PostedRoundRecord"],
     *,
     primary: str,
     current_issue_digest: str | None,
     config: object,
-) -> frozenset[int]:
-    """Every replay-derived step-back candidate round, across history boundaries.
+) -> tuple[StepBackEntry, ...]:
+    """Every replay-derived plan step-back episode, across history boundaries.
 
     A phase-advance or invalid scheduler record ends the primary walk, so the
     episodes of each primary segment are replayed from the records before that
-    boundary.  A step-back candidate keeps its reviewer notice after the panel
-    opens on it, as the recorded entry used to provide.
+    boundary and merged, oldest first, without duplicates.  Episodes from
+    before the panel opening therefore stay visible after it: the candidate
+    reviewer notice and the no-progress alternative summary both read them.
     """
     ordered = sorted(records, key=lambda item: item.index)
     cuts: list[int | None] = [
@@ -1345,14 +1346,31 @@ def plan_step_back_candidate_rounds_in_history(
         or (record.metadata.role == "summary" and record.metadata.phase == "plan-phase-advance")
     ]
     cuts.append(None)
-    rounds: set[int] = set()
+    seen: dict[tuple[int, int], StepBackEntry] = {}
     for cut in cuts:
         prefix = [record for record in ordered if cut is None or record.index < cut]
         state = derive_plan_step_back_state(
             prefix, primary=primary, current_issue_digest=current_issue_digest, config=config
         )
-        rounds.update(episode.candidate_round for episode in state.episodes)
-    return frozenset(rounds)
+        for episode in state.episodes:
+            seen.setdefault((episode.trigger_round, episode.record_index), episode)
+    return tuple(sorted(seen.values(), key=lambda episode: episode.record_index))
+
+
+def plan_step_back_candidate_rounds_in_history(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    current_issue_digest: str | None,
+    config: object,
+) -> frozenset[int]:
+    """Every replay-derived step-back candidate round, across history boundaries."""
+    return frozenset(
+        episode.candidate_round
+        for episode in plan_step_back_episodes_in_history(
+            records, primary=primary, current_issue_digest=current_issue_digest, config=config
+        )
+    )
 
 
 def mandatory_plan_findings_since(

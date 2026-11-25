@@ -2410,3 +2410,13 @@ def test_candidate_rounds_survive_the_panel_opening_phase_advance(_crossed_from_
     assert plan_step_back_candidate_rounds_in_history(
         with_advance, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
     ) == frozenset({3})
+    from coding_review_agent_loop.review_step_back import plan_step_back_episodes_in_history
+
+    episodes = plan_step_back_episodes_in_history(
+        with_advance, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
+    )
+    # The no-progress message reads the alternative from this merged history.
+    assert [(e.trigger_round, e.candidate_round) for e in episodes] == [(2, 3)]
+    assert plan_step_back_episodes_in_history(
+        records, primary=PRIMARY, current_issue_digest=DIGEST, config=_REPLAY_CONFIG
+    ) == episodes

@@ -269,6 +269,7 @@ from .review_step_back import (
     mandatory_plan_findings_since,
     plan_step_back_anchor,
     plan_step_back_candidate_rounds_in_history,
+    plan_step_back_episodes_in_history,
     step_back_alternative_summary,
 )
 from .no_progress import (
@@ -2211,15 +2212,20 @@ def _run_plan_first_loop_body(
                 f"; plan-growth measurements: {describe()}" if callable(describe) else ""
             )
             alternative: tuple[int, str] | None = None
-            step_back_state = (
-                plan_step_back_state(
-                    projected, panel_opening_index=plan_panel_evidence.opening_index
+            # Every primary segment, so an episode from before the panel
+            # opening still supplies its alternative after it.
+            episodes = (
+                plan_step_back_episodes_in_history(
+                    projected,
+                    primary=plan_primary_name,
+                    current_issue_digest=plan_issue_digest,
+                    config=config,
                 )
                 if plan_primary_name is not None
-                else None
+                else ()
             )
-            if step_back_state is not None:
-                for episode in reversed(step_back_state.episodes):
+            if episodes:
+                for episode in reversed(episodes):
                     summary = step_back_alternative_summary(projected, episode)
                     if summary is not None and summary.strip():
                         alternative = (episode.candidate_round, summary)

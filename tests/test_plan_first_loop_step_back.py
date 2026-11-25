@@ -1026,3 +1026,195 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
 # --- #2069: plan human-decision stops exit 4 with the three-part message -------
 
 
+
+
+# --- the no-progress message keeps a pre-panel step-back alternative (#2098) --
+
+
+def _np_keep_patches(base_rounds, *, base, item_id):
+    """Planner patches that keep ``item_id`` open, each changing the steps.
+
+    ``base_rounds`` are the rounds of the candidates the patches revise; each
+    revision publishes the next candidate at the following listed round.
+    """
+    outputs = []
+    for n, published in zip(base_rounds, base_rounds[1:]):
+        payload = {
+            "schema_version": 1,
+            "kind": "plan_revision_patch",
+            "semantic_patch_contract_version": 1,
+            "state": "blocking",
+            "summary": f"Keep revision {n}.",
+            "prior_plan_item_dispositions": [
+                {"item_id": item_id, "disposition": "blocking", "note": "Out of scope."}
+            ],
+            "base_round_number": n,
+            "base_state_identity": base.state_identity,
+            "operations": [{
+                "op": "replace", "field": "plan_steps",
+                "value": [f"Implement the reviewed scope, panel revision {n}."],
+            }],
+        }
+        base = AuthenticatedPlanState.from_plan(
+            assemble_plan_revision(base, payload), round_number=published
+        )
+        outputs.append(json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude")
+    return outputs
+
+
+def test_post_panel_no_progress_stop_keeps_the_pre_panel_alternative(tmp_path, monkeypatch):
+    """`plan-k-unchanged`: an episode from before the panel opening still supplies the
+    approach alternative of a later no-progress stop (the replay is per segment)."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from coding_review_agent_loop.no_progress import (
+        plan_no_progress_observations as real_observations,
+    )
+
+    def observations(records, **kwargs):
+        # A semantic patch can never return a byte-identical plan, so the
+        # observed subject is normalized to the live plan; every other window
+        # rule stays real.
+        live = next(
+            record.metadata.subject
+            for record in sorted(records, key=lambda item: item.index, reverse=True)
+            if record.metadata.role == "coder"
+        )
+        return tuple(replace(o, subject=live) for o in real_observations(records, **kwargs))
+
+    monkeypatch.setattr(plan_first_loop_module, "plan_no_progress_observations", observations)
+    fresh, base0 = _m1103_fresh_base()
+    codex1, claude1, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base_round2)
+    justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex_rest, claude_rest, base_round5 = _m1103_blocking_chain(3, 4, base=base_round3)
+    approve = structured_plan_review(
+        state="approved",
+        prior_plan_item_dispositions=[{"item_id": "item-4", "disposition": "resolved"}],
+    )
+    gemini_first = structured_plan_review(
+        state="blocking", reviewer="Google Gemini", blocking_plan_issues=["Close the panel gap."],
+    )
+    gemini_keep = structured_plan_review(
+        state="blocking", reviewer="Google Gemini",
+        prior_plan_item_dispositions=[{"item_id": "item-5", "disposition": "blocking"}],
+    )
+    runner = _FakeRunner(
+        claude_outputs=[
+            fresh, *claude1, justify, *claude_rest,
+            # Candidate 5 is reviewed again by the panel at round 6 (a
+            # reviewer-only phase advance), so its revision publishes round 7.
+            *_np_keep_patches([5, 7, 8, 9, 10, 11], base=base_round5, item_id="item-5"),
+        ],
+        codex_outputs=[*codex1, *codex2, *codex_rest, approve]
+        + [structured_plan_review(state="approved")] * 6,
+        gemini_outputs=[gemini_first] + [gemini_keep] * 6,
+    )
+    config = _staged_plan_config(
+        tmp_path, max_rounds=12, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+    )
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "- [item-5] Close the panel gap." in message
+    assert "Step-back approach alternative proposed at round 5 (excerpt): Close gap 4." in message
+    # The stop came after the panel opened (Gemini reviewed), with one step-back turn.
+    assert len(_m1251_prompts(runner, "gemini")) >= 3
+    assert sum(_STEP_BACK_MARKER in prompt for prompt in _m1251_prompts(runner, "claude")) == 1
+
+
+# --- legacy step-back fields are inert on a loop resume (#2098) ---------------
+
+
+def _legacy_variant(comments, variant):
+    """Inject a legacy step-back field into an otherwise identical history."""
+    from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
+
+    rewritten = []
+    for comment in comments:
+        body = comment["body"]
+        match = re.search(r"AGENT_LOOP_META: (\S+) -->", body)
+        if match is not None:
+            payload = decode_mapping(match.group(1))
+            planner = payload.get("flow") == "plan" and payload.get("role") == "coder"
+            primary_checkpoint = (
+                payload.get("phase") == "scheduler-prelaunch"
+                and payload.get("scheduler_phase") == "primary"
+            )
+            if variant == "valid" and planner and payload.get("round_number") == 5:
+                payload["step_back_entries"] = [
+                    {"phase": "plan", "reviewer": "Codex", "trigger_round": 4}
+                ]
+            elif variant == "valid-elsewhere" and planner and payload.get("round_number") == 3:
+                # A legacy entry naming a round the replay never triggers on.
+                payload["step_back_entries"] = [
+                    {"phase": "plan", "reviewer": "Codex", "trigger_round": 2}
+                ]
+            elif variant == "malformed" and planner:
+                payload["step_back_entries"] = [{"phase": "plan"}]
+            elif variant == "deferral" and primary_checkpoint:
+                payload["scheduler_step_back_deferral"] = True
+            body = body.replace(match.group(1), encode_mapping(payload))
+        rewritten.append(dict(comment, body=body))
+    return rewritten
+
+
+def _prompt_routing(runner):
+    """Per prompt: agent, step-back turn, reviewer notice, anchor and sweep request."""
+    return [
+        (
+            cmd[0],
+            _STEP_BACK_MARKER in cmd[-1],
+            _STEP_BACK_NOTICE in cmd[-1],
+            "simplified design" in cmd[-1],
+            "PRIMARY SWEEP REQUEST" in cmd[-1],
+        )
+        for cmd, _cwd in runner.commands
+        if cmd[0] in {"claude", "codex", "gemini"}
+    ]
+
+
+def test_legacy_step_back_fields_resume_identically_through_the_loop(tmp_path):
+    """`plan-resume-legacy` (resume integration): histories with an active
+    replay-derived episode and legacy entries absent, valid, malformed, or a
+    legacy deferral marker resume with identical outcomes and prompt routing."""
+    first, _error = _m1251_run(tmp_path, last_round=5, max_rounds=5)
+    # Round 5 reviewed the step-back candidate, so the episode is open.
+    assert _STEP_BACK_MARKER in _m1251_prompts(first, "claude")[-1]
+    fresh, base0 = _m1103_fresh_base()
+    _c, _cl, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    _justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex, claude, _base = _m1103_blocking_chain(3, 7, base=base_round3)
+    config = _staged_plan_config(
+        tmp_path, max_rounds=7, plan_growth_max_chars=4500, plan_growth_max_revisions=3
+    )
+    outcomes = {}
+    for variant in ("absent", "valid", "valid-elsewhere", "malformed", "deferral"):
+        history = (
+            list(first.issue_comments) if variant == "absent"
+            else _legacy_variant(first.issue_comments, variant)
+        )
+        decoded = _plan_round_records(_FakeRunner(issue_comments=history))
+        # The injected legacy field really decodes as that variant.
+        assert {
+            "absent": lambda: not any(r.step_back_entries for r in decoded),
+            "valid": lambda: any(r.step_back_entries for r in decoded),
+            "valid-elsewhere": lambda: any(r.step_back_entries for r in decoded),
+            "malformed": lambda: any(r.step_back_status == "invalid" for r in decoded),
+            "deferral": lambda: any(r.scheduler_step_back_deferral for r in decoded),
+        }[variant](), variant
+        rerun = _FakeRunner(
+            issue_comments=history, claude_outputs=claude[2:4], codex_outputs=codex[3:5]
+        )
+        with pytest.raises(AgentLoopError) as excinfo:
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+        outcomes[variant] = (
+            type(excinfo.value).__name__, str(excinfo.value), _prompt_routing(rerun),
+        )
+    baseline = outcomes["absent"]
+    assert "still reported blocking" in baseline[1]
+    # The open episode keeps the anchor and admits no second step-back.
+    assert not any(step_back for _a, step_back, *_rest in baseline[2])
+    assert any(anchor for _a, _s, _n, anchor, _sw in baseline[2])
+    for variant, outcome in outcomes.items():
+        assert outcome == baseline, variant

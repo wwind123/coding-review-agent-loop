@@ -408,7 +408,8 @@ reviews, and an empty live blocking set.
 The live candidate is the current plan subject plus the blocking IDs of the
 pre-round ledger. The message (lead empty, subject label `plan`) adds the plan
 size (characters plus the growth-assessment measurements) and the newest
-replay-derived step-back candidate's summary as the approach alternative, and
+step-back candidate's summary, replayed per primary segment so it survives the
+panel opening, as the approach alternative, and
 `stop_plan_pre_panel_decision` posts it once as a planning diagnostic and raises
 `PlanPrePanelHumanDecisionError` (exit 4) without a round record. The plan step-back and sweep
 stay prompts with internal thresholds (`PLAN_STEP_BACK_ROUNDS`,
