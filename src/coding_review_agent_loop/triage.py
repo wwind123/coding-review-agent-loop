@@ -594,7 +594,6 @@ def run_issue_triage(
             marker_description="structured issue_triage JSON object",
             validate=lambda text: parse_triage_response(text, allowed_signals=TRIAGE_REASON_SIGNALS),
             usage_context=usage_context,
-            use_repair=True,
             role="reviewer",
             label="triage",
             operation_description="advisory issue triage",

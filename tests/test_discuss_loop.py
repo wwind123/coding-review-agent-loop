@@ -2735,10 +2735,9 @@ def test_discuss_loop_analyzer_failure_falls_back_to_mechanical_agenda(tmp_path)
                 rebuttal="Objection stands.",
             ),
         ],
-        # The analyzer emits prose the strict parser rejects, and the repair
-        # backend output is also unusable, so the analyzer fails outright.
+        # The analyzer emits prose the strict parser rejects, so the analyzer
+        # fails outright.
         claude_outputs=["I could not produce a structured agenda, sorry."],
-        antigravity_outputs=[("still not a structured agenda", 0)],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
@@ -2764,10 +2763,8 @@ def test_discuss_loop_analyzer_failure_falls_back_to_mechanical_agenda(tmp_path)
     assert "Analyzer-extracted consensus" not in final
 
 
-def test_discuss_loop_rejects_repaired_hallucinated_analyzer_agenda(tmp_path):
-    from unittest.mock import patch
-
-    repaired = _discuss_agenda_text(
+def test_discuss_loop_rejects_reasked_hallucinated_analyzer_agenda(tmp_path):
+    hallucinated = _discuss_agenda_text(
         disagreements=[
             {
                 "topic": "Antigravity implementation strategy",
@@ -2803,16 +2800,19 @@ def test_discuss_loop_rejects_repaired_hallucinated_analyzer_agenda(tmp_path):
                 rebuttal="Split still fits.",
             ),
         ],
+        # The analyzer first narrates instead of answering; the same-agent
+        # re-ask (#2066) then returns a well-formed but hallucinated agenda.
         claude_outputs=[
-            "I've drafted the round-1 agenda but the write to the required response file needs your permission."
+            "I've drafted the round-1 agenda but the write to the required response file needs your permission.",
+            hallucinated,
         ],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
-        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
 
     assert result == 0
+    assert runner.claude_outputs == []  # the re-ask consumed the hallucinated agenda
     rendered = "\n".join(runner.comments)
     assert "Antigravity implementation strategy" not in rendered
     assert "levitation libraries" not in rendered
@@ -3149,9 +3149,9 @@ def test_discuss_loop_required_research_renders_sourced_facts(tmp_path):
     assert "Gemini CLI remains available for enterprise users." in final
 
 
-def test_discuss_loop_required_research_fails_when_repair_cannot_restore(tmp_path):
-    # conftest neuters the repair pass, so the missing research object survives
-    # repair and the debater invocation fails instead of being silently accepted.
+def test_discuss_loop_required_research_fails_when_research_stays_missing(tmp_path):
+    # The missing research object is never restored, so the debater
+    # invocation fails instead of being silently accepted.
     runner = FakeRunner(
         codex_outputs=[_discuss_review_text(outcome="implement")],
         gemini_outputs=[],

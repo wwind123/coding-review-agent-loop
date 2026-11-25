@@ -438,11 +438,6 @@ from .response_normalization import (
     strip_unknown_prior_item_dispositions,
     unknown_dispositions_are_resolved_history,
 )
-from .repair_preservation import (
-    require_recoverable_semantic_patch,
-    require_repair_architecture_impact_absent,
-    validate_repair_preservation,
-)
 from .runner import Runner
 
 from .local_test_evidence import (
@@ -869,8 +864,6 @@ from .architecture_contract import (
     _surface_decomposition_degradations,
     _architecture_impact_from_metadata,
     _resumed_review_architecture,
-    _acknowledgement_repair_forbids_assessment,
-    _pin_acknowledgement_repair,
     _surface_refused_decomposition,
     _ArchitectureImpactContractUnsatisfied,
 )

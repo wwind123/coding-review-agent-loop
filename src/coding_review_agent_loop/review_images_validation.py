@@ -9,7 +9,7 @@ from .response_normalization import attempt_envelope_normalization
 
 def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, prompt,
                         validate, role=None, session_id=None, timeout_seconds=None,
-                        label=None, use_repair=False, repair_expected_kind=None,
+                        label=None, repair_expected_kind=None,
                         strict_revalidate=None, usage_context=None, **_unused):
     """Normalize the text envelope only; never reassess or resume the image turn.
 

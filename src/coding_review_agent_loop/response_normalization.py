@@ -4,8 +4,7 @@ Every function here rewrites only mechanically recoverable defects (envelope
 material, lossless aliases, lone-string matrix list fields, unknown prior-item
 dispositions proven to be resolved history, architecture status near misses)
 and never calls a model.  The caller re-validates every rewritten candidate.
-They used to live in ``repair.py`` / ``repair_preservation.py``; they now run
-for every validated turn, independent of the retired repair flag.
+They run for every validated turn.
 """
 
 from __future__ import annotations
@@ -72,8 +71,8 @@ def _payload(text: str) -> dict | None:
 def recover_payload(text: str) -> dict | None:
     """Return the JSON object mechanically recoverable from *text*, if any.
 
-    Shared with the repair admission gate so the gate and the grounding guard
-    agree on exactly which sources carry a recoverable structured payload.
+    Shared by the validated turn and the architecture acceptance boundary so
+    both agree on exactly which sources carry a recoverable structured payload.
     """
     return _payload(text)
 
@@ -355,7 +354,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 def attempt_semantic_patch_disposition_normalization(raw: str) -> str | None:
     """Rename the lossless ``rationale`` disposition alias to ``note``.
 
-    This is deliberately narrower than model repair: it neither selects nor
+    This is deliberately narrow: it neither selects nor
     changes a disposition, and it refuses ambiguous rows that contain both
     names. The strict semantic-patch parser remains authoritative afterward.
     """
@@ -397,7 +396,7 @@ def attempt_semantic_patch_disposition_normalization(raw: str) -> str | None:
 
 @dataclass(frozen=True)
 class ArchitectureNearMissNormalization:
-    """Pre-repair normalization result; the record stays out of band."""
+    """Near-miss normalization result; the record stays out of band."""
 
     raw: str
     record: ParseDegradation | None
@@ -442,17 +441,16 @@ def canonicalize_architecture_near_miss_text(text: str) -> str:
 def normalize_architecture_impact_near_miss(
     raw: str, *, required_contract: bool, expected_kind: str | None = None
 ) -> ArchitectureNearMissNormalization:
-    """Resolve the status near miss in the raw payload before repair (#924).
+    """Resolve the status near miss in the raw payload before validation (#924).
 
-    Deterministic normalization runs before the LLM repair pass.  A
-    corroborated `modified` becomes a wire-valid `changed` that preservation
-    then pins; every other near miss has its whole optional object removed,
+    Deterministic normalization runs before any same-agent re-ask.  A
+    corroborated `modified` becomes a wire-valid `changed`; every other near miss has its whole optional object removed,
     which is exactly what the parser-only `undetermined` status stands for.
     Any other payload, including an unparseable one, is returned unchanged.
 
     The absence pin has two triggers.  A normalization removal is pinned for
-    every kind, including optional-assessment reviews, so repair can never put
-    back a stronger claim.  Under a required contract, a recoverable source of
+    every kind, including optional-assessment reviews, so a later candidate can
+    never put back a stronger claim.  Under a required contract, a recoverable source of
     the expected kind that simply omits the assessment is pinned too.
     """
     normalized, record, payload, removed = _rewrite_architecture_near_miss(raw)

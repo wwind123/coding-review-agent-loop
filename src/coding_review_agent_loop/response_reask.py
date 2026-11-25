@@ -91,7 +91,7 @@ def _redact(text: str, *, config: AgentLoopConfig | None = None) -> str:
 
 
 def _sanitize_diagnostic(text: str, *, config: AgentLoopConfig | None = None) -> str:
-    """Redact and reduce backend diagnostics to their last error line (moved from repair.py)."""
+    """Redact and reduce backend diagnostics to their last error line."""
     clean = _redact(text, config=config)
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
     matching = [line for line in lines if _KNOWN_ERROR_RE.search(line)]

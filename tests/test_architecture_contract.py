@@ -241,48 +241,11 @@ def test_resumed_review_architecture_comes_from_round_metadata():
     assert architecture_contract._resumed_review_architecture(legacy, impact) == (impact, ())
 
 
-def test_acknowledgement_repair_pins_the_accepted_assessment(tmp_path):
-    record = architecture_contract.ParseDegradation.build(
-        element_path="pr_review.architecture_impact.status", rule="r",
-        observed="modified", outcome="degraded-to-undetermined",
-    )
-    accepted = SimpleNamespace(architecture_impact=None, architecture_impact_degradations=(record,))
-    fabricated = pr_loop._validate_review_response(
-        _deg_with(_r2_pr_review(), {"status": "unchanged", "rationale": "No change."}),
-        reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
-    )
-    config = make_config(tmp_path)
-    assert architecture_contract._pin_acknowledgement_repair(
-        accepted, fabricated, config=config, reviewer_name="Codex"
-    ) is None
-    ack_only = pr_loop._validate_review_response(
-        _deg_with(_r2_pr_review(), None),
-        reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
-    )
-    pinned = architecture_contract._pin_acknowledgement_repair(
-        accepted, ack_only, config=config, reviewer_name="Codex"
-    )
-    assert pinned.architecture_impact is None
-    assert pinned.architecture_impact_degradations == (record,)
-    # Absence is pinned for the repair when the accepted source has none.
-    assert architecture_contract._acknowledgement_repair_forbids_assessment(_deg_with(_r2_pr_review(), None))
-    # New repair output is validated strictly: a legacy synonym is rejected.
+
+
+def test_strict_review_validation_rejects_a_legacy_status_synonym():
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
         pr_loop._validate_review_response(
             _deg_with(_r2_pr_review(), {"status": "none", "rationale": "No change."}),
             reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
         )
-
-
-def test_acknowledgement_equality_check_refuses_a_changed_assessment_directly(tmp_path):
-    # Defense in depth behind preservation: any durable difference fails.
-    accepted = validate_structured_plan_state(
-        _deg_with(structured_plan_state(), dict(_DEG_CORROBORATED, status="changed"))
-    )
-    altered = replace(
-        accepted,
-        architecture_impact=replace(accepted.architecture_impact, rationale="Different."),
-    )
-    assert architecture_contract._pin_acknowledgement_repair(
-        accepted, altered, config=make_config(tmp_path), reviewer_name="Codex"
-    ) is None

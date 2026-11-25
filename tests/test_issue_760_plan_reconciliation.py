@@ -34,7 +34,6 @@ from coding_review_agent_loop.unresolved_items import (
     _validate_review_response,
     _apply_unresolved_item_dispositions,
 )
-from coding_review_agent_loop.repair import _build_repair_prompt
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "issue_760_plan_reconciliation.json"
@@ -249,7 +248,7 @@ def test_real_review_and_followup_renderers_couple_budget_omission_to_guidance(t
     assert "For each concern against a verified canonical plan" not in followup
 
 
-def test_coder_followup_and_repair_guidance_separate_plan_conflicts_from_fixes(tmp_path):
+def test_coder_followup_guidance_separates_plan_conflicts_from_fixes(tmp_path):
     context = _plan_context(_scenarios()[0]["plan_context"])
     config = make_config(tmp_path, reviewer=("codex",))
     followup = build_followup_prompt(
@@ -259,21 +258,14 @@ def test_coder_followup_and_repair_guidance_separate_plan_conflicts_from_fixes(t
         config,
         approved_plan_context=context,
     )
-    repair = _build_repair_prompt(
-        "malformed",
-        expected_kind="coder_followup",
-        unresolved_item_ids=("item-1",),
+    normalized = " ".join(followup.split())
+    assert "mutually incompatible with a verified approved-plan decision" in normalized
+    assert "never" in normalized and "remaining_items" in normalized
+    assert "evidence-backed correctness, security, compatibility, or test defects" in normalized
+    assert (
+        "never disputed merely because the implementation followed the plan" in normalized
+        or "must never be disputed merely because the implementation followed the plan" in normalized
     )
-
-    for text in (followup, repair):
-        normalized = " ".join(text.split())
-        assert "mutually incompatible with a verified approved-plan decision" in normalized
-        assert "never" in normalized and "remaining_items" in normalized
-        assert "evidence-backed correctness, security, compatibility, or test defects" in normalized
-        assert (
-            "never disputed merely because the implementation followed the plan" in normalized
-            or "must never be disputed merely because the implementation followed the plan" in normalized
-        )
 
 
 @pytest.mark.parametrize(

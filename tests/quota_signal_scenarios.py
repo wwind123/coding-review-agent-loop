@@ -442,7 +442,7 @@ def main():
         monkeypatch = stack.enter_context(pytest.MonkeyPatch.context())
         fixture_args = {'monkeypatch': monkeypatch, 'tmp_path_factory': factory}
         fixtures = (
-            '_retired_repair_seams', '_isolated_agy_log_dir', '_no_real_github_backoff',
+            '_isolated_agy_log_dir', '_no_real_github_backoff',
             '_reset_checkout_baselines', '_fake_runner_private_transport',
             '_stub_tool_provenance', '_agent_commands_available',
             '_isolate_worker_budget_environment', '_isolate_workdir_claims',

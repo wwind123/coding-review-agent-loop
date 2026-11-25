@@ -599,9 +599,8 @@ launcher uses `-I` and prepends these paths, preventing cwd, `PYTHONPATH`, user-
 or a retargeted startup `current` symlink from changing its code or dependencies.
 
 Both `runner.py` launch paths (pipe and PTY) apply `agent_executable_environment`
-after backend merging and before broker/containment preparation. Direct Gemini
-repair and legacy `repair.py` spawns use `pinned_agent_environment` to merge guards
-before pinning. Only the launcher directory is prepended, never the venv `bin`;
+after backend merging and before broker/containment preparation; no agent is
+spawned outside the runner. Only the launcher directory is prepended, never the venv `bin`;
 prior copies are removed without changing other entries, including empty cwd
 entries. The exported `AGENT_LOOP_EXECUTABLE` composes with the coder guard:
 `<launcher dir>:<guard dir>:<pre-guard PATH>`. The guard strips only its directory;

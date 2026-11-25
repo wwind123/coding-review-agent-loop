@@ -53,7 +53,7 @@ def test_missing_row_triggers_one_same_session_reask_and_corrected_map_is_adopte
     assert reask_prompt.startswith(h.calls[0]["prompt"])
     assert "row-man: missing-row" in reask_prompt
     assert "This is the only coverage re-ask" in reask_prompt
-    # No repair/fallback invocation: only the pre-existing post-auth correction
+    # No fallback invocation: only the pre-existing post-auth correction
     # (caused by the fake selectors, never by coverage) may use run_agent_result.
     assert all(k.get("label") == "semantic-evidence-correction" for _a, k in h.agent_result_calls)
     comment = h.coder_comment()
@@ -591,7 +591,6 @@ def test_workflow_every_real_acceptance_path_reaches_the_single_coverage_reask(t
 
     incomplete, ok = _real_agent_texts()
     outputs = [incomplete, ok, ok]
-    repair_calls = []
     if path == "reask":
         outputs = [incomplete.replace('"kind"', "kind", 1), incomplete, ok, ok]
     elif path == "failed-exit-artifact":
@@ -613,7 +612,6 @@ def test_workflow_every_real_acceptance_path_reaches_the_single_coverage_reask(t
     assert "row-man: missing-row" in commands[-1][-1]
     if path == "reask":
         assert "re-ask 1 of 2" in commands[1][-1]
-    assert repair_calls == []
     comment = h.coder_comment()
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert h.run_pr_calls
@@ -859,15 +857,10 @@ def test_workflow_envelope_normalization_reaches_the_single_coverage_reask(tmp_p
 
     incomplete, ok = _real_agent_texts()
     # Reversed footer/signature order is a recoverable envelope defect that the
-    # deterministic normalizer fixes without any repair model.
+    # deterministic normalizer fixes without a re-ask.
     payload, end = json.JSONDecoder().raw_decode(incomplete)
     reversed_envelope = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[reversed_envelope, ok, ok])
-    repair_calls = []
-    monkeypatch.setattr(
-        validated_agent_module, "attempt_repair",
-        lambda raw, *a, **k: repair_calls.append(1) or incomplete,
-    )
     normalized = []
     real_normalize = validated_agent_module.attempt_envelope_normalization
     monkeypatch.setattr(
@@ -879,7 +872,6 @@ def test_workflow_envelope_normalization_reaches_the_single_coverage_reask(tmp_p
     commands = _claude_commands(h)
     assert len(commands) == 2
     assert "row-man: missing-row" in commands[-1][-1]
-    assert repair_calls == []
     comment = h.coder_comment()
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert h.run_pr_calls

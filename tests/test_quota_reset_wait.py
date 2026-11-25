@@ -23,7 +23,6 @@ from coding_review_agent_loop import (
 from coding_review_agent_loop.agents.base import AgentResult
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from test_semantic_evidence_repair_routing import (
-    _forbid_repair,
     _implementation_with_claim,
     _observation,
     _sequenced_validator,
@@ -139,9 +138,6 @@ def test_unparsed_reset_keeps_ordinary_retry_and_never_waits(tmp_path, slept):
 # --- quota-replay-frozen -------------------------------------------------------
 
 def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, slept, monkeypatch):
-    patch_attr_in(
-        monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair
-    )
     results = [
         AgentResult(text=_implementation_with_claim(), returncode=0, session_id="s-first"),
         _claude_limit(),
@@ -155,7 +151,7 @@ def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, 
         response = validated_agent._run_validated_agent(
             FakeRunner(), agent="claude", config=config, prompt="Implement the issue.",
             marker_description="structured issue_implementation result",
-            validate=_sequenced_validator(catalogs, invoke), role="coder", use_repair=True,
+            validate=_sequenced_validator(catalogs, invoke), role="coder",
             repair_expected_kind="issue_implementation", session_id="caller",
             reask_on_evidence_rejection=True,
         )

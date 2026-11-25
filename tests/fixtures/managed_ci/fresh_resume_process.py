@@ -86,10 +86,7 @@ class ReviewBoundary(Exception):
 
 
 def drive(path, workdir, *, create, direct, strict):
-    from coding_review_agent_loop import git_transport, workdir_claims, validated_agent
-    # As in conftest, an invalid fake agent response must fail locally rather
-    # than invoking a real provider from this independent interpreter.
-    validated_agent.attempt_repair = lambda *args, **kwargs: None
+    from coding_review_agent_loop import git_transport, workdir_claims
     workdir_claims._set_claim_root_for_tests(workdir / "claims")
     def import_ref(destination, source_ref, tracking_ref, *, runner, **kwargs):
         if source_ref.startswith("refs/pull/"):

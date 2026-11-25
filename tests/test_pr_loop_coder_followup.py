@@ -1917,10 +1917,9 @@ def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
     assert "Latest coder turn evidence" not in str(without.value)
 
 
-# --- #1626: dropped test_observations, repair-first, and evidence progress ---
+# --- #1626: dropped test_observations and evidence progress ---
 
 import coding_review_agent_loop.local_test_evidence as _evidence_module_1626  # noqa: E402
-import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
 
 _CMD_1626 = ("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0")
 _CMD_TEXT_1626 = "python3 -m pytest tests/test_x.py -q -n 0"
@@ -2018,40 +2017,19 @@ def _evidence_reviews_1626(carried_rounds, *, final="approved"):
 
 
 def _run_evidence_loop_1626(
-    tmp_path, monkeypatch, *, coder_outputs, turn_receipts, reviews, repair_output=None,
-    runner_class=None,
+    tmp_path, monkeypatch, *, coder_outputs, turn_receipts, reviews, runner_class=None,
 ):
-    """Drive run_pr_loop through the real validated turn and execute_repair.
-
-    The stubbed repair model stands in for a real repair launch: it replaces
-    the runner's latest test turn and captures no receipts.
-    """
+    """Drive run_pr_loop through the real validated turn."""
     runner = (runner_class or _EvidenceRunner1626)(
         turn_receipts=turn_receipts, tmp_path=tmp_path,
         codex_outputs=reviews, claude_outputs=coder_outputs,
     )
-    repair_launches = []
-
-    def repair_launch(launch_runner, config, prompt, *, model, log_path):
-        launch_runner._latest_test_turn_id = f"repair-turn-{len(repair_launches) + 1}"
-        repair_launches.append(prompt)
-        text = repair_output or ""
-        return SimpleNamespace(
-            text=text, returncode=0 if text else 1, raw_output=text or "repair unavailable",
-            usage=None, raw_usage=None, observed_model=None, text_source="stdout",
-        )
-
-    monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
-    monkeypatch.setattr(_repair_module_1626, "run_cli_repair", repair_launch)
-    config = make_config(
-        tmp_path, coder="claude", reviewer="codex", max_rounds=8,
-        repair_backend="claude", repair_models=("repair-model",), quiet=False,
-    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=8, quiet=False)
     try:
         outcome = run_pr_loop(runner, pr_number=77, config=config)
     except AgentLoopError as exc:
         outcome = exc
-    return outcome, runner, repair_launches
+    return outcome, runner
 
 
 def _reviews_run_1626(runner):
@@ -2063,7 +2041,7 @@ def test_uncited_supersession_or_no_supersession_stops_at_the_window_1626(tmp_pa
     from coding_review_agent_loop.errors import HumanDecisionRequiredError
 
     # (a) Supersession by this turn's pass, but no surviving citation cites it.
-    outcome, runner, _launches = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path / "uncited", monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([])],
         turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
@@ -2074,7 +2052,7 @@ def test_uncited_supersession_or_no_supersession_stops_at_the_window_1626(tmp_pa
     live = runner.last_reconciled_local_test_evidence
     assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by == "pass-2"
     # (b) Nothing superseded by a coder-turn receipt.
-    outcome, runner, _launches = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path / "none", monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("fail-1")])],
         turn_receipts=[(), ()],
@@ -2091,7 +2069,7 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
     """Matrix row `grant-not-from-bounded-eviction`."""
     # A cited receipt cannot fit: #1758 requires an explicit capacity stop.
     monkeypatch.setattr(_evidence_module_1626, "MAX_ROUND_BYTES", 300)
-    outcome, runner, _launches = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path, monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("pass-2")])],
         # An incompatible pass: reconciliation adds a caveat, supersedes nothing.
@@ -2257,7 +2235,7 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
     )
     monkeypatch.setattr(evidence, "stable_tracked_tree_snapshot", lambda _cwd: snapshot)
     monkeypatch.setitem(globals(), "_EvidenceRunner1626", UnstableRunner)
-    outcome, runner, launches = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path, monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("pass-2")])],
         turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin" if compatible else "/changed"})]],
@@ -2267,7 +2245,6 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
     failure = next(row for row in live.observations if row.receipt_id == "fail-1")
     assert failure.attribution.stable is False
     assert failure.attribution.head is None
-    assert not launches
     if compatible:
         assert outcome == 0, outcome
         assert _reviews_run_1626(runner) == 3
@@ -2305,7 +2282,7 @@ def test_saturated_no_commit_citations_reach_next_review_1758(tmp_path, monkeypa
     if at_threshold:
         outputs.insert(0, _followup_1626())
         receipts.insert(0, ())
-    outcome, runner, _ = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path, monkeypatch, coder_outputs=outputs, turn_receipts=receipts,
         reviews=_evidence_reviews_1626(int(at_threshold)),
     )
@@ -2592,8 +2569,7 @@ def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monke
 
 
 @pytest.mark.parametrize("dispatch", ["ordinary", "same-pr", "conflict"])
-@pytest.mark.parametrize("repair_future", [False])
-def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatch, dispatch, repair_future):
+def test_excluded_evidence_1868_dispatch_records(tmp_path, monkeypatch, dispatch):
     from pr_loop_test_helpers import _evidence_review, _EVIDENCE_TEXT, _pr_records
     from coding_review_agent_loop.round_metadata import (
         _serialize_unresolved_item,
@@ -2628,49 +2604,8 @@ def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatc
         runner.codex_outputs = [json.dumps(payload) + raw[end:], final]
     logs = []
     monkeypatch.setattr(pr_loop, "log", lambda config, message: logs.append(message))
-    repair_calls = []
-    if not repair_future:
-        import coding_review_agent_loop.validated_agent as validated_module
-        def unexpected_repair(*args, **kwargs):
-            pytest.fail("Excluded remaining evidence must not invoke repair")
-        monkeypatch.setattr(validated_module, "attempt_repair", unexpected_repair)
-    if repair_future:
-        coder = coder.replace("item-2", "item-3")
-        import coding_review_agent_loop.repair as repair_module
-        import coding_review_agent_loop.validated_agent as validated_module
-        from unittest.mock import patch, MagicMock
-        final = final.replace('"item_id": "item-2", "disposition": "blocking"', '"item_id": "item-2", "disposition": "future"')
-        end = final.index("\n<!-- AGENT_STATE:")
-        payload = json.loads(final[:end])
-        payload["prior_item_dispositions"].append({"item_id": "item-3", "disposition": "blocking", "note": "Evidence still pending."})
-        runner.codex_outputs[1] = json.dumps(payload) + final[end:]
-        raw = runner.codex_outputs[0]
-        end = raw.index("\n<!-- AGENT_STATE:")
-        payload = json.loads(raw[:end])
-        payload["future_followups"] = ["Later cache locking work."]
-        runner.codex_outputs[0] = json.dumps(payload) + raw[end:]
-        end = coder.index("\n<!-- AGENT_STATE:")
-        payload = json.loads(coder[:end])
-        payload["disputed_items"] = ["item-2"]
-        payload["dispute_evidence"] = {"item-2": "Future work is unnecessary."}
-        runner.claude_outputs = [json.dumps(payload) + "\nUnrelated malformed prose.\n" + coder[end:]] * 2
-        real_repair = repair_module.attempt_repair
-
-        def repair(raw, command, **kwargs):
-            repair_calls.append(kwargs)
-            with patch.object(repair_module.subprocess, "run", return_value=MagicMock(returncode=0, stdout=coder)) as call:
-                result = real_repair(raw, command, **kwargs)
-            prompt = call.call_args.args[0]
-            prompt = prompt[prompt.index("--prompt") + 1]
-            assert "## Optional coder follow-up item IDs:" not in prompt
-            assert "complete set of valid IDs" in prompt
-            return result
-        monkeypatch.setattr(validated_module, "attempt_repair", repair)
     with pytest.raises(AgentLoopError, match="final barrier"):
         run_pr_loop(runner, pr_number=77, config=config)
-    if repair_future:
-        assert repair_calls and all(call["unresolved_item_ids"] == ("item-1",) for call in repair_calls)
-        assert all(not call.get("optional_item_ids") for call in repair_calls)
     records = _pr_records(runner)
     coder_records = [record for record in records if record.metadata.role == "coder"]
     assert coder_records
@@ -2679,7 +2614,7 @@ def test_excluded_evidence_1868_dispatch_records_and_repair(tmp_path, monkeypatc
                 if item.obligation_kind == "human-exact-head-evidence"]
     assert evidence and all(item.lifecycle != "cleared" for item in evidence)
     assert all(_deserialize_unresolved_item(_serialize_unresolved_item(item)) == item for item in evidence)
-    assert "listed excluded ledger item(s) " + ("item-3" if repair_future else "item-2") in "\n".join(logs)
+    assert "listed excluded ledger item(s) item-2" in "\n".join(logs)
 
 
 class _LargeReceiptRunner1995(_EvidenceRunner1626):
@@ -2713,7 +2648,7 @@ def test_nine_cited_fixture_receipts_over_the_cap_publish_and_resolve_1995(tmp_p
     """
     receipts = [(f"pass-{i}", "passed", {"PATH": "/usr/bin"}) for i in range(9)]
     cited = [_citation_1626(receipt_id) for receipt_id, _outcome, _env in receipts]
-    outcome, runner, _launches = _run_evidence_loop_1626(
+    outcome, runner = _run_evidence_loop_1626(
         tmp_path, monkeypatch,
         coder_outputs=[_followup_1626(), _followup_1626(cited)],
         turn_receipts=[(), receipts],

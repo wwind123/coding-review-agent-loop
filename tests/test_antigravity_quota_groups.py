@@ -468,46 +468,6 @@ def test_parallel_memory_through_production_reviewer_launcher(tmp_path):
         assert early.models[early.model_index] == OPUS
 
 
-def test_multiple_overrides_and_out_of_chain_repair_model(tmp_path, monkeypatch):
-    import sys
-
-    from coding_review_agent_loop import repair as repair_module
-    from coding_review_agent_loop.repair import execute_repair
-
-    # test_antigravity_module_imports_without_fcntl re-imports the module, so
-    # the module-level ``agy`` can be stale on a shared worker; patch the live
-    # module whose backend class the repair chain really uses.
-    agy = sys.modules[repair_module.AntigravityBackend.__module__]
-
-    monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
-    overrides = ((GEM1, "g1"), (GEM2, "g1"), (OPUS, "g2"))
-    config = make_config(
-        tmp_path, antigravity_models=MULTI_GEMINI_CHAIN, antigravity_quota_groups=overrides,
-        repair_models=("Out Of Chain Model",),
-    )
-    state = agy.AntigravityAttemptState.from_config(config, 1)
-    assert state.groups == ("g1", "g1", "gemini", "gemini", "g2")
-    captured = []
-    real_run = agy.AntigravityBackend.run
-
-    def spy(self, runner, cfg, *args, **kwargs):
-        captured.append(cfg)
-        return real_run(self, runner, cfg, *args, **kwargs)
-
-    memories_before = dict(agy._run_memories)
-    with patch.object(agy.AntigravityBackend, "run", spy):
-        execute_repair(
-            malformed_pr_review_source(state="approved"),
-            runner=FakeRunner(antigravity_outputs=[("not structured", 0)] * 8),
-            config=config, run_id="r", usage_context=None,
-            validate=lambda t: (_ for _ in ()).throw(AgentLoopError("invalid")),
-            expected_kind="pr_review",
-        )
-    assert captured and all(c.antigravity_quota_groups == overrides for c in captured)
-    assert captured[0].antigravity_models == ("Out Of Chain Model",)
-    assert agy._run_memories == memories_before
-
-
 def test_interleaved_custom_chain_never_invokes_exhausted_group(tmp_path):
     chain = ("Gemini A", "Claude B", "Gemini C")
     with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
@@ -600,32 +560,6 @@ def test_unverified_reset_with_retry_budget_on_opus_retries_same_model_then_fail
     assert len(sleeps) == 1
     assert type(error) is AgentInvocationError
     assert not isinstance(error, QuotaResetExceededError)
-
-
-def test_format_repair_never_reads_or_marks_quota_memory(tmp_path, monkeypatch):
-    from coding_review_agent_loop.repair import execute_repair
-
-    monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
-    touched = []
-
-    def boom(*_a, **_k):
-        touched.append("access")
-        raise AssertionError("repair touched quota memory")
-
-    config = make_config(tmp_path, repair_models=("Out Of Chain Model",))
-    with workdir_claims.workdir_claim_scope(), \
-            patch.object(agy, "quota_memory_for_current_run", boom), \
-            patch.object(agy.AntigravityQuotaGroupMemory, "mark_exhausted", boom), \
-            patch.object(agy.AntigravityQuotaGroupMemory, "is_exhausted", boom), \
-            patch.object(agy.AntigravityAttemptState, "from_config", boom):
-        execute_repair(
-            malformed_pr_review_source(state="approved"),
-            runner=FakeRunner(antigravity_outputs=[(LIVE_SAMPLE, 1)] * 8),
-            config=config, run_id="r", usage_context=None,
-            validate=lambda t: (_ for _ in ()).throw(AgentLoopError("invalid")),
-            expected_kind="pr_review",
-        )
-    assert touched == []
 
 
 def test_every_unavailable_stop_is_a_transient_category(tmp_path):
@@ -989,17 +923,12 @@ def _silent_turn(tmp_path, log_dir, outputs, agy_logs, *, spawn_wall_time=None, 
     logs: list[str] = []
     repairs: list[object] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
     try:
         with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
-                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)), \
-                patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)):
             response = validated_agent._run_validated_agent(
                 runner, agent="antigravity", config=config, prompt="PROMPT",
-                marker_description="none", validate=_strict_validate, use_repair=True,
+                marker_description="none", validate=_strict_validate,
             )
         error = None
     except (AgentInvocationError, QuotaResetExceededError) as exc:
@@ -1310,19 +1239,14 @@ def _review_turn(tmp_path, outputs, *, models, agent_max_retries=1, runner=None)
     logs: list[str] = []
     repairs: list[object] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
     try:
         with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
-                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)), \
-                patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)):
             response = validated_agent._run_validated_agent(
                 runner, agent="antigravity", config=config, prompt="Review this PR.",
                 marker_description="structured pr_review",
                 validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-                use_repair=True, repair_expected_kind="pr_review", role="reviewer",
+                repair_expected_kind="pr_review", role="reviewer",
             )
         error = None
     except (AgentInvocationError, QuotaResetExceededError) as exc:

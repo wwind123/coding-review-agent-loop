@@ -51,7 +51,6 @@ from .protocol_common import (
 )
 from .response_normalization import (
     canonicalize_architecture_near_miss_text,
-    recover_payload,
     remove_prior_item_dispositions,
 )
 from .runner import Runner
@@ -65,9 +64,8 @@ from .protocol_markers import TrustedBody, sanitize_historical_text
 from .agent_failure import ValidatedAgentResponse
 
 
-# Validation may invoke format repair, whose runner intentionally starts a new
-# broker turn. Keep the acquisition snapshot in a context-local seam so the
-# existing validators continue to receive the coder turn while repair runs.
+# Keep the acquisition snapshot in a context-local seam so the existing
+# validators receive the acquisition of the coder turn being validated.
 _VALIDATION_TEST_TURN_CONTEXT: ContextVar[
     tuple[Runner, str | None, tuple[object, ...]] | None
 ] = ContextVar("validation_test_turn_context", default=None)
@@ -1039,44 +1037,6 @@ def _resumed_review_architecture(
         return legacy_reparse, ()
     impact = _architecture_impact_from_metadata(getattr(metadata, "architecture_impact", None))
     return impact, tuple(getattr(metadata, "architecture_impact_degradations", ()) or ())
-
-
-def _acknowledgement_repair_forbids_assessment(review_output: str) -> bool:
-    """An acknowledgement repair may not add an assessment the source lacks.
-
-    It exists only to add the acknowledgement, so absence is pinned whether
-    the review omitted the assessment or a degraded one was removed.
-    """
-    payload = recover_payload(review_output)
-    return isinstance(payload, dict) and "architecture_impact" not in payload
-
-
-def _pin_acknowledgement_repair(
-    accepted: object | None,
-    repaired: object | None,
-    *,
-    config: AgentLoopConfig,
-    reviewer_name: str,
-) -> object | None:
-    """Keep the accepted assessment and records through an acknowledgement repair.
-
-    A repair whose assessment differs, in its durable shape, from the accepted
-    one is a failed repair; otherwise the accepted records are reattached.
-    """
-    if repaired is None or accepted is None:
-        return repaired
-    if sanitize_architecture_impact(repaired.architecture_impact) != sanitize_architecture_impact(
-        accepted.architecture_impact
-    ):
-        log(
-            config,
-            f"{reviewer_name}: acknowledgement repair changed the accepted architecture_impact; "
-            "treating the repair as failed",
-        )
-        return None
-    return dataclasses_replace(
-        repaired, architecture_impact_degradations=accepted.architecture_impact_degradations
-    )
 
 
 def _surface_refused_decomposition(

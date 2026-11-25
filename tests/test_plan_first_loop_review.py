@@ -5,7 +5,6 @@ import coding_review_agent_loop.plan_execution as plan_execution
 import json
 import re
 from dataclasses import replace
-from unittest.mock import patch
 
 import pytest
 
@@ -1405,13 +1404,6 @@ def test_acknowledgement_blockers_propagate_through_plan_revision(
         return real_prompt(*args, **kwargs)
 
     monkeypatch.setattr(plan_first_loop_module, "build_plan_revision_prompt", revision_prompt)
-    repair_inputs = []
-
-    def exhausted(text, **kwargs):
-        repair_inputs.append((text, tuple(kwargs["repair_kwargs"]["reviewer_requirement_ids"])))
-        return text, None, ()
-
-    monkeypatch.setattr(plan_first_loop_module, "_run_structured_repair", exhausted)
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), max_rounds=2,
         plan_execution_mode="plan-only",
@@ -1440,14 +1432,13 @@ def test_acknowledgement_blockers_propagate_through_plan_revision(
         "before plan approval."
     )
     assert all("Orchestrator plan review:\n\n" + item.text in feedback for item in items)
-    # No acknowledgement repair runs any more (#2066): the missing marker is
-    # re-injected as the blocking item above and the reviewer is asked again.
-    assert repair_inputs == []
+    # The missing acknowledgement is re-injected as the blocking item above
+    # and the reviewer is asked again (#2066).
     records = _plan_round_records(runner)
     revised = next(r for r in records if r.role == "coder" and r.round_number == 2)
     assert [item.item_id for item in revised.prior_items] == item_ids
     assert [item.text for item in revised.prior_items] == [item.text for item in items]
-    # The reconciliation checkpoint remains before final acknowledgement repair.
+    # The reconciliation checkpoint remains before the final acknowledgement gate.
     checkpoints = [r for r in records if r.phase == "reconciliation" and r.round_number == 1]
     assert len(checkpoints) == int(missing_panel)
     assert all(not checkpoint.new_items for checkpoint in checkpoints)
@@ -1472,10 +1463,9 @@ def test_acknowledgement_gate_bypasses_unnecessary_blockers(tmp_path, monkeypatc
     ), "get_issue_context", context)
 
     def unexpected(*args, **kwargs):
-        pytest.fail("The conditional acknowledgement gate must not construct or repair a blocker")
+        pytest.fail("The conditional acknowledgement gate must not construct a blocker")
 
     monkeypatch.setattr(plan_first_loop_module, "_plan_acknowledgement_blocker", unexpected)
-    monkeypatch.setattr(plan_first_loop_module, "_run_structured_repair", unexpected)
     review = acknowledged
     if gate == "mandatory-finding":
         payload = json.loads(unacknowledged.split("\n<!--", 1)[0])
@@ -1708,10 +1698,8 @@ def test_issue_loop_plan_review_drops_resolved_history_disposition_under_incompl
     )
     config = make_config(tmp_path, coder="claude", reviewer=("codex",))
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    repair_mock.assert_not_called()
     assert ledger_flags and ledger_flags[0] is True
     # #2100: the validator drops the non-carried ID itself and the published
     # review names it; the history-proven strip no longer runs.

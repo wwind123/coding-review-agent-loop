@@ -948,27 +948,10 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
 
 from acknowledgement_helpers import ACK_ID, dedicated_ack, durable_record, pr_payload as ack_pr_payload
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
-from coding_review_agent_loop.repair import RepairAttemptResult
 from coding_review_agent_loop.github import _parse_pr_human_requirements
 
 
-def _exhaust_ack_repair(monkeypatch):
-    calls = []
-    def exhausted(raw, **kwargs):
-        assert kwargs["repair_kwargs"]["expected_kind"] == "pr_review"
-        calls.append(raw)
-        attempts = [RepairAttemptResult(
-            backend="codex", model=model, prompt="Repair acknowledgement.", output="invalid",
-            returncode=0, outcome="invalid_output", diagnostic="Missing acknowledgement.",
-            log_path=None, fallback_planned=index == 0,
-        ) for index, model in enumerate(("gpt-6-luna", "gpt-6.1-sol"))]
-        return None, None, attempts
-    monkeypatch.setattr(pr_loop, "_run_structured_repair", exhausted)
-    return calls
-
-
 def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tmp_path, monkeypatch):
-    calls = _exhaust_ack_repair(monkeypatch)
     requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
     runner = FakeRunner(
         pr_payload=ack_pr_payload(),
@@ -984,7 +967,6 @@ def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tm
         return result
     monkeypatch.setattr(pr_loop, "_reconcile_human_requirements_ack_item", reconcile)
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3)) == 0
-    assert calls == []  # no acknowledgement repair runs (#2066)
     assert clears
     from types import SimpleNamespace
     records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr")
@@ -999,14 +981,12 @@ def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tm
 
 def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_path, monkeypatch):
     from acknowledgement_helpers import ack_resume_history
-    calls = _exhaust_ack_repair(monkeypatch)
     runner = FakeRunner(
         pr_payload=ack_pr_payload(ack_resume_history(promoted=True, coder_ack=True, unrelated=False)),
         gemini_outputs=[_code_requirement_review(reviewer="Google Gemini")],
     )
     with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
-    assert calls == []  # no acknowledgement repair runs (#2066)
     from types import SimpleNamespace
     failures = [r for r in _extract_round_metadata_records(
         [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
@@ -1019,7 +999,6 @@ def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_pat
 def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monkeypatch, round_number):
     from dataclasses import replace
     from coding_review_agent_loop.round_state import _resume_pr_round
-    _exhaust_ack_repair(monkeypatch)
     future = UnresolvedReviewItem(item_id="item-7", reviewer="Codex", source_round=1,
                                   text="Preserve deferred work.", status="future")
     high_item = replace(future, item_id="item-41")
@@ -1048,7 +1027,6 @@ def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monke
 @pytest.mark.parametrize("fresh_read", [True, False])
 def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypatch, policy, force_full, fresh_read):
     """The reopened pass can read old publications and still launch a fresh board."""
-    calls = _exhaust_ack_repair(monkeypatch)
     runner = FakeRunner(
         pr_payload=ack_pr_payload(),
         codex_outputs=[_code_requirement_review(human_requirements_resolved=False)],
@@ -1068,7 +1046,6 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     before = records()
     publications = [r for r in before if r.metadata.phase == "publication"]
     assert {r.metadata.agent for r in publications} == {"Codex", "Gemini"}
-    assert calls == []  # no acknowledgement repair runs (#2066)
     runner.codex_outputs.append(_code_requirement_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     runner.gemini_outputs.append(_code_requirement_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     if not fresh_read:
@@ -1103,7 +1080,6 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     after = records()
     assert len([r for r in after if r.metadata.phase == "publication"]) == 4
     assert not runner.codex_outputs and not runner.gemini_outputs
-    assert calls == []  # no acknowledgement repair runs (#2066)
     assert snapshots and any(i.item_id == ACK_ID for i in snapshots[-1][0])
     assert not snapshots[-1][1]
     assert after[:len(before)] == before
@@ -1547,7 +1523,6 @@ _ACK_PLACEMENTS_2026 = {
 @pytest.mark.parametrize("placement", list(_ACK_PLACEMENTS_2026))
 def test_live_coder_ack_placement_ledger_is_placement_independent(tmp_path, monkeypatch, caplog, placement):
     caplog.set_level("WARNING")
-    _exhaust_ack_repair(monkeypatch)
     requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
     coder_output = structured_coder_followup(
         human_requirement_ids=[requirement_id], **_ACK_PLACEMENTS_2026[placement]
@@ -1620,7 +1595,6 @@ def test_valid_ack_forced_into_synthesis_keeps_the_ack_open_in_loop_and_resume(t
     import coding_review_agent_loop.coder_followup_degradation as degradation
     from types import SimpleNamespace
 
-    _exhaust_ack_repair(monkeypatch)
     requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
     valid_ack = structured_coder_followup(human_requirement_ids=[requirement_id])
     runner = FakeRunner(

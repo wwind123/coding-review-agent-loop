@@ -1000,22 +1000,20 @@ def test_followup_overlong_refs_through_validated_agent_never_repairs_1300(tmp_p
 
     runner = FakeRunner(codex_outputs=[text])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
-        response = validated_agent._run_validated_agent(
-            runner,
-            agent="codex",
-            config=config,
-            prompt="FOLLOWUP PROMPT",
-            session_id=None,
-            marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda body: validate_structured_coder_followup(
-                body, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog
-            ),
-            use_repair=True,
-            repair_expected_kind="coder_followup",
-            role="coder",
-            operation_description="coder follow-up",
-        )
+    response = validated_agent._run_validated_agent(
+        runner,
+        agent="codex",
+        config=config,
+        prompt="FOLLOWUP PROMPT",
+        session_id=None,
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        validate=lambda body: validate_structured_coder_followup(
+            body, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog
+        ),
+        repair_expected_kind="coder_followup",
+        role="coder",
+        operation_description="coder follow-up",
+    )
 
     assert repair_calls == []
     assert len([c for c, _cwd in runner.commands if c[:1] == ["codex"]]) == 1
@@ -1203,93 +1201,6 @@ def test_remote_head_race_correction_stays_unverified(monkeypatch, tmp_path):
     assert row.evidence_citations == ()
     assert "head changed during bounded semantic correction" in row.caveats
     assert any(d.code == "head-changed-during-correction" for d in result.diagnostics)
-
-
-# --- #1388: coder_followup repair with resolved and optional item IDs --------
-
-from unittest.mock import MagicMock as _MagicMock1388, patch as _patch1388  # noqa: E402
-
-import coding_review_agent_loop.repair as _repair_module_1388  # noqa: E402
-from coding_review_agent_loop.protocol import UnresolvedReviewItem as _Item1388  # noqa: E402
-from coding_review_agent_loop.unresolved_items import (  # noqa: E402
-    _validate_coder_followup_response as _validate_followup_1388,
-)
-
-
-def _malformed_1388(payload_text):
-    # Prose between the JSON object and the footer fails validation, so the
-    # first response needs a repair for a reason unrelated to item IDs.
-    json_part, _footer = payload_text.split("\n<!-- AGENT_STATE:", 1)
-    return json_part + "\n## Changes made\nProse before the footer.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
-
-
-def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), resolved_ids=(), excluded_ids=()):
-
-    real_attempt_repair = _repair_module_1388.attempt_repair
-    prompts = []
-    calls = []
-
-    def through_real_attempt(raw, gemini_cmd, **kwargs):
-        calls.append(kwargs)
-        result = _MagicMock1388(returncode=0, stdout=repaired)
-        with _patch1388.object(
-            _repair_module_1388.subprocess, "run", return_value=result
-        ) as run:
-            output = real_attempt_repair(raw, gemini_cmd, **kwargs)
-        cmd = run.call_args.args[0]
-        prompts.append(cmd[cmd.index("--prompt") + 1])
-        return output
-
-    runner = FakeRunner(claude_outputs=[malformed])
-    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
-    with _patch1388.object(validated_agent, "attempt_repair", through_real_attempt):
-        response = validated_agent._run_validated_agent(
-            runner,
-            agent="claude",
-            config=config,
-            prompt="Address review feedback.",
-            marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: _validate_followup_1388(
-                text,
-                unresolved_items=items,
-                optional_item_ids=optional_ids,
-                resolved_item_ids=resolved_ids,
-                excluded_item_ids=excluded_ids,
-                human_requirements=(),
-                architecture_status_mode="legacy",
-            ),
-            use_repair=True,
-            repair_expected_kind="coder_followup",
-            repair_unresolved_item_ids=tuple(item.item_id for item in items),
-            repair_optional_item_ids=optional_ids,
-        )
-    return response, prompts, calls
-
-
-def test_1388_repair_that_strips_a_valid_optional_note_is_refused(tmp_path):
-    items = (_Item1388(item_id="item-1", reviewer="Codex", source_round=1, text="Fix it.", status="blocking"),)
-    source = structured_coder_followup(
-        state="approved",
-        addressed_items=["item-1", "item-2"],
-        addressed_item_notes={
-            "item-1": "Fixed the parser.",
-            "item-2": "Also added the cache lock.",
-        },
-    )
-    stripped = structured_coder_followup(
-        state="approved",
-        addressed_items=["item-1"],
-        addressed_item_notes={"item-1": "Fixed the parser."},
-    )
-
-    with pytest.raises(AgentLoopError):
-        _run_repair_1388(
-            tmp_path,
-            malformed=_malformed_1388(source),
-            repaired=stripped,
-            items=items,
-            optional_ids=("item-2",),
-        )
 
 
 def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):

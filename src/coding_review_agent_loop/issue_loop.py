@@ -541,7 +541,6 @@ def run_issue_loop(
             # Without the exact coder role a sandboxed run hands this committing
             # turn the fail-closed read-only grant (#1077).
             role="coder",
-            use_repair=True,
             repair_expected_kind="issue_implementation",
             repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
             repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,

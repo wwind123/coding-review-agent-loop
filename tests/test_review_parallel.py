@@ -795,11 +795,8 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
-        return_value=(None, None, []),
-    ):
-        with pytest.raises(AgentInvocationError) as error:
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert error.value.plan_validation_exhaustion is not None
     assert len(runner.verified_round_bodies) == 1
@@ -909,9 +906,8 @@ def test_plan_parallel_revision_validation_exhaustion_survives_resume(
         agent_max_retries=0,
     )
 
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
-        with pytest.raises(AgentInvocationError) as error:
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert error.value.plan_validation_exhaustion is not None
     diagnostic_comments = [
@@ -962,14 +958,12 @@ def test_repeated_exhausted_plan_failures_select_highest_attempt_across_invocati
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
-        with pytest.raises(AgentInvocationError):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentInvocationError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     runner.claude_outputs = [invalid_candidate]
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", return_value=(None, None, [])):
-        with pytest.raises(AgentInvocationError):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentInvocationError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
     runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
@@ -2766,16 +2760,8 @@ def test_parallel_plan_review_settles_healthy_reviewer_when_peer_returns_narrati
         agent_retry_backoff_seconds=0,
     )
 
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        lambda raw, gemini_cmd, **kwargs: structured_plan_review(
-            state="blocking",
-            summary="Plan review incomplete: the test command was terminated.",
-            blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
-        ),
-    ):
-        with pytest.raises(AgentLoopError):
-            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     # The healthy reviewer's settled turn is kept -- privately, because the
     # refused reviewer is retried and must not read it (#1025).

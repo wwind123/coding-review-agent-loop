@@ -5420,16 +5420,11 @@ def run_pr_loop(
                                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                                     **_pr_review_validators(reviewer_name),
                                     usage_context=usage_context,
-                                    use_repair=True,
                                     repair_expected_kind="pr_review",
                                     repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
                                         human_requirements,
                                         requirement_scope="PR requirements",
                                     ),
-                                    repair_allowed_prior_item_ids=tuple(
-                                        item.item_id for item in prior_unresolved_items
-                                    ),
-                                    repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
                                     ledger_incomplete=round_ledger_incomplete,
                                     repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
@@ -5757,16 +5752,11 @@ def run_pr_loop(
                             marker_description="<!-- AGENT_STATE: approved|blocking -->",
                             **sequential_pr_validators,
                             usage_context=usage_context,
-                            use_repair=True,
                             repair_expected_kind="pr_review",
                             repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
                                 human_requirements,
                                 requirement_scope="PR requirements",
                             ),
-                            repair_allowed_prior_item_ids=tuple(
-                                item.item_id for item in prior_unresolved_items
-                            ),
-                            repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
                             ledger_incomplete=round_ledger_incomplete,
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
@@ -9198,10 +9188,7 @@ def run_pr_loop(
                     **_architecture_and_test_observation_mode_validators(_validate_coder_followup_response_by_mode),
                     usage_context=usage_context,
                     role="coder",
-                    use_repair=True,
                     repair_expected_kind="coder_followup",
-                    repair_unresolved_item_ids=repair_unresolved_item_ids,
-                    repair_optional_item_ids=coder_optional_item_ids,
                     repair_surfaced_requirement_ids=coder_human_requirements_context.surfaced_requirement_ids,
                     repair_requires_direct_discussion_ack=coder_human_requirements_context.requires_direct_discussion_ack,
                     salvage_context=SalvageContext(

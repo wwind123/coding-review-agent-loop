@@ -95,8 +95,7 @@ def _validate_revision(text):
 def _run(runner, config, texts_kind="plan_state"):
     logs: list[str] = []
     exhaustions = []
-    with patch_object_in((validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", wraps=validated_agent_module._run_structured_repair) as spy, \
-            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, issue_recovery, plan_execution,), "log", lambda _c, m: logs.append(m)), \
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop, issue_recovery, plan_execution,), "log", lambda _c, m: logs.append(m)), \
             patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
             patch.object(validated_agent_module.time, "sleep", lambda *_a: None):
         try:
@@ -108,7 +107,6 @@ def _run(runner, config, texts_kind="plan_state"):
                 session_id=None,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                 validate=_validate_state if texts_kind == "plan_state" else _validate_revision,
-                use_repair=True,
                 repair_expected_kind=texts_kind,
                 role="planner",
                 operation_description="planning",
@@ -119,7 +117,7 @@ def _run(runner, config, texts_kind="plan_state"):
             error = None
         except AgentInvocationError as exc:
             response, error = None, exc
-    return response, error, logs, spy, exhaustions
+    return response, error, logs, exhaustions
 
 
 _AGENT = ["codex"]
@@ -149,17 +147,16 @@ def _models(cmds):
 
 
 @pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
-def test_bare_strings_are_normalized_without_repair_or_replay(tmp_path, kind):
+def test_bare_strings_are_normalized_without_replay(tmp_path, kind):
     row = _row(forbidden_side_effects="Must not refuse", related_scope_item_ids="scope-1")
     if kind == "plan_state":
         text = _state(row, exclusions="Not loosened")
     else:
         text = _revision(row)
     runner = _runner("codex", [text])
-    response, error, logs, spy, _ = _run(runner, _config(tmp_path, "codex", 0), kind)
+    response, error, logs, _ = _run(runner, _config(tmp_path, "codex", 0), kind)
     assert error is None and response is not None
     assert len(_cmds(runner, "codex")) == 1
-    spy.assert_not_called()
     assert any(
         "normalized risk test matrix string field(s)" in m
         and "forbidden_side_effects" in m and "related_scope_item_ids" in m
@@ -174,7 +171,7 @@ def test_bare_strings_are_normalized_without_repair_or_replay(tmp_path, kind):
 def test_unrecoverable_matrix_is_reasked_with_quoted_error(tmp_path, kind):
     make = _state if kind == "plan_state" else _revision
     runner = _runner("codex", [make(_row(forbidden_side_effects="")), make()])
-    response, error, logs, spy, _ = _run(runner, _config(tmp_path, "codex", 0), kind)
+    response, error, logs, _ = _run(runner, _config(tmp_path, "codex", 0), kind)
     assert error is None and response is not None
     cmds = _cmds(runner, "codex")
     assert len(cmds) == 2
@@ -188,7 +185,7 @@ def test_remaining_defect_after_normalization_is_quoted_and_persisted(tmp_path):
     bad_first = _state(_row(forbidden_side_effects="First slip", related_scope_item_ids=""))
     bad_replay = _state(_row(forbidden_side_effects="Replay slip", related_scope_item_ids=""))
     runner = _runner("codex", [bad_first, bad_replay])
-    response, error, logs, _spy, exhaustions = _run(runner, _config(tmp_path, "codex", 1))
+    response, error, logs, exhaustions = _run(runner, _config(tmp_path, "codex", 1))
     assert response is None and error is not None
     cmds = _cmds(runner, "codex")
     # The primary turn and both shared re-asks; no ordinary retry follows.
@@ -215,7 +212,7 @@ def test_replay_does_not_consume_retry_budget_or_fallback(tmp_path, agent):
     bad = _state(_row(forbidden_side_effects=""))
     # retries=0: the replay still runs, on the same model.
     runner = _runner(agent, [bad, _state()])
-    response, error, _logs, spy, _ = _run(runner, _config(tmp_path, agent, 0))
+    response, error, _logs, _ = _run(runner, _config(tmp_path, agent, 0))
     assert error is None and response is not None
     cmds = _cmds(runner, agent)
     assert len(cmds) == 2
@@ -223,7 +220,7 @@ def test_replay_does_not_consume_retry_budget_or_fallback(tmp_path, agent):
         assert _models(cmds) == ["ModelA", "ModelA"]
     # retries=1: replay, then an ordinary retryable failure, still gets its retry.
     runner = _runner(agent, [bad, "Error: server is overloaded, try again later", _state()])
-    response, error, _logs, _spy, _ = _run(runner, _config(tmp_path, agent, 1))
+    response, error, _logs, _ = _run(runner, _config(tmp_path, agent, 1))
     assert error is None and response is not None
     cmds = _cmds(runner, agent)
     assert len(cmds) == 3
@@ -236,7 +233,7 @@ def test_execution_integrity_refusal_keeps_ordinary_budget(tmp_path):
     payload.pop("execution_recommendation")
     bad = json.dumps(payload) + PLAN_FOOTER
     runner = _runner("codex", [bad, bad, bad])
-    response, error, _l, _s, _e = _run(runner, _config(tmp_path, "codex", 1))
+    response, error, _l, _e = _run(runner, _config(tmp_path, "codex", 1))
     # A missing execution recommendation shares the two re-asks; it never
     # spends the ordinary retry budget on the same defect.
     assert response is None and error.failure_category == "deterministic"
@@ -275,7 +272,7 @@ def test_replay_takes_no_transition_or_delay_with_zero_budget(tmp_path):
     state_cls, transitions, spy = _spy_transitions()
     runner = _runner("antigravity", [_state(_row(forbidden_side_effects="")), _state()])
     with patch.object(state_cls, "next_after_failure", spy):
-        response, error, _l, _s, _e = _run_noskip(runner, _config(tmp_path, "antigravity", 0))
+        response, error, _l = _run_noskip(runner, _config(tmp_path, "antigravity", 0))
     assert error is None and response is not None
     assert transitions == []
     assert _order(runner, "agy") == ["agent", "agent"]
@@ -287,7 +284,7 @@ def test_reasks_take_no_transition_or_delay(tmp_path):
     bad = _state(_row(forbidden_side_effects=""))
     runner = _runner("antigravity", [bad, "Error: server is overloaded, try again later", _state()])
     with patch.object(state_cls, "next_after_failure", spy):
-        response, error, _logs, _spy, _ = _run_noskip(runner, _config(tmp_path, "antigravity", 1))
+        response, error, _logs = _run_noskip(runner, _config(tmp_path, "antigravity", 1))
     assert error is None and response is not None
     # Both validation failures are same-agent re-asks: no Antigravity
     # transition, no backoff delay and no model fallback (#2066).
@@ -304,7 +301,7 @@ def _run_noskip(runner, config):
                 runner, agent=_AGENT[0], config=config, prompt="ORIGINAL PROMPT",
                 session_id=None,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=_validate_state, use_repair=True, repair_expected_kind="plan_state",
+                validate=_validate_state, repair_expected_kind="plan_state",
                 role="planner", operation_description="planning",
                 require_execution_strategy_contract=True,
                 require_risk_test_matrix_contract=True,
@@ -312,7 +309,7 @@ def _run_noskip(runner, config):
             error = None
         except AgentInvocationError as exc:
             response, error = None, exc
-    return response, error, logs, None, []
+    return response, error, logs
 
 
 def test_mixed_contract_failure_after_matrix_replay_reports_the_real_contract(tmp_path):
@@ -320,7 +317,7 @@ def test_mixed_contract_failure_after_matrix_replay_reports_the_real_contract(tm
     payload.pop("execution_recommendation")
     exec_bad = json.dumps(payload) + PLAN_FOOTER
     runner = _runner("codex", [_state(_row(forbidden_side_effects="")), exec_bad])
-    response, error, _logs, _spy, exhaustions = _run(runner, _config(tmp_path, "codex", 0))
+    response, error, _logs, exhaustions = _run(runner, _config(tmp_path, "codex", 0))
     assert response is None and error.failure_category == "deterministic"
     assert len(_cmds(runner, "codex")) == 3
     text = str(error)

@@ -34,8 +34,6 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
-import coding_review_agent_loop.plan_first_loop as plan_first_loop
-import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.response_validation as response_validation
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in, patch_object_in
@@ -160,11 +158,9 @@ def test_diagnostic_shaped_public_response_remains_transient(tmp_path):
     runner = FakeRunner(gemini_outputs=[{"stdout": public_response}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        with pytest.raises(AgentLoopError) as exc_info:
-            run_pr_loop(runner, pr_number=77, config=config)
+    with pytest.raises(AgentLoopError) as exc_info:
+        run_pr_loop(runner, pr_number=77, config=config)
 
-    repair_mock.assert_not_called()
     assert "Failure category: transient" in str(exc_info.value)
     assert "Suggestion:" in str(exc_info.value)
 
@@ -207,34 +203,31 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
     # The scripted dirty tree is this checkout's prepared state.
     establish_initial_baseline(config, runner, config.codex_dir)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        with pytest.raises(AgentInvocationError) as exc_info:
-            _run_validated_agent(
-                runner,
+    with pytest.raises(AgentInvocationError) as exc_info:
+        _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text,
+                reviewer="OpenAI Codex",
+                unresolved_items=(), architecture_status_mode="legacy",
+            ),
+            repair_expected_kind="pr_review",
+            role="reviewer",
+            salvage_context=SalvageContext(
+                repo=config.repo,
+                issue_number=480,
+                scope="unsupported-model-test",
                 agent="codex",
-                config=config,
-                prompt="Review the PR.",
-                marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                validate=lambda text: _validate_review_response(
-                    text,
-                    reviewer="OpenAI Codex",
-                    unresolved_items=(), architecture_status_mode="legacy",
-                ),
-                use_repair=True,
-                repair_expected_kind="pr_review",
-                role="reviewer",
-                salvage_context=SalvageContext(
-                    repo=config.repo,
-                    issue_number=480,
-                    scope="unsupported-model-test",
-                    agent="codex",
-                    run_id="run-480",
-                ),
-            )
+                run_id="run-480",
+            ),
+        )
 
     message = str(exc_info.value)
     assert exc_info.value.failure_category == "unsupported_model"
-    repair_mock.assert_not_called()
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
     assert (
         "Codex reviewer failed because requested model `gpt-5.5-pro` is not "
@@ -258,23 +251,19 @@ def test_marker_safety_failure_does_not_capture_plan_validation_exhaustion(tmp_p
     config = make_config(tmp_path, agent_max_retries=0)
     persisted = []
 
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
-        return_value=(None, None, []),
-    ):
-        with pytest.raises(AgentInvocationError) as error:
-            _run_validated_agent(
-                runner,
-                agent="claude",
-                config=config,
-                prompt="Produce the plan.",
-                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=lambda text: text,
-                use_repair=True,
-                repair_expected_kind="plan_state",
-                plan_validation_failure_handler=lambda exhaustion, invocation_error: persisted.append(
-                    (exhaustion, invocation_error)
-                ),
-            )
+    with pytest.raises(AgentInvocationError) as error:
+        _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Produce the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=lambda text: text,
+            repair_expected_kind="plan_state",
+            plan_validation_failure_handler=lambda exhaustion, invocation_error: persisted.append(
+                (exhaustion, invocation_error)
+            ),
+        )
 
     assert error.value.failure_category == "deterministic"
     assert error.value.plan_validation_exhaustion is None
@@ -296,21 +285,19 @@ def test_structured_plan_review_transient_terms_with_trailing_prose_normalizes(t
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="gemini",
-            config=config,
-            prompt="Review the plan.",
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=lambda text: _validate_plan_review_response(
-                text,
-                reviewer="Google Gemini",
-                unresolved_items=(), architecture_status_mode="legacy",
-            ),
-            use_repair=True,
-            repair_expected_kind="plan_review",
-        )
+    response = _run_validated_agent(
+        runner,
+        agent="gemini",
+        config=config,
+        prompt="Review the plan.",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        validate=lambda text: _validate_plan_review_response(
+            text,
+            reviewer="Google Gemini",
+            unresolved_items=(), architecture_status_mode="legacy",
+        ),
+        repair_expected_kind="plan_review",
+    )
 
     assert response.text == structured_plan_review(
         state="approved",
@@ -320,7 +307,6 @@ def test_structured_plan_review_transient_terms_with_trailing_prose_normalizes(t
         ),
         reviewer="Google Gemini",
     )
-    repair_mock.assert_not_called()
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 
@@ -339,21 +325,19 @@ def test_structured_pr_review_transient_terms_duplicate_footer_normalizes(tmp_pa
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="gemini",
-            config=config,
-            prompt="Review the PR.",
-            marker_description="<!-- AGENT_STATE: approved|blocking -->",
-            validate=lambda text: _validate_review_response(
-                text,
-                reviewer="Google Gemini",
-                unresolved_items=(), architecture_status_mode="legacy",
-            ),
-            use_repair=True,
-            repair_expected_kind="pr_review",
-        )
+    response = _run_validated_agent(
+        runner,
+        agent="gemini",
+        config=config,
+        prompt="Review the PR.",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        validate=lambda text: _validate_review_response(
+            text,
+            reviewer="Google Gemini",
+            unresolved_items=(), architecture_status_mode="legacy",
+        ),
+        repair_expected_kind="pr_review",
+    )
 
     assert response.text == structured_pr_review(
         state="approved",
@@ -363,7 +347,6 @@ def test_structured_pr_review_transient_terms_duplicate_footer_normalizes(tmp_pa
         ),
         reviewer="Google Gemini",
     )
-    repair_mock.assert_not_called()
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 
@@ -418,7 +401,6 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
                 unresolved_items=unresolved_items,
                 human_requirements=(), architecture_status_mode="legacy",
             ),
-            use_repair=True,
             repair_expected_kind="coder_followup",
         )
 
@@ -532,10 +514,8 @@ def test_gemini_duplicate_trailing_agent_state_marker_normalizes_without_repair(
     runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    repair_mock.assert_not_called()
     assert any("Found one issue." in comment for comment in runner.comments)
     assert all(comment.count("<!-- AGENT_STATE: approved -->") == 1 for comment in runner.comments)
 
@@ -565,9 +545,8 @@ def test_gemini_pre_marker_429_malformed_public_response_fails_deterministically
     runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value="still invalid"):
-        with pytest.raises(AgentLoopError) as exc_info:
-            run_pr_loop(runner, pr_number=77, config=config)
+    with pytest.raises(AgentLoopError) as exc_info:
+        run_pr_loop(runner, pr_number=77, config=config)
 
     message = str(exc_info.value)
     # The internal category stays deterministic (no transient auto-retry), but
@@ -622,7 +601,6 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
                 reviewer="Google Gemini",
                 unresolved_items=(), architecture_status_mode="legacy",
             ),
-            use_repair=True,
             repair_expected_kind="pr_review",
         )
 
@@ -674,7 +652,6 @@ def test_resend_only_coder_reask_keeps_the_primary_acquisition_catalog(tmp_path,
             marker_description="structured coder follow-up",
             validate=validate,
             role="coder",
-            use_repair=True,
             repair_expected_kind="coder_followup",
             session_id="caller-session",
         )
@@ -1830,7 +1807,7 @@ def test_antigravity_reviewer_capacity_retry_falls_back_with_repair_enabled(tmp_
     with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
         response = _run_validated_agent(
             FakeRunner(), agent="antigravity", config=config, prompt="Review.",
-            marker_description="test", validate=lambda text: text, use_repair=True, role="reviewer",
+            marker_description="test", validate=lambda text: text, role="reviewer",
         )
 
     assert response.text == "valid review"
@@ -1856,7 +1833,7 @@ def test_antigravity_capacity_exhaustion_is_reported_transient(tmp_path):
         with pytest.raises(AgentInvocationError, match="transient"):
             _run_validated_agent(
                 FakeRunner(), agent="antigravity", config=config, prompt="Review.",
-                marker_description="test", validate=lambda text: text, use_repair=True, role="reviewer",
+                marker_description="test", validate=lambda text: text, role="reviewer",
             )
 
 
@@ -2252,7 +2229,7 @@ def test_tests_run_correction_is_resend_only_and_inherits_the_primary_catalog(tm
         response = _run_validated_agent(
             runner, agent='claude', config=config, prompt='Correct PR feedback.',
             marker_description='structured coder followup', validate=validate,
-            role='coder', use_repair=True, repair_expected_kind='coder_followup',
+            role='coder', repair_expected_kind='coder_followup',
             reask_on_evidence_rejection=True,
         )
     assert invoke.call_count == 2
@@ -2306,7 +2283,7 @@ def test_rejected_acquisition_keeps_blocking_reason_as_advisory(tmp_path, refere
         _run_validated_agent(
             runner, agent="claude", config=config, prompt="Implement issue.",
             marker_description="structured implementation", validate=reject,
-            role="coder", use_repair=False,
+            role="coder",
             salvage_context=SalvageContext(repo=config.repo, issue_number=56,
                 scope=scope, agent="claude"),
             operation_description="issue implementation",
@@ -2334,7 +2311,7 @@ def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind,
         _run_validated_agent(
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Review.", marker_description="structured review", validate=reject,
-            role=role, use_repair=False)
+            role=role)
     message = str(stop.value)
     assert "response validation refused" in message
     assert "Coder terminal context" not in message
@@ -2352,7 +2329,7 @@ def test_rejected_other_role_has_no_coder_terminal_context(tmp_path, role, kind,
     ids=["auth", "billing"],
 )
 def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, output):
-    """#2029: a refused repair on a named auth/billing failure keeps its stop."""
+    """#2029: a named auth/billing failure keeps its stop without format fallback."""
     from coding_review_agent_loop.protocol import parse_pr_review
 
     runner = FakeRunner(antigravity_outputs=[(output, 0)] * 4)
@@ -2363,14 +2340,8 @@ def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, 
         agent_retry_backoff_seconds=0,
     )
     logs: list[str] = []
-    repairs: list[object] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
-            patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
         with pytest.raises(AgentInvocationError) as excinfo:
             _run_validated_agent(
                 runner,
@@ -2379,7 +2350,6 @@ def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, 
                 prompt="Review this PR.",
                 marker_description="structured pr_review",
                 validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-                use_repair=True,
                 repair_expected_kind="pr_review",
                 role="reviewer",
             )
@@ -2387,7 +2357,6 @@ def test_provider_definitive_reviewer_failure_never_format_falls_back(tmp_path, 
     models = [c[c.index("--model") + 1] for c, _ in runner.commands if c[:1] == ["agy"]]
     assert models == ["Model A"]
     assert excinfo.value.failure_category == "non-retryable"
-    assert repairs == []
     assert not any("falling back to" in line for line in logs)
 
 
@@ -2422,14 +2391,8 @@ def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
         agent_retry_backoff_seconds=0,
     )
     logs: list[str] = []
-    repairs: list[object] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
-            patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
         with pytest.raises(AgentInvocationError) as excinfo:
             _run_validated_agent(
                 runner,
@@ -2438,7 +2401,6 @@ def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
                 prompt="Review this PR.",
                 marker_description="structured pr_review",
                 validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-                use_repair=True,
                 repair_expected_kind="pr_review",
                 role="reviewer",
             )
@@ -2447,7 +2409,6 @@ def test_json_mode_error_envelope_with_narration_stops_on_the_provider_error(
     assert all("--output-format" in cmd and "--json-schema" not in cmd for cmd in cmds)
     assert [c[c.index("--model") + 1] for c in cmds] == ["Model A"]
     assert excinfo.value.failure_category == "non-retryable"
-    assert repairs == []
     assert not any("falling back to" in line for line in logs)
     assert not any("no recoverable structured payload" in line for line in logs)
 
@@ -2488,12 +2449,7 @@ def test_classification_mixed_without_answers_is_reasked_then_accepted(tmp_path)
     good = _classification_review("code", summary="GOOD")
     runner = FakeRunner(codex_outputs=[bad, good])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    repairs: list[str] = []
-    def fake_repair(raw, **kwargs):
-        repairs.append(raw)
-        return None, None, []
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
-        response = _run_production_classification(runner, config)
+    response = _run_production_classification(runner, config)
     assert response.marker_value.requirement_evidence[0]["role"] == "code"
     commands = _codex_commands(runner)
     assert len(commands) == 2
@@ -2502,20 +2458,14 @@ def test_classification_mixed_without_answers_is_reasked_then_accepted(tmp_path)
     assert "requirement_evidence[0]" in commands[1]
     assert _SOURCE_ID in commands[1]
     assert "mixed requires at least one answered_item_id" in commands[1]
-    assert repairs == []
 
 
 def test_classification_reask_exhausted_takes_judgement_failure_path(tmp_path):
     bad = _classification_review("mixed", leftover="Fix retries.", summary="BAD")
     runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    repairs: list[str] = []
-    def fake_repair(raw, **kwargs):
-        repairs.append(raw)
-        return None, None, []
-    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
-        with pytest.raises(AgentLoopError) as info:
-            _run_production_classification(runner, config)
+    with pytest.raises(AgentLoopError) as info:
+        _run_production_classification(runner, config)
     message = str(info.value)
     assert "response rejected after 2 same-agent re-asks" in message
     assert "requirement_evidence" in message
@@ -2523,7 +2473,6 @@ def test_classification_reask_exhausted_takes_judgement_failure_path(tmp_path):
     assert getattr(info.value, "failure_category", None) == "deterministic"
     # The primary turn plus the two shared same-agent re-asks; never a third.
     assert len(_codex_commands(runner)) == 3
-    assert repairs == []
 
 
 # ---------------------------------------------------------------------------

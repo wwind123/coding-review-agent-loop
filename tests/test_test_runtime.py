@@ -4979,16 +4979,6 @@ def test_antigravity_invocations_carry_the_unknown_cap_fact(tmp_path, monkeypatc
         assert runtime.prelaunch_notice(600, 1800, merged) is not None
 
 
-def test_format_repair_never_reaches_the_claude_backend():
-    import inspect
-
-    from coding_review_agent_loop.agents import format_repair
-
-    source = inspect.getsource(format_repair)
-    assert "agent_shell_environment" not in source and "BASH_" not in source
-    assert "agents.claude" not in source and "ClaudeBackend" not in source
-
-
 def test_contended_claude_launch_survives_admission_plus_target_time(tmp_path, monkeypatch):
     # A target that nearly reaches its watchdog after a host-capacity wait
     # still passes (admission is not counted against the target), and the

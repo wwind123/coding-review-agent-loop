@@ -6,7 +6,6 @@ import ast
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -197,20 +196,16 @@ def test_no_set_accepts_any_path_unchanged(tmp_path, hook):
     assert _path_of(response) == "README.md"
 
 
-def test_membership_failure_never_reaches_format_repair(tmp_path):
-    calls = []
+def test_membership_failure_is_reasked_to_the_coder(tmp_path):
     runner = FakeRunner(claude_outputs=[
         _with_impact(structured_issue_implementation(), "README.md"),
         _with_impact(structured_issue_implementation(), BILLING),
     ])
-    with patch.object(
-        validated_agent, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
-    ):
-        response = _run(
-            runner, tmp_path, "issue_implementation", lambda: MEMBERS,
-            use_repair=True, repair_expected_kind="issue_implementation",
-        )
-    assert calls == []
+    response = _run(
+        runner, tmp_path, "issue_implementation", lambda: MEMBERS,
+        repair_expected_kind="issue_implementation",
+    )
+    assert len(_prompts(runner)) == 2
     assert _path_of(response) == BILLING
 
 
