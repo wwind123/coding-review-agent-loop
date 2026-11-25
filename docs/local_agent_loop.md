@@ -9344,7 +9344,10 @@ must concern one of:
 
 1. a stated requirement or acceptance criterion of the issue, or a signed human
    requirement;
-2. a regression or correctness bug in behaviour the change touches; or
+2. a regression or correctness bug in behaviour the change touches that is
+   reachable today with the current code, inputs, data, and callers; the
+   finding must name the concrete current trigger (the input, call path, or
+   state that fails today); or
 3. a security or data-loss risk introduced by the change.
 
 Reviewers decide this scope eligibility first. Hardening, robustness, or
@@ -9354,6 +9357,16 @@ did not ask for) go in `future_followups` or are omitted, unless the finding
 explicitly argues which criterion it meets. A trivially small off-scope
 suggestion stays optional and never becomes same-plan or same-PR work. The
 exhaustiveness rule and "missing edge cases" wording are scoped to the issue.
+
+Robustness against hypothetical future inputs, data, config, markers, or
+callers ("a future edit to X could break Y", "if a second entry is added",
+"values above N that do not exist today") is hardening, not a criterion-2 bug
+(#2164). It goes in `future_followups` or is omitted, unless the issue or a
+signed human requirement asks for that robustness, in which case the finding
+cites it under criterion 1. A carried item whose only remaining concern is
+such a hypothetical is dispositioned `future` (or `resolved`). A real defect
+in the new code that is reachable today (wrong output, a crash, a test that
+fails today) still blocks however small it is.
 
 ### Operator-declared out of scope
 

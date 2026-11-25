@@ -924,8 +924,10 @@ _REVIEWER_BLOCKING_SCOPE_FLOWS = {
 def _reviewer_blocking_scope_guidance(flow: str) -> str:
     """Return the static blocking-scope criteria for one review flow (#1389).
 
-    Like ``_reviewer_exhaustiveness_guidance`` the text depends only on
-    ``flow``, so it is safe inside the compact stable prefixes.
+    Criterion (ii) requires a defect reachable today with a named current
+    trigger; robustness against hypothetical future inputs is hardening
+    (#2164). Like ``_reviewer_exhaustiveness_guidance`` the text depends only
+    on ``flow``, so it is safe inside the compact stable prefixes.
     """
     blocking_list, followup_list, same_status, change = _REVIEWER_BLOCKING_SCOPE_FLOWS[flow]
     return (
@@ -933,19 +935,33 @@ def _reviewer_blocking_scope_guidance(flow: str) -> str:
         f"`{blocking_list}` or `{followup_list}` entry, or a carried item kept "
         f"`blocking`/`{same_status}`) must concern one of: (i) a stated requirement or "
         "acceptance criterion of the issue, or a signed human requirement; (ii) a "
-        f"regression or correctness bug in behaviour this {change} touches; or (iii) a "
-        f"security or data-loss risk introduced by this {change}. Decide this scope "
+        f"regression or correctness bug in behaviour this {change} touches that is "
+        "reachable with the current code, inputs, data, and callers, where the finding "
+        "must name the concrete current trigger (the input, call path, or state that "
+        f"fails today); or (iii) a security or data-loss risk introduced by this "
+        f"{change}. Decide this scope "
         "eligibility first, before deciding whether a finding is small or fits the "
         "current design. Hardening, robustness, or lifecycle edge cases beyond that "
         "scope (for example cross-process concurrency, signal or cancellation paths, "
         "crash recovery, persistence state machines, or new permission and deploy "
         "gates the issue did not ask for) belong in `future_followups` when this "
         "review's follow-up rules allow them, or are omitted, unless the finding text "
-        "explicitly names which of (i)-(iii) it falls under and why. A finding that is "
-        "not eligible stays optional however small it is: never put it in "
+        "explicitly names which of (i)-(iii) it falls under and why. Findings about "
+        "inputs, data, config, markers, or callers that might change in the future are "
+        "hardening, not (ii) correctness bugs, and labelling them (ii) does not make them "
+        "eligible: for example 'a future edit to X could break Y', 'if a second entry is "
+        "added', or 'values above N that do not exist today'. They belong in "
+        "`future_followups` when this review's follow-up rules allow them, or are "
+        "omitted; the only exception is when the issue or a signed human requirement "
+        "asks for that robustness, and the finding then cites it under (i). A finding "
+        "that is not eligible stays optional however small it is: never put it in "
         f"`{blocking_list}` or `{followup_list}`, and disposition a carried item that "
-        "is not eligible as `future` (or `resolved` when nothing remains) rather than "
-        "keeping it active.\n"
+        "is not eligible, including one whose only remaining concern is a hypothetical "
+        "future input, edit, or caller, as `future` (or `resolved` when nothing "
+        "remains) rather than keeping it active. A real defect in the new or changed "
+        "code that is reachable today (wrong output, a crash, a test that fails today) "
+        "still blocks under (ii) however small it is; this rule narrows only what "
+        "counts as reachable.\n"
     )
 
 
