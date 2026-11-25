@@ -6,7 +6,6 @@ import json
 import re
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -60,7 +59,6 @@ from coding_review_agent_loop.decomposition import (  # noqa: E402
     EXECUTION_DECISION_MARKER_RE as _M1087_DECISION_RE,
     _decode_execution_decision as _m1087_decode_decision,
 )
-import coding_review_agent_loop.validated_agent as validated_agent_module
 
 
 @pytest.mark.parametrize(
@@ -309,14 +307,13 @@ def test_legacy_plan_revision_gate_runs_through_issue_loop(tmp_path, monkeypatch
     patch_attr_in(monkeypatch, (response_validation, plan_first_loop_module), "_validate_plan_revision_response", capture_validator
     )
     if include_matrix:
-        with patch.object(validated_agent_module, "attempt_repair", return_value=None):
-            with pytest.raises(AgentLoopError):
-                run_issue_loop(
-                    runner,
-                    issue_number=56,
-                    config=config,
-                    plan_first=True,
-                )
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(
+                runner,
+                issue_number=56,
+                config=config,
+                plan_first=True,
+            )
         assert captured_gate_values and all(captured_gate_values)
     else:
         assert run_issue_loop(

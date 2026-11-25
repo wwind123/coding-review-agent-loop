@@ -2609,22 +2609,16 @@ def test_validated_turn_accepts_the_recovered_envelope_payload_without_repair(
     config = make_config(tmp_path, antigravity_model="Gemini 4 Hydrogen (Medium)", agent_max_retries=0)
     repairs: list[object] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
-        response = _run_validated_agent(
-            runner,
-            agent="antigravity",
-            config=config,
-            prompt="Review this PR.",
-            marker_description="structured pr_review",
-            validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-            use_repair=True,
-            repair_expected_kind="pr_review",
-            role="reviewer",
-        )
+    response = _run_validated_agent(
+        runner,
+        agent="antigravity",
+        config=config,
+        prompt="Review this PR.",
+        marker_description="structured pr_review",
+        validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
+        repair_expected_kind="pr_review",
+        role="reviewer",
+    )
 
     assert repairs == []
     assert response.marker_value.state == "approved"
@@ -2683,12 +2677,7 @@ def test_structured_agent_unavailable_keeps_availability_handling(tmp_path, monk
     repairs: list[object] = []
     logs: list[str] = []
 
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair), \
-            patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
         try:
             response = _run_validated_agent(
                 runner,
@@ -2697,7 +2686,6 @@ def test_structured_agent_unavailable_keeps_availability_handling(tmp_path, monk
                 prompt="Review this PR.",
                 marker_description="structured pr_review",
                 validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-                use_repair=True,
                 repair_expected_kind="pr_review",
                 role="reviewer",
             )
@@ -3113,12 +3101,7 @@ def test_backend_quota_line_wins_over_rejection_in_agy_log(tmp_path, monkeypatch
 
 
 def _run_structured_review_turn(runner, config, logs, repairs, *, expected_kind="pr_review"):
-    def record_repair(*_a, **_k):
-        repairs.append(1)
-        return None
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair), \
-            patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
         return _run_validated_agent(
             runner,
             agent="antigravity",
@@ -3126,7 +3109,6 @@ def _run_structured_review_turn(runner, config, logs, repairs, *, expected_kind=
             prompt="Review this PR.",
             marker_description="structured pr_review",
             validate=lambda text: parse_pr_review(text, reviewer="Antigravity"),
-            use_repair=True,
             repair_expected_kind=expected_kind,
             role="reviewer",
         )
@@ -3564,11 +3546,6 @@ def test_bare_approved_envelope_payload_never_yields_an_approval(tmp_path, monke
     config = make_config(tmp_path, antigravity_model="Gemini 3.8 Flash (High)", agent_max_retries=0)
     backend_repairs: list[int] = []
 
-    def record_backend_repair(*_a, **_k):
-        backend_repairs.append(1)
-        return None
-
-    monkeypatch.setattr(validated_agent, "attempt_repair", record_backend_repair)
     with pytest.raises(AgentInvocationError) as excinfo:
         _run_validated_agent(
             runner,
@@ -3577,7 +3554,6 @@ def test_bare_approved_envelope_payload_never_yields_an_approval(tmp_path, monke
             prompt="Review.",
             marker_description=f"structured {kind}",
             validate=parse,
-            use_repair=True,
             repair_expected_kind=kind,
             role="reviewer",
         )

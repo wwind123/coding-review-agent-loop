@@ -1,4 +1,4 @@
-"""Signed requirement routing shape, ownership, replay and repair boundaries."""
+"""Signed requirement routing shape, ownership and replay boundaries."""
 import dataclasses
 from copy import deepcopy
 from types import SimpleNamespace
@@ -9,7 +9,6 @@ from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequire
 from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.protocol import UnresolvedReviewItem, parse_structured_pr_review
 from coding_review_agent_loop.requirement_evidence import parse_associations, project, historical_projection, classify_review
-from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from coding_review_agent_loop.round_metadata import (
     PostedRoundMetadata,
     _encode_round_metadata,
@@ -75,24 +74,6 @@ def test_associations_fail_closed(fault, replay):
         assert historical_projection(requirements, records) == tuple(requirements)
     else:
         assert project(requirements, reviews, items) == tuple(requirements)
-
-
-@pytest.mark.parametrize("change", ["add", "remove", "role", "leftover", "target"])
-def test_format_repair_cannot_invent_or_change_classification(change):
-    _, entry, text, _ = setup_role()
-    modified = dict(entry)
-    if change == "role":
-        modified["role"] = "evidence-only"
-        modified["leftover_instructions"] = ""
-    elif change == "leftover":
-        modified["leftover_instructions"] = "Invent another code instruction."
-    elif change == "target":
-        modified["answered_item_ids"] = ["item-2"]
-    target = _evidence_review() if change == "remove" else _classified_review([modified])
-    source = _evidence_review() if change == "add" else text
-    with pytest.raises(AgentLoopError, match="classification"):
-        validate_repair_preservation(source, target)
-    validate_repair_preservation(text, text)
 
 
 @pytest.mark.parametrize("role", ["mixed", "evidence-only"])

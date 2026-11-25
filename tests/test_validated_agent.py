@@ -165,7 +165,7 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
         validated_agent_module._run_validated_agent(
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            **validators, use_repair=True, repair_expected_kind=kind,
+            **validators, repair_expected_kind=kind,
             require_architecture_impact_contract=True,
             plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
         )
@@ -241,16 +241,12 @@ def test_always_unsatisfied_contract_stops_after_the_existing_budget(tmp_path):
 
 
 def test_contract_only_failure_makes_no_repair_invocation(tmp_path):
-    calls = []
     unsatisfied = _deg_with(structured_issue_implementation(), None)
     runner = _r2_FakeRunner(claude_outputs=[unsatisfied])
-    with patch.object(
-        validated_agent_module, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
-    ):
-        with pytest.raises(_DegInvocationError):
-            _r2_run(runner, tmp_path, retries=0, use_repair=True,
-                    repair_expected_kind="issue_implementation")
-    assert calls == []
+    with pytest.raises(_DegInvocationError):
+        _r2_run(runner, tmp_path, retries=0,
+                repair_expected_kind="issue_implementation")
+    assert not hasattr(validated_agent_module, "attempt_repair")
 
 
 @pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])

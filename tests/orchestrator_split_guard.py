@@ -209,8 +209,8 @@ def fresh_incoherent_bindings(
 ) -> list[str]:
     """Run ``incoherent_bindings`` in a fresh interpreter with no test patches.
 
-    Inside the test session the suite-wide repair stub and per-test patches
-    rewrite owned names in registered modules, which would hide or fake a
+    Inside the test session per-test patches rewrite owned names in
+    registered modules, which would hide or fake a
     divergent production binding, so the pristine namespaces are checked here.
     """
     code = (

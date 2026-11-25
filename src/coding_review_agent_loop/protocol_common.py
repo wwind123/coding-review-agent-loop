@@ -133,7 +133,7 @@ def _bounded_single_line(text: str, limit: int) -> str:
     # Records are rendered into round comments, so no angle bracket survives:
     # an HTML comment opener can never reach a body as a protocol record.
     flattened = " ".join(
-        sanitize_historical_text(text)  # shape-check: fatal:authentication-or-forgery
+        sanitize_historical_text(text)
         .replace("`", "'")
         .replace("<", "\u2039")
         .replace(">", "\u203a")
@@ -160,24 +160,24 @@ class ParseDegradation:
     def build(cls, *, element_path: str, rule: str, observed: object, outcome: str) -> "ParseDegradation":
         observed_text = observed if isinstance(observed, str) else json.dumps(observed, sort_keys=True, default=str)
         return cls(
-            element_path=_bounded_single_line(element_path, PARSE_DEGRADATION_FIELD_CHARS),  # shape-check: fatal:authentication-or-forgery
-            rule=_bounded_single_line(rule, PARSE_DEGRADATION_FIELD_CHARS),  # shape-check: fatal:authentication-or-forgery
-            observed_preview=_bounded_single_line(observed_text, PARSE_DEGRADATION_PREVIEW_CHARS),  # shape-check: fatal:authentication-or-forgery
-            outcome=_bounded_single_line(outcome, PARSE_DEGRADATION_FIELD_CHARS),  # shape-check: fatal:authentication-or-forgery
+            element_path=_bounded_single_line(element_path, PARSE_DEGRADATION_FIELD_CHARS),
+            rule=_bounded_single_line(rule, PARSE_DEGRADATION_FIELD_CHARS),
+            observed_preview=_bounded_single_line(observed_text, PARSE_DEGRADATION_PREVIEW_CHARS),
+            outcome=_bounded_single_line(outcome, PARSE_DEGRADATION_FIELD_CHARS),
         )
 
     def to_payload(self) -> dict[str, str]:
         return {
-            "element_path": sanitize_historical_text(self.element_path),  # shape-check: fatal:authentication-or-forgery
-            "rule": sanitize_historical_text(self.rule),  # shape-check: fatal:authentication-or-forgery
-            "observed_preview": sanitize_historical_text(self.observed_preview),  # shape-check: fatal:authentication-or-forgery
-            "outcome": sanitize_historical_text(self.outcome),  # shape-check: fatal:authentication-or-forgery
+            "element_path": sanitize_historical_text(self.element_path),
+            "rule": sanitize_historical_text(self.rule),
+            "observed_preview": sanitize_historical_text(self.observed_preview),
+            "outcome": sanitize_historical_text(self.outcome),
         }
 
 def parse_degradation_payload(value: object) -> ParseDegradation:
     """Strictly decode one orchestrator-written record for metadata rehydration."""
     if not isinstance(value, Mapping) or set(value) != {"element_path", "rule", "observed_preview", "outcome"}:
-        raise AgentLoopError("Parse degradation record must have exactly the documented keys.")  # shape-check: fatal:orchestrator-authored
+        raise AgentLoopError("Parse degradation record must have exactly the documented keys.")
     fields: dict[str, str] = {}
     for key, limit in (
         ("element_path", PARSE_DEGRADATION_FIELD_CHARS),
@@ -187,10 +187,10 @@ def parse_degradation_payload(value: object) -> ParseDegradation:
     ):
         item = value[key]
         if not isinstance(item, str) or not item.strip() or len(item) > limit + 1:
-            raise AgentLoopError(f"Parse degradation record field {key} is invalid.")  # shape-check: fatal:orchestrator-authored
-        fields[key] = _bounded_single_line(item, limit)  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(f"Parse degradation record field {key} is invalid.")
+        fields[key] = _bounded_single_line(item, limit)
     if fields["outcome"] not in PARSE_DEGRADATION_OUTCOMES:
-        raise AgentLoopError("Parse degradation record outcome is invalid.")  # shape-check: fatal:orchestrator-authored
+        raise AgentLoopError("Parse degradation record outcome is invalid.")
     return ParseDegradation(**fields)
 
 @dataclass(frozen=True)
@@ -220,7 +220,7 @@ def _normalize_requirement_label(text: str) -> str:
         return stable.group(0).lower()
     legacy = re.fullmatch(r"\s*Requirement\s+(\d+)\s*", text, re.I)
     if not legacy:
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(
             f"Invalid human requirement label: {text}. Only exact surfaced signed labels like "
             "`hr-<64 hexadecimal characters>` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
             "comments, and arbitrary labels are not signed human requirements."
@@ -256,7 +256,7 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
             label = match.group(0)
             stable = re.search(r"hr-[0-9a-f]{64}", label, re.I)
             addressed_ids.append(
-                _normalize_requirement_label(stable.group(0) if stable else label)  # shape-check: fatal:no-conservative-reading
+                _normalize_requirement_label(stable.group(0) if stable else label)
             )
 
     return ParsedHumanRequirementsAcknowledgement(
@@ -268,7 +268,7 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
 
 def _expect_object(value: object, *, context: str) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise AgentLoopError(f"{context} must be a JSON object.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be a JSON object.")
     return value
 
 def _expect_exact_keys(
@@ -281,10 +281,10 @@ def _expect_exact_keys(
     keys = set(value)
     missing = sorted(required - keys)
     if missing:
-        raise AgentLoopError(f"{context} is missing required field(s): {', '.join(missing)}")  # shape-check: delegated
+        raise AgentLoopError(f"{context} is missing required field(s): {', '.join(missing)}")
     unknown = sorted(keys - required - optional)
     if unknown:
-        raise AgentLoopError(f"{context} has unknown field(s): {', '.join(unknown)}")  # shape-check: delegated
+        raise AgentLoopError(f"{context} has unknown field(s): {', '.join(unknown)}")
 
 
 # Lenient agent-response key policy (#2114).  Unknown string-valued keys are
@@ -393,7 +393,7 @@ def _apply_key_renames(
             # A prefer-canonical alias is only ever read as text, whether or
             # not the canonical key is present: a null or list value is never
             # renamed or dropped silently.
-            raise AgentLoopError(  # shape-check: delegated
+            raise AgentLoopError(
                 f"{context}.{alias} must be a string to be read as `{canonical}`."
             )
         if canonical in result:
@@ -401,7 +401,7 @@ def _apply_key_renames(
                 result.pop(alias)
                 _logger.warning("%s: dropped field %s because %s is present", context, alias, canonical)
                 continue
-            raise AgentLoopError(  # shape-check: delegated
+            raise AgentLoopError(
                 f"{context} has both `{alias}` and `{canonical}`; use only `{canonical}`."
             )
         result = {(canonical if key == alias else key): entry for key, entry in result.items()}
@@ -428,20 +428,20 @@ def _expect_known_keys_lenient(
     known = set(required) | set(optional)
     if response_keys_strict():
         # Inside a semantic plan-patch operation: no rename, no drop.
-        _expect_exact_keys(value, context=context, required=set(required), optional=set(optional))  # shape-check: delegated
+        _expect_exact_keys(value, context=context, required=set(required), optional=set(optional))
         return dict(value)
-    result = _apply_key_renames(  # shape-check: delegated
+    result = _apply_key_renames(
         value,
         context=context,
         renames=[rename for rename in renames if rename[0] not in known],
     )
     missing = sorted(set(required) - set(result))
     if missing:
-        raise AgentLoopError(f"{context} is missing required field(s): {', '.join(missing)}")  # shape-check: delegated
+        raise AgentLoopError(f"{context} is missing required field(s): {', '.join(missing)}")
     unknown = sorted(key for key in result if key not in known)
     strict = [key for key in unknown if is_protected_response_key(key) or not isinstance(result[key], str)]
     if strict:
-        raise AgentLoopError(f"{context} has unknown field(s): {', '.join(strict)}")  # shape-check: delegated
+        raise AgentLoopError(f"{context} has unknown field(s): {', '.join(strict)}")
     for key in unknown:
         _logger.warning("%s: dropped unknown field %s", context, key)
         result.pop(key)
@@ -480,7 +480,7 @@ def partition_item_id_buckets(
 
 def _expect_int(value: object, *, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise AgentLoopError(f"{context} must be an integer.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be an integer.")
     return value
 
 _INT_LIKE_STRING_RE = re.compile(r"^\s*#?(\d+)\s*$")
@@ -498,11 +498,11 @@ def _expect_int_like(value: object, *, context: str) -> int:
             converted = int(match.group(1))
             _logger.warning("%s: converted digit string to integer %d", context, converted)
             return converted
-    return _expect_int(value, context=context)  # shape-check: delegated
+    return _expect_int(value, context=context)
 
 def _expect_bool(value: object, *, context: str) -> bool:
     if not isinstance(value, bool):
-        raise AgentLoopError(f"{context} must be a boolean.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be a boolean.")
     return value
 
 def _expect_strict_string(value: object, *, context: str) -> str:
@@ -511,10 +511,10 @@ def _expect_strict_string(value: object, *, context: str) -> str:
     No shape normalization, so a list-wrapped ID never becomes an ID (#2109).
     """
     if not isinstance(value, str):
-        raise AgentLoopError(f"{context} must be a string.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be a string.")
     normalized = value.strip()
     if not normalized:
-        raise AgentLoopError(f"{context} must be a non-empty string.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be a non-empty string.")
     return normalized
 
 
@@ -530,11 +530,11 @@ def _expect_non_empty_string(value: object, *, context: str) -> str:
             _logger.warning("%s: unwrapped single-element list to string", context)
             value = value[0]
         else:
-            raise AgentLoopError(  # shape-check: delegated
+            raise AgentLoopError(
                 f"{context} must be a string; a one-element list of a string is "
                 f"accepted, got a list of {len(value)} element(s)."
             )
-    return _expect_strict_string(value, context=context)  # shape-check: delegated
+    return _expect_strict_string(value, context=context)
 
 def _flat_object_defect(value: Mapping[object, object]) -> tuple[str, str] | None:
     """Return `(key, description)` for the first value that cannot render losslessly.
@@ -588,7 +588,7 @@ def _flatten_labelled_object(value: Mapping[object, object], *, context: str) ->
     defect = _flat_object_defect(value)
     if defect is not None:
         key, description = defect
-        raise AgentLoopError(  # shape-check: delegated
+        raise AgentLoopError(
             f"{context} object item must contain only non-empty string or "
             f"string-list values; got {description} for key {key!r}."
         )
@@ -612,14 +612,14 @@ def _expect_string_list(
             _logger.warning("%s: wrapped a lone string as a one-item list", context)
             value = [value]
     if not isinstance(value, list):
-        raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must be a JSON array.")
     items: list[object] = []
     for index, item in enumerate(value):
         if flatten_object_items and isinstance(item, Mapping):
             # Opt-in for the architecture_impact list fields only (#1330):
             # flatten before validation so a structured item never needs a
             # model repair pass, and leave an audit line for the normalization.
-            item = _flatten_labelled_object(item, context=f"{item_context} at index {index}")  # shape-check: delegated
+            item = _flatten_labelled_object(item, context=f"{item_context} at index {index}")
             _logger.warning(
                 "%s at index %d: flattened architecture-impact object item to text",
                 item_context,
@@ -627,11 +627,11 @@ def _expect_string_list(
             )
         items.append(item)
     rendered = tuple(
-        _expect_strict_string(item, context=f"{item_context} at index {index}")  # shape-check: delegated
+        _expect_strict_string(item, context=f"{item_context} at index {index}")
         for index, item in enumerate(items)
     )
     if len(rendered) < min_length:
-        raise AgentLoopError(f"{context} must contain at least {min_length} item(s).")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must contain at least {min_length} item(s).")
     return rendered
 
 def _expect_optional_string_list(
@@ -643,7 +643,7 @@ def _expect_optional_string_list(
     min_length: int = 0,
 ) -> tuple[str, ...]:
     value = payload.get(field_name, [])
-    return _expect_string_list(  # shape-check: delegated
+    return _expect_string_list(
         value,
         context=context,
         item_context=item_context,
@@ -689,9 +689,9 @@ def _extract_json_object_prefix(text: str) -> tuple[dict[str, object], str] | No
     try:
         payload, end = decoder.raw_decode(stripped)
     except json.JSONDecodeError as exc:
-        raise AgentLoopError("Structured response must begin with one top-level JSON object.") from exc  # shape-check: fatal:unparseable-envelope
+        raise AgentLoopError("Structured response must begin with one top-level JSON object.") from exc
     if not isinstance(payload, dict):
-        raise AgentLoopError("Structured response must begin with a JSON object.")  # shape-check: fatal:unparseable-envelope
+        raise AgentLoopError("Structured response must begin with a JSON object.")
     return payload, stripped[end:]
 
 def _consume_structured_footer_and_signature(
@@ -707,19 +707,19 @@ def _consume_structured_footer_and_signature(
     trailing = trailing.lstrip()
     state_match = state_re.search(trailing)
     if state_match is None:
-        raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
+        raise AgentLoopError(
             f"{context_label} must place <!-- {state_marker_name}: approved|blocking --> after the JSON object."
         )
 
     before_footer = trailing[: state_match.start()].strip()
     if before_footer:
         if not allow_human_requirements_prefix:
-            raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
+            raise AgentLoopError(
                 f"{context_label} may not include prose between the JSON object and the {state_marker_name} footer."
             )
-        parsed_human_requirements = parse_human_requirements_acknowledgement(before_footer)  # shape-check: fatal:no-conservative-reading
+        parsed_human_requirements = parse_human_requirements_acknowledgement(before_footer)
         if not parsed_human_requirements.marker_present or not parsed_human_requirements.section_present:
-            raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
+            raise AgentLoopError(
                 f"{context_label} may only include a signed human requirements acknowledgement before the {state_marker_name} footer."
             )
 
@@ -730,7 +730,7 @@ def _consume_structured_footer_and_signature(
         trailing = trailing[marker_match.end() :].lstrip()
     signature_match = re.match(r"^--\s+\S[^\n]*(?:\n)?$", trailing)
     if signature_match is None or trailing[signature_match.end() :].strip():
-        raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
+        raise AgentLoopError(
             f"{context_label} may not include trailing prose after the JSON footer and signature."
         )
 
@@ -740,17 +740,17 @@ def _consume_structured_footer_and_signature(
         # Compare the closed-enum fold, so `Blocking` matches a blocking
         # footer; the footer grammar itself is unchanged (#2109).
         if closed_enum_fold_key(payload_state) != footer_state:
-            raise AgentLoopError(  # shape-check: fatal:unparseable-envelope
+            raise AgentLoopError(
                 f"{context_label} footer {state_marker_name} must match the payload state."
             )
     return payload
 
 def _require_supported_schema_version(payload: dict[str, object]) -> None:
     if "schema_version" not in payload:
-        raise AgentLoopError("Structured response is missing required field: schema_version")  # shape-check: fatal:kind-or-version-mismatch
-    version = _expect_int(payload["schema_version"], context="schema_version")  # shape-check: fatal:kind-or-version-mismatch
+        raise AgentLoopError("Structured response is missing required field: schema_version")
+    version = _expect_int(payload["schema_version"], context="schema_version")
     if version != 1:
-        raise AgentLoopError(f"Unsupported structured response schema_version: {version}")  # shape-check: fatal:kind-or-version-mismatch
+        raise AgentLoopError(f"Unsupported structured response schema_version: {version}")
 
 
 # #2009: the only accepted ``staging_feasibility`` tokens and their meanings.

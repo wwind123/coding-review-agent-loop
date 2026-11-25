@@ -62,11 +62,7 @@ def history(raw, config, state="blocking", round_number=1):
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_fresh_owner_retry_precedes_review(tmp_path, monkeypatch, staged):
-    import coding_review_agent_loop.validated_agent as validated
-    def no_repair(*args, **kwargs):
-        raise AssertionError("Ownership correction must return to the planner")
-    monkeypatch.setattr(validated, "_run_structured_repair", no_repair)
+def test_fresh_owner_retry_precedes_review(tmp_path, staged):
     runner = FakeRunner(claude_outputs=[candidate(staged=staged), candidate("one-shot")],
                         codex_outputs=[structured_plan_review(state="approved")])
     config = make_config(tmp_path, plan_execution_mode="plan-only", max_rounds=3)

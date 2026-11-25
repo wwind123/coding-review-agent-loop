@@ -406,12 +406,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    def forbidden_repair(*_a, **_k):
-        raise AssertionError("repair must not run for dropped execution_refs")
-
     patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(validated_agent, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(validated_agent, "execute_repair", forbidden_repair, raising=False)  # retired seam (#2066)
     monkeypatch.setattr(
         response_validation,
         "stable_tracked_tree_snapshot",
@@ -2012,7 +2007,6 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
     controls whether the loop sees the posted round records.
     """
     import coding_review_agent_loop.github as github_module
-    import coding_review_agent_loop.validated_agent as validated_agent_module
 
     ack_item_id = HUMAN_REQUIREMENTS_ACK_ITEM_ID
     first = HumanReviewRequirement(
@@ -2086,28 +2080,19 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
         )
 
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context", review_context)
-    repairs = []
-    real_repair = validated_agent_module._run_structured_repair
-
-    def spy_repair(raw, **kwargs):
-        repairs.append(raw)
-        return real_repair(raw, **kwargs)
-
-    monkeypatch.setattr(validated_agent_module, "_run_structured_repair", spy_repair)
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4, quiet=False)
-    return runner, config, repairs, resolved_claim
+    return runner, config, resolved_claim
 
 
 def test_1388_coder_listing_a_resolved_item_as_addressed_is_normalized(
     tmp_path, monkeypatch, capsys,
 ):
-    runner, config, repairs, resolved_claim = _run_1388_acknowledgement_round(
+    runner, config, _resolved_claim = _run_1388_acknowledgement_round(
         tmp_path, monkeypatch, recorded_history=True
     )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert resolved_claim not in repairs
     err = capsys.readouterr().err
     assert (
         "Round 3: Claude listed already-resolved item(s) item-1 in addressed_items; "
@@ -2152,11 +2137,9 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
         raw = raw.replace(audit, 'pytest tests/test_api.py /outside/test_api.py') + '\ntrailing prose'
     initial = raw
     if mode.startswith('fallback'):
-        import coding_review_agent_loop.validated_agent as validated_agent
         payload, end = json.JSONDecoder().raw_decode(raw)
         payload['test_observations'] = {}
         raw = json.dumps(payload) + raw[end:]
-        monkeypatch.setattr(validated_agent, 'attempt_repair', lambda raw, *a, **k: raw)
     corrected = structured_coder_followup(
         summary='Accepted replacement claim.', addressed_items=['item-1'],
         tests_run=[audit], reviewer='OpenAI Codex',

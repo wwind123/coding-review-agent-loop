@@ -1582,7 +1582,6 @@ def _run_plan_first_loop_body(
                     full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
                 )),
                 usage_context=usage_context,
-                use_repair=True,
                 repair_expected_kind="plan_state",
                 repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
                 repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
@@ -3183,14 +3182,10 @@ def _run_plan_first_loop_body(
                             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                             **_plan_review_validators(reviewer_name),
                             usage_context=usage_context,
-                            use_repair=True,
                             repair_expected_kind="plan_review",
                             repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
                                 issue_context.human_requirements,
                                 requirement_scope="planning requirements",
-                            ),
-                            repair_allowed_prior_item_ids=tuple(
-                                item.item_id for item in prior_unresolved_items
                             ),
                             ledger_incomplete=round_ledger_incomplete,
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
@@ -3360,13 +3355,11 @@ def _run_plan_first_loop_body(
                         marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                         **validators,
                         usage_context=usage_context,
-                        use_repair=True,
                         repair_expected_kind="plan_review",
                         repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
                             issue_context.human_requirements,
                             requirement_scope="planning requirements",
                         ),
-                        repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                         ledger_incomplete=round_ledger_incomplete,
                         repair_resolved_history_item_ids=round_resolved_history_item_ids,
                         role="reviewer",
@@ -4279,7 +4272,6 @@ def _run_plan_first_loop_body(
                     ))
                 )),
                 usage_context=usage_context,
-                use_repair=True,
                 repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
                 repair_surfaced_requirement_ids=(
                     plan_revision_human_requirements_context.surfaced_requirement_ids
@@ -4296,7 +4288,6 @@ def _run_plan_first_loop_body(
                 reject_unsolicited_risk_test_matrix_contract=(
                     False if semantic_revision else not require_fresh_matrix_contract
                 ),
-                repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
                 ledger_incomplete=round_ledger_incomplete,
                 # The revision runs after this round's dispositions were applied,
                 # so its proof must cover the items this round resolved. The

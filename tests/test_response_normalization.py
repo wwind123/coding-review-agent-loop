@@ -5,8 +5,6 @@ import json
 import pytest
 
 import coding_review_agent_loop.architecture_contract as architecture_contract
-import coding_review_agent_loop.repair as repair
-import coding_review_agent_loop.repair_preservation as repair_preservation
 import coding_review_agent_loop.response_normalization as response_normalization
 import coding_review_agent_loop.response_validation as response_validation
 import coding_review_agent_loop.review_images_validation as review_images_validation
@@ -38,9 +36,8 @@ NORMALIZERS = (
 def test_normalizers_live_in_response_normalization(name):
     owner = getattr(response_normalization, name)
     assert owner.__module__ == "coding_review_agent_loop.response_normalization"
-    # The validated turn binds the relocated object; repair.py only re-exports it.
+    # The validated turn binds the relocated object.
     assert getattr(validated_agent, name, owner) is owner
-    assert getattr(repair, name) is owner
 
 
 def test_image_turn_and_architecture_boundary_import_the_relocated_owners():
@@ -52,15 +49,17 @@ def test_image_turn_and_architecture_boundary_import_the_relocated_owners():
         architecture_contract.canonicalize_architecture_near_miss_text
         is response_normalization.canonicalize_architecture_near_miss_text
     )
-    assert architecture_contract.recover_payload is response_normalization.recover_payload
-    # repair_preservation keeps compatibility names that point at the new owner.
-    assert repair_preservation.recover_payload is response_normalization.recover_payload
 
 
-def test_validated_turn_no_longer_imports_the_repair_modules():
-    source = open(validated_agent.__file__, encoding="utf-8").read()
-    assert "from .repair import" not in source
-    assert "from .repair_preservation import" not in source
+@pytest.mark.parametrize(
+    "module", ["repair", "repair_preservation", "shape_check_audit", "agents.format_repair"]
+)
+def test_retired_repair_modules_are_gone(module):
+    """`architecture-canonicalization-retained`: no import of a deleted module."""
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(f"coding_review_agent_loop.{module}")
 
 
 def test_corroborated_near_miss_canonicalizes_and_strictly_reparses():
@@ -99,9 +98,8 @@ def _review_validator(text):
     )
 
 
-@pytest.mark.parametrize("use_repair", [False, True])
-def test_envelope_defect_is_normalized_without_a_reask_or_repair(tmp_path, use_repair):
-    """`mechanical-normalization-no-reask`: independent of the retired flag."""
+def test_envelope_defect_is_normalized_without_a_reask(tmp_path):
+    """`mechanical-normalization-no-reask`: no model call for an envelope defect."""
     valid = structured_pr_review(summary="Looks good.")
     fenced = "```json\n" + valid.replace("\n<!--", "\n```\n<!--", 1)
     with patch_object_in(
@@ -112,7 +110,6 @@ def test_envelope_defect_is_normalized_without_a_reask_or_repair(tmp_path, use_r
             FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
-            use_repair=use_repair,
         )
     assert invoke.call_count == 1
     assert response.marker_value.summary == "Looks good."
@@ -166,3 +163,78 @@ def test_risk_matrix_string_field_is_wrapped_without_a_model_call(tmp_path):
     assert invoke.call_count == 1
     stored = json.loads(response.text.split("\n<!--", 1)[0])
     assert stored["risk_test_matrix"]["rows"][0]["forbidden_side_effects"] == ["Must not refuse"]
+
+
+# Near-miss normalization cases moved from the deleted
+# tests/test_repair_preservation.py (#2092): the normalizer outlives the
+# repair modules, so its behavior stays pinned here.
+
+
+def _near_miss_payload(text: str) -> dict:
+    return json.loads(text[: text.index("}\n") + 1])
+
+
+def _near_miss_text(impact) -> str:
+    rendered = structured_issue_implementation()
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def test_near_miss_normalization_rewrites_corroborated_status_to_changed():
+    result = response_normalization.normalize_architecture_impact_near_miss(
+        _near_miss_text(_DEG_CORROBORATED), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert _near_miss_payload(result.raw)["architecture_impact"]["status"] == "changed"
+    assert result.record.outcome == "normalized-to-changed"
+    assert result.record.element_path == "issue_implementation.architecture_impact.status"
+    assert result.forbid_architecture_impact is False
+    assert "undetermined" not in result.raw
+
+
+def test_near_miss_normalization_removes_uncorroborated_assessment():
+    required = response_normalization.normalize_architecture_impact_near_miss(
+        _near_miss_text(_DEG_UNCORROBORATED), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert "architecture_impact" not in _near_miss_payload(required.raw)
+    assert required.record.outcome == "degraded-to-undetermined"
+    assert required.forbid_architecture_impact is True
+    assert "undetermined" not in required.raw
+    # A normalization removal is pinned for every kind, including the
+    # optional-assessment reviews.
+    optional = response_normalization.normalize_architecture_impact_near_miss(
+        _near_miss_text(_DEG_UNCORROBORATED), required_contract=False
+    )
+    assert optional.forbid_architecture_impact is True
+    # A genuine omission is pinned only under a required contract.
+    omitted = response_normalization.normalize_architecture_impact_near_miss(
+        _near_miss_text(None), required_contract=False
+    )
+    assert omitted.forbid_architecture_impact is False
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        structured_issue_implementation(),
+        '{"kind":"issue_implementation","architecture_impact":{"status":"modified"',
+        "plain prose with no JSON",
+    ],
+    ids=["valid", "truncated", "prose"],
+)
+def test_near_miss_normalization_leaves_other_payloads_byte_identical(raw):
+    result = response_normalization.normalize_architecture_impact_near_miss(raw, required_contract=True)
+    assert result.raw == raw
+    assert result.record is None
+
+
+def test_near_miss_normalization_pins_absence_of_a_genuine_omission():
+    result = response_normalization.normalize_architecture_impact_near_miss(
+        _near_miss_text(None), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert result.record is None
+    assert result.forbid_architecture_impact is True

@@ -6619,8 +6619,7 @@ def test_structured_pr_review_rejects_malformed_evidence_requests(value):
 
 
 @pytest.mark.parametrize("field", ["blocking_items", "same_pr_followups", "future_followups"])
-def test_evidence_request_listed_as_a_finding_is_invalid_and_repairable(field):
-    from coding_review_agent_loop.repair_preservation import validate_repair_preservation
+def test_evidence_request_listed_as_a_finding_is_invalid_and_correctable(field):
     from coding_review_agent_loop.unresolved_items import _validate_review_response
 
     state = "approved" if field == "future_followups" else "blocking"
@@ -6630,22 +6629,14 @@ def test_evidence_request_listed_as_a_finding_is_invalid_and_repairable(field):
             source, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
         )
 
-    # The bounded format repair keeps the typed request and drops the
-    # coder-routed duplicate; the repaired response validates.
-    repaired = _evidence_review(state=state)
-    validate_repair_preservation(source, repaired, allowed_prior_item_ids=())
+    # A corrected resend keeps the typed request and drops the coder-routed
+    # duplicate; it validates.
+    corrected = _evidence_review(state=state)
     parsed = _validate_review_response(
-        repaired, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
+        corrected, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
     )
     assert parsed.exact_head_evidence_requests == (_EVIDENCE_REQUEST,)
     assert parsed.blocking_items == ()
-
-    # A repair that drops the typed request in favour of the finding is refused.
-    dropped = _evidence_review(
-        state=state, exact_head_evidence_requests=[], **{field: [_EVIDENCE_REQUEST]}
-    )
-    with pytest.raises(AgentLoopError, match="exact_head_evidence_requests"):
-        validate_repair_preservation(source, dropped, allowed_prior_item_ids=())
 
 
 def test_evidence_obligation_lifecycle_is_validated():
@@ -7300,7 +7291,7 @@ from coding_review_agent_loop.protocol import (  # noqa: E402
     sanitize_architecture_impact as _sanitize_1330,
     validate_structured_plan_state as _validate_plan_state_1330,
 )
-from coding_review_agent_loop.repair_preservation import (  # noqa: E402
+from coding_review_agent_loop.response_normalization import (  # noqa: E402
     canonicalize_architecture_near_miss_text as _canonicalize_1330,
 )
 
@@ -7986,16 +7977,9 @@ def test_fold_helper_reuses_flat_object_helpers_1328():
     import inspect
 
     from coding_review_agent_loop.protocol import _fold_unknown_finding_keys
-    from coding_review_agent_loop.shape_check_audit import SHAPE_CHECK_AUDIT
 
     source = inspect.getsource(_fold_unknown_finding_keys)
     assert "_flat_object_defect(" in source and "_render_flat_object(" in source
-    for name in (
-        "_fold_unknown_finding_keys",
-        "_flatten_plan_review_finding",
-        "_expect_review_finding_list",
-    ):
-        assert "payload-bound" in SHAPE_CHECK_AUDIT[name].clauses
 
 
 # --- Plan review finding provenance (#1505) ---------------------------------

@@ -647,9 +647,6 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
-        lambda *_a, **_k: (None, None, ()),
-    )
 
     with pytest.raises(AgentLoopError, match="architecture_impact"):
         run_issue_loop(runner, issue_number=56, config=ordinary_config)
@@ -749,9 +746,6 @@ def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimp
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
-        lambda *_a, **_k: (None, None, ()),
-    )
 
     with pytest.raises(AgentLoopError, match="ordinary managed-CI") as exc_info:
         run_issue_loop(runner, issue_number=56, config=config)
@@ -818,9 +812,6 @@ def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
         protection_mode=protection_mode,
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
-    )
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
-        lambda *_a, **_k: (None, None, ()),
     )
 
     with pytest.raises(AgentLoopError, match="rejected before a PR number was accepted") as exc_info:

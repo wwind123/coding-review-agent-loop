@@ -356,7 +356,7 @@ class VisualRun:
                         prompt=prompt, role='reviewer', session_id=None, timeout_seconds=300,
                         label='visible-defects', image_inputs=images,
                         validate=lambda text: validate_visual(text, reviewer=name, items=assigned, parse_requirement_evidence=freeze_mode(config)),
-                        use_repair=False, usage_context=usage_context)
+                        usage_context=usage_context)
                 if current_head() != head:
                     return VisualOutcome(stale=True)
                 if response.acquisition_outcome != 'success':

@@ -4203,11 +4203,10 @@ def test_superseded_prepanel_review_context_block_is_non_authoritative(tmp_path)
     assert "Superseded pre-panel review context" not in plain
 
 
-def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
-    """#849: every coder, correction, and repair surface shows the exact claim keys."""
+def test_semantic_claim_schema_is_shared_by_every_prompt_surface():
+    """#849: every coder and correction surface shows the exact claim keys."""
     from types import SimpleNamespace as _Namespace
 
-    import coding_review_agent_loop.repair as repair_module
     from coding_review_agent_loop.protocol_risk import (
         SEMANTIC_RISK_CLAIM_KEYS,
         _parse_semantic_risk_coverage_claims,
@@ -4231,25 +4230,12 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
             diagnostics=(),
             execution_catalog=(),
         ),
-        "repair-issue": repair_module._build_repair_prompt(
-            "{}", expected_kind="issue_implementation"
-        ),
-        "repair-followup": repair_module._build_repair_prompt(
-            "{}", expected_kind="coder_followup"
-        ),
-        "repair-issue-rules": repair_module._issue_implementation_instruction(
-            "issue_implementation", None, False
-        ),
     }
     example_json = semantic_risk_claim_example_json()
     for name, text in surfaces.items():
         for key in SEMANTIC_RISK_CLAIM_KEYS:
             assert f"`{key}`" in text or f'"{key}"' in text, (name, key)
         assert example_json in text, name
-    assert "Format K" in surfaces["repair-issue"]
-    format_k = surfaces["repair-issue"].split("Valid Format K", 1)[1].split("## Valid Format", 1)[0]
-    assert example_json in format_k
-    assert "{semantic_risk_claim_example}" not in repair_module._REPAIR_PROMPT
 
     example = json.loads(example_json)
     assert example == semantic_risk_claim_example()
@@ -5031,8 +5017,6 @@ def test_exhaustiveness_rule_sits_inside_the_compact_stable_prefixes(tmp_path):
 
 
 def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
-    import coding_review_agent_loop.repair as repair_module
-
     config = make_config(tmp_path)
     prompts = {
         "coder-followup": build_followup_prompt(77, 1, "Needs tests.", config),
@@ -5042,9 +5026,6 @@ def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
             783, 2, "Previous plan", "Blocking review", config, compact_context=True
         ),
         "discuss-review": build_discuss_review_prompt(56, config, reviewer="codex", round_number=1),
-        "repair-pr-review": repair_module._build_repair_prompt("{}", expected_kind="pr_review"),
-        "repair-plan-review": repair_module._build_repair_prompt("{}", expected_kind="plan_review"),
-        "repair-coder": repair_module._build_repair_prompt("{}", expected_kind="coder_followup"),
     }
     for name, prompt in prompts.items():
         assert "Review exhaustively" not in prompt, name
@@ -7589,7 +7570,6 @@ def test_review_and_coder_prompts_thread_superseded_ids(tmp_path):
 def test_coder_guidance_keeps_positive_pr_beside_blocked_signed_requirement(tmp_path):
     """Matrix row `prompt-guidance-keeps-pr`."""
     from coding_review_agent_loop.github import HumanReviewRequirement, IssueContext
-    from coding_review_agent_loop.repair import _build_repair_prompt
 
     requirement = HumanReviewRequirement(
         source_type="Issue comment",
@@ -7609,10 +7589,6 @@ def test_coder_guidance_keeps_positive_pr_beside_blocked_signed_requirement(tmp_
         build_issue_implementation_prompt(56, "1. Fix it.", config, issue_context=issue_context),
         build_completion_recovery_prompt(config, issue_context=issue_context, human_requirements=(requirement,)),
     ]
-    repair_prompt = _build_repair_prompt(
-        "Not structured.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
-        expected_kind="issue_implementation",
-    )
     forbidden = (
         "discovered to be blocked after a PR",
         "requires `pr_number: null`",
@@ -7628,10 +7604,6 @@ def test_coder_guidance_keeps_positive_pr_beside_blocked_signed_requirement(tmp_
         for phrase in forbidden:
             assert phrase not in prompt, phrase
     assert any("keeps the real positive `pr_number`" in prompt for prompt in coder_prompts)
-    assert "Use `pr_number: null` only for a no-PR result" in repair_prompt
-    assert "stays beside the positive PR as a `blocked`" in repair_prompt
-    for phrase in forbidden:
-        assert phrase not in repair_prompt, phrase
 
 
 # --- #2145: plan-review implementation notes reach implementer and PR reviewers ---

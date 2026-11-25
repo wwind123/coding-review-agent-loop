@@ -215,7 +215,7 @@ def _install_v2_dispatch_boundary(monkeypatch):
 
 def _managed_guard_loop(
     tmp_path, monkeypatch, *, managed=True, mode="implicit", audit_runs=(), audit_returncode=0,
-    claude_outputs=None, antigravity_outputs=None, real_repair=False, expect_error=None,
+    claude_outputs=None, antigravity_outputs=None, expect_error=None,
 ):
     record = _fake_real_gh(tmp_path, monkeypatch)
     runner = _GuardedCoderRunner(
@@ -240,13 +240,6 @@ def _managed_guard_loop(
             "app": {"slug": "github-actions"}, "check_suite": {"id": 5},
         }]},
     )
-    if real_repair:
-        # Undo the autouse repair stub so the configured repair chain runs.
-        from coding_review_agent_loop import validated_agent
-        from coding_review_agent_loop.agents import antigravity as agy_mod
-
-        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
-        monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
     contract = None
     if managed and mode in {"implicit", "explicit"}:
         contract = ManagedCiContract()
@@ -719,7 +712,7 @@ def test_v2_dispatch_never_appends_a_v1_record(tmp_path, monkeypatch):
 
 def _failed_qualification_fix_loop(
     tmp_path, monkeypatch, *, coder_run=True, claude_outputs=None, antigravity_outputs=(),
-    real_repair=False, expect_error=False,
+    expect_error=False,
 ):
     """Approval, a real v1 dispatch, a failed qualification, then a guarded
     coder fix turn whose audit sees the orchestrator's own run (#1414)."""
@@ -755,12 +748,6 @@ def _failed_qualification_fix_loop(
             "app": {"slug": "github-actions"}, "check_suite": {"id": 5},
         }]},
     )
-    if real_repair:
-        from coding_review_agent_loop import validated_agent
-        from coding_review_agent_loop.agents import antigravity as agy_mod
-
-        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
-        monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
     contract = ManagedCiContract()
     monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *_a, **_k: contract)
     failed_check = PullRequestCheck(
@@ -831,7 +818,7 @@ def test_rejected_guarded_fix_turn_passes_records_and_posts_nothing_for_own_run(
     malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
     runner, contract, rejected = _failed_qualification_fix_loop(
         tmp_path, monkeypatch, coder_run=False, claude_outputs=[malformed],
-        antigravity_outputs=["still not a response"] * 12, real_repair=True, expect_error=True,
+        expect_error=True,
     )
 
     [call] = rejected
@@ -887,20 +874,19 @@ def _legacy_rejection_path(monkeypatch):
 
 
 def _prose_before_footer(response):
-    """Markdown between the JSON object and the footer needs format repair."""
+    """Markdown between the JSON object and the footer fails validation."""
     head, footer, tail = response.partition("<!-- AGENT_STATE:")
     return f"{head.rstrip()}\n## Changes made\nProse the envelope forbids.\n{footer}{tail}"
 
 
 def test_rejected_guarded_coder_turn_still_publishes_dispatch_audit(tmp_path, monkeypatch):
     """#1366 item-3: a bypass dispatch followed by a response that fails
-    validation and repair is still surfaced, without masking the rejection."""
+    validation (and its same-agent re-asks) is still surfaced, without masking the rejection."""
     _legacy_rejection_path(monkeypatch)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
     runner, _record, dispatches, _ = _managed_guard_loop(
         tmp_path, monkeypatch, claude_outputs=[malformed],
-        antigravity_outputs=["still not a response"] * 12, real_repair=True,
         audit_runs=[_dispatch_run(38032663783, "525753a4b04bd57d874211ba1fade250c3ff6d82", created_at=now)],
         expect_error=True,
     )

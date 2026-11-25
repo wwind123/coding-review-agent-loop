@@ -362,7 +362,7 @@
         "retained_driver_lookup_sites": []
       },
       "SemanticRiskCoverageClaim": {
-        "sha256": "c7564b2edad0ebd59839321542d7eace52b2032a5c12df2a3c9fa4885dfadf8a",
+        "sha256": "14018caf50d228a67fc8f619a7dbb2ef991d99d4a0e3890c2132de0069c473f9",
         "original_lines": [
           1017,
           1066
@@ -442,7 +442,7 @@
         "retained_driver_lookup_sites": []
       },
       "SemanticRiskCoverageClaims": {
-        "sha256": "87c0d0d64e57b0f2a7cf0b67354a6184f1786aa2e9e992d58fa56a2f1427c94f",
+        "sha256": "ddf5997ee144493bb4fb09997bb56d63c5e11d66be97d14ef02965017f9b0b2a",
         "original_lines": [
           1069,
           1100
@@ -501,7 +501,7 @@
         ]
       },
       "SemanticRiskCoverageGap": {
-        "sha256": "0cbed1fcbbe7b7806e9361fffc585c42cdc621deaf96cea0c14443b91a83a7e7",
+        "sha256": "3bdd35e3360b661bd60fff6292f62e0185241f1bc8ad91ebb595b4cbe396a510",
         "original_lines": [
           1103,
           1116
@@ -524,7 +524,7 @@
         "retained_driver_lookup_sites": []
       },
       "SemanticRiskCoverageGaps": {
-        "sha256": "22c533354e1f1e90991b82ebb0d92552ddbc8fe27a6d0eb3bf389934cbea5439",
+        "sha256": "db9667061d523f4172acc03f2835818452d4457cbdf251537fadaef99a2bac73",
         "original_lines": [
           1119,
           1131
@@ -957,7 +957,7 @@
         "retained_driver_lookup_sites": []
       },
       "_risk_bounded_string": {
-        "sha256": "7f8ab223da4b2fdad3c15e2290b8929fc6a7c85d628a81a8472d6b37ed07e66a",
+        "sha256": "077a07d44fad66650855d422668388f1578a004a7c5a29f604b8c240bfc89b6c",
         "original_lines": [
           1704,
           1708
@@ -983,7 +983,7 @@
         ]
       },
       "_risk_bounded_string_list": {
-        "sha256": "0d535b3afea5f736294a0349edfb7b9dfb9fc8cf0013b732ac36529d66de137d",
+        "sha256": "c14fb082169c433f063818e3293d1313316624a2bba39c19296e14b3b12951f1",
         "original_lines": [
           1711,
           1726
@@ -1001,7 +1001,7 @@
         "retained_driver_lookup_sites": []
       },
       "RiskTestMatrixRow": {
-        "sha256": "fcbff26ab3f50c7edc6dab997adff570a13b66ccae44cb9dca60387c2ab39448",
+        "sha256": "c48195180111344b9f04f36b98de251b22b9cb5c71d8f688f123ecbf64004ad8",
         "original_lines": [
           1729,
           1758
@@ -1030,7 +1030,7 @@
         ]
       },
       "RiskTestMatrix": {
-        "sha256": "cc6ff16896a5e067582fa427ece77a239fc413fd1020351cd036130d87c6f13f",
+        "sha256": "2cb706972a4d549e76a3a34338d07c56e68ea3b075778196d96f0fcc959c9804",
         "original_lines": [
           1761,
           1780
@@ -1108,7 +1108,7 @@
         ]
       },
       "RiskTestMatrixChange": {
-        "sha256": "0987c40b6dc751fd662ca29f9e981fdcd1a7a7e2a4c1b7422e8a8f93299f0246",
+        "sha256": "84ea5440a9c1bd34cf08186857d015020d41692335452a8f3aa2f9822be924ef",
         "original_lines": [
           1783,
           1794
@@ -1141,7 +1141,7 @@
         "retained_driver_lookup_sites": []
       },
       "_validate_risk_row_id": {
-        "sha256": "7e26d31e866714c3e4d5f061b5ed8e645b6a4606aa9d2c35f56372839e8eac3c",
+        "sha256": "250dbf3fec14c3e5d1dbfb7e286151884f2a9ec81604824be1054cde1ed231e3",
         "original_lines": [
           1797,
           1803
@@ -1168,7 +1168,7 @@
         ]
       },
       "_validate_risk_owner": {
-        "sha256": "043977f5af1586e85f16f7ba405b98fbd7098bbe91a0121b1f7eae224cd5b13d",
+        "sha256": "71c12e1bae35311f7f498bd3c9c58b9fd87a5405fbda160399c36d933451b963",
         "original_lines": [
           1806,
           1812
@@ -1186,7 +1186,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_risk_test_matrix": {
-        "sha256": "9f67b20f65c07958e9917b2fec781ebdc90c566078b31553e284ced9017ef843",
+        "sha256": "3b6599b181ebee9e12b1b3428d625989e583b0d2962d177c2159721b61a7c404",
         "original_lines": [
           1815,
           1888
@@ -1218,7 +1218,7 @@
         "retained_driver_lookup_sites": []
       },
       "parse_risk_test_matrix": {
-        "sha256": "3d71e1e5a827fb73c1cff907529b8905150b97339ee09cf7e86a48a5eee4654f",
+        "sha256": "5f681a5b3c761dfc866a776e899d567b106456d7eb72e42f761aab2b5e238ea5",
         "original_lines": [
           1891,
           1903
@@ -1437,7 +1437,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_risk_test_matrix_changes": {
-        "sha256": "6cbbd61393644c9d6579fe9f94ec53ac14520cac9632484a7b8f6035869ce2f6",
+        "sha256": "283f159cf9427e5c0643bdaf358d311c698bd9b48d711344d6ca84e80b643dbf",
         "original_lines": [
           1906,
           1934
@@ -1463,7 +1463,7 @@
         "retained_driver_lookup_sites": []
       },
       "parse_risk_test_matrix_changes": {
-        "sha256": "8519a9040a4a7e6f545455b4d7e058f61084bc7041a47da2a4991ef0ed26405a",
+        "sha256": "181f4c246dbe8fee10fee981f3808f227d5bcf2ac5c04fea8dd245c9cb4b66b8",
         "original_lines": [
           1937,
           1938
@@ -1585,7 +1585,7 @@
         "retained_driver_lookup_sites": []
       },
       "risk_test_matrix_identity": {
-        "sha256": "d5c7f4b3d46e5a7755af6f6e2f7e5573207330e3eee900070faa1c67820e49b9",
+        "sha256": "e005cfb5eefd4802cc31ed840d53d13379c94557c21c0f136594e8e4ee14846a",
         "original_lines": [
           2022,
           2040
@@ -1878,7 +1878,7 @@
         "retained_driver_lookup_sites": []
       },
       "sanitize_risk_test_matrix": {
-        "sha256": "718a37220816aa443fec5ddc91f79391c174ebf59821ca5712f8773d4ea714f7",
+        "sha256": "36491236538bd9c5f3a26d748441f67c4b67e945a38f38a39630b39c723c0a94",
         "original_lines": [
           2043,
           2047
@@ -1896,7 +1896,7 @@
         "retained_driver_lookup_sites": []
       },
       "validate_risk_test_matrix_revision": {
-        "sha256": "72e09ac81a4c36fb21ab53d1dc42a25bf1a4781c6b6c449fecf7b21bf4927802",
+        "sha256": "a83f5986ed8d684130ae1d20b54690c19dae12d1a91cf47a0072d74414b038f1",
         "original_lines": [
           2050,
           2249
@@ -2052,7 +2052,7 @@
         "retained_driver_lookup_sites": []
       },
       "RiskTestMatrixEvidenceRow": {
-        "sha256": "a2eab7f716130153b0863bd8c71f60bb07b21dbb232f2c5ac4e0ceaeda04f160",
+        "sha256": "6c6accb7000f197ed11d68b3c1e2c97fa39917283a13e42085406771065c712e",
         "original_lines": [
           2388,
           2426
@@ -2073,7 +2073,7 @@
         "retained_driver_lookup_sites": []
       },
       "RiskTestMatrixEvidence": {
-        "sha256": "659584a164ec86c821a7e0e7bcbb61de55c94c7a6ae5ef5eed87c6365e4a51e0",
+        "sha256": "47b86581d6ef5a8be23af33af855fb8e5ab38ccabde22ec35d59b8b5a27642b0",
         "original_lines": [
           2429,
           2438
@@ -2097,7 +2097,7 @@
         "retained_driver_lookup_sites": []
       },
       "PostAuthClaimDiagnostic": {
-        "sha256": "0fab2bed72daa6fe23fff1672e94737fa50855752bdc832676c95d86673fb7c4",
+        "sha256": "d595b1eaddafb3b7b745f3f034bf5f1e11785198dbe0b55b42e0579c128f4d96",
         "original_lines": [
           2441,
           2454
@@ -2652,7 +2652,7 @@
         "retained_driver_lookup_sites": []
       },
       "_degraded_row_claim_message": {
-        "sha256": "476a002cf2d6c08581bcb6dafd463ea039fb6cdd594a9e10e2b414488af78266",
+        "sha256": "2ffa05237f88acdbf3e4731419002987dc6009aad41593d7141a0689e9563f91",
         "original_lines": [
           2701,
           2708
@@ -2669,7 +2669,7 @@
         "retained_driver_lookup_sites": []
       },
       "_unapproved_row_claim_message": {
-        "sha256": "ede349b8e63c7eba07b6b9f4fef6dd21ed7d039bde5603742d07217400204beb",
+        "sha256": "ae8ac7de22d3d905f70a67726ae1451ddb61561b43ed662993ece533d16a045a",
         "original_lines": [
           2711,
           2739
@@ -2701,7 +2701,7 @@
         "retained_driver_lookup_sites": []
       },
       "derive_risk_test_matrix_evidence": {
-        "sha256": "0b2df6317f82a5444c4b60cf496356194dc77e723cf655a8b738a35ff5962917",
+        "sha256": "3265ab54f831a5cf709d5b84e60265ac64f4b7c158c4dcef5b045f4b6be3c315",
         "original_lines": [
           2752,
           3120
@@ -2808,7 +2808,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_risk_evidence_citations": {
-        "sha256": "f7e41ffdf731fa3dc32da6bf16e82dc43fcc2ae0ec051f75367dcd113c3cd68c",
+        "sha256": "b5b55a9a37765b4ff62eebd9a0d7d9644a0a745c2d9e8e657f2d24e03439dd7c",
         "original_lines": [
           3128,
           3129
@@ -2825,7 +2825,7 @@
         "retained_driver_lookup_sites": []
       },
       "parse_risk_test_matrix_evidence": {
-        "sha256": "00b619e9e4324a9614904d0d1acd44d8debce065b4dabdc00709cf082e26e7ba",
+        "sha256": "d16c5ed8092e90b9bc40ef4892d4897fbe1efe597725139b90e69007e7b88a49",
         "original_lines": [
           3132,
           3307
@@ -2911,7 +2911,7 @@
         ]
       },
       "_parse_operator_signed_row": {
-        "sha256": "3bc97cede9761504f9d0091c190cb1a5199215b95211ba0ac008126c03210746",
+        "sha256": "a1afc4d4c008ec1123d27b5ce9fa09481f343449e16562a963dd29ec11a47651",
         "original_lines": [
           3310,
           3359
@@ -2932,7 +2932,7 @@
         "retained_driver_lookup_sites": []
       },
       "apply_signed_evidence_references": {
-        "sha256": "9467e7df2dd8db6593ea836305d3c8182780bd88eda5f321a75842d228d6017e",
+        "sha256": "f48747f1f82a3a397f66d65dc27ddf0e0395c952574511b6e7b2361ea8c98cb8",
         "original_lines": [
           3362,
           3408
@@ -3147,7 +3147,7 @@
         "retained_driver_lookup_sites": []
       },
       "render_evidence_rejection_detail": {
-        "sha256": "bdbd2acf52455247487227338fb6748026b43e62ba89682458088686dd59a6b2",
+        "sha256": "ef9ce3e43a7644d92eeec4f15f0db19f998103148e37eccb58abb4ae7b3665c4",
         "original_lines": [
           3666,
           3677
@@ -3165,7 +3165,7 @@
         "retained_driver_lookup_sites": []
       },
       "_node_test_hint": {
-        "sha256": "7f1cb37851501ff1a3fe7d8fdecc0cb3a221179ebb21b0edaf4081c62f13ee33",
+        "sha256": "d77312885b15763a37409b9842e316c5defc6b1d25518b38272ef833585a0a4d",
         "original_lines": [
           3680,
           3741
@@ -3336,7 +3336,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_risk_test_matrix_contract_fields": {
-        "sha256": "0f3f9e97b04d036d7c5b9178274f0a869b32af3cf9d21c15c3feb191d05b2915",
+        "sha256": "c80ac6bb10ccf2be7589984f034bc2ce3604ae203ea6fcbdd6a5c20adcd9f8c6",
         "original_lines": [
           3906,
           3941
@@ -3361,7 +3361,7 @@
         ]
       },
       "_expect_test_observations": {
-        "sha256": "b69096c53039b6e92a873685c7c615e0d3d41fe0d4f31febb8009c28d658b1ff",
+        "sha256": "04ad23e4acf28d776cde26892b4e5c5d31648ea585d2603123bdf8e6a951acec",
         "original_lines": [
           4320,
           4346
@@ -3556,7 +3556,7 @@
         "retained_driver_lookup_sites": []
       },
       "_citation_defect_observed": {
-        "sha256": "556fd4405df7866d14ba6efa04d41617cc9381a7b8bf2f14aca6ca42fda683de",
+        "sha256": "6a88df62f6fe758030a1ff82fc7df89647c43dfd889254813a93915ad60b6484",
         "original_lines": [
           4398,
           4406
@@ -3577,7 +3577,7 @@
         "retained_driver_lookup_sites": []
       },
       "_decode_test_observations_string": {
-        "sha256": "c0456f5da27f01c710ddefb6c168bf4cfa45b0e95ca42612c9c4fe0daa3cd576",
+        "sha256": "aecdf1e952d15fdf7b58cab8953c78757431ffd14a6fd74566ab16dbcb1ae35f",
         "original_lines": [
           4409,
           4424
@@ -3597,7 +3597,7 @@
         "retained_driver_lookup_sites": []
       },
       "_degradable_test_observations": {
-        "sha256": "c919efdc3c4f32e89c8dd6a096382b6e3313b229df8be1a51c5424165dc90ee0",
+        "sha256": "1477c0120f85a480827b1ee9fdd9f8243eb86a880233f02d4551035b2d0a96a3",
         "original_lines": [
           4427,
           4513
@@ -3658,7 +3658,7 @@
         "retained_driver_lookup_sites": []
       },
       "_hard_capped_claim_string": {
-        "sha256": "29cf3c2fb4b463486f80613693679fe004b7b46492f7cdef53e7b5719fc702a4",
+        "sha256": "b733082bbfeedd1208e82c26f1d9480823dbdd41a6bd8cfcb1bb277055d34bdd",
         "original_lines": [
           4524,
           4529
@@ -3685,7 +3685,7 @@
         "retained_driver_lookup_sites": []
       },
       "_optional_semantic_fact_string": {
-        "sha256": "2d69b0ae131a4f94815b3bcb542e138dafebe1421694fd703da139daa7bae532",
+        "sha256": "abd1f4f745915f1415db5825357cb12b55f7cfe617d9bb3acd5d038c427be1f8",
         "original_lines": [
           4549,
           4567
@@ -3703,7 +3703,7 @@
         "retained_driver_lookup_sites": []
       },
       "_optional_semantic_fact_list": {
-        "sha256": "2d3d0226b41b743a22c2998aaedec2b12c77447a4f7ad9593e57b00e5294463f",
+        "sha256": "4aecbe1710509f89b180e12f9df85e1bd5373aa1ddeca0f2c02a891262f4c612",
         "original_lines": [
           4570,
           4617
@@ -3722,7 +3722,7 @@
         "retained_driver_lookup_sites": []
       },
       "_semantic_execution_ref_list": {
-        "sha256": "97afb119472a522f704c4b595f069f512c4a5c1451aef9203e8875d651e57bdd",
+        "sha256": "a35a5936e76d117503bd444d24a8c2f7ce43e2f3f087ef7d4cae0fe7e4450730",
         "original_lines": [
           4620,
           4648
@@ -3764,7 +3764,7 @@
         "retained_driver_lookup_sites": []
       },
       "_dropped_ref_preview": {
-        "sha256": "ccec3802e48fe4c9ec2f756218fe2566a35a2052ab363c75916cd45fadebb263",
+        "sha256": "817bee177bdaca690bd6b4c2f2af9c62d774743a4c799132e5704909899605df",
         "original_lines": [
           4680,
           4685
@@ -3780,7 +3780,7 @@
         "retained_driver_lookup_sites": []
       },
       "_dropped_execution_refs_caveat": {
-        "sha256": "1b47790d8d1e1c625cd40aab1ece337fedfe54c9aaf122c43551958cc45f2b79",
+        "sha256": "4754f1c798dade1b67b469bb055a1b0b36e37ecee6de7b017860185b93070724",
         "original_lines": [
           4688,
           4694
@@ -3796,7 +3796,7 @@
         "retained_driver_lookup_sites": []
       },
       "_overflow_execution_refs_caveat": {
-        "sha256": "1fb9d7954c50840beab8d111269ae22220b154925fa2aac2076b1e47c55cf913",
+        "sha256": "157c5b08aae497dc7a3702bed8054d7c0f179ff995065af0e5757ace2bed3a0f",
         "original_lines": [
           4697,
           4713
@@ -3813,7 +3813,7 @@
         "retained_driver_lookup_sites": []
       },
       "_named_refs_caveat": {
-        "sha256": "d8d0655a736910a527b7dff793a04d65061c3503f0e1def2c7491867f638e59e",
+        "sha256": "9e35d5fee713fceff899472f75e8f5088ae3b8ac2051f2ca71616fa221ca2076",
         "original_lines": [
           4716,
           4729
@@ -3860,7 +3860,7 @@
         "retained_driver_lookup_sites": []
       },
       "_check_dropped_value_bound": {
-        "sha256": "2cf0643a9492a345bf5f424ac2ecbb18b47b040cbd6f640f666670c7ce4ce7c4",
+        "sha256": "5f7b2f7428fa17cfb6ff93f9d65120d8853cd7cf908299f1182c7eca340c8f05",
         "original_lines": [
           4748,
           4760
@@ -3878,7 +3878,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_semantic_risk_coverage_claims": {
-        "sha256": "a73dd1d6d0dd682977865de287b1e1ca56737dcd5f58d38d1bb5e8856221750f",
+        "sha256": "a5d1433305c8c6a7958101b869e30f086ab552682b589ef1de5144d315d75ffc",
         "original_lines": [
           4763,
           5183
@@ -3962,7 +3962,7 @@
         ]
       },
       "_gap_degradations": {
-        "sha256": "f91fc17a1a347e6b40a2d2e82e15d36d6b48dd188c05f154a57946cd629687b0",
+        "sha256": "8ce3979bb0093257353e5e27f0b9cb2f99bca5523171340d429e5abd65255651",
         "original_lines": [
           5186,
           5192
@@ -3979,7 +3979,7 @@
         "retained_driver_lookup_sites": []
       },
       "_parse_semantic_risk_coverage_gaps": {
-        "sha256": "f602b3efefc28d8f46ec70ead8fd81cfa9d591d587ce4bc403a9c82dcb19d462",
+        "sha256": "efc198fad47c427a91830129c11003ecd5144b66a989eebf68daae86684abe94",
         "original_lines": [
           5195,
           5262
@@ -4022,7 +4022,7 @@
         "retained_driver_lookup_sites": []
       },
       "_claim_row_id_or_degradation": {
-        "sha256": "a928782d5ee58d3d97e003d7460f527f1072139c72f8b9365c6a7b9d62018a2b",
+        "sha256": "cb9a82a7059a262e5a071db593ad46452a6a5ea5b770f70a5bfcf150c2e4199f",
         "original_lines": [
           5272,
           5302
@@ -4048,7 +4048,7 @@
         "retained_driver_lookup_sites": []
       },
       "RiskTestMatrixMetadata": {
-        "sha256": "2319b5ea71cbe25a9bf26033e43d7ba8e798d363468eecd6995b03bdb6b2cc2c",
+        "sha256": "a285511ce0c193c89d91d5d7356a838b84f0ce5176ceba8076cea7cfbecc4285",
         "original_lines": [
           8276,
           8295
@@ -4072,7 +4072,7 @@
         ]
       },
       "_parse_complete_risk_test_matrix_row": {
-        "sha256": "66c856186c7d9233023c4f874bd674f7f1118fa407aa9ff796c4baa1edd62df2",
+        "sha256": "c0baf584b629b88aa83d6b569199b5d3ff36fa311588ec56f46249c7b36ccfb5",
         "original_lines": [
           8443,
           8463
@@ -4094,7 +4094,7 @@
         "retained_driver_lookup_sites": []
       },
       "parse_risk_test_matrix_row": {
-        "sha256": "3bde28368acf2222931c5591d4b3574c57bdcb805970bea6c13ec510c73c79ca",
+        "sha256": "b7ab5853194e5ffc5964cafe0a857244cc93b86be6b76944f101b159bd7a5336",
         "original_lines": [
           8466,
           8471
@@ -4116,7 +4116,7 @@
         ]
       },
       "_parse_matrix_metadata": {
-        "sha256": "17b710eb79d4ddbe3a4d961e09563803331b2dc73dd60724bb5759ef3e7f5cec",
+        "sha256": "ba93ecd0a20e57cda8e9a8455d7a3118a429fd7a2258fb28b8ffad2cae6b623c",
         "original_lines": [
           8510,
           8535

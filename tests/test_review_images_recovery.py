@@ -125,7 +125,7 @@ def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_
         return validated_agent._run_validated_agent(
             object(), agent="claude", config=make_config(tmp_path), prompt="image assessment",
             marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
-            validate=json.loads, use_repair=True, reask_on_evidence_rejection=True,
+            validate=json.loads, reask_on_evidence_rejection=True,
             completion_recovery=object())
     if not cleanup_confirmed:
         monkeypatch.setattr("coding_review_agent_loop.review_images_validation.attempt_envelope_normalization",
@@ -140,7 +140,7 @@ def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_
     assert len(calls) == 1 and images._closed
 
 
-def test_format_repair_only_sees_generated_text_and_keeps_frozen_proof(tmp_path, monkeypatch):
+def test_envelope_normalization_only_sees_generated_text_and_keeps_frozen_proof(tmp_path, monkeypatch):
     from coding_review_agent_loop import review_images_validation as validation
     snapshot, images = inputs()
     snapshot.close()
@@ -156,18 +156,16 @@ def test_format_repair_only_sees_generated_text_and_keeps_frozen_proof(tmp_path,
     response = validated_agent._run_validated_agent(
         object(), agent="claude", config=make_config(tmp_path), prompt="untrusted prompt and image bytes",
         marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
-        validate=json.loads, use_repair=True, repair_expected_kind="pr_review")
+        validate=json.loads, repair_expected_kind="pr_review")
     assert seen == ["malformed generated response"]
     assert response.image_delivery_proof is proof and images._closed
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-@pytest.mark.parametrize("stage,use_repair", [
-    ("initial", False), ("initial", True), ("normalized", True),
-])
+@pytest.mark.parametrize("stage", ["initial", "normalized"])
 @pytest.mark.parametrize("token,marker,_surface", MARKERS)
 def test_image_validation_guards_every_parse_against_reserved_records(
-    tmp_path, monkeypatch, provider, stage, use_repair, token, marker, _surface,
+    tmp_path, monkeypatch, provider, stage, token, marker, _surface,
 ):
     from coding_review_agent_loop import review_images_validation as validation
 
@@ -199,9 +197,9 @@ def test_image_validation_guards_every_parse_against_reserved_records(
         validated_agent._run_validated_agent(
             object(), agent=provider, config=make_config(tmp_path), prompt="untrusted images and diff",
             marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
-            validate=validate, use_repair=use_repair, repair_expected_kind="pr_review")
+            validate=validate, repair_expected_kind="pr_review")
     assert parses == ([] if stage == "initial" else [original])
-    # Envelope normalization always runs since the repair flag retired
-    # (#2066); the normalized text is still guarded and rejected.
+    # Envelope normalization always runs (#2066); the normalized text is
+    # still guarded and rejected.
     assert normalizations == [original]
     assert len(acquisitions) == 1 and images._closed

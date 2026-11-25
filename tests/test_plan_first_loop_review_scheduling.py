@@ -58,7 +58,6 @@ from issue_loop_test_helpers import (
     _m1251_prompts,
     _plan_round_records,
     _remediation_plan_fixtures,
-    _repaired_acknowledgement_fixtures,
     _staged_plan_config,
 )
 from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
@@ -402,80 +401,6 @@ def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
 
     # Both reviewers approved, yet the plan is not carried into implementation.
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
-
-
-def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt_repost):
-    """A named Antigravity primary approves on fallback Model B without the ack."""
-    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
-
-    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
-    dispositions = [{
-        "requirement_id": requirement.requirement_id,
-        "disposition": "addressed",
-        "evidence": "The plan preserves the public API.",
-    }]
-    flash = SeatAgent(
-        ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash",
-    )
-    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
-    for seat in (flash, opus):
-        seat.workdir.mkdir()
-
-    def review(seat_signature, *, resolved):
-        return structured_plan_review(
-            state="approved", reviewer=seat_signature,
-            human_requirements_resolved=resolved,
-            human_requirement_dispositions=dispositions,
-        )
-
-    repaired = review("flash (Google Antigravity: Model B)", resolved=True)
-    runner = _FakeRunner(
-        claude_outputs=[plan_output],
-        antigravity_outputs=[
-            ("quota exceeded", 1),
-            review("flash (Google Antigravity: Model B)", resolved=False),
-            review("opus (Google Antigravity: Model C)", resolved=True),
-        ],
-    )
-    real_get_issue_context = discuss_loop.get_issue_context
-
-    def _patched(runner_arg, *, config, issue_number):
-        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
-        return replace(context, human_requirements=(requirement,))
-
-    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop, plan_execution), "get_issue_context", _patched)
-    config = make_config(
-        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
-        plan_review_policy="primary-then-panel", primary_plan_reviewer=flash,
-        review_parallel=True, agent_max_retries=0, max_rounds=6,
-    )
-    real_post = architecture_contract.post_issue_comment
-    state = {"interrupted": False}
-
-    def interrupt_before_the_repost(*args, **kwargs):
-        body = kwargs["body"]
-        if (
-            interrupt_repost and not state["interrupted"]
-            and "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in body
-            and "\n-- flash (" in body
-        ):
-            state["interrupted"] = True
-            raise KeyboardInterrupt
-        return real_post(*args, **kwargs)
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
-        with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=interrupt_before_the_repost,
-        ):
-            if interrupt_repost:
-                with pytest.raises(KeyboardInterrupt):
-                    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-                assert state["interrupted"]
-                restored = [r for r in _plan_round_records(runner) if r.agent == "flash"]
-                assert [(r.model_used, r.surfaced_reviewer_requirement_ids) for r in restored] == [
-                    ("Model B", ()),
-                ]
-            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-    return runner
 
 
 def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):

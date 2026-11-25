@@ -8,7 +8,6 @@ import json
 import os
 import re
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_loop
@@ -665,15 +664,6 @@ _NARRATION_ONLY_PR_REVIEW = (
 )
 
 
-def _fabricated_pr_review():
-    return structured_pr_review(
-        state="blocking",
-        summary="PR review incomplete: the test command was terminated.",
-        blocking_items=["PR review incomplete: the test command was terminated."],
-        reviewer="OpenAI Codex",
-    )
-
-
 def test_pr_loop_records_narration_only_reviewer_as_unavailable(tmp_path):
     runner = FakeRunner(
         codex_outputs=[_NARRATION_ONLY_PR_REVIEW] * 4,
@@ -694,12 +684,8 @@ def test_pr_loop_records_narration_only_reviewer_as_unavailable(tmp_path):
         agent_retry_backoff_seconds=0,
     )
 
-    with patch(
-        "coding_review_agent_loop.validated_agent.attempt_repair",
-        lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
-    ):
-        with pytest.raises(AgentLoopError, match="missing required input from Codex"):
-            run_pr_loop(runner, pr_number=77, config=config)
+    with pytest.raises(AgentLoopError, match="missing required input from Codex"):
+        run_pr_loop(runner, pr_number=77, config=config)
 
     assert "**Review status: Incomplete**" in runner.comments[-1]
     assert not any("PR review incomplete" in body for body in runner.comments)
@@ -741,79 +727,6 @@ def _ack_with_impact(rendered, impact):
     return json.dumps(payload) + rendered[split:]
 
 
-def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
-    requirement = HumanReviewRequirement(
-        source_type="PR comment",
-        author="maintainer",
-        created_at="2026-05-18T10:00:00Z",
-        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
-        body="Keep the current audit trail.",
-    )
-    metadata = PullRequestMetadata(
-        number=77, repo="OWNER/REPO", title="Acknowledgement repair",
-        head_branch="feature/review-context", base_branch="main",
-        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
-    )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "get_observed_pr_review_context",
-        lambda *args, **kwargs: PullRequestReviewContext(
-            metadata=metadata, comments=(), human_requirements=(requirement,)
-        ),
-    )
-    # The reviewer approves with an uncorroborated near miss and no
-    # acknowledgement; acceptance removes the assessment and records it.
-    unacknowledged = _ack_with_impact(
-        structured_pr_review(summary="Codex approves.", reviewer="OpenAI Codex"),
-        _ACK_UNCORROBORATED,
-    )
-    repaired = _ack_with_impact(
-        structured_pr_review(
-            summary="Codex approves.", reviewer="OpenAI Codex",
-            human_requirements_resolved=True,
-        ),
-        None if repaired_status is None
-        else {"status": repaired_status, "rationale": "No architectural change."},
-    )
-    from pr_loop_test_helpers import _with_code_classification
-    unacknowledged = _with_code_classification(unacknowledged, [requirement])
-    repaired = _with_code_classification(repaired, [requirement])
-    runner = FakeRunner(codex_outputs=[unacknowledged] * 3)
-    repair_calls = []
-
-    def fake_repair(raw, cmd, **kwargs):
-        repair_calls.append(raw)
-        return repaired
-
-    config = make_config(
-        tmp_path, reviewer="codex", max_rounds=1,
-        agent_max_retries=0, agent_retry_backoff_seconds=0,
-    )
-    repair_results = []
-    real_structured_repair = validated_agent._run_structured_repair
-
-    def spy_repair(*args, **kwargs):
-        result = real_structured_repair(*args, **kwargs)
-        repair_results.append(result)
-        return result
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", spy_repair
-    ):
-        try:
-            outcome = run_pr_loop(runner, pr_number=77, config=config)
-        except AgentLoopError as exc:
-            outcome = exc
-    _ack_pr_run.repair_results = repair_results
-    records = []
-    for comment in runner.pr_payload["comments"]:
-        match = re.search(
-            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
-        )
-        if match:
-            decoded = _decode_round_metadata(match.group("payload"))
-            if decoded.role == "reviewer":
-                records.append(decoded)
-    return outcome, records, repair_calls
-
-
 def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
     """Interrupt right after Codex's review is posted, then resume the round."""
     requirement = HumanReviewRequirement(
@@ -836,12 +749,8 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         ),
         _ACK_UNCORROBORATED,
     )
-    repaired = structured_pr_review(
-        summary="Codex approves.", reviewer="OpenAI Codex", human_requirements_resolved=True
-    )
     from pr_loop_test_helpers import _with_code_classification
     review = _with_code_classification(review, [requirement])
-    repaired = _with_code_classification(repaired, [requirement])
     runner = FakeRunner(codex_outputs=[review] * 3)
     config = make_config(
         tmp_path, reviewer="codex", max_rounds=1, review_parallel=parallel,
@@ -870,40 +779,29 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
             raise KeyboardInterrupt
         return result
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", lambda raw, cmd, **kw: repaired), \
-            patch_object_in((
-                pr_loop_support, pr_loop, issue_loop,
-            ), "post_pr_comment", side_effect=interrupt_after_review):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=interrupt_after_review):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     codex_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
 
-    resumed, carriers, repair_calls = [], [], []
+    resumed = []
     real_resumed = architecture_contract._resumed_review_architecture
-    real_pin = architecture_contract._pin_acknowledgement_repair
 
     def spy_resumed(*args, **kwargs):
         result = real_resumed(*args, **kwargs)
         resumed.append(result)
         return result
 
-    def spy_pin(accepted, repaired_value, **kwargs):
-        carriers.append(accepted)
-        return real_pin(accepted, repaired_value, **kwargs)
-
-    def fake_repair(raw, cmd, **kwargs):
-        repair_calls.append(raw)
-        return repaired
-
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((architecture_contract, pr_loop), "_resumed_review_architecture", spy_resumed
-    ), patch_object_in((architecture_contract,), "_pin_acknowledgement_repair", spy_pin):
+    with patch_object_in((architecture_contract, pr_loop), "_resumed_review_architecture", spy_resumed):
         try:
             outcome = run_pr_loop(runner, pr_number=77, config=config)
         except AgentLoopError as exc:
             outcome = exc
     codex_after = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
     return SimpleNamespace(
-        outcome=outcome, resumed=resumed, carriers=carriers, repair_calls=repair_calls,
+        outcome=outcome, resumed=resumed,
         records=codex_records(), reinvoked=codex_after - codex_before,
     )
 
@@ -920,7 +818,6 @@ def test_resumed_acknowledged_pr_review_is_rebuilt_from_round_metadata(
     ((impact, records),) = run.resumed
     assert impact is None
     assert [r.outcome for r in records] == ["degraded-to-undetermined"]
-    assert run.repair_calls == []
     for record in run.records:
         assert record.architecture_impact is None
         assert [r.outcome for r in record.architecture_impact_degradations] == [
@@ -947,11 +844,6 @@ def test_resumed_unacknowledged_classified_pr_review_is_never_resumed_by_classif
     ((impact, records),) = run.resumed
     assert impact is None
     assert [r.outcome for r in records] == ["degraded-to-undetermined"]
-    for carrier in run.carriers:
-        assert carrier.architecture_impact is None
-        assert [r.outcome for r in carrier.architecture_impact_degradations] == [
-            "degraded-to-undetermined"
-        ]
 
 
 @pytest.mark.parametrize("state_report", [None, "measured"])
@@ -1319,7 +1211,6 @@ from coding_review_agent_loop.unresolved_items import (  # noqa: E402
     _validate_coder_followup_response as _validate_followup_1626,
 )
 from agent_loop_helpers import structured_coder_followup as _structured_followup_1626  # noqa: E402
-import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
 
 _PROSE_1626 = (
     "The node command ran with no environment override; the checkout's gitignored venv "
@@ -1340,12 +1231,6 @@ def _followup_text_1626(observations, *, summary="Re-ran the locale tests.", **c
     return json.dumps(payload) + raw[end:]
 
 
-_REPAIRED_1626 = _followup_text_1626(
-    [{"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}],
-    summary=f"Re-ran the locale tests. {_PROSE_1626}",
-)
-
-
 class _ReceiptRunner1626(FakeRunner):
     """A coder turn that captures one passing run-tests receipt."""
 
@@ -1359,18 +1244,12 @@ class _ReceiptRunner1626(FakeRunner):
         return super().run_with_log(args, **kwargs)
 
 
-def _followup_turn_1626(tmp_path, outputs, *, repair=None, run_cli_repair=None, monkeypatch=None, **config_changes):
+def _followup_turn_1626(tmp_path, outputs, **config_changes):
     runner = _ReceiptRunner1626(claude_outputs=list(outputs))
     config = make_config(
         tmp_path, coder="claude", agent_max_retries=0, agent_retry_backoff_seconds=0,
         **config_changes,
     )
-    calls = []
-
-    def fake_repair(raw, cmd, **kwargs):
-        calls.append(kwargs)
-        return repair(raw) if callable(repair) else repair
-
     validators = _observation_validators_1626(
         lambda mode, observations_mode: lambda text: _validate_followup_1626(
             text, unresolved_items=(), human_requirements=(),
@@ -1378,28 +1257,17 @@ def _followup_turn_1626(tmp_path, outputs, *, repair=None, run_cli_repair=None, 
             test_observations_mode=observations_mode,
         )
     )
-    kwargs = dict(
-        agent="claude", config=config, prompt="Address the review.",
-        marker_description="<!-- AGENT_STATE: approved|blocking -->",
-        require_architecture_impact_contract=True, role="coder",
-        use_repair=True, repair_expected_kind="coder_followup", **validators,
-    )
-    if run_cli_repair is not None:
-        # The suite-wide conftest stubs the legacy hook; restore the real
-        # execute_repair route for this turn.
-        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
-        monkeypatch.setattr(_repair_module_1626, "run_cli_repair", run_cli_repair)
-        call = lambda: validated_agent._run_validated_agent(runner, **kwargs)  # noqa: E731
-    else:
-        def call():
-            with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
-                return validated_agent._run_validated_agent(runner, **kwargs)
     try:
-        outcome = call()
+        outcome = validated_agent._run_validated_agent(
+            runner, agent="claude", config=config, prompt="Address the review.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            require_architecture_impact_contract=True, role="coder",
+            repair_expected_kind="coder_followup", **validators,
+        )
     except AgentLoopError as exc:
         outcome = exc
     coder_turns = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    return outcome, calls, coder_turns
+    return outcome, coder_turns
 
 
 def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
@@ -1414,7 +1282,7 @@ def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
         "canonical_document_rationale": "The loader section changed.",
     }
     source = _followup_text_1626(_PROSE_1626, architecture_impact=near_miss)
-    response, _calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    response, coder_turns = _followup_turn_1626(tmp_path, [source])
     assert isinstance(response, ValidatedAgentResponse), response
     parsed = response.marker_value
     assert parsed.architecture_impact.status == "changed"
@@ -1432,24 +1300,23 @@ def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
 def test_fallback_does_not_mask_another_fatal_defect_1626(tmp_path):
     """Matrix row `fallback-other-defect`."""
     source = _followup_text_1626(_PROSE_1626, summary="   ")
-    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    outcome, coder_turns = _followup_turn_1626(tmp_path, [source])
     assert isinstance(outcome, AgentLoopError)
     assert not isinstance(outcome, ValidatedAgentResponse)
-    # Re-asked twice, never repaired, then rejected: the degrade fallback
-    # never masks the other fatal defect.
-    assert calls == []
+    # Re-asked twice, then rejected: the degrade fallback never masks the
+    # other fatal defect.
     assert len(coder_turns) == 3
 
 
-def test_valid_array_followup_runs_no_repair_1626(tmp_path):
+def test_valid_array_followup_is_accepted_unchanged_1626(tmp_path):
     """Matrix row `valid-array-unchanged` at the validated-turn seam."""
     valid = _followup_text_1626([
         {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}
     ])
-    response, calls, _coder_turns = _followup_turn_1626(tmp_path, [valid], repair=_REPAIRED_1626)
+    response, coder_turns = _followup_turn_1626(tmp_path, [valid])
     assert isinstance(response, ValidatedAgentResponse), response
     assert response.text == valid
-    assert calls == []
+    assert len(coder_turns) == 1
     assert response.marker_value.test_observation_degradations == ()
 
 

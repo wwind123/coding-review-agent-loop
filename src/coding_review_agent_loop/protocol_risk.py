@@ -227,14 +227,14 @@ class SemanticRiskCoverageClaim:
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
-            "execution_refs": [sanitize_historical_text(item) for item in self.execution_refs],  # shape-check: fatal:authentication-or-forgery
-            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],  # shape-check: fatal:authentication-or-forgery
-            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],  # shape-check: fatal:authentication-or-forgery
-            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),  # shape-check: fatal:authentication-or-forgery
-            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],  # shape-check: fatal:authentication-or-forgery
-            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],  # shape-check: fatal:authentication-or-forgery
-            "caveats": [sanitize_historical_text(item) for item in self.caveats],  # shape-check: fatal:authentication-or-forgery
+            "row_id": sanitize_historical_text(self.row_id),
+            "execution_refs": [sanitize_historical_text(item) for item in self.execution_refs],
+            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],
+            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],
+            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),
+            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],
+            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],
+            "caveats": [sanitize_historical_text(item) for item in self.caveats],
         }
         if self.test_level is not None:
             payload["test_level"] = self.test_level
@@ -272,7 +272,7 @@ class SemanticRiskCoverageClaims:
         return self.claims
 
     def to_payload(self) -> list[dict[str, object]]:
-        return [claim.to_payload() for claim in self.claims]  # shape-check: fatal:authentication-or-forgery
+        return [claim.to_payload() for claim in self.claims]
 
 
 @dataclass(frozen=True)
@@ -285,9 +285,9 @@ class SemanticRiskCoverageGap:
 
     def to_payload(self) -> dict[str, object]:
         return {
-            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
-            "reason": sanitize_historical_text(self.reason),  # shape-check: fatal:authentication-or-forgery
-            "proposed_correction": sanitize_historical_text(self.proposed_correction),  # shape-check: fatal:authentication-or-forgery
+            "row_id": sanitize_historical_text(self.row_id),
+            "reason": sanitize_historical_text(self.reason),
+            "proposed_correction": sanitize_historical_text(self.proposed_correction),
         }
 
 
@@ -303,7 +303,7 @@ class SemanticRiskCoverageGaps:
     degradations: tuple[ParseDegradation, ...] = ()
 
     def to_payload(self) -> list[dict[str, object]]:
-        return [gap.to_payload() for gap in self.gaps]  # shape-check: fatal:authentication-or-forgery
+        return [gap.to_payload() for gap in self.gaps]
 
 
 # The matrix is deliberately a structured, generation-gated contract.  It is
@@ -410,9 +410,9 @@ _RISK_OWNER_STAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_MATRIX_MAX_FIELD_BYTES) -> str:
-    rendered = _expect_strict_string(value, context=context)  # shape-check: delegated
+    rendered = _expect_strict_string(value, context=context)
     if len(rendered.encode("utf-8")) > max_bytes:
-        raise AgentLoopError(f"{context} exceeds the {max_bytes}-byte bound.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} exceeds the {max_bytes}-byte bound.")
     return rendered
 
 
@@ -423,14 +423,14 @@ def _risk_bounded_string_list(
     max_items: int = RISK_MATRIX_MAX_LIST_ITEMS,
     min_items: int = 0,
 ) -> tuple[str, ...]:
-    rendered = _expect_string_list(value, context=context, item_context=context, strict_shape=True)  # shape-check: delegated
+    rendered = _expect_string_list(value, context=context, item_context=context, strict_shape=True)
     if len(rendered) < min_items:
-        raise AgentLoopError(f"{context} must contain at least {min_items} item(s).")  # shape-check: delegated
+        raise AgentLoopError(f"{context} must contain at least {min_items} item(s).")
     if len(rendered) > max_items:
-        raise AgentLoopError(f"{context} exceeds the {max_items}-item bound.")  # shape-check: delegated
+        raise AgentLoopError(f"{context} exceeds the {max_items}-item bound.")
     for index, item in enumerate(rendered):
         if len(item.encode("utf-8")) > RISK_MATRIX_MAX_FIELD_BYTES:
-            raise AgentLoopError(f"{context}[{index}] exceeds the {RISK_MATRIX_MAX_FIELD_BYTES}-byte bound.")  # shape-check: delegated
+            raise AgentLoopError(f"{context}[{index}] exceeds the {RISK_MATRIX_MAX_FIELD_BYTES}-byte bound.")
     return rendered
 
 
@@ -451,18 +451,18 @@ class RiskTestMatrixRow:
 
     def to_payload(self) -> dict[str, object]:
         return {
-            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
-            "label": sanitize_historical_text(self.label),  # shape-check: fatal:authentication-or-forgery
-            "entry_path_or_mode": sanitize_historical_text(self.entry_path_or_mode),  # shape-check: fatal:authentication-or-forgery
-            "initial_state": sanitize_historical_text(self.initial_state),  # shape-check: fatal:authentication-or-forgery
-            "event": sanitize_historical_text(self.event),  # shape-check: fatal:authentication-or-forgery
-            "expected_outcome": sanitize_historical_text(self.expected_outcome),  # shape-check: fatal:authentication-or-forgery
-            "forbidden_side_effects": [sanitize_historical_text(item) for item in self.forbidden_side_effects],  # shape-check: fatal:authentication-or-forgery
-            "proposed_test_level": sanitize_historical_text(self.proposed_test_level),  # shape-check: fatal:authentication-or-forgery
-            "proposed_test_location": sanitize_historical_text(self.proposed_test_location),  # shape-check: fatal:authentication-or-forgery
-            "applicability": sanitize_historical_text(self.applicability),  # shape-check: fatal:authentication-or-forgery
-            "related_scope_item_ids": [sanitize_historical_text(item) for item in self.related_scope_item_ids],  # shape-check: fatal:authentication-or-forgery
-            "execution_owner": sanitize_historical_text(self.execution_owner),  # shape-check: fatal:authentication-or-forgery
+            "row_id": sanitize_historical_text(self.row_id),
+            "label": sanitize_historical_text(self.label),
+            "entry_path_or_mode": sanitize_historical_text(self.entry_path_or_mode),
+            "initial_state": sanitize_historical_text(self.initial_state),
+            "event": sanitize_historical_text(self.event),
+            "expected_outcome": sanitize_historical_text(self.expected_outcome),
+            "forbidden_side_effects": [sanitize_historical_text(item) for item in self.forbidden_side_effects],
+            "proposed_test_level": sanitize_historical_text(self.proposed_test_level),
+            "proposed_test_location": sanitize_historical_text(self.proposed_test_location),
+            "applicability": sanitize_historical_text(self.applicability),
+            "related_scope_item_ids": [sanitize_historical_text(item) for item in self.related_scope_item_ids],
+            "execution_owner": sanitize_historical_text(self.execution_owner),
         }
 
 
@@ -476,11 +476,11 @@ class RiskTestMatrix:
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "applicability": self.applicability,
-            "rows": [row.to_payload() for row in self.rows],  # shape-check: fatal:authentication-or-forgery
-            "important_exclusions": [sanitize_historical_text(item) for item in self.important_exclusions],  # shape-check: fatal:authentication-or-forgery
+            "rows": [row.to_payload() for row in self.rows],
+            "important_exclusions": [sanitize_historical_text(item) for item in self.important_exclusions],
         }
         if self.not_applicable_rationale is not None:
-            payload["not_applicable_rationale"] = sanitize_historical_text(self.not_applicable_rationale)  # shape-check: fatal:authentication-or-forgery
+            payload["not_applicable_rationale"] = sanitize_historical_text(self.not_applicable_rationale)
         return payload
 
     @property
@@ -498,101 +498,101 @@ class RiskTestMatrixChange:
         return {
             "operation": self.operation,
             "row_ids": list(self.row_ids),
-            "rationale": sanitize_historical_text(self.rationale),  # shape-check: fatal:authentication-or-forgery
+            "rationale": sanitize_historical_text(self.rationale),
         }
 
 
 def _validate_risk_row_id(value: object, *, context: str) -> str:
-    row_id = _risk_bounded_string(value, context=context, max_bytes=128)  # shape-check: fatal:no-conservative-reading
+    row_id = _risk_bounded_string(value, context=context, max_bytes=128)
     if not _is_valid_risk_row_id(row_id):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(
             f"{context} must be a matrix-specific identifier and may not resemble a reviewer finding ID."
         )
     return row_id
 
 
 def _validate_risk_owner(value: object, *, context: str) -> str:
-    owner = _risk_bounded_string(value, context=context, max_bytes=128)  # shape-check: fatal:no-conservative-reading
+    owner = _risk_bounded_string(value, context=context, max_bytes=128)
     if owner not in RISK_MATRIX_OWNER_NAMES and not _RISK_OWNER_STAGE_RE.fullmatch(owner):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(
             f"{context} must be one of one-shot, retained-parent, final-integration, or a reviewed stage ID."
         )
     return owner
 
 
 def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") -> RiskTestMatrix:
-    payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
+    payload = _expect_object(value, context=context)
     # Complete-matrix path only (#2114): unknown string keys are dropped with a
     # warning; the identity is computed from the parsed rows, never raw keys.
-    payload = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
+    payload = _expect_known_keys_lenient(
         payload,
         context=context,
         required=set(RISK_TEST_MATRIX_REQUIRED_KEYS),
         optional=set(RISK_TEST_MATRIX_OPTIONAL_KEYS),
     )
     applicability = fold_enum_value(
-        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),
         RISK_MATRIX_APPLICABILITY, context=f"{context}.applicability",
     )
     if applicability not in RISK_MATRIX_APPLICABILITY:
-        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")
     rows_payload = payload["rows"]
     if not isinstance(rows_payload, list):
-        raise AgentLoopError(f"{context}.rows must be a JSON array.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.rows must be a JSON array.")
     if len(rows_payload) > RISK_MATRIX_MAX_ROWS:
-        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound; consolidate scenarios explicitly.")  # shape-check: fatal:payload-bound
+        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound; consolidate scenarios explicitly.")
     rows: list[RiskTestMatrixRow] = []
     seen: set[str] = set()
     for index, raw_row in enumerate(rows_payload):
         row_context = f"{context}.rows[{index}]"
-        row = _expect_object(raw_row, context=row_context)  # shape-check: fatal:no-conservative-reading
-        row = _expect_known_keys_lenient(  # shape-check: fatal:no-conservative-reading
+        row = _expect_object(raw_row, context=row_context)
+        row = _expect_known_keys_lenient(
             row,
             context=row_context,
             required=set(RISK_TEST_MATRIX_ROW_KEYS),
         )
-        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")  # shape-check: fatal:no-conservative-reading
+        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")
         if row_id in seen:
-            raise AgentLoopError(f"{context} contains duplicate row ID `{row_id}`.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{context} contains duplicate row ID `{row_id}`.")
         seen.add(row_id)
         row_applicability = fold_enum_value(
-            _risk_bounded_string(row["applicability"], context=f"{row_context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+            _risk_bounded_string(row["applicability"], context=f"{row_context}.applicability", max_bytes=64),
             {"applicable", "required", "not-applicable"}, context=f"{row_context}.applicability",
         )
         if row_applicability not in {"applicable", "required", "not-applicable"}:
-            raise AgentLoopError(f"{row_context}.applicability is invalid (got `{_dropped_ref_preview(row_applicability)}`); allowed values: applicable, not-applicable, required.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{row_context}.applicability is invalid (got `{_dropped_ref_preview(row_applicability)}`); allowed values: applicable, not-applicable, required.")
         rows.append(
             RiskTestMatrixRow(
                 row_id=row_id,
-                label=_risk_bounded_string(row["label"], context=f"{row_context}.label"),  # shape-check: fatal:no-conservative-reading
-                entry_path_or_mode=_risk_bounded_string(row["entry_path_or_mode"], context=f"{row_context}.entry_path_or_mode"),  # shape-check: fatal:no-conservative-reading
-                initial_state=_risk_bounded_string(row["initial_state"], context=f"{row_context}.initial_state"),  # shape-check: fatal:no-conservative-reading
-                event=_risk_bounded_string(row["event"], context=f"{row_context}.event"),  # shape-check: fatal:no-conservative-reading
-                expected_outcome=_risk_bounded_string(row["expected_outcome"], context=f"{row_context}.expected_outcome"),  # shape-check: fatal:no-conservative-reading
-                forbidden_side_effects=_risk_bounded_string_list(row["forbidden_side_effects"], context=f"{row_context}.forbidden_side_effects"),  # shape-check: fatal:no-conservative-reading
-                proposed_test_level=_risk_bounded_string(row["proposed_test_level"], context=f"{row_context}.proposed_test_level"),  # shape-check: fatal:no-conservative-reading
-                proposed_test_location=_risk_bounded_string(row["proposed_test_location"], context=f"{row_context}.proposed_test_location"),  # shape-check: fatal:no-conservative-reading
+                label=_risk_bounded_string(row["label"], context=f"{row_context}.label"),
+                entry_path_or_mode=_risk_bounded_string(row["entry_path_or_mode"], context=f"{row_context}.entry_path_or_mode"),
+                initial_state=_risk_bounded_string(row["initial_state"], context=f"{row_context}.initial_state"),
+                event=_risk_bounded_string(row["event"], context=f"{row_context}.event"),
+                expected_outcome=_risk_bounded_string(row["expected_outcome"], context=f"{row_context}.expected_outcome"),
+                forbidden_side_effects=_risk_bounded_string_list(row["forbidden_side_effects"], context=f"{row_context}.forbidden_side_effects"),
+                proposed_test_level=_risk_bounded_string(row["proposed_test_level"], context=f"{row_context}.proposed_test_level"),
+                proposed_test_location=_risk_bounded_string(row["proposed_test_location"], context=f"{row_context}.proposed_test_location"),
                 applicability=row_applicability,
-                related_scope_item_ids=_risk_bounded_string_list(row["related_scope_item_ids"], context=f"{row_context}.related_scope_item_ids"),  # shape-check: fatal:no-conservative-reading
-                execution_owner=_validate_risk_owner(row["execution_owner"], context=f"{row_context}.execution_owner"),  # shape-check: fatal:no-conservative-reading
+                related_scope_item_ids=_risk_bounded_string_list(row["related_scope_item_ids"], context=f"{row_context}.related_scope_item_ids"),
+                execution_owner=_validate_risk_owner(row["execution_owner"], context=f"{row_context}.execution_owner"),
             )
         )
-    exclusions = _risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
+    exclusions = _risk_bounded_string_list(
         payload["important_exclusions"], context=f"{context}.important_exclusions", max_items=RISK_MATRIX_MAX_EXCLUSIONS
     )
     rationale_value = payload.get("not_applicable_rationale")
-    rationale = None if rationale_value is None else _risk_bounded_string(  # shape-check: fatal:no-conservative-reading
+    rationale = None if rationale_value is None else _risk_bounded_string(
         rationale_value, context=f"{context}.not_applicable_rationale", max_bytes=2_048
     )
     if applicability == "not-applicable":
         if rows:
-            raise AgentLoopError(f"{context} not-applicable matrices must contain no rows.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{context} not-applicable matrices must contain no rows.")
         if not rationale:
-            raise AgentLoopError(f"{context} not-applicable matrices require a non-empty rationale.")  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{context} not-applicable matrices require a non-empty rationale.")
     elif not rows:
-        raise AgentLoopError(f"{context} applicable matrices require at least one row.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context} applicable matrices require at least one row.")
     elif not any(row.applicability in {"applicable", "required"} for row in rows):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(
             f"{context} applicable matrices require at least one applicable or required row; "
             "use a not-applicable matrix with a proportionate rationale when no scenario is enforceable."
         )
@@ -608,53 +608,53 @@ def parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") 
     """Validate the bounded generation-1 matrix payload."""
     if isinstance(value, RiskTestMatrix):
         matrix = value
-        encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")  # shape-check: fatal:authentication-or-forgery
+        encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
         if len(encoded) > RISK_MATRIX_MAX_PAYLOAD_BYTES:
-            raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")  # shape-check: fatal:payload-bound
+            raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")
         return matrix
-    matrix = _parse_risk_test_matrix(value, context=context)  # shape-check: fatal:no-conservative-reading
-    encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")  # shape-check: fatal:authentication-or-forgery
+    matrix = _parse_risk_test_matrix(value, context=context)
+    encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
     if len(encoded) > RISK_MATRIX_MAX_PAYLOAD_BYTES:
-        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")  # shape-check: fatal:payload-bound
+        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")
     return matrix
 
 
 def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
     if isinstance(value, dict):
-        _expect_exact_keys(value, context=context, required=set(RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS))  # shape-check: fatal:no-conservative-reading
+        _expect_exact_keys(value, context=context, required=set(RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS))
         value = value["changes"]
     if isinstance(value, tuple):
         value = list(value)
     if not isinstance(value, list):
-        raise AgentLoopError(f"{context} must be a JSON array or an object containing `changes`.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context} must be a JSON array or an object containing `changes`.")
     if len(value) > RISK_MATRIX_MAX_CHANGES:
-        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_CHANGES}-change bound.")  # shape-check: fatal:payload-bound
+        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_CHANGES}-change bound.")
     changes: list[RiskTestMatrixChange] = []
     for index, raw_change in enumerate(value):
         change_context = f"{context}[{index}]"
-        change = _expect_object(raw_change, context=change_context)  # shape-check: fatal:no-conservative-reading
-        _expect_exact_keys(change, context=change_context, required=set(RISK_TEST_MATRIX_CHANGE_KEYS))  # shape-check: fatal:no-conservative-reading
+        change = _expect_object(raw_change, context=change_context)
+        _expect_exact_keys(change, context=change_context, required=set(RISK_TEST_MATRIX_CHANGE_KEYS))
         operation = fold_enum_value(
-            _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32),  # shape-check: fatal:no-conservative-reading
+            _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32),
             RISK_MATRIX_CHANGE_OPERATIONS, context=f"{change_context}.operation",
         )
         if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
-            raise AgentLoopError(f"{change_context}.operation is invalid (got `{_dropped_ref_preview(operation)}`); allowed values: {', '.join(sorted(RISK_MATRIX_CHANGE_OPERATIONS))}.")  # shape-check: fatal:no-conservative-reading
-        row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(  # shape-check: fatal:no-conservative-reading
-            _risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{change_context}.operation is invalid (got `{_dropped_ref_preview(operation)}`); allowed values: {', '.join(sorted(RISK_MATRIX_CHANGE_OPERATIONS))}.")
+        row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(
+            _risk_bounded_string_list(
                 change["row_ids"],
                 context=f"{change_context}.row_ids",
                 max_items=RISK_MATRIX_MAX_AUDIT_ROW_IDS,
             )
         ))
         if not row_ids:
-            raise AgentLoopError(f"{change_context}.row_ids must not be empty.")  # shape-check: fatal:no-conservative-reading
-        changes.append(RiskTestMatrixChange(operation=operation, row_ids=row_ids, rationale=_risk_bounded_string(change["rationale"], context=f"{change_context}.rationale", max_bytes=2_048)))  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(f"{change_context}.row_ids must not be empty.")
+        changes.append(RiskTestMatrixChange(operation=operation, row_ids=row_ids, rationale=_risk_bounded_string(change["rationale"], context=f"{change_context}.rationale", max_bytes=2_048)))
     return tuple(changes)
 
 
 def parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
-    return _parse_risk_test_matrix_changes(value, context=context)  # shape-check: fatal:no-conservative-reading
+    return _parse_risk_test_matrix_changes(value, context=context)
 
 
 # Explicit, lossless table of risk-test-matrix list-of-strings fields (same
@@ -744,15 +744,15 @@ def risk_test_matrix_identity(
     *,
     contract_version: int = RISK_TEST_MATRIX_CONTRACT_VERSION,
 ) -> str:
-    parsed_matrix = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)  # shape-check: fatal:authentication-or-forgery
+    parsed_matrix = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
     parsed_changes = tuple(
-        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]  # shape-check: fatal:authentication-or-forgery
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
         for item in changes
     )
     payload = {
         "contract_version": contract_version,
-        "matrix": parsed_matrix.to_payload(),  # shape-check: fatal:authentication-or-forgery
-        "changes": [item.to_payload() for item in parsed_changes],  # shape-check: fatal:authentication-or-forgery
+        "matrix": parsed_matrix.to_payload(),
+        "changes": [item.to_payload() for item in parsed_changes],
     }
     return hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -762,8 +762,8 @@ def risk_test_matrix_identity(
 def sanitize_risk_test_matrix(value: RiskTestMatrix | Mapping[str, object] | None) -> dict[str, object] | None:
     if value is None:
         return None
-    parsed = value if isinstance(value, RiskTestMatrix) else parse_risk_test_matrix(value)  # shape-check: fatal:orchestrator-authored
-    return parsed.to_payload()  # shape-check: fatal:authentication-or-forgery
+    parsed = value if isinstance(value, RiskTestMatrix) else parse_risk_test_matrix(value)
+    return parsed.to_payload()
 
 
 def validate_risk_test_matrix_revision(
@@ -782,14 +782,14 @@ def validate_risk_test_matrix_revision(
     current diff, but any new semantic change still needs a fresh operation
     and any unrelated operation is still rejected.
     """
-    old = previous if isinstance(previous, RiskTestMatrix) else parse_risk_test_matrix(previous, context="previous risk_test_matrix")  # shape-check: fatal:no-conservative-reading
-    new = current if isinstance(current, RiskTestMatrix) else parse_risk_test_matrix(current, context="current risk_test_matrix")  # shape-check: fatal:no-conservative-reading
+    old = previous if isinstance(previous, RiskTestMatrix) else parse_risk_test_matrix(previous, context="previous risk_test_matrix")
+    new = current if isinstance(current, RiskTestMatrix) else parse_risk_test_matrix(current, context="current risk_test_matrix")
     parsed_changes = tuple(
-        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]  # shape-check: fatal:no-conservative-reading
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
         for item in changes
     )
     parsed_historical_changes = [
-        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]  # shape-check: fatal:no-conservative-reading
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
         for item in historical_changes
     ]
     current_changes = list(parsed_changes)
@@ -798,9 +798,9 @@ def validate_risk_test_matrix_revision(
             current_changes.remove(historical_change)
         except ValueError:
             continue
-    semantic_changed = old.to_payload() != new.to_payload()  # shape-check: fatal:authentication-or-forgery
+    semantic_changed = old.to_payload() != new.to_payload()
     if approved and semantic_changed:
-        raise AgentLoopError("Approved risk matrix is immutable; substantive changes require explicit replanning.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError("Approved risk matrix is immutable; substantive changes require explicit replanning.")
     # The approval boundary receives the accepted draft plus the audit carried
     # by that draft, rather than a prior approved baseline.  The audit is a
     # historical record of how the draft got here, so its subjects are not
@@ -810,7 +810,7 @@ def validate_risk_test_matrix_revision(
     if approved and not semantic_changed:
         return parsed_changes
     if semantic_changed and not current_changes:
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(
             "Risk matrix changes omit audit operations; semantic changes require explicit "
             "review-visible audit operations."
         )
@@ -844,7 +844,7 @@ def validate_risk_test_matrix_revision(
     matrix_scope = (old_ids | new_ids) or {"matrix"}
     for change in current_changes:
         if len(set(change.row_ids)) != len(change.row_ids):
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(
                 f"Risk matrix audit operation `{change.operation}` repeats a row ID; "
                 "each row may be audited only once."
             )
@@ -864,7 +864,7 @@ def validate_risk_test_matrix_revision(
                 match_detail = (
                     f"found {len(matrix_change_indexes)}; remove duplicate complete-scope entries"
                 )
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(
                 "Risk matrix-level changes require one review-visible audit operation "
                 "with operation `change`, `split`, or `merge` covering the complete matrix scope. "
                 f"{match_detail}. Changed matrix fields: {changed_fields}. "
@@ -899,12 +899,12 @@ def validate_risk_test_matrix_revision(
         # row subjects and should be rejected.
         overlap = sorted(subject & seen_subjects)
         if overlap:
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(
                 "Risk matrix audit operations overlap on row IDs: " + ", ".join(overlap)
             )
         unknown = sorted(subject - (old_ids | new_ids))
         if unknown:
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(
                 "Risk matrix audit operation names unknown row IDs: " + ", ".join(unknown)
             )
 
@@ -952,7 +952,7 @@ def validate_risk_test_matrix_revision(
             if removed and operation not in {"retire", "split", "merge"}:
                 details.append("removed=" + ",".join(sorted(removed)))
             detail = f" ({'; '.join(details)})" if details else ""
-            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+            raise AgentLoopError(
                 f"Risk matrix audit operation `{operation}` has an invalid transition{detail}; "
                 f"it must name {expected}."
             )
@@ -962,9 +962,9 @@ def validate_risk_test_matrix_revision(
     covered.update(matrix_transition_covered)
     missing = sorted(changed_ids - covered)
     if missing:
-        raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))
     if approved and changed_ids:
-        raise AgentLoopError("Approved risk matrix rows cannot be removed, reassigned, or weakened without a newly reviewed baseline.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError("Approved risk matrix rows cannot be removed, reassigned, or weakened without a newly reviewed baseline.")
     return parsed_changes
 
 
@@ -1123,20 +1123,20 @@ class RiskTestMatrixEvidenceRow:
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
-            "status": sanitize_historical_text(self.status),  # shape-check: fatal:authentication-or-forgery
-            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],  # shape-check: fatal:authentication-or-forgery
-            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],  # shape-check: fatal:authentication-or-forgery
-            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),  # shape-check: fatal:authentication-or-forgery
-            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],  # shape-check: fatal:authentication-or-forgery
-            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],  # shape-check: fatal:authentication-or-forgery
+            "row_id": sanitize_historical_text(self.row_id),
+            "status": sanitize_historical_text(self.status),
+            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],
+            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],
+            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),
+            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],
+            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],
             "evidence_citations": [
-                {"command": sanitize_historical_text(item.command),  # shape-check: fatal:authentication-or-forgery
-                 "receipt_id": sanitize_historical_text(item.receipt_id),  # shape-check: fatal:authentication-or-forgery
-                 "claim": sanitize_historical_text(item.claim)}  # shape-check: fatal:authentication-or-forgery
+                {"command": sanitize_historical_text(item.command),
+                 "receipt_id": sanitize_historical_text(item.receipt_id),
+                 "claim": sanitize_historical_text(item.claim)}
                 for item in self.evidence_citations
             ],
-            "caveats": [sanitize_historical_text(item) for item in self.caveats],  # shape-check: fatal:authentication-or-forgery
+            "caveats": [sanitize_historical_text(item) for item in self.caveats],
         }
         # Tool-captured payloads stay byte-identical to the pre-#1325 shape.
         if self.evidence_source == EVIDENCE_SOURCE_OPERATOR_SIGNED:
@@ -1152,8 +1152,8 @@ class RiskTestMatrixEvidence:
 
     def to_payload(self) -> dict[str, object]:
         return {
-            "matrix_identity": sanitize_historical_text(self.matrix_identity),  # shape-check: fatal:authentication-or-forgery
-            "rows": [row.to_payload() for row in self.rows],  # shape-check: fatal:authentication-or-forgery
+            "matrix_identity": sanitize_historical_text(self.matrix_identity),
+            "rows": [row.to_payload() for row in self.rows],
         }
 
 
@@ -1167,9 +1167,9 @@ class PostAuthClaimDiagnostic:
 
     def to_payload(self) -> dict[str, str]:
         return {
-            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
-            "code": sanitize_historical_text(self.code),  # shape-check: fatal:authentication-or-forgery
-            "message": sanitize_historical_text(self.message),  # shape-check: fatal:authentication-or-forgery
+            "row_id": sanitize_historical_text(self.row_id),
+            "code": sanitize_historical_text(self.code),
+            "message": sanitize_historical_text(self.message),
         }
 
 
@@ -1418,10 +1418,10 @@ def _neutralize_identifier_like(text: str) -> str:
 
 
 def _degraded_row_claim_message(record: ParseDegradation) -> str:
-    observed = _neutralize_identifier_like(_dropped_ref_preview(record.observed_preview))  # shape-check: fatal:authentication-or-forgery
+    observed = _neutralize_identifier_like(_dropped_ref_preview(record.observed_preview))
     return (
-        f"The semantic coverage claim at `{_dropped_ref_preview(record.element_path)}` was dropped "  # shape-check: fatal:authentication-or-forgery
-        f"before authentication: {_dropped_ref_preview(record.rule)} "  # shape-check: fatal:authentication-or-forgery
+        f"The semantic coverage claim at `{_dropped_ref_preview(record.element_path)}` was dropped "
+        f"before authentication: {_dropped_ref_preview(record.rule)} "
         f"(observed `{observed}`). "
         "The claim asserted no coverage."
     )
@@ -1436,22 +1436,22 @@ def _unapproved_row_claim_message(
 ) -> str:
     """Name the dropped row, the scope it violated, and its real owner."""
     scope = (
-        f"execution owner `{_dropped_ref_preview(execution_owner)}`"  # shape-check: fatal:authentication-or-forgery
+        f"execution owner `{_dropped_ref_preview(execution_owner)}`"
         if execution_owner
         else "this turn"
     )
     if row_owner is None:
         origin = "The row is not in the approved matrix."
     else:
-        origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."  # shape-check: fatal:authentication-or-forgery
+        origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."
     return (
         f"A semantic coverage claim for row "
-        f"`{_neutralize_identifier_like(_dropped_ref_preview(row_id))}` was dropped "  # shape-check: fatal:authentication-or-forgery
+        f"`{_neutralize_identifier_like(_dropped_ref_preview(row_id))}` was dropped "
         f"because the row is not in the approved enforceable matrix set for {scope}. "
         f"{origin} The claim asserted no coverage."
         + (
-            f" Claim `{_dropped_ref_preview(record.element_path)}`: "  # shape-check: fatal:authentication-or-forgery
-            f"{_dropped_ref_preview(record.rule)} (outcome `{_dropped_ref_preview(record.outcome)}`)."  # shape-check: fatal:authentication-or-forgery
+            f" Claim `{_dropped_ref_preview(record.element_path)}`: "
+            f"{_dropped_ref_preview(record.rule)} (outcome `{_dropped_ref_preview(record.outcome)}`)."
             if record is not None
             else ""
         )
@@ -1496,10 +1496,10 @@ def derive_risk_test_matrix_evidence(
     trees are still caught by those proofs, and whether evidence alone
     answers a finding is the reviewer's judgement in the next round.
     """
-    parsed_matrix = parse_risk_test_matrix(matrix)  # shape-check: fatal:orchestrator-authored
-    identity = expected_identity or risk_test_matrix_identity(parsed_matrix)  # shape-check: fatal:authentication-or-forgery
+    parsed_matrix = parse_risk_test_matrix(matrix)
+    identity = expected_identity or risk_test_matrix_identity(parsed_matrix)
     if not re.fullmatch(r"[0-9a-f]{64}", identity):
-        raise AgentLoopError("derived risk evidence matrix identity must be a SHA-256 digest")  # shape-check: fatal:orchestrator-authored
+        raise AgentLoopError("derived risk evidence matrix identity must be a SHA-256 digest")
     # ``observations`` is the authoritative journal used to derive aggregate
     # failure status.  Selector resolution is deliberately a separate input:
     # a cumulative journal may retain observations from earlier coder turns,
@@ -1518,14 +1518,14 @@ def derive_risk_test_matrix_evidence(
         if execution_ref is None:
             continue
         if execution_ref in observation_by_ref:
-            raise AgentLoopError(  # shape-check: fatal:orchestrator-authored
+            raise AgentLoopError(
                 f"execution catalog contains colliding execution_ref `{execution_ref}`"
             )
         observation_by_ref[execution_ref] = observation
 
     claim_values = _claims_value(claims)
     if len(claim_values) > SEMANTIC_RISK_CLAIMS_MAX_ROWS:
-        raise AgentLoopError(  # shape-check: fatal:orchestrator-authored
+        raise AgentLoopError(
             f"semantic risk coverage exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound"
         )
     enforceable_row_ids = {
@@ -1535,20 +1535,20 @@ def derive_risk_test_matrix_evidence(
     claim_by_row: dict[str, SemanticRiskCoverageClaim] = {}
     for claim in claim_values:
         if not isinstance(claim, SemanticRiskCoverageClaim):
-            raise AgentLoopError("semantic risk coverage contains an invalid claim type")  # shape-check: fatal:orchestrator-authored
+            raise AgentLoopError("semantic risk coverage contains an invalid claim type")
         if claim.row_id not in enforceable_row_ids:
-            raise AgentLoopError(  # shape-check: fatal:orchestrator-authored
+            raise AgentLoopError(
                 f"semantic risk coverage names unknown or non-enforceable row `{claim.row_id}`"
             )
         if claim.row_id in claim_by_row:
-            raise AgentLoopError(  # shape-check: fatal:orchestrator-authored
+            raise AgentLoopError(
                 f"semantic risk coverage contains duplicate claim for row `{claim.row_id}`"
             )
         claim_by_row[claim.row_id] = claim
         # A shared run may evidence several rows (#865); only reject repeats
         # within one row's selection.
         if len(set(claim.execution_refs)) != len(claim.execution_refs):
-            raise AgentLoopError(  # shape-check: fatal:orchestrator-authored
+            raise AgentLoopError(
                 f"semantic risk coverage for row `{claim.row_id}` selects an execution_ref more than once"
             )
     diagnostics: list[PostAuthClaimDiagnostic] = []
@@ -1589,7 +1589,7 @@ def derive_risk_test_matrix_evidence(
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
                 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
-                _unapproved_row_claim_message(  # shape-check: fatal:authentication-or-forgery
+                _unapproved_row_claim_message(
                     dropped_row_id,
                     row_owner=owner_by_row.get(dropped_row_id),
                     execution_owner=execution_owner,
@@ -1607,7 +1607,7 @@ def derive_risk_test_matrix_evidence(
             diagnostics.append(PostAuthClaimDiagnostic(
                 record.element_path,
                 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
-                _degraded_row_claim_message(record),  # shape-check: fatal:authentication-or-forgery
+                _degraded_row_claim_message(record),
             ))
         for dropped_row_id in claims.dropped_row_ids:
             if dropped_row_id in covered_dropped:
@@ -1617,7 +1617,7 @@ def derive_risk_test_matrix_evidence(
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
                 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
-                _unapproved_row_claim_message(  # shape-check: fatal:authentication-or-forgery
+                _unapproved_row_claim_message(
                     dropped_row_id,
                     row_owner=owner_by_row.get(dropped_row_id),
                     execution_owner=execution_owner,
@@ -1632,7 +1632,7 @@ def derive_risk_test_matrix_evidence(
             diagnostics.append(PostAuthClaimDiagnostic(
                 record.element_path,
                 DEGRADED_ROW_CLAIM_DIAGNOSTIC,
-                _degraded_row_claim_message(record),  # shape-check: fatal:authentication-or-forgery
+                _degraded_row_claim_message(record),
             ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
     capture_classifications: dict[str, dict[str, object]] = {}
@@ -1706,7 +1706,7 @@ def derive_risk_test_matrix_evidence(
                 valid_selected = False
                 diagnostics.append(PostAuthClaimDiagnostic(
                     row.row_id, "unknown-execution-ref",
-                    f"Execution selector `{_dropped_ref_preview(dropped_ref)}` was not present "  # shape-check: fatal:authentication-or-forgery
+                    f"Execution selector `{_dropped_ref_preview(dropped_ref)}` was not present "
                     "in the authenticated turn catalog.",
                 ))
                 caveats.append("A claimed execution selector was unknown or cross-turn.")
@@ -1774,7 +1774,7 @@ def derive_risk_test_matrix_evidence(
                     if _only_suite_start_unverified(observation):
                         capture_disqualifiers.add("suite-start-unverified")
                         message += " " + suite_start_unverified_diagnostic(observation)
-                        message += _node_test_hint(observation, message)  # shape-check: fatal:authentication-or-forgery
+                        message += _node_test_hint(observation, message)
                     diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "inadmissible-execution", message))
                 else:
                     receipt_id = _observation_value(observation, "receipt_id")
@@ -1845,7 +1845,7 @@ build_risk_test_matrix_evidence = derive_risk_test_matrix_evidence
 
 
 def _parse_risk_evidence_citations(value: object, *, context: str) -> tuple[TestObservationCitation, ...]:
-    return _expect_test_observations(value, context=context)  # shape-check: fatal:authentication-or-forgery
+    return _expect_test_observations(value, context=context)
 
 
 def parse_risk_test_matrix_evidence(
@@ -1868,21 +1868,21 @@ def parse_risk_test_matrix_evidence(
     its reference resolves to a trusted reference for the same row, matrix
     identity and ``expected_signed_head``.
     """
-    payload = _expect_object(value, context=context)  # shape-check: fatal:authentication-or-forgery
-    _expect_exact_keys(payload, context=context, required={"matrix_identity", "rows"})  # shape-check: fatal:authentication-or-forgery
-    identity = _risk_bounded_string(payload["matrix_identity"], context=f"{context}.matrix_identity", max_bytes=128)  # shape-check: fatal:authentication-or-forgery
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required={"matrix_identity", "rows"})
+    identity = _risk_bounded_string(payload["matrix_identity"], context=f"{context}.matrix_identity", max_bytes=128)
     if not re.fullmatch(r"[0-9a-f]{64}", identity):
-        raise AgentLoopError(f"{context}.matrix_identity must be a SHA-256 digest.")  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context}.matrix_identity must be a SHA-256 digest.")
     if expected_identity is not None and identity != expected_identity:
-        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered approved matrix.")  # shape-check: fatal:authentication-or-forgery
-    if matrix is not None and expected_identity is None and identity != risk_test_matrix_identity(matrix):  # shape-check: fatal:authentication-or-forgery
-        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered matrix payload.")  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered approved matrix.")
+    if matrix is not None and expected_identity is None and identity != risk_test_matrix_identity(matrix):
+        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered matrix payload.")
     raw_rows = payload["rows"]
     if not isinstance(raw_rows, list):
-        raise AgentLoopError(f"{context}.rows must be a JSON array.")  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context}.rows must be a JSON array.")
     if len(raw_rows) > RISK_MATRIX_MAX_ROWS:
-        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound.")  # shape-check: fatal:payload-bound
-    parsed_matrix = parse_risk_test_matrix(matrix) if matrix is not None else None  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound.")
+    parsed_matrix = parse_risk_test_matrix(matrix) if matrix is not None else None
     expected_ids = (
         set(expected_row_ids)
         if expected_row_ids is not None
@@ -1900,8 +1900,8 @@ def parse_risk_test_matrix_evidence(
     seen: set[str] = set()
     for index, raw_row in enumerate(raw_rows):
         row_context = f"{context}.rows[{index}]"
-        row = _expect_object(raw_row, context=row_context)  # shape-check: fatal:authentication-or-forgery
-        _expect_exact_keys(  # shape-check: fatal:authentication-or-forgery
+        row = _expect_object(raw_row, context=row_context)
+        _expect_exact_keys(
             row,
             context=row_context,
             required={
@@ -1910,30 +1910,30 @@ def parse_risk_test_matrix_evidence(
             },
             optional={"caveats", "evidence_source", "signed_evidence_reference"},
         )
-        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")  # shape-check: fatal:no-conservative-reading
+        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")
         if row_id in seen:
-            raise AgentLoopError(f"{context} maps row `{row_id}` more than once.")  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(f"{context} maps row `{row_id}` more than once.")
         seen.add(row_id)
-        status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)  # shape-check: fatal:authentication-or-forgery
+        status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)
         if status not in RISK_MATRIX_EVIDENCE_STATUSES:
-            raise AgentLoopError(f"{row_context}.status is invalid (got `{_dropped_ref_preview(status)}`); allowed values: {', '.join(sorted(RISK_MATRIX_EVIDENCE_STATUSES))}.")  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(f"{row_context}.status is invalid (got `{_dropped_ref_preview(status)}`); allowed values: {', '.join(sorted(RISK_MATRIX_EVIDENCE_STATUSES))}.")
         parsed_row = RiskTestMatrixEvidenceRow(
             row_id=row_id,
             status=status,
-            test_identifiers=_risk_bounded_string_list(row["test_identifiers"], context=f"{row_context}.test_identifiers"),  # shape-check: fatal:authentication-or-forgery
-            test_locations=_risk_bounded_string_list(row["test_locations"], context=f"{row_context}.test_locations"),  # shape-check: fatal:authentication-or-forgery
-            workflow_path_claim=_risk_bounded_string(row["workflow_path_claim"], context=f"{row_context}.workflow_path_claim"),  # shape-check: fatal:authentication-or-forgery
-            outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),  # shape-check: fatal:authentication-or-forgery
-            forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),  # shape-check: fatal:authentication-or-forgery
-            evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),  # shape-check: fatal:authentication-or-forgery
-            caveats=_risk_bounded_string_list(  # shape-check: fatal:authentication-or-forgery
+            test_identifiers=_risk_bounded_string_list(row["test_identifiers"], context=f"{row_context}.test_identifiers"),
+            test_locations=_risk_bounded_string_list(row["test_locations"], context=f"{row_context}.test_locations"),
+            workflow_path_claim=_risk_bounded_string(row["workflow_path_claim"], context=f"{row_context}.workflow_path_claim"),
+            outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),
+            forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),
+            evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),
+            caveats=_risk_bounded_string_list(
                 row.get("caveats", []),
                 context=f"{row_context}.caveats",
                 max_items=RISK_MATRIX_MAX_CAVEATS,
             ),
         )
         if "evidence_source" in row or "signed_evidence_reference" in row:
-            parsed_row = _parse_operator_signed_row(  # shape-check: fatal:authentication-or-forgery
+            parsed_row = _parse_operator_signed_row(
                 row,
                 parsed_row,
                 row_context=row_context,
@@ -1950,7 +1950,7 @@ def parse_risk_test_matrix_evidence(
             or not parsed_row.forbidden_effect_assertions
             or not parsed_row.evidence_citations
         ):
-            raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(
                 f"{row_context} with status `verified` must include test identifiers, locations, "
                 "outcome and forbidden-effect assertions, and evidence citations."
             )
@@ -1979,7 +1979,7 @@ def parse_risk_test_matrix_evidence(
                     if (expected := _receipt_expected_status(observation, claim=citation.claim)) is not None
                 )
             if invalid:
-                raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+                raise AgentLoopError(
                     f"{row_context} contains citations without matching authoritative "
                     + ("passing " if status == "verified" else "")
                     + "test receipts: " + ", ".join(invalid)
@@ -1988,7 +1988,7 @@ def parse_risk_test_matrix_evidence(
                 (len(expected_statuses) == 1 and status not in expected_statuses)
                 or (len(expected_statuses) > 1 and status != "incomplete")
             ):
-                raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+                raise AgentLoopError(
                     f"{row_context} status `{status}` contradicts the authoritative receipt "
                     f"outcome; expected {sorted(expected_statuses)} or `incomplete` for mixed receipts."
                 )
@@ -2004,7 +2004,7 @@ def parse_risk_test_matrix_evidence(
                 for observation in matched_observations:
                     semantics, _rich = _observation_semantics(observation)
                     for caveat in (*semantics["attribution_caveats"], *semantics["caveats"]):
-                        rendered_caveat = _risk_bounded_string(  # shape-check: fatal:authentication-or-forgery
+                        rendered_caveat = _risk_bounded_string(
                             caveat,
                             context=f"{row_context}.authoritative_caveat",
                         )
@@ -2012,7 +2012,7 @@ def parse_risk_test_matrix_evidence(
                             all_caveats.append(rendered_caveat)
                 parsed_row = dataclasses.replace(
                     parsed_row,
-                    caveats=_risk_bounded_string_list(  # shape-check: fatal:authentication-or-forgery
+                    caveats=_risk_bounded_string_list(
                         all_caveats,
                         context=f"{row_context}.caveats",
                         max_items=RISK_MATRIX_MAX_CAVEATS,
@@ -2022,7 +2022,7 @@ def parse_risk_test_matrix_evidence(
     if expected_ids is not None and {row.row_id for row in result} != expected_ids:
         missing = sorted(expected_ids - {row.row_id for row in result})
         extra = sorted({row.row_id for row in result} - expected_ids)
-        raise AgentLoopError(f"{context} must map every delivered row exactly once (missing={missing}, extra={extra}).")  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context} must map every delivered row exactly once (missing={missing}, extra={extra}).")
     return RiskTestMatrixEvidence(matrix_identity=identity, rows=tuple(result))
 
 
@@ -2037,14 +2037,14 @@ def _parse_operator_signed_row(
 ) -> RiskTestMatrixEvidenceRow:
     """Accept an operator-signed row only through a trusted bound reference (#1325)."""
     if trusted_signed_references is None:
-        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(
             f"{row_context} carries evidence provenance; only the orchestrator may label a "
             "row operator-signed."
         )
     source = row.get("evidence_source")
     reference_id = row.get("signed_evidence_reference")
     if source != EVIDENCE_SOURCE_OPERATOR_SIGNED or not isinstance(reference_id, str):
-        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(
             f"{row_context} has invalid evidence provenance."
         )
     reference = next(
@@ -2057,7 +2057,7 @@ def _parse_operator_signed_row(
         or reference.matrix_identity != matrix_identity
         or reference.head != expected_signed_head
     ):
-        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(
             f"{row_context} names a signed-evidence reference that is not bound to this row, "
             "matrix and head."
         )
@@ -2067,7 +2067,7 @@ def _parse_operator_signed_row(
         or not parsed_row.outcome_assertions
         or not parsed_row.forbidden_effect_assertions
     ):
-        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(
             f"{row_context} operator-signed rows must be verified, receipt-free, and carry "
             "outcome and forbidden-effect assertions."
         )
@@ -2104,7 +2104,7 @@ def apply_signed_evidence_references(
         return evidence
     approved_rows: dict[str, RiskTestMatrixRow] = {}
     if approved_matrix is not None:
-        approved_rows = {row.row_id: row for row in parse_risk_test_matrix(approved_matrix).rows}  # shape-check: fatal:orchestrator-authored
+        approved_rows = {row.row_id: row for row in parse_risk_test_matrix(approved_matrix).rows}
     rows: list[RiskTestMatrixEvidenceRow] = []
     for row in evidence.rows:
         reference = by_row.get(row.row_id)
@@ -2395,7 +2395,7 @@ def render_evidence_rejection_detail(detail: str) -> str:
     against it reaches the coder unaltered: markers neutralized, whitespace runs
     collapsed, and the whole detail capped.
     """
-    neutralized = sanitize_historical_text(detail)  # shape-check: fatal:authentication-or-forgery
+    neutralized = sanitize_historical_text(detail)
     quoted = " ".join(neutralized.replace("<", "(").replace(">", ")").split())
     if len(quoted) > EVIDENCE_REASK_MAX_CHARS:
         quoted = quoted[: EVIDENCE_REASK_MAX_CHARS - 3] + "..."
@@ -2460,7 +2460,7 @@ def _node_test_hint(observation: object, message: str = "") -> str:
     # collapsed or truncated rerun command is never shown.
     if _safe_label(sentence, MAX_SAFE_COMMAND_BYTES * 2) != sentence:
         return ""
-    rendered = render_evidence_rejection_detail(message + " " + sentence)  # shape-check: fatal:authentication-or-forgery
+    rendered = render_evidence_rejection_detail(message + " " + sentence)
     if not rendered.endswith(sentence):
         return ""
     return " " + sentence
@@ -2638,30 +2638,30 @@ def _parse_risk_test_matrix_contract_fields(
         for name in ("risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes")
     }
     if any(present.values()) and not all(present.values()):
-        raise AgentLoopError(  # shape-check: fatal:kind-or-version-mismatch
+        raise AgentLoopError(
             f"{context} risk matrix fields must include risk_test_matrix_contract_version, "
             "risk_test_matrix, and risk_test_matrix_changes together."
         )
     if not any(present.values()):
         if required:
-            raise AgentLoopError(  # shape-check: fatal:kind-or-version-mismatch
+            raise AgentLoopError(
                 f"Fresh {context} responses require risk_test_matrix_contract_version: 1 "
                 "and a complete risk_test_matrix contract."
             )
         return None, None, ()
     if reject_unsolicited:
-        raise AgentLoopError(  # shape-check: fatal:kind-or-version-mismatch
+        raise AgentLoopError(
             f"historical matrix-less {context} responses must not introduce a risk test "
             "matrix without an explicit fresh generation-1 planning gate."
         )
-    version = _expect_int(  # shape-check: fatal:kind-or-version-mismatch
+    version = _expect_int(
         payload["risk_test_matrix_contract_version"],
         context=f"{context}.risk_test_matrix_contract_version",
     )
     if version != RISK_TEST_MATRIX_CONTRACT_VERSION:
-        raise AgentLoopError(f"Unsupported {context} risk_test_matrix_contract_version: {version}.")  # shape-check: fatal:kind-or-version-mismatch
-    matrix = parse_risk_test_matrix(payload["risk_test_matrix"], context=f"{context}.risk_test_matrix")  # shape-check: fatal:kind-or-version-mismatch
-    changes = parse_risk_test_matrix_changes(  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"Unsupported {context} risk_test_matrix_contract_version: {version}.")
+    matrix = parse_risk_test_matrix(payload["risk_test_matrix"], context=f"{context}.risk_test_matrix")
+    changes = parse_risk_test_matrix_changes(
         payload["risk_test_matrix_changes"], context=f"{context}.risk_test_matrix_changes"
     )
     return version, matrix, changes
@@ -2670,25 +2670,25 @@ def _expect_test_observations(
     value: object, *, context: str
 ) -> tuple[TestObservationCitation, ...]:
     if not isinstance(value, list):
-        raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:authentication-or-forgery
+        raise AgentLoopError(f"{context} must be a JSON array.")
     result: list[TestObservationCitation] = []
     for index, item in enumerate(value):
         item_context = f"{context}[{index}]"
-        payload = _expect_object(item, context=item_context)  # shape-check: fatal:authentication-or-forgery
-        _expect_exact_keys(  # shape-check: fatal:authentication-or-forgery
+        payload = _expect_object(item, context=item_context)
+        _expect_exact_keys(
             payload,
             context=item_context,
             required={"command", "receipt_id", "claim"},
         )
-        claim = _expect_strict_string(payload["claim"], context=f"{item_context}.claim")  # shape-check: fatal:authentication-or-forgery
+        claim = _expect_strict_string(payload["claim"], context=f"{item_context}.claim")
         if claim not in {"current-result", "base-reproduction"}:
-            raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(
                 f"{item_context}.claim must be `current-result` or `base-reproduction`."
             )
         result.append(
             TestObservationCitation(
-                command=_expect_strict_string(payload["command"], context=f"{item_context}.command"),  # shape-check: fatal:authentication-or-forgery
-                receipt_id=_expect_strict_string(payload["receipt_id"], context=f"{item_context}.receipt_id"),  # shape-check: fatal:authentication-or-forgery
+                command=_expect_strict_string(payload["command"], context=f"{item_context}.command"),
+                receipt_id=_expect_strict_string(payload["receipt_id"], context=f"{item_context}.receipt_id"),
                 claim=claim,
             )
         )
@@ -2748,10 +2748,10 @@ def _citation_defect_observed(item: object, rule: str) -> str:
     """Observed text for a dropped citation: shape and key names, never values."""
     if rule == CITATION_KEYS_RULE and isinstance(item, dict):
         return _neutralize_identifier_like(
-            _dropped_ref_preview("keys " + (", ".join(sorted(str(key) for key in item)) or "none"))  # shape-check: fatal:authentication-or-forgery
+            _dropped_ref_preview("keys " + (", ".join(sorted(str(key) for key in item)) or "none"))
         )
     if rule == CITATION_CLAIM_RULE and isinstance(item, dict) and isinstance(item.get("claim"), str):
-        return _neutralize_identifier_like(_dropped_ref_preview(item["claim"])) or "blank"  # shape-check: fatal:authentication-or-forgery
+        return _neutralize_identifier_like(_dropped_ref_preview(item["claim"])) or "blank"
     return _json_type_label(item)
 
 
@@ -2765,7 +2765,7 @@ def _decode_test_observations_string(value: object, *, context: str) -> list | N
     """
     if not isinstance(value, str):
         return None
-    _check_dropped_value_bound(value, context=context)  # shape-check: delegated
+    _check_dropped_value_bound(value, context=context)
     try:
         decoded = json.loads(value)
     except ValueError:
@@ -2795,11 +2795,11 @@ def _degradable_test_observations(
         raise ValueError(f"Unknown test_observations mode: {mode}")
     leading: tuple[ParseDegradation, ...] = ()
     if isinstance(value, str):
-        _check_dropped_value_bound(value, context=context)  # shape-check: fatal:payload-bound
-        decoded = _decode_test_observations_string(value, context=context)  # shape-check: fatal:payload-bound
+        _check_dropped_value_bound(value, context=context)
+        decoded = _decode_test_observations_string(value, context=context)
         if decoded is not None:
             value = decoded
-            leading = (ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+            leading = (ParseDegradation.build(
                 element_path=context,
                 rule=TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE,
                 observed=_json_type_label(""),
@@ -2807,18 +2807,18 @@ def _degradable_test_observations(
             ),)
     if not isinstance(value, list):
         # A non-list value counts as one drop at the field path.
-        _check_dropped_value_bound(value, context=context)  # shape-check: fatal:payload-bound
+        _check_dropped_value_bound(value, context=context)
         if mode == "repair-first":
             # Dropping the field would silently discard the turn's evidence
             # citations, so the structured repair pass gets it first.
-            raise TestObservationsShapeError(  # shape-check: fatal:no-conservative-reading
+            raise TestObservationsShapeError(
                 f"{context} must be a JSON array of citation objects, not "
                 f"{_json_type_label(value)}.",
                 field_path=context,
                 type_label=_json_type_label(value),
                 fallback_degradable=True,
             )
-        return (), (ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+        return (), (ParseDegradation.build(
             element_path=context,
             rule=(
                 TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
@@ -2837,13 +2837,13 @@ def _degradable_test_observations(
         )
         if mode == "repair-first":
             # Repairable, but the terminal outcome stays fatal: no fallback.
-            raise TestObservationsShapeError(  # shape-check: fatal:payload-bound
+            raise TestObservationsShapeError(
                 message,
                 field_path=context,
                 type_label=_json_type_label(value),
                 fallback_degradable=False,
             )
-        raise AgentLoopError(message)  # shape-check: fatal:payload-bound
+        raise AgentLoopError(message)
     citations: list[TestObservationCitation] = []
     records: list[ParseDegradation] = []
     for index, (citation, rule) in enumerate(classified):
@@ -2852,11 +2852,11 @@ def _degradable_test_observations(
             citations.append(citation)
             continue
         item_context = f"{context}[{index}]"
-        _check_dropped_value_bound(value[index], context=item_context)  # shape-check: fatal:payload-bound
-        records.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+        _check_dropped_value_bound(value[index], context=item_context)
+        records.append(ParseDegradation.build(
             element_path=item_context,
             rule=rule,
-            observed=_citation_defect_observed(value[index], rule),  # shape-check: fatal:authentication-or-forgery
+            observed=_citation_defect_observed(value[index], rule),
             outcome=CITATION_DROPPED_OUTCOME,
         ))
     return tuple(citations), leading + tuple(records)
@@ -2873,7 +2873,7 @@ def _semantic_execution_ref(observation: object) -> str | None:
 def _hard_capped_claim_string(value: str, *, context: str) -> None:
     """Reject a claim string beyond the dropped-value hard cap: unbounded input."""
     if len(value.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
+        raise AgentLoopError(
             f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES}-byte bound."
         )
 
@@ -2907,7 +2907,7 @@ def _optional_semantic_fact_string(value: object, *, context: str) -> tuple[str,
     if not isinstance(value, str):
         return "", CLAIM_FACT_MISTYPED_RULE
     # Raw length, before trimming: padding never hides unbounded input.
-    _hard_capped_claim_string(value, context=context)  # shape-check: fatal:payload-bound
+    _hard_capped_claim_string(value, context=context)
     normalized = value.strip()
     if not normalized:
         return "", None
@@ -2944,7 +2944,7 @@ def _optional_semantic_fact_list(
         return (), CLAIM_FACT_MISTYPED_RULE
     for index, item in enumerate(value):
         if isinstance(item, str):
-            _hard_capped_claim_string(item, context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
+            _hard_capped_claim_string(item, context=f"{context}[{index}]")
     if not all(isinstance(item, str) and item.strip() for item in value):
         return (), CLAIM_FACT_MISTYPED_RULE
     # Validate the complete list before truncating, so a malformed or
@@ -2987,7 +2987,7 @@ def _semantic_execution_ref_list(
         if isinstance(item, str):
             # The hard cap applies to the raw value, before trimming, so
             # whitespace padding can never smuggle unbounded input past it.
-            _hard_capped_claim_string(item, context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
+            _hard_capped_claim_string(item, context=f"{context}[{index}]")
         if not isinstance(item, str) or not item.strip():
             rule = CLAIM_EXECUTION_REFS_MISTYPED_RULE
             continue
@@ -3028,7 +3028,7 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
 
 def _dropped_ref_preview(ref: str) -> str:
     """Render one dropped ref as sanitized, single-line, bounded text."""
-    flattened = " ".join(sanitize_historical_text(ref).replace("`", "'").split())  # shape-check: fatal:authentication-or-forgery
+    flattened = " ".join(sanitize_historical_text(ref).replace("`", "'").split())
     if len(flattened) <= SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS:
         return flattened
     return flattened[:SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS] + "\u2026"
@@ -3036,7 +3036,7 @@ def _dropped_ref_preview(ref: str) -> str:
 
 def _dropped_execution_refs_caveat(dropped_refs: Sequence[str]) -> str:
     """Name dropped refs in one caveat within the semantic field bound."""
-    return _named_refs_caveat(  # shape-check: fatal:authentication-or-forgery
+    return _named_refs_caveat(
         "Dropped execution_refs that are not current-turn `agent-loop run-tests` "
         "selectors (they cannot verify this row): ",
         dropped_refs,
@@ -3054,7 +3054,7 @@ def _overflow_execution_refs_caveat(
         f"{len(overflow)} over-bound selector(s) and "
         f"{len(duplicates)} duplicate occurrence(s) removed"
     )
-    return _named_refs_caveat(  # shape-check: fatal:authentication-or-forgery
+    return _named_refs_caveat(
         f"Over-long execution_refs were trimmed to the first "
         f"{SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} distinct selectors "
         f"({counts}; they cannot verify this row): ",
@@ -3067,14 +3067,14 @@ def _named_refs_caveat(prefix: str, dropped_refs: Sequence[str]) -> str:
     budget = SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES
     parts: list[str] = []
     for index, ref in enumerate(dropped_refs):
-        candidate = prefix + ", ".join((*parts, f"`{_dropped_ref_preview(ref)}`")) + "."  # shape-check: fatal:authentication-or-forgery
+        candidate = prefix + ", ".join((*parts, f"`{_dropped_ref_preview(ref)}`")) + "."
         remaining = len(dropped_refs) - index - 1
         suffix = f" (+{remaining} more)" if remaining else ""
         if len((candidate + suffix).encode("utf-8")) > budget:
             omitted = len(dropped_refs) - index
             text = prefix + ", ".join(parts) + f"{', ' if parts else ''}(+{omitted} more)."
             return _truncate_utf8(text, budget)
-        parts.append(f"`{_dropped_ref_preview(ref)}`")  # shape-check: fatal:authentication-or-forgery
+        parts.append(f"`{_dropped_ref_preview(ref)}`")
     return _truncate_utf8(prefix + ", ".join(parts) + ".", budget)
 
 
@@ -3103,7 +3103,7 @@ def _check_dropped_value_bound(value: object, *, context: str) -> None:
     """
     size = _dropped_value_bytes(value)
     if size > DROPPED_VALUE_MAX_BYTES:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
+        raise AgentLoopError(
             f"{context} is {size} bytes, beyond the {DROPPED_VALUE_MAX_BYTES}-byte bound "
             "for a dropped value."
         )
@@ -3204,7 +3204,7 @@ def _parse_semantic_risk_coverage_claims(
             if execution_ref is None:
                 continue
             if execution_ref in catalog_by_ref:
-                raise NonRepairableEvidenceRejection(  # shape-check: fatal:orchestrator-authored
+                raise NonRepairableEvidenceRejection(
                     f"{context} cannot validate a colliding execution_ref `{execution_ref}`.",
                     reason="catalog-collision",
                 )
@@ -3212,8 +3212,8 @@ def _parse_semantic_risk_coverage_claims(
     degradations: list[ParseDegradation] = []
     if not isinstance(value, list):
         # Field-scope defect: no claim survives, so every row reads missing.
-        _check_dropped_value_bound(value, context=context)  # shape-check: fatal:payload-bound
-        degradations.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+        _check_dropped_value_bound(value, context=context)
+        degradations.append(ParseDegradation.build(
             element_path=context,
             rule=CLAIMS_FIELD_NOT_ARRAY_RULE,
             observed=_json_type_label(value),
@@ -3221,7 +3221,7 @@ def _parse_semantic_risk_coverage_claims(
         ))
         return SemanticRiskCoverageClaims((), degradations=tuple(degradations))
     if len(value) > SEMANTIC_RISK_CLAIMS_MAX_ROWS:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
+        raise AgentLoopError(
             f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound."
         )
     result: list[SemanticRiskCoverageClaim] = []
@@ -3243,8 +3243,8 @@ def _parse_semantic_risk_coverage_claims(
         if not isinstance(raw_claim, dict):
             # Object shape is decided first: no row-ID, selector or fact
             # logic runs on a non-object, and only its type is recorded.
-            _check_dropped_value_bound(raw_claim, context=claim_context)  # shape-check: fatal:payload-bound
-            degradations.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+            _check_dropped_value_bound(raw_claim, context=claim_context)
+            degradations.append(ParseDegradation.build(
                 element_path=claim_context,
                 rule=CLAIM_NOT_OBJECT_RULE,
                 observed=_json_type_label(raw_claim),
@@ -3256,16 +3256,16 @@ def _parse_semantic_risk_coverage_claims(
         # degradable defect on the same claim can mask one.
         reserved = sorted(key for key in payload if key in CLAIM_RESERVED_AUTHORITY_KEYS)
         if reserved:
-            raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            raise AgentLoopError(
                 f"{claim_context} names orchestrator-owned authority field(s): "
                 + ", ".join(reserved)
                 + "."
             )
         row_id_context = f"{claim_context}.row_id"
-        row_id, row_defect = _claim_row_id_or_degradation(payload, context=row_id_context)  # shape-check: fatal:payload-bound
+        row_id, row_defect = _claim_row_id_or_degradation(payload, context=row_id_context)
         refs_context = f"{claim_context}.execution_refs"
         if "execution_refs" in payload:
-            ref_items, refs_rule = _semantic_execution_ref_list(  # shape-check: fatal:payload-bound
+            ref_items, refs_rule = _semantic_execution_ref_list(
                 payload["execution_refs"], context=refs_context
             )
         else:
@@ -3278,7 +3278,7 @@ def _parse_semantic_risk_coverage_claims(
             kept_items, dup_items, over_items = _normalize_overlong_execution_refs(ref_items)
             # The discarded raw occurrences (padding included) are bounded
             # before any degradation decision can mask them.
-            _check_dropped_value_bound(  # shape-check: fatal:payload-bound
+            _check_dropped_value_bound(
                 [raw for _i, raw, _s in (*dup_items, *over_items)],
                 context=refs_context,
             )
@@ -3300,7 +3300,7 @@ def _parse_semantic_risk_coverage_claims(
             isinstance(caveats_value, list)
             and len(caveats_value) > SEMANTIC_RISK_CLAIMS_MAX_CAVEATS
         ):
-            raise AgentLoopError(  # shape-check: fatal:payload-bound
+            raise AgentLoopError(
                 f"{claim_context}.caveats exceeds the {SEMANTIC_RISK_CLAIMS_MAX_CAVEATS}-item bound."
             )
         truncated_facts: list[tuple[str, str]] = []
@@ -3310,11 +3310,11 @@ def _parse_semantic_risk_coverage_claims(
             field_context = f"{claim_context}.{field_name}"
             raw_fact = payload.get(field_name)
             if field_name == "workflow_path_claim":
-                workflow_path_claim, fact_rule = _optional_semantic_fact_string(  # shape-check: fatal:payload-bound
+                workflow_path_claim, fact_rule = _optional_semantic_fact_string(
                     raw_fact, context=field_context
                 )
             else:
-                fact_lists[field_name], fact_rule = _optional_semantic_fact_list(  # shape-check: fatal:payload-bound
+                fact_lists[field_name], fact_rule = _optional_semantic_fact_list(
                     raw_fact,
                     context=field_context,
                     field=field_name,
@@ -3322,7 +3322,7 @@ def _parse_semantic_risk_coverage_claims(
                 )
             if fact_rule is not None:
                 fact_defects.append((field_context, fact_rule, _fact_defect_observed(raw_fact, fact_rule)))
-        caveats, caveats_rule = _optional_semantic_fact_list(  # shape-check: fatal:payload-bound
+        caveats, caveats_rule = _optional_semantic_fact_list(
             caveats_value,
             context=f"{claim_context}.caveats",
             max_items=SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
@@ -3368,7 +3368,7 @@ def _parse_semantic_risk_coverage_claims(
                 # Authority decisions over real broker handles: repair cannot
                 # satisfy them, so they must not route to it (#990).
                 if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
-                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                    raise NonRepairableEvidenceRejection(
                         f"{refs_context} selector `{ref}` is not an admissible passing observation: "
                         f"{'; '.join(_observation_outcome_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
@@ -3384,8 +3384,8 @@ def _parse_semantic_risk_coverage_claims(
                         f"observed at {_observation_timestamp_label(observation)}. "
                         "Cite a different observation whose launch was fully verified."
                     )
-                    node_test_hint = _node_test_hint(observation, launch_integrity_message)  # shape-check: fatal:authentication-or-forgery
-                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                    node_test_hint = _node_test_hint(observation, launch_integrity_message)
+                    raise NonRepairableEvidenceRejection(
                         launch_integrity_message + node_test_hint,
                         reason="launch-integrity",
                     )
@@ -3423,7 +3423,7 @@ def _parse_semantic_risk_coverage_claims(
             defect = (
                 refs_context,
                 CLAIM_EXECUTION_REFS_REPEATED_RULE,
-                _neutralize_identifier_like(_dropped_ref_preview(repeated_ref)),  # shape-check: fatal:authentication-or-forgery
+                _neutralize_identifier_like(_dropped_ref_preview(repeated_ref)),
             )
         unknown_keys = sorted(
             key for key in payload
@@ -3434,7 +3434,7 @@ def _parse_semantic_risk_coverage_claims(
             defect = (
                 claim_context,
                 CLAIM_UNKNOWN_KEYS_RULE,
-                _neutralize_identifier_like(_dropped_ref_preview(", ".join(unknown_keys))),  # shape-check: fatal:authentication-or-forgery
+                _neutralize_identifier_like(_dropped_ref_preview(", ".join(unknown_keys))),
             )
         # A mistyped row ID is an arbitrary JSON value with no bound of its
         # own, so it keeps the whole-claim bound.
@@ -3457,19 +3457,19 @@ def _parse_semantic_risk_coverage_claims(
             # claim must not be rejected more strongly than an accepted one
             # (#920, #926).
             if not row_id_only_defect:
-                _check_dropped_value_bound(payload, context=claim_context)  # shape-check: fatal:payload-bound
+                _check_dropped_value_bound(payload, context=claim_context)
             else:
                 # The one part of such a claim no per-field bound covers is
                 # the discarded tail of an over-long fact list (#913), so the
                 # tails are bounded together before the record is built.
-                _check_dropped_value_bound(  # shape-check: fatal:payload-bound
+                _check_dropped_value_bound(
                     {
                         field: payload[field][RISK_MATRIX_MAX_LIST_ITEMS:]
                         for field, _message in truncated_facts
                     },
                     context=claim_context,
                 )
-            drop_record = ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+            drop_record = ParseDegradation.build(
                 element_path=element_path,
                 rule=rule,
                 observed=observed,
@@ -3495,9 +3495,9 @@ def _parse_semantic_risk_coverage_claims(
                     f"({_json_type_label(raw_level)}); treated as undeclared."
                 )
         if dropped_refs:
-            bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))  # shape-check: fatal:authentication-or-forgery
+            bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))
         if overflow_duplicates or overflow_refs:
-            bookkeeping.append(_overflow_execution_refs_caveat(overflow_duplicates, overflow_refs))  # shape-check: fatal:authentication-or-forgery
+            bookkeeping.append(_overflow_execution_refs_caveat(overflow_duplicates, overflow_refs))
         if truncated_facts:
             bookkeeping.append(
                 _truncated_fact_lists_caveat([message for _, message in truncated_facts])
@@ -3534,7 +3534,7 @@ def _parse_semantic_risk_coverage_claims(
 
 def _gap_degradations(drops: Sequence[tuple[str, str, object]]) -> tuple[ParseDegradation, ...]:
     return tuple(
-        ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+        ParseDegradation.build(
             element_path=path, rule=rule, observed=observed, outcome=COVERAGE_GAP_DROPPED_OUTCOME,
         )
         for path, rule, observed in drops
@@ -3563,7 +3563,7 @@ def _parse_semantic_risk_coverage_gaps(
     drops: list[tuple[str, str, object]] = []
     if not isinstance(value, list):
         drops.append((context, "risk_test_matrix_coverage_gaps is not a JSON array; no gap is kept", _json_type_label(value)))
-        return SemanticRiskCoverageGaps((), _gap_degradations(drops))  # shape-check: fatal:authentication-or-forgery
+        return SemanticRiskCoverageGaps((), _gap_degradations(drops))
     allowed = None if expected_row_ids is None else set(expected_row_ids)
     counts: dict[str, int] = {}
     for raw in value[:SEMANTIC_RISK_CLAIMS_MAX_ROWS]:
@@ -3580,7 +3580,7 @@ def _parse_semantic_risk_coverage_gaps(
             drops.append((path, "gap is not a JSON object", _json_type_label(raw)))
             continue
         if set(raw) != set(SEMANTIC_RISK_COVERAGE_GAP_KEYS):
-            drops.append((path, "gap must have exactly row_id, reason, and proposed_correction", _neutralize_identifier_like(_dropped_ref_preview(", ".join(sorted(str(k) for k in raw))))))  # shape-check: fatal:authentication-or-forgery
+            drops.append((path, "gap must have exactly row_id, reason, and proposed_correction", _neutralize_identifier_like(_dropped_ref_preview(", ".join(sorted(str(k) for k in raw))))))
             continue
         fields: dict[str, str] = {}
         bad: str | None = None
@@ -3598,17 +3598,17 @@ def _parse_semantic_risk_coverage_gaps(
             continue
         row_id = fields["row_id"]
         if allowed is not None and row_id not in allowed:
-            drops.append((f"{path}.row_id", "gap row_id is not an enforceable approved row", _neutralize_identifier_like(_dropped_ref_preview(row_id))))  # shape-check: fatal:authentication-or-forgery
+            drops.append((f"{path}.row_id", "gap row_id is not an enforceable approved row", _neutralize_identifier_like(_dropped_ref_preview(row_id))))
             continue
         if counts.get(row_id, 0) > 1:
-            drops.append((f"{path}.row_id", "gap row_id is declared more than once", _neutralize_identifier_like(_dropped_ref_preview(row_id))))  # shape-check: fatal:authentication-or-forgery
+            drops.append((f"{path}.row_id", "gap row_id is declared more than once", _neutralize_identifier_like(_dropped_ref_preview(row_id))))
             continue
         gaps.append(SemanticRiskCoverageGap(
             row_id=row_id,
             reason=fields["reason"],
             proposed_correction=fields["proposed_correction"],
         ))
-    return SemanticRiskCoverageGaps(tuple(gaps), _gap_degradations(drops))  # shape-check: fatal:authentication-or-forgery
+    return SemanticRiskCoverageGaps(tuple(gaps), _gap_degradations(drops))
 
 
 def _fact_defect_observed(value: object, rule: str) -> str:
@@ -3638,16 +3638,16 @@ def _claim_row_id_or_degradation(
             f"type {'null' if value is None else type(value).__name__}",
         )
     if len(value.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
+        raise AgentLoopError(
             f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES}-byte bound."
         )
     try:
-        return _validate_risk_row_id(value, context=context), None  # shape-check: handled
+        return _validate_risk_row_id(value, context=context), None
     except AgentLoopError:
         return None, (
             context,
             CLAIM_ROW_ID_MALFORMED_RULE,
-            _neutralize_identifier_like(_dropped_ref_preview(value)) or "blank",  # shape-check: fatal:authentication-or-forgery
+            _neutralize_identifier_like(_dropped_ref_preview(value)) or "blank",
         )
 
 
@@ -3663,69 +3663,69 @@ class RiskTestMatrixMetadata:
         payload: dict[str, object] = {
             "applicability": self.applicability,
             "important_exclusions": [
-                sanitize_historical_text(item) for item in self.important_exclusions  # shape-check: fatal:authentication-or-forgery
+                sanitize_historical_text(item) for item in self.important_exclusions
             ],
         }
         if self.not_applicable_rationale is not None:
-            payload["not_applicable_rationale"] = sanitize_historical_text(  # shape-check: fatal:authentication-or-forgery
+            payload["not_applicable_rationale"] = sanitize_historical_text(
                 self.not_applicable_rationale
             )
         return payload
 
 
 def _parse_complete_risk_test_matrix_row(value: object, *, context: str) -> RiskTestMatrixRow:
-    payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
-    _expect_exact_keys(payload, context=context, required=set(RISK_TEST_MATRIX_ROW_KEYS))  # shape-check: fatal:no-conservative-reading
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required=set(RISK_TEST_MATRIX_ROW_KEYS))
     return RiskTestMatrixRow(
-        row_id=_validate_risk_row_id(payload["row_id"], context=f"{context}.row_id"),  # shape-check: fatal:no-conservative-reading
-        label=_risk_bounded_string(payload["label"], context=f"{context}.label"),  # shape-check: fatal:no-conservative-reading
-        entry_path_or_mode=_risk_bounded_string(payload["entry_path_or_mode"], context=f"{context}.entry_path_or_mode"),  # shape-check: fatal:no-conservative-reading
-        initial_state=_risk_bounded_string(payload["initial_state"], context=f"{context}.initial_state"),  # shape-check: fatal:no-conservative-reading
-        event=_risk_bounded_string(payload["event"], context=f"{context}.event"),  # shape-check: fatal:no-conservative-reading
-        expected_outcome=_risk_bounded_string(payload["expected_outcome"], context=f"{context}.expected_outcome"),  # shape-check: fatal:no-conservative-reading
-        forbidden_side_effects=_risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
+        row_id=_validate_risk_row_id(payload["row_id"], context=f"{context}.row_id"),
+        label=_risk_bounded_string(payload["label"], context=f"{context}.label"),
+        entry_path_or_mode=_risk_bounded_string(payload["entry_path_or_mode"], context=f"{context}.entry_path_or_mode"),
+        initial_state=_risk_bounded_string(payload["initial_state"], context=f"{context}.initial_state"),
+        event=_risk_bounded_string(payload["event"], context=f"{context}.event"),
+        expected_outcome=_risk_bounded_string(payload["expected_outcome"], context=f"{context}.expected_outcome"),
+        forbidden_side_effects=_risk_bounded_string_list(
             payload["forbidden_side_effects"], context=f"{context}.forbidden_side_effects"
         ),
-        proposed_test_level=_risk_bounded_string(payload["proposed_test_level"], context=f"{context}.proposed_test_level"),  # shape-check: fatal:no-conservative-reading
-        proposed_test_location=_risk_bounded_string(payload["proposed_test_location"], context=f"{context}.proposed_test_location"),  # shape-check: fatal:no-conservative-reading
-        applicability=_risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
-        related_scope_item_ids=_risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
+        proposed_test_level=_risk_bounded_string(payload["proposed_test_level"], context=f"{context}.proposed_test_level"),
+        proposed_test_location=_risk_bounded_string(payload["proposed_test_location"], context=f"{context}.proposed_test_location"),
+        applicability=_risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),
+        related_scope_item_ids=_risk_bounded_string_list(
             payload["related_scope_item_ids"], context=f"{context}.related_scope_item_ids"
         ),
-        execution_owner=_validate_risk_owner(payload["execution_owner"], context=f"{context}.execution_owner"),  # shape-check: fatal:no-conservative-reading
+        execution_owner=_validate_risk_owner(payload["execution_owner"], context=f"{context}.execution_owner"),
     )
 
 
 def parse_risk_test_matrix_row(value: object, *, context: str = "risk_test_matrix_row") -> RiskTestMatrixRow:
     """Parse one complete row for semantic matrix operations."""
-    row = _parse_complete_risk_test_matrix_row(value, context=context)  # shape-check: fatal:no-conservative-reading
+    row = _parse_complete_risk_test_matrix_row(value, context=context)
     if row.applicability not in {"applicable", "required", "not-applicable"}:
-        raise AgentLoopError(f"{context}.applicability is invalid (got `{_dropped_ref_preview(row.applicability)}`); allowed values: applicable, not-applicable, required.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.applicability is invalid (got `{_dropped_ref_preview(row.applicability)}`); allowed values: applicable, not-applicable, required.")
     return row
 
 def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMetadata:
-    payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
-    _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
         payload,
         context=context,
         required={"applicability", "important_exclusions"},
         optional={"not_applicable_rationale"},
     )
     applicability = fold_enum_value(
-        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),  # shape-check: fatal:no-conservative-reading
+        _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),
         RISK_MATRIX_APPLICABILITY, context=f"{context}.applicability",
     )
     if applicability not in RISK_MATRIX_APPLICABILITY:
-        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")
     rationale_value = payload.get("not_applicable_rationale")
-    rationale = None if rationale_value is None else _risk_bounded_string(  # shape-check: fatal:no-conservative-reading
+    rationale = None if rationale_value is None else _risk_bounded_string(
         rationale_value, context=f"{context}.not_applicable_rationale", max_bytes=2_048
     )
     if applicability == "not-applicable" and not rationale:
-        raise AgentLoopError(f"{context}.not_applicable_rationale must be non-empty for a not-applicable matrix.")  # shape-check: fatal:no-conservative-reading
+        raise AgentLoopError(f"{context}.not_applicable_rationale must be non-empty for a not-applicable matrix.")
     return RiskTestMatrixMetadata(
         applicability=applicability,
-        important_exclusions=_risk_bounded_string_list(  # shape-check: fatal:no-conservative-reading
+        important_exclusions=_risk_bounded_string_list(
             payload["important_exclusions"],
             context=f"{context}.important_exclusions",
             max_items=RISK_MATRIX_MAX_EXCLUSIONS,

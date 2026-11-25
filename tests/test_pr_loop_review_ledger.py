@@ -7,7 +7,6 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
@@ -1475,10 +1474,8 @@ def test_staged_secondary_audit_drops_resolved_primary_disposition_under_incompl
     )
     config = _staged_config(tmp_path)
 
-    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    repair_mock.assert_not_called()
     assert _agent_sequence(runner) == ["codex", "claude", "codex", "gemini", "agy"]
     assert [phase for phase, _head in _audit_phases(runner)] == [
         "primary", "primary", "secondary-audit",

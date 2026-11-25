@@ -39,8 +39,8 @@ def test_baseline_no_longer_freezes_definition_digests():
 
 
 def test_registered_modules_bind_the_facades_objects():
-    # Checked in a fresh interpreter: in this process the autouse repair stub
-    # and per-test patches rewrite owned names before a divergence is observed.
+    # Checked in a fresh interpreter: in this process per-test patches rewrite
+    # owned names before a divergence is observed.
     registered = [f"{guard.PACKAGE}.{name}" for name in guard.registered_module_names()]
     assert guard.fresh_incoherent_bindings(registered) == []
 
@@ -78,15 +78,16 @@ def test_package_modules_import_without_the_facade():
     assert guard.package_import_problems() == []
 
 
-def test_retired_repair_seams_are_bound_only_by_the_test_shim():
-    # #2066: the validated turn and the lifecycle loops no longer bind the
-    # repair pass.  tests/conftest.py installs inert stand-ins under these
-    # names only so legacy patches stay inert; the production sources must
-    # never define or import them.
-    from conftest import RETIRED_REPAIR_SEAMS
-
+def test_retired_repair_seams_are_not_bound_by_production_modules():
+    # #2066/#2092: the validated turn and the lifecycle loops no longer bind
+    # the repair pass, and no test shim stands in for it.
+    retired = {
+        "validated_agent": ("attempt_repair", "_ORIGINAL_ATTEMPT_REPAIR", "_run_structured_repair", "_log_repair_attempts"),
+        "pr_loop": ("_run_structured_repair", "_log_repair_attempts"),
+        "plan_first_loop": ("_run_structured_repair", "_log_repair_attempts"),
+    }
     package = Path(guard.__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
-    for module_name, names in RETIRED_REPAIR_SEAMS.items():
+    for module_name, names in retired.items():
         source = (package / f"{module_name}.py").read_text(encoding="utf-8")
         for name in names:
             assert re.search(rf"\b{name}\b", source) is None, (module_name, name)

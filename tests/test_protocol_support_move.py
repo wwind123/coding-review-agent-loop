@@ -54,9 +54,10 @@ def test_fresh_import_order(first):
                    env={**os.environ, "PYTHONPATH": str(PACKAGE.parent)}, cwd=ROOT)
 
 
-def test_linked_audit_imports_resolve_to_the_declared_owner():
-    from coding_review_agent_loop.shape_check_audit import PARSER_OWNERS
+PARSER_OWNERS = ("protocol_common", "protocol_discuss", "protocol_risk", "protocol")
 
+
+def test_parser_module_imports_resolve_to_the_declared_owner():
     definitions = {}
     imports = []
     for owner in PARSER_OWNERS:

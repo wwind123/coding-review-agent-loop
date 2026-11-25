@@ -345,22 +345,16 @@ def test_coder_ci_dispatch_guard_defaults_off():
 
 
 def test_every_coder_launch_site_uses_the_shared_helper():
-    """Static enumeration: each coder/repair launch path installs the guard."""
+    """Static enumeration: each coder launch path installs the guard."""
     root = SRC / "coding_review_agent_loop"
     sites = {
         "agents/claude.py": 'coder_ci_guard_environment(config, "claude", role)',
         "agents/codex.py": 'coder_ci_guard_environment(config, "codex", role)',
         "agents/gemini.py": 'coder_ci_guard_environment(config, "gemini", role)',
         "agents/antigravity.py": 'coder_ci_guard_environment(config, "antigravity", role)',
-        "agents/format_repair.py": 'coder_ci_guard_environment(config, backend, "repair")',
-        "repair.py": 'coder_ci_guard_environment(config, "gemini", "repair")',
     }
     for relative, needle in sites.items():
         assert needle in (root / relative).read_text(encoding="utf-8"), relative
-    # The test-hook-only Gemini subprocess in attempt_repair is not a
-    # production launch; flag it here if it ever stops being hook-only.
-    repair_text = (root / "repair.py").read_text(encoding="utf-8")
-    assert repair_text.count("subprocess.run(") == 2
 
 
 def test_module_exports_are_stable():

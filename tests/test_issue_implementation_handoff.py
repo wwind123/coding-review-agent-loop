@@ -410,8 +410,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     """#849: a claim missing all semantic facts must not reject the envelope.
 
     The PR contract and issue handoff are recorded before the single
-    post-authentication correction runs, implementation is not re-run, and
-    repair is never invoked.
+    post-authentication correction runs and implementation is not re-run.
     """
     approved_plan, plan_context = _implementation_matrix_context()
     current = _workflow_observation(
@@ -480,14 +479,10 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         correction_prompts.append(kwargs["prompt"])
         return SimpleNamespace(text=corrected_text)
 
-    def forbidden_repair(*_a, **_k):
-        raise AssertionError("repair must not run for an incomplete semantic claim")
-
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "post_trusted_pr_contract_record", recording_contract_record)
     patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
@@ -583,8 +578,8 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     """#859: command-string execution_refs must not strand a tested PR.
 
     The envelope parses with the refs dropped, the PR is authenticated and
-    handed off, implementation is not re-run, repair is never invoked, and at
-    most one post-authentication correction runs.
+    handed off, implementation is not re-run, and at most one
+    post-authentication correction runs.
     """
     approved_plan, plan_context = _implementation_matrix_context()
     current = _workflow_observation(
@@ -655,13 +650,9 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         correction_prompts.append(kwargs["prompt"])
         return SimpleNamespace(text=corrected_text)
 
-    def forbidden_repair(*_a, **_k):
-        raise AssertionError("repair must not run for dropped execution_refs")
-
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
     patch_attr_in(monkeypatch, (pr_loop, issue_implementation, issue_loop, issue_recovery, plan_execution,), "post_issue_pr_handoff_comment", recording_handoff)
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
@@ -778,12 +769,8 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
         dispatches.append(kwargs)
         return results[len(dispatches) - 1]
 
-    def forbid_repair(*_a, **_k):
-        pytest.fail("a citation re-ask must not invoke structured repair")
-
     run_pr_calls = []
     patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_run_agent_result)
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", forbid_repair)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, issue_recovery, plan_execution,), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None

@@ -2133,11 +2133,6 @@ def _bind_child_planning(monkeypatch, binding=None):
         ),
     )
 
-    def forbid_repair(*args, **kwargs):
-        raise AssertionError("a rejected inherited candidate must never reach the repair model")
-
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
-
 
 def _agent_prompts(runner, agent):
     head = [agent] if agent == "claude" else [agent, "exec"]
@@ -2296,10 +2291,6 @@ def _m976_patch(base_plan_text, *, summary, add_row=False):
 
 def test_m976_top_level_row_bound_overflow_is_replanned_instead_of_fatal(tmp_path, monkeypatch):
     """#976: a top-level (non-child) revision that overflows the row bound replans."""
-    def forbid_repair(*args, **kwargs):
-        raise AssertionError("a deterministic assembly rejection must never reach the repair model")
-
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
     fresh = _m976_full_plan_state()
     overflow = _m976_patch(fresh, summary=WEAK_SUMMARY, add_row=True)
     consolidated = _m976_patch(fresh, summary="Consolidated revision.")
@@ -2372,13 +2363,8 @@ def _m979_patch_with(base_plan_text, *, operations=None, extra_operations=(), su
     return json.dumps(patch) + PLAN_FOOTER
 
 
-def _m979_forbid_repair(*args, **kwargs):
-    raise AssertionError("a semantic patch payload rejection must never reach the repair model")
-
-
 def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monkeypatch):
-    """#979: repair pins the patch payload, so a payload rejection replans instead."""
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    """#979: a semantic patch payload rejection uses the bounded replan."""
     fresh = _m976_full_plan_state()
     # A strict patch-schema failure is a payload rejection (#979); since #2100
     # a non-carried disposition no longer is.
@@ -2415,10 +2401,9 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
 
 
 def test_m2100_patch_with_non_carried_dispositions_is_accepted_without_replan(tmp_path, monkeypatch):
-    """#2100: extras are dropped, published as a note, and never replan or repair."""
+    """#2100: extras are dropped, published as a note, and never replan."""
     from coding_review_agent_loop.round_metadata import _decode_round_metadata
 
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     with_extras = json.loads(_m976_patch(fresh, summary="Revision with extras.").split("\n<!--", 1)[0])
     with_extras["prior_plan_item_dispositions"] = [
@@ -2499,7 +2484,6 @@ def test_m2100_resume_from_a_published_dropped_id_revision(tmp_path, monkeypatch
     """resume-sidecar-stable: a rerun resumes from the published revision."""
     from coding_review_agent_loop.plan_assembly import decode_assembled_plan_sidecar
 
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh, _m2100_patch_with_extras(fresh, "Revision with extras.")],
@@ -2542,7 +2526,6 @@ def test_m2100_semantic_patch_overflow_digest_keeps_ignored_ids(tmp_path, monkey
     """compact-overflow-note on the semantic-patch publication path."""
     from issue_loop_test_helpers import _m948_noise
 
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     payload = json.loads(_m976_full_plan_state().split("\n<!--", 1)[0])
     payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
     fresh = json.dumps(payload) + PLAN_FOOTER
@@ -2572,7 +2555,6 @@ def test_m2100_semantic_patch_overflow_digest_keeps_ignored_ids(tmp_path, monkey
 
 
 def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
     runner = _ChildPlanningRunner(
@@ -2634,13 +2616,6 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     assert normalized is not None
     candidate, diagnostic = classify(prose_wrapped, normalized)
     assert candidate == normalized and "operations" in diagnostic
-    # The classifier agrees with the preservation check: any repair that
-    # clears the payload rejection must change the payload, which is vetoed.
-    from coding_review_agent_loop.repair_preservation import validate_repair_preservation
-
-    stripped = _m976_patch(fresh, summary="Bad.")
-    with pytest.raises(AgentLoopError, match="must be preserved exactly"):
-        validate_repair_preservation(unknown, stripped)
     # A strict patch-schema failure is payload-level too, even though the
     # full validator reports it as a plain parse error.
     empty_operations = _m979_patch_with(fresh, operations=[])
@@ -2698,8 +2673,7 @@ def test_m979_envelope_error_does_not_mask_a_payload_disposition_defect():
 def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
     tmp_path, monkeypatch, defect, expected
 ):
-    """#979 item: a parse-level payload error uses the bounded replan, not repair."""
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
+    """#979 item: a parse-level payload error uses the bounded replan."""
     fresh = _m976_full_plan_state()
     if defect == "empty-operations":
         rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
@@ -3108,11 +3082,6 @@ class _M936World:
             self.comments.append(comment(self.signed_record()))
         self.runner = None
         patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop, plan_execution), "get_issue_context", self._issue_context)
-
-        def forbid_repair(*args, **kwargs):
-            raise AssertionError("the repair model must never see an inherited-row rejection")
-
-        patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
 
     def signed_record(self, **overrides):
         fields = dict(
@@ -5212,8 +5181,6 @@ def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
 # ---------------------------------------------------------------------------
 
 _M1377_ACTOR = ("agent", 7)
-# The #936 world forbids repair; the requirement-acknowledgement path needs it.
-_M1377_REAL_REPAIR = None  # the acknowledgement repair was retired (#2066)
 _M1377_PARENT_RULE = HumanReviewRequirement(
     source_type="Issue body", author="maintainer", created_at="2026-05-17T08:00:00Z",
     url="https://github.com/OWNER/REPO/issues/55", body="Preserve the parent audit trail.",
@@ -5386,7 +5353,6 @@ def test_m1377_real_child_public_entry_after_parent_requirement_addition_and_wit
     the requirement is then withdrawn, that approval is stale again: the entry
     goes back to fresh review and managed recovery refuses to bind it."""
     world = _M1377World(tmp_path, monkeypatch, weak=False, signed=False, handoff=False)
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _M1377_REAL_REPAIR)
     config = world.config(plan_execution_mode=mode)
     approvals_before = sum(1 for r in world.plan_records() if r.metadata.role == "reviewer")
 
@@ -5819,14 +5785,12 @@ def test_m2009_patch_with_separable_validates_as_safe_without_replan_routing(cap
         f"plan_revision_patch.operations[{len(parsed.operations) - 1}].value: "
         "normalized staging_feasibility `Separable` to `safe` before validation"
     ]
-    # The candidate text is untouched, so repair preservation's byte pinning
-    # still sees exactly what the planner wrote.
+    # The candidate text is untouched: it is exactly what the planner wrote.
     assert '"staging_feasibility": "Separable"' in accepted
 
 
 def test_m2009_unknown_staging_feasibility_replan_feedback_lists_allowed_values(tmp_path, monkeypatch):
     """#2009: `maybe` stays fatal and the correction record names the fix."""
-    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     recommendation = json.loads(fresh.split("\n", 1)[0])["execution_recommendation"]
     recommendation["staging_feasibility"] = "maybe"

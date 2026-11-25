@@ -128,7 +128,7 @@ def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, 
         return validated_agent._run_validated_agent(
             runner, agent=agent, config=config, prompt="visible defects", role="reviewer",
             marker_description="visual", timeout_seconds=30, image_inputs=images,
-            validate=validate, use_repair=True, reask_on_evidence_rejection=True)
+            validate=validate, reask_on_evidence_rejection=True)
     if cleanup == "unconfirmed":
         with pytest.raises(AgentLoopError, match="cleanup-failed"):
             run()

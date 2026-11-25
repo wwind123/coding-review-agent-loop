@@ -98,19 +98,13 @@ def _run(tmp_path, text, validate, **extra):
         marker_description="structured issue_implementation result",
         validate=validate,
         role="coder",
-        use_repair=True,
         repair_expected_kind="issue_implementation",
         **extra,
     )
 
 
-def _forbid_repair(*args, **kwargs):
-    pytest.fail("a semantic evidence rejection must not invoke structured repair")
-
-
 def test_non_admissible_selector_also_skips_repair(tmp_path, monkeypatch):
     catalog = [_observation(outcome="failed")]
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     text = _implementation_with_claim()
     result = AgentResult(text=text, returncode=0)
 
@@ -153,7 +147,6 @@ def _reask(tmp_path, results, catalogs, *, session_id=None, retries=1, text=None
                 marker_description="structured issue_implementation result",
                 validate=_sequenced_validator(catalogs, invoke),
                 role="coder",
-                use_repair=True,
                 repair_expected_kind="issue_implementation",
                 session_id=session_id,
                 reask_on_evidence_rejection=True,
@@ -168,17 +161,12 @@ def _result(text=None, session_id=None):
     return AgentResult(text=text or _implementation_with_claim(), returncode=0, session_id=session_id)
 
 
-@pytest.fixture
-def no_repair(monkeypatch):
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
-
-
 @pytest.mark.parametrize(
     "bad",
     [_observation(suite_start="not-started"), _observation(outcome="failed")],
     ids=["unverified", "failed"],
 )
-def test_reask_then_valid_citation_is_accepted(tmp_path, no_repair, bad):
+def test_reask_then_valid_citation_is_accepted(tmp_path, bad):
     response, error, invoke = _reask(
         tmp_path, [_result(), _result()], [[bad], [_observation()]], retries=0
     )
@@ -195,7 +183,7 @@ def test_reask_then_valid_citation_is_accepted(tmp_path, no_repair, bad):
     "caller, first, expected",
     [(None, "new-sess", "new-sess"), ("s0", None, "s0"), (None, None, None)],
 )
-def test_reask_session_selection(tmp_path, no_repair, caller, first, expected):
+def test_reask_session_selection(tmp_path, caller, first, expected):
     bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(
         tmp_path,
@@ -209,7 +197,7 @@ def test_reask_session_selection(tmp_path, no_repair, caller, first, expected):
     assert invoke.call_args_list[1].kwargs["session_id"] == expected
 
 
-def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
+def test_envelope_normalized_rejection_is_reasked(tmp_path):
     masked = _implementation_with_claim() + "\ntrailing prose"
     bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(
@@ -287,7 +275,6 @@ def _run_real(tmp_path, results):
                 marker_description="structured issue_implementation result",
                 validate=_real_validator(runner),
                 role="coder",
-                use_repair=True,
                 repair_expected_kind="issue_implementation",
                 reask_on_evidence_rejection=True,
             )
@@ -296,7 +283,7 @@ def _run_real(tmp_path, results):
             return None, exc, invoke
 
 
-def test_reask_validates_against_the_second_turns_own_catalog(tmp_path, no_repair):
+def test_reask_validates_against_the_second_turns_own_catalog(tmp_path):
     first = _turn_result(
         _claim_text("turn1:obs-1"), "t1", [_obs_for("turn1:obs-1", "t1", suite_start="not-started")], "s1"
     )
@@ -310,7 +297,7 @@ def test_reask_validates_against_the_second_turns_own_catalog(tmp_path, no_repai
     assert claims[0].execution_refs == ("turn2:obs-1",)
 
 
-def test_reask_cannot_cite_the_rejected_turns_observation(tmp_path, no_repair):
+def test_reask_cannot_cite_the_rejected_turns_observation(tmp_path):
     bad = _obs_for("turn1:obs-1", "t1", suite_start="not-started")
     first = _turn_result(_claim_text("turn1:obs-1"), "t1", [bad])
     # The re-ask turn's closed catalog holds only turn 2; citing turn 1 again
@@ -444,37 +431,6 @@ def test_approved_plan_call_site_enables_reask():
 # response reaches structured repair; the repaired candidate restores the
 # summary and re-presents the coder's own (rejected) selector.
 _MASKED = _implementation_with_claim(summary="")
-_REJECTED_CANDIDATE = _implementation_with_claim()
-
-
-@pytest.fixture
-def real_repair(monkeypatch):
-    """Undo the suite-wide legacy hook so the real execute_repair chain runs."""
-    from coding_review_agent_loop import validated_agent
-
-    monkeypatch.setattr(
-        validated_agent_module, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR
-    )
-
-
-def _cli_repair(monkeypatch, outputs):
-    """Script the codex repair chain: one ``(text, returncode)`` per model call."""
-    import coding_review_agent_loop.repair as repair_module
-    from types import SimpleNamespace
-
-    scripted = list(outputs)
-    calls: list[str] = []
-
-    def fake_cli_repair(runner, config, prompt, *, model, log_path):
-        calls.append(model)
-        text, returncode = scripted.pop(0)
-        return SimpleNamespace(
-            text=text, returncode=returncode, raw_output="", usage=None, raw_usage=None,
-            observed_model=None, text_source="stdout",
-        )
-
-    monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
-    return calls
 
 
 def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config_overrides):
@@ -492,7 +448,6 @@ def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config
                     marker_description="structured issue_implementation result",
                     validate=_sequenced_validator(catalogs, invoke),
                     role="coder",
-                    use_repair=True,
                     repair_expected_kind="issue_implementation",
                     reask_on_evidence_rejection=reask,
                 )
@@ -520,12 +475,7 @@ def _assert_semantic_stop(error):
     return message
 
 
-def _legacy_hook(candidate):
-    return lambda raw, cmd, **kwargs: candidate
-
-
-def test_legacy_hook_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
-    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+def test_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
     bad = [_observation(suite_start="not-started")]
     response, error, invoke, _ = _run_masked(
         tmp_path, [bad, [_observation()]], [_result(_MASKED), _result()], reask=True, retries=0
@@ -579,7 +529,7 @@ def _derive_for_row_1(claims, catalog):
     )
 
 
-def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tmp_path, monkeypatch, no_repair):
+def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tmp_path, monkeypatch):
     """`followup-cites-unverified-suite`: the turn validates; post-auth refuses the citation."""
     from coding_review_agent_loop.protocol import validate_structured_coder_followup
     from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
@@ -603,7 +553,6 @@ def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tm
             marker_description="structured coder_followup result",
             validate=validate,
             role="coder",
-            use_repair=True,
             repair_expected_kind="coder_followup",
         )
     assert invoke.call_count == 1
@@ -622,7 +571,7 @@ def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tm
     assert classification["disqualifiers"] == ["suite-start-unverified"]
 
 
-def test_implementation_citing_unverified_suite_start_spends_no_reask_1659(tmp_path, no_repair):
+def test_implementation_citing_unverified_suite_start_spends_no_reask_1659(tmp_path):
     """`impl-and-repair-cite-unverified-suite`: accepted on the first turn, no re-ask."""
     response, error, invoke = _reask(tmp_path, [_result(), _result()], [_unverified_suite_catalog()], retries=0)
     assert error is None
@@ -630,7 +579,7 @@ def test_implementation_citing_unverified_suite_start_spends_no_reask_1659(tmp_p
     assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
 
 
-def test_implementation_reask_budget_is_intact_for_a_later_real_rejection_1659(tmp_path, no_repair):
+def test_implementation_reask_budget_is_intact_for_a_later_real_rejection_1659(tmp_path):
     """The non-terminal citation does not consume the one-per-invocation re-ask."""
     bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(
@@ -648,7 +597,6 @@ def test_forwarded_output_does_not_spend_evidence_correction(tmp_path, monkeypat
     def validate(candidate):
         parsed = validate_structured_issue_implementation(candidate)
         return response_validation._degrade_out_of_checkout_tests(parsed, config=config)
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result",
                          return_value=AgentResult(text=text, returncode=0)) as invoke:
         accepted = _run(tmp_path, text, validate)
@@ -686,7 +634,7 @@ def _run_followup(tmp_path, monkeypatch, results, *, repair_surfaced=False, conf
             response = _run_validated_agent(
                 FakeRunner(), agent="claude", config=config, prompt="Address PR feedback.",
                 marker_description="structured coder_followup result",
-                validate=_followup_validator(config), role="coder", use_repair=True,
+                validate=_followup_validator(config), role="coder",
                 repair_expected_kind="coder_followup", reask_on_evidence_rejection=True,
             )
         except AgentInvocationError as exc:
@@ -694,7 +642,7 @@ def _run_followup(tmp_path, monkeypatch, results, *, repair_surfaced=False, conf
     return response, error, invoke, logged
 
 
-def test_issue_wrapped_du_measurement_is_accepted_without_reask_2052(tmp_path, monkeypatch, no_repair):
+def test_issue_wrapped_du_measurement_is_accepted_without_reask_2052(tmp_path, monkeypatch):
     """`measure-wrapped-outside`: the issue's exact hand-off is accepted on the first attempt."""
     from agent_loop_helpers import structured_coder_followup
     import coding_review_agent_loop.workdir_guard as guard
@@ -786,7 +734,7 @@ def test_workdir_refusal_reasons_and_prompts_stay_separate_2052(tmp_path):
     pytest.param("du -sk ../scratch", id="relative-only-outside"),
     pytest.param("du -sk *", id="glob-only"),
 ])
-def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatch, no_repair, entry):
+def test_disqualified_measurement_entry_gets_one_reask_2052(tmp_path, monkeypatch, entry):
     """Every disqualifying token class is refused and recovered by one coder re-ask."""
     from agent_loop_helpers import structured_coder_followup
 

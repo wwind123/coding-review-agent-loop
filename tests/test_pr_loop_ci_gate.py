@@ -766,6 +766,12 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
         return original(*args, **kwargs)
 
     patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", capture)
+    monkeypatch.setattr(
+        pr_loop, "_log_coder_followup_dispatch",
+        lambda _config, _round, _coder, items: captured.update(
+            followup_item_ids=tuple(item.item_id for item in items)
+        ),
+    )
     with pytest.raises(CoderReached):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
     assert snapshots == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "6367c48dd193d56ea7b0baad25b19455e529f5ee"]
@@ -776,11 +782,11 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
         assert failure.url in prompt
         assert "Reviewed head: 6367c48dd193d56ea7b0baad25b19455e529f5ee" in prompt
         assert "Do not wait for queued or running CI" in prompt
-        assert "item-2" in captured["repair_unresolved_item_ids"]
+        assert "item-2" in captured["followup_item_ids"]
         assert "Pending checks:" not in prompt
     else:
         assert "Failing checks:" not in prompt
-        assert "item-2" not in captured["repair_unresolved_item_ids"]
+        assert "item-2" not in captured["followup_item_ids"]
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
@@ -2440,6 +2446,12 @@ def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypa
         return original(*args, **kwargs)
 
     patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", capture)
+    monkeypatch.setattr(
+        pr_loop, "_log_coder_followup_dispatch",
+        lambda _config, _round, _coder, items: captured.update(
+            followup_item_ids=tuple(item.item_id for item in items)
+        ),
+    )
     monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
     with pytest.raises(CoderReached):
@@ -2450,7 +2462,7 @@ def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypa
     for finding in payload["blocking_items"]:
         assert finding in reviews[0]
         assert finding in captured["prompt"]
-    assert len(captured["repair_unresolved_item_ids"]) == len(payload["blocking_items"])
+    assert len(captured["followup_item_ids"]) == len(payload["blocking_items"])
 
 
 @pytest.mark.parametrize("summary", [

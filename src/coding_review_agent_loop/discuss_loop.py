@@ -951,7 +951,6 @@ def _run_discuss_analyzer(
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
             validate=validate_structured_discuss_agenda,
             usage_context=usage_context,
-            use_repair=True,
             repair_expected_kind="discuss_agenda",
             role="analyzer",
             label=f"discuss-analyzer-r{round_number}",
@@ -1031,7 +1030,6 @@ def _run_discuss_analyzer(
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
             validate=validate_structured_discuss_round_synthesis,
             usage_context=usage_context,
-            use_repair=True,
             repair_expected_kind="discuss_round_synthesis",
             role="analyzer",
             label=f"discuss-round-synthesis-r{round_number}",
@@ -1144,7 +1142,6 @@ def _run_discuss_final_analyzer(
             ),
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
             validate=validate_final_output, usage_context=usage_context,
-            use_repair=True,
             repair_expected_kind=(
                 "discuss_final_synthesis"
                 if config.discuss_result_mode == "answer"
@@ -1201,7 +1198,7 @@ def _run_discuss_evidence_reconciler(
             prompt=build_discuss_evidence_reconciliation_prompt(issue_number, config, analyzer=analyzer, candidates=candidates),
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
             validate=lambda text: validate_structured_discuss_evidence_reconciliation(text, observation_ids=tuple(statuses), observation_statuses=statuses),
-            usage_context=usage_context, use_repair=True,
+            usage_context=usage_context,
             repair_expected_kind="discuss_evidence_reconciliation", role="analyzer",
             label="discuss-evidence-reconciliation", operation_description="evidence reconciliation",
         )
@@ -1286,7 +1283,6 @@ def _run_discuss_debater_turn(
             )
         ),
         usage_context=usage_context,
-        use_repair=True,
         repair_expected_kind="discuss_answer" if config.discuss_result_mode == "answer" else "discuss_review",
         role="reviewer",
         label=f"discuss-r{round_number}",
@@ -1312,7 +1308,7 @@ def _run_discuss_semantic_finalization(
             prompt=build_discuss_semantic_comparison_prompt(issue_number, config, answers=answers),
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
             validate=lambda text: validate_structured_discuss_semantic_comparison(text, reviewers=names),
-            usage_context=usage_context, use_repair=True,
+            usage_context=usage_context,
             repair_expected_kind="discuss_semantic_comparison", role="analyzer",
             label="discuss-semantic-comparison", operation_description="semantic answer comparison",
         )
@@ -1351,7 +1347,7 @@ def _run_discuss_semantic_finalization(
                     remaining_decisions=comparison.remaining_decisions),
                 marker_description="<!-- AGENT_PLAN_STATE: approved -->",
                 validate=lambda text, name=reviewer_name: validate_structured_discuss_answer_confirmation(text, reviewer=name),
-                usage_context=usage_context, use_repair=True,
+                usage_context=usage_context,
                 repair_expected_kind="discuss_answer_confirmation", role="reviewer",
                 label="discuss-answer-confirmation", timeout_seconds=config.discuss_debater_timeout,
                 operation_description="semantic answer confirmation",

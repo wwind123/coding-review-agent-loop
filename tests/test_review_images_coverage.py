@@ -15,7 +15,6 @@ from coding_review_agent_loop import validated_agent
 from coding_review_agent_loop.agents.base import AgentResult
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.protocol import parse_pr_review
-from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from coding_review_agent_loop.review_images_manifest import publish
 from coding_review_agent_loop.review_images_config import delivery_limits
 from coding_review_agent_loop.review_images_state import digest, History
@@ -156,21 +155,6 @@ def test_dedicated_scope_rejects_foreign_authority(attachment, damage):
     else: response['kind'] = 'pr_review'
     with pytest.raises(AgentLoopError):
         coverage.decisions(response, scope, report)
-
-
-@pytest.mark.parametrize('change', ['drop', 'add', 'binding', 'order', 'malformed'])
-def test_repair_preserves_complete_typed_authority(change):
-    raw = typed_review(requests=(REQUEST, dict(REQUEST, request_id='desktop', description='Desktop page')))
-    source, _ = json.JSONDecoder().raw_decode(raw)
-    target = copy.deepcopy(source)
-    if change == 'drop': target.pop('screenshot_requests')
-    elif change == 'add': target['screenshot_coverage_acceptances'] = [dict(request_id='mobile')]
-    elif change == 'binding': target['screenshot_requests'][0]['request_id'] = 'other'
-    elif change == 'order': target['screenshot_requests'].reverse()
-    else: source['screenshot_requests'] = {'malformed': True}
-    with pytest.raises(AgentLoopError):
-        validate_repair_preservation(json.dumps(source), json.dumps(target))
-    validate_repair_preservation(raw, raw)
 
 
 def test_typed_identity_survives_contract_and_same_head_refresh(tmp_path):

@@ -617,18 +617,11 @@ def _issue_level_run_1229(tmp_path, outputs, **config_overrides):
     config = make_config(
         tmp_path, execution_strategy_contract_required=True, quiet=False, **config_overrides
     )
-    repair_calls = []
-    real_repair = validated_agent_module._run_structured_repair
-
-    def spy(*args, **kwargs):
-        repair_calls.append(args)
-        return real_repair(*args, **kwargs)
-
-    return runner, config, repair_calls, spy
+    return runner, config
 
 
 def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
-    runner, config, repair_calls, spy = _issue_level_run_1229(
+    runner, config = _issue_level_run_1229(
         tmp_path, outputs, agent_max_retries=retries
     )
     posted = []
@@ -638,12 +631,11 @@ def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
         posted.append(str(body))
         return real_post(_runner, config=config, issue_number=issue_number, body=body)
 
-    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", spy)
     patch_attr_in(monkeypatch, (architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", capture)
     # Later stages have no scripted output; only the planning turn is under test.
     with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    return runner, repair_calls, posted
+    return runner, posted
 
 
 def _posted_matrix_1229(body):
@@ -662,9 +654,8 @@ def test_issue_level_bare_strings_are_accepted_on_first_planner_call(tmp_path, m
     payload = json.loads(good.split("\n<!--", 1)[0])
     payload["risk_test_matrix"]["important_exclusions"] = "Lone exclusion"
     good = json.dumps(payload) + good[len(good.split("\n<!--", 1)[0]):]
-    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [good])
+    runner, posted = _run_issue_level_1229(tmp_path, monkeypatch, [good])
     assert len(_claude_prompts_1229(runner)) == 1
-    assert repair_calls == []
     assert posted
     matrix = _posted_matrix_1229(posted[0])
     assert matrix["rows"][0]["forbidden_side_effects"] == ["Slip one"]
@@ -685,7 +676,7 @@ def test_issue_level_unrecoverable_matrix_is_reasked_and_accepted(tmp_path, monk
             bad, require_execution_strategy_contract=1, require_risk_test_matrix_contract=1
         )
     good = _matrix_plan_candidate_1229(forbidden_side_effects=["Replay accepted"])
-    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
+    runner, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
     prompts = ["\n".join(c) for c in _claude_prompts_1229(runner)]
     assert len(prompts) == 2
     heading = "Previous response rejected (re-ask 1 of 2)"
@@ -695,7 +686,6 @@ def test_issue_level_unrecoverable_matrix_is_reasked_and_accepted(tmp_path, monk
     err = capsys.readouterr().err
     # The planner itself resent the matrix (#2066); no repair model ran.
     assert "repair backend=" not in err
-    assert repair_calls == []
     assert posted
     assert _posted_matrix_1229(posted[0])["rows"][0]["forbidden_side_effects"] == ["Replay accepted"]
 
