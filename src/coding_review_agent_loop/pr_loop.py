@@ -292,7 +292,6 @@ from .round_metadata import (
     ResumedReviewRound,
     _attach_round_metadata,
     scope_approved_plan_matrix,
-    RecoveryRoundBudget,
 )
 from .qualification_checkpoint import QualificationCheckpoint
 from .round_state import (
@@ -522,9 +521,7 @@ from .pr_loop_support import (
     _ordinary_checks_snapshot_is_authoritative,
     _managed_success_supersedes_ordinary_checks,
     _persist_qualification_checkpoint,
-    _persist_coder_dispatch,
-    _persist_head_review_recovery,
-    _record_coder_followup_rejection,
+    warn_deprecated_review_unrecorded_head,
     _resume_pr_round_admitted,
     _cached_trusted_actor,
     _visibility_snapshot,
@@ -702,6 +699,7 @@ def run_pr_loop(
     post_merge_run = ObligationRun(runner, config, pr_number)
     runner._post_merge_run = post_merge_run
     visual_startup(config)
+    warn_deprecated_review_unrecorded_head(config)
     visual_enabled = visual_review_requested(config)  # The one run-time visual gate (#2070).
     visual_run = VisualRun(runner)
     runner._screenshot_coverage_pr = pr_number
@@ -2690,9 +2688,7 @@ def run_pr_loop(
                 ),
                 broken_evidence_freeze_head=None,
                 evidence_clearances=tuple(carry.evidence_clearances),
-                recovery_round_budget=None,
                 head_review_recovery=None,
-                head_review_recovery_post_required=False,
                 # The re-entry keeps its own round rule; it is never closed.
                 reconciliation_record=None,
             )
@@ -2865,29 +2861,10 @@ def run_pr_loop(
             else:
                 request_automatic_scheduler_fallback("qualification checkpoint is invalid")
                 final_sweep_pending = True
-        # Bounded budget carried by a recovery record (#1292), restored under
-        # the same bound.  It never carries lifecycle, approvals or identities,
-        # and no recovery path grants an extension of its own.
-        recovery_budget = (
-            resumed_round.recovery_round_budget if resumed_round is not None else None
-        )
-        if recovery_budget is not None and qualification_checkpoint is None:
-            if (
-                recovery_budget.valid
-                and config.max_rounds <= recovery_budget.allowed_rounds <= config.max_rounds + 2
-            ):
-                allowed_rounds = recovery_budget.allowed_rounds
-                watch_failure_extension_used = recovery_budget.watch_failure_extension_used
-                watch_head_extension_used = recovery_budget.watch_head_extension_used
-            else:
-                request_automatic_scheduler_fallback(
-                    "recovery record budget is invalid or out of bound"
-                )
-                final_sweep_pending = True
         if resumed_round is not None and resumed_round.head_review_recovery is not None:
             log(
                 config,
-                f"PR #{pr_number}: head-review recovery ({resumed_round.head_review_recovery}) "
+                f"PR #{pr_number}: resume from a {resumed_round.head_review_recovery} anchor "
                 f"runs an ordinary review round {resumed_round.round_number} of the current head",
             )
         # Exact-head evidence state (#1068).  A freeze or release record is a
@@ -3340,31 +3317,6 @@ def run_pr_loop(
                     request_automatic_scheduler_fallback("qualification inputs changed during resume")
                     final_sweep_pending = True
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
-            if (
-                current_resume is not None
-                and current_resume.head_review_recovery is not None
-                and current_resume.head_review_recovery_post_required
-            ):
-                # The handoff is written before any reviewer is dispatched so an
-                # interruption resumes with this ledger, round and budget.
-                _persist_head_review_recovery(
-                    runner,
-                    config=config,
-                    pr_number=pr_number,
-                    round_number=current_resume.round_number,
-                    head_sha=pr_metadata.head_sha,
-                    ledger=current_resume.prior_items,
-                    budget=RecoveryRoundBudget(
-                        allowed_rounds,
-                        watch_failure_extension_used,
-                        watch_head_extension_used,
-                    ),
-                    source=current_resume.head_review_recovery,
-                )
-                resumed_round = dataclasses_replace(
-                    current_resume, head_review_recovery_post_required=False
-                )
-                current_resume = resumed_round
             # One historical projection seeds reconciliation and this round's reviewer-owned set (#2020).
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
@@ -4142,22 +4094,12 @@ def run_pr_loop(
             skip_reviewers_for_recovery = recovery_skips_reviewers(current_resume, broken_freeze_head, qualification_checkpoint)
             if skip_reviewers_for_recovery:
                 if current_resume is not None and current_resume.unrecorded_head_advance:
-                    if current_resume.rejected_coder_followup_reason:
-                        log(
-                            config,
-                            f"Round {round_number}: coder recovery (attempt "
-                            f"{(current_resume.dispatch_attempt or 1) + 1}) after a rejected "
-                            f"coder follow-up dispatched on "
-                            f"{current_resume.rejected_coder_followup_from_head}; routing the "
-                            f"carried items through {coder_name} before review",
-                        )
-                    else:
-                        log(
-                            config,
-                            f"Round {round_number}: PR head advanced to {current_pr_subject} "
-                            "without current-head coder metadata; routing recovered prior items "
-                            f"through {coder_name} before review",
-                        )
+                    log(
+                        config,
+                        f"Round {round_number}: PR head advanced to {current_pr_subject} "
+                        "without current-head coder metadata; routing recovered prior items "
+                        f"through {coder_name} before review",
+                    )
                 else:
                     log(
                         config,
@@ -8946,26 +8888,7 @@ def run_pr_loop(
                 + "\n\n".join(reviewer_summaries.values()) + "\n\n"
                 if reviewer_summaries else ""
             )
-            if (
-                current_resume is not None
-                and current_resume.unrecorded_head_advance
-                and current_resume.rejected_coder_followup_reason
-            ):
-                # The orchestrator rejected the previous coder turn (#1292).
-                summary_context = (
-                    f"Recovery context: the previous coder follow-up (attempt "
-                    f"{current_resume.dispatch_attempt or 1}) was dispatched on "
-                    f"`{current_resume.rejected_coder_followup_from_head or 'unknown'}`; the "
-                    f"current head is `{pr_metadata.head_sha or 'unknown'}`. The orchestrator "
-                    "did not accept its response: "
-                    f"{current_resume.rejected_coder_followup_reason} Nothing from that attempt "
-                    "was reviewed or recorded. Check each recovered item against the current "
-                    "head, fix the cause of the rejection, and report only valid in-checkout "
-                    "test evidence. List an item in addressed_items only after confirming the "
-                    "current head satisfies it.\n\n"
-                    + summary_context
-                )
-            elif current_resume is not None and current_resume.unrecorded_head_advance:
+            if current_resume is not None and current_resume.unrecorded_head_advance:
                 # The external head may or may not contain the fixes; the
                 # coder must check each recovered item against it (#1034).
                 summary_context = (
@@ -9212,42 +9135,15 @@ def run_pr_loop(
                 runner, config=config, pr_number=pr_number, metadata=pr_metadata,
                 contract=managed_ci, checkpoint=qualification_checkpoint,
             )
-            # Record the slot, ledger, budget and attempt before the coder can
-            # push, so a rejected or interrupted turn is resumable (#1292).  If
-            # the record cannot be written, the coder is not dispatched.
+            # The pre-turn ledger and head bind the coder record that every
+            # head-moving turn posts, accepted, degraded or synthesized (#2087).
             pre_turn_ledger = tuple(unresolved_items)
             pre_turn_head = str(pr_metadata.head_sha or "")
-            dispatch_budget = RecoveryRoundBudget(
-                allowed_rounds, watch_failure_extension_used, watch_head_extension_used
-            )
-            coder_recovery_resume = (
-                current_resume
-                if current_resume is not None
-                and current_resume.unrecorded_head_advance
-                and current_resume.dispatch_attempt is not None
-                else None
-            )
-            dispatch_attempt = (
-                coder_recovery_resume.dispatch_attempt + 1
-                if coder_recovery_resume is not None
-                else 1
-            )
-            dispatch_carried_reasons = (
-                coder_recovery_resume.carried_rejection_reasons
-                if coder_recovery_resume is not None
-                else ()
-            )
-            _persist_coder_dispatch(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                dispatch_round=round_number,
-                dispatch_head=pre_turn_head,
-                ledger=pre_turn_ledger,
-                budget=dispatch_budget,
-                attempt=dispatch_attempt,
-                carried_reasons=dispatch_carried_reasons,
-            )
+            if not pre_turn_head or pre_turn_head == "unknown":
+                raise AgentLoopError(
+                    f"PR #{pr_number}: the PR head is unknown, so the coder follow-up cannot "
+                    "be bound to a head; no coder was dispatched."
+                )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
             # Frozen at the coder acquisition (#1626); a repair launch cannot
             # repoint it, and evidence bounding never trims it.
@@ -9648,22 +9544,11 @@ def run_pr_loop(
                         turn_started_at=coder_turn_started_at,
                         orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                     )
-                # A coder that pushed and was then rejected leaves a head with no
-                # coder or reviewer record; persist why, then surface the original
-                # error unchanged.
-                coder_recovery.unless_recorded(_record_coder_followup_rejection)(
-                    runner,
-                    config=config,
-                    pr_number=pr_number,
-                    error=coder_followup_error,
-                    dispatch_round=round_number,
-                    pre_turn_head=pre_turn_head,
-                    ledger=pre_turn_ledger,
-                    budget=dispatch_budget,
-                    attempt=dispatch_attempt,
-                    recovery_dispatch=dispatch_attempt > 1,
-                    carried_reasons=dispatch_carried_reasons,
-                )
+                # A head-moving rejection already posted its degraded or
+                # synthesized coder record, and a failure after an accepted turn
+                # that pushed gets a synthesized one here; an unchanged head
+                # writes nothing.  The original error always surfaces (#2087).
+                coder_recovery.record_failed_push(coder_followup_error)
                 raise
             coder_dispatch_audit_note = ""
             if coder_ci_guarded:

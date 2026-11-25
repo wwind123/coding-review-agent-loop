@@ -551,7 +551,8 @@ response cannot introduce it or set those fields. Resume reauthenticates the
 same shape, bound to both heads of the transition.
 
 A rejected-coder recovery across a fresh grant (#1367) is a third shape, with a
-real reviewer. A coder follow-up pushes a stranded head and is rejected, an
+real reviewer. Since #2087 no new chain of this shape is written (a pushed
+rejection posts a coder record instead), so it is read-only for historical chains. A coder follow-up pushes a stranded head and is rejected, an
 operator fresh grant is then minted at that head, and the recovery dispatch
 pushes a new head. The fresh grant's immutable predecessor link names the
 original authorization, so continuity binds the blocking review of the original

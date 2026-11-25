@@ -587,7 +587,7 @@ def test_run_pr_loop_freeform_coder_followup_includes_model(tmp_path):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     # First PR comment is the reviewer blocking; second is the coder followup
-    followup_body = runner.pr_payload["comments"][2]["body"]
+    followup_body = runner.pr_payload["comments"][1]["body"]
     stripped = _strip_round_metadata(followup_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
 

@@ -29,7 +29,7 @@ def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     command_names = [cmd[:2] for cmd, _cwd in runner.commands]
     assert ["claude", "--print"] in command_names
     assert ["codex", "exec"] in command_names
-    assert len(runner.comments) == 6
+    assert len(runner.comments) == 5
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
     assert list((tmp_path / "logs").glob("*-claude-attempt1.log"))
     assert list((tmp_path / "logs").glob("*-codex.log"))
@@ -141,7 +141,7 @@ def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
         ["codex", "exec"],
         ["claude", "--print"],
     ]
-    assert len(runner.comments) == 6
+    assert len(runner.comments) == 5
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 

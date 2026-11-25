@@ -8136,7 +8136,8 @@ PR-mode resume (#1024). An older binary resuming such a chain cannot
 reauthenticate the link and stops rather than granting anything.
 
 A rejected-coder recovery across a fresh grant is the third exception, and it
-keeps a real reviewer (#1367). When a coder follow-up for round R pushes a
+keeps a real reviewer (#1367). Since #2087 such chains are only read from
+history: a pushed rejection now posts a coder record, so no new one is written. When a coder follow-up for round R pushes a
 stranded head and its response is rejected, a PR-mode resume needs
 `--managed-ci-fresh`, which mints a fresh grant at the stranded head after the
 blocking review. The fresh grant records an immutable link to the original
@@ -9258,7 +9259,7 @@ as claimed already present at that head rather than as fixes made by the turn.
 A head change observed while the run is still watching checks restarts review
 instead of starting a recovery round.
 
-### Rejected coder follow-ups and head-review recovery (#1292)
+### Rejected coder follow-ups and legacy recovery records (#1292, #2087)
 
 A coder turn can push and then be rejected by the post-response validators
 (for example a test run against a live remote target). The rejection discards
@@ -9287,127 +9288,61 @@ continues straight to the review round, with no second coder turn:
 Dropped fields never count as claims, reviewers still review the exact head,
 and a later invocation resumes from the record with a review of the current
 head. A quota, human-decision or interrupt stop after a push posts a
-synthesized record best-effort and then stops as before. An unchanged head
-keeps the behaviour below, and if the coder record cannot be posted the
-original coder error is reported.
+synthesized record best-effort and then stops as before, and so does any other
+failure raised after an accepted turn pushed but before its coder record was
+posted. If the coder record cannot be posted the original coder error is
+reported. A rejection that did not move the head posts nothing and reports the
+original error, as before.
 
-The records below remain for unchanged-head recovery dispatches and for
-records written by earlier releases, where the new head carries no coder or
-reviewer record. Three orchestrator-posted summary records, all written by the
-authenticated GitHub actor, make that state resumable. None is a coder-role
-record, and nothing ever force-pushes or resets the branch.
+**No coder-recovery records (#2087).** The orchestrator no longer writes a
+`coder-dispatch` record before a coder turn, a `coder-followup-rejected` record
+after a rejection, or a `head-review-recovery` handoff before a head review.
+There is no recovery round budget, no consecutive-attempt limit and no
+resume refusal that an operator has to override. Nothing force-pushes, resets
+the branch or writes a coder-role record on the coder's behalf.
 
-- **Coder-dispatch record** (`coder-dispatch`). Written before every PR coder
-  follow-up dispatch. It holds the dispatch round, the dispatch head, an
-  immutable snapshot of the ledger, the bounded round budget (allowed rounds
-  and the two used-extension flags), the consecutive attempt number and any
-  carried rejection reasons. If it cannot be written the coder is not
-  dispatched. Ordinary resume never sees it: it is excluded from ordinary
-  record selection, and a valid first-attempt dispatch on the current head is
-  skipped as a non-handoff.
-- **Rejected-follow-up record** (`coder-followup-rejected`). Written when a
-  recovery dispatch (attempt 2) is rejected on an unchanged head; earlier
-  releases also wrote it when a dispatch was rejected after the head moved,
-  and those records are still read. A rejection after a push now posts a
-  degraded or synthesized coder record instead (see below). It is keyed to the head observed afterwards
-  and keeps the pre-turn head separately (`dispatch_head` and the from-head).
-  Its reason is bounded to about 2000 characters, redacted for secrets and
-  stripped of protocol markers. Its ledger is the pre-dispatch snapshot, never
-  the live ledger the rejected turn may have rewritten. An ordinary rejection on
-  an unchanged head writes nothing. A failure to post the record is logged and
-  never masks the original error; the dispatch record still carries the attempt.
-- **Head-review-recovery record** (`head-review-recovery`). The handoff written
-  before an ordinary head review recovery (below).
+**Legacy records migrate on resume.** PRs that earlier releases left mid-recovery
+resume without operator action:
 
-Resume admits these records only when the authenticated GitHub actor authored
-them. PR comment projections carry no numeric author IDs, so the identities
-come from the REST comment history merged into the projection and are fetched
-only when admission is needed (a recovery record exists, the head has no
-records of its own, or `--review-unrecorded-head` is set). An incomplete or
-empty REST read, or an unresolvable actor, stops with a clear error before any
-agent call. Admission applies only to these record kinds and to the legacy
-checkpoint anchor; existing round metadata stays unauthenticated as before.
+- When the latest admitted record (ignoring later scheduler and qualification
+  checkpoints) is a legacy `coder-dispatch`, `coder-followup-rejected` or
+  `head-review-recovery` record, resume is an ordinary review round of the
+  current head with that record's active items and round: no coder turn, the
+  full board, and no new record. This holds whether or not the head moved, at
+  any recorded attempt, and for a structurally malformed legacy record, which
+  no longer stops resume. A legacy record with no active items starts an
+  ordinary first review of the head. A legacy round budget is not restored;
+  `--max-rounds` and its extensions apply as for any round.
+- Legacy records are admitted only when the authenticated GitHub actor
+  authored them. PR comment projections carry no numeric author IDs, so the
+  identities come from the REST comment history merged into the projection and
+  are fetched only when admission is needed (a legacy recovery record or
+  evidence authority exists, or the head has no records of its own). An
+  incomplete or empty REST read, or an unresolvable actor, stops with a clear
+  error before any agent call. A legacy record written by another account is
+  never a ledger source: resume uses the admitted history as if it were absent.
+- A legacy `head-review-recovery` record followed by reviewer publications on
+  its head stays a boundary: records published before it are not replayed into
+  the round, and earlier qualification checkpoints on the head stay superseded.
+- A PR stranded on a pre-handoff qualification-checkpoint summary (the
+  #1370 shape), authored by the authenticated actor, resumes at the
+  checkpoint's own round (never rewound) as an ordinary review of the current
+  head with its active items; one with no active items gets a full fresh review.
 
-Every recovery record is validated per phase before any recovery field is read,
-used to choose a record, or used to classify one. A dispatch record must be
-bound to its dispatch head and sit one round after its dispatch round. A
-rejected-follow-up record is bound to the head observed at rejection (which may
-equal or differ from the dispatch head), must carry its from-head equal to the
-dispatch head, a reason and the dispatch round. All of them need a valid
-dispatch round and head, an attempt of `1..2`, a boolean recovery flag equal to
-`attempt > 1` and a valid budget. A head-review record needs a known source, a
-valid budget and a round. A live structurally invalid record stops resume with
-a diagnostic naming its comment index and fields, before any agent call; no
-attempt is defaulted and no round is invented.
+**Unrecorded head advance with no coherent handoff.** A head that advanced
+without a record still routes through the existing readers (a coder round for
+a manual push after a reviewed round, the evidence-boundary and closure
+readers). When none of them can reconstruct a coherent handoff, resume no
+longer refuses: it runs an ordinary review round of the current head from the
+latest admitted ordinary ledger (scoped records never own it), with no coder
+turn. The moved-head fact is kept, so a release boundary is still not
+revalidated against its old baseline. Reviewing is never approval: every
+required reviewer must still approve the exact head.
 
-**Handoff retirement.** A coder-recovery handoff (rejected-follow-up or
-dispatch record) is retired by any later coder, reviewer or head-review record
-on any head; later scheduler or checkpoint summaries do not retire it. A
-head-review handoff is retired by a later coder or reviewer record, or a
-reconciliation, on its own head. One newest-first walk selects the live
-handoff, and both resume entry points use it: for the current head and for the
-latest prior head after a further head advance. A retired record is never
-validated or consulted.
-
-**Coder recovery.** A selected coder handoff resumes a coder round in its
-original dispatch slot with the carried active items and the restored budget, so
-the round-limit guards that admitted the first dispatch admit the recovery and
-the reviewers run in the following round. The prompt states that the previous
-attempt (with its number) was dispatched on the from-head, that the current head
-is another, that the orchestrator did not accept its response and why, and that
-only valid in-checkout test evidence may be reported. The budget is restored
-only under the existing bound (`max_rounds` to `max_rounds + 2`); a restored
-used-extension flag blocks a second watcher extension. After
-`MAX_REJECTED_DISPATCH_ATTEMPTS` (2) consecutive rejected or interrupted
-attempts the run stops, listing the recorded reasons and pointing to
-`--review-unrecorded-head`. With `--review-unrecorded-head`, coder recovery
-never runs: the handoff becomes a head-review recovery at any attempt (below).
-
-**Head-review recovery.** Head-review recovery is an ordinary review round of
-the current head. It carries only the recorded item ledger, the bounded round
-budget and one handoff record written before review. That record supersedes
-earlier qualification checkpoints on the head, so the round never restores their
-lifecycle, never takes the checkpoint reviewer-skip path, and is not an
-unrecorded head advance (the coder-first recovery skip does not apply). It never
-overrides review scheduling: there is no forced full board and no merge-conflict
-or checkpoint reviewer-skip suppression, so primary-then-panel gating and the
-standard merge-conflict route apply, and any coder that follows goes through a
-dispatch record and the attempt limit. On a head with a pending merge conflict,
-or under the primary gate before the panel opens, a coder may therefore run
-before the secondary reviewers, as on any ordinary head. The handoff never
-counts as a reconciled round; an interruption right after it resumes with its
-ledger, round and budget even without the flag, and partial reviewer
-publication resumes normally.
-
-Two sources use it:
-
-1. **Legacy checkpoint anchor.** A PR stranded before this feature, whose latest
-   prior-head record is the pre-handoff qualification-checkpoint summary,
-   resumes at the checkpoint's own round (never rewound) with its active items
-   and only its bounded budget. The anchor must be authored by the authenticated
-   actor. An anchor with no active items gets a full fresh review.
-2. **`agent-loop pr N --review-unrecorded-head`.** Takes effect whenever it is
-   given. At any dispatch attempt, it turns a coder-recovery handoff, or any
-   unrecorded head advance, into a head-review recovery round of the current
-   head, with no coder turn first. That includes an advance after an evidence
-   conversion, freeze or release: the boundary's reconstructed ledger, reopened
-   requests and boundary fields are kept, and after a release an unrecorded
-   push still skips release-baseline revalidation, exactly as without the flag.
-   It also skips a pending coder retry recorded on the current head (a
-   coder-recovery handoff whose coder did not push), so the reviewers review
-   that head again. A coder that runs after the head review starts a fresh
-   attempt sequence at attempt 1. A head that has its own round records resumes
-   normally. It is still the sanctioned operator recovery for any refused
-   history (the unrecorded-head refusal, the attempt limit, or a malformed
-   recovery record). It never force-pushes and never posts a coder-role
-   record. The budget comes from the latest admitted valid
-   budget-carrying record (dispatch, rejected-follow-up, head-review or
-   checkpoint); a malformed record is never a budget source, every candidate must be authored by the authenticated actor (a forged checkpoint or an ordinary-phase record never supplies a budget), and without any
-   source the defaults apply, so a round above `--max-rounds` is refused rather
-   than granted. A recovery handoff's own admitted budget is used first. Without
-   the flag every path behaves as before: coder recovery runs for attempt 1, the
-   refusal remains, and its message names the flag instead of suggesting a
-   hand-written coder follow-up.
+**`--review-unrecorded-head` is deprecated.** The option is still accepted on
+`agent-loop pr` for one release, logs a deprecation notice and has no effect:
+the resume result is the same as without it. It will be removed in the next
+release.
 
 Reviewer responses should use structured JSON first. A PR review starts with:
 

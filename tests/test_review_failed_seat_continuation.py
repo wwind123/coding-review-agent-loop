@@ -114,6 +114,25 @@ def _ledger_entering(records, round_number):
     return {item.item_id: item for item in record.prior_items}
 
 
+def _capture_coder_ledgers(monkeypatch):
+    """The pre-turn ledger each coder follow-up was dispatched with, by record round.
+
+    No coder-dispatch record is posted since #2087, so the ledger is read from
+    the coder-record helper the loop builds before every coder turn.
+    """
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+
+    captured = {}
+    original = degradation.CoderFollowupRecovery.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        captured[self.record_round] = {item.item_id: item for item in self.ledger}
+
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, "__init__", init)
+    return captured
+
+
 def _merged(runner):
     return any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 
@@ -206,7 +225,7 @@ def test_pr_blocker_plus_rejected_seat_continues_with_frozen_items(tmp_path, par
 
 
 @pytest.mark.parametrize("order", [("codex", "claude"), ("claude", "codex")], ids=["fails-last", "fails-first"])
-def test_pr_sequential_failure_in_either_order_runs_remaining_seat(tmp_path, order):
+def test_pr_sequential_failure_in_either_order_runs_remaining_seat(tmp_path, monkeypatch, order):
     """Row pr-sequential-block-plus-rejected: the remaining seat runs whatever the order."""
     # Items are numbered in reviewer order: the first seat's finding is item-1.
     codex_item, claude_item = ("item-1", "item-2") if order[0] == "codex" else ("item-2", "item-1")
@@ -214,6 +233,7 @@ def test_pr_sequential_failure_in_either_order_runs_remaining_seat(tmp_path, ord
     codex.append(_codex_blocks_and_clears_claude("future", codex_item=codex_item, claude_item=claude_item))
     runner = FakeRunner(codex_outputs=codex, claude_outputs=claude, gemini_outputs=gemini)
     config = make_config(tmp_path, coder="gemini", reviewer=order, max_rounds=3, review_parallel=False)
+    coder_ledgers = _capture_coder_ledgers(monkeypatch)
 
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -222,11 +242,10 @@ def test_pr_sequential_failure_in_either_order_runs_remaining_seat(tmp_path, ord
     assert len(_calls(runner, "codex")) == 2  # Codex still reviewed round 2
     assert any(r.agent == "Codex" and r.round_number == 2 for r in records if r.role == "reviewer")
     # The coder was dispatched for round 2 (its scripted output then ran out).
-    assert any(r.role == "summary" and r.phase == "coder-dispatch" and r.round_number == 3 for r in records)
+    assert 3 in coder_ledgers
     reconciliation = _reconciliation(records, 2)
     assert reconciliation.failed_reviewer_seats == ("Claude",)
-    dispatch = next(r for r in records if r.phase == "coder-dispatch" and r.round_number == 3)
-    ledger = {item.item_id: item for item in dispatch.prior_items}
+    ledger = coder_ledgers[3]
     assert ledger[claude_item].status == "blocking"  # not deferred by Codex's `future`
     assert ledger[claude_item].reviewer == "Claude"
     assert codex_item not in ledger or ledger[codex_item].status != "blocking"
@@ -345,7 +364,7 @@ def test_pr_resume_after_continued_round_keeps_frozen_item(tmp_path):
 
 
 @pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
-def test_pr_carried_blocker_without_new_finding_continues(tmp_path, parallel):
+def test_pr_carried_blocker_without_new_finding_continues(tmp_path, monkeypatch, parallel):
     """Rows pr-parallel-block-plus-rejected / pr-sequential-block-plus-rejected:
     the healthy seat raises no new finding and only keeps its carried item blocking."""
     codex, claude, gemini = _round_one_both_block()
@@ -355,6 +374,7 @@ def test_pr_carried_blocker_without_new_finding_continues(tmp_path, parallel):
     ]))
     runner = FakeRunner(codex_outputs=codex, claude_outputs=claude, gemini_outputs=gemini)
     config = make_config(tmp_path, coder="gemini", reviewer=("codex", "claude"), max_rounds=3, review_parallel=parallel)
+    coder_ledgers = _capture_coder_ledgers(monkeypatch)
 
     # The round-2 coder turn has no scripted answer: reaching it proves continuation.
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
@@ -362,8 +382,7 @@ def test_pr_carried_blocker_without_new_finding_continues(tmp_path, parallel):
 
     records = _pr_records(runner)
     assert _reconciliation(records, 2).failed_reviewer_seats == ("Claude",)
-    dispatch = next(r for r in records if r.phase == "coder-dispatch" and r.round_number == 3)
-    ledger = {item.item_id: item for item in dispatch.prior_items}
+    ledger = coder_ledgers[3]
     assert ledger["item-1"].status == "blocking" and ledger["item-2"].status == "blocking"
     assert ledger["item-2"].reviewer == "Claude"
     assert len(_calls(runner, "gemini")) == 2

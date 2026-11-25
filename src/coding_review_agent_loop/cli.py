@@ -1630,10 +1630,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--review-unrecorded-head",
         action="store_true",
         help=(
-            "Operator recovery for a PR whose resume is refused (for example a coder "
-            "follow-up that pushed and was then rejected): run an ordinary review round "
-            "of the current head with the recorded active items carried. Never "
-            "force-pushes and never posts a coder-role record."
+            "Deprecated no-op, removed in the next release. Every head-moving coder "
+            "turn now posts a coder record and an unrecorded head resumes as a review "
+            "of the current head, so there is no refused resume to override. Accepted "
+            "and logged; it changes nothing."
         ),
     )
     pr.add_argument(

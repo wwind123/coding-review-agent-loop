@@ -648,6 +648,24 @@ class CoderFollowupRecovery:
         except Exception as secondary:  # noqa: BLE001 - never mask the stopping error
             log(self.config, f"PR #{self.pr_number}: could not post a synthesized coder record ({secondary})")
 
+    def record_failed_push(self, error: BaseException) -> None:
+        """Record a pushed head a later failure left without a coder record (#2087).
+
+        A failure raised after the coder turn returned (for example evidence
+        derivation) used to be covered by the legacy rejected-follow-up record.
+        Now the head-moving turn gets a best-effort synthesized coder record,
+        unless a record was already posted or attempted for this turn, or the
+        error is fail-closed (the head or checkout cannot be trusted).  Never
+        raises: the caller re-raises the original error.
+        """
+        from .pr_head_sync import PrHeadObservationError
+
+        if self.record_posted or self.source is not None:
+            return
+        if isinstance(error, (PrHeadObservationError, CheckoutVerificationError)):
+            return
+        self._post_synthesized_best_effort(error)
+
     def metadata_fields(self) -> dict[str, object]:
         if self.source is None:
             return {}
@@ -721,10 +739,6 @@ class CoderFollowupRecovery:
             if self.original_error is not None:
                 raise self.original_error from secondary
             raise
-
-    def unless_recorded(self, record: Callable[..., None]) -> Callable[..., None]:
-        """Today's rejection record, skipped once a coder record was posted."""
-        return (lambda *args, **kwargs: None) if self.record_posted else record
 
 
 def rollback_discarded_annotations(items: Sequence[object], pre_turn_ledger: Sequence[object]) -> list:

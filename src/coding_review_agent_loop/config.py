@@ -518,8 +518,8 @@ class AgentLoopConfig:
     # protection refused this token with HTTP 403 and the readable effective
     # rules show no strict enforcement (#1040).  Requires the waiver above.
     allow_unreadable_protection: bool = False
-    # Operator recovery for a refused PR resume (#1292): run an ordinary review
-    # round of the current head from the recorded active items.
+    # Deprecated no-op (#2087): ``--review-unrecorded-head`` is still accepted
+    # for one release and only logs a deprecation notice.
     review_unrecorded_head: bool = False
     # Runtime-only correlation value minted by the issue-created preflight.
     # It is intentionally not a CLI option: a later invocation must perform a

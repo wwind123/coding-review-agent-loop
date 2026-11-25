@@ -598,15 +598,13 @@ behavior in detail.
 A coder follow-up that pushes a commit and is then rejected no longer leaves the
 head unrecorded: the loop posts a degraded coder record (invalid fields dropped
 and noted) or, when nothing parses, a git-synthesized one, and reviews the new
-head. If `agent-loop pr <number>` still refuses to resume because the PR head
-advanced without a recorded handoff (for example from an earlier release),
-rerun with `--review-unrecorded-head`. It runs an ordinary
-review round of the current head with the recorded active items carried, never
-force-pushes, and never posts a record in the coder's name. The flag takes
-effect whenever it is given: it also skips a pending coder recovery at the
-first dispatch attempt and reviews the current head instead. An oversized coder
-follow-up comment is posted in bounded form rather than ending the run. See
-[rejected coder follow-ups](docs/local_agent_loop.md#rejected-coder-follow-ups-and-head-review-recovery-1292).
+head. Coder-recovery records, the recovery attempt limit and the resume refusal
+are gone; a PR left mid-recovery by an earlier release resumes as an ordinary
+review of the current head with its recorded items, with no coder turn.
+`--review-unrecorded-head` is deprecated: it is still accepted for one release,
+logs a notice and has no effect. An oversized coder follow-up comment is posted
+in bounded form rather than ending the run. See
+[rejected coder follow-ups](docs/local_agent_loop.md#rejected-coder-follow-ups-and-legacy-recovery-records-1292-2087).
 
 For an issue-created managed-CI PR whose original authorization comment is
 missing, recovery is deliberately explicit. On a voluntary or plan-limited

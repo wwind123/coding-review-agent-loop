@@ -333,9 +333,9 @@ def test_1553_selective_intermediate_resumed_owner_selection_posts_no_checkpoint
     # Only the coder ran; no reviewer was relaunched.
     assert _agent_sequence(runner)[before_agents:] == ["claude"]
     later = _records_after(runner, reconciliation.index)
-    # Only the coder's own dispatch record follows: no scheduler checkpoint, no
-    # reviewer record, no duplicate reconciliation, and no rollover.
-    assert later and all(record.metadata.phase == "coder-dispatch" for record in later)
+    # Nothing follows (no coder-dispatch record since #2087): no scheduler
+    # checkpoint, no reviewer record, no duplicate reconciliation, no rollover.
+    assert later == []
 
 
 def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
@@ -636,10 +636,10 @@ def test_1553_conflict_resume_keeps_the_coder_route_in_the_closed_round(tmp_path
 
     assert not hasattr(review_rounds, "PartialReviewRoundError")
     assert _agent_sequence(runner)[before_agents:] == ["claude"]
-    # Only the coder's own dispatch record follows: no scheduler checkpoint,
-    # reviewer record or reconciliation, in round 2 or a rolled-over round.
+    # Nothing follows (no coder-dispatch record since #2087): no scheduler
+    # checkpoint, reviewer record or reconciliation, in round 2 or a rolled-over round.
     later = _records_after(runner, reconciliation)
-    assert later and all(r.metadata.phase == "coder-dispatch" for r in later)
+    assert later == []
 
 
 def test_1553_rollover_at_the_round_limit_stops_with_the_round_limit_diagnostic(tmp_path):

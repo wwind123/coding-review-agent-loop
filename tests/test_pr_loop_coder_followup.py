@@ -652,18 +652,6 @@ def _coder_prompts_1292(runner):
     return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
 
 
-def _legacy_rejection_writer(monkeypatch):
-    """Simulate a pre-#2086 release: a post-push rejection writes the legacy
-    rejected-follow-up record instead of a degraded coder record.
-
-    The legacy recovery readers stay until stage 2 of #2065 replaces them with
-    migration reads, so these tests still need records in that shape.
-    """
-    import coding_review_agent_loop.coder_followup_degradation as degradation
-
-    monkeypatch.setattr(degradation.CoderFollowupRecovery, "_recover", lambda self, error: None)
-
-
 def _unknown_id_and_citation_followup():
     """Unknown item ID plus a citation that selects no passing receipt (#2086).
 
@@ -883,11 +871,12 @@ def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_un
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert _records_1292(runner, "coder-followup-rejected") == []
-    (dispatch,) = _records_1292(runner, "coder-dispatch")
-    assert dispatch.dispatch_attempt == 1 and dispatch.recovery_dispatch is False
+    # No recovery record of any legacy phase is written any more (#2087).
+    for phase in ("coder-followup-rejected", "coder-dispatch", "head-review-recovery"):
+        assert _records_1292(runner, phase) == []
+    assert _coder_records_2086(runner) == []
     resumed = _resume_pr_round(
-        runner.pr_payload["comments"] and [
+        [
             IssueComment(
                 author=_ACTOR_1292[0], created_at=None, body=comment["body"], author_id=_ACTOR_1292[1]
             )
@@ -896,81 +885,13 @@ def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_un
         head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("claude",),
         trusted_actor=_ACTOR_1292,
     )
-    # The first-attempt dispatch is ignored: resume is the ordinary checkpoint-free round.
-    assert resumed is None or resumed.rejected_coder_followup_reason is None
-
-
-def test_rejection_record_ledger_is_the_pre_dispatch_snapshot(tmp_path, monkeypatch):
-    _legacy_rejection_writer(monkeypatch)
-    disputing = structured_coder_followup(
-        summary="Disputed.", disputed_items=["item-1"], dispute_evidence={"item-1": "x"},
-        tests_run=["pytest tests/test_foo.py https://live.example"], reviewer="OpenAI Codex",
-    )
-    runner = _rejected_push_runner_1292(coder_outputs=[disputing])
-    config = make_config(tmp_path, coder="codex", reviewer="claude")
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=config)
-    (rejection,) = _records_1292(runner, "coder-followup-rejected")
-    assert [(item.item_id, item.status, item.text) for item in rejection.prior_items] == [
-        ("item-1", "blocking", "Add a regression test.")
-    ]
-
-
-def test_dispatch_record_failure_stops_before_the_coder_runs(tmp_path):
-    runner = _rejected_push_runner_1292()
-    original = runner.run
-
-    def failing_run(cmd, *args, **kwargs):
-        if cmd[:3] == ["gh", "pr", "comment"]:
-            body_path = Path(cmd[cmd.index("--body-file") + 1]) if "--body-file" in cmd else None
-            text = body_path.read_text(encoding="utf-8") if body_path else "\n".join(cmd)
-            if "coder dispatch record" in text:
-                raise AgentLoopError("cannot post")
-        return original(cmd, *args, **kwargs)
-
-    runner.run = failing_run
-    config = make_config(tmp_path, coder="codex", reviewer="claude")
-    with pytest.raises(AgentLoopError, match="cannot post"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert _coder_prompts_1292(runner) == []
-
-
-def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_limit(tmp_path, monkeypatch):
-    _legacy_rejection_writer(monkeypatch)
-    runner = _rejected_push_runner_1292(
-        coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP, _VALID_FOLLOWUP],
-        reviews=[_blocking_review_1292(), _approving_review_1292()],
-    )
-    config = make_config(tmp_path, coder="codex", reviewer="claude")
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    original = runner.run
-
-    def failing_run(cmd, *args, **kwargs):
-        if cmd[:3] == ["gh", "pr", "comment"]:
-            body_path = Path(cmd[cmd.index("--body-file") + 1]) if "--body-file" in cmd else None
-            text = body_path.read_text(encoding="utf-8") if body_path else "\n".join(cmd)
-            if "rejected coder follow-up record" in text:
-                raise RuntimeError("rejection post failed")
-        return original(cmd, *args, **kwargs)
-
-    runner.run = failing_run
-    # The attempt-2 rejection cannot be recorded; the original error still surfaces.
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    runner.run = original
-    assert len(_records_1292(runner, "coder-followup-rejected")) == 1
-    # The attempt-2 dispatch record still carries the attempt: resume stops at the limit.
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "consecutive" in str(raised.value)
-    assert len(_coder_prompts_1292(runner)) == 6  # three acquisitions per refused dispatch
+    assert resumed is None or resumed.head_review_recovery is None
 
 
 _A_1292, _B_1292, _C_1292 = "a" * 40, "b" * 40, "c" * 40
 from coding_review_agent_loop.protocol import UnresolvedReviewItem  # noqa: E402
 from coding_review_agent_loop.round_metadata import (
-    RecoveryRoundBudget as _Budget1292,
+    LegacyRoundBudget as _Budget1292,
 )  # noqa: E402
 
 
@@ -1098,11 +1019,9 @@ def test_stranded_checkpoint_history_gets_an_ordinary_review_round_of_the_new_he
 
     assert _agent_order_1292(runner)[0] == "codex"  # never routed through a coder first
     assert "claude" not in _agent_order_1292(runner)
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.head_review_recovery_source == "legacy-checkpoint"
-    assert handoff.round_number == 2 and handoff.subject == _B_1292  # never rewound
-    assert [item.item_id for item in handoff.prior_items] == ["item-1"]
-    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
+    assert _records_1292(runner, "head-review-recovery") == []  # no handoff is written (#2087)
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == _B_1292]
+    assert reviews and all(r.round_number == 2 for r in reviews)  # never rewound
     assert not any(
         record.role == "coder" for record in _records_1292(runner) if record.subject == _B_1292
     )
@@ -1121,8 +1040,9 @@ def test_stranded_checkpoint_history_excludes_a_foreign_anchor(tmp_path):
     assert _records_1292(runner, "head-review-recovery") == []
 
 
-def test_operator_flag_reviews_the_current_head_after_the_attempt_limit(tmp_path):
-    """Rows operator-flag-recovery and rejection-retry-limit."""
+@pytest.mark.parametrize("flag", [False, True])
+def test_latest_legacy_rejection_reviews_the_current_head_with_no_coder_turn(tmp_path, flag):
+    """Row migrate-rejected through run_pr_loop: no refusal, no coder turn, no new record."""
     records = [
         *_history_1292(), _dispatch_1292(), _rejection_1292(),
         _dispatch_1292(subject=_B_1292, attempt=2),
@@ -1132,19 +1052,18 @@ def test_operator_flag_reviews_the_current_head_after_the_attempt_limit(tmp_path
         ),
     ]
     runner = _stranded_runner_1292(records, _B_1292)
-    config = make_config(tmp_path, reviewer="codex", coder="claude")
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "live remote target" in str(raised.value) and "again" in str(raised.value)
-    assert _agent_order_1292(runner) == []
-
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
+    # The deprecated flag changes nothing (#2087).
+    config = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=flag)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert _agent_order_1292(runner) == ["codex"]
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.head_review_recovery_source == "operator"
-    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
+    assert _records_1292(runner, "head-review-recovery") == []
+    assert len(_records_1292(runner, "coder-dispatch")) == 2  # only the seeded legacy records
+    assert len(_records_1292(runner, "coder-followup-rejected")) == 2
     assert not any(record.role == "coder" and record.subject == _B_1292 for record in _records_1292(runner))
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == _B_1292]
+    assert reviews and all(r.round_number == 1 for r in reviews)
+    reviewer_prompt = runner.commands[command_index(runner.commands, ["codex", "exec"])][0][-1]
+    assert "[item-1]" in reviewer_prompt
 
 
 def test_head_review_handoff_interruption_resumes_without_the_flag_and_posts_no_second_record(tmp_path):
@@ -1167,47 +1086,43 @@ def test_head_review_handoff_interruption_resumes_without_the_flag_and_posts_no_
 
 
 def test_head_review_handoff_survives_a_further_head_advance(tmp_path):
-    """Row resume-after-rejection variant (ii)."""
+    """Row migrate-dispatch-headreview: a legacy handoff on a prior head, head moved again."""
     budget = _Budget1292(5, False, False)
     records = [*_history_1292(), _handoff_1292(round_number=2, budget=budget)]
     runner = _stranded_runner_1292(records, _C_1292)
     config = make_config(tmp_path, reviewer="codex", coder="claude")
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    new_handoffs = [r for r in _records_1292(runner, "head-review-recovery") if r.subject == _C_1292]
-    assert len(new_handoffs) == 1 and new_handoffs[0].round_number == 2
-    assert [item.item_id for item in new_handoffs[0].prior_items] == ["item-1"]
+    assert len(_records_1292(runner, "head-review-recovery")) == 1  # only the seeded record
     assert _agent_order_1292(runner) == ["codex"]
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == _C_1292]
+    assert reviews and all(r.round_number == 2 for r in reviews)
+    assert all([i.item_id for i in r.prior_items] == ["item-1"] for r in reviews)
 
 
-def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_path):
-    """Row resume-after-rejection variant (i)."""
-    records = [*_history_1292("Claude"), _dispatch_1292(), _rejection_1292()]
-    runner = FakeRunner(
-        claude_outputs=[_approving_review_1292()],
-        codex_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP],
-        pr_payload={"headRefOid": _C_1292, "comments": _seed_1292(*records)},
-        authenticated_actor=_ACTOR_1292,
-        advance_pr_head_on_coder_followup=False,
-    )
-    config = make_config(tmp_path, coder="codex", reviewer="claude")
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    prompt = _coder_prompts_1292(runner)[0]
-    assert f"`{_A_1292}`" in prompt and f"`{_C_1292}`" in prompt
-    assert "live remote target" in prompt and "attempt 1" in prompt
-    (second_dispatch,) = [r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_attempt == 2]
-    assert second_dispatch.recovery_dispatch is True and second_dispatch.dispatch_round == 1
-    # The unchanged-head rejection of the recovery is recorded; a rerun stops at the limit.
-    assert [r.dispatch_attempt for r in _records_1292(runner, "coder-followup-rejected")][-1] == 2
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    # One recovery dispatch: the primary turn and its two same-agent re-asks.
-    assert len(_coder_prompts_1292(runner)) == 3
+@pytest.mark.parametrize("head", [_B_1292, _C_1292])
+def test_latest_legacy_rejection_or_dispatch_resumes_as_a_review_wherever_the_head_is(tmp_path, head):
+    """Rows migrate-rejected and migrate-dispatch-headreview through run_pr_loop."""
+    for records in (
+        [*_history_1292("Claude"), _dispatch_1292(), _rejection_1292()],
+        [*_history_1292("Claude"), _dispatch_1292()],
+    ):
+        runner = FakeRunner(
+            claude_outputs=[_approving_review_1292()],
+            codex_outputs=[_LIVE_TARGET_FOLLOWUP],
+            pr_payload={"headRefOid": head, "comments": _seed_1292(*records)},
+            authenticated_actor=_ACTOR_1292,
+            advance_pr_head_on_coder_followup=False,
+        )
+        config = make_config(tmp_path, coder="codex", reviewer="claude")
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert _coder_prompts_1292(runner) == []  # the coder is never dispatched
+        assert len(_records_1292(runner, "coder-dispatch")) == 1  # only the seeded record
+        assert _records_1292(runner, "head-review-recovery") == []
 
 
-def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_recovery_coder(tmp_path):
-    """Row rejection-budget-preserved."""
-    budget = _Budget1292(3, True, False)  # max_rounds=2 plus the watcher extension
+def test_last_round_legacy_rejection_reviews_the_head_within_the_configured_rounds(tmp_path):
+    """A legacy rejection at the last configured round migrates to that round's review."""
+    budget = _Budget1292(3, True, False)  # a legacy extended budget is not restored
     records = [
         *_history_1292("Claude"),
         dataclasses.replace(_dispatch_1292(budget=budget), dispatch_round=2, round_number=3),
@@ -1221,12 +1136,9 @@ def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_rec
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude", max_rounds=2)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert len(_coder_prompts_1292(runner)) == 1  # not blocked by either round-limit guard
-    (coder_record,) = [
-        r for r in _records_1292(runner)
-        if r.role == "coder" and r.subject not in (_A_1292, _B_1292)
-    ]
-    assert coder_record.round_number == 3  # reviewers run in the following round
+    assert _coder_prompts_1292(runner) == []
+    reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == _B_1292]
+    assert reviews and all(r.round_number == 2 for r in reviews)
 
 
 def test_forged_rejection_does_not_anchor_resume_or_supply_its_reason(tmp_path):
@@ -1303,77 +1215,23 @@ def test_ordinary_resume_authenticates_even_when_the_head_has_records(tmp_path, 
 
 
 @pytest.mark.parametrize(
-    "malformed, field",
+    "malformed",
     [
-        (lambda: _rejection_1292(dispatch_attempt=None), "dispatch_attempt"),
-        (lambda: _rejection_1292(dispatch_round=None), "dispatch_round"),
-        (lambda: _dispatch_1292(subject=_B_1292, attempt=2, recovery_dispatch=False), "recovery_dispatch"),
+        lambda: _rejection_1292(dispatch_attempt=None),
+        lambda: _rejection_1292(dispatch_round=None),
+        lambda: _dispatch_1292(subject=_B_1292, attempt=2, recovery_dispatch=False),
     ],
 )
-def test_malformed_live_recovery_record_stops_before_any_agent_call_and_the_flag_recovers(
-    tmp_path, malformed, field
-):
-    """Row metadata-compat on the production resume path."""
+def test_malformed_latest_legacy_record_migrates_to_a_review_on_the_production_path(tmp_path, malformed):
+    """Row unrecoverable-advance (malformed legacy record) through run_pr_loop: no refusal."""
     record = malformed()
     head = record.subject
     runner = _stranded_runner_1292([*_history_1292(), record], head)
     config = make_config(tmp_path, reviewer="codex", coder="claude")
-    with pytest.raises(AgentLoopError, match=rf"comment index 2 .*malformed.*{field}"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert _agent_order_1292(runner) == []
-
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.recovery_round_budget.allowed_rounds == flagged.max_rounds  # default budget
-    # The posted handoff retires the malformed record: a later restart is not blocked.
-    again = _stranded_runner_1292([], head)
-    again.pr_payload["comments"] = runner.pr_payload["comments"]
-    resumed = _resume_pr_round(
-        [
-            IssueComment(author=_ACTOR_1292[0], created_at=None, body=c["body"], author_id=_ACTOR_1292[1])
-            for c in runner.pr_payload["comments"]
-        ],
-        head_sha=head, configured_reviewers=("codex",), trusted_actor=_ACTOR_1292,
-    )
-    assert resumed is None or resumed.rejected_coder_followup_reason is None
-
-
-def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruption(tmp_path, monkeypatch):
-    _legacy_rejection_writer(monkeypatch)
-    """Rows recovery-rejected-no-push and rejection-superseded (the full chain)."""
-    runner = _rejected_push_runner_1292(
-        coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP],
-        reviews=[_blocking_review_1292()],
-    )
-    config = make_config(tmp_path, coder="codex", reviewer="claude")
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    pushed = runner.pr_payload["headRefOid"]
-
-    runner.advance_pr_head_on_coder_followup = False  # the recovery coder does not push
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    second = _records_1292(runner, "coder-followup-rejected")[-1]
-    assert second.subject == second.dispatch_head == second.rejected_coder_followup_from_head == pushed
-    assert second.dispatch_attempt == 2 and second.recovery_dispatch is True
-
-    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as limit:
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert "consecutive" in str(limit.value)
-    assert len(_coder_prompts_1292(runner)) == 6  # the limit stops a third dispatch (three acquisitions each)
-
-    flagged = make_config(tmp_path, coder="codex", reviewer="claude", review_unrecorded_head=True)
-    runner.claude_outputs.clear()  # interrupt right after the handoff: no reviewer output
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=flagged)
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.subject == pushed and handoff.head_review_recovery_source == "operator"
-
-    runner.claude_outputs.append(_approving_review_1292())
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0  # no flag needed
-    assert len(_records_1292(runner, "head-review-recovery")) == 1  # resumed from the handoff
-    assert len(_coder_prompts_1292(runner)) == 6  # no further coder dispatch
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_order_1292(runner) == ["codex"]
+    assert _records_1292(runner, "head-review-recovery") == []
+    assert not any(r.role == "coder" and r.subject == head for r in _records_1292(runner))
 
 
 def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path):
@@ -1387,6 +1245,11 @@ def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path
     assert config_from_args(flagged, FakeRunner()).review_unrecorded_head is True
     with pytest.raises(SystemExit):
         parser.parse_args(["issue", "5", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
+    help_text = next(
+        action.help for action in parser._subparsers._group_actions[0].choices["pr"]._actions
+        if "--review-unrecorded-head" in action.option_strings
+    )
+    assert "Deprecated no-op" in help_text
 
 
 # --- Review feedback on #1296: authenticated budgets, numbering, matrix paths --
@@ -1399,23 +1262,21 @@ def _rec_1292(items=None):
 from coding_review_agent_loop.protocol import ReviewItemDisposition  # noqa: E402
 
 
-@pytest.mark.parametrize("source", ["legacy-checkpoint", "operator"])
+@pytest.mark.parametrize("source", ["legacy-checkpoint", "legacy-rejection"])
 def test_head_review_recovery_under_primary_then_panel_gates_the_panel_and_bounds_the_coder(
     tmp_path, monkeypatch, source
 ):
-    """Rows legacy-checkpoint-stranded / operator-flag-recovery: ordinary primary gate, no override."""
+    """Legacy anchors resume as an ordinary primary-gated review, then the coder."""
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     if source == "legacy-checkpoint":
         records = [*_history_1292(), _checkpoint_1292()]
-        flag = False
     else:
         records = [
             *_history_1292(), _dispatch_1292(), _rejection_1292(attempt=2, subject=_B_1292,
                                                                 carried_rejection_reasons=("a",), reason="b"),
         ]
-        flag = True
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -1428,19 +1289,14 @@ def test_head_review_recovery_under_primary_then_panel_gates_the_panel_and_bound
         pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records)},
         authenticated_actor=_ACTOR_1292,
     )
-    config = _staged_config(tmp_path, review_unrecorded_head=flag, coder="claude")
+    config = _staged_config(tmp_path, coder="claude")
     with pytest.raises(Exception):  # scripted outputs run out after the coder turn
         run_pr_loop(runner, pr_number=77, config=config)
     sequence = _agent_sequence(runner)
     assert sequence[:2] == ["codex", "claude"]  # primary first, panel gated, then the coder
     assert "gemini" not in sequence[:2] and "agy" not in sequence[:2]
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.head_review_recovery_source == source
-    coder_dispatches = [
-        r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_head == _B_1292
-    ]
-    assert coder_dispatches and coder_dispatches[-1].dispatch_attempt == 1
-    assert coder_dispatches[-1].round_number > handoff.round_number  # after the handoff
+    assert _records_1292(runner, "head-review-recovery") == []
+    assert not [r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_head == _B_1292]
 
 
 def test_legacy_recovery_on_a_confirmed_merge_conflict_uses_the_standard_conflict_route(tmp_path):
@@ -1458,9 +1314,8 @@ def test_legacy_recovery_on_a_confirmed_merge_conflict_uses_the_standard_conflic
     with pytest.raises(Exception):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner)[0] == "claude"  # conflict route, reviewers skipped
-    assert len(_records_1292(runner, "head-review-recovery")) == 1
-    dispatch = [r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_head == _B_1292]
-    assert dispatch and dispatch[0].dispatch_attempt == 1
+    assert _records_1292(runner, "head-review-recovery") == []
+    assert _records_1292(runner, "coder-dispatch") == []
 
 
 def test_partial_publication_after_a_handoff_supersedes_the_stale_repair_checkpoint(tmp_path):
@@ -1499,50 +1354,19 @@ def test_partial_publication_after_a_handoff_supersedes_the_stale_repair_checkpo
         authenticated_actor=_ACTOR_1292,
         advance_pr_head_on_coder_followup=False,
     )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), coder="claude", max_rounds=5)
-    # Round 6 exceeds max_rounds: only the handoff's extended budget admits it.
+    # A legacy handoff budget is no longer restored (#2087): round 6 runs
+    # because it is within the configured rounds.
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), coder="claude", max_rounds=6)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert "claude" not in _agent_sequence(runner)  # the stale repair skip did not return
     assert "gemini" in _agent_sequence(runner)
     assert len(_records_1292(runner, "head-review-recovery")) == 1
 
 
-def test_operator_recovery_above_max_rounds_needs_an_authenticated_budget_source(tmp_path):
-    """Row operator-flag-recovery: no rounds are granted without an admitted source."""
-    checkpoint = dataclasses.replace(
-        _checkpoint_1292(),
-        round_number=3,
-        qualification_checkpoint=QualificationCheckpoint(
-            obligation_kind="managed-exact-head-ci", obligation_identity="ci",
-            lifecycle="repair_required", failed_head_sha=_A_1292, candidate_head_sha=None,
-            allowed_rounds=3, watch_failure_extension_used=True, watch_head_extension_used=False,
-        ),
-    )
-    prelaunch = _meta_1292(
-        "summary", "scheduler-prelaunch", round_number=3, items=(_item_1292(),)
-    )
-    records = [*_history_1292(), checkpoint, prelaunch]
-    config = make_config(
-        tmp_path, reviewer="codex", coder="claude", max_rounds=2, review_unrecorded_head=True
-    )
-    # Forged checkpoint (index 2): no admitted source, so the override refuses.
-    forged = _stranded_runner_1292(records, _B_1292, forged=(2,))
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(forged, pr_number=77, config=config)
-    assert _agent_order_1292(forged) == []
-    assert _records_1292(forged, "head-review-recovery") == []
-    # Authenticated checkpoint: its used-extension budget is restored and carried.
-    genuine = _stranded_runner_1292(records, _B_1292)
-    assert run_pr_loop(genuine, pr_number=77, config=config) == 0
-    (handoff,) = _records_1292(genuine, "head-review-recovery")
-    assert handoff.round_number == 3
-    assert handoff.recovery_round_budget == _Budget1292(3, True, False)
-
-
-def test_rejection_after_the_live_ledger_was_rewritten_persists_the_pre_dispatch_snapshot(
+def test_failure_after_an_accepted_pushed_turn_posts_a_synthesized_record_with_the_pre_turn_ledger(
     tmp_path, monkeypatch
 ):
-    """Row rejection-ledger-snapshot: the failure comes after _apply_dispute_evidence ran."""
+    """A failure after _apply_dispute_evidence ran still leaves the pushed head recorded (#2087)."""
     import coding_review_agent_loop.pr_loop as pr_loop_module
 
     seen = []
@@ -1568,89 +1392,12 @@ def test_rejection_after_the_live_ledger_was_rewritten_persists_the_pre_dispatch
         run_pr_loop(runner, pr_number=77, config=config)
     before, after = seen[0]
     assert before != after  # the live ledger really was rewritten by the rejected turn
-    (rejection,) = _records_1292(runner, "coder-followup-rejected")
-    assert tuple(rejection.prior_items) == before
-
-
-def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_twice(
-    tmp_path, monkeypatch
-):
-    """Row rejection-budget-preserved, through the real watcher on the final round."""
-    _legacy_rejection_writer(monkeypatch)
-    failed_check = PullRequestCheck(
-        name="final-ci/exact-head", kind="check_run", status="failure",
-        url="https://github.com/OWNER/REPO/actions/runs/555",
-    )
-    failed_checks = _watch_check_board("failing", failing=(failed_check,))
-    runner = FakeRunner(
-        codex_outputs=[
-            structured_pr_review(state="approved", summary="Approved."),
-            structured_pr_review(
-                state="approved", summary="Approved after the CI fix.",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        claude_outputs=[
-            # The refused report and its two same-agent re-asks (#2066).
-            *[
-                structured_coder_followup(
-                    summary="Fixed CI.", addressed_items=["item-1"],
-                    tests_run=["pytest tests/test_foo.py https://live.example"],
-                )
-            ] * 3,
-            structured_coder_followup(summary="Fixed CI in checkout.", addressed_items=["item-1"]),
-        ],
-        authenticated_actor=_ACTOR_1292,
-    )
-    config = make_config(tmp_path, auto_merge=True, max_rounds=1)
-    qualified_heads = []
-
-    def watcher(*args, **kwargs):
-        head = runner.pr_payload["headRefOid"]  # the actual current head at each observation
-        qualified_heads.append(head)
-        return ManagedCiOutcome(status="failed", checks=failed_checks, head_sha=head)
-
-    monkeypatch.setattr(
-        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
-    )
-    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", watcher)
-    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
-
-    # Round 1 (the final round): the watcher grants its one extension, then the
-    # CI-repair coder pushes and is rejected.
-    with pytest.raises(AgentLoopError, match="live remote target"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert _records_1292(runner, "coder-followup-rejected") == []
     pushed = runner.pr_payload["headRefOid"]
-    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
-    (first_dispatch,) = _records_1292(runner, "coder-dispatch")
-    assert first_dispatch.recovery_round_budget == _Budget1292(2, True, False)
-    (rejection,) = _records_1292(runner, "coder-followup-rejected")
-    assert rejection.recovery_round_budget == _Budget1292(2, True, False)
-
-    # The restart restores that budget: the recovery coder is dispatched in the
-    # original slot, its record lands one round later, the reviewers publish for
-    # the new head, and the next watcher failure is refused a second extension.
-    with pytest.raises(AgentLoopError, match=r"blocking issues after round 2") as refused:
-        run_pr_loop(runner, pr_number=77, config=config)
-    recovered_head = runner.pr_payload["headRefOid"]
-    assert recovered_head != pushed
-    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", pushed, recovered_head]  # the third failure was observed
-    second_dispatch = _records_1292(runner, "coder-dispatch")[1]
-    assert second_dispatch.dispatch_attempt == 2 and second_dispatch.dispatch_round == 1
-    assert second_dispatch.recovery_round_budget == _Budget1292(2, True, False)
-    (coder_record,) = [
-        r for r in _records_1292(runner) if r.role == "coder" and r.subject == recovered_head
-    ]
-    assert coder_record.round_number == 2
-    reviews = [
-        r for r in _records_1292(runner)
-        if r.role == "reviewer" and r.subject == recovered_head and r.round_number == 2
-    ]
-    assert reviews  # the following reviewer round published for the recovered head
-    assert "managed-exact-head-ci" in str(refused.value)  # refused: no second extension
-    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 4  # the refused dispatch (three acquisitions) plus the recovery
-    assert len(_records_1292(runner, "coder-dispatch")) == 2  # no second extension was granted
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "synthesized"
+    assert tuple(record.prior_items) == before
+    assert record.raw_structured_coder_response is None
 
 
 def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agent_call(tmp_path):
@@ -2788,7 +2535,8 @@ def test_post_coder_branch_observation_precedes_publication(tmp_path, monkeypatc
 
 def test_recovery_dispatch_desync_bypasses_guarded_rejection_audit(tmp_path, monkeypatch):
     from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
-    records = [*_history_1292('Claude'), _dispatch_1292(), _rejection_1292()]
+    import coding_review_agent_loop.coder_followup_degradation as degradation
+    records = _history_1292('Claude')  # an unrecorded advance routes the coder first
     runner = FakeRunner(codex_outputs=[_VALID_FOLLOWUP],
                         pr_payload={'headRefOid': _B_1292, 'comments': _seed_1292(*records)},
                         authenticated_actor=_ACTOR_1292,
@@ -2803,13 +2551,13 @@ def test_recovery_dispatch_desync_bypasses_guarded_rejection_audit(tmp_path, mon
     monkeypatch.setattr(pr_loop, 'revalidate_adopted_managed_ci', lambda *a, **k: True)
     monkeypatch.setattr(pr_loop, 'managed_label_present', lambda *a, **k: True)
     monkeypatch.setattr(pr_loop, 'publish_rejected_coder_turn_dispatch_audit', lambda *a, **k: calls.append('audit'))
-    monkeypatch.setattr(pr_loop, '_record_coder_followup_rejection', lambda *a, **k: calls.append('rejection'))
+    monkeypatch.setattr(degradation.CoderFollowupRecovery, '_post_synthesized_best_effort',
+                        lambda self, error: calls.append('synthesized'))
     config = make_config(tmp_path, coder='codex', reviewer='claude')
     with pytest.raises(PrHeadObservationError, match='desync'):
         run_pr_loop(runner, pr_number=77, config=config)
-    assert calls == []
-    dispatches = _records_1292(runner, 'coder-dispatch')
-    assert dispatches[-1].dispatch_attempt == 2
+    assert calls == []  # fail-closed: no audit and no coder record
+    assert _records_1292(runner, 'coder-dispatch') == []
     assert not _records_1292(runner, 'coder')
 
 
@@ -2994,104 +2742,6 @@ def test_nine_cited_fixture_receipts_over_the_cap_publish_and_resolve_1995(tmp_p
         assert "unknown or cross-turn" not in line
 
 
-# --- --review-unrecorded-head before the attempt limit (#2059) ---------------
-
-
-def test_operator_flag_at_dispatch_attempt_one_reviews_the_head_with_no_coder_turn(tmp_path):
-    """Row flag-attempt1-dispatch: a live attempt-1 dispatch from head A, head now B."""
-    records = [*_history_1292(), _dispatch_1292()]
-    # Without the flag the attempt-1 handoff routes the carried items through the coder.
-    plain = _stranded_runner_1292(
-        records, _B_1292, claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
-    )
-    assert run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude")) == 0
-    assert _agent_order_1292(plain)[0] == "claude"
-    assert _records_1292(plain, "head-review-recovery") == []
-
-    runner = _stranded_runner_1292(records, _B_1292)
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
-    assert _agent_order_1292(runner) == ["codex"]
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.head_review_recovery_source == "operator"
-    assert handoff.subject == _B_1292 and handoff.round_number == 1
-    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
-    assert [item.item_id for item in handoff.prior_items] == ["item-1"]
-    assert not any(record.role == "coder" and record.subject == _B_1292 for record in _records_1292(runner))
-    assert not any("--force" in " ".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["git"])
-
-
-def test_operator_flag_head_review_then_a_later_coder_dispatch_starts_at_attempt_one(tmp_path):
-    """Row flag-evidence-boundary (attempt lineage): the converted round restarts attempts."""
-    records = [*_history_1292(), _dispatch_1292(), _rejection_1292()]
-    runner = _stranded_runner_1292(
-        records, _B_1292,
-        codex_outputs=[
-            structured_pr_review(
-                state="blocking", summary="Still open.",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking",
-                                          "note": "Not fixed yet."}],
-            ),
-            structured_pr_review(
-                state="approved", summary="Resolved.",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
-            ),
-        ],
-        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
-    )
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
-    assert _agent_order_1292(runner)[:2] == ["codex", "claude"]
-    assert len(_records_1292(runner, "head-review-recovery")) == 1
-    later = [record for record in _records_1292(runner, "coder-dispatch") if record.subject == _B_1292]
-    assert later and all(record.dispatch_attempt == 1 for record in later)
-    assert all(record.recovery_dispatch is False for record in later)
-
-
-def test_operator_flag_after_a_release_with_a_mixed_ledger_runs_reviewers_first(tmp_path):
-    """Row flag-evidence-boundary (release, mixed ledger) at loop level."""
-    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
-
-    evidence, _ = _upsert_evidence_obligation(
-        [], item_number=2, reviewer="Codex", text="Attach the live run.",
-        source_round=1, current_head_sha=_A_1292,
-    )
-    ledger = (_item_1292(), *evidence)
-    release = _meta_1292("summary", "evidence-release", subject=_A_1292, round_number=1, items=ledger)
-    records = [*_history_1292(), release]
-    resumed = _resume_pr_round(
-        _seed_comments_1292(records), head_sha=_B_1292, configured_reviewers=("codex",),
-        trusted_actor=_ACTOR_1292, review_unrecorded_head=True,
-    )
-    assert resumed is not None and resumed.head_review_recovery == "operator"
-    # The release-revalidation predicate keeps today's moved-head result: the
-    # head still advanced without a record, so no prior-baseline revalidation.
-    assert resumed.head_advanced_without_record is True
-    assert resumed.broken_evidence_freeze_head is None
-    assert resumed.evidence_boundary is not None and resumed.evidence_boundary.phase == "evidence-release"
-    same_head = _resume_pr_round(
-        _seed_comments_1292(records), head_sha=_A_1292, configured_reviewers=("codex",),
-        trusted_actor=_ACTOR_1292, review_unrecorded_head=True,
-    )
-    assert same_head is not None and same_head.head_advanced_without_record is False
-    assert same_head.evidence_boundary is not None
-
-    # No scripted reviewer output: the run stops at the first agent call, which
-    # shows what the loop dispatched first after posting the handoff record.
-    runner = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(runner, pr_number=77, config=flagged)
-    assert _agent_order_1292(runner) == ["codex"]
-    plain = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude"))
-    assert _agent_order_1292(plain) == ["claude"]  # without the flag: unchanged coder recovery
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.subject == _B_1292 and handoff.head_review_recovery_source == "operator"
-    assert {item.item_id for item in handoff.prior_items} >= {"item-1", "item-2"}
-
-
 def _seed_comments_1292(records):
     from coding_review_agent_loop.github import IssueComment as _Comment
 
@@ -3148,9 +2798,9 @@ def test_real_coder_post_seam_resolves_admitted_historical_heads(tmp_path, monke
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pr_loop, "bounded_coder_round_comment", spy)
-    records = [*_history_1292(), _dispatch_1292()]
+    # An external push to B after A's reviewed round: the coder routes first.
     runner = _stranded_runner_1292(
-        records, _B_1292, claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        _history_1292(), _B_1292, claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
     )
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude")) == 0
     assert captured and callable(captured[0])
@@ -3200,52 +2850,12 @@ def _spy_release_revalidation(monkeypatch):
     return seen
 
 
-@pytest.mark.parametrize("phase", ["evidence-freeze", "evidence-release", "evidence-conversion"])
-def test_operator_flag_after_each_evidence_boundary_runs_reviewers_first(tmp_path, monkeypatch, phase):
-    """Item-4 / row flag-evidence-boundary at loop level for freeze, release and conversion."""
-    seen = _spy_release_revalidation(monkeypatch)
-    records = _boundary_records_2059(phase, _A_1292)
-    baseline = _resume_pr_round(
-        _seed_comments_1292(records), head_sha=_B_1292, configured_reviewers=("codex",),
-        trusted_actor=_ACTOR_1292,
-    )
-    assert baseline is not None and baseline.unrecorded_head_advance is True
-    # No scripted reviewer output: the run stops at the first agent call, after
-    # any handoff record, showing which role the loop dispatched first.
-    runner = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(runner, pr_number=77, config=flagged)
-    assert _agent_order_1292(runner) == ["codex"]
-    (handoff,) = _records_1292(runner, "head-review-recovery")
-    assert handoff.subject == _B_1292 and handoff.head_review_recovery_source == "operator"
-    # The boundary's reconstructed ledger (code finding plus reopened or
-    # rebound evidence) is carried unchanged into the head review.
-    assert [i.item_id for i in handoff.prior_items] == [i.item_id for i in baseline.prior_items]
-    if phase != "evidence-conversion":
-        evidence = [i for i in handoff.prior_items if i.item_id == "item-2"]
-        assert evidence and evidence[0].lifecycle == "evidence_deferred"
-    assert not any(r.role == "coder" and r.subject == _B_1292 for r in _records_1292(runner))
-    if phase == "evidence-release":
-        assert seen[0] == ("evidence-release", (False, None))  # no revalidation of a moved head
-
-    # Without the flag the routing is unchanged: a broken freeze reviews the new
-    # head in full, while release and conversion advances route the coder first.
-    plain = _stranded_runner_1292(records, _B_1292, codex_outputs=[])
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(plain, pr_number=77, config=make_config(tmp_path, reviewer="codex", coder="claude"))
-    assert _agent_order_1292(plain) == (["codex"] if phase == "evidence-freeze" else ["claude"])
-    assert _records_1292(plain, "head-review-recovery") == []
-    if phase == "evidence-release":
-        assert seen[-1] == ("evidence-release", (False, None))
-
-
 def test_same_head_release_still_revalidates_against_its_baseline(tmp_path, monkeypatch):
     """Row flag-evidence-boundary control: a release resumed at its own head revalidates."""
     seen = _spy_release_revalidation(monkeypatch)
     records = _boundary_records_2059("evidence-release", _A_1292)
     runner = _stranded_runner_1292(records, _A_1292, codex_outputs=[])
-    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude")
     try:
         run_pr_loop(runner, pr_number=77, config=flagged)
     except AgentLoopError:

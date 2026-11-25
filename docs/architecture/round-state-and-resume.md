@@ -1,6 +1,6 @@
 # Round state and resume
 
-Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
+Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-ups and legacy recovery-record migration, and the context and trust contracts that every prompt and resume path must preserve.
 
 Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/pr_round_ingestion.py`, `src/coding_review_agent_loop/pr_round_errors.py`, `src/coding_review_agent_loop/round_metadata.py`, `src/coding_review_agent_loop/round_closure.py`, `src/coding_review_agent_loop/round_closure_writer.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
@@ -130,8 +130,9 @@ projection. No historical migration or comment rewrite is performed.
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,
 used by `round_state.py`. Before PR promotion, it indexes the earliest
 durable appearance of each numbered acknowledgement candidate across both
-`prior_items` and `new_items` in history order. Recovery transport carriers
-(dispatch, rejected follow-up, and head-review recovery) are lineage-neutral
+`prior_items` and `new_items` in history order. Legacy recovery transport
+carriers (dispatch, rejected follow-up, and head-review recovery; no longer
+written since #2087) are lineage-neutral
 at this stage because their actor admission happens later; the next ordinary
 carrier establishes origin. Transport alone cannot grant
 authority, and a following reviewer origin still rejects recovery.
@@ -264,8 +265,7 @@ post; a begun publication is never verified or re-posted.
 
 The closed-incomplete record reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
-round and history-wide numbering into a fresh review on the new head without
-requiring the operator recovery override.
+round and history-wide numbering into a fresh review on the new head.
 
 ## Closed planning rounds
 
@@ -462,31 +462,34 @@ its own acquisition catalog, outside-checkout tests and a malformed
 `architecture_impact` (invalid dispositions become `blocked`), revalidated under
 that catalog; else a git-synthesized record. Review then runs on the new head.
 `human_requirements_degraded` keeps the acknowledgement item open.
-Before every PR coder dispatch the orchestrator still posts a
-`coder-dispatch` summary (dispatch round and head, immutable ledger snapshot,
-bounded round budget, attempt number, carried reasons); a rejected recovery
-dispatch on an unchanged head posts a `coder-followup-rejected`
-summary keyed to the observed head with a bounded, redacted reason. Ordinary
-selection never sees dispatch records. Resume admits these records only from
-the authenticated GitHub actor, using author identities fetched from REST and
-only when needed, validates each live record per phase before reading any
-recovery field (a malformed live record stops resume before any agent call),
-and uses one newest-first walk, shared by the current head and the latest prior
-head, to pick the live handoff. Later coder, reviewer or head-review records
-retire a handoff. A coder handoff resumes a coder round in its original slot
-with the restored bounded budget and a prompt that names both heads and the
-reason, up to `MAX_REJECTED_DISPATCH_ATTEMPTS`. Head-review recovery (a legacy
-qualification-checkpoint anchor, or `agent-loop pr N --review-unrecorded-head`)
-is an ordinary review round of the current head: it carries only the ledger, the
-bounded budget and a `head-review-recovery` handoff that supersedes earlier
-checkpoints, and never overrides review scheduling or merge-conflict routing.
-Nothing force-pushes or writes a coder-role record on the operator's behalf.
-`--review-unrecorded-head` takes effect whenever given (#2059): every outcome
-routed through coder recovery passes through `_as_operator_head_review`, which
-keeps the ledger, round, numbering and evidence-boundary fields and clears coder
-output, attempt lineage and checkpoint; the budget is the handoff's admitted
-budget or the shared authenticated search. `head_advanced_past_boundary` keeps
-the moved-head fact, so release-baseline revalidation is still skipped.
+A failure raised after an accepted turn pushed, before its coder record
+posted, gets a best-effort synthesized record (`record_failed_push`); a
+fail-closed head or checkout error posts nothing.
+
+No coder-recovery record is written any more (#2087): there is no
+`coder-dispatch` pre-record, `coder-followup-rejected` record or
+`head-review-recovery` handoff, and no recovery round budget, attempt limit or
+`_RecoveryRefusal`. The three phases survive only as
+`LEGACY_RECOVERY_RECORD_PHASES`, decoded read-only (`LegacyRoundBudget`,
+`legacy_recovery_record_problems`) so historical records re-encode
+byte-identically and legacy #1367 continuity chains still validate. Resume
+admits legacy records only from the authenticated GitHub actor (REST
+identities fetched only when needed) and has one migration reader,
+`_legacy_recovery_migration`: when the latest admitted record, ignoring later
+scheduler and qualification checkpoints, is a legacy recovery record, resume is
+an ordinary review round of the current head with that record's active ledger
+and round (`dispatch_round` for coder phases), no coder output, the full board
+and no new record, whatever its attempt, head movement or per-phase validity.
+A legacy head-review handoff followed by reviewer publications remains a
+boundary for current-round selection. The pre-handoff legacy qualification
+checkpoint anchor resumes the same way at its own round. An unrecorded advance
+that no reader can reconstruct no longer refuses:
+`_current_head_review_from_latest_ledger` reviews the current head from the
+latest admitted non-scoped ledger with `head_advanced_past_boundary` set, so a
+release baseline is still not revalidated on a moved head. These resumes carry
+an informational `head_review_recovery` label (`legacy-recovery`,
+`legacy-checkpoint`, `unrecorded-advance`); a legacy round budget is never
+restored. `--review-unrecorded-head` is a deprecated no-op for one release.
 
 The PR-loop coder follow-up comment is size-bounded at its posting seam
 (`coder_comment_budget.py`, #2059). A comment that fits the transport is posted
@@ -554,7 +557,7 @@ amendment digest, so an operator latch recorded only on an activation-only
 record survives a resume without the flag (#1559). A stray, whose digest is
 null or repeats an earlier carrier, stays fully inert, and calls-avoided still
 ignores every inert record. A conversion repeat or a
-head-review recovery handoff reopens the round, so a checkpoint after one is
+legacy head-review recovery handoff reopens the round, so a checkpoint after one is
 not inert. Nothing is deleted, so such PRs resume into round N+1 as they are.
 
 A live, valid scheduler-prelaunch checkpoint for an open round N > 1 anchors

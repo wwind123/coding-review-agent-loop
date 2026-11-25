@@ -195,7 +195,8 @@ def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypa
         [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
         flow="pr",
     )
-    assert any(record.metadata.phase == "coder-dispatch" and record.metadata.seat_binding
+    # The coder record (no coder-dispatch record since #2087) carries the seat binding.
+    assert any(record.metadata.role == "coder" and record.metadata.seat_binding
                for record in interrupted_records)
     checkpoint = next(
         record.metadata for record in interrupted_records
