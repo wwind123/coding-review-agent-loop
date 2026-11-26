@@ -316,8 +316,8 @@ from .review_scheduling import (
     undecodable_history_message,
 )
 from .round_closure_writer import (
-    RoundIncompleteSignal, classify_round_reviewers, close_incomplete_round, closure_carried_items, closure_round_limit_note, decide_round_closure,
-    excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
+    RoundIncompleteSignal, RoundStateReadError, classify_round_reviewers, close_incomplete_round, closure_carried_items, closure_round_limit_note, decide_round_closure,
+    excluded_incomplete_round_route, excluded_route_stop, impending_opening_source, mint_pr_review_items, pr_published_review, pr_records_blocking_summary,
 )
 from .round_visibility import (
     latest_round_checkpoint_index,
@@ -506,6 +506,8 @@ from .pr_loop_support import (
     conversion_repeat_round,
     conversion_boundary_candidate_present,
     conversion_visibility_boundary,
+    pre_conversion_only_reviewers,
+    resolve_conversion_closure_boundary,
     evidence_authority_from_records,
     freeze_signed_baseline,
     latest_conversion_index,
@@ -2924,6 +2926,12 @@ def run_pr_loop(
         # Conversion records this process posted, as (round, record metadata).
         # Only these may be synthesized into a visibility fallback (#1664).
         own_conversion_records: list[tuple[int, PostedRoundMetadata]] = []
+        # Rounds whose comment refresh failed right after this process's own
+        # operator conversion: only there may the closure place it (#2163).
+        own_conversion_refresh_failed: set[int] = set()
+        # Per round, pre-conversion-only reviewers a refusal site named as peers:
+        # history read through the converted ledger, never peers again (#2163).
+        pr_conversion_hidden_peers: dict[int, set[str]] = {}
 
         def remember_own_conversion(round_number: int, head_sha: str | None, audit) -> None:
             own_conversion_records.append((
@@ -3390,7 +3398,14 @@ def run_pr_loop(
                     # the converted ledger, so every reviewer reviews fresh.
                     conversion_pass = True
                     if current_resume is not None:
-                        current_resume = dataclasses_replace(current_resume, completed_reviews=())
+                        # The resumed round becomes a conversion handoff (#2163), as on
+                        # resume: the converted ledger and no pre-conversion reviews or
+                        # reconciliation, so no re-entry, closure or rollover restores them.
+                        current_resume = dataclasses_replace(
+                            current_resume, completed_reviews=(), reconciliation_record=None,
+                            prior_items=tuple(unresolved_items),
+                            next_unresolved_item_number=max(current_resume.next_unresolved_item_number,
+                                                            next_unresolved_item_number))
                     discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
                     # Re-admit conversion visibility; unsafe history never falls back.
                     try:
@@ -3398,6 +3413,7 @@ def run_pr_loop(
                     except PrRoundHistoryError:
                         raise
                     except AgentLoopError as exc:
+                        own_conversion_refresh_failed.add(round_number)
                         log(
                             config,
                             f"Round {round_number}: PR #{pr_number} comment refresh after the "
@@ -4192,17 +4208,40 @@ def run_pr_loop(
                     round_number=round_number, prior_items=tuple(prior_unresolved_items), coder_output=None,
                     completed_reviews=(), next_unresolved_item_number=next_unresolved_item_number)
 
-            def _pr_closure_ledger_records(public: dict[str, PostedRoundRecord]) -> dict[str, PostedRoundRecord]:
-                """Every completed round-N review (any phase) and any other public publication, in board order."""
+            def _pr_closure_ledger_records(public: dict[str, PostedRoundRecord], *, floor: int = -1) -> dict[str, PostedRoundRecord]:
+                """Every completed round-N review (any phase) and any other public publication, in board order.
+
+                ``floor`` is a conversion boundary: records at or before it belong to the pre-conversion pass.
+                """
                 return {name: record for name in (agent_display_name(r) for r in configured_reviewers)
                         if name not in superseded_prepanel_reviews
-                        and (record := completed_by_name.get(name) or public.get(name)) is not None}
+                        and (record := completed_by_name.get(name) or public.get(name)) is not None
+                        and record.index > floor}
+
+            def _pr_conversion_boundary() -> int | None:
+                """The shared conversion boundary of a repeat (#2163); raises retryably when unresolved."""
+                return resolve_conversion_closure_boundary(
+                    runner, config, pr_number=pr_number, comments=pr_comments, round_number=round_number,
+                    head_sha=pr_metadata.head_sha, own_conversion_refresh_failed=round_number in own_conversion_refresh_failed,
+                    own_conversion=next((metadata for own_round, metadata in reversed(own_conversion_records)
+                                         if own_round == round_number), None))
 
             def _pr_round_closure() -> object | None:
                 """Round-wide closed-incomplete decision and writer (#2064); replaces #2054's call."""
-                if ((current_resume is not None and (current_resume.round_number != round_number
-                        or current_resume.reconciliation_record is not None or current_resume.evidence_boundary is not None))
-                        or skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None or conversion_pass):
+                if skip_reviewers_for_recovery or conflict_pending or evidence_pass is not None:
+                    return None
+                # A conversion repeat closes too, on post-conversion publications only (#2163).
+                # An unresolved boundary never closes: it stops only a round that would close.
+                boundary, unresolved_boundary = None, None
+                try:
+                    boundary = _pr_conversion_boundary() if conversion_pass else None
+                except RoundStateReadError as exc:
+                    unresolved_boundary = exc
+                floor = boundary if boundary is not None else -1
+                if current_resume is not None and (current_resume.round_number != round_number
+                        or (current_resume.reconciliation_record is not None
+                            and current_resume.reconciliation_record.index > floor)
+                        or current_resume.evidence_boundary is not None):
                     return None
                 order = [agent_display_name(reviewer) for reviewer in configured_reviewers]
                 # Public same-round publications by the shared visibility rule (#1156), across
@@ -4217,14 +4256,15 @@ def run_pr_loop(
                     flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order,
                     primary_reviewer=scheduler_contract.primary_reviewer if scheduler_capabilities.requires_primary else None,
                     launch_phase=launch_phase, launching=tuple(sorted(selected_reviewer_names)),
-                    checkpoint_index=len(pr_comments))
+                    checkpoint_index=len(pr_comments), reopening_boundary_index=boundary)
                 published = {record.metadata.agent: record for record in same_round_public_publications(
-                    history, flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order)
+                    history, flow="pr", round_number=round_number, subject=current_pr_subject, reviewer_names=order,
+                    reopening_boundary_index=boundary)
                     if record.metadata.agent in visible and record.metadata.agent not in superseded_prepanel_reviews}
                 # A rejected own withheld-round publication, or a published pre-panel-unqualified
                 # review; a sequential (authoritative) record keeps its same-round re-run.
                 rejected = {name: record for name, record in completed_by_name.items()
-                            if name not in resumed_by_name and name not in superseded_prepanel_reviews
+                            if name not in resumed_by_name and name not in superseded_prepanel_reviews and record.index > floor
                             and (record.metadata.phase == "publication" or name in prepanel_unqualified_reviews)}
                 found = classify_round_reviewers(
                     runner, config=config, surface="pr", number=pr_number, round_number=round_number,
@@ -4239,12 +4279,13 @@ def run_pr_loop(
                                                 publications=found.publications, fresh_turns=found.fresh_turns)
                 if decision is None:
                     return None
-
+                if unresolved_boundary is not None:
+                    raise unresolved_boundary
                 base = _pr_closure_base()
                 closed = close_incomplete_round(
                     runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
                     comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
-                    published_records=_pr_closure_ledger_records(published),
+                    published_records=_pr_closure_ledger_records(published, floor=floor),
                     next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
                     mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
                     post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
@@ -4254,40 +4295,70 @@ def run_pr_loop(
                     state.clear()
                 return closed
 
+            def _pr_reenter_round(resumed: object | None, *, conversion: bool = False) -> None:
+                """Every signal re-entry of round N restores the pre-scheduler state first (#2064, #2163)."""
+                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided, pending_conversion_pass
+                resumed_round, pending_conversion_pass = resumed, conversion
+                final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
+                pending_automatic_fallback_reasons[:] = list(restored)
+                round_sequence.repeat_current()
+
             def _pr_close_on_signal(signal: RoundIncompleteSignal) -> None:
                 """A former refusal site found round N incomplete before any post: close it and re-enter (#2064)."""
-                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided
-                if conversion_pass or evidence_pass is not None or skip_reviewers_for_recovery or conflict_pending:
-                    raise excluded_route_stop(signal, route="conversion repeat" if conversion_pass else "evidence pass" if evidence_pass is not None else "recovery route") from signal
+                route = excluded_incomplete_round_route(evidence_pass=evidence_pass is not None,
+                                                        recovery=skip_reviewers_for_recovery, conflict=conflict_pending)
+                if route is not None:
+                    raise excluded_route_stop(signal, route=route, pr_number=pr_number) from signal
                 if not signal.before_publication:
                     raise signal  # Fail closed without deletion advice; the next resume's decision closes the round.
-                if current_resume is not None and current_resume.reconciliation_record is not None:
+                # A conversion repeat closes on its post-conversion publications (#2163);
+                # an unresolved boundary stops retryably before anything is posted.
+                boundary = _pr_conversion_boundary() if conversion_pass else None
+                floor = boundary if boundary is not None else -1
+                published_names = tuple(signal.published)
+                if boundary is not None:
+                    hidden = pre_conversion_only_reviewers(
+                        _extract_round_metadata_records(pr_comments, flow="pr"), round_number=round_number,
+                        head_sha=current_pr_subject, boundary=boundary, spool=pr_round_spool,
+                        names=[agent_display_name(r) for r in configured_reviewers])
+                    published_names = tuple(name for name in published_names if name not in hidden)
+                    if signal.published and not published_names:
+                        # Only pre-conversion history was named: nothing to close. Re-enter the
+                        # repeat with those reviewers excluded as peers (#2163).
+                        hidden_now = pr_conversion_hidden_peers.setdefault(round_number, set())
+                        if set(signal.published) <= hidden_now:
+                            raise AgentLoopError(
+                                f"PR #{pr_number}: conversion-repeat invariant violated: round {round_number} "
+                                "named only pre-conversion reviews as peers twice. Nothing was posted; rerun "
+                                "after reporting this defect.") from signal
+                        hidden_now.update(signal.published)
+                        log(config, f"Round {round_number}: {', '.join(signal.published)} published only before "
+                            "the conversion; re-entering the repeat without them as peers")
+                        _pr_reenter_round(current_resume, conversion=True)
+                        return
+                if (current_resume is not None and current_resume.reconciliation_record is not None
+                        and current_resume.reconciliation_record.index > floor):
                     # A reconciled round is already closed (#1553): re-enter so its own
                     # record rolls it over instead of launching beside public peers.
-                    resumed_round = dataclasses_replace(current_resume, completed_reviews=())
-                    final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
-                    pending_automatic_fallback_reasons[:] = list(restored)
-                    round_sequence.repeat_current()
+                    _pr_reenter_round(dataclasses_replace(current_resume, completed_reviews=()))
                     return
-                records = _pr_closure_ledger_records({})
+                records = _pr_closure_ledger_records({}, floor=floor)
                 decision = decide_round_closure(
                     round_number=round_number, reviewer_order=[agent_display_name(r) for r in configured_reviewers],
                     publications={name: (getattr(pr_comments[records[name].index], "comment_id", None) if name in records else None)
-                                  for name in signal.published}, fresh_turns=dict(signal.unreplayable))
+                                  for name in published_names}, fresh_turns=dict(signal.unreplayable))
                 if decision is None:
                     raise signal
                 base = _pr_closure_base()
-                resumed_round = close_incomplete_round(
+                closed = close_incomplete_round(
                     runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
                     comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
                     published_records=records, next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
                     mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
                     post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
                 pr_round_spool.discard()
-                pr_closure_item_ids.update(item.item_id for item in resumed_round.current_round_new_items)
-                final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
-                pending_automatic_fallback_reasons[:] = list(restored)
-                round_sequence.repeat_current()
+                pr_closure_item_ids.update(item.item_id for item in closed.current_round_new_items)
+                _pr_reenter_round(closed)
 
             # A reconciled round is closed (#1553): it never receives another
             # scheduling or reviewer record.  Recovery, qualification,
@@ -4322,6 +4393,7 @@ def run_pr_loop(
                 published = [
                     agent_display_name(reviewer) for reviewer in configured_reviewers
                     if resumed_by_name.get(agent_display_name(reviewer)) is not None
+                    and agent_display_name(reviewer) not in pr_conversion_hidden_peers.get(round_number, ())
                 ]
                 _preflight_spooled_publications(
                     spool=pr_round_spool, reviewers=configured_reviewers, published_names=published,
@@ -5273,6 +5345,8 @@ def run_pr_loop(
                     if reviewer in pr_today_peers
                     or agent_display_name(reviewer) in pr_visible_names
                 )
+            pr_round_public_peers = tuple(r for r in pr_round_public_peers
+                                          if agent_display_name(r) not in pr_conversion_hidden_peers.get(round_number, ()))
             # A round that holds withheld outcomes began as a parallel round;
             # finish it through the same withhold-then-publish launcher even
             # when this run is sequential (#1025).

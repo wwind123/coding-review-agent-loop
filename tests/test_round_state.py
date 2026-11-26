@@ -2436,3 +2436,118 @@ def test_malformed_supersession_payload_never_closes_the_round():
     resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex", "gemini"))
     assert resumed.reconciliation_record is None
     assert {r.metadata.agent for r in resumed.completed_reviews} == {"Codex", "Gemini"}
+
+
+# --- #2163: a closure later than the conversion record ends the repeat -------
+
+
+def _valid_conversion(*, round_number, head):
+    """An operator conversion record whose audit decodes on extraction."""
+    from coding_review_agent_loop.evidence_conversion import (
+        ConversionAuditRow, EvidenceConversionAudit, converted_evidence_obligation_identity,
+    )
+
+    identity = "f" * 64
+    audit = EvidenceConversionAudit(source="operator", matrix_identity=identity, head=head, rows=(
+        ConversionAuditRow(row_id="row-a", obligation_identity=converted_evidence_obligation_identity("row-a", identity),
+                           obligation_item_id="item-2", owners=("Codex",), converted_item_ids=(),
+                           attempt_record_rounds=()),
+    ))
+    return _summary("evidence-conversion", head, round_number, evidence_conversion=audit)
+
+
+def _conversion_round_history(*, closed):
+    """Round 2 at head A: a pre-conversion review and reconciliation, then the conversion.
+
+    The round's coder record belongs to round 1, as in the carried-panel shape,
+    so no current-round coder or reviewer record follows the conversion.
+    """
+    from coding_review_agent_loop.round_closure import (
+        ROUND_CLOSED_INCOMPLETE_PHASE, build_round_closure_payload,
+    )
+    conversion = _valid_conversion(round_number=2, head=_OLD)
+    closed_ledger = (_item(1), _item(2, "Operator evidence for row-a."))
+    history = [
+        _coder(),
+        _reviewer(new_items=(_item(),)),
+        _summary("reconciliation", _OLD, 1, (_item(),)),
+        _reviewer(round_number=2, items=(_item(),)),
+        _summary("reconciliation", _OLD, 2, (_item(),)),
+        conversion,
+    ]
+    if closed:
+        payload = build_round_closure_payload(
+            flow="pr", round_number=2, subject=_OLD, published=(("Codex", None),),
+            unreplayable=(("Gemini", "no spooled outcome"),), item_number_high_water=3,
+        )
+        history.append(dataclasses.replace(
+            _summary(ROUND_CLOSED_INCOMPLETE_PHASE, _OLD, 2, closed_ledger, round_closure=payload),
+            new_items=(_item(3, "Rename the parser helper."),),
+        ))
+    else:
+        history.append(_summary("scheduler-prelaunch", _OLD, 2, closed_ledger))
+    return history
+
+
+def test_a_later_closure_wins_over_the_conversion_handoff_resume():
+    """`conv-resume-reader-closure-precedence` (#2163)."""
+    history = _conversion_round_history(closed=True)
+    resumed = _resume(history, _OLD)
+    assert resumed is not None and resumed.round_number == 2
+    assert resumed.reconciliation_record is not None
+    assert resumed.reconciliation_record.index == len(history) - 1
+    assert resumed.reconciliation_record.metadata.phase == "round-closed-incomplete"
+    assert [i.item_id for i in resumed.reconciliation_record.metadata.new_items] == ["item-3"]
+    assert [i.item_id for i in resumed.prior_items] == ["item-1", "item-2"]
+    assert resumed.completed_reviews == ()
+
+
+def test_a_conversion_after_an_earlier_reconciliation_still_resumes_the_open_repeat():
+    """`conv-resume-reader-closure-precedence` (#2163): an open repeat is unchanged."""
+    history = _conversion_round_history(closed=False)
+    records = _extract_round_metadata_records(_history(*history), flow="pr")
+    assert records[5].metadata.evidence_conversion is not None  # an admitted conversion record
+    resumed = _resume(history, _OLD)
+    assert resumed is not None and resumed.round_number == 2
+    # The conversion handoff: its own ledger, no reconciliation, no reviews.
+    assert resumed.reconciliation_record is None
+    assert resumed.completed_reviews == ()
+    assert resumed.prior_items == records[5].metadata.prior_items
+
+
+def test_conversion_repeat_round_ends_at_a_later_closure_record():
+    """Step 5(a) (#2163): the repeat predicate stops at a same-round closure."""
+    from coding_review_agent_loop.pr_loop_support import conversion_repeat_round
+
+    for closed, expected in ((False, True), (True, False)):
+        records = _extract_round_metadata_records(_history(*_conversion_round_history(closed=closed)), flow="pr")
+        assert conversion_repeat_round(records, round_number=2, head_sha=_OLD) is expected
+
+
+def _resolver(monkeypatch, *, boundary=None, candidate=False, comments=(), **kwargs):
+    from coding_review_agent_loop.pr_loop_support import ConversionVisibilityBoundary
+
+    monkeypatch.setattr(pr_loop_support, "conversion_visibility_boundary", lambda *a, **k: (
+        ConversionVisibilityBoundary(index=boundary, key=(None, None, None)) if boundary is not None else None))
+    monkeypatch.setattr(pr_loop_support, "conversion_boundary_candidate_present", lambda *a, **k: candidate)
+    return pr_loop_support.resolve_conversion_closure_boundary(
+        None, None, pr_number=77, comments=comments, round_number=2, head_sha=_OLD, **kwargs)
+
+
+def test_the_conversion_closure_boundary_resolver_has_three_outcomes(monkeypatch):
+    """Step 3 (#2163): resolved, none (absent or foreign), or a retryable unresolved stop."""
+    from coding_review_agent_loop.round_closure_writer import RoundStateReadError
+    own = _valid_conversion(round_number=2, head=_OLD)
+    assert _resolver(monkeypatch, boundary=5) == 5
+    # A succeeded refresh ignores the own conversion: the admitted history decides.
+    assert _resolver(monkeypatch, own_conversion=own) is None
+    with pytest.raises(RoundStateReadError, match="could not be admitted as a trusted boundary"):
+        _resolver(monkeypatch, candidate=True)
+    with pytest.raises(RoundStateReadError, match="could not be admitted as a trusted boundary"):
+        _resolver(monkeypatch, candidate=True, own_conversion=own, own_conversion_refresh_failed=True)
+    # After a failed refresh the own conversion is placed after every snapshot record.
+    snapshot = _history(_coder(), _reviewer(round_number=2), _summary("reconciliation", _OLD, 2))
+    assert _resolver(monkeypatch, comments=snapshot, own_conversion=own, own_conversion_refresh_failed=True) == 3
+    for unplaceable in (None, dataclasses.replace(own, round_number=3), dataclasses.replace(own, subject=_NEW)):
+        with pytest.raises(RoundStateReadError, match="could not be placed"):
+            _resolver(monkeypatch, comments=snapshot, own_conversion=unplaceable, own_conversion_refresh_failed=True)
