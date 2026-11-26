@@ -2929,6 +2929,9 @@ def run_pr_loop(
         # Rounds whose comment refresh failed right after this process's own
         # operator conversion: only there may the closure place it (#2163).
         own_conversion_refresh_failed: set[int] = set()
+        # Per round, pre-conversion-only reviewers a refusal site named as peers:
+        # history read through the converted ledger, never peers again (#2163).
+        pr_conversion_hidden_peers: dict[int, set[str]] = {}
 
         def remember_own_conversion(round_number: int, head_sha: str | None, audit) -> None:
             own_conversion_records.append((
@@ -4287,7 +4290,7 @@ def run_pr_loop(
 
             def _pr_close_on_signal(signal: RoundIncompleteSignal) -> None:
                 """A former refusal site found round N incomplete before any post: close it and re-enter (#2064)."""
-                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided
+                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided, pending_conversion_pass
                 route = excluded_incomplete_round_route(evidence_pass=evidence_pass is not None,
                                                         recovery=skip_reviewers_for_recovery, conflict=conflict_pending)
                 if route is not None:
@@ -4305,6 +4308,21 @@ def run_pr_loop(
                         head_sha=current_pr_subject, boundary=boundary, spool=pr_round_spool,
                         names=[agent_display_name(r) for r in configured_reviewers])
                     published_names = tuple(name for name in published_names if name not in hidden)
+                    if signal.published and not published_names:
+                        # Only pre-conversion history was named: nothing to close. Re-enter the
+                        # repeat with those reviewers excluded as peers (#2163).
+                        hidden_now = pr_conversion_hidden_peers.setdefault(round_number, set())
+                        if set(signal.published) <= hidden_now:
+                            raise AgentLoopError(
+                                f"PR #{pr_number}: conversion-repeat invariant violated: round {round_number} "
+                                "named only pre-conversion reviews as peers twice. Nothing was posted; rerun "
+                                "after reporting this defect.") from signal
+                        hidden_now.update(signal.published)
+                        log(config, f"Round {round_number}: {', '.join(signal.published)} published only before "
+                            "the conversion; re-entering the repeat without them as peers")
+                        resumed_round, pending_conversion_pass = current_resume, True
+                        round_sequence.repeat_current()
+                        return
                 if (current_resume is not None and current_resume.reconciliation_record is not None
                         and current_resume.reconciliation_record.index > floor):
                     # A reconciled round is already closed (#1553): re-enter so its own
@@ -4367,6 +4385,7 @@ def run_pr_loop(
                 published = [
                     agent_display_name(reviewer) for reviewer in configured_reviewers
                     if resumed_by_name.get(agent_display_name(reviewer)) is not None
+                    and agent_display_name(reviewer) not in pr_conversion_hidden_peers.get(round_number, ())
                 ]
                 _preflight_spooled_publications(
                     spool=pr_round_spool, reviewers=configured_reviewers, published_names=published,
@@ -5318,6 +5337,8 @@ def run_pr_loop(
                     if reviewer in pr_today_peers
                     or agent_display_name(reviewer) in pr_visible_names
                 )
+            pr_round_public_peers = tuple(r for r in pr_round_public_peers
+                                          if agent_display_name(r) not in pr_conversion_hidden_peers.get(round_number, ()))
             # A round that holds withheld outcomes began as a parallel round;
             # finish it through the same withhold-then-publish launcher even
             # when this run is sequential (#1025).

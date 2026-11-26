@@ -5436,7 +5436,8 @@ def conversion_repeat_round(
     repeat round (``conversion_review_round`` for an auto conversion, the
     record's round for an admitted operator conversion, #1664) at the live
     head and no later admitted freeze, release, coder or closure record exists
-    at that head (a closed-incomplete record ends the repeat, #2163).
+    at that head (a later reconciliation or closed-incomplete record of the round
+    ends the repeat, #2163).
     """
     from .round_closure import is_round_closure_boundary
     if not head_sha:
@@ -5463,7 +5464,8 @@ def conversion_repeat_round(
             record.metadata.phase in {EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE}
             or record.metadata.role == "coder"
             or (
-                is_round_closure_boundary(record.metadata)
+                # A later reconciliation or closure of the round ends the repeat (#2163).
+                (record.metadata.phase == "reconciliation" or is_round_closure_boundary(record.metadata))
                 and record.metadata.round_number == round_number
             )
         )

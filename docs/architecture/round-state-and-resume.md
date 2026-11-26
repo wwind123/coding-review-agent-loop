@@ -253,11 +253,11 @@ be deleted. A reconciled round with a blocking pre-panel review keeps its
 pre-panel stop.
 
 A conversion repeat (#2163) closes on post-conversion publications,
-carrying the converted ledger. `resolve_conversion_closure_boundary` serves
+with the converted ledger. `resolve_conversion_closure_boundary` serves
 round start and the handler: an admitted record bounds them; an absent or
 foreign one is none (all count); an unadmitted candidate or unplaceable own
-conversion stops retryably (rerun or inspect it). A later closure ends the
-repeat on resume; N+1 schedules by board policy. Evidence, recovery and
+conversion stops retryably (rerun or inspect it). A later reconciliation or closure
+ends it on resume; N+1 follows board policy. Evidence, recovery and
 conflict routes launch no withheld-round reviewer; their stop says rerun
 `agent-loop pr <N>` with the same options.
 

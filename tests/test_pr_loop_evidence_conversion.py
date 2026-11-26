@@ -1917,6 +1917,157 @@ def test_an_own_operator_conversion_bounds_the_closure_only_after_a_failed_refre
         assert first_result == conversion.index  # the admitted history decides
 
 
+def _stop_on_post(monkeypatch, predicate, message):
+    """Raise once, before posting, the first comment whose metadata matches ``predicate``."""
+    import coding_review_agent_loop.pr_loop_support as support
+    from agent_loop_helpers import patch_attr_in
+
+    real = pr_loop_module.post_pr_comment
+    armed = [True]
+
+    def post(runner_, *, config, pr_number, body, **kwargs):
+        records = _extract_round_metadata_records([SimpleNamespace(body=body)], flow="pr")
+        if armed[0] and records and predicate(runner_, records[0].metadata):
+            armed[0] = False
+            raise AgentLoopError(message)
+        return real(runner_, config=config, pr_number=pr_number, body=body, **kwargs)
+
+    patch_attr_in(monkeypatch, (pr_loop_module, support), "post_pr_comment", post)
+    return lambda: patch_attr_in(monkeypatch, (pr_loop_module, support), "post_pr_comment", real)
+
+
+def test_a_restart_after_the_repeat_reconciled_takes_the_closed_round_rollover(tmp_path, monkeypatch):
+    """item-1 (#2163): a later same-round reconciliation ends the repeat on resume."""
+    from coding_review_agent_loop.pr_loop_support import conversion_repeat_round
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+
+    def freeze_after_repeat(runner_, metadata):
+        return metadata.phase == "evidence-freeze"
+
+    restore = _stop_on_post(monkeypatch, freeze_after_repeat, "stopped after the repeat reconciled")
+    with pytest.raises(AgentLoopError, match="stopped after the repeat reconciled"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    restore()
+    conversion = _conversion(runner)
+    after = [r.metadata.phase for r in _records(runner) if r.index > conversion.index]
+    assert after[-1] == "reconciliation" and "evidence-freeze" not in after
+    assert conversion_repeat_round(_records(runner), round_number=3, head_sha=START_HEAD) is False
+    runner.simulate_new_process()
+    reconciled = _records(runner)[-1].index
+    launches = _launches(runner)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    # The reconciled repeat is closed: its reviews are reused, no reviewer runs
+    # again in round 3 or later, and finalization posts the freeze it was about to.
+    assert _reviewer_rounds_after(runner, reconciled) == []
+    assert [r.metadata.phase for r in _records(runner) if r.index > reconciled] == ["evidence-freeze"]
+    assert _launches(runner) == launches
+    assert len([r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]) == 1
+    assert _closures(runner) == []
+
+
+def test_a_signal_naming_only_pre_conversion_peers_re_enters_the_repeat(tmp_path, monkeypatch):
+    """item-2 (#2163): an emptied filter never re-raises the signal or counts history."""
+    context = _plan_context("row-a", "row-b")
+    runner, config, conversion = _restart_without_repeat_publications(tmp_path, monkeypatch, context)
+    _signal_once(monkeypatch, published=("Antigravity",),
+                 unreplayable=(("Codex", "its withheld outcome is missing or no longer validates"),))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config)
+    assert _closures(runner) == []
+    # The repeat re-entered without Antigravity's pre-conversion review as a peer
+    # and ran the full board fresh in round 3.
+    _assert_fresh_repeat(runner, conversion)
+    assert _records(runner)[-1].metadata.phase == "evidence-freeze"
+
+
+def _partly_published_round_3(tmp_path, monkeypatch, context):
+    """Round 3 publishes Antigravity's review, then stops before its reconciliation."""
+    runner, config = _carried_panel_runner(
+        tmp_path, monkeypatch, context, plan={"row-a": "failed", "row-b": "verified"}, repeat=False,
+    )
+    restore = _stop_on_post(
+        monkeypatch, lambda _r, m: m.phase == "reconciliation" and m.round_number == 3,
+        "stopped before the round-3 reconciliation",
+    )
+    with pytest.raises(AgentLoopError, match="stopped before the round-3 reconciliation"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    restore()
+    published = [r for r in _records(runner) if r.metadata.round_number == 3 and r.metadata.role == "reviewer"]
+    assert [r.metadata.agent for r in published] == ["Antigravity"]
+    assert not any(r.metadata.phase == "reconciliation" and r.metadata.round_number == 3 for r in _records(runner))
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_repeat_review())
+    runner.gemini_outputs.append(_repeat_review("Google Gemini"))
+    runner.antigravity_outputs.append(_repeat_review("Antigravity"))
+    return runner, dataclasses.replace(config, pr_convert_evidence_rows=("row-a",))
+
+
+def _fail_refresh_after_conversion(monkeypatch, runner):
+    real_read = pr_loop_module.get_pr_review_context
+    armed = [True]
+
+    def read(*args, **kwargs):
+        if armed[0] and any(r.metadata.phase == "evidence-conversion" for r in _records(runner)):
+            armed[0] = False  # only the refresh right after the conversion fails
+            raise AgentLoopError("comment refresh failed")
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop_module, "get_pr_review_context", read)
+    return armed
+
+
+def test_a_stale_snapshot_with_a_pre_conversion_publication_never_closes_the_round(tmp_path, monkeypatch):
+    """item-3 / `conv-stale-own-conversion-snapshot` (#2163), loop level.
+
+    Round 3 holds Antigravity's published review and no reconciliation; the
+    operator conversion's refresh fails, so the closure decision reads the
+    pre-conversion snapshot.  Without the own-conversion placement it would
+    close round 3 on that pre-conversion review.
+    """
+    context = _plan_context("row-a", "row-b")
+    runner, config = _partly_published_round_3(tmp_path, monkeypatch, context)
+    armed = _fail_refresh_after_conversion(monkeypatch, runner)
+    calls = _spy_boundary(monkeypatch)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert armed == [False]
+    conversion = _conversion(runner)
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    assert _closures(runner) == []  # the pre-conversion publication never closed the round
+    kwargs, boundary = calls[0]
+    assert kwargs["own_conversion_refresh_failed"] is True and kwargs["own_conversion"] is not None
+    assert isinstance(boundary, int) and boundary >= conversion.index
+    _assert_fresh_repeat(runner, conversion)
+
+
+def test_a_stale_snapshot_whose_own_conversion_cannot_be_placed_stops_retryably(tmp_path, monkeypatch):
+    """item-3 / `conv-stale-own-conversion-snapshot` (#2163): unplaceable, so no closure."""
+    import coding_review_agent_loop.pr_loop_support as support
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _partly_published_round_3(tmp_path, monkeypatch, context)
+    _fail_refresh_after_conversion(monkeypatch, runner)
+    real_extract = support._extract_round_metadata_records
+
+    def undecodable_for_placement(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "resolve_conversion_closure_boundary":
+            raise AgentLoopError("snapshot could not be decoded")
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(support, "_extract_round_metadata_records", undecodable_for_placement)
+    launches = _launches(runner)
+    with pytest.raises(RoundStateReadError, match="could not be decoded") as refused:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert any(entry.name == "_pr_round_closure" for entry in refused.traceback)
+    assert "delet" not in str(refused.value).lower()
+    conversion = _conversion(runner)
+    assert _closures(runner) == [] and _reviews_after(runner, conversion.index) == []
+    assert _launches(runner) == launches
+
+
 def test_a_conversion_repeat_closure_at_the_round_limit_names_the_next_round(tmp_path, monkeypatch):
     """`conv-max-rounds` (#2163): the closure is posted; round 4 is never launched."""
     context = _plan_context("row-a", "row-b")
