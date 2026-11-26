@@ -48,6 +48,7 @@ from .round_state import (
 from .round_closure_writer import (
     RoundIncompleteSignal,
     RoundStateReadError,
+    UNRESOLVED_CONVERSION_BOUNDARY_DETAIL,
     round_incomplete_signal,
     round_state_read_error,
 )
@@ -1054,11 +1055,7 @@ def _partial_round_refusal(
         # untrusted record both leave the boundary unresolved (#1676).
         return round_state_read_error(
             surface=surface, number=number, round_number=round_number,
-            detail=(
-                "this round's evidence-conversion record could not be admitted as a trusted "
-                "boundary, so the earlier pass's publications cannot be excluded from the peer "
-                "set; inspect the conversion record if reads were healthy"
-            ),
+            detail=UNRESOLVED_CONVERSION_BOUNDARY_DETAIL,
         )
     return round_incomplete_signal(
         surface=surface, number=number, round_number=round_number,

@@ -2156,7 +2156,13 @@ def _resume_pr_round_from_records(
             reviewer_records.pop(metadata.agent, None)
         else:
             reviewer_records[metadata.agent] = record
-    if conversion_boundary is not None and latest_coder_record is None and not reviewer_records:
+    # A reconciliation or closure later than the conversion record (only those
+    # are kept above) ends the repeat: the closed round resumes as reconciled
+    # with its own ledger, not as an open conversion handoff (#2163).
+    if (
+        conversion_boundary is not None and latest_coder_record is None and not reviewer_records
+        and reconciliation_record is None
+    ):
         return _conversion_handoff_resume(
             conversion_boundary,
             current_head_records=[r for r in records if r.metadata.subject == head_sha],

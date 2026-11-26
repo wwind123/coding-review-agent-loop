@@ -99,22 +99,59 @@ def round_incomplete_signal(
     )
 
 
-def excluded_route_stop(signal: RoundIncompleteSignal, *, route: str) -> RoundIncompleteSignal:
-    """The defensive invariant inside a route the closure rule excludes (#2064).
+def excluded_incomplete_round_route(*, evidence_pass: bool, recovery: bool, conflict: bool) -> str | None:
+    """The label of a route that keeps its own records instead of closing (#2163).
 
-    Recovery, conflict, evidence and conversion passes keep their own routes,
-    so the round is not closed there: the run stops fail-closed with nothing
-    posted, no reviewer launched and no deletion advice.
+    The evidence pass, the recovery route and the conflict route launch no
+    withheld-round reviewer, so no refusal site runs there; ``None`` means the
+    round uses the ordinary closure (a conversion repeat rolls over).
+    """
+    if evidence_pass:
+        return "evidence pass"
+    if conflict:
+        return "conflict route"
+    if recovery:
+        return "recovery route"
+    return None
+
+
+def excluded_route_stop(signal: RoundIncompleteSignal, *, route: str, pr_number: int) -> RoundIncompleteSignal:
+    """The defensive invariant inside a route that keeps its own records (#2064, #2163).
+
+    The evidence pass, recovery and conflict routes write sequential or coder
+    records, not withheld-round publications, so the round is not closed
+    there.  The stop names the one working next step: rerun the same command,
+    which resumes the route from its own records; the next ordinary round's
+    start then closes any incomplete round.  No deletion advice.
     """
     names = ", ".join(name for name, _cause in signal.unreplayable) or "a reviewer"
     peers = ", ".join(signal.published) or "a same-round peer"
+    round_number = signal.round_number
+    later = (
+        f"if round {round_number} still holds an incomplete publication, the next ordinary "
+        f"round's start closes it and review continues in round {round_number + 1}"
+        if round_number is not None
+        else "the next ordinary round's start closes any incomplete round"
+    )
     return RoundIncompleteSignal(
-        f"Review round {signal.round_number} is incomplete inside its {route}: {names} cannot be "
-        f"replayed beside the published review(s) of {peers}. The {route} keeps its own route, "
-        "so the round is not closed; nothing was posted and no reviewer was launched.",
-        round_number=signal.round_number, published=signal.published,
+        f"Review round {round_number} is incomplete inside its {route}: {names} cannot be "
+        f"replayed beside the published review(s) of {peers}. Nothing was posted and no "
+        f"reviewer was launched; the {route} writes sequential or coder records, not "
+        "withheld-round publications, so it keeps its own records and the round is not "
+        f"closed here. Next step: rerun `agent-loop pr {pr_number}` with the same options; "
+        f"the {route} resumes from its own records, and {later}.",
+        round_number=round_number, published=signal.published,
         unreplayable=signal.unreplayable, before_publication=False,
     )
+
+
+# The unresolved-boundary detail shared by the refusal sites and the closure
+# paths (#1676, #2163), so the wording cannot drift between them.
+UNRESOLVED_CONVERSION_BOUNDARY_DETAIL = (
+    "this round's evidence-conversion record could not be admitted as a trusted "
+    "boundary, so the earlier pass's publications cannot be excluded from the peer "
+    "set; inspect the conversion record if reads were healthy"
+)
 
 
 def round_state_read_error(*, surface: str, number: int, round_number: int, detail: str) -> RoundStateReadError:

@@ -178,17 +178,16 @@ round 1. Earlier reviews saw a different ledger and are rerun; the boundary is
 not reconciliation or approval. Parallel-review peer visibility and the
 round-closure decision use the same latest same-head, same-round boundary in
 the history being read: earlier publications are historical context.
-Publications after the boundary remain peers. A posted review that resume
-rejects is a publication that the closed-incomplete writer below closes, with
-the failing predicate as its cause.
+Publications after the boundary remain peers. A posted review resume rejects
+is a publication the closed-incomplete writer below closes, citing the failed
+predicate.
 
 Legacy (#2054, read-only since #2064): a tool-owned
-`signed-input-supersession` Orchestrator summary closed an unreconciled round
-whose published reviews were all rejected only because the signed requirement
-set grew. Its writer was removed (#2081); `signed_input_record.py` keeps the
-decoder for one release window. A malformed payload never closes a round; an
-existing record closes round N like a reconciliation with no completed
-reviews, its reviews inert history.
+`signed-input-supersession` summary closed an unreconciled round whose reviews
+were all rejected only because the signed requirement set grew. Its writer was
+removed (#2081); `signed_input_record.py` keeps the decoder for one release. A
+malformed payload never closes a round; a valid one closes round N like a
+reconciliation with no completed reviews.
 
 A tool-owned `round-closed-incomplete` Orchestrator summary (#2064,
 `round_closure.py`) closes a PR or plan round in which some reviews were
@@ -203,8 +202,7 @@ item of the record's own ledger, never closes a round; such a closure-phase
 summary also never counts as a reconciliation, so the round stays open for
 ordinary settlement. Only author-authenticated records are read.
 `is_round_closure_boundary` is the one closure predicate: the new record on either flow, or a legacy PR
-`signed-input-supersession` record, which keeps closing rounds for one release
-window. On the PR flow the record closes round N like a reconciliation with no
+`signed-input-supersession` record (one release window). On the PR flow the record closes round N like a reconciliation with no
 completed reviews; its reviewer records are inert for resume, panel evidence,
 scheduler history and approval carry (`closed_round_review_indexes`), a later
 scheduler checkpoint in the round is inert, and the closed-round rollover
@@ -235,9 +233,9 @@ malformed spool record; such a record is never resumed, so its reviewer also
 needs a fresh turn (unless resume admitted its public anchor: then it is stale
 and discarded). A rejected own review always
 needs a fresh turn; others need one without a settled failure or valid spooled
-response. Reconciled rounds, failed-seat retries, recovery,
-conflict, evidence and conversion passes, the approved-plan shortcut and plan
-ownership failures are excluded; sequential (authoritative) records, which the
+response. Reconciled rounds, failed-seat retries, recovery, conflict and
+evidence passes, the approved-plan shortcut and plan ownership failures are
+excluded; sequential (authoritative) records, which the
 visibility rule never treats as peers, keep their same-round re-run but still
 enter the closure ledger. `close_incomplete_round` rebuilds every completed
 review with helpers shared with resume and settlement, by published verdict:
@@ -249,19 +247,25 @@ the flow is history, so the full board reviews again behind the primary gate.
 Carried secondary-owned findings are carried obligations; at `--max-rounds`
 the limit stop after the record names N+1. Former
 refusal sites raise `RoundIncompleteSignal` before any launch; the handler uses
-the same writer (a reconciled round re-enters its rollover; an excluded pass
-stops fail-closed). Read failures and an unadmitted conversion boundary
-stop retryably (`RoundStateReadError`). Nothing deletes a comment or asks for
-one to be deleted. A reconciled round with a blocking pre-panel review keeps
-its pre-panel stop.
+the same writer (a reconciled round re-enters its rollover). Read failures stop
+retryably (`RoundStateReadError`). Nothing deletes a comment or asks for one to
+be deleted. A reconciled round with a blocking pre-panel review keeps its
+pre-panel stop.
+
+A conversion repeat (#2163) closes on post-conversion publications,
+carrying the converted ledger. `resolve_conversion_closure_boundary` serves
+round start and the handler: an admitted record bounds them; an absent or
+foreign one is none (all count); an unadmitted candidate or unplaceable own
+conversion stops retryably (rerun or inspect it). A later closure ends the
+repeat on resume; N+1 schedules by board policy. Evidence, recovery and
+conflict routes launch no withheld-round reviewer; their stop says rerun
+`agent-loop pr <N>` with the same options.
 
 Since #2081 this rule is the only partial-round remedy: the refusal error,
-carrier suffix resume, deletion listing, classification-only resume (#2035)
-and supersession writer (#2054) are gone, and
-`tests/test_no_delete_comment_remedy.py` guards against a round-recovery
-deletion remedy. Reviews those paths admitted are unreplayable and roll over.
-Publication keeps only a local "began" spool mark written before the first
-post; a begun publication is never verified or re-posted.
+carrier suffix resume, deletion listing, classification-only resume (#2035) and
+supersession writer (#2054) are gone; `tests/test_no_delete_comment_remedy.py`
+guards it. Publication keeps only a local "began" spool mark, written before
+the first post.
 
 The closed-incomplete record reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,

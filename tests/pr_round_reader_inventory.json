@@ -1895,6 +1895,14 @@
       "occurrence": 1
     },
     {
+      "module": "pr_loop",
+      "function": "run_pr_loop::_pr_close_on_signal",
+      "call": "_extract_round_metadata_records(pr_comments, flow='pr')",
+      "family": "rounds",
+      "provenance": "pr_loop.run_pr_loop::_pr_close_on_signal: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. The conversion-repeat signal handler (#2163) reads the same admitted observed pr_comments snapshot as the round-start closure, after the shared boundary resolver admitted the conversion record, only to drop pre-conversion-only reviewers before any post.",
+      "occurrence": 1
+    },
+    {
       "module": "pr_loop_support",
       "function": "_fresh_pr_qualification_snapshot",
       "call": "_extract_round_metadata_records(context.comments, flow='pr')",
@@ -2004,6 +2012,14 @@
       "call": "_extract_round_metadata_records(tuple(comments), flow='pr')",
       "family": "rounds",
       "provenance": "pr_loop_support.conversion_boundary_candidate_present: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; evidence/capture entry points additionally call the shared admission accessor. Refreshed qualification uses a new observed context.",
+      "occurrence": 1
+    },
+    {
+      "module": "pr_loop_support",
+      "function": "resolve_conversion_closure_boundary",
+      "call": "_extract_round_metadata_records(comments, flow='pr')",
+      "family": "rounds",
+      "provenance": "pr_loop_support.resolve_conversion_closure_boundary: pr_round_ingestion.protocol_comments masks invocation-only PR, plan and discuss anchors and sidecars after github authenticated acquisition; managed_ci_authorization independently binds continuity history. Pure PR reducers receive admitted observed snapshots; the resolver (#2163) admits the conversion record through conversion_visibility_boundary and reads the snapshot only to place this invocation's own conversion after a failed refresh.",
       "occurrence": 1
     },
     {
@@ -3329,6 +3345,12 @@
       "function": "comment_identity_key",
       "classification": "reader",
       "admission": "pr_loop_support acquires authenticated PR context before round/capture reducers; progress and completion notes are publication idempotency/presentation checks and do not supply approvals."
+    },
+    {
+      "module": "pr_loop_support",
+      "function": "resolve_conversion_closure_boundary",
+      "classification": "reader",
+      "admission": "pr_loop passes the admitted observed pr_comments snapshot from github.get_pr_review_context; conversion_visibility_boundary admits the conversion record before it bounds publications, and only this invocation's own conversion is placed after a failed refresh (#2163). It never supplies approvals."
     },
     {
       "module": "pr_loop_support",

@@ -5435,9 +5435,10 @@ def conversion_repeat_round(
     True when the latest admitted conversion record names this round as its
     repeat round (``conversion_review_round`` for an auto conversion, the
     record's round for an admitted operator conversion, #1664) at the live
-    head and no later admitted freeze, release, or coder record exists at
-    that head.
+    head and no later admitted freeze, release, coder or closure record exists
+    at that head (a closed-incomplete record ends the repeat, #2163).
     """
+    from .round_closure import is_round_closure_boundary
     if not head_sha:
         return False
     conversion = next(
@@ -5461,6 +5462,10 @@ def conversion_repeat_round(
         and (
             record.metadata.phase in {EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE}
             or record.metadata.role == "coder"
+            or (
+                is_round_closure_boundary(record.metadata)
+                and record.metadata.round_number == round_number
+            )
         )
         for record in records
     )
@@ -5582,6 +5587,82 @@ def conversion_visibility_boundary(
     return ConversionVisibilityBoundary(
         index=record.index, key=comment_identity_key(comments[record.index])
     )
+
+
+def resolve_conversion_closure_boundary(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object],
+    round_number: int,
+    head_sha: str | None,
+    own_conversion: PostedRoundMetadata | None = None,
+    own_conversion_refresh_failed: bool = False,
+) -> int | None:
+    """The one conversion boundary for every closure decision in a repeat (#2163).
+
+    Resolved from exactly ``comments``: an admitted conversion record returns
+    its index, and only later publications count.  No candidate (none, or a
+    foreign-authored comment whose protocol body admission strips) returns
+    ``None``: every same-round publication counts, so no peer is hidden and no
+    commenter can hold the run.  A candidate that is present but cannot be
+    admitted raises the retryable :class:`RoundStateReadError`.  This
+    invocation's own conversion is placed only when the refresh after posting
+    it failed, at the position the visibility snapshot gives it (after every
+    snapshot record); it cannot be placed without a matching own record.
+    """
+    from .round_closure_writer import UNRESOLVED_CONVERSION_BOUNDARY_DETAIL, round_state_read_error
+
+    def unresolved(detail: str) -> Exception:
+        return round_state_read_error(surface="pr", number=pr_number, round_number=round_number, detail=detail)
+
+    comments = tuple(comments)
+    boundary = conversion_visibility_boundary(
+        runner, config, pr_number=pr_number, comments=comments, round_number=round_number, head_sha=head_sha,
+    )
+    if boundary is not None:
+        return boundary.index
+    if conversion_boundary_candidate_present(comments, round_number=round_number, head_sha=head_sha):
+        raise unresolved(UNRESOLVED_CONVERSION_BOUNDARY_DETAIL)
+    if not own_conversion_refresh_failed:
+        return None
+    if own_conversion is None or own_conversion.round_number != round_number or own_conversion.subject != head_sha:
+        raise unresolved(
+            "this invocation's own evidence-conversion record is missing from the comment snapshot "
+            "and could not be placed in it; inspect the conversion record if reads were healthy"
+        )
+    try:
+        top = max((record.index for record in _extract_round_metadata_records(comments, flow="pr")), default=-1)
+    except PrRoundHistoryError:
+        raise
+    except AgentLoopError as exc:
+        raise unresolved(f"the comment snapshot could not be decoded ({exc})") from exc
+    return max(len(comments), top + 1)
+
+
+def pre_conversion_only_reviewers(
+    records: Sequence[PostedRoundRecord], *, round_number: int, head_sha: str | None,
+    boundary: int, names: Sequence[str], spool: object,
+) -> set[str]:
+    """Reviewers whose round-N publications all precede the conversion boundary (#2163).
+
+    A reviewer with a later record, or whose spool publication began (or may
+    have: legacy or malformed), stays a publication; so does one with no
+    GitHub record yet, whose publication is unrecorded or in flight.
+    """
+    from .round_visibility import same_round_public_publications
+
+    indexes: dict[str, list[int]] = {}
+    for record in same_round_public_publications(
+        records, flow="pr", round_number=round_number, subject=str(head_sha), reviewer_names=names,
+    ):
+        indexes.setdefault(record.metadata.agent, []).append(record.index)
+    return {
+        name for name, found in indexes.items()
+        if max(found) <= boundary
+        and spool.publication_state(name) not in {"began", "legacy", "malformed"}  # type: ignore[attr-defined]
+    }
 
 
 def round_evidence_authority_records(
