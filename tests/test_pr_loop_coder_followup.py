@@ -3053,3 +3053,94 @@ def test_pr_loop_drops_and_reports_an_unknown_coder_item_id_2114(tmp_path, capsy
     assert "Stale claim." not in body
     reviews = [r for r in _records_1292(runner) if r.role == "reviewer" and r.subject == pushed]
     assert reviews and reviews[-1].state == "approved"
+
+
+# --- #2153: degraded recovery then a later failure; untransportable record --
+
+
+def test_degraded_recovery_then_later_failure_posts_a_synthesized_record_2153(tmp_path, monkeypatch):
+    """Row degraded-then-later-failure: the degraded turn fails before its post."""
+    def failing_derive(*args, **kwargs):
+        raise AgentLoopError("derived evidence rejected")
+
+    monkeypatch.setattr(pr_loop, "_derive_authenticated_risk_evidence_for_coder", failing_derive)
+    runner = _rejected_push_runner_1292()  # an outside-checkout tests_run: degraded
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="derived evidence rejected"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    (record,) = _coder_records_2086(runner, pushed)
+    assert record.coder_record_source == "synthesized"
+    assert [item.item_id for item in record.prior_items] == ["item-1"]
+    notes = record.coder_record_degradations
+    assert any("tests_run" in note for note in notes)  # the degraded notes are preserved
+    assert "stopped (AgentLoopError)" in notes[-1]
+    assert record.raw_structured_coder_response is None  # no claim of the discarded response
+    (body,) = _comment_bodies_2086(runner, "## Orchestrator-synthesized coder record")
+    assert "### Addressed items" not in body
+    assert not any(r.role == "reviewer" and r.subject == pushed for r in _records_1292(runner))
+
+
+def _incompressible_2153(chars, seed=""):
+    return "".join(
+        hashlib.sha256(f"{seed}:{n}".encode()).hexdigest() for n in range(chars // 64 + 1)
+    )[:chars]
+
+
+def test_untransportable_coder_record_posts_a_notice_and_resume_is_unchanged_2153(tmp_path, monkeypatch):
+    """Rows untransportable-ordinary-path and resume-after-notice.
+
+    The ledger is a real oversized ledger; only the codec limit is lowered,
+    and only while the coder record is bounded.
+    """
+    import coding_review_agent_loop.round_transport as round_transport
+    from coding_review_agent_loop.coder_comment_budget import CoderRecordUntransportableError
+    from coding_review_agent_loop.pr_loop_decisions import recovery_skips_reviewers
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+
+    long_item = "Add a regression test. " + _incompressible_2153(6_000)
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[_VALID_FOLLOWUP], reviews=[_blocking_review_1292(long_item), _approving_review_1292()],
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    real_bound = pr_loop.bounded_coder_round_comment
+    size_causes = []
+
+    def lowered_bound(*args, **kwargs):
+        with monkeypatch.context() as patch:
+            patch.setattr(round_transport, "_MAX_COMPRESSED", 2_500)
+            try:
+                return real_bound(*args, **kwargs)
+            except CoderRecordUntransportableError as error:
+                size_causes.append(error.__cause__)
+                raise
+
+    monkeypatch.setattr(pr_loop, "bounded_coder_round_comment", lowered_bound)
+    with pytest.raises(CoderRecordUntransportableError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert isinstance(size_causes[0], round_transport.RoundMetadataTooLargeError)
+
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    (notice,) = _comment_bodies_2086(runner, "round-metadata transport bound")
+    assert scan_reserved_markers(notice) == () and "<!--" not in notice
+    assert "**Not claimed (every carried item stays open):** `item-1`" in notice
+    assert "### Addressed items" not in notice
+    assert _coder_records_2086(runner, pushed) == []  # never admitted as a record
+    assert not any(r.role == "reviewer" and r.subject == pushed for r in _records_1292(runner))
+
+    # Resume: the unchanged unrecorded-advance path from the latest admitted ledger.
+    comments = [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]]
+    resumed = _resume_pr_round(comments, head_sha=pushed, configured_reviewers=("claude",))
+    assert resumed is not None and resumed.unrecorded_head_advance is True
+    assert [(item.item_id, item.status) for item in resumed.prior_items] == [("item-1", "blocking")]
+    assert recovery_skips_reviewers(resumed, None, None)
+
+    # A rerun (limits restored) routes the coder first, then reviews.
+    monkeypatch.setattr(pr_loop, "bounded_coder_round_comment", real_bound)
+    runner.codex_outputs.append(_VALID_FOLLOWUP)
+    commands_before = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    rerun_agents = [cmd[0] for cmd, _cwd in runner.commands[commands_before:] if cmd[:1] in (["claude"], ["codex"])]
+    assert rerun_agents[:2] == ["codex", "claude"]

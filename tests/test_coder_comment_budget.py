@@ -677,3 +677,83 @@ def test_freeform_trailing_lines_of_any_shape_are_budgeted_content(tail):
     assert "Short narration." in anchor and FREEFORM_OMISSION_NOTE in anchor
     assert anchor.rstrip().endswith("<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude: claude-opus-5-5 (medium)")
     assert _hydrated(parts).metadata.raw_structured_coder_response == original
+
+
+# --- Codec size limits and the untransportable minimal tier (#2153) ---------
+
+import hashlib  # noqa: E402
+
+import coding_review_agent_loop.round_transport as round_transport  # noqa: E402
+from coding_review_agent_loop.coder_comment_budget import CoderRecordUntransportableError  # noqa: E402
+from coding_review_agent_loop.errors import AgentLoopError  # noqa: E402
+from coding_review_agent_loop.round_transport import RoundMetadataTooLargeError  # noqa: E402
+
+LOWERED_COMPRESSED_LIMIT = 4_000
+
+
+def _incompressible(chars, seed=""):
+    return "".join(
+        hashlib.sha256(f"{seed}:{n}".encode()).hexdigest() for n in range(chars // 64 + 1)
+    )[:chars]
+
+
+def _oversized_ledger():
+    return [_code_item(n, text=_incompressible(2_000, seed=n)) for n in range(1, 11)]
+
+
+@pytest.fixture
+def lowered_codec_limits(monkeypatch):
+    monkeypatch.setattr(round_transport, "_MAX_COMPRESSED", LOWERED_COMPRESSED_LIMIT)
+
+
+def test_oversized_discardable_field_still_falls_back_with_the_ledger(tmp_path, lowered_codec_limits):
+    """Row discardable-oversize-falls-back: a codec size limit is "does not fit"."""
+    config = make_config(tmp_path)
+    items = [_code_item(1)]
+    followup = _followup(["item-1"])
+    metadata = _metadata(items, raw=_raw(followup) + _incompressible(20_000))
+    with pytest.raises(RoundMetadataTooLargeError):
+        _attach_round_metadata("Body.", metadata)  # the full record cannot even be attached
+    _full, result, parts = _post(followup, items, config, metadata=metadata, fallback_old_head=PRIOR)
+    assert result.level == FALLBACK_LEVEL
+    assert result.metadata.raw_structured_coder_response is None
+    assert [item.item_id for item in result.metadata.prior_items] == ["item-1"]
+    assert _hydrated(parts).metadata.prior_items == tuple(items)
+
+
+def test_oversized_freeform_response_falls_back_to_the_synthesized_record(lowered_codec_limits):
+    """Row freeform-oversize-falls-back: _bounded_freeform's probes use _fits."""
+    original = _incompressible(80_000)  # larger than the body and the codec limit
+    items = [_code_item(1)]
+    metadata = _metadata(items)
+    result = bounded_coder_round_comment(
+        _signed(original), metadata, pr_number=PR, head_sha=HEAD, freeform_text=original,
+        fallback_old_head=PRIOR,
+    )
+    assert result.level == FALLBACK_LEVEL
+    assert result.metadata.raw_structured_coder_response is None
+    assert result.metadata.prior_items == tuple(items)
+    parts = [str(part) for part in prepare_round_comment(result.posted_body)]
+    assert all(len(part) <= MAX_GITHUB_BODY_CHARS for part in parts)
+    assert _hydrated(parts).metadata.coder_record_source == "synthesized"
+
+
+def test_untransportable_minimal_tier_raises_the_typed_error(tmp_path, lowered_codec_limits):
+    """Row typed-budget-error: only the minimal tier with the ledger kept raises."""
+    config = make_config(tmp_path)
+    items = _oversized_ledger()
+    followup = _followup(["item-1"])
+    with pytest.raises(CoderRecordUntransportableError) as raised:
+        _post(followup, items, config, metadata=_metadata(items, raw=_raw(followup)), fallback_old_head=PRIOR)
+    assert isinstance(raised.value.__cause__, RoundMetadataTooLargeError)
+    assert raised.value.head_sha == HEAD and raised.value.old_head == PRIOR
+    assert raised.value.item_ids == tuple(item.item_id for item in items)
+
+
+def test_serialization_errors_are_never_untransportable(tmp_path):
+    """Row typed-budget-error: a non-size failure propagates with its own type."""
+    metadata = _metadata([_code_item(1)], review_scope={"x": object()})
+    # encode_mapping lets json.dumps raise TypeError, as before #2153.
+    with pytest.raises(TypeError) as raised:
+        bounded_coder_round_comment("Body.", metadata, pr_number=PR, head_sha=HEAD, freeform_text=None)
+    assert not isinstance(raised.value, AgentLoopError)

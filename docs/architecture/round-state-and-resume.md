@@ -457,14 +457,14 @@ trees; legitimate architecture transitions invalidate approvals, and persisting
 the fresh observation makes repeated unchanged gates stable.
 
 A rejected coder follow-up that moved the head gets a coder record (#2086):
-the final candidate, minus unknown IDs, citations without a passing receipt in
-its own acquisition catalog, outside-checkout tests and a malformed
-`architecture_impact` (invalid dispositions become `blocked`), revalidated under
-that catalog; else a git-synthesized record. Review then runs on the new head.
-`human_requirements_degraded` keeps the acknowledgement item open.
-A failure raised after an accepted turn pushed, before its coder record
-posted, gets a best-effort synthesized record (`record_failed_push`); a
-fail-closed head or checkout error posts nothing.
+the final candidate minus droppable fields, revalidated under its own
+acquisition catalog (invalid dispositions become `blocked`), else a
+git-synthesized record. Review then runs on the new head.
+`human_requirements_degraded` keeps the acknowledgement item open. A failure
+raised after the turn pushed, before its record posted (even after a degraded
+recovery, #2153), gets a best-effort synthesized record (`record_failed_push`)
+unless one was posted or attempted; a fail-closed head or checkout error posts
+nothing.
 
 No coder-recovery record is written any more (#2087): there is no
 `coder-dispatch` pre-record, `coder-followup-rejected` record or
@@ -493,18 +493,17 @@ restored. `--review-unrecorded-head` was removed (#2162).
 
 The PR-loop coder follow-up comment is size-bounded at its posting seam
 (`coder_comment_budget.py`, #2059). A comment that fits the transport is posted
-unchanged. Otherwise the renderer steps through bound levels 1-4. They keep a
-fixed core: the head, the capped summary, every item ID under its disposition,
-and the signature. Excerpts, the grouping of repeated native evidence requests,
-count lines, compact and minimal coverage maps, and compact degradation
-indicators shrink everything else, including the sections that
-`_attach_round_metadata` inserts (its `degradation_projection`). Each trial is
-measured with the exact preparation that posts it. Round metadata keeps the
-complete response, and for free-form output the original text, so resume never
-reads the bounded projection as the coder output. If no level fits, a
-claim-free synthesized record posts: `prior_items` spills as usual, listing and
-diffstat are capped, nonessential metadata is omitted, and the caller adopts it.
-The overflow error never escapes the coder seam (#2086).
+unchanged; otherwise bound levels 1-4 keep the head, capped summary, item IDs
+and signature, and shrink the rest. Trials use the exact posting
+preparation. Round metadata keeps the complete response (for free-form output,
+the original text). If no level fits, a claim-free synthesized record keeping
+`prior_items` posts. The overflow error never escapes the coder seam (#2086).
+Codec size limits raise `RoundMetadataTooLargeError` (the writer enforces the
+reader's decompressed limit too), which every probe treats as not fitting. If
+even the minimal tier (ledger kept) cannot be transported,
+`CoderRecordUntransportableError` posts a metadata-free, claim-free notice and
+stops. Resume never admits it (the unchanged unrecorded-advance path); an
+operator must shrink the ledger (#2153).
 Reviewer and other round comments are not bounded.
 
 A PR round closed by its reconciliation summary is final. It receives no new

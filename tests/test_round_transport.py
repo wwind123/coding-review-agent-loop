@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -3299,3 +3300,83 @@ def test_2009_compact_anchor_renders_normalized_staging_feasibility_alias() -> N
     assert "complete validated execution recommendation" in anchor
     assert "`staging_feasibility`: `safe`" in anchor
     assert "separable" not in anchor
+
+
+# --- Typed round-metadata size limits (#2153) -------------------------------
+
+
+def _incompressible(chars: int, seed: object = "") -> str:
+    digest_count = chars // 64 + 1
+    return "".join(
+        hashlib.sha256(f"{seed}:{n}".encode()).hexdigest() for n in range(digest_count)
+    )[:chars]
+
+
+def test_encode_over_the_compressed_limit_raises_the_typed_size_error(monkeypatch):
+    """Row codec-encode-limit: the compressed limit at encode and attachment."""
+    monkeypatch.setattr(transport, "_MAX_COMPRESSED", 1_000)
+    with pytest.raises(transport.RoundMetadataTooLargeError):
+        transport.encode_mapping({"prior_items": _incompressible(10_000)})
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="b" * 40,
+        raw_structured_coder_response=_incompressible(10_000),
+    )
+    with pytest.raises(transport.RoundMetadataTooLargeError):
+        _attach_round_metadata("Body.", metadata)
+
+
+def test_encode_refuses_a_payload_the_reader_would_reject(monkeypatch):
+    """Row decode-limit-symmetric: the writer enforces the decompressed limit."""
+    monkeypatch.setattr(transport, "_MAX_DECOMPRESSED", 1_000)
+    oversized = {"field": "x" * 5_000}  # compresses far below _MAX_COMPRESSED
+    with pytest.raises(transport.RoundMetadataTooLargeError):
+        transport.encode_mapping(oversized)
+    for size in (10, 500, 950):
+        payload = {"field": "x" * size}
+        try:
+            encoded = transport.encode_mapping(payload)
+        except transport.RoundMetadataTooLargeError:
+            continue
+        assert transport.decode_mapping(encoded) == payload
+    # Reading an untrusted oversized payload keeps its generic error.
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_LOOP_META payload") as raised:
+        transport.decode_mapping("v1_" + transport._b64(zlib.compress(b'{"a":"' + b"x" * 5_000 + b'"}')))
+    assert not isinstance(raised.value, transport.RoundMetadataTooLargeError)
+
+
+def test_serialization_failures_keep_their_existing_types():
+    """Row codec-encode-limit: a non-serializable value is never a size failure."""
+    with pytest.raises(TypeError):
+        transport.encode_mapping({"field": object()})
+
+
+def test_spill_over_the_field_limit_raises_the_typed_size_error(monkeypatch):
+    """Row codec-encode-limit: build_spill's per-field compressed limit."""
+    items = tuple(
+        UnresolvedReviewItem(
+            item_id=f"item-{n}", reviewer="Codex", source_round=1,
+            text=_incompressible(2_000, seed=n), status="blocking",
+        )
+        for n in range(1, 51)
+    )
+    body = _attach_round_metadata(
+        "Body.",
+        PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="b" * 40,
+                            prior_items=items),
+    )
+    real_zlib = transport.zlib
+
+    class _SpillLimitedZlib:
+        """Real zlib; the limit drops only once the ledger field is spilled."""
+
+        def __getattr__(self, name):
+            return getattr(real_zlib, name)
+
+        def compress(self, data, level=-1):
+            if data.startswith(b"["):
+                monkeypatch.setattr(transport, "_MAX_COMPRESSED", 100)
+            return real_zlib.compress(data, level)
+
+    monkeypatch.setattr(transport, "zlib", _SpillLimitedZlib())
+    with pytest.raises(transport.RoundMetadataTooLargeError, match="too large to spill safely"):
+        transport.prepare_round_comment(body)

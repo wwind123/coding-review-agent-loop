@@ -9545,13 +9545,14 @@ def run_pr_loop(
                     turn_started_at=coder_turn_started_at,
                     orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                 )
-            bounded_coder_comment = bounded_coder_round_comment(
+            # An untransportable record gets a metadata-free notice and stops (#2153).
+            bounded_coder_comment = coder_recovery.bound(lambda: bounded_coder_round_comment(
                 public_comment, latest_coder_metadata, pr_number=pr_number,
                 head_sha=updated_pr_context.metadata.head_sha, audit_note=coder_dispatch_audit_note,
                 render_kwargs=coder_render_kwargs, freeform_text=coder_output, **coder_recovery.budget_kwargs(),
                 evidence_heads=lambda: admitted_evidence_heads(runner, config, pr_number, pr_comments,
                                                                pre_turn_head, updated_pr_context.metadata.head_sha),
-            )
+            ))
             coder_recovery.post(lambda: post_pr_comment(runner, config=config, pr_number=pr_number, body=bounded_coder_comment.posted_body))
             latest_coder_metadata, latest_coder_output, unresolved_items, coder_response_discarded = coder_recovery.adopt(bounded_coder_comment, latest_coder_metadata, latest_coder_output, unresolved_items)
             if coder_response_discarded:  # a claim-free synthesized record: none of its claims count (#2086)
