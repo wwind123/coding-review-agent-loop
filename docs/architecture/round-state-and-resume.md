@@ -229,9 +229,9 @@ configured reviewer needs a fresh round-N turn. A publication is a public
 same-round publication by the shared visibility rule (any scheduler phase, minus
 the primary review gating this launch), an own publication-phase review resume
 rejected, a published pre-panel-unqualified review (PR), or a begun, legacy or
-malformed spool record; such a record is never resumed, so its reviewer also
-needs a fresh turn (unless resume admitted its public anchor: then it is stale
-and discarded). A rejected own review always
+malformed spool record of any seat binding (#2150); such a record is never
+resumed, so its reviewer needs a fresh turn (unless resume admitted its public
+anchor: then it is discarded). A rejected own review always
 needs a fresh turn; others need one without a settled failure or valid spooled
 response. Reconciled rounds, failed-seat retries, recovery, conflict and
 evidence passes, the approved-plan shortcut and plan ownership failures are
@@ -248,9 +248,8 @@ Carried secondary-owned findings are carried obligations; at `--max-rounds`
 the limit stop after the record names N+1. Former
 refusal sites raise `RoundIncompleteSignal` before any launch; the handler uses
 the same writer (a reconciled round re-enters its rollover). Read failures stop
-retryably (`RoundStateReadError`). Nothing deletes a comment or asks for one to
-be deleted. A reconciled round with a blocking pre-panel review keeps its
-pre-panel stop.
+retryably (`RoundStateReadError`). Nothing deletes or asks to delete comments. A
+reconciled round with a blocking pre-panel review keeps its pre-panel stop.
 
 A conversion repeat (#2163) closes on post-conversion publications,
 with the converted ledger. `resolve_conversion_closure_boundary` serves

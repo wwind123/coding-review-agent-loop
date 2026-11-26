@@ -235,6 +235,7 @@ def test_own_rejected_publication_closes_the_round_and_discards_the_replayable_p
     _no_deletion_advice(runner)
 
 
+
 # --- migration-stopped-partial ----------------------------------------------------
 
 
@@ -767,39 +768,67 @@ def test_partly_public_publication_rolls_the_round_over_without_posting_its_suff
     _no_deletion_advice(runner)
 
 
-@pytest.mark.parametrize("state", ["fresh", "began"])
-def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path, state):
-    """A spooled response saved under another seat binding (#2081 review item-1).
-
-    ``publication_state`` returns a plain string since #2081.  A never-published
-    (fresh) response is discarded and the reviewer reviews under the new binding;
-    a begun publication still refuses recovery.  Neither path may crash on the
-    return type.
-    """
+def _seat_reconfigured_spool(tmp_path, state, *, codex_outputs, gemini_outputs):
+    """Seed Codex's round-1 record under an old seat binding in ``state``."""
     from agent_loop_helpers import FakeRunner
 
     old = {"version": 1, "seats": [{"seat": "codex", "model": "old-model"}]}
     new = {"version": 1, "seats": [{"seat": "codex", "model": "new-model"}]}
-    runner = FakeRunner(
-        codex_outputs=[structured_pr_review(summary="Codex reviews under the new seat.")],
-        gemini_outputs=[structured_pr_review(summary="Gemini approves.", reviewer="Google Gemini")],
-    )
+    runner = FakeRunner(codex_outputs=codex_outputs, gemini_outputs=gemini_outputs)
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
                          pr_seat_binding_override=new)
     spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
     spool.store("Codex", {"text": structured_pr_review(summary="Stale under the old seat."),
                           "seat_binding": old})
-    if state == "began":
-        spool.mark_publication_began("Codex")
+    if state != "fresh":
+        path = spool._path("Codex")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if state == "began":
+            payload["publication"] = {"began_at": "2026-11-26T00:00:00+00:00"}
+        elif state == "legacy":
+            del payload["carrier_protocol"]
+        else:  # malformed: a non-mapping publication mark on a loadable record
+            payload["publication"] = None
+        path.write_text(json.dumps(payload), encoding="utf-8")
     assert spool.publication_state("Codex") == state
+    if state != "fresh":
+        # The record still loads, so it reaches the seat-reconfiguration check.
+        assert spool.load("Codex") is not None
+    return runner, config, spool
 
+
+@pytest.mark.parametrize("state", ["fresh", "began", "legacy", "malformed"])
+def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path, state):
+    """A spooled response saved under another seat binding (#2081 item-1, #2150).
+
+    A never-published (fresh) response is discarded and the reviewer reviews
+    under the new binding, with no closure.  A began, legacy or malformed
+    record is no longer a terminal stop: round 1 closes with one
+    closed-incomplete record naming Codex as unreplayable, the stale text is
+    never posted, and review continues in round 2 under the new binding.
+    """
+    runner, config, spool = _seat_reconfigured_spool(
+        tmp_path, state,
+        codex_outputs=[structured_pr_review(summary="Codex reviews under the new seat.")],
+        gemini_outputs=[structured_pr_review(summary="Gemini approves.", reviewer="Google Gemini")],
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not any("Stale under the old seat." in body for body in runner.comments)
+    assert not any("refusing recovery" in body for body in runner.comments)
+    assert "codex" in [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
+    _no_deletion_advice(runner)
+    reviewer_rounds = sorted({r.round_number for r in _comment_records(runner, surface="pr", flow="pr")
+                              if r.role == "reviewer" and r.agent == "Codex"})
     if state == "fresh":
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
         assert spool.publication_state("Codex") == "absent"
-        assert "codex" in [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
-        assert not any("Stale under the old seat." in body for body in runner.comments)
-    else:
-        with pytest.raises(AgentLoopError, match="under another seat binding; refusing recovery"):
-            run_pr_loop(runner, pr_number=77, config=config)
-        assert spool.publication_state("Codex") == "began"
-        assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["gemini"])]
+        assert _closures(runner) == []
+        assert reviewer_rounds == [1]
+        return
+    (closure,) = _closures(runner)
+    assert closure.round_number == 1
+    unreplayable = {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
+    from coding_review_agent_loop.round_closure_writer import _POSSIBLY_PUBLIC_STATES
+
+    assert unreplayable["Codex"] == _POSSIBLY_PUBLIC_STATES[state]
+    assert reviewer_rounds == [2]

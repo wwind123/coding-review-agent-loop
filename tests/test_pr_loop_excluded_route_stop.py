@@ -290,3 +290,62 @@ def test_an_evidence_pass_stop_is_resumed_by_rerunning_the_same_command(tmp_path
     runner.simulate_new_process()
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     _assert_sequential_evidence_pass(runner, before=before)
+
+
+# --- seat reconfiguration on routes that skip reviewers (#2150) -------------
+
+
+_OLD_SEATS = {"version": 1, "seats": [{"seat": "codex", "model": "old-model"}]}
+_NEW_SEATS = {"version": 1, "seats": [{"seat": "codex", "model": "new-model"}]}
+
+
+def _began_under_old_seats(config, round_number, subject):
+    """A begun record saved under another seat binding than the run's."""
+    spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=round_number, subject=subject)
+    spool.store("Codex", {"text": structured_pr_review(summary=WITHHELD, reviewer="OpenAI Codex"),
+                          "seat_binding": _OLD_SEATS})
+    spool.mark_publication_began("Codex")
+    assert spool.publication_state("Codex") == "began"
+    assert spool.load("Codex")["seat_binding"] == _OLD_SEATS
+    return spool
+
+
+def _assert_no_seat_refusal(runner):
+    assert not any("refusing recovery" in comment or "another seat binding" in comment
+                   for comment in runner.comments)
+    assert not any("Delete these" in comment or "partial-round recovery" in comment
+                   for comment in runner.comments)
+
+
+def test_the_conflict_route_keeps_a_begun_record_saved_under_another_seat_binding(tmp_path):
+    """`seat-excluded-route`, conflict: the seat check neither refuses nor removes the record.
+
+    The conflict route launches no round-1 reviewer, posts no stale text and no
+    closure, and the next ordinary round reviews on its own spool, so the
+    orphaned round-1 record does not stop the run.
+    """
+    runner = _conflict_runner()
+    config = make_config(tmp_path, pr_seat_binding_override=_NEW_SEATS)
+    spool = _began_under_old_seats(config, 1, HEAD)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agents(runner) == ["claude", "codex"]  # the coder, then the next ordinary round's reviewer
+    assert _closures(runner) == []
+    assert not any(r.metadata.round_number == 1 and r.metadata.role == "reviewer" for r in _records(runner))
+    assert [(r.metadata.round_number, r.metadata.role) for r in _records(runner)] == [(2, "coder"), (2, "reviewer")]
+    assert spool.publication_state("Codex") == "began"  # untouched by the seat check
+    assert not any(WITHHELD in comment for comment in runner.comments)
+    _assert_no_seat_refusal(runner)
+
+
+def test_the_recovery_route_keeps_a_begun_record_saved_under_another_seat_binding(tmp_path):
+    """`seat-excluded-route`, recovery: the route runs its coder without a seat refusal.
+
+    The record is left for the next ordinary round, whose start closes the
+    round with one closed-incomplete record; the stale text is never posted.
+    """
+    runner = _recovery_runner()
+    config = make_config(tmp_path, reviewer="codex", pr_seat_binding_override=_NEW_SEATS)
+    spool = _began_under_old_seats(config, 2, NEW)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    _assert_recovery_then_ordinary_closure(runner, spool)
+    _assert_no_seat_refusal(runner)
