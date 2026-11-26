@@ -29,7 +29,7 @@ from .errors import AgentLoopError, CheckoutVerificationError
 from .logging import log
 
 # Roles whose agent runs in a tool-owned temporary directory, not the checkout.
-TOOL_ISOLATED_ROLES = frozenset({"semantic-dedupe", "repair"})
+TOOL_ISOLATED_ROLES = frozenset({"semantic-dedupe"})
 
 # Hash budgets: a file beyond either is recorded by stat identity instead.
 MAX_HASH_FILE_BYTES = 16 * 1024 * 1024

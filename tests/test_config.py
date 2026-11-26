@@ -189,11 +189,9 @@ def test_sweep_flags_reach_the_config_from_the_cli(tmp_path):
     parser = build_parser()
     defaults = config_from_args(parser.parse_args(base_argv), _FakeRunner())
     assert defaults.plan_sweep_reasoning_effort == ""
-    # `--plan-sweep-rounds` still parses but is deprecated and ignored (#2098).
+    # `--plan-sweep-rounds` was removed (#2098, #2162); the effort flag stays live.
     config = config_from_args(
-        parser.parse_args(
-            [*base_argv, "--plan-sweep-rounds", "1", "--plan-sweep-reasoning-effort", "high"]
-        ),
+        parser.parse_args([*base_argv, "--plan-sweep-reasoning-effort", "high"]),
         _FakeRunner(),
     )
     assert config.plan_sweep_reasoning_effort == "high"

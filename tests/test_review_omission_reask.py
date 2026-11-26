@@ -65,7 +65,6 @@ def _run(runner, config, *, reask=True):
         repair_expected_kind="pr_review",
         role="reviewer",
         operation_description="PR review",
-        reask_on_prior_disposition_omission=reask,
     )
 
 
@@ -107,7 +106,6 @@ def test_omission_is_reasked_once_on_same_model_and_accepted(tmp_path, backend):
             repair_expected_kind="pr_review",
             role="reviewer",
             operation_description="PR review",
-            reask_on_prior_disposition_omission=True,
         )
 
     assert "COMPLETE Approves" in response.text

@@ -341,7 +341,8 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first \
 Instead of `--semantic-followup-backend claude` you may pass
 `--no-semantic-followup-dedupe`. The semantic-followup helper must be
 overridden because its default backend (`antigravity`) has no role grant in this
-mode. No repair backend runs any more, so `--repair-backend` needs no override.
+mode. No repair backend runs any more; the old `--repair-backend` flag was removed
+(#2162) and passing it is a startup error.
 
 What each role gets:
 
@@ -601,8 +602,9 @@ and noted) or, when nothing parses, a git-synthesized one, and reviews the new
 head. Coder-recovery records, the recovery attempt limit and the resume refusal
 are gone; a PR left mid-recovery by an earlier release resumes as an ordinary
 review of the current head with its recorded items, with no coder turn.
-`--review-unrecorded-head` is deprecated: it is still accepted for one release,
-logs a notice and has no effect. An oversized coder follow-up comment is posted
+`--review-unrecorded-head` was removed (#2162); passing it is a startup error
+that names the replacement (an unrecorded head already resumes as a review of
+the current head). An oversized coder follow-up comment is posted
 in bounded form rather than ending the run. See
 [rejected coder follow-ups](docs/local_agent_loop.md#rejected-coder-follow-ups-and-legacy-recovery-records-1292-2087).
 
@@ -977,8 +979,8 @@ addressed/remaining split. Single-obligation findings are unchanged. Reviewers
 disposition individual sub-items, coder claims are advisory, and an item is
 resolved when all of its sub-items are. The loop warns when no sub-item of a
 finding closes for `--no-progress-rounds` rounds (default 3); it is advisory and
-never changes `--max-rounds`. The retired `--sub-item-stall-rounds` is accepted
-and ignored for one release. See
+never changes `--max-rounds`. The retired `--sub-item-stall-rounds` was removed
+(#2162); passing it is a startup error naming `--no-progress-rounds`. See
 [docs/local_agent_loop.md](docs/local_agent_loop.md#sub-items-for-conjunctive-review-findings).
 
 ### Advisory architecture context
@@ -1554,8 +1556,8 @@ Purely mechanical fixes (envelope trimming, lone-string matrix list fields,
 lossless aliases) run in code without a model call. If both re-asks fail, the
 turn fails as before. The former `--repair-backend`, `--repair-model`,
 `--repair-reasoning-effort`, `--repair-timeout-seconds` and
-`--containment-repair-*` flags are deprecated no-ops for one release: they
-still parse, print a deprecation notice and no longer require the `agy` CLI.
+`--containment-repair-*` flags were removed (#2162): passing one is a startup
+error that says no repair pass exists.
 See [the CLI guide](docs/local_agent_loop.md#agent-backends).
 
 Backend-specific authentication, model selection, fallback, timeout, and
@@ -1762,8 +1764,8 @@ Repeats of unresolved items
 (re-emitted text included), future follow-ups and, on reviews after the primary's first,
 findings it tagged `revision_introduced` do not count; it never stops a run. The retired
 plan thresholds `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`,
-`--plan-primary-stall-rounds` and `--plan-sweep-rounds` are accepted and ignored for one
-release with a deprecation notice.
+`--plan-primary-stall-rounds` and `--plan-sweep-rounds` were removed (#2162); passing one
+is a startup error naming `--no-progress-rounds`.
 `--plan-sweep-reasoning-effort LEVEL` (off by default) runs only that sweep turn at a
 higher Codex or Claude effort. Plan reviewers tag new mandatory findings with an
 optional `provenance` (`revision_introduced` or `pre_existing`) against a previous-plan
@@ -1788,7 +1790,7 @@ The message names the unchanged items, the head and K, and keeps the child-plan 
 route, the coder's unsuperseded receipts, the citation diagnosis, the approach-alternative
 excerpt and the PR size when they apply. The retired `--pr-step-back-rounds`,
 `--pr-step-back-line-window`, `--pr-non-convergence-rounds` and `--sub-item-stall-rounds`
-are accepted and ignored for one release with a deprecation notice. See
+were removed (#2162); passing one is a startup error naming `--no-progress-rounds`. See
 [PR no-progress stop](docs/local_agent_loop.md#pr-no-progress-stop). `--pr-human-evidence freeze|advisory|off` (default `advisory`) decides how reviewers' exact-head evidence requests are handled: `advisory` collects them into a non-blocking "Human checks requested" list posted at approval (with `--auto-merge` and a non-empty list the PR is left approved and unmerged and the run exits 0), `off` drops them, and `freeze` keeps the blocking evidence freeze; the evidence stall and row conversion below run only under `freeze` ([details](docs/local_agent_loop.md#exact-head-human-evidence-mode---pr-human-evidence)). `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. `--pr-evidence-capture-attempts N` (default 2, `0` disables) first converts a row whose evidence was only capture-limited (incomplete capture, unverified launch, unknown selectors; never an authoritative failure) for N consecutive coder attempts into an exact-head human evidence obligation answered at the final evidence freeze, and `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]` converts named unsatisfied rows on demand before any agent runs. When every unchanged item is evidence the evidence stall may own, the no-progress stop defers so the evidence stall decides first. Evidence no agent session or runner can produce belongs only in `exact_head_evidence_requests`. A child-planning cycle inherits `--plan-review-policy`,
 `--primary-plan-reviewer`, `--plan-sweep-reasoning-effort`, and `--plan-provenance-baseline-max-chars` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in

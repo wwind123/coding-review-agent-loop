@@ -612,9 +612,9 @@ def test_docs_describe_rejected_coder_recovery_continuity_exception():
     assert "the PR stays draft and unmerged and no approval is synthesized" in doc_text
 
 
-def test_docs_describe_coder_recovery_removal_legacy_migration_and_deprecated_flag():
+def test_docs_describe_coder_recovery_removal_legacy_migration_and_removed_flag():
     # #2087: no coder-recovery records, attempts or refusals; legacy records
-    # migrate to a current-head review; the flag is a deprecated no-op.
+    # migrate to a current-head review; the flag was removed in #2162.
     arch = " ".join(
         (REPO_ROOT / "docs" / "architecture" / "round-state-and-resume.md").read_text(encoding="utf-8").split()
     )
@@ -623,7 +623,8 @@ def test_docs_describe_coder_recovery_removal_legacy_migration_and_deprecated_fl
     for text in (arch, guide):
         assert "LEGACY_RECOVERY_RECORD_PHASES" in arch
         assert "no new record" in text
-        assert "`--review-unrecorded-head` is" in text and "deprecated" in text
+        assert "`--review-unrecorded-head`" in text and "removed" in text and "#2162" in text
+        assert "deprecated no-op for one release" not in text
     assert "No coder-recovery record is written any more (#2087)" in arch
     assert "`_legacy_recovery_migration`" in arch
     assert "**No coder-recovery records (#2087).**" in guide
@@ -638,7 +639,8 @@ def test_docs_describe_coder_recovery_removal_legacy_migration_and_deprecated_fl
     anchor = _github_anchor("Rejected coder follow-ups and legacy recovery records (#1292, #2087)")
     assert f"(docs/local_agent_loop.md#{anchor})" in readme
     parser_help = build_parser()._subparsers._group_actions[0].choices["pr"].format_help()
-    assert "Deprecated no-op" in " ".join(parser_help.split())
+    assert "--review-unrecorded-head" not in parser_help
+    assert "Deprecated no-op" not in " ".join(parser_help.split())
 
 
 def test_architecture_documents_the_planning_scheduler():
@@ -681,7 +683,8 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "#### Primary-phase stall stop" not in text
     assert "**Upgrade note:**" in text
     assert "contract identity" in text
-    assert "accepted and\nignored for one release" in text
+    assert "accepted and\nignored for one release" not in text
+    assert "`--plan-sweep-rounds` were removed in\n#2162" in text
     architecture = _architecture_set_text()
     assert "primary-phase stall stop and the step-back escalation stop were removed" in architecture
     assert "--plan-primary-stall-rounds" in architecture
@@ -1022,7 +1025,7 @@ def test_operator_docs_document_the_plan_step_back_mechanism():
     readme = (root / "README.md").read_text()
     architecture = _architecture_set_text()
 
-    # #2098: step-back is a prompt only; both thresholds are deprecated.
+    # #2098: step-back is a prompt only; both thresholds were removed (#2162).
     for flag in ("--plan-step-back-rounds", "--plan-step-back-escalation-rounds"):
         assert flag in text and flag in readme and flag in architecture
     assert "#### Plan step-back turn\n" in text
@@ -1092,7 +1095,7 @@ def test_operator_docs_document_the_pr_step_back_mechanism():
     readme = (root / "README.md").read_text()
     architecture = _architecture_set_text()
 
-    # #2097: the step-back flags are retired (accepted and ignored).
+    # #2097: the step-back flags are retired (removed in #2162).
     for flag in ("--pr-step-back-rounds", "--pr-step-back-line-window"):
         assert flag in text and flag in readme and flag in architecture
     assert "#### PR step-back turn and reviewer sweep" in text
@@ -1770,3 +1773,30 @@ def test_claude_model_help_describes_execution_and_signature(command):
     help_text = " ".join(subparsers[command].format_help().split())
     assert "Claude model to run and stamp in the signature." in help_text
     assert "Mutually exclusive with --claude-arg --model." in help_text
+
+
+def test_docs_no_longer_describe_the_2162_flags_as_accepted():
+    """#2162: README, the CLI guide and the architecture set name the removal."""
+    import re
+
+    from coding_review_agent_loop.cli import RETIRED_FLAGS
+
+    documents = {
+        "README.md": README.read_text(encoding="utf-8"),
+        "docs/local_agent_loop.md": LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8"),
+        "architecture": _architecture_set_text(),
+    }
+    stale = re.compile(
+        r"(accepted and ignored for one release|deprecated no-ops? for one release"
+        r"|deprecated no-ops? kept for one release|still accepted for one release"
+        r"|is a deprecated no-op|are deprecated no-ops)"
+    )
+    for name, text in documents.items():
+        flat = " ".join(text.split())
+        assert not stale.search(flat), (name, stale.search(flat).group(0))
+        assert "#2162" in flat, name
+    readme = " ".join(documents["README.md"].split())
+    guide = " ".join(documents["docs/local_agent_loop.md"].split())
+    for flag in ("--repair-backend", "--review-unrecorded-head", "--sub-item-stall-rounds"):
+        assert flag in readme and flag in guide
+    assert set(RETIRED_FLAGS)  # the table the docs describe

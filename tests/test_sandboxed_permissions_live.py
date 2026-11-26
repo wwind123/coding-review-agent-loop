@@ -492,8 +492,6 @@ def _config(root: Path, checkout: Path, **overrides):
         antigravity_dir=root / "antigravity",
         coder="claude",
         reviewer=("codex", "claude"),
-        repair_backend="claude",
-        repair_models=("repair-model",),
         semantic_followup_backend="claude",
         claude_model=os.environ.get("AGENT_LOOP_LIVE_CLAUDE_MODEL", ""),
         codex_model=os.environ.get("AGENT_LOOP_LIVE_CODEX_MODEL", ""),

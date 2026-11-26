@@ -257,7 +257,7 @@ could therefore hold a run in the primary phase indefinitely. Since #2098 the
 **plan no-progress detector** bounds that under every review policy (see
 [findings and convergence](findings-and-convergence.md)):
 the primary-phase stall stop and the step-back escalation stop were removed, and
-`--plan-primary-stall-rounds` is accepted and ignored for one release. Two
+`--plan-primary-stall-rounds` was removed (#2162) and is a startup error. Two
 optional planning-only checkpoint fields remain: `scheduler_issue_digest` (issue
 title/body digest, read by the step-back and sweep retirement rules) and
 `scheduler_stall_reset`. The one-shot `--plan-reset-stall-streak` stamps
@@ -284,7 +284,7 @@ not a reviewer item. Planner and reviewer round records carry
 
 **Plan step-back prompt** (internal threshold
 `review_step_back.PLAN_STEP_BACK_ROUNDS` = 2; `--plan-step-back-rounds` and
-`--plan-step-back-escalation-rounds` are accepted and ignored for one release).
+`--plan-step-back-escalation-rounds` were removed in #2162).
 Step-back targets the "new edge case every round" pattern and is a prompt
 technique only: it never stops the run (#2098). Under `primary-then-panel`,
 `review_step_back.classify_review` reads the primary's *historical* review record
@@ -318,7 +318,7 @@ an orchestrator guard revision displaced the step-back turn; the effect is
 prompt-only and identical on fresh and resumed runs.
 
 **Plan sweep trigger** (internal threshold `review_step_back.PLAN_SWEEP_ROUNDS` =
-2; `--plan-sweep-rounds` is accepted and ignored for one release;
+2; `--plan-sweep-rounds` was removed in #2162;
 `--plan-sweep-reasoning-effort`, off by default). The step-back arms only on a
 crossed one-shot plan, so a primary can drip-feed new findings on a plan that
 never crosses a growth signal. Under `primary-then-panel`,

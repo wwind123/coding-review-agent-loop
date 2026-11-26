@@ -1040,8 +1040,7 @@ def test_stranded_checkpoint_history_excludes_a_foreign_anchor(tmp_path):
     assert _records_1292(runner, "head-review-recovery") == []
 
 
-@pytest.mark.parametrize("flag", [False, True])
-def test_latest_legacy_rejection_reviews_the_current_head_with_no_coder_turn(tmp_path, flag):
+def test_latest_legacy_rejection_reviews_the_current_head_with_no_coder_turn(tmp_path):
     """Row migrate-rejected through run_pr_loop: no refusal, no coder turn, no new record."""
     records = [
         *_history_1292(), _dispatch_1292(), _rejection_1292(),
@@ -1052,8 +1051,7 @@ def test_latest_legacy_rejection_reviews_the_current_head_with_no_coder_turn(tmp
         ),
     ]
     runner = _stranded_runner_1292(records, _B_1292)
-    # The deprecated flag changes nothing (#2087).
-    config = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=flag)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert _agent_order_1292(runner) == ["codex"]
     assert _records_1292(runner, "head-review-recovery") == []
@@ -1234,22 +1232,20 @@ def test_malformed_latest_legacy_record_migrates_to_a_review_on_the_production_p
     assert not any(r.role == "coder" and r.subject == head for r in _records_1292(runner))
 
 
-def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path):
+def test_review_unrecorded_head_flag_was_removed(capsys):
+    """#2162: rejected on pr, unknown elsewhere, and hidden from help."""
     from coding_review_agent_loop.cli import build_parser
-    from coding_review_agent_loop.config import config_from_args
 
     parser = build_parser()
-    base = ["pr", "123", "--repo", "OWNER/REPO", "--codex-dir", str(tmp_path / "codex")]
-    assert config_from_args(parser.parse_args(base), FakeRunner()).review_unrecorded_head is False
-    flagged = parser.parse_args([*base, "--review-unrecorded-head"])
-    assert config_from_args(flagged, FakeRunner()).review_unrecorded_head is True
+    with pytest.raises(SystemExit) as raised:
+        parser.parse_args(["pr", "123", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
+    assert raised.value.code == 2
+    assert "--review-unrecorded-head was removed (#2162)" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         parser.parse_args(["issue", "5", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
-    help_text = next(
-        action.help for action in parser._subparsers._group_actions[0].choices["pr"]._actions
-        if "--review-unrecorded-head" in action.option_strings
-    )
-    assert "Deprecated no-op" in help_text
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pr", "--help"])
+    assert "--review-unrecorded-head" not in capsys.readouterr().out
 
 
 # --- Review feedback on #1296: authenticated budgets, numbering, matrix paths --
@@ -1435,7 +1431,6 @@ def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agen
 def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agent_call(tmp_path, case):
     """Generalizes the omitted-handoff rule to checkpoint anchors and budget sources."""
     prelaunch = _meta_1292("summary", "scheduler-prelaunch", round_number=2, items=(_item_1292(),))
-    flag = False
     if case == "legacy-anchor":
         records, omit = [*_history_1292(), _checkpoint_1292()], 2
     elif case in {"operator-budget-checkpoint", "operator-budget-coder-record"}:
@@ -1453,7 +1448,7 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
                 _meta_1292("coder", subject=_A_1292, round_number=2, items=(_item_1292(),)),
                 qualification_checkpoint=used.qualification_checkpoint,
             )
-        records, omit, flag = [*_history_1292(), used, prelaunch], 2, True
+        records, omit = [*_history_1292(), used, prelaunch], 2
     else:
         records = [
             *_history_1292(), _dispatch_1292(),
@@ -1473,7 +1468,7 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
         return result
 
     runner.run = omitting_run
-    config = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=flag)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
     with pytest.raises(AgentLoopError, match="cannot (?:be authenticated|authenticate comment)"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []

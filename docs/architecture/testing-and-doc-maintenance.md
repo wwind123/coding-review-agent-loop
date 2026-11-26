@@ -357,10 +357,12 @@ risk-matrix section, because the transport may replace those sections with a
 bounded summary. The response-normalization
 strip helpers stay but are unreachable for live turns. The
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
-`--repair-timeout-seconds` and `--containment-repair-*` flags are deprecated
-no-ops: they still parse, print one deprecation notice, are never validated
-and no longer require the agy CLI; containment drops the repair-only overrides
-before policy parsing. The former repair, content-preservation, format-repair
+`--repair-timeout-seconds` and `--containment-repair-*` flags were removed in
+#2162: passing one is a startup error saying no repair pass exists. The
+`Config.repair_*` fields, the `repair` containment, runner and Antigravity role,
+`AntigravityBackend.run_repair` and the unread `reask_on_*` arguments of the
+validated turn went with them; old usage and history records that name the
+repair role stay decodable. The former repair, content-preservation, format-repair
 and shape-check audit modules are deleted (#2092); `tests/test_cli_repair.py`
 statically checks that only the no-op flag handling still names the repair
 backend and that none of the deleted modules is present or imported.

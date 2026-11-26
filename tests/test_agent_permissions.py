@@ -47,7 +47,7 @@ def test_named_sandboxed_reviewer_is_refused_before_command_lookup(monkeypatch, 
         "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
         "--reviewer-seat", "model-b=codex", "--seat-model", "model-b=Model B",
         "--primary-reviewer-seat", "model-a", "--pr-review-policy", "primary-then-panel",
-        "--repair-backend", "codex", "--semantic-followup-backend", "codex",
+        "--semantic-followup-backend", "codex",
     ])
     assert code == 1
     error = capsys.readouterr().err
@@ -66,7 +66,7 @@ def test_named_sandboxed_supported_backend_reaches_configuration(monkeypatch, ba
         cli.main([
             "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
             "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
-            "--repair-backend", "codex", "--semantic-followup-backend", "codex",
+            "--semantic-followup-backend", "codex",
         ])
 
 
@@ -81,7 +81,7 @@ def test_named_sandboxed_mixed_board_checks_all_providers(capsys, extra, expecte
 
     code = cli.main([
         "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
-        "--repair-backend", "codex", "--semantic-followup-backend", "codex",
+        "--semantic-followup-backend", "codex",
         "--reviewer-seat", "model-a=codex",
         "--seat-model", "model-a=Model A", *extra,
     ])
@@ -142,8 +142,6 @@ def sandboxed_config(tmp_path, **overrides):
     values = dict(
         agent_permissions="sandboxed",
         reviewer=("codex", "claude"),
-        repair_backend="claude",
-        repair_models=("repair-model",),
         semantic_followup_backend="claude",
         antigravity_dir=tmp_path / "antigravity",
     )
@@ -1191,12 +1189,6 @@ def test_non_reviewer_refusal_omits_the_board_trade(tmp_path):
     assert "review board" not in str(info.value)
 
 
-def test_retired_repair_backend_is_not_a_sandboxed_selection(tmp_path):
-    # --repair-backend is a deprecated no-op (#2066): no repair agent runs.
-    config = sandboxed_config(tmp_path, repair_backend="antigravity")
-    assert config.agent_permissions == "sandboxed"
-
-
 @pytest.mark.parametrize("provider", ["antigravity", "gemini"])
 def test_role_permission_args_refuses_unsandboxable_provider_with_reason(
     tmp_path, sandbox, provider
@@ -1266,7 +1258,7 @@ def test_primary_reviewer_selections_are_rejected(field_name):
     values = dict(
         coder="claude", implementation_coder=None, reviewer=("claude",),
         primary_reviewer=None, primary_plan_reviewer=None, discuss_analyzer=None,
-        repair_backend="claude", semantic_followup_dedupe=False, semantic_followup_backend="gemini",
+        semantic_followup_dedupe=False, semantic_followup_backend="gemini",
     )
     values[field_name] = "gemini"
     with pytest.raises(AgentLoopError, match=field_name):

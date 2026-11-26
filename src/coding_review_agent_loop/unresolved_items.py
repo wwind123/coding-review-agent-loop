@@ -2539,7 +2539,7 @@ def sub_item_progress(
 ) -> tuple[SubItemProgress, ...]:
     """Classify every carried or just-cleared item that has sub-items.
 
-    ``window`` is ``--sub-item-stall-rounds``; 0 disables the stall check, so
+    ``window`` is the no-progress window (``--no-progress-rounds``); 0 disables the stall check, so
     no item is ever ``stalled``.  A pure function of persisted state: the same
     ledger and cleared records always give the same signal, which is what
     keeps the published notices idempotent across resume.

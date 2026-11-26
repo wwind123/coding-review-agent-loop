@@ -125,7 +125,7 @@ def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_
         return validated_agent._run_validated_agent(
             object(), agent="claude", config=make_config(tmp_path), prompt="image assessment",
             marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
-            validate=json.loads, reask_on_evidence_rejection=True,
+            validate=json.loads,
             completion_recovery=object())
     if not cleanup_confirmed:
         monkeypatch.setattr("coding_review_agent_loop.review_images_validation.attempt_envelope_normalization",

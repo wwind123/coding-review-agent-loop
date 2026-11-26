@@ -927,7 +927,7 @@ and coder prompts, the coder follow-up comment, and one orchestrator
 `### Sub-item progress` comment per round that cleared or newly stalled a
 finding. The report warns when no sub-item of a finding closes for
 `--no-progress-rounds` rounds (default 3; the retired `--sub-item-stall-rounds`
-is accepted and ignored), and the max-rounds message
+was removed in #2162 and is a startup error), and the max-rounds message
 includes a converging/stalled summary per finding. The signal is advisory: it
 never changes `--max-rounds`.
 
@@ -1474,8 +1474,9 @@ and removes it, only if the record still carries its own token, after settings
 restoration and before unlocking. It invokes the backend, removes the injected prefix in a
 `finally` path, parses the candidate, and takes the after snapshot before
 releasing either lock. Reviewer and coder paths therefore cannot observe a peer's
-injected prompt as worktree activity. Isolated `role=repair` / `run_repair`
-invocations skip Git probes, replacement metadata, and replay eligibility. The
+injected prompt as worktree activity. Isolated `role=semantic-dedupe`
+invocations skip Git probes, replacement metadata, and replay eligibility (the
+former `repair` role was removed with the repair pass, #2162). The
 snapshots are read-only evidence gates and cannot guarantee that a backend had no
 other external side effects.
 
@@ -1764,8 +1765,8 @@ requested properties are accepted, launches a unique foreground scope under
 `agent-loop.slice`. It uses the exact form
 `systemd-run --user --scope --quiet` and intentionally omits `--wait`,
 `--service`, and `--pipe`. `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and
-`TasksMax` are applied to the aggregate and to the `coder`, `reviewer`,
-`repair`, or `test-gate` child profile. A child profile is never above the
+`TasksMax` are applied to the aggregate and to the `coder`, `reviewer`, or
+`test-gate` child profile. A child profile is never above the
 effective aggregate, including when another process holds a stricter lease.
 
 Use `containment-preflight` before a live run to see the resolved policy,
@@ -5129,8 +5130,9 @@ continue after the stop:
 Because the decision is recomputed from durable records, rerunning with unchanged
 flags stops again at the same point before any agent turn. The retired
 `--plan-primary-stall-rounds`, `--plan-step-back-rounds`,
-`--plan-step-back-escalation-rounds` and `--plan-sweep-rounds` are accepted and
-ignored for one release with one deprecation notice; history export labels the
+`--plan-step-back-escalation-rounds` and `--plan-sweep-rounds` were removed in
+#2162: passing one is a startup error naming `--no-progress-rounds`. History
+export labels the
 stop `plan-no-progress` and keeps the `plan-primary-stall` and `plan-step-back`
 labels for older comments.
 
@@ -5204,7 +5206,7 @@ the signals is never reached by it (#1505). Under `--plan-review-policy
 primary-then-panel` the sweep addresses that pattern. It never stops a run.
 
 - The sweep request (an internal threshold of two; the retired
-  `--plan-sweep-rounds` is ignored). Once the primary has
+  `--plan-sweep-rounds` was removed in #2162). Once the primary has
   blocked two consecutive primary-phase rounds with new mandatory findings, its
   next review prompt carries a sweep request. The request lists the finding
   classes it already raised (the newest 12 IDs and first lines, with an
@@ -5393,9 +5395,9 @@ best-effort: a failure is logged as a warning and the run still stops with
 exit code 4 and the same message.
 
 **Retired flags.** `--pr-step-back-rounds`, `--pr-step-back-line-window`,
-`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` are accepted for one
-release and ignored: any integer, including `0`, parses, changes nothing, and
-logs one deprecation notice naming `--no-progress-rounds`. The advisory
+`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` were removed in
+#2162 after one release as ignored no-ops: passing one, with or without a value,
+exits with status 2 and an error naming `--no-progress-rounds`. The advisory
 sub-item stall report now uses the `--no-progress-rounds` window. Legacy
 `step_back_entries` and stall fields in old round records still decode and are
 ignored by every stop and routing decision; new coder records keep writing
@@ -9305,10 +9307,10 @@ turn. The moved-head fact is kept, so a release boundary is still not
 revalidated against its old baseline. Reviewing is never approval: every
 required reviewer must still approve the exact head.
 
-**`--review-unrecorded-head` is deprecated.** The option is still accepted on
-`agent-loop pr` for one release, logs a deprecation notice and has no effect:
-the resume result is the same as without it. It will be removed in the next
-release.
+**`--review-unrecorded-head` is removed.** The option was a no-op for one
+release and was removed in #2162. Passing it to `agent-loop pr` is a startup
+error (exit 2) explaining that an unrecorded head already resumes as a review of
+the current head.
 
 Reviewer responses should use structured JSON first. A PR review starts with:
 
@@ -10408,10 +10410,10 @@ entries are also removed from the stored response text, so resume and
 publication see the same dispositions as live validation.
 
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
-`--repair-timeout-seconds` and `--containment-repair-*` are deprecated no-ops
-kept for one release. They still parse, print one `deprecated no-op flag(s)
-ignored` notice on stderr, are never validated and no longer require the `agy`
-CLI. They will be removed in a later release.
+`--repair-timeout-seconds` and `--containment-repair-*` were removed in #2162
+after one release as no-ops. Passing one is a startup error (exit 2) that says
+no repair pass exists: a rejected structured response is re-asked to the same
+agent.
 
 Long reset or quota responses can exit early with guidance to rerun after the
 reset or switch keys/models. Narrower transient stream, tool-call, network

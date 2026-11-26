@@ -2576,24 +2576,6 @@ def _cached_trusted_actor(runner: Runner) -> tuple[str, int] | None:
     return None
 
 
-def warn_deprecated_review_unrecorded_head(config: AgentLoopConfig) -> bool:
-    """Log the deprecation notice for ``--review-unrecorded-head`` (#2087).
-
-    The option is a no-op kept for one release: every head-moving coder turn
-    now posts a coder record, legacy recovery records resume as a review of
-    the current head, and no resume refuses for it to override.
-    """
-    if not config.review_unrecorded_head:
-        return False
-    log(
-        config,
-        "--review-unrecorded-head is deprecated and has no effect; it will be removed in "
-        "the next release. Resume already reviews the current head whenever the coder "
-        "follow-up was not recorded.",
-    )
-    return True
-
-
 def _visibility_snapshot(
     *,
     fresh_records: Sequence[PostedRoundRecord] | None,

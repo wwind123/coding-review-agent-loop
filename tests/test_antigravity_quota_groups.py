@@ -840,7 +840,7 @@ def test_wait_pre_dispatch_keeps_a_pending_judgement_reask(tmp_path, advancing_s
         )
         response = validated_agent._run_validated_agent(
             runner, agent="antigravity", config=config, prompt="PROMPT", marker_description="none",
-            validate=validate, session_id="S1", reask_on_missing_judgement_field=True,
+            validate=validate, session_id="S1",
         )
     assert response.text == "with verdict"
     assert invoke.call_count == 2

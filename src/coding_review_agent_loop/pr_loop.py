@@ -521,7 +521,6 @@ from .pr_loop_support import (
     _ordinary_checks_snapshot_is_authoritative,
     _managed_success_supersedes_ordinary_checks,
     _persist_qualification_checkpoint,
-    warn_deprecated_review_unrecorded_head,
     _resume_pr_round_admitted,
     _cached_trusted_actor,
     _visibility_snapshot,
@@ -699,7 +698,6 @@ def run_pr_loop(
     post_merge_run = ObligationRun(runner, config, pr_number)
     runner._post_merge_run = post_merge_run
     visual_startup(config)
-    warn_deprecated_review_unrecorded_head(config)
     visual_enabled = visual_review_requested(config)  # The one run-time visual gate (#2070).
     visual_run = VisualRun(runner)
     runner._screenshot_coverage_pr = pr_number
@@ -5429,8 +5427,6 @@ def run_pr_loop(
                                     repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
                                     operation_description="PR review",
-                                    reask_on_prior_disposition_omission=True,
-                                    reask_on_missing_judgement_field=True,
                                 )
                             except AgentLoopError as exc:
                                 # Includes QuotaResetExceededError: captured here
@@ -5761,8 +5757,6 @@ def run_pr_loop(
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="PR review",
-                            reask_on_prior_disposition_omission=True,
-                            reask_on_missing_judgement_field=True,
                             ),
                         )
                     )
@@ -9198,7 +9192,6 @@ def run_pr_loop(
                         agent=config.coder,
                         run_id=usage_context.run_id,
                     ),
-                    reask_on_evidence_rejection=True,
                     operation_description="PR feedback follow-up",
                 ))
                 coder_output = coder_response.text

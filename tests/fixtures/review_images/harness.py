@@ -86,7 +86,6 @@ def main():
             'model_provider="fixture"\n[model_providers.fixture]\nname="fixture"\n'
             f'base_url="{url}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n')
     config = make_config(scratch, agent_permissions=mode, reviewer=(provider,),
-                         repair_backend="codex", repair_models=("gpt-6.1-sol",),
                          semantic_followup_backend="codex",
                          **{f"{provider}_dir": ROOT, f"{provider}_cmd": binary,
                             f"reviewer_{provider}_model": model,

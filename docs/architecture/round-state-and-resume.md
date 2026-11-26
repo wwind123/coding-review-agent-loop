@@ -489,7 +489,7 @@ latest admitted non-scoped ledger with `head_advanced_past_boundary` set, so a
 release baseline is still not revalidated on a moved head. These resumes carry
 an informational `head_review_recovery` label (`legacy-recovery`,
 `legacy-checkpoint`, `unrecorded-advance`); a legacy round budget is never
-restored. `--review-unrecorded-head` is a deprecated no-op for one release.
+restored. `--review-unrecorded-head` was removed (#2162).
 
 The PR-loop coder follow-up comment is size-bounded at its posting seam
 (`coder_comment_budget.py`, #2059). A comment that fits the transport is posted

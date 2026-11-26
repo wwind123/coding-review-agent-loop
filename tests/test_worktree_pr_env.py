@@ -39,8 +39,7 @@ from test_run_worktrees import Env, RecordingRunner, git
 
 LOCK = "package-lock.json"
 SANDBOXED = (
-    "--agent-permissions", "sandboxed", "--repair-backend", "claude", "--repair-model", "m",
-    "--no-semantic-followup-dedupe",
+    "--agent-permissions", "sandboxed", "--no-semantic-followup-dedupe",
 )
 
 

@@ -409,9 +409,10 @@ verified before every between-turn sync (before any reset or clean) and every
 real test gate, and refreshed only afterwards; a gate adopts only new
 artifacts. Each completed turn refreshes it, and a post-turn capture that
 fails, or exceeds the 100,000-path cap, poisons the entry so a later
-clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` and
-`repair` (tool-owned temporary directories) and dry-run are exempt. The
-Antigravity backend treats `semantic-dedupe` like `repair`: a GEMINI lock
+clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` (a
+tool-owned temporary directory) and dry-run are exempt; the former `repair` role
+was removed with the repair pass (#2162). The Antigravity backend isolates
+`semantic-dedupe`: a GEMINI lock
 beside the temporary directory instead of in git metadata, no checkout
 snapshot or replacement classification, and the strict empty-allowlist
 settings injection for the turn. Explicit
@@ -456,7 +457,7 @@ get only an `unknown` shell-cap fact. Broker-owned detached runs are deferred. S
 A containment-aware test-worker budget (`test_workers.py`) is derived after
 admission from the limits that apply on each path (managed handle limits,
 cgroup ancestry, usable host memory, CPU affinity/quota) and exported to coder
-and repair agents as `AGENT_LOOP_TEST_WORKERS`. The parent-owned broker is the
+agents as `AGENT_LOOP_TEST_WORKERS`. The parent-owned broker is the
 enforcement boundary: it applies the stricter of the parent and client values
 and injects a stdlib-only pytest plugin that clamps or refuses the final
 resolved pytest-xdist worker count and reports the gateways actually created.

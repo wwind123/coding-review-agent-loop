@@ -2230,7 +2230,6 @@ def test_tests_run_correction_is_resend_only_and_inherits_the_primary_catalog(tm
             runner, agent='claude', config=config, prompt='Correct PR feedback.',
             marker_description='structured coder followup', validate=validate,
             role='coder', repair_expected_kind='coder_followup',
-            reask_on_evidence_rejection=True,
         )
     assert invoke.call_count == 2
     assert len(seen) >= 2

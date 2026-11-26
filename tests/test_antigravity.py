@@ -976,24 +976,6 @@ def test_antigravity_after_snapshot_runs_after_gemini_cleanup_under_lock(
     assert "Agent Loop Single-Shot Session" not in snapshots_seen[1][1]
 
 
-def test_antigravity_repair_skips_checkout_probes_and_replacement_metadata(tmp_path, monkeypatch):
-    from coding_review_agent_loop.agents import antigravity as agy_mod
-    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
-
-    settings_file = tmp_path / "settings.json"
-    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
-    config = make_config(tmp_path, antigravity_dir=tmp_path / "agy")
-    runner = FakeRunner(antigravity_outputs=[("MODULE_NOT_FOUND", 1)])
-
-    result = AntigravityBackend().run_repair(
-        runner, config, "Repair this response.", model="ModelA"
-    )
-
-    assert runner.git_probe_calls == []
-    assert result.self_update_reason is None
-    assert result.self_update_replay_refusal_kind is None
-    assert result.self_update_replay_refusal_detail is None
-
 def test_antigravity_backend_lock_order_settings_outer_gemini_inner(tmp_path, monkeypatch):
     """Settings lock (outer) is acquired before GEMINI.md lock (inner);
     settings are restored before the settings lock is released."""
@@ -1507,18 +1489,18 @@ def _agy_commands(runner):
     return [command for command, _ in runner.commands if command[:1] == ["agy"]]
 
 
-def test_settings_lock_budget_helpers_cover_reviewer_repair_and_explicit_timeouts(
+def test_settings_lock_budget_helpers_cover_print_and_explicit_timeouts(
     tmp_path, monkeypatch
 ):
     import importlib
 
     agy_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
 
-    reviewer = make_config(tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=120)
-    repair = make_config(tmp_path, antigravity_print_timeout_seconds=60, repair_timeout_seconds=900)
-    tiny = make_config(tmp_path, antigravity_print_timeout_seconds=1, repair_timeout_seconds=1)
+    reviewer = make_config(tmp_path, antigravity_print_timeout_seconds=600)
+    long_print = make_config(tmp_path, antigravity_print_timeout_seconds=900)
+    tiny = make_config(tmp_path, antigravity_print_timeout_seconds=1)
     assert agy_mod.settings_lock_turn_bound_seconds(reviewer) == 600
-    assert agy_mod.settings_lock_turn_bound_seconds(repair) == 900
+    assert agy_mod.settings_lock_turn_bound_seconds(long_print) == 900
     # An explicit coder/reviewer turn timeout above the print timeout wins.
     assert agy_mod.settings_lock_turn_bound_seconds(reviewer, 1500) == 1500
     assert agy_mod.settings_lock_turn_bound_seconds(reviewer, None) == 600
@@ -1946,13 +1928,12 @@ def test_antigravity_semantic_dedupe_ignores_response_files(tmp_path, monkeypatc
     assert "stale" not in result.text and "file written" not in result.text
 
 
-def test_antigravity_repair_and_reviewer_paths_keep_their_behaviour(tmp_path, monkeypatch):
+def test_antigravity_coder_and_reviewer_paths_keep_their_behaviour(tmp_path, monkeypatch):
     """`agy-other-roles-unchanged` (#1472): only semantic-dedupe gets the classification path."""
     import json as _json
     from coding_review_agent_loop.agents import antigravity as agy_mod
     from coding_review_agent_loop.agents.antigravity import (
         AntigravityBackend,
-        _REPAIR_GEMINI_MD,
         _REVIEWER_SETTINGS_INJECTION,
         _SEMANTIC_DEDUPE_GEMINI_MD,
     )
@@ -1974,24 +1955,20 @@ def test_antigravity_repair_and_reviewer_paths_keep_their_behaviour(tmp_path, mo
     agy_dir = tmp_path / "agy"
     agy_dir.mkdir()
     config = make_config(tmp_path, antigravity_dir=agy_dir)
-    runner = CapturingRunner(antigravity_outputs=[("ok", 0), ("ok", 0), ("ok", 0)])
+    runner = CapturingRunner(antigravity_outputs=[("ok", 0), ("ok", 0)])
     AntigravityBackend().run(runner, config, "Review PR.", role="reviewer")
     reviewer_prompt = runner.commands[-1][0][-1]
     AntigravityBackend().run(runner, config, "Implement.", role="coder")
     coder_prompt = runner.commands[-1][0][-1]
-    AntigravityBackend().run_repair(runner, config, "Repair this.", model="ModelA")
-    repair_prompt = runner.commands[-1][0][-1]
 
-    (reviewer_md, reviewer_settings), (coder_md, coder_settings), (repair_md, repair_settings) = seen
+    (reviewer_md, reviewer_settings), (coder_md, coder_settings) = seen
     assert "Agent Loop Single-Shot Session" in reviewer_md
     assert reviewer_settings["permissions"] == _REVIEWER_SETTINGS_INJECTION["permissions"]
     assert "Agent Loop Single-Shot Session" in coder_md
     assert coder_settings is None
-    assert _REPAIR_GEMINI_MD in repair_md
-    assert repair_settings["permissions"] == {"allow": []}
-    for md in (reviewer_md, coder_md, repair_md):
+    for md in (reviewer_md, coder_md):
         assert _SEMANTIC_DEDUPE_GEMINI_MD not in md
-    for prompt in (reviewer_prompt, coder_prompt, repair_prompt):
+    for prompt in (reviewer_prompt, coder_prompt):
         assert "PUBLIC RESPONSE FILE" in prompt
     assert "Run any verification steps" in coder_prompt
     # Reviewer and coder still take the git-metadata lock and snapshots.
@@ -2007,8 +1984,8 @@ def test_settings_lock_advertised_turn_bound_narrows_only_semantic_dedupe(tmp_pa
 
     agy_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
     advertised = agy_mod.settings_lock_advertised_turn_bound_seconds
-    config = make_config(tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=120)
-    repair_heavy = make_config(tmp_path, antigravity_print_timeout_seconds=60, repair_timeout_seconds=900)
+    config = make_config(tmp_path, antigravity_print_timeout_seconds=600)
+    long_print = make_config(tmp_path, antigravity_print_timeout_seconds=900)
 
     assert advertised(config, "semantic-dedupe", 120) == 120
     assert advertised(config, "semantic-dedupe", 120.0) == 120
@@ -2017,19 +1994,19 @@ def test_settings_lock_advertised_turn_bound_narrows_only_semantic_dedupe(tmp_pa
     # Without a positive finite timeout the dedupe role never under-advertises.
     for missing in (None, 0, -1):
         assert advertised(config, "semantic-dedupe", missing) == 600
-    assert advertised(repair_heavy, "semantic-dedupe", None) == 900
+    assert advertised(long_print, "semantic-dedupe", None) == 900
     # Every other role keeps exactly the role-independent bound.
-    for role in ("reviewer", "coder", "repair", None):
+    for role in ("reviewer", "coder", None):
         for timeout in (None, 120, 1500):
             assert advertised(config, role, timeout) == agy_mod.settings_lock_turn_bound_seconds(
                 config, timeout
             )
-            assert advertised(repair_heavy, role, timeout) == agy_mod.settings_lock_turn_bound_seconds(
-                repair_heavy, timeout
+            assert advertised(long_print, role, timeout) == agy_mod.settings_lock_turn_bound_seconds(
+                long_print, timeout
             )
     assert advertised(config, "reviewer", 120) == 600
     assert advertised(config, "coder", 120) == 600
-    assert advertised(repair_heavy, "repair", None) == 900
+    assert advertised(long_print, "coder", None) == 900
 
 
 def _record_holder_publications(harness, monkeypatch):
@@ -2088,7 +2065,7 @@ def test_semantic_dedupe_holder_publishes_its_runner_timeout(tmp_path, monkeypat
 @pytest.mark.parametrize(
     ("role", "timeout_seconds", "expected"),
     [("reviewer", None, 600), ("reviewer", 1500.0, 1500), ("coder", 120.0, 600),
-     ("coder", None, 600), ("repair", None, 900)],
+     ("coder", None, 600)],
 )
 def test_non_dedupe_holders_publish_the_role_independent_bound(
     tmp_path, monkeypatch, role, timeout_seconds, expected
@@ -2096,10 +2073,7 @@ def test_non_dedupe_holders_publish_the_role_independent_bound(
     """`other-roles-unchanged` (#1508): only semantic-dedupe narrows its bound."""
     harness = _SettingsLockHarness(tmp_path, monkeypatch)
     Runner, published, order = _record_holder_publications(harness, monkeypatch)
-    repair_timeout = 900 if role == "repair" else 120
-    config = harness.config(
-        tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=repair_timeout
-    )
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
     kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
     harness.mod.AntigravityBackend().run(
         Runner(antigravity_outputs=[("ok", 0)]), config, "Work.", role=role, **kwargs
@@ -2863,7 +2837,7 @@ def test_validated_turn_threads_eligibility_into_the_agy_argv(
     assert ("--output-format" in cmd) is flags_expected
 
 
-@pytest.mark.parametrize("role", ["repair", "semantic-dedupe"])
+@pytest.mark.parametrize("role", ["semantic-dedupe"])
 def test_isolated_roles_never_get_schema_flags(tmp_path, monkeypatch, role):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
 

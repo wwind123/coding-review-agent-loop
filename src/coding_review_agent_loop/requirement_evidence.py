@@ -359,7 +359,6 @@ CLASSIFICATION_INVOKE_OPTIONS = {
     "marker_description": "structured PR review classification",
     "role": "reviewer",
     "operation_description": "Signed-source classification",
-    "reask_on_missing_judgement_field": True,
     "reviewer_judgement_turn": True,
 }
 

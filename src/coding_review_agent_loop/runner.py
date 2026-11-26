@@ -1982,7 +1982,7 @@ class Runner:
         self.telemetry_attribution: dict | None = None
 
     def set_containment_role(self, role: str | None) -> None:
-        if role in {"coder", "reviewer", "repair", "test-gate"}:
+        if role in {"coder", "reviewer", "test-gate"}:
             self._containment_role = role
 
     def configure_from_config(self, config: object) -> None:
@@ -2069,7 +2069,7 @@ class Runner:
         for name in ATTRIBUTION_ENV.values():
             launch_env.pop(name, None)
         launch_env.update(attribution_environment(self.telemetry_attribution))
-        if role not in {"coder", "repair"}:
+        if role != "coder":
             return None
         budget = self.derive_worker_budget(handle)
         # launch_env is consumed only at Popen, after admission.
@@ -2105,7 +2105,7 @@ class Runner:
         role: str,
         env: Mapping[str, str] | None,
     ) -> tuple[TestBrokerServer | None, str | None]:
-        if os.name == "nt" or role not in {"coder", "repair"}:
+        if os.name == "nt" or role != "coder":
             return None, None
         values = dict(os.environ)
         if env is not None:
@@ -2878,8 +2878,6 @@ class Runner:
         lowered = label.lower()
         if "test" in lowered or "gate" in lowered:
             return "test-gate"
-        if "repair" in lowered:
-            return "repair"
         if "review" in lowered:
             return "reviewer"
         return "coder"

@@ -912,10 +912,7 @@ def _run_validated_agent_in_scope(
     strict_revalidate: Callable[[str], object] | None = None,
     test_observations_fallback_validate: Callable[[str], object] | None = None,
     test_observations_fallback_strict_revalidate: Callable[[str], object] | None = None,
-    reask_on_prior_disposition_omission: bool = False,
-    reask_on_missing_judgement_field: bool = False,
     reviewer_judgement_turn: bool = False,
-    reask_on_evidence_rejection: bool = False,
     architecture_document_paths: Callable[[], frozenset[str] | None] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in

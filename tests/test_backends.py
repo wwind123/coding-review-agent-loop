@@ -1414,8 +1414,7 @@ def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(
     monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))
     agent_permissions.reset_sandbox_state()
     config = make_config(
-        tmp_path, agent_permissions="sandboxed", repair_backend="claude",
-        repair_models=("m",), semantic_followup_backend="claude",
+        tmp_path, agent_permissions="sandboxed", semantic_followup_backend="claude",
         antigravity_dir=tmp_path / "agy", agent_max_retries=0,
     )
     runner = FakeRunner(codex_outputs=[
@@ -1448,8 +1447,7 @@ def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(
     monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))
     agent_permissions.reset_sandbox_state()
     config = make_config(
-        tmp_path, agent_permissions="sandboxed", repair_backend="claude",
-        repair_models=("m",), semantic_followup_backend="claude",
+        tmp_path, agent_permissions="sandboxed", semantic_followup_backend="claude",
         antigravity_dir=tmp_path / "agy", agent_max_retries=0,
     )
     runner = FakeRunner(codex_outputs=[

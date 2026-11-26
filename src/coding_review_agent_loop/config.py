@@ -94,11 +94,6 @@ DEFAULT_NO_PROGRESS_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
-DEFAULT_REPAIR_MODELS: tuple[str, ...] = (
-    "Gemini 3.8 Flash (Medium)",
-    # Served on Antigravity's separate quota, so it is a real fallback (#2023).
-    "Claude Opus 5.5 (Medium)",
-)
 # agy reports a transient model-access failure on its provider channel (stdout,
 # with no response artifact) with this text.  Matched case-insensitively; the
 # singular form also matches the plural "errors".
@@ -313,7 +308,7 @@ class AgentLoopConfig:
     # ``off`` drops them, and ``freeze`` keeps the blocking evidence freeze.
     pr_human_evidence: str = "advisory"
     # The PR and plan no-progress window (#2097, #2098); it also paces the
-    # advisory sub-item stall report that ``--sub-item-stall-rounds`` used to set.
+    # advisory sub-item stall report.
     no_progress_rounds: int = DEFAULT_NO_PROGRESS_ROUNDS
     # One-shot operator reset of the plan no-progress window (#1112, #2098):
     # the run's first staged checkpoint (any phase) is stamped as a durable
@@ -406,10 +401,6 @@ class AgentLoopConfig:
     gemini_model: str = ""
     claude_model: str = ""
     claude_effort: str = ""
-    repair_backend: str = "antigravity"
-    repair_models: tuple[str, ...] = DEFAULT_REPAIR_MODELS
-    repair_reasoning_effort: str = ""
-    repair_timeout_seconds: int = 120
     # Active subprocess capture is kept outside mutable agent checkouts.  The
     # legacy log_dir remains the home for salvage and usage artifacts.
     subprocess_log_dir: Path | None = None
@@ -476,7 +467,7 @@ class AgentLoopConfig:
     # merge. `auto_merge` remains an implicit managed-CI eligibility signal so
     # existing invocations retain their behavior.
     managed_ci: bool = False
-    # Invocation-scoped coder/repair CI-dispatch guard (#1366).  Never set from
+    # Invocation-scoped coder CI-dispatch guard (#1366).  Never set from
     # the CLI or derived from ``managed_ci``: each loop sets it on a replaced
     # config passed only to coder turns, from the live managed-CI decision or
     # the managed creation intent.  It drives both the coder prompt guidance
@@ -499,9 +490,6 @@ class AgentLoopConfig:
     # protection refused this token with HTTP 403 and the readable effective
     # rules show no strict enforcement (#1040).  Requires the waiver above.
     allow_unreadable_protection: bool = False
-    # Deprecated no-op (#2087): ``--review-unrecorded-head`` is still accepted
-    # for one release and only logs a deprecation notice.
-    review_unrecorded_head: bool = False
     # Runtime-only correlation value minted by the issue-created preflight.
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
@@ -579,10 +567,6 @@ class AgentLoopConfig:
     containment_reviewer_memory_max: object | None = None
     containment_reviewer_memory_swap_max: object | None = None
     containment_reviewer_tasks_max: object | None = None
-    containment_repair_memory_high: object | None = None
-    containment_repair_memory_max: object | None = None
-    containment_repair_memory_swap_max: object | None = None
-    containment_repair_tasks_max: object | None = None
     containment_test_gate_memory_high: object | None = None
     containment_test_gate_memory_max: object | None = None
     containment_test_gate_memory_swap_max: object | None = None
@@ -740,8 +724,6 @@ class AgentLoopConfig:
             raise AgentLoopError("--worktree-setup-timeout must be a positive integer.")
         if self.test_python is not None:
             object.__setattr__(self, "test_python", validate_test_python(self.test_python))
-        # The repair_* fields are deprecated no-ops (#2066): no repair backend
-        # runs, so they are never validated and can never fail a run.
         if self.implementation_coder_model and self.implementation_coder is None:
             object.__setattr__(self, "implementation_coder", self.coder)
         if self.implementation_codex_reasoning_effort and self.implementation_coder is None:
@@ -2128,81 +2110,6 @@ def _resolve_agent_memory_dir(
     return resolved
 
 
-DEPRECATED_REPAIR_FLAG_DESTS = (
-    ("repair_backend", "--repair-backend"),
-    ("repair_model", "--repair-model"),
-    ("repair_reasoning_effort", "--repair-reasoning-effort"),
-    ("repair_timeout_seconds", "--repair-timeout-seconds"),
-    ("containment_repair_memory_high", "--containment-repair-memory-high"),
-    ("containment_repair_memory_max", "--containment-repair-memory-max"),
-    ("containment_repair_memory_swap_max", "--containment-repair-memory-swap-max"),
-    ("containment_repair_tasks_max", "--containment-repair-tasks-max"),
-)
-
-
-def deprecated_repair_flags(args: argparse.Namespace) -> tuple[str, ...]:
-    """The deprecated no-op repair flags an invocation passed (#2066)."""
-    return tuple(
-        flag
-        for dest, flag in DEPRECATED_REPAIR_FLAG_DESTS
-        if getattr(args, dest, None) not in (None, "", [], ())
-    )
-
-
-def warn_deprecated_repair_flags(args: argparse.Namespace) -> str | None:
-    """Print one deprecation notice when any repair flag was passed; return it."""
-    flags = deprecated_repair_flags(args)
-    if not flags:
-        return None
-    notice = (
-        "agent-loop: deprecated no-op flag(s) ignored: "
-        + ", ".join(flags)
-        + ". A rejected structured response is now re-asked to the same agent (at most "
-        "twice) instead of a repair backend; these flags will be removed in a later release."
-    )
-    print(notice, file=sys.stderr)
-    return notice
-
-
-# PR and plan convergence-stop thresholds retired by the single no-progress
-# detector (#2097, #2098): accepted and ignored for one release, with a
-# one-line notice.
-DEPRECATED_CONVERGENCE_FLAG_DESTS = (
-    ("pr_step_back_rounds", "--pr-step-back-rounds"),
-    ("pr_step_back_line_window", "--pr-step-back-line-window"),
-    ("pr_non_convergence_rounds", "--pr-non-convergence-rounds"),
-    ("sub_item_stall_rounds", "--sub-item-stall-rounds"),
-    ("plan_step_back_rounds", "--plan-step-back-rounds"),
-    ("plan_step_back_escalation_rounds", "--plan-step-back-escalation-rounds"),
-    ("plan_primary_stall_rounds", "--plan-primary-stall-rounds"),
-    ("plan_sweep_rounds", "--plan-sweep-rounds"),
-)
-
-
-def deprecated_convergence_flags(args: argparse.Namespace) -> tuple[str, ...]:
-    """The retired convergence flags an invocation passed, in table order."""
-    return tuple(
-        flag for dest, flag in DEPRECATED_CONVERGENCE_FLAG_DESTS
-        if getattr(args, dest, None) is not None
-    )
-
-
-def warn_deprecated_convergence_flags(args: argparse.Namespace) -> str | None:
-    """Print one deprecation notice when any retired flag was passed; return it."""
-    flags = deprecated_convergence_flags(args)
-    if not flags:
-        return None
-    notice = (
-        "agent-loop: deprecated flag(s) ignored: " + ", ".join(flags)
-        + ". One no-progress detector (--no-progress-rounds) replaces the PR step-back, "
-        "non-convergence and unchanged-head stops and the plan step-back, escalation, "
-        "primary-stall and sweep thresholds; these flags will be removed in a later "
-        "release."
-    )
-    print(notice, file=sys.stderr)
-    return notice
-
-
 def preflight_agent_commands(
     args: argparse.Namespace,
     runner: Runner,
@@ -2229,7 +2136,6 @@ def preflight_agent_commands(
             *((discuss_analyzer,) if discuss_analyzer is not None else ()),
         )
     )
-    # No repair backend is preflighted: --repair-backend is a no-op (#2066).
     for agent in role_agents:
         command, override_flag = command_options[agent]
         resolved = shutil.which(command)
@@ -2455,8 +2361,6 @@ def config_from_args(
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
     validate_sandboxed_args(args, configured_reviewers, named_seats=named_seats)
-    warn_deprecated_repair_flags(args)
-    warn_deprecated_convergence_flags(args)
     if not getattr(args, "reconcile_post_merge_obligations", False):
         preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
 
@@ -2728,7 +2632,6 @@ def config_from_args(
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
         allow_unreadable_protection=getattr(args, "allow_unreadable_protection", False),
-        review_unrecorded_head=bool(getattr(args, "review_unrecorded_head", False)),
         managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
         managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",

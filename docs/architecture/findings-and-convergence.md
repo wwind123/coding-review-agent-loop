@@ -284,7 +284,7 @@ the authenticated actor suppress a repost, which keeps it exactly-once across
 resume. A pure helper classifies each item as `new`, `converging`, `stalled`,
 `complete` or `cleared` from persisted rounds. `--no-progress-rounds`
 (default 3, minimum 1) sets the stall window (the retired
-`--sub-item-stall-rounds` is ignored), and the max-rounds diagnostics
+`--sub-item-stall-rounds` was removed in #2162), and the max-rounds diagnostics
 add a per-item progress block. The signal is advisory: it never changes
 `--max-rounds`, `allowed_rounds` or a checkpoint bound.
 
@@ -371,9 +371,8 @@ approach-alternative excerpt, or any degraded-history log. A static AST guard in
 retired entry readers in `pr_loop.py`, `pr_loop_support.py` and
 `no_progress.py` while allowing the writer keyword. The retired flags
 `--pr-step-back-rounds`, `--pr-step-back-line-window`,
-`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` are accepted and
-ignored for one release (`config.warn_deprecated_convergence_flags` logs one
-notice); their config fields and cross-validation are removed.
+`--pr-non-convergence-rounds` and `--sub-item-stall-rounds` were removed
+(#2162): hidden `cli.RETIRED_FLAGS` entries exit 2 naming `--no-progress-rounds`.
 
 **Plan no-progress stop** (same `--no-progress-rounds` K; #2098, stage 2 of
 #2067). The plan loop reuses the same `no_progress_decision` and replaces the
@@ -416,9 +415,7 @@ stay prompts with internal thresholds (`PLAN_STEP_BACK_ROUNDS`,
 `PLAN_SWEEP_ROUNDS`), and the step-back episode is replay-derived (see
 [review scheduling](review-scheduling.md)). The four plan threshold flags
 `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`,
-`--plan-primary-stall-rounds` and `--plan-sweep-rounds` join
-`DEPRECATED_CONVERGENCE_FLAG_DESTS`: accepted, ignored and named in the one
-notice. History export labels the stop `plan-no-progress` and keeps `plan-step-back` and `plan-primary-stall` for old comments. The
+`--plan-primary-stall-rounds` and `--plan-sweep-rounds` are in that table too. History export labels the stop `plan-no-progress` and keeps `plan-step-back` and `plan-primary-stall` for old comments. The
 legacy-field AST guard also covers the plan modules.
 
 **PR step-back turn and reviewer sweep** (a prompt technique only). The PR fix
