@@ -3398,7 +3398,12 @@ def run_pr_loop(
                     # the converted ledger, so every reviewer reviews fresh.
                     conversion_pass = True
                     if current_resume is not None:
-                        current_resume = dataclasses_replace(current_resume, completed_reviews=())
+                        # The resumed round now carries the converted ledger (#2163): a
+                        # re-entry or closure built from it never restores the old one.
+                        current_resume = dataclasses_replace(
+                            current_resume, completed_reviews=(), prior_items=tuple(unresolved_items),
+                            next_unresolved_item_number=max(current_resume.next_unresolved_item_number,
+                                                            next_unresolved_item_number))
                     discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
                     # Re-admit conversion visibility; unsafe history never falls back.
                     try:
@@ -4288,9 +4293,16 @@ def run_pr_loop(
                     state.clear()
                 return closed
 
+            def _pr_reenter_round(resumed: object | None, *, conversion: bool = False) -> None:
+                """Every signal re-entry of round N restores the pre-scheduler state first (#2064, #2163)."""
+                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided, pending_conversion_pass
+                resumed_round, pending_conversion_pass = resumed, conversion
+                final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
+                pending_automatic_fallback_reasons[:] = list(restored)
+                round_sequence.repeat_current()
+
             def _pr_close_on_signal(signal: RoundIncompleteSignal) -> None:
                 """A former refusal site found round N incomplete before any post: close it and re-enter (#2064)."""
-                nonlocal resumed_round, final_sweep_pending, scheduler_calls_avoided, pending_conversion_pass
                 route = excluded_incomplete_round_route(evidence_pass=evidence_pass is not None,
                                                         recovery=skip_reviewers_for_recovery, conflict=conflict_pending)
                 if route is not None:
@@ -4320,17 +4332,13 @@ def run_pr_loop(
                         hidden_now.update(signal.published)
                         log(config, f"Round {round_number}: {', '.join(signal.published)} published only before "
                             "the conversion; re-entering the repeat without them as peers")
-                        resumed_round, pending_conversion_pass = current_resume, True
-                        round_sequence.repeat_current()
+                        _pr_reenter_round(current_resume, conversion=True)
                         return
                 if (current_resume is not None and current_resume.reconciliation_record is not None
                         and current_resume.reconciliation_record.index > floor):
                     # A reconciled round is already closed (#1553): re-enter so its own
                     # record rolls it over instead of launching beside public peers.
-                    resumed_round = dataclasses_replace(current_resume, completed_reviews=())
-                    final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
-                    pending_automatic_fallback_reasons[:] = list(restored)
-                    round_sequence.repeat_current()
+                    _pr_reenter_round(dataclasses_replace(current_resume, completed_reviews=()))
                     return
                 records = _pr_closure_ledger_records({}, floor=floor)
                 decision = decide_round_closure(
@@ -4340,17 +4348,15 @@ def run_pr_loop(
                 if decision is None:
                     raise signal
                 base = _pr_closure_base()
-                resumed_round = close_incomplete_round(
+                closed = close_incomplete_round(
                     runner, config=config, decision=decision, flow="pr", subject=current_pr_subject, number=pr_number,
                     comments_length=len(pr_comments), current_resume=base, prior_items=prior_unresolved_items,
                     published_records=records, next_item_number=max(next_unresolved_item_number, base.next_unresolved_item_number),
                     mint_record=_pr_mint_closed, bound_metadata=bound_pr_metadata,
                     post_comment=lambda body: post_pr_comment(runner, config=config, pr_number=pr_number, body=body))
                 pr_round_spool.discard()
-                pr_closure_item_ids.update(item.item_id for item in resumed_round.current_round_new_items)
-                final_sweep_pending, scheduler_calls_avoided, restored = closed_round_pre_scheduler
-                pending_automatic_fallback_reasons[:] = list(restored)
-                round_sequence.repeat_current()
+                pr_closure_item_ids.update(item.item_id for item in closed.current_round_new_items)
+                _pr_reenter_round(closed)
 
             # A reconciled round is closed (#1553): it never receives another
             # scheduling or reviewer record.  Recovery, qualification,

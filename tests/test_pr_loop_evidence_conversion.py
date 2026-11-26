@@ -1983,6 +1983,43 @@ def test_a_signal_naming_only_pre_conversion_peers_re_enters_the_repeat(tmp_path
     assert _records(runner)[-1].metadata.phase == "evidence-freeze"
 
 
+def test_an_operator_conversion_re_entry_keeps_the_converted_ledger_and_scheduler_state(tmp_path, monkeypatch):
+    """item-7 (#2163): the pre-conversion-only re-entry after an in-process operator conversion.
+
+    Round 3 resumed reconciled with item-1 blocking; the operator converts row-a
+    in process. A signal naming only pre-conversion Antigravity re-enters the
+    repeat, which must keep the converted ledger and the pre-scheduler state.
+    """
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    _signal_once(monkeypatch, published=("Antigravity",),
+                 unreplayable=(("Codex", "its withheld outcome is missing or no longer validates"),))
+    real_select = pr_loop_module.select_reviewers
+
+    def select_avoiding_calls(*args, **kwargs):
+        # Each scheduler decision reports avoided calls, so a re-entry that does
+        # not restore the pre-scheduler state would count them twice.
+        decision = real_select(*args, **kwargs)
+        return dataclasses.replace(decision, calls_avoided=decision.calls_avoided + 5)
+
+    monkeypatch.setattr(pr_loop_module, "select_reviewers", select_avoiding_calls)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context,
+                    config=dataclasses.replace(config, review_parallel=False))
+    conversion = _conversion(runner)
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    assert _closures(runner) == []
+    _assert_fresh_repeat(runner, conversion)
+    converted = [(i.item_id, i.status) for i in conversion.metadata.prior_items]
+    after = [r for r in _records(runner) if r.index > conversion.index]
+    # Every record of the re-entered repeat, up to the freeze, carries the converted ledger.
+    assert after and all([(i.item_id, i.status) for i in r.metadata.prior_items] == converted for r in after)
+    checkpoints = [r.metadata for r in after if r.metadata.phase == "scheduler-prelaunch"]
+    assert len(checkpoints) == 2  # the re-entry re-posts its checkpoint once
+    # The re-entry restores the pre-scheduler state, so the counter is not double-counted.
+    assert checkpoints[0].scheduler_calls_avoided == checkpoints[1].scheduler_calls_avoided
+
+
 def _partly_published_round_3(tmp_path, monkeypatch, context):
     """Round 3 publishes Antigravity's review, then stops before its reconciliation."""
     runner, config = _carried_panel_runner(
