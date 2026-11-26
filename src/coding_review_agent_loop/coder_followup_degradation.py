@@ -17,6 +17,11 @@ with no coder record.  This module turns that rejection into a record:
 Dropped fields never become claims: a dropped item ID is not addressed, a
 dropped citation is not evidence and a normalized disposition is ``blocked``.
 An unchanged head keeps today's rejection behaviour.
+
+When even the minimal synthesized record cannot be transported (the ledger
+exceeds a codec size limit, #2153), the pushed head gets a best-effort,
+metadata-free notice listing every carried item as not claimed; it is never
+admitted as a round record, and the run stops with the original error.
 """
 
 from __future__ import annotations
@@ -61,6 +66,14 @@ SYNTHESIZED_ID_LISTING_CHARS = 2000
 SYNTHESIZED_DIFFSTAT_LINES = 40
 SYNTHESIZED_DIFFSTAT_LINE_CHARS = 160
 SYNTHESIZED_RECORD_HEADING = "## Orchestrator-synthesized coder record"
+UNTRANSPORTABLE_NOTICE_REASON = "its record exceeded the round-metadata transport bound"
+UNTRANSPORTABLE_NOTICE_TEXT = (
+    "No round metadata could be attached to this notice, so it is not a round record: the "
+    "ledger in the latest admitted record stays authoritative, and every item listed above "
+    "stays open.\n\nThe PR cannot progress until an operator shrinks the ledger or closes "
+    "items in it."
+)
+_NOTICE_ID_LISTING_TIERS = (2000, 500, 120, 0)
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9._:/#-]{1,80}$")
 
 
@@ -522,6 +535,9 @@ class CoderFollowupRecovery:
         self.human_requirements_degraded = False
         self.original_error: BaseException | None = None
         self.record_posted = False
+        # Set once a best-effort post was attempted (success or failure), so
+        # a later failure path never repeats it (#2153).
+        self.record_attempted = False
 
     @property
     def requirements_in_force(self) -> bool:
@@ -621,12 +637,20 @@ class CoderFollowupRecovery:
             new_head = self._moved_head()
             if new_head is None:
                 return
+            self.record_attempted = True
             from .architecture_contract import _architecture_metadata_fields
-            from .coder_comment_budget import bounded_coder_round_comment
+            from .coder_comment_budget import CoderRecordUntransportableError, bounded_coder_round_comment
             from .round_metadata import _is_followup_dispatch_head
 
+            # An earlier degraded or synthesized recovery keeps its notes, so
+            # the record still says the response was degraded (#2153).
+            stop_note = (
+                f"The coder turn stopped ({type(error).__name__}) after pushing; "
+                "this record was synthesized from git."
+            )
+            prior_notes = self.notes if self.source is not None else ()
             self.source = "synthesized"
-            self.notes = (f"The coder turn stopped ({type(error).__name__}) after pushing; this record was synthesized from git.",)
+            self.notes = tuple(dict.fromkeys((*prior_notes, stop_note)))
             self.human_requirements_degraded = self.requirements_in_force
             text = self.synthesized_text(new_head, reason="the turn stopped before a response was accepted")
             metadata = self.metadata_factory(
@@ -639,14 +663,71 @@ class CoderFollowupRecovery:
                 **_architecture_metadata_fields(self.config),  # type: ignore[arg-type]
                 **self.metadata_fields(),
             )
-            bounded = bounded_coder_round_comment(
-                text, metadata, pr_number=self.pr_number, head_sha=new_head, freeform_text=text,
-                **self.budget_kwargs(),
-            )
+            try:
+                bounded = bounded_coder_round_comment(
+                    text, metadata, pr_number=self.pr_number, head_sha=new_head, freeform_text=text,
+                    **self.budget_kwargs(),
+                )
+            except CoderRecordUntransportableError as untransportable:
+                self.post_untransportable_notice(untransportable)
+                return
             self.post_body(bounded.posted_body)
             self.record_posted = True
         except Exception as secondary:  # noqa: BLE001 - never mask the stopping error
             log(self.config, f"PR #{self.pr_number}: could not post a synthesized coder record ({secondary})")
+
+    def post_untransportable_notice(self, error: BaseException) -> None:
+        """Post a claim-free, metadata-free notice for an untransportable record (#2153).
+
+        The notice carries no reserved protocol marker and no round metadata,
+        so it is never admitted as a round record: resume keeps the latest
+        admitted ledger with every item open.  Never raises.
+        """
+        if self.post_body is None:
+            return
+        try:
+            new_head = self._moved_head()
+            if new_head is None:
+                return
+            self.record_attempted = True
+            from .round_transport import MAX_GITHUB_BODY_CHARS
+
+            diffstat = bounded_diffstat(self.runner, self.workdir, self.pre_turn_head, new_head)
+            body = ""
+            for id_chars in _NOTICE_ID_LISTING_TIERS:
+                text = synthesize_coder_record_text(
+                    old_head=self.pre_turn_head, new_head=new_head, item_ids=self._item_ids(),
+                    diffstat=diffstat if id_chars else "(omitted)",
+                    reason=UNTRANSPORTABLE_NOTICE_REASON, id_listing_chars=id_chars,
+                )
+                lines = text.rstrip("\n").splitlines()
+                if lines and lines[-1].startswith("<!--"):
+                    lines.pop()
+                body = "\n".join(lines).rstrip() + "\n\n" + UNTRANSPORTABLE_NOTICE_TEXT
+                if len(body) <= MAX_GITHUB_BODY_CHARS:
+                    break
+            self.post_body(body)
+            self.record_posted = True
+            log(self.config, f"PR #{self.pr_number}: the coder record for `{new_head}` cannot be "
+                f"transported ({error}); posted a metadata-free notice")
+        except Exception as secondary:  # noqa: BLE001 - never mask the original error
+            log(self.config, f"PR #{self.pr_number}: could not post the untransportable-record notice ({secondary})")
+
+    def bound(self, make_bounded: Callable[[], object]) -> object:
+        """Bound the ordinary coder record; an untransportable one gets the notice (#2153).
+
+        Re-raises the recovery's original error when one is set (as ``post``
+        does), otherwise the untransportable error itself.
+        """
+        from .coder_comment_budget import CoderRecordUntransportableError
+
+        try:
+            return make_bounded()
+        except CoderRecordUntransportableError as untransportable:
+            self.post_untransportable_notice(untransportable)
+            if self.original_error is not None:
+                raise self.original_error from untransportable
+            raise
 
     def record_failed_push(self, error: BaseException) -> None:
         """Record a pushed head a later failure left without a coder record (#2087).
@@ -654,13 +735,15 @@ class CoderFollowupRecovery:
         A failure raised after the coder turn returned (for example evidence
         derivation) used to be covered by the legacy rejected-follow-up record.
         Now the head-moving turn gets a best-effort synthesized coder record,
-        unless a record was already posted or attempted for this turn, or the
-        error is fail-closed (the head or checkout cannot be trusted).  Never
+        unless a record was already posted or a best-effort post was already
+        attempted for this turn, or the error is fail-closed (the head or
+        checkout cannot be trusted).  A degraded or synthesized recovery whose
+        turn fails before its record is posted is covered too (#2153).  Never
         raises: the caller re-raises the original error.
         """
         from .pr_head_sync import PrHeadObservationError
 
-        if self.record_posted or self.source is not None:
+        if self.record_posted or self.record_attempted:
             return
         if isinstance(error, (PrHeadObservationError, CheckoutVerificationError)):
             return
@@ -730,9 +813,13 @@ class CoderFollowupRecovery:
     def post(self, publish: Callable[[], object]) -> object:
         """Post the coder record; a failed degraded post surfaces the original error."""
         if self.source is None:
-            return publish()
+            result = publish()
+            self.record_posted = True
+            return result
         try:
-            return publish()
+            result = publish()
+            self.record_posted = True
+            return result
         except Exception as secondary:
             log(self.config, f"PR #{self.pr_number}: could not post the {self.source} coder record "
                 f"({secondary}); surfacing the original coder error")

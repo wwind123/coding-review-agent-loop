@@ -11,6 +11,10 @@ record becomes a claim-free orchestrator-synthesized fallback (#2086): the
 ledger stays authoritative in ``prior_items`` (spilled as usual), the visible
 item listing and diffstat are capped, and nonessential metadata is omitted.
 The transport overflow error is only the internal fit probe and never escapes.
+A codec size limit (``RoundMetadataTooLargeError``) is also "does not fit" for
+every probe (#2153); only when the minimal tier, which keeps the ledger, still
+cannot be transported does the helper raise ``CoderRecordUntransportableError``.
+Serialization and provenance errors propagate with their own types.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from .errors import AgentLoopError
 from .comment_rendering import MAX_CODER_BOUND_LEVEL, render_public_agent_comment
 from .protocol_common import HTML_COMMENT_RE, SIGNATURE_RE
 from .round_metadata import PostedRoundMetadata, _attach_round_metadata
-from .round_transport import round_comment_fits
+from .round_transport import RoundMetadataTooLargeError, round_comment_fits
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +36,44 @@ FREEFORM_OMISSION_NOTE = (
     "comment size limit; the full text is in the round metadata."
 )
 _AUDIT_NOTE_CHARS = {3: 500, 4: 200}
+
+
+class CoderRecordUntransportableError(AgentLoopError):
+    """Even the minimal synthesized coder record cannot be transported (#2153).
+
+    The ledger (or the minimal kept metadata) exceeds a codec size limit, so no
+    postable round record exists for ``head_sha``.  The coder seam posts a
+    metadata-free notice instead and stops.
+    """
+
+    def __init__(
+        self, message: str, *, head_sha: str | None, old_head: str | None, item_ids: Sequence[str]
+    ) -> None:
+        super().__init__(message)
+        self.head_sha, self.old_head, self.item_ids = head_sha, old_head, tuple(item_ids)
+
+
+class _ProbeState:
+    """The last size cause a fit probe swallowed, for exception chaining."""
+
+    def __init__(self) -> None:
+        self.size_error: RoundMetadataTooLargeError | None = None
+
+
+def _fits(make_candidate: Callable[[], object], state: _ProbeState | None = None):
+    """Build one candidate and return it when it can be transported, else None.
+
+    ``make_candidate`` performs the metadata attachment.  A body-budget
+    overflow or a codec size limit means "does not fit"; every other error
+    propagates unchanged.
+    """
+    try:
+        candidate = make_candidate()
+        return candidate if round_comment_fits(candidate) else None  # type: ignore[arg-type]
+    except RoundMetadataTooLargeError as error:
+        if state is not None:
+            state.size_error = error
+        return None
 
 
 @dataclass(frozen=True)
@@ -161,6 +203,7 @@ def _synthesized_fallback(
         except Exception:  # noqa: BLE001 - display-only
             full_diffstat = "(diffstat unavailable)"
     attempts = ((2000, 40), (500, 10), (120, 3), (0, 0))
+    state = _ProbeState()
     for tier in (fallback, _minimal_fallback(fallback)):
         for id_chars, diff_lines in attempts:
             text = synthesize_coder_record_text(
@@ -169,16 +212,19 @@ def _synthesized_fallback(
                 reason="its record exceeded the GitHub comment size limit",
                 id_listing_chars=id_chars,
             )
-            candidate = _attach_round_metadata(text, tier, degradation_projection="compact")
-            if round_comment_fits(candidate):
+            candidate = _fits(
+                lambda: _attach_round_metadata(text, tier, degradation_projection="compact"), state
+            )
+            if candidate is not None:
                 LOGGER.info("PR #%s: coder round comment posted as the synthesized fallback", pr_number)
                 return BoundedCoderComment(candidate, FALLBACK_LEVEL, tier, coder_output=text)
     # Only the authoritative ledger and record identity remain, and even they
     # cannot be transported: there is no postable record to return.
-    raise AgentLoopError(
+    raise CoderRecordUntransportableError(
         f"PR #{pr_number}: even the minimal synthesized coder record cannot be transported "
-        "(the ledger itself exceeds the spill bound)."
-    )
+        "(the ledger itself exceeds the spill bound).",
+        head_sha=head_sha, old_head=old_head, item_ids=item_ids,
+    ) from state.size_error
 
 
 def _minimal_fallback(metadata: PostedRoundMetadata) -> PostedRoundMetadata:
@@ -215,8 +261,8 @@ def bounded_coder_round_comment(
     ``render_kwargs`` re-renders a structured follow-up at a bound level; for
     free-form output it is ``None`` and ``freeform_text`` is the original text.
     """
-    full = _attach_round_metadata(_with_audit_note(audit_note, full_body, 0), metadata)
-    if round_comment_fits(full):
+    full = _fits(lambda: _attach_round_metadata(_with_audit_note(audit_note, full_body, 0), metadata))
+    if full is not None:
         return BoundedCoderComment(full, 0, metadata)
     fallback = lambda: _synthesized_fallback(  # noqa: E731
         metadata, pr_number=pr_number, head_sha=head_sha, old_head=fallback_old_head,
@@ -228,7 +274,6 @@ def bounded_coder_round_comment(
             full_body, metadata, pr_number=pr_number, head_sha=head_sha,
             audit_note=audit_note, freeform_text=freeform_text, fallback=fallback,
         )
-    candidate = full
     heads: Sequence[str] = ()
     for level in range(1, MAX_CODER_BOUND_LEVEL + 1):
         if level == 2 and callable(evidence_heads):
@@ -241,12 +286,12 @@ def bounded_coder_round_comment(
             head_sha=head_sha,
             evidence_heads=heads,
         )
-        candidate = _attach_round_metadata(
+        candidate = _fits(lambda: _attach_round_metadata(
             _with_audit_note(audit_note, visible, level),
             metadata,
             degradation_projection="full" if level < 3 else "compact",
-        )
-        if round_comment_fits(candidate):
+        ))
+        if candidate is not None:
             LOGGER.info("PR #%s: coder round comment posted at bound level %s", pr_number, level)
             return BoundedCoderComment(candidate, level, metadata)
     return fallback()
@@ -315,26 +360,28 @@ def _bounded_freeform(
         visible = "\n\n".join(part for part in (text, FREEFORM_OMISSION_NOTE, trailer) if part)
         return _attach_round_metadata(_with_audit_note(audit_note, visible, 4), metadata)
 
+    # Every probe goes through ``_fits``, and the result reuses a fitted
+    # candidate, so no unprobed attachment can raise (#2153).
     low, high = 0, len(content)
-    if not round_comment_fits(build(0)):
+    best = _fits(lambda: build(0))
+    if best is None:
         return fallback()
     while low < high:
         middle = (low + high + 1) // 2
-        if round_comment_fits(build(middle)):
-            low = middle
+        fitted = _fits(lambda: build(middle))
+        if fitted is not None:
+            low, best = middle, fitted
         else:
             high = middle - 1
-    best = build(low)
     if low == 0 and content:
         # The first line alone does not fit: cut it at a character boundary.
         cut_low, cut_high = 0, len(content[0]) - 1
         while cut_low < cut_high:
             middle = (cut_low + cut_high + 1) // 2
-            if round_comment_fits(build(0, middle)):
-                cut_low = middle
+            fitted = _fits(lambda: build(0, middle))
+            if fitted is not None:
+                cut_low, best = middle, fitted
             else:
                 cut_high = middle - 1
-        if cut_low > 0:
-            best = build(0, cut_low)
     LOGGER.info("PR #%s: free-form coder round comment posted bounded", pr_number)
     return BoundedCoderComment(best, MAX_CODER_BOUND_LEVEL, metadata)

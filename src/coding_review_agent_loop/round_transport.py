@@ -106,6 +106,16 @@ class RoundCommentOverflowError(AgentLoopError):
     """
 
 
+class RoundMetadataTooLargeError(AgentLoopError):
+    """Round metadata exceeds a codec size limit (#2153).
+
+    Raised by the writer for the compressed payload limit, the decompressed
+    limit the reader enforces, and a spilled field's compressed limit, so a
+    caller can tell an oversized record from malformed or unauthorized input.
+    Serialization and provenance failures keep their own types.
+    """
+
+
 _OVERFLOW_ATTRIBUTED_FIELDS = 5
 
 
@@ -200,9 +210,12 @@ def encode_mapping(payload: Mapping[str, object]) -> str:
     raw = json.dumps(
         dict(payload), separators=(",", ":"), sort_keys=True, ensure_ascii=False
     ).encode()
+    if len(raw) > _MAX_DECOMPRESSED:
+        # The reader refuses this payload, so the writer never emits it.
+        raise RoundMetadataTooLargeError("Round metadata is too large to transport safely.")
     compressed = zlib.compress(raw, 9)
     if len(compressed) > _MAX_COMPRESSED:
-        raise AgentLoopError("Round metadata is too large to transport safely.")
+        raise RoundMetadataTooLargeError("Round metadata is too large to transport safely.")
     return "v1_" + _b64(compressed)
 
 
@@ -819,7 +832,9 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             return None
         packed = zlib.compress(raw_value, 9)
         if len(packed) > _MAX_COMPRESSED:
-            raise AgentLoopError(f"Round metadata field {field} is too large to spill safely.")
+            raise RoundMetadataTooLargeError(
+                f"Round metadata field {field} is too large to spill safely."
+            )
         raw_digest = hashlib.sha256(raw_value).hexdigest()
         packed_digest = hashlib.sha256(packed).hexdigest()
         encoded_packed = _b64(packed)

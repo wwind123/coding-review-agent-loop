@@ -425,3 +425,172 @@ def test_unchanged_or_unobservable_head_keeps_todays_rejection(tmp_path):
         with pytest.raises(AgentLoopError, match="rejected"):
             recovery.run(lambda: (_ for _ in ()).throw(error))
         assert recovery.source is None and recovery.metadata_fields() == {}
+
+
+# --- record_failed_push guard and the untransportable notice (#2153) --------
+
+import hashlib  # noqa: E402
+
+import coding_review_agent_loop.round_transport as round_transport  # noqa: E402
+from coding_review_agent_loop.errors import QuotaResetExceededError  # noqa: E402
+from coding_review_agent_loop.pr_head_sync import PrHeadObservationError  # noqa: E402
+from coding_review_agent_loop.protocol_markers import scan_reserved_markers  # noqa: E402
+from coding_review_agent_loop.round_state import _extract_round_metadata_records  # noqa: E402
+
+
+def _recovery_2153(tmp_path, *, posts, observe=lambda: HEAD, ledger=ITEMS, fail_post=False):
+    def post_body(body):
+        posts.append(body)
+        if fail_post:
+            raise AgentLoopError("GitHub write failed")
+
+    return CoderFollowupRecovery(
+        _Runner(), config=make_config(tmp_path), pr_number=77, pre_turn_head=OLD, ledger=ledger,
+        coder_name="OpenAI Codex", record_round=2, validator_factory=_factory(_Runner(), tmp_path),
+        human_requirements_context=None, workdir=tmp_path, observe_head=observe,
+        metadata_factory=lambda **fields: PostedRoundMetadata(**fields), post_body=post_body,
+    )
+
+
+def _posted_records(posts):
+    return [
+        record.metadata
+        for record in _extract_round_metadata_records([SimpleNamespace(body=body) for body in posts], flow="pr")
+    ]
+
+
+def test_synthesized_recovery_then_later_failure_posts_one_record(tmp_path):
+    """Row synthesized-then-later-failure."""
+    posts: list[str] = []
+    recovery = _recovery_2153(tmp_path, posts=posts)
+    response = recovery.run(lambda: (_ for _ in ()).throw(AgentLoopError("unparseable")))
+    assert recovery.source == "synthesized" and posts == []
+    later = AgentLoopError("derived evidence rejected")
+    recovery.record_failed_push(later)
+    recovery.record_failed_push(later)  # a second failure path never posts again
+    (record,) = _posted_records(posts)
+    assert record.subject == HEAD and record.coder_record_source == "synthesized"
+    assert tuple(record.prior_items) == ITEMS
+    notes = " ".join(record.coder_record_degradations)
+    assert "could not be parsed or degraded" in notes and "AgentLoopError" in notes
+    assert "coder_followup" not in (record.raw_structured_coder_response or "")
+    assert response.marker_value == "blocking"
+
+
+def test_degraded_recovery_then_later_failure_keeps_the_degraded_notes(tmp_path):
+    """Row degraded-then-later-failure at the seam helper."""
+    posts: list[str] = []
+    recovery = _recovery_2153(tmp_path, posts=posts)
+    recovery.source, recovery.notes = "degraded", ("Dropped unknown item ID(s) `item-99`; they are not addressed.",)
+    recovery.record_failed_push(AgentLoopError("derived evidence rejected"))
+    (record,) = _posted_records(posts)
+    assert record.coder_record_source == "synthesized"
+    assert record.coder_record_degradations[0].startswith("Dropped unknown item ID(s)")
+    assert "stopped (AgentLoopError)" in record.coder_record_degradations[-1]
+
+
+def test_failed_best_effort_attempt_is_not_retried(tmp_path):
+    """Row attempted-not-retried."""
+    posts: list[str] = []
+    recovery = _recovery_2153(tmp_path, posts=posts, fail_post=True)
+    stop = QuotaResetExceededError("quota reset is too far away")
+    with pytest.raises(QuotaResetExceededError) as raised:
+        recovery.run(lambda: (_ for _ in ()).throw(stop))
+    assert raised.value is stop
+    assert len(posts) == 1 and recovery.record_attempted and not recovery.record_posted
+    recovery.record_failed_push(stop)  # pr_loop's except block
+    assert len(posts) == 1
+
+
+@pytest.mark.parametrize("case", ["unchanged-head", "head-observation", "checkout-verification"])
+def test_fail_closed_or_unchanged_head_posts_nothing(tmp_path, case):
+    """Row fail-closed-and-unchanged."""
+    posts: list[str] = []
+    error = {
+        "unchanged-head": AgentLoopError("later"),
+        "head-observation": PrHeadObservationError("PR-head verification failed"),
+        "checkout-verification": degradation.CheckoutVerificationError("checkout changed"),
+    }[case]
+    observe = (lambda: OLD) if case == "unchanged-head" else (lambda: HEAD)
+    recovery = _recovery_2153(tmp_path, posts=posts, observe=observe)
+    recovery.record_failed_push(error)
+    if case == "unchanged-head":
+        recovery.post_untransportable_notice(error)
+    assert posts == []
+    unchanged = _recovery_2153(tmp_path, posts=posts, observe=lambda: OLD)
+    unchanged.post_untransportable_notice(AgentLoopError("untransportable"))
+    assert posts == []
+
+
+def _incompressible(chars, seed=""):
+    return "".join(
+        hashlib.sha256(f"{seed}:{n}".encode()).hexdigest() for n in range(chars // 64 + 1)
+    )[:chars]
+
+
+def _oversized_ledger_2153():
+    return tuple(
+        UnresolvedReviewItem(
+            item_id=f"item-{n}", reviewer="Codex", source_round=1,
+            text=_incompressible(2_000, seed=n), status="blocking",
+        )
+        for n in range(1, 11)
+    )
+
+
+def _assert_untransportable_notice(body, item_ids):
+    assert scan_reserved_markers(body) == () and "AGENT_LOOP_META" not in body
+    assert "<!--" not in body
+    assert _posted_records([body]) == []
+    assert "**Not claimed (every carried item stays open):**" in body
+    for item_id in item_ids:
+        assert f"`{item_id}`" in body
+    assert "round-metadata transport bound" in body
+    assert degradation.UNTRANSPORTABLE_NOTICE_TEXT in body
+
+
+def test_untransportable_record_on_the_best_effort_path_posts_the_notice(tmp_path, monkeypatch):
+    """Row untransportable-best-effort-path: real oversized ledger, lowered limits."""
+    monkeypatch.setattr(round_transport, "_MAX_COMPRESSED", 4_000)
+    posts: list[str] = []
+    ledger = _oversized_ledger_2153()
+    recovery = _recovery_2153(tmp_path, posts=posts, ledger=ledger)
+    stop = QuotaResetExceededError("quota reset is too far away")
+    with pytest.raises(QuotaResetExceededError) as raised:
+        recovery.run(lambda: (_ for _ in ()).throw(stop))
+    assert raised.value is stop
+    (body,) = posts
+    _assert_untransportable_notice(body, [item.item_id for item in ledger])
+    recovery.record_failed_push(stop)
+    assert len(posts) == 1
+
+
+def test_failed_notice_post_never_masks_the_original_error(tmp_path, monkeypatch, capsys):
+    """A failing notice post is logged; the stopping error still re-raises."""
+    monkeypatch.setattr(round_transport, "_MAX_COMPRESSED", 4_000)
+    posts: list[str] = []
+    recovery = _recovery_2153(tmp_path, posts=posts, ledger=_oversized_ledger_2153(), fail_post=True)
+    stop = QuotaResetExceededError("quota reset is too far away")
+    with pytest.raises(QuotaResetExceededError) as raised:
+        recovery.run(lambda: (_ for _ in ()).throw(stop))
+    assert raised.value is stop and len(posts) == 1
+
+
+def test_bound_reraises_the_recovery_original_error_after_the_notice(tmp_path):
+    """The ordinary-path wrapper: notice, then the recovery's original error."""
+    from coding_review_agent_loop.coder_comment_budget import CoderRecordUntransportableError
+
+    posts: list[str] = []
+    recovery = _recovery_2153(tmp_path, posts=posts)
+    original = AgentLoopError("unparseable")
+    recovery.run(lambda: (_ for _ in ()).throw(original))
+    untransportable = CoderRecordUntransportableError("too large", head_sha=HEAD, old_head=OLD, item_ids=())
+
+    def make_bounded():
+        raise untransportable
+
+    with pytest.raises(AgentLoopError) as raised:
+        recovery.bound(make_bounded)
+    assert raised.value is original and raised.value.__cause__ is untransportable
+    (body,) = posts
+    _assert_untransportable_notice(body, [item.item_id for item in ITEMS])
