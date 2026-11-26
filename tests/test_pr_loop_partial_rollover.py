@@ -50,8 +50,13 @@ NAMES = {"codex": "Codex", "gemini": "Gemini", "claude": "Claude"}
 
 
 def _reviewer_runs(runner):
-    """Every reviewer CLI invocation, including Claude as a reviewer."""
-    return [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["gemini"], ["claude"])]
+    """Every reviewer CLI invocation, including Claude and Antigravity (``agy``) reviewers.
+
+    Antigravity's model-catalog probe is not a reviewer turn, so it is excluded.
+    """
+    return [cmd[0] for cmd, _cwd in runner.commands
+            if cmd[:1] in (["codex"], ["gemini"], ["claude"])
+            or (cmd[:1] == ["agy"] and "catalog" not in cmd)]
 
 
 def _with_evidence(review, requests):
@@ -846,6 +851,8 @@ def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path,
     reviews = [r for r in _comment_records(runner, surface="pr", flow="pr") if r.role == "reviewer"]
     review_rounds = {r.agent: r.round_number for r in reviews}
     assert all(r.seat_binding == new for r in reviews)
+    # Positive control: the spy's instrumentation sees both Antigravity seats' turns.
+    assert _reviewer_runs(runner) == ["agy", "agy"]
     if state == "fresh":
         assert spool.publication_state("flash") == "absent"
         assert _closures(runner) == [] and seen == []
