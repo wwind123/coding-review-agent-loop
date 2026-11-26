@@ -37,7 +37,7 @@ from coding_review_agent_loop.round_metadata import (
 )
 from coding_review_agent_loop.round_state import _resume_pr_round
 
-from agent_loop_helpers import make_config, patch_attr_in, patch_object_in, structured_pr_review
+from agent_loop_helpers import FakeRunner, make_config, patch_attr_in, patch_object_in, structured_pr_review
 from test_review_parallel import (
     _PartialPublicationProbeRunner,
     _comment_records,
@@ -50,8 +50,13 @@ NAMES = {"codex": "Codex", "gemini": "Gemini", "claude": "Claude"}
 
 
 def _reviewer_runs(runner):
-    """Every reviewer CLI invocation, including Claude as a reviewer."""
-    return [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["gemini"], ["claude"])]
+    """Every reviewer CLI invocation, including Claude and Antigravity (``agy``) reviewers.
+
+    Antigravity's model-catalog probe is not a reviewer turn, so it is excluded.
+    """
+    return [cmd[0] for cmd, _cwd in runner.commands
+            if cmd[:1] in (["codex"], ["gemini"], ["claude"])
+            or (cmd[:1] == ["agy"] and "catalog" not in cmd)]
 
 
 def _with_evidence(review, requests):
@@ -233,6 +238,7 @@ def test_own_rejected_publication_closes_the_round_and_discards_the_replayable_p
     records = _comment_records(runner, surface="pr", flow="pr")
     assert sorted(r.agent for r in records if r.role == "reviewer" and r.round_number == 2) == ["Codex", "Gemini"]
     _no_deletion_advice(runner)
+
 
 
 # --- migration-stopped-partial ----------------------------------------------------
@@ -767,39 +773,148 @@ def test_partly_public_publication_rolls_the_round_over_without_posting_its_suff
     _no_deletion_advice(runner)
 
 
-@pytest.mark.parametrize("state", ["fresh", "began"])
-def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path, state):
-    """A spooled response saved under another seat binding (#2081 review item-1).
+def _seat_board(tmp_path, flash_model, **overrides):
+    """A named-seat board (flash, opus); ``flash_model`` sets flash's seat binding."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 
-    ``publication_state`` returns a plain string since #2081.  A never-published
-    (fresh) response is discarded and the reviewer reviews under the new binding;
-    a begun publication still refuses recovery.  Neither path may crash on the
-    return type.
-    """
-    from agent_loop_helpers import FakeRunner
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", (flash_model,)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir(exist_ok=True)
+    opus.workdir.mkdir(exist_ok=True)
+    return make_config(tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+                       pre_review_tests=False, agent_max_retries=0, **overrides)
 
-    old = {"version": 1, "seats": [{"seat": "codex", "model": "old-model"}]}
-    new = {"version": 1, "seats": [{"seat": "codex", "model": "new-model"}]}
-    runner = FakeRunner(
-        codex_outputs=[structured_pr_review(summary="Codex reviews under the new seat.")],
-        gemini_outputs=[structured_pr_review(summary="Gemini approves.", reviewer="Google Gemini")],
-    )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
-                         pr_seat_binding_override=new)
-    spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
-    spool.store("Codex", {"text": structured_pr_review(summary="Stale under the old seat."),
+
+def _seat_review(seat, model, summary, **kwargs):
+    return (structured_pr_review(summary=summary, reviewer=f"{seat} (Google Antigravity: {model})", **kwargs), 0)
+
+
+def _old_seat_binding(tmp_path):
+    """flash's binding under the previous model, taken from a real board."""
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+
+    return reviewer_seat_binding(_seat_board(tmp_path, "Model A"))
+
+
+def _seed_old_seat_record(spool, state, old):
+    """Store flash's round-1 record under ``old`` in publication ``state``."""
+    spool.store("flash", {"text": structured_pr_review(summary="Stale under the old seat."),
                           "seat_binding": old})
-    if state == "began":
-        spool.mark_publication_began("Codex")
-    assert spool.publication_state("Codex") == state
+    if state != "fresh":
+        path = spool._path("flash")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if state == "began":
+            payload["publication"] = {"began_at": "2026-11-26T00:00:00+00:00"}
+        elif state == "legacy":
+            del payload["carrier_protocol"]
+        else:  # malformed: a non-mapping publication mark on a loadable record
+            payload["publication"] = None
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    assert spool.publication_state("flash") == state
+    # The record still loads, so it reaches the seat-reconfiguration check.
+    assert spool.load("flash") is not None and spool.load("flash")["seat_binding"] == old
 
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+@pytest.mark.parametrize("state", ["fresh", "began", "legacy", "malformed"])
+def test_seat_reconfiguration_reads_the_spool_publication_state_string(tmp_path, monkeypatch, state, policy):
+    """A spooled response saved under another seat binding (#2081 item-1, #2150).
+
+    flash's seat moved from Model A to Model C.  A never-published (fresh)
+    record is discarded and flash reviews round 1 under the new binding, with
+    no closure.  A began, legacy or malformed record is no longer a terminal
+    stop: before any reviewer launches, round 1 closes with one
+    closed-incomplete record naming flash as unreplayable, the stale text is
+    never posted, and both seats review round 2 under the new binding.  The
+    same holds for the non-selective and the selective board.
+    """
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+    from coding_review_agent_loop.round_closure_writer import _POSSIBLY_PUBLIC_STATES
+
+    old = _old_seat_binding(tmp_path)
+    config = _seat_board(tmp_path, "Model C", review_parallel=True, pr_review_policy=policy)
+    new = reviewer_seat_binding(config)
+    assert new is not None and old is not None and new != old
+    runner = FakeRunner(antigravity_outputs=[
+        _seat_review("flash", "Model C", "flash reviews under the new seat."),
+        _seat_review("opus", "Model B", "opus approves."),
+    ])
+    spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
+    _seed_old_seat_record(spool, state, old)
+    seen = _spy_closure(monkeypatch, runner)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not any("Stale under the old seat." in body for body in runner.comments)
+    assert not any("refusing recovery" in body for body in runner.comments)
+    _no_deletion_advice(runner)
+    reviews = [r for r in _comment_records(runner, surface="pr", flow="pr") if r.role == "reviewer"]
+    review_rounds = {r.agent: r.round_number for r in reviews}
+    assert all(r.seat_binding == new for r in reviews)
+    # Positive control: the spy's instrumentation sees both Antigravity seats' turns.
+    assert _reviewer_runs(runner) == ["agy", "agy"]
     if state == "fresh":
-        assert run_pr_loop(runner, pr_number=77, config=config) == 0
-        assert spool.publication_state("Codex") == "absent"
-        assert "codex" in [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
-        assert not any("Stale under the old seat." in body for body in runner.comments)
-    else:
-        with pytest.raises(AgentLoopError, match="under another seat binding; refusing recovery"):
-            run_pr_loop(runner, pr_number=77, config=config)
-        assert spool.publication_state("Codex") == "began"
-        assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] in (["codex"], ["gemini"])]
+        assert spool.publication_state("flash") == "absent"
+        assert _closures(runner) == [] and seen == []
+        assert review_rounds == {"flash": 1, "opus": 1}
+        return
+    (closure,) = _closures(runner)
+    assert closure.round_number == 1
+    assert seen == [[]]  # no reviewer launched before the round-1 closure
+    unreplayable = {e["agent"]: e["cause"] for e in closure.round_closure["unreplayable"]}
+    assert unreplayable["flash"] == _POSSIBLY_PUBLIC_STATES[state]
+    assert review_rounds == {"flash": 2, "opus": 2}
+    assert not runner.antigravity_outputs
+
+@pytest.mark.parametrize("review_parallel", [True, False], ids=["parallel", "sequential"])
+def test_stale_seat_record_beside_an_admitted_public_anchor_is_removed_without_closing(tmp_path, review_parallel):
+    """`seat-public-anchor` (#2150): flash's round-1 anchor is public under the
+    current seat binding and resume admits it, while a stale begun record
+    under flash's old binding remains in the spool.
+
+    The seat-reconfiguration check keeps the record; the preflight then
+    removes it because flash's public anchor was admitted.  opus's withheld
+    outcome replays, so round 1 completes with no closure, no duplicate
+    anchor, and the stale text is never posted.
+    """
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
+
+    def board(flash_model):
+        flash = SeatAgent(ReviewerSeat("flash", "codex", (flash_model,)), tmp_path / "flash")
+        opus = SeatAgent(ReviewerSeat("opus", "gemini", ("Model B",)), tmp_path / "opus")
+        flash.workdir.mkdir(exist_ok=True)
+        opus.workdir.mkdir(exist_ok=True)
+        config = make_config(tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+                             review_parallel=True, pre_review_tests=False, agent_max_retries=0)
+        return config, flash, opus
+
+    old = reviewer_seat_binding(board("Model A")[0])
+    config, flash, opus = board("Model C")
+    assert reviewer_seat_binding(config) != old
+    markers = ("flash approves independently.", "opus approves independently.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers, slow_reviewer="gemini",
+        codex_outputs=[structured_pr_review(summary=markers[0], reviewer="flash (OpenAI Codex: Model C)")],
+        gemini_outputs=[structured_pr_review(summary=markers[1], reviewer="opus (Google Gemini: Model B)")],
+    )
+    _interrupt_pr(runner, config, markers, at=2)
+    assert [_published_count(runner, m) for m in markers] == [1, 0]
+    spool = pr_loop._review_round_spool(config, surface="pr", number=77, round_number=1, subject=HEAD)
+    assert spool.publication_state("flash") == "absent"
+    assert spool.publication_state("opus") == "fresh"  # opus's withheld outcome is replayable
+    spool.store("flash", {"text": structured_pr_review(summary="Stale under the old seat."),
+                          "seat_binding": old})
+    spool.mark_publication_began("flash")
+    assert spool.publication_state("flash") == "began"
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, review_parallel=review_parallel)) == 0
+
+    assert _closures(runner) == []
+    assert spool.publication_state("flash") == "absent"  # the stale record was removed
+    assert [_published_count(runner, m) for m in markers] == [1, 1]  # no duplicate anchor
+    assert runner.reviewer_launches == launches_before  # nobody re-ran round 1
+    assert not any("Stale under the old seat." in body for body in runner.comments)
+    reviews = [r for r in _comment_records(runner, surface="pr", flow="pr") if r.role == "reviewer"]
+    assert sorted((r.agent, r.round_number) for r in reviews) == [("flash", 1), ("opus", 1)]
+    _no_deletion_advice(runner)

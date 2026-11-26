@@ -4145,14 +4145,12 @@ def run_pr_loop(
                     saved = pr_round_spool.load(name)
                     if saved is None or saved.get("failure") is not None or saved.get("seat_binding") == seat_binding:
                         continue
-                    state = pr_round_spool.publication_state(name)
-                    if state == "fresh":
+                    # A began, legacy or malformed record stays: the round-start
+                    # closure or the spool preflight closes the round on ordinary
+                    # routes, and routes that skip reviewers never read it (#2150, #2064).
+                    if pr_round_spool.publication_state(name) == "fresh":
                         pr_round_spool.remove(name)
                         log(config, f"Discarded unpublished {name} response checkpoint after seat reconfiguration")
-                    else:
-                        raise AgentLoopError(
-                            f"{name} has a published or unprovable response checkpoint under another seat binding; refusing recovery."
-                        )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
                 return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: (validate_associations if human_evidence.freeze else lambda parsed, *_: parsed)(_validate_review_response(
