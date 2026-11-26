@@ -2020,6 +2020,60 @@ def test_an_operator_conversion_re_entry_keeps_the_converted_ledger_and_schedule
     assert checkpoints[0].scheduler_calls_avoided == checkpoints[1].scheduler_calls_avoided
 
 
+@pytest.mark.parametrize("boundary", ["unresolved", "foreign"])
+def test_an_operator_conversion_on_a_reconciled_round_drops_the_stale_reconciliation(tmp_path, monkeypatch, boundary):
+    """item-8 (#2163): the in-process conversion clears the resumed round's pre-conversion reconciliation.
+
+    Round 3 resumed reconciled; the operator converts row-a in process. With an
+    unresolved boundary the round-start decision must stop retryably before any
+    checkpoint; with a foreign conversion comment (no boundary) it must close
+    the round on the converted ledger, never roll over the stale reconciliation.
+    """
+    import coding_review_agent_loop.pr_loop_support as support
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    reconciliation = [r for r in _records(runner) if r.metadata.phase == "reconciliation"][-1]
+    assert reconciliation.metadata.round_number == 3
+    if boundary == "unresolved":
+        _fail_boundary_identity_reads(monkeypatch)
+    else:
+        real_apply = support._apply_evidence_conversion
+
+        def apply_then_forge(*args, **kwargs):
+            outcome = real_apply(*args, **kwargs)
+            runner.pr_payload["comments"][-1]["author"] = {"login": "mallory"}
+            runner.pr_payload["comments"][-1]["_rest_author_id"] = 999
+            return outcome
+
+        monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_forge)
+    launches = _launches(runner)
+    config = dataclasses.replace(config, review_parallel=False)
+    if boundary == "unresolved":
+        with pytest.raises(RoundStateReadError) as refused:
+            run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config)
+        _assert_unresolved_boundary_refusal(str(refused.value))
+        assert any(entry.name == "_pr_round_closure" for entry in refused.traceback)
+        conversion = _conversion(runner)
+        # Nothing after the conversion: no checkpoint, no closure, no reviewer.
+        assert [r for r in _records(runner) if r.index > conversion.index] == []
+        assert _launches(runner) == launches
+        return
+    runner.codex_outputs.append(_repeat_review())
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, approved_plan_context=context, config=config)
+    conversion = _conversion(runner)
+    [closure] = _closures(runner)
+    assert closure.metadata.round_number == 3 and closure.index > conversion.index
+    assert [name for name, _cid in _closure_published(closure)] == ["Antigravity"]
+    # The closure carries the converted ledger, not the stale reconciliation's.
+    assert [(i.item_id, i.status) for i in closure.metadata.prior_items] == [
+        ("item-1", "converted"), ("item-2", "blocking"),
+    ]
+    assert not any(r.index > conversion.index and r.metadata.round_number == 3
+                   and r.metadata.role == "reviewer" for r in _records(runner))
+
+
 def _partly_published_round_3(tmp_path, monkeypatch, context):
     """Round 3 publishes Antigravity's review, then stops before its reconciliation."""
     runner, config = _carried_panel_runner(

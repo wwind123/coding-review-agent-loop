@@ -3398,10 +3398,12 @@ def run_pr_loop(
                     # the converted ledger, so every reviewer reviews fresh.
                     conversion_pass = True
                     if current_resume is not None:
-                        # The resumed round now carries the converted ledger (#2163): a
-                        # re-entry or closure built from it never restores the old one.
+                        # The resumed round becomes a conversion handoff (#2163), as on
+                        # resume: the converted ledger and no pre-conversion reviews or
+                        # reconciliation, so no re-entry, closure or rollover restores them.
                         current_resume = dataclasses_replace(
-                            current_resume, completed_reviews=(), prior_items=tuple(unresolved_items),
+                            current_resume, completed_reviews=(), reconciliation_record=None,
+                            prior_items=tuple(unresolved_items),
                             next_unresolved_item_number=max(current_resume.next_unresolved_item_number,
                                                             next_unresolved_item_number))
                     discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
