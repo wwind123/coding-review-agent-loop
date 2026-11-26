@@ -3073,7 +3073,6 @@ def _permission_args(tmp_path, *extra):
 
 
 SANDBOXED_HELPERS = (
-    "--repair-backend", "claude", "--repair-model", "claude-haiku-4-5",
     "--semantic-followup-backend", "claude",
 )
 
@@ -3130,8 +3129,8 @@ def test_sandboxed_rejects_every_passthrough_agent_arg(tmp_path, passthrough):
 
 
 def test_sandboxed_no_longer_names_a_repair_backend_before_command_preflight(tmp_path):
-    # --repair-backend is a deprecated no-op (#2066): sandboxed mode needs no
-    # repair selection, while the semantic follow-up selection still applies.
+    # No repair pass exists (#2066, #2162): sandboxed mode needs no repair
+    # selection, while the semantic follow-up selection still applies.
     args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", "--semantic-followup-backend", "claude")
     config_from_args(args, FakeRunner())
     args = _permission_args(tmp_path, "--agent-permissions", "sandboxed")
@@ -5239,9 +5238,8 @@ def _preflight_args(monkeypatch, extra, missing=("agy",)):
     return args, detection_calls, which_calls
 
 
-@pytest.mark.parametrize("extra", [[], ["--repair-backend", "antigravity"]])
-def test_config_preflight_never_requires_agy_for_the_retired_repair_backend(monkeypatch, extra):
-    args, _, which_calls = _preflight_args(monkeypatch, extra)
+def test_config_preflight_never_requires_agy_without_an_antigravity_role(monkeypatch):
+    args, _, which_calls = _preflight_args(monkeypatch, [])
     monkeypatch.setattr(
         "coding_review_agent_loop.config.detect_repo",
         lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
@@ -5266,33 +5264,19 @@ def test_config_preflight_antigravity_role_keeps_generic_message(monkeypatch):
     assert str(exc.value) == "agy CLI not found on PATH; install it or pass --antigravity-cmd <path>."
 
 
-def test_config_preflight_explicit_codex_repair_does_not_look_up_agy(monkeypatch):
-    args, _, which_calls = _preflight_args(
-        monkeypatch, ["--repair-backend", "codex", "--repair-model", "X"]
-    )
-    monkeypatch.setattr(
-        "coding_review_agent_loop.config.detect_repo",
-        lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
-    )
-    with pytest.raises(RuntimeError, match="past preflight"):
-        config_from_args(args, Runner())
-    assert "agy" not in which_calls
-    assert args.repair_backend == "codex"
-    assert args.repair_model == ["X"]
+def test_repair_backend_is_rejected_at_startup(capsys):
+    """#2162: the retired repair flags are a startup error, not a no-op."""
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(["task", "x", "--repair-backend", "codex"])
+    assert raised.value.code == 2
+    assert "no repair pass exists" in capsys.readouterr().err
 
 
-def test_config_preflight_codex_repair_without_model_is_accepted(monkeypatch):
-    args, _, _ = _preflight_args(
-        monkeypatch, ["--repair-backend", "codex", "--repo", "owner/repo"], missing=()
-    )
-    config_from_args(args, Runner())
-
-
-def test_repair_backend_help_says_deprecated_noop(capsys):
+def test_repair_backend_is_absent_from_help(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["task", "x", "--help"])
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "Deprecated no-op. A rejected structured response is re-asked to the same agent" in help_text
+    assert "--repair-backend" not in help_text
     assert "agy CLI even when no role uses Antigravity" not in help_text
 
 

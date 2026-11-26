@@ -196,7 +196,7 @@ def test_completion_only_dry_run_and_closed_tracker(tmp_path, monkeypatch, capsy
 
 def test_recovery_option_boundary():
     runtime.validate_recovery_options(None, ['agent-loop', 'pr', '1', '--reconcile-post-merge-obligations', '--dry-run'])
-    for option in ('--auto-merge', '--managed-ci', '--review-unrecorded-head', '--test-command'):
+    for option in ('--auto-merge', '--managed-ci', '--max-rounds', '--test-command'):
         with pytest.raises(AgentLoopError):
             runtime.validate_recovery_options(None, ['agent-loop', 'pr', '1', option])
 

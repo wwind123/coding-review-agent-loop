@@ -5329,21 +5329,43 @@ def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_std
     assert args.issue_number == 643
 
 
-def test_recovery_renderer_skips_the_plan_primary_stall_rounds_value(tmp_path):
-    """The stall threshold's integer value is not mistaken for the issue (#1103)."""
+def test_recovery_renderer_skips_live_value_option_values(tmp_path):
+    """A live value option's payload is not mistaken for the issue (#1103, #2162).
+
+    `recovery-command-roundtrip`: the rendered command parses again, keeps
+    each live value, and never names a flag removed in #2162.
+    """
+    from coding_review_agent_loop.cli import RETIRED_FLAGS
+
     parser = build_parser()
     config = make_config(
         tmp_path,
         invocation_argv=(
             "agent-loop", "issue", "--plan-review-policy", "primary-then-panel",
-            "--plan-primary-stall-rounds", "3", "643",
+            "--no-progress-rounds", "3", "--plan-sweep-reasoning-effort", "high",
+            "--pr-evidence-stall-rounds", "4", "--containment-coder-memory-high", "1G", "643",
         ),
     )
     rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
-    args = parser.parse_args(shlex.split(rendered)[1:])
+    tokens = shlex.split(rendered)
+    assert not set(tokens) & set(RETIRED_FLAGS)
+    args = parser.parse_args(tokens[1:])
     assert args.command == "issue"
     assert args.issue_number == 643
-    assert args.plan_primary_stall_rounds == 3
+    assert args.no_progress_rounds == 3
+    assert args.plan_sweep_reasoning_effort == "high"
+    assert args.pr_evidence_stall_rounds == 4
+    assert args.containment_coder_memory_high == "1G"
+
+
+def test_recovery_value_options_list_no_retired_flag():
+    """`recovery-command-roundtrip`: the replay table drops every #2162 flag."""
+    from coding_review_agent_loop.cli import RETIRED_FLAGS
+    from coding_review_agent_loop.managed_ci_recovery_commands import _RECOVERY_VALUE_OPTIONS
+
+    assert not _RECOVERY_VALUE_OPTIONS & set(RETIRED_FLAGS)
+    for live in ("--no-progress-rounds", "--plan-sweep-reasoning-effort", "--pr-evidence-stall-rounds"):
+        assert live in _RECOVERY_VALUE_OPTIONS
 
 
 @pytest.mark.parametrize("protocol", ["https", "ssh"])
@@ -5412,6 +5434,10 @@ def test_recovery_renderer_keeps_fixture_foreign_scopes_1995(tmp_path):
 
 
 def test_recovery_value_option_table_covers_all_recovery_subparsers():
+    # Retired flags (#2162) are a startup error, so a recorded invocation can
+    # never carry one and the replay table need not classify them.
+    from coding_review_agent_loop.cli import RETIRED_FLAGS
+
     parser = build_parser()
     subparsers = next(action for action in parser._actions if action.dest == "command")
 
@@ -5422,7 +5448,7 @@ def test_recovery_value_option_table_covers_all_recovery_subparsers():
             for action in subparser._actions
             if action.nargs != 0
             for option in action.option_strings
-            if option.startswith("--")
+            if option.startswith("--") and option not in RETIRED_FLAGS
         }
         assert value_options <= _managed_ci_recovery_commands._RECOVERY_VALUE_OPTIONS, (
             f"{command} value-taking recovery options are not classified: "
@@ -13577,7 +13603,7 @@ def test_recovery_renderer_never_replays_plan_reset_stall_streak(tmp_path, targe
         tmp_path,
         invocation_argv=(
             "agent-loop", "issue", "643", "--plan-first",
-            "--plan-reset-stall-streak", "--plan-primary-stall-rounds", "3",
+            "--plan-reset-stall-streak", "--no-progress-rounds", "3",
             "--reviewer", "codex",
         ),
     )
@@ -13589,7 +13615,7 @@ def test_recovery_renderer_never_replays_plan_reset_stall_streak(tmp_path, targe
     assert "--plan-reset-stall-streak" not in tokens
     assert "--reviewer" in tokens
     if target == "issue":
-        assert tokens[tokens.index("--plan-primary-stall-rounds") + 1] == "3"
+        assert tokens[tokens.index("--no-progress-rounds") + 1] == "3"
 
 
 class _CheckoutSetupReached(Exception):

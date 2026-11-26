@@ -122,11 +122,10 @@ def settings_lock_turn_bound_seconds(
     """Longest agy turn this invocation may hold the settings lock for.
 
     Role-independent on purpose: the same bound is the fallback allowance for
-    an unknown holder, which may be a reviewer, coder or repair turn.
+    an unknown holder, which may be a reviewer or coder turn.
     """
     return float(max(
         config.antigravity_print_timeout_seconds,
-        config.repair_timeout_seconds,
         timeout_seconds or 0,
     ))
 
@@ -1082,7 +1081,7 @@ _SEMANTIC_DEDUPE_ROLE = "semantic-dedupe"
 # Roles that run in an isolated temporary directory with no tools: the GEMINI
 # lock sits beside the temp dir, no checkout snapshot is taken, and the strict
 # empty-allowlist settings are injected for the turn (#1472).
-_ISOLATED_NO_TOOL_ROLES = frozenset({"repair", _SEMANTIC_DEDUPE_ROLE})
+_ISOLATED_NO_TOOL_ROLES = frozenset({_SEMANTIC_DEDUPE_ROLE})
 
 _SEMANTIC_DEDUPE_GEMINI_MD = """# Agent Loop Classification
 
@@ -1109,15 +1108,6 @@ then print only the bare JSON object requested above, and end your turn
 immediately with no further output.
 """
 
-
-_REPAIR_GEMINI_MD = """# Agent Loop Format Repair
-
-This is a single-shot formatting-only repair task in an isolated temporary directory.
-Do not inspect files, run shell commands or tests, mutate any repository, start
-background tasks, or invoke subagents. Use only the malformed response and protocol
-examples in the prompt. Return the repaired response immediately.
-
-"""
 
 # `agy --print` normally emits a small amount of startup chrome before it can
 # reach the Node launcher. Replacement replay is safe only when every residual
@@ -1697,9 +1687,7 @@ class AntigravityBackend:
             raise CheckoutVerificationError(
                 f"cannot resolve the GEMINI lock for {config.antigravity_dir}: {exc}"
             ) from exc
-        if role == "repair":
-            single_shot_instruction = _REPAIR_GEMINI_MD
-        elif role == _SEMANTIC_DEDUPE_ROLE:
+        if role == _SEMANTIC_DEDUPE_ROLE:
             single_shot_instruction = _SEMANTIC_DEDUPE_GEMINI_MD
         else:
             single_shot_instruction = single_shot_session_instruction(config.base)
@@ -1858,16 +1846,11 @@ class AntigravityBackend:
                                 config.coder_test_command_timeout_seconds
                             ),
                             **agent_shell_environment(config, "antigravity", role),
-                            # Managed-CI coder/repair turns, including
-                            # run_repair: refuse CI-triggering gh (#1366).
+                            # Managed-CI coder turns: refuse CI-triggering gh (#1366).
                             **coder_ci_guard_environment(config, "antigravity", role),
                         },
                         use_pty=True,
-                        timeout_seconds=(
-                            config.repair_timeout_seconds
-                            if role == "repair"
-                            else timeout_seconds
-                        ),
+                        timeout_seconds=timeout_seconds,
                     )
                     # The stdout-only silence check is necessary for the
                     # final one, so normal turns pay no directory listing.
@@ -1947,8 +1930,6 @@ class AntigravityBackend:
 
         # Prefer the public response file the prompt asks the agent to write; else
         # keep only what follows the public-response marker in stdout; else stdout.
-        if role == "repair":
-            response_file_text = read_public_response_file(response_path)
         assert result is not None
         # A classification turn answers on stdout only; a response file left
         # by another turn is never mistaken for its answer.
@@ -2096,35 +2077,6 @@ class AntigravityBackend:
             _settings_lock_sleep(min(SETTINGS_LOCK_POLL_SECONDS, window_left, overall_left))
         if announced:
             log(config, f"{seat_label} acquired shared agy settings lock after {_settings_lock_monotonic() - started:.1f}s")
-
-    def run_repair(
-        self,
-        runner: Runner,
-        config: AgentLoopConfig,
-        prompt: str,
-        *,
-        model: str,
-        run_id: str | None = None,
-        log_path: Path | None = None,
-    ) -> AgentResult:
-        """Run one isolated, no-tools Antigravity format-repair attempt."""
-        repair_root = make_private_dirs(scratch_root() / "repair")
-        with tempfile.TemporaryDirectory(prefix="agy-", dir=repair_root) as temp_dir:
-            workdir = Path(temp_dir)
-            repair_config = replace(
-                config,
-                antigravity_dir=workdir,
-                antigravity_model=None,
-                antigravity_models=(model,),
-            )
-            return self.run(
-                runner,
-                repair_config,
-                prompt,
-                run_id=run_id,
-                role="repair",
-                log_path_override=log_path,
-            )
 
 
 BACKEND = AntigravityBackend()

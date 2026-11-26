@@ -109,8 +109,6 @@ def _run(runner, config, *, judgement=True, omission=False, kind="pr_review"):
         repair_expected_kind=kind,
         role="reviewer",
         operation_description="PR review",
-        reask_on_missing_judgement_field=judgement,
-        reask_on_prior_disposition_omission=omission,
     )
 
 
@@ -228,7 +226,6 @@ def _run_real(runner, config, *, judgement=True, agent="codex"):
         repair_expected_kind="pr_review",
         role="reviewer",
         operation_description="PR review",
-        reask_on_missing_judgement_field=judgement,
     )
 
 

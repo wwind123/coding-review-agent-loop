@@ -21,3 +21,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - The pre-reviewer checkpoint rule now feeds the round-closure decision rather than a deletion listing: a half-published unreconciled round closes as incomplete and rolls over (#2081, #2064).
 
 - 2026-11-24: The primary-phase stall stop, the plan step-back escalation stop and the step-back deferral checkpoint are removed. The plan step-back episode is replay-derived from review records, `--plan-reset-stall-streak` now restarts the no-progress window and is stamped and decoded in any staged phase (#2098).
+
+- 2026-11-25: `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds` and `--plan-sweep-rounds` are removed after their one-release window and are now startup errors naming `--no-progress-rounds`; `--plan-sweep-reasoning-effort` stays live (#2162, #2098).

@@ -309,8 +309,8 @@ def test_guard_composes_with_rest_shim(tmp_path, ambient_real):
 # ------------------------------------------------------------ role scope ---
 
 
-@pytest.mark.parametrize("role", ["coder", "repair"])
-def test_guard_environment_present_for_guarded_coder_and_repair(tmp_path, role):
+@pytest.mark.parametrize("role", ["coder"])
+def test_guard_environment_present_for_guarded_coder(tmp_path, role):
     fake, _ = _fake_gh(tmp_path / "bin")
     config = replace(make_config(tmp_path), coder_ci_dispatch_guard=True)
     env = coder_ci_guard_environment(
@@ -321,13 +321,14 @@ def test_guard_environment_present_for_guarded_coder_and_repair(tmp_path, role):
     assert env[TARGET_ENV] == str(fake)
 
 
-@pytest.mark.parametrize("role", ["reviewer", "planner", "step_back", None])
+# The repair role was removed with the repair pass (#2066, #2162).
+@pytest.mark.parametrize("role", ["reviewer", "planner", "step_back", "repair", None])
 def test_guard_environment_absent_for_other_roles(tmp_path, role):
     config = replace(make_config(tmp_path), coder_ci_dispatch_guard=True)
     assert coder_ci_guard_environment(config, "claude", role, root=tmp_path / "root") == {}
 
 
-@pytest.mark.parametrize("role", ["coder", "repair"])
+@pytest.mark.parametrize("role", ["coder"])
 def test_guard_environment_absent_when_unmanaged(tmp_path, role):
     config = replace(make_config(tmp_path), managed_ci=True, auto_merge=True)
     # Never derived from managed_ci / auto-merge: only the invocation flag counts.
@@ -358,7 +359,7 @@ def test_every_coder_launch_site_uses_the_shared_helper():
 
 
 def test_module_exports_are_stable():
-    assert coder_ci_guard.GUARD_ROLES == frozenset({"coder", "repair"})
+    assert coder_ci_guard.GUARD_ROLES == frozenset({"coder"})
 
 
 # ------------------------------------------- agent-loop executable pin (#1632) ---

@@ -153,7 +153,6 @@ def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, 
             marker_description="structured issue_implementation result",
             validate=_sequenced_validator(catalogs, invoke), role="coder",
             repair_expected_kind="issue_implementation", session_id="caller",
-            reask_on_evidence_rejection=True,
         )
     assert response.marker_value is not None
     assert invoke.call_count == 3

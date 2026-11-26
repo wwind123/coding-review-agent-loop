@@ -3191,7 +3191,6 @@ def _run_plan_first_loop_body(
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="plan review",
-                            reask_on_missing_judgement_field=True,
                         )
                     except AgentLoopError as exc:
                         # Includes QuotaResetExceededError: captured here and
@@ -3364,7 +3363,6 @@ def _run_plan_first_loop_body(
                         repair_resolved_history_item_ids=round_resolved_history_item_ids,
                         role="reviewer",
                         operation_description="plan review",
-                        reask_on_missing_judgement_field=True,
                     ),
                 ))
                 if sequential_failure is not None:

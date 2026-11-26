@@ -23,7 +23,7 @@ def setup_config(tmp_path, monkeypatch, provider="claude", *, named=False, mode=
     executable.chmod(0o700)
     secondary = "codex" if provider == "claude" else "claude"
     config = make_config(tmp_path, reviewer=(provider, secondary), primary_reviewer=provider,
-                         pr_review_policy="primary-then-panel", repair_backend="codex", repair_models=("gpt-6.1-sol",),
+                         pr_review_policy="primary-then-panel",
                          semantic_followup_backend="codex",
                          agent_permissions=mode,
                          **{f"{provider}_cmd": str(executable), f"{provider}_model": "agent-wide-conflict",
@@ -128,7 +128,7 @@ def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, 
         return validated_agent._run_validated_agent(
             runner, agent=agent, config=config, prompt="visible defects", role="reviewer",
             marker_description="visual", timeout_seconds=30, image_inputs=images,
-            validate=validate, reask_on_evidence_rejection=True)
+            validate=validate)
     if cleanup == "unconfirmed":
         with pytest.raises(AgentLoopError, match="cleanup-failed"):
             run()

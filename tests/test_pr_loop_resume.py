@@ -562,53 +562,16 @@ def test_resume_pr_round_reviews_the_current_head_for_an_incoherent_unrecorded_h
     assert resumed.head_advanced_without_record is True
 
 
-def test_deprecated_review_unrecorded_head_flag_parses_logs_and_changes_no_resume(tmp_path, capsys, monkeypatch):
-    """Row deprecated-flag: parses, logs a deprecation notice, same resume result."""
+def test_removed_review_unrecorded_head_flag_is_a_startup_error(capsys):
+    """#2162: the one-release no-op is gone; an unrecorded head already resumes as a review."""
     from coding_review_agent_loop.cli import build_parser
-    from coding_review_agent_loop.config import config_from_args
-    import coding_review_agent_loop.pr_round_ingestion as pr_round_ingestion
-    from coding_review_agent_loop.pr_loop_support import (
-        _resume_pr_round_admitted,
-        warn_deprecated_review_unrecorded_head,
-    )
-    from test_round_state import (
-        _ACTOR, _NEW, _NEWER, _OLD, _base_history, _checkpoint_summary, _dispatch, _handoff,
-        _history, _rejection,
-    )
 
-    parser = build_parser()
-    base = ["pr", "123", "--repo", "OWNER/REPO", "--codex-dir", str(tmp_path / "codex")]
-    plain = dataclasses.replace(config_from_args(parser.parse_args(base), FakeRunner()), quiet=False)
-    flagged = dataclasses.replace(
-        config_from_args(parser.parse_args([*base, "--review-unrecorded-head"]), FakeRunner()), quiet=False,
-    )
-    assert plain.review_unrecorded_head is False and flagged.review_unrecorded_head is True
-    assert warn_deprecated_review_unrecorded_head(plain) is False
-    assert "--review-unrecorded-head is deprecated" not in capsys.readouterr().err
-    assert warn_deprecated_review_unrecorded_head(flagged) is True
-    assert "--review-unrecorded-head is deprecated and has no effect" in capsys.readouterr().err
-
-    monkeypatch.setattr(
-        pr_round_ingestion, "admit_pr_comments",
-        lambda runner, config, *, pr_number, comments: (comments, _ACTOR),
-    )
-    cases = [
-        ([*_base_history()], _OLD),
-        ([*_base_history()], _NEW),
-        ([*_base_history(), _dispatch(), _rejection()], _NEW),
-        ([*_base_history(), _dispatch(), _rejection(attempt=2, reason="two", reasons=("one",))], _NEWER),
-        ([*_base_history(), _handoff(subject=_NEW, round_number=3)], _NEW),
-        ([*_base_history(), _checkpoint_summary()], _NEW),
-    ]
-    for history, head in cases:
-        results = [
-            _resume_pr_round_admitted(
-                FakeRunner(), config=config, pr_number=123, comments=_history(*history),
-                head_sha=head, configured_reviewers=("codex",),
-            )
-            for config in (plain, flagged)
-        ]
-        assert results[0] == results[1]
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(["pr", "123", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
+    assert raised.value.code == 2
+    err = capsys.readouterr().err
+    assert "--review-unrecorded-head was removed (#2162)" in err
+    assert "resumes as a review of the current head" in err
 
 
 def test_pr_resume_preserves_persisted_failure_in_next_coder_metadata(tmp_path):

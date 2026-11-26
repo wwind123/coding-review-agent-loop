@@ -1819,3 +1819,46 @@ def test_capture_lost_supervision_retries_uncertain_scope_kill(monkeypatch,tmp_p
     monkeypatch.setattr(containment_module.time,'sleep',lambda _:None)
     with pytest.raises(StopProbe): containment_module._kill_delegated_scope(tmp_path,'owned.scope')
     assert len(calls)==3
+
+
+# --- #2162: the repair role is gone from containment -------------------------
+
+
+def test_policy_from_values_builds_coder_reviewer_and_test_gate_roles_only():
+    """`containment-policy-roles`: the live roles validate and keep their limits."""
+    policy = containment_module.policy_from_values({
+        "containment_memory_max": "8G",
+        "containment_coder_memory_max": "2G",
+        "containment_reviewer_tasks_max": "321",
+        "containment_test-gate_memory_high": "1G",
+    })
+    roles = dict(policy.roles)
+    assert set(roles) == {"coder", "reviewer", "test-gate"} == set(containment_module.CONTAINED_ROLES)
+    assert roles["coder"].memory_max == 2_000_000_000
+    assert roles["reviewer"].tasks_max == 321
+    assert roles["test-gate"].memory_high == 1_000_000_000
+    # A role that no longer exists resolves to the coder limits, as the
+    # discarded repair-role overrides already did before #2162.
+    assert policy.role_limits("repair") == roles["coder"]
+
+
+@pytest.mark.parametrize(
+    ("label", "role"),
+    [
+        ("Codex review", "reviewer"),
+        ("test gate", "test-gate"),
+        ("Claude coder", "coder"),
+        ("Antigravity repair", "coder"),
+        ("repair review", "reviewer"),
+    ],
+)
+def test_runner_role_from_label_never_returns_the_removed_repair_role(label, role):
+    """`containment-policy-roles`: labels resolve to coder, reviewer or test-gate."""
+    assert runner_module.Runner._role_from_label(label) == role
+
+
+def test_runner_ignores_the_removed_repair_containment_role():
+    runner = runner_module.Runner()
+    runner.set_containment_role("reviewer")
+    runner.set_containment_role("repair")
+    assert runner._containment_role == "reviewer"

@@ -32,7 +32,6 @@ from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_NO_PROGRESS_ROUNDS,
-    DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
     DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
@@ -159,21 +158,87 @@ def _evidence_row_list(value: str) -> tuple[str, ...]:
     return tuple(rows)
 
 
-def _deprecated_ignored_option(
-    parser: argparse.ArgumentParser, flag: str, replacement: str
-) -> None:
-    """A retired integer option kept for one release (#2097).
+_NO_PROGRESS_REPLACEMENT = "use --no-progress-rounds instead"
+_NO_REPAIR_REPLACEMENT = (
+    "no repair pass exists; a rejected structured response is re-asked to the same agent"
+)
+_CURRENT_HEAD_REPLACEMENT = (
+    "an unrecorded head already resumes as a review of the current head, "
+    "so there is nothing to override"
+)
 
-    Any integer, including 0, parses; the value is never stored on the config,
-    and ``config_from_args`` logs one notice naming ``replacement``.
-    """
-    parser.add_argument(
-        flag,
-        type=int,
-        default=None,
-        metavar="N",
-        help=f"Deprecated and ignored for one release; see {replacement}.",
-    )
+# Flags removed in #2162 after one release as accepted-and-ignored no-ops
+# (#2065, #2066, #2067).  They stay registered, hidden, so that passing one is
+# a startup error naming the replacement instead of argparse's generic
+# "unrecognized arguments", and so that argparse cannot prefix-match a removed
+# name onto a surviving option (for example ``--plan-sweep-rounds`` onto
+# ``--plan-sweep-reasoning-effort``).
+RETIRED_FLAGS: dict[str, str] = {
+    "--sub-item-stall-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--plan-primary-stall-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--plan-step-back-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--plan-sweep-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--plan-step-back-escalation-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--pr-step-back-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--pr-step-back-line-window": _NO_PROGRESS_REPLACEMENT,
+    "--pr-non-convergence-rounds": _NO_PROGRESS_REPLACEMENT,
+    "--repair-backend": _NO_REPAIR_REPLACEMENT,
+    "--repair-model": _NO_REPAIR_REPLACEMENT,
+    "--repair-reasoning-effort": _NO_REPAIR_REPLACEMENT,
+    "--repair-timeout-seconds": _NO_REPAIR_REPLACEMENT,
+    "--containment-repair-memory-high": _NO_REPAIR_REPLACEMENT,
+    "--containment-repair-memory-max": _NO_REPAIR_REPLACEMENT,
+    "--containment-repair-memory-swap-max": _NO_REPAIR_REPLACEMENT,
+    "--containment-repair-tasks-max": _NO_REPAIR_REPLACEMENT,
+    "--review-unrecorded-head": _CURRENT_HEAD_REPLACEMENT,
+}
+RETIRED_COMMON_FLAGS: tuple[str, ...] = (
+    "--sub-item-stall-rounds",
+    "--plan-primary-stall-rounds",
+    "--plan-step-back-rounds",
+    "--plan-sweep-rounds",
+    "--plan-step-back-escalation-rounds",
+    "--pr-step-back-rounds",
+    "--pr-step-back-line-window",
+    "--pr-non-convergence-rounds",
+    "--repair-backend",
+    "--repair-model",
+    "--repair-reasoning-effort",
+    "--repair-timeout-seconds",
+)
+RETIRED_CONTAINMENT_FLAGS: tuple[str, ...] = (
+    "--containment-repair-memory-high",
+    "--containment-repair-memory-max",
+    "--containment-repair-memory-swap-max",
+    "--containment-repair-tasks-max",
+)
+RETIRED_PR_FLAGS: tuple[str, ...] = ("--review-unrecorded-head",)
+# A dest no live code reads from ``vars(args)``; with ``default=SUPPRESS`` it
+# never appears on the namespace at all.
+_RETIRED_FLAG_DEST = "retired_flag_sink"
+
+
+class _RetiredFlagAction(argparse.Action):
+    """Reject a removed flag with a message that names its replacement."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs["nargs"] = "?"
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        flag = self.option_strings[0]
+        parser.error(f"{flag} was removed (#2162): {RETIRED_FLAGS[flag]}")
+
+
+def _add_retired_flags(parser: argparse.ArgumentParser, flags: Sequence[str]) -> None:
+    for flag in flags:
+        parser.add_argument(
+            flag,
+            action=_RetiredFlagAction,
+            dest=_RETIRED_FLAG_DEST,
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -409,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "the outer bound)."
             ),
         )
-        _deprecated_ignored_option(subparser, "--sub-item-stall-rounds", "--no-progress-rounds")
+        _add_retired_flags(subparser, RETIRED_COMMON_FLAGS)
         subparser.add_argument(
             "--flat-child-limit",
             type=int,
@@ -491,32 +556,6 @@ def build_parser() -> argparse.ArgumentParser:
                 "Maximum wait for each agy --print invocation (default: 600). "
                 "Overrides agy's five-minute print-mode default."
             ),
-        )
-        # The cross-model repair pass was replaced by the same-agent re-ask
-        # rule (#2066); these flags stay parseable for one release.
-        subparser.add_argument(
-            "--repair-backend",
-            default=None,
-            help=(
-                "Deprecated no-op. A rejected structured response is re-asked to the same "
-                "agent instead of a repair backend; this flag is ignored and will be removed."
-            ),
-        )
-        subparser.add_argument(
-            "--repair-model",
-            action="append",
-            default=None,
-            help="Deprecated no-op (see --repair-backend).",
-        )
-        subparser.add_argument(
-            "--repair-reasoning-effort",
-            default=None,
-            help="Deprecated no-op (see --repair-backend).",
-        )
-        subparser.add_argument(
-            "--repair-timeout-seconds",
-            default=None,
-            help="Deprecated no-op (see --repair-backend).",
         )
         agy_model_group = subparser.add_mutually_exclusive_group()
         agy_model_group.add_argument(
@@ -1200,9 +1239,6 @@ def build_parser() -> argparse.ArgumentParser:
                 "instead."
             ),
         )
-        _deprecated_ignored_option(subparser, "--plan-primary-stall-rounds", "--no-progress-rounds")
-        _deprecated_ignored_option(subparser, "--plan-step-back-rounds", "--no-progress-rounds")
-        _deprecated_ignored_option(subparser, "--plan-sweep-rounds", "--no-progress-rounds")
         subparser.add_argument(
             "--plan-provenance-baseline-max-chars",
             type=int,
@@ -1228,9 +1264,6 @@ def build_parser() -> argparse.ArgumentParser:
                 "ignore it with a log line."
             ),
         )
-        _deprecated_ignored_option(subparser, "--plan-step-back-escalation-rounds", "--no-progress-rounds")
-        _deprecated_ignored_option(subparser, "--pr-step-back-rounds", "--no-progress-rounds")
-        _deprecated_ignored_option(subparser, "--pr-step-back-line-window", "--no-progress-rounds")
         subparser.add_argument(
             "--pr-evidence-stall-rounds",
             type=int,
@@ -1272,7 +1305,6 @@ def build_parser() -> argparse.ArgumentParser:
                 "--pr-human-evidence freeze."
             ),
         )
-        _deprecated_ignored_option(subparser, "--pr-non-convergence-rounds", "--no-progress-rounds")
         subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",
@@ -1575,16 +1607,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="POSITIVE_ID",
         help="Complete expected-closing issue set for this existing PR; repeatable.",
     )
-    pr.add_argument(
-        "--review-unrecorded-head",
-        action="store_true",
-        help=(
-            "Deprecated no-op, removed in the next release. Every head-moving coder "
-            "turn now posts a coder record and an unrecorded head resumes as a review "
-            "of the current head, so there is no refused resume to override. Accepted "
-            "and logged; it changes nothing."
-        ),
-    )
+    _add_retired_flags(pr, RETIRED_PR_FLAGS)
     pr.add_argument(
         "--supersede-expected-closing-contract",
         action="store_true",
@@ -2099,12 +2122,9 @@ def add_containment_options(parser: argparse.ArgumentParser) -> None:
                 f"--containment-{role}-{option}",
                 dest=f"containment_{role}_{suffix}",
                 default=None,
-                help=(
-                    "Deprecated no-op: no repair process runs any more (#2066)."
-                    if role == "repair"
-                    else f"Override {label} for the {role} role."
-                ),
+                help=f"Override {label} for the {role} role.",
             )
+    _add_retired_flags(parser, RETIRED_CONTAINMENT_FLAGS)
     add_test_worker_options(parser)
 
 

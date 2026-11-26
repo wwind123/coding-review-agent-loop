@@ -2056,7 +2056,7 @@ def _start_round_1981(comments, monkeypatch, resumed, *, admitted=True):
     value = pr_loop_support._pr_amendment_start_round(
         _pr_context_1981(comments), ("codex", "claude"), SimpleNamespace(),
         runner=object() if admitted else None,
-        config=SimpleNamespace(review_unrecorded_head=False) if admitted else None,
+        config=SimpleNamespace() if admitted else None,
     )
     assert admissions == ([77] if admitted else [])
     return value, calls
@@ -2217,7 +2217,7 @@ def _admitted_scenario_1986(monkeypatch, *, admission="drop-foreign"):
 
 def _emitters_1986(scenario, removed, *, runner):
     """(start round, template) from the two emitters for one amendment."""
-    config = _config_1981(review_unrecorded_head=False)
+    config = _config_1981()
     lineage = _pending_lineage_1981(effective_from_round=1)
     lineage.pending_amendments[0].removed_reviewers = tuple(removed)
     context = _pr_context_1981(scenario.comments)
@@ -2277,7 +2277,7 @@ def test_1986_admission_failure_yields_no_template_and_start_round_propagates(mo
     lineage = _pending_lineage_1981(effective_from_round=1)
     lineage.pending_amendments[0].removed_reviewers = ("Codex",)
     context = _pr_context_1981(scenario.comments)
-    config = _config_1981(review_unrecorded_head=False)
+    config = _config_1981()
     template = pr_loop_support._pr_amendment_activation_template(
         lineage.pending_amendments[0], 2, lineage=lineage, pr_number=77,
         resumed=scenario.resumed, pr_context=context, config=config, runner=object(),

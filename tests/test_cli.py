@@ -10,25 +10,26 @@ from agent_loop_helpers import FakeRunner, make_config
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import (
     DEFAULT_NO_PROGRESS_ROUNDS,
-    DEPRECATED_CONVERGENCE_FLAG_DESTS,
     config_from_args,
-    deprecated_convergence_flags,
 )
 from coding_review_agent_loop.errors import AgentLoopError
 
-PLAN_DEPRECATED_FLAGS = (
+# Retired by the single no-progress detector (#2097, #2098) and removed from
+# the parser in #2162: passing one is a startup error naming the replacement.
+PLAN_RETIRED_FLAGS = (
     "--plan-step-back-rounds",
     "--plan-step-back-escalation-rounds",
     "--plan-primary-stall-rounds",
     "--plan-sweep-rounds",
 )
-DEPRECATED_FLAGS = (
+RETIRED_FLAGS = (
     "--pr-step-back-rounds",
     "--pr-step-back-line-window",
     "--pr-non-convergence-rounds",
     "--sub-item-stall-rounds",
-    *PLAN_DEPRECATED_FLAGS,
+    *PLAN_RETIRED_FLAGS,
 )
+RETIRED_DESTS = {flag.lstrip("-").replace("-", "_") for flag in RETIRED_FLAGS}
 
 
 def _argv(tmp_path, *extra):
@@ -44,19 +45,6 @@ def _argv(tmp_path, *extra):
 def _config(tmp_path, *extra):
     args = build_parser().parse_args(_argv(tmp_path, *extra))
     return args, config_from_args(args, FakeRunner())
-
-
-def _comparable(config):
-    """Every numeric or boolean threshold: none may depend on a retired flag.
-
-    Per-run paths and tokens differ between any two invocations, so they are
-    left out; the retired flags never had a path or string value.
-    """
-    return {
-        field.name: getattr(config, field.name)
-        for field in dataclasses.fields(config)
-        if isinstance(getattr(config, field.name), (bool, int))
-    }
 
 
 def test_no_progress_rounds_defaults_to_three(tmp_path, capsys):
@@ -87,49 +75,33 @@ def test_direct_config_rejects_an_invalid_window(tmp_path, invalid):
         make_config(tmp_path, no_progress_rounds=invalid)
 
 
-@pytest.mark.parametrize("flag", DEPRECATED_FLAGS)
+@pytest.mark.parametrize("flag", RETIRED_FLAGS)
 @pytest.mark.parametrize("value", ["0", "3", "17"])
-def test_each_retired_flag_parses_is_ignored_and_logs_one_notice(tmp_path, capsys, flag, value):
-    """`flags-deprecated`: any integer, including 0, parses and changes nothing."""
-    _args, baseline = _config(tmp_path)
-    capsys.readouterr()
-    args, config = _config(tmp_path, flag, value)
+def test_each_retired_flag_is_a_startup_error_naming_the_window(tmp_path, capsys, flag, value):
+    """#2162: the one-release no-op window is over; nothing is silently ignored."""
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(_argv(tmp_path, flag, value))
+    assert raised.value.code == 2
     err = capsys.readouterr().err
-    notices = [line for line in err.splitlines() if "deprecated flag(s) ignored" in line]
-    assert len(notices) == 1
-    assert flag in notices[0] and "--no-progress-rounds" in notices[0]
-    assert deprecated_convergence_flags(args) == (flag,)
-    assert _comparable(config) == _comparable(baseline)
-    assert config.no_progress_rounds == DEFAULT_NO_PROGRESS_ROUNDS
-
-
-def test_every_retired_flag_together_logs_one_notice_naming_each(tmp_path, capsys):
-    extra = [part for flag in DEPRECATED_FLAGS for part in (flag, "0")]
-    args, config = _config(tmp_path, *extra)
-    err = capsys.readouterr().err
-    (notice,) = [line for line in err.splitlines() if "deprecated flag(s) ignored" in line]
-    for flag in DEPRECATED_FLAGS:
-        assert flag in notice
-    assert deprecated_convergence_flags(args) == DEPRECATED_FLAGS
-    assert config.no_progress_rounds == DEFAULT_NO_PROGRESS_ROUNDS
+    assert f"{flag} was removed (#2162)" in err
+    assert "--no-progress-rounds" in err
 
 
 def test_retired_flags_never_reach_the_config():
     from coding_review_agent_loop.config import AgentLoopConfig
 
     names = {field.name for field in dataclasses.fields(AgentLoopConfig)}
-    assert tuple(flag for _dest, flag in DEPRECATED_CONVERGENCE_FLAG_DESTS) == DEPRECATED_FLAGS
-    for dest, _flag in DEPRECATED_CONVERGENCE_FLAG_DESTS:
-        assert dest not in names
+    assert len(RETIRED_DESTS) == len(RETIRED_FLAGS)
+    assert not RETIRED_DESTS & names
 
 
-def test_retired_flags_are_marked_deprecated_in_help(capsys):
+def test_retired_flags_are_hidden_from_help(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["pr", "--help"])
     out = "".join(capsys.readouterr().out.split())  # argparse wraps at hyphens
     assert "--no-progress-roundsKStopforahumandecision(exit4)" in out
-    for flag in DEPRECATED_FLAGS:
-        assert f"{flag}NDeprecatedandignoredforonerelease;see--no-progress-rounds." in out
+    for flag in RETIRED_FLAGS:
+        assert flag not in out
 
 
 def _issue_argv(tmp_path, *extra):
@@ -144,33 +116,21 @@ def _issue_argv(tmp_path, *extra):
 
 
 @pytest.mark.parametrize("policy", ["all-reviewers", "primary-then-panel"])
-@pytest.mark.parametrize("flag", PLAN_DEPRECATED_FLAGS)
-@pytest.mark.parametrize("value", ["0", "1", "9"])
-def test_each_retired_plan_flag_is_ignored_under_either_plan_policy(
-    tmp_path, capsys, policy, flag, value
-):
-    """`plan-flags-deprecated`: no validation error, no config field, one notice."""
+@pytest.mark.parametrize("flag", PLAN_RETIRED_FLAGS)
+def test_each_retired_plan_flag_is_rejected_under_either_plan_policy(tmp_path, capsys, policy, flag):
     policy_args = ["--plan-review-policy", policy]
     if policy == "primary-then-panel":
         policy_args += ["--primary-plan-reviewer", "codex"]
-    parser = build_parser()
-    baseline = config_from_args(parser.parse_args(_issue_argv(tmp_path, *policy_args)), FakeRunner())
-    capsys.readouterr()
-    args = parser.parse_args(_issue_argv(tmp_path, *policy_args, flag, value))
-    config = config_from_args(args, FakeRunner())
-    (notice,) = [
-        line for line in capsys.readouterr().err.splitlines()
-        if "deprecated flag(s) ignored" in line
-    ]
-    assert flag in notice and "--no-progress-rounds" in notice
-    assert "plan step-back, escalation, primary-stall and sweep thresholds" in notice
-    assert _comparable(config) == _comparable(baseline)
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(_issue_argv(tmp_path, *policy_args, flag, "1"))
+    assert raised.value.code == 2
+    assert "--no-progress-rounds" in capsys.readouterr().err
 
 
 def test_retired_plan_fields_never_reach_a_child_or_verification_config(tmp_path):
     from coding_review_agent_loop import plan_execution
 
-    dests = {dest for dest, flag in DEPRECATED_CONVERGENCE_FLAG_DESTS if flag in PLAN_DEPRECATED_FLAGS}
+    dests = {flag.lstrip("-").replace("-", "_") for flag in PLAN_RETIRED_FLAGS}
     assert len(dests) == 4
     assert not dests & set(plan_execution._PLAN_BOARD_CONFIG_FIELDS)
     with pytest.raises(TypeError):

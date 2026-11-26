@@ -149,7 +149,6 @@ def _reask(tmp_path, results, catalogs, *, session_id=None, retries=1, text=None
                 role="coder",
                 repair_expected_kind="issue_implementation",
                 session_id=session_id,
-                reask_on_evidence_rejection=True,
             )
             error = None
         except AgentInvocationError as exc:
@@ -276,7 +275,6 @@ def _run_real(tmp_path, results):
                 validate=_real_validator(runner),
                 role="coder",
                 repair_expected_kind="issue_implementation",
-                reask_on_evidence_rejection=True,
             )
             return response, None, invoke
         except AgentInvocationError as exc:
@@ -416,15 +414,6 @@ def test_catalog_collision_is_a_resend_only_reask_with_the_primary_catalog(tmp_p
     assert response.acquisition_test_turn_id == "t1"
 
 
-def test_approved_plan_call_site_enables_reask():
-    import inspect
-
-    from coding_review_agent_loop import issue_implementation
-
-    source = inspect.getsource(issue_implementation)
-    assert "reask_on_evidence_rejection=True" in source
-
-
 # --- #999: a rejection exposed only by a repair candidate ---
 
 # A blank summary is an envelope defect normalization cannot fix, so the
@@ -449,7 +438,6 @@ def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config
                     validate=_sequenced_validator(catalogs, invoke),
                     role="coder",
                     repair_expected_kind="issue_implementation",
-                    reask_on_evidence_rejection=reask,
                 )
                 error = None
             except AgentInvocationError as exc:
@@ -458,7 +446,8 @@ def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config
 
 
 def _codex_repair(**overrides):
-    return {"repair_backend": "codex", "repair_models": ("model-a", "model-b"), **overrides}
+    # No repair backend exists (#2066, #2162); the overrides pass through.
+    return dict(overrides)
 
 
 def _assert_semantic_stop(error):
@@ -635,7 +624,7 @@ def _run_followup(tmp_path, monkeypatch, results, *, repair_surfaced=False, conf
                 FakeRunner(), agent="claude", config=config, prompt="Address PR feedback.",
                 marker_description="structured coder_followup result",
                 validate=_followup_validator(config), role="coder",
-                repair_expected_kind="coder_followup", reask_on_evidence_rejection=True,
+                repair_expected_kind="coder_followup",
             )
         except AgentInvocationError as exc:
             error = exc
