@@ -38,10 +38,10 @@ turn, so the adapter publishes a token-owned holder record (PID, run ID, seat,
 role, turn bound) after acquiring it, and a waiter allows each observed holder
 its advertised turn bound plus a margin under an overall cap. An expired wait
 raises `AgentSettingsLockWaitTimeout`, a transient `AgentInvocationError`,
-before settings.json is touched; `run_validated_agent` and the direct
-Antigravity repair path each retry it once in place without spending retries
-or model fallback. A second expiry stays seat-local (repair records
-`settings_lock_contention`) and is never treated as a backend outage; a
+before settings.json is touched; `run_validated_agent` re-waits once in place
+without spending `agent_max_retries`, model fallback or quota state. A second
+expiry propagates as a transient `AgentInvocationError`, stays seat-local and
+is never treated as a backend outage; a
 parallel PR round treats it as retry-bound, withholding healthy peers in the
 round spool so a rerun completes the round independently. PR round metadata, including scheduler records and
 legacy coder recovery records, stores a versioned board binding. Recovery verifies
@@ -327,10 +327,11 @@ startup.
   issue's own set and the parent's set separately. The live loop never reuses
   a resumed approval whose recorded key, keyless legacy fallback or parent set
   is stale, so its reviewer reviews again. Staged carried approvals bind the
-  parent set the same way. An acknowledgement recovered by repair is
-  persisted as a new reviewer record wherever approvals carry this evidence,
-  including generation-1 `all-reviewers` plans, so a restart or qualification
-  binds it instead of reading the earlier unacknowledged record.
+  parent set the same way. A reviewer approval that lacks the acknowledgement
+  is never amended in-round: it re-injects a blocking plan item, the reviewer
+  answers in a later round, and that later round's own reviewer record is what
+  a restart or qualification binds, including for generation-1 `all-reviewers`
+  plans.
 - **Legacy plain history.** Unanchored plain `all-reviewers` history proves
   membership by its reviewer posters, never completion. Without an issue-side
   implementation handoff bound to the current plan hash it is `undetermined`
@@ -420,8 +421,7 @@ startup.
   checked again at every planning round. Floor authorizations come only from
   signed plan segments. Once a round's reviews are in, before its outcome
   creates the next round (a planner revision or a reviewer-only phase-advance
-  record) or reaches approval, again after each acknowledgement repair (an
-  agent turn) before its result is published, and at each later round, the
+  record) or reaches approval, and at each later round, the
   run re-reads the issue, re-admits link records
   through the authenticated actor and re-resolves the plan lineage.
   Inconsistent history, or any board change recorded while the run was

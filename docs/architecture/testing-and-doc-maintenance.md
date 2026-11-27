@@ -96,9 +96,8 @@ one of the assessment's list fields is flattened deterministically before
 validation to `key: value` text in the object's own key order, pairs joined by
 `; ` and list values by `, `, and the parser logs one normalization line per
 flattened item. The same renderability rule, exported from `protocol.py`, is
-what counts as positive evidence for the `modified` near miss and what repair
-preservation pins, so a renderable object survives a repair as the identical
-object or as its flattened string. Nested objects, nested lists, non-string
+what counts as positive evidence for the `modified` near miss and what the
+deterministic flattening accepts. Nested objects, nested lists, non-string
 scalars, empty values and empty objects still fail closed with an error that
 names the field and the offending key; string-list fields outside the
 assessment keep rejecting object items.
@@ -447,9 +446,9 @@ relocating text into findings or requests; mixed leftovers must remain nonblank.
 leftover is a judgement re-ask, while null, `[]` or whitespace-only leftovers
 canonicalize to empty. The role is valid only when a strictly newer surfaced
 signed source from the same author exists.
-Repair compares copies under this same role-aware normalization only when both collections
-parse, retaining raw equality otherwise. Collection shape, order and all other
-content stay protected. A real bounded reviewer continuation owns missing
+`requirement_evidence.py` canonicalizes each parsed entry with
+`normalize_empty_text` inside `parse_associations`, which `protocol.py` calls
+before strict validation; no comparison against an earlier response exists. A real bounded reviewer continuation owns missing
 classification. Mixed-source prompt and disposition validation use the original
 signed ID with the verbatim source and attributed leftover scope; agreement is by role (#2000). Classification is separate from native
 evidence authorization and does not waive live citation validation. Report-side

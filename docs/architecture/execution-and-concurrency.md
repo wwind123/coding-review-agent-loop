@@ -536,8 +536,9 @@ persisted across processes.
 `--output-format json` envelope for eligible kinds. Answer: response file, else
 the one expected-kind object in `response` (footer/signature added in code),
 else the marker; `structured_output` is ignored. Ambiguity (several objects,
-wrong kind, contradicting footer) is a trusted, repair-free format failure
-feeding `format-fallback`. Envelope-only reviews are refused repair. See the
+wrong kind, contradicting footer) is a trusted format failure feeding
+`format-fallback`; no model reformats it. Substance-free reviews fail as
+unavailable. See the
 [CLI guide](../local_agent_loop.md#structured-output).
 
 **Quota reset wait.** `--wait-for-quota-reset DURATION` (off by default) turns
@@ -878,7 +879,7 @@ allowing commentary and non-tool reasoning. Before attribution, Codex allowlists
 non-tool records: message/reasoning items, developer tool declarations and known
 events. Calls, outputs, execution items and unknown kinds fail even without turn
 IDs. Declarations supply no proof. Replay, images and malformed streams never
-become response, transient or repair candidates. Private logs retain streams;
+become response or transient candidates. Private logs retain streams;
 stdin summaries redact payloads without changing delivery.
 
 Model identity is CLI-record evidence, not provider attestation. Codex uses the
@@ -894,7 +895,8 @@ namespace. Default CI replays fixtures and deselects real CLI tests before shard
 explicit selection fails on missing prerequisites.
 
 `review_images_validation.py` requires original proof even for timeout/nonzero
-exits and normalization. Repair has no image/proof authority. Re-asks, completion
+exits and normalization. Normalization (no backend, prompt, path or
+image access) supplies no proof. Re-asks, completion
 resume, fallback and replay are disabled. Prompt manifest, inventory, mappings
 and diff remain escaped untrusted data; requester coverage is excluded.
 
