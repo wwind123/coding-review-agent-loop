@@ -508,6 +508,49 @@ def test_architecture_states_cross_row_selector_reuse_policy():
     assert "an admissible selector repeated within one claim" in text
 
 
+def test_architecture_set_drops_retired_repair_pass_prose():
+    # #2182: the cross-model structured-output repair pass is retired
+    # (#2066, #2092, #2162). Architecture prose must not describe it as live.
+    # The bare word "repair" stays legal: identifiers such as
+    # `acknowledgement-repair-failed` and non-format senses (CI repair rounds,
+    # human-repair stops, history repair) are still accurate.
+    text = " ".join(_architecture_set_text().split())
+    retired_phrases = (
+        "repair-free format failure",
+        "Envelope-only reviews are refused repair",
+        "Repair has no image/proof authority",
+        "Repair runs before assembly",
+        "and repair invocations have separately",
+        "skips the repair model",
+        "direct Antigravity repair path",
+        "An acknowledgement recovered by repair",
+        "Repair may preserve a complete v1 source",
+        "repair records `settings_lock_contention`",
+        "after each acknowledgement repair",
+        "Repair compares copies",
+        "survives a repair",
+        "A failed citation repair",
+    )
+    for phrase in retired_phrases:
+        assert phrase not in text, phrase
+    replacement_phrases = (
+        # execution-and-concurrency.md
+        "`format-fallback`; no model reformats it",
+        # planning.md
+        "Deterministic, model-free normalization of a `plan_revision_patch`",
+        # plan-context-and-presentation.md
+        "Deterministic normalization runs before assembly",
+        # reviewer-boards.md
+        "is never amended in-round",
+        # testing-and-doc-maintenance.md
+        "no comparison against an earlier response exists",
+        # findings-and-convergence.md
+        "A failed `test_observations` format re-ask",
+    )
+    for phrase in replacement_phrases:
+        assert phrase in text, phrase
+
+
 def test_docs_list_tool_owned_machine_readable_record_types():
     doc_text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     readme_text = README.read_text(encoding="utf-8")

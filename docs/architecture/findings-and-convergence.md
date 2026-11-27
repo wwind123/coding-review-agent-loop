@@ -531,7 +531,7 @@ Repeated passes and unchanged canonical statuses earn nothing. Evidence does
 not resolve findings automatically: the next reviewer must disposition them,
 and CI qualification remains independent.
 
-A failed citation repair therefore never earns the grant. A different head
+A failed `test_observations` format re-ask never earns the grant. A different head
 resets it, and like the count it is in memory only. The live reconciliation's
 prior-round input is the previous round's bounded projection
 (`prior_local_test_evidence`, decoded in `Runner.render_local_test_evidence`),

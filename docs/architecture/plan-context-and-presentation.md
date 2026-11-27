@@ -115,9 +115,10 @@ residual encoded metadata characters, and the names and encoded sizes of the
 largest unspilled metadata fields. It reports names and integers only, never
 content.
 
-Repair runs before assembly and is lossless for semantic patches: it may fix
-only the response envelope and cannot add operations, change rationales, or
-alter base bindings. A cross-form, approved, stale, incomplete, or identity-
+Deterministic normalization runs before assembly and is lossless for semantic
+patches: it may fix only the response envelope and footer, apply the lossless
+disposition key alias, and strip prior-item dispositions that history proves
+resolved. It cannot add operations, change rationales, or alter base bindings. A cross-form, approved, stale, incomplete, or identity-
 mismatched response fails before publication. The assembled generation-1
 Markdown and its existing subject/hash remain the downstream review and
 implementation surface; the sidecar is the durable authority used for

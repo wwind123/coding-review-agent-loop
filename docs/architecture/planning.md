@@ -66,9 +66,9 @@ issue-to-PR handoff binds that plan to the implementation PR independently of
 bounded issue-comment text. Direct PR resumes recover that binding when it
 exists; an ordinary PR without planning provenance does not invent a plan.
 
-Planning, implementation, reviewer, and repair invocations have separately
-resolved model/effort settings. An implementation override must not implicitly
-change the reviewer or repair backend. Issue creation and PR resume converge
+Planning, implementation, and reviewer invocations have separately resolved
+model/effort settings. An implementation override must not implicitly change
+the reviewer backend. Issue creation and PR resume converge
 on the shared PR loop after provenance validation.
 
 Every plan and plan-revision prompt form (full, compact and semantic patch)
@@ -87,8 +87,8 @@ applicability, meaningful combinations, exclusions, stable matrix-local row IDs,
 and execution ownership. Draft changes are auditable before approval; the
 approved payload is immutable until a newly reviewed substantive replan. Round
 metadata and its existing sidecar authenticate canonical structured bytes and a
-payload-bound section boundary independently of rendered markdown. Prompts,
-repair and PR resume consume the semantic payload first. Renderer
+payload-bound section boundary independently of rendered markdown. Prompts and
+PR resume consume the semantic payload first. Renderer
 drift therefore does not invalidate authentic history; malformed, oversized, or
 matrix-only hydration/rendering data closes only the matrix channel and leaves
 an independently valid plan hash/subject available. Legacy records remain
@@ -112,20 +112,23 @@ reviewed deltas: child plan reviewers receive a deterministic parent-versus-chil
 coverage delta, recomputed on resume and never persisted, with a duty to block
 any narrowing of coverage or test reachability. The same comparison runs inside
 the child plan-first cycle, from both parent dispatch and the direct child
-entry, as an orchestrator-owned bounded replan that is independent of structured
-repair: a weakening candidate stays unpublished in memory, the planner is
+entry, as an orchestrator-owned bounded replan that is independent of the same-agent
+re-ask budget: a weakening candidate stays unpublished in memory, the planner is
 re-invoked with the field-level diagnostic over the unchanged authenticated
 base, and exhausting `MAX_INHERITED_MATRIX_REPLANS` persists one authenticated
 plan-validation diagnostic record and stops deterministically before any
 reviewer or implementation turn; the next invocation recovers that record for
 its first planner turn. The same loop also absorbs deterministic plan-assembly
-failures on every plan-first run and semantic-patch payload rejections: repair
-may change only a semantic patch's envelope, so the recovered patch payload is
-validated on its own before repair is considered. Any payload rejection (a
+failures on every plan-first run and semantic-patch payload rejections. Deterministic, model-free normalization of
+a `plan_revision_patch` may change only the response envelope and footer, apply
+the lossless rationale-to-note disposition key alias, and strip a prior-item
+disposition only when history proves the item resolved; it never alters patch
+operations, their values or rationales, or base bindings. The recovered patch
+payload is therefore validated on its own first. Any payload rejection (a
 strict patch-schema failure including a missing or wrong kind, an unknown
 prior-item disposition, or an invalid
-human-requirement disposition), including one masked by an envelope error,
-skips the repair model and becomes a replan diagnostic instead. Every plan prompt form carries the inherited obligations
+human-requirement disposition), including one masked by an envelope error, is
+not re-asked and becomes a bounded replan diagnostic instead. Every plan prompt form carries the inherited obligations
 through one shared lossless renderer that shows exactly the compared form. Both
 prompt blocks fail closed rather than truncate: oversized parent obligations
 stop child planning before any planner turn, and an oversized delta set rejects
@@ -170,9 +173,9 @@ for the plan it revises), so a restart right after the revised round cannot
 narrow the board. PR approvals stay keyed by plan hash and subject, so none
 recorded before a rebind is carried.
 
-The validated matrix wire schema is the canonical source for planner and
-repair prompt key lists and minimal applicable/not-applicable examples. Repair
-is bounded format recovery: it preserves a complete fresh matrix and rejects
+The validated matrix wire schema is the canonical source for planner
+prompt key lists and minimal applicable/not-applicable examples. Deterministic
+normalization only wraps lone-string matrix list fields; validation then rejects
 missing or semantically inconsistent matrix content rather than inventing
 scenarios. Fresh execution-recommendation integrity remains eligible for the
 existing planner replay, while an unrecoverable absent or malformed fresh
@@ -194,7 +197,7 @@ in `risk_test_matrix_coverage_gaps`. After the reported PR passes its
 read-only guards, one post-acceptance gate in `issue_implementation.py` runs
 `risk_coverage_map.check_coverage_map` against the PR's pushed head and sends at
 most one same-session coverage re-ask naming the deficient rows (never through
-repair or the retry budget). The final assessment, recomputed after semantic
+the retry budget). The final assessment, recomputed after semantic
 correction, renders as a display-only coverage-map section; it guarantees
 completeness and well-formedness only, is distinct from canonical evidence, and
 does not change the persistence boundary. See `docs/local_agent_loop.md`.
@@ -356,8 +359,8 @@ wrappers). The recorded command and the input manifest keep the original
 package-manager spelling. A package-manager observation without a live executed
 command is never admissible evidence. Plain `node <file>` is not recognized; the
 launch-integrity rejection instead names the exact `node --test <file>` spelling
-when redaction left the file token untouched. Repair
-does not generate matrix identities, canonical rows, receipt IDs, mappings,
+when redaction left the file token untouched. Response
+normalization does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted
 canonical evidence remains readable for resume, while a fresh response that
@@ -405,7 +408,7 @@ scope-item IDs, coupling constraints, one-shot or enriched staged deliveries,
 and independent retained-parent/final-integration allocations. Coverage is
 exactly once; dependencies are earlier-only; automation is one of
 `agent-pr`, `human-action`, or `manual-close`. Unversioned historical plans
-remain legacy-undecided and are never upgraded by inference or repair.
+remain legacy-undecided and are never upgraded by inference or normalization.
 
 The recommendation is canonicalized into a bounded sidecar and round metadata,
 so its strategy, topology, allocations, compatibility constraints, and caveats
@@ -429,8 +432,8 @@ topology, handoffs, and dispatch; dry-run reports that action without
 persistence or GitHub writes. The durable decision is written before any
 follow-up, child, handoff, coder, or PR mutation, and staged execution is
 bounded to one `agent-pr` child per run while the parent remains open.
-Repair may preserve a complete v1 source, but cannot synthesize missing
-recommendation data.
+Normalization never synthesizes missing recommendation data; an incomplete v1
+recommendation fails validation.
 
 Execution re-approval uses `execution_retirement.py` and its strict inventory
 reader to assess complete child and all-state PR listings plus every referenced
@@ -562,7 +565,7 @@ guidance and carry no protocol authority.
 Before publication, fresh plans, full revisions, and assembled semantic revisions
 validate matrix owners against their own execution recommendation. Invalid owners
 return to the planner through bounded deterministic correction, without publication
-or envelope repair changing the topology. Exhaustion identifies ownership validation
+or envelope normalization changing the topology. Exhaustion identifies ownership validation
 and preserves the diagnostic for the next invocation.
 
 Published unapproved plans are checked before review as well. An ownership failure
