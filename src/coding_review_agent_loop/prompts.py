@@ -182,7 +182,11 @@ requested" list posted at approval; they never hold the PR open for a coder roun
 a code defect in `exact_head_evidence_requests`, and never list a human check in
 `blocking_items`. Signed-source classification is not requested in this mode: omit
 `requirement_evidence` (it is ignored); signed human requirements are ordinary requirements
-for the coder. If your only remaining concerns are human checks, approve the code."""
+for the coder. If your only remaining concerns are human checks, approve the code.
+Already-listed checks appear under "Advisory human checks"; never re-request one, even
+rephrased. The optional `withdrawn_human_checks` array lists IDs of your own listed checks
+to withdraw (stale for this head, or replaced by a rephrased request); it is never for
+`prior_item_dispositions` IDs."""
 
 PR_REVIEW_OFF_EVIDENCE_GUIDANCE = """`exact_head_evidence_requests` is ignored in this run
 (`--pr-human-evidence off`): do not use it, and never list a human-only check in
@@ -3478,8 +3482,9 @@ def build_review_prompt(
     evidence_scope: Mapping[str, object] | None = None,
     screenshot_context: str = "",
     released_disputes: Mapping[str, Sequence[str]] | None = None,
+    human_checks_context: str = "",
 ) -> str:
-    coder_followup_context += screenshot_context
+    coder_followup_context += screenshot_context + human_checks_context
     from .capture_acceptance import evidence_prompt
     if evidence_scope is not None:
         sweep_context = ""

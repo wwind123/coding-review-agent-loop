@@ -3722,6 +3722,7 @@ def run_pr_loop(
             round_new_unresolved_items: list[UnresolvedReviewItem] = []
             # (reviewer, requests) pairs from this round's reviews (#1068).
             round_evidence_requests: list[tuple[str, tuple[str, ...]]] = []
+            round_human_check_withdrawals: list[tuple[str, tuple[str, ...], tuple[str, ...], int | None]] = []  # #2105
             current_pr_subject = str(pr_metadata.head_sha or "unknown")
             round_ledger_incomplete = _round_ledger_may_be_incomplete(
                 current_resume=current_resume,
@@ -5119,6 +5120,7 @@ def run_pr_loop(
                             ),
                             phase=phase,
                             evidence_requests=parsed.exact_head_evidence_requests,
+                            withdrawn_human_checks=parsed.withdrawn_human_checks if human_evidence.advisory else (),  # #2105
                             requirement_evidence=parsed.requirement_evidence,
                             screenshot_requests=parsed.screenshot_requests, screenshot_coverage_acceptances=parsed.screenshot_coverage_acceptances, post_merge_requests=tuple(r.payload() for r in parsed.post_merge_obligations),
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
@@ -5436,6 +5438,7 @@ def run_pr_loop(
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
                                 screenshot_context=post_merge_run.context() + screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else post_merge_run.context(),
+                                human_checks_context=human_evidence.prompt_context(),  # #2105
                                 pr_metadata=pr_metadata,
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
@@ -5790,6 +5793,7 @@ def run_pr_loop(
                                 reviewer=reviewer,
                                 evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
                                 screenshot_context=post_merge_run.context() + screenshot_coverage.prompt_context(runner, config=config, pr=pr_number, head=pr_metadata.head_sha, requester=agent_display_name(reviewer), items=prior_unresolved_items) if not capture_scopes else post_merge_run.context(),
+                                human_checks_context=human_evidence.prompt_context(),  # #2105
                                 pr_metadata=pr_metadata,
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
@@ -5996,6 +6000,8 @@ def run_pr_loop(
                         subject=current_pr_subject,
                         reviewer_name=reviewer_name,
                     )
+                if carried_approval_record is None and (parsed_review.withdrawn_human_checks or parsed_review.exact_head_evidence_requests):
+                    round_human_check_withdrawals.append((reviewer_name, parsed_review.withdrawn_human_checks, parsed_review.exact_head_evidence_requests, resumed_record.index if resumed_record is not None else None))
                 if carried_approval_record is None and parsed_review.exact_head_evidence_requests:
                     round_evidence_requests.append(
                         (reviewer_name, parsed_review.exact_head_evidence_requests)
@@ -6080,6 +6086,10 @@ def run_pr_loop(
             if pr_fatal_errors and not pr_round_parallel and not pr_continuation_allowed:
                 # A sequential stop keeps today's shape: no reconciliation record.
                 raise next((e for _n, e in pr_fatal_errors if isinstance(e, QuotaResetExceededError)), pr_fatal_errors[0][1])
+            for withdrawing_reviewer, withdrawn_ids, _requests, position in round_human_check_withdrawals:  # before the reconciliation record (#2105)
+                human_evidence.withdraw(withdrawing_reviewer, withdrawn_ids, round_number=round_number, position=position)
+            for requesting_reviewer, _ids, requests, position in round_human_check_withdrawals:  # only a later request re-admits
+                human_evidence.requested(requesting_reviewer, requests, position=position)
             if (
                 (
                     pr_round_parallel
@@ -6949,7 +6959,7 @@ def run_pr_loop(
                         items=unresolved_items,
                         current_head_sha=pr_metadata.head_sha,
                         capability=ordinary_recovery,
-                        hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
+                        hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True, draft=True),
                     )
                     if merged:
                         print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
@@ -8097,7 +8107,7 @@ def run_pr_loop(
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
                                     capability=ordinary_recovery,
-                                    hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
+                                    hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True, draft=True),
                                 )
                                 if merged:
                                     print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
@@ -8673,7 +8683,7 @@ def run_pr_loop(
                                 items=unresolved_items,
                                 current_head_sha=pr_metadata.head_sha,
                                 capability=ordinary_recovery,
-                                hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True),
+                                hold=lambda: human_evidence.hold(runner, head_sha=pr_metadata.head_sha, round_number=round_number, merging=True, draft=True),
                             )
                             if merged:
                                 print(f"PR #{pr_number} merged after deliberate ordinary recovery.")

@@ -727,41 +727,43 @@ cannot be atomic with later pushes; existing exact-head gates remain necessary.
 ## Human evidence mode
 
 `--pr-human-evidence freeze|advisory|off` (default `advisory`, #2063) gates the
-whole native human-evidence channel; every branch keys off the configured mode,
-and persisted state only supplies the migration trigger and list contents.
-`human_evidence_mode.py` holds one normalization choke point. In `advisory` and
-`off` it removes every open native or converted `human-exact-head-evidence`
-obligation (never a screenshot obligation) from the ledger. It runs after each
-ledger-construction path: the round-start resume assignment, restore for new
-input, and the round's request ingestion. It runs once more inside the
-finalization gate wrapper, so no such obligation reaches partitioning, dispatch
-or finalization. `advisory` moves each removed item onto a deduplicated
-"Human checks requested" list and `off` drops it with a log line. The list is
-stamped, through a context-variable stamp at the single round-metadata encoder,
-on every orchestrator PR record while it is non-empty (`human_checks`; omitted
-when empty; malformed individual entries are dropped; a spillable
-round-transport field, so a large list moves to sidecars, and a missing or
-corrupt sidecar fails the record closed instead of reading as an empty list). It is also written on the human-checks comment,
-whose record uses its own flow so PR round reconstruction never reads it. Each
-entry keeps the complete removed item, so a later `freeze` resume restores the
-original typed obligation (converted-row identity, owners and owner states)
-instead of re-creating it; identities cleared at the current head are skipped.
+native human-evidence channel by the configured mode. `human_evidence_mode.py`
+holds one normalization choke point. In `advisory` and `off` it removes every
+open native or converted `human-exact-head-evidence` obligation (never a
+screenshot one) from the ledger after each ledger-construction path (round-start
+resume, restore for new input, request ingestion) and inside the finalization
+gate wrapper, so none reaches partitioning, dispatch or finalization. `advisory`
+moves each removed item to a deduplicated "Human checks requested" list; `off`
+drops it with a log line. The encoder stamps the list on every orchestrator PR
+record while non-empty (`human_checks`; spillable; a missing sidecar fails
+closed) and on the human-checks comment, whose own flow PR reconstruction never
+reads. Each entry keeps the complete removed item, so a `freeze` resume restores
+the typed obligation (row identity and owners), skipping identities cleared at
+the current head.
 
-Outside `freeze`, signed-source classification, association validation and
-parsing, historical association routing, the evidence-only stall and automatic
-conversion are skipped, and operator conversion is refused at config
-validation. The finalization gate reconciles converted rows only in `freeze`, and
-outside it a native evidence item reaching the freeze write fails closed
-instead of freezing. Every reviewer-response parse site passes the mode explicitly, and
-a static guard test enforces this. The finalization gate still runs whenever the
-advisory list is non-empty, so the final head and signed-input reads, the
-screenshot final gate and `_ensure_finalization_ready` all precede approval. At
-approval the list is posted once per head and identity set. With `--auto-merge`
-and a non-empty list the merge and post-merge completion are skipped and the run
-exits 0 with a notice. A non-freeze resume of a native evidence freeze publishes
-a release with reason `advisory-mode` (unless screenshot obligations stay
-frozen), sets revalidation against the freeze's signed baseline, and continues
-without reviewers.
+Outside `freeze`, signed-source classification, association handling, the
+evidence stall and conversion are skipped (operator conversion is refused). The
+finalization gate reconciles converted rows only in `freeze`; outside it a
+native evidence item reaching the freeze write fails closed. Every
+reviewer-response parse site passes the mode explicitly (statically guarded).
+The gate still runs while the list is non-empty, so final reads and
+`_ensure_finalization_ready` precede approval. At approval the list is posted
+once per head and identity set; with `--auto-merge` and a non-empty list the
+merge and completion are skipped and the run exits 0 with a notice. The
+ordinary-recovery hold runs before readiness, so it leaves the PR a draft and
+says so (#2106). A non-freeze resume of a native freeze publishes an
+`advisory-mode` release (unless screenshots stay frozen), revalidates against
+the freeze's signed baseline, and continues without reviewers.
+
+Reviewers see the list in the prompt's volatile context (#2105) under
+deterministic display IDs, never as carried items. A reviewer may withdraw its
+own native entry via `withdrawn_human_checks`; converted rows, other reviewers'
+entries and unknown IDs are logged and ignored, and the field is ignored outside
+`advisory`. Withdrawals from approving and blocking reviews apply before the
+reconciliation record and persist on the reviewer's own record. Requests and
+withdrawals replay in record order per check and requester: the newest wins, and
+a withdrawal counts only after a request. The result filters the seeded list
+before the mode branch and every normalization in every mode.
 
 ## Requester-owned screenshot obligations
 
