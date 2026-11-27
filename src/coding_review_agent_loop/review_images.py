@@ -153,11 +153,22 @@ def validate_visual(text, *, reviewer, items, parse_requirement_evidence=True):
     from .unresolved_items import _validate_review_response
     from .protocol import parse_pr_review
     # Explicit dispositions are mandatory; prose inference is not proof.
+    # Dispositions for IDs outside the assigned set are dropped before parsing
+    # and recorded on the result, as elsewhere since #2100 (#2113).  Fully
+    # equal repeats collapse at parse time; a conflicting repeat is rejected by
+    # _validate_review_response below.
+    items = tuple(items)
+    aliases = {alias: item.item_id for item in items
+               for alias in getattr(item, 'alias_item_ids', ())}
     raw = parse_pr_review(text, reviewer=reviewer, architecture_status_mode='strict',
-                          parse_requirement_evidence=parse_requirement_evidence)
-    ids = [d.item_id for d in raw.dispositions]
-    if len(ids) != len(set(ids)) or set(ids) != {item.item_id for item in items}:
-        raise AgentLoopError('Visual dispositions must name exactly the assigned findings')
+                          parse_requirement_evidence=parse_requirement_evidence,
+                          carried_item_ids=(frozenset(item.item_id for item in items),
+                                            frozenset(aliases)))
+    covered = {aliases.get(d.item_id, d.item_id) for d in raw.dispositions}
+    missing = sorted({item.item_id for item in items} - covered)
+    if missing:
+        raise AgentLoopError('Visual dispositions must name every assigned finding: '
+                             + ', '.join(missing))
     parsed = _validate_review_response(text, reviewer=reviewer, unresolved_items=items,
                                       architecture_status_mode='strict', include_visual=True,
                                       parse_requirement_evidence=parse_requirement_evidence)
@@ -362,6 +373,14 @@ class VisualRun:
                 if response.acquisition_outcome != 'success':
                     raise ValueError('visual reviewer acquisition did not succeed')
                 parsed = validate_visual(response.text, reviewer=name, items=assigned, parse_requirement_evidence=freeze_mode(config))
+                # The accepted text has the dropped non-carried entries stripped;
+                # restore their IDs from the accepted candidate (#2113).
+                from .architecture_contract import (
+                    ignored_prior_disposition_ids,
+                    reattach_ignored_prior_disposition_ids,
+                )
+                parsed = reattach_ignored_prior_disposition_ids(
+                    parsed, ignored_prior_disposition_ids(response.marker_value))
                 from .review_images_state import digest
                 binding.update(kind='result', intent_id=intent.comment_id,
                                proof=digest(asdict(response.image_delivery_proof)))
@@ -547,6 +566,7 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
     )
     from .unresolved_items import _next_unresolved_item, _apply_unresolved_item_dispositions
     from .agent_failure import _metadata_identity_fields
+    from .architecture_contract import ignored_disposition_metadata_fields
     parsed = outcome.parsed
     name = outcome.scope['seat']
     prior = assigned_items(items, name)
@@ -569,6 +589,7 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
                     subject=metadata.head_sha, prior_items=tuple(prior), dispositions=parsed.dispositions,
                     new_items=tuple(new), state=parsed.state, review_scope=outcome.scope,
                     visual_lifecycle=outcome.lifecycle, screenshot_coverage=outcome.coverage, phase='visual', seat_binding=seat_binding,
+                    **ignored_disposition_metadata_fields(parsed),
                     **_metadata_identity_fields(outcome.response), acquisition_outcome='success', acquisition_returncode=0)))
     except (AgentLoopError, OSError, ValueError, subprocess.SubprocessError) as exc:
         diagnostic('Visual publication unknown; durable intent remains spent: ' + str(exc)[:1024])

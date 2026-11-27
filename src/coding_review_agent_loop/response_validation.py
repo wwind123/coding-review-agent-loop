@@ -1312,8 +1312,10 @@ def _check_plan_revision_patch_ledger(
     this never rejects agent output; a surviving non-carried ID is an
     orchestrator defect, not a replan diagnostic.
     """
-    # A carried ID disposed twice is ambiguous; repair must keep the payload,
-    # so this is a payload rejection (bounded replan), never a re-ask (#2100).
+    # Fully equal repeats already collapsed at parse time (#2114).  A carried
+    # ID disposed twice with conflicting entries is ambiguous; repair must keep
+    # the payload, so this is a payload rejection (bounded replan), never a
+    # re-ask (#2100, #2117).
     _reject_duplicate_carried_dispositions(
         parsed.prior_plan_item_dispositions,
         context="plan_revision_patch.prior_plan_item_dispositions",
@@ -1336,17 +1338,21 @@ def _reject_duplicate_carried_dispositions(
     context: str,
     error: type[AgentLoopError] = AgentLoopError,
 ) -> None:
-    """Reject a carried ID disposed more than once (#2100).
+    """Reject conflicting repeated dispositions of a carried ID (#2100, #2117).
 
     Runs on the kept (carried) dispositions after the pre-parse partition, so
-    a repeated non-carried ID has already been dropped once and never
-    rejects.  The reviewer validators apply the same rule.
+    a repeated non-carried ID has already been dropped and never rejects.
+    Repeats that are equal on every parsed field were already collapsed to one
+    entry at parse time (#2114), so any carried ID still present more than
+    once here has entries that differ in some field: a contradiction with no
+    principled tie-break.  The reviewer validators apply the same rule.
     """
     ids = [item.item_id for item in dispositions]
     duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
     if duplicates:
         raise error(
-            f"{context} lists carried prior items more than once: " + ", ".join(duplicates)
+            f"{context} lists carried prior items with conflicting dispositions "
+            "more than once: " + ", ".join(duplicates)
         )
 
 

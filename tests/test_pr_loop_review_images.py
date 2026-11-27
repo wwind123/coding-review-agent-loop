@@ -178,7 +178,7 @@ def test_visual_dispositions_are_explicit_and_scope_isolated():
     item = replace(_next_unresolved_item(item_number=1, reviewer='OpenAI Codex', source_round=1,
                          text='Clipped title', status='blocking'), origin_scope='visible-defects')
     clean = structured_pr_review()
-    with pytest.raises(AgentLoopError, match='exactly'):
+    with pytest.raises(AgentLoopError, match='every assigned finding: item-1'):
         visual.validate_visual(clean, reviewer='OpenAI Codex', items=(item,))
     resolved = structured_pr_review(prior_item_dispositions=[{'item_id':'item-1','disposition':'resolved'}])
     assert visual.validate_visual(resolved, reviewer='OpenAI Codex', items=(item,)).state == 'approved'
@@ -188,6 +188,96 @@ def test_visual_dispositions_are_explicit_and_scope_isolated():
     assert ordinary.dispositions == ()
     assert ordinary.ignored_prior_disposition_ids == ('item-1',)
     assert _validate_review_response(clean, reviewer='OpenAI Codex', unresolved_items=(item,), architecture_status_mode='strict').state == 'approved'
+
+
+def _assigned_visual_item():
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    return replace(_next_unresolved_item(item_number=1, reviewer='OpenAI Codex', source_round=1,
+                   text='Clipped title', status='blocking'), origin_scope='visible-defects')
+
+
+def test_visual_review_drops_non_carried_dispositions():
+    """#2113: a non-carried ID is dropped and recorded, never rejected or applied."""
+    item = _assigned_visual_item()
+    text = structured_pr_review(prior_item_dispositions=[
+        {'item_id': 'item-1', 'disposition': 'resolved'},
+        {'item_id': 'item-9', 'disposition': 'resolved'}])
+    parsed = visual.validate_visual(text, reviewer='OpenAI Codex', items=(item,))
+    assert parsed.ignored_prior_disposition_ids == ('item-9',)
+    assert [d.item_id for d in parsed.dispositions] == ['item-1']
+
+
+@pytest.mark.parametrize('dispositions', [
+    [],
+    [{'item_id': 'item-9', 'disposition': 'resolved'}],
+], ids=['none', 'only-non-carried'])
+def test_visual_review_still_requires_explicit_assigned_disposition(dispositions):
+    item = _assigned_visual_item()
+    text = structured_pr_review(prior_item_dispositions=dispositions)
+    with pytest.raises(AgentLoopError, match='every assigned finding: item-1'):
+        visual.validate_visual(text, reviewer='OpenAI Codex', items=(item,))
+
+
+def test_visual_review_collapses_equal_repeats_and_rejects_conflicting_ones():
+    item = _assigned_visual_item()
+    entry = {'item_id': 'item-1', 'disposition': 'resolved', 'note': 'Fixed.'}
+    equal = visual.validate_visual(structured_pr_review(prior_item_dispositions=[entry, dict(entry)]),
+                                   reviewer='OpenAI Codex', items=(item,))
+    assert [d.item_id for d in equal.dispositions] == ['item-1']
+    conflicting = structured_pr_review(state='blocking', prior_item_dispositions=[
+        entry, {'item_id': 'item-1', 'disposition': 'blocking', 'note': 'Still clipped.'}])
+    with pytest.raises(AgentLoopError, match='more than once: item-1'):
+        visual.validate_visual(conflicting, reviewer='OpenAI Codex', items=(item,))
+
+
+@pytest.mark.parametrize('extra', [True, False], ids=['with-extra', 'no-extra'])
+def test_visual_publication_records_dropped_dispositions(visual_setup, monkeypatch, extra):
+    """#2113: attempt keeps the dropped IDs and publish_assessment records them."""
+    from coding_review_agent_loop.round_metadata import IGNORED_DISPOSITIONS_NOTE_PREFIX
+    config, calls, original = visual_setup
+    second = [{'item_id': 'item-1', 'disposition': 'resolved'}]
+    if extra:
+        second.append({'item_id': 'item-9', 'disposition': 'resolved'})
+    texts = [structured_pr_review(state='blocking', blocking_items=['Title is clipped in the sealed mobile image.']),
+             structured_pr_review(prior_item_dispositions=second)]
+    def reviewer(runner, **kw):
+        result = original(runner, **kw)
+        if kw.get('image_inputs'):
+            text = texts.pop(0)
+            return replace(result, text=text, message_text=text, raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent, 'run_agent_result', reviewer)
+    publication = visual.publish_assessment
+    observed = []
+    def inspect_publication(*a, **kw):
+        observed.append(kw['outcome'].parsed)
+        result = publication(*a, **kw)
+        observed.append(result[1])
+        return result
+    monkeypatch.setattr(visual, 'publish_assessment', inspect_publication)
+    runner = FakeRunner(codex_outputs=[structured_pr_review(), structured_pr_review()],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'],
+                    addressed_item_notes={'item-1':'Adjusted title width.'})],
+        advance_pr_head_on_coder_followup=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert texts == []
+    parsed, ledger = observed[2], observed[3]
+    expected = ('item-9',) if extra else ()
+    # VisualRun.attempt re-validated the stripped text yet kept the dropped IDs.
+    assert parsed.ignored_prior_disposition_ids == expected
+    assert [d.item_id for d in parsed.dispositions] == ['item-1']
+    # item-1 was applied (no longer live); item-9 never reached the ledger.
+    assert 'item-1' not in {i.item_id for i in ledger}
+    assert 'item-9' not in {i.item_id for i in ledger}
+    published = [r for r in records(runner) if is_visual_review(r.metadata)]
+    assert len(published) == 2
+    assert published[1].metadata.ignored_prior_disposition_ids == expected
+    noted = [c['body'] for c in runner.pr_payload['comments']
+             if IGNORED_DISPOSITIONS_NOTE_PREFIX in c['body']]
+    if extra:
+        assert len(noted) == 1 and 'item-9' in noted[0]
+    else:
+        assert noted == []
 
 
 @pytest.mark.parametrize('push', [False, True])
