@@ -8773,8 +8773,10 @@ def test_plan_added_prefixed_scope_items_validate_and_round_trip_verbatim_2177()
 
 # --- #2156: dispositions-only hold patches ---------------------------------
 
-from coding_review_agent_loop.protocol import (  # noqa: E402
+from coding_review_agent_loop.protocol_risk import (  # noqa: E402
     RISK_MATRIX_MAX_CHANGES as _MAX_CHANGES_2156,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
     parse_plan_revision_patch as _parse_patch_2156,
     validate_structured_plan_revision_patch as _validate_patch_2156,
 )

@@ -1032,7 +1032,7 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
 
 
 def _np_keep_patches(base_rounds, *, base, item_id):
-    """Planner patches that keep ``item_id`` open, each changing the steps.
+    """Dispositions-only hold patches (#2156) that keep ``item_id`` open.
 
     ``base_rounds`` are the rounds of the candidates the patches revise; each
     revision publishes the next candidate at the following listed round.
@@ -1050,10 +1050,7 @@ def _np_keep_patches(base_rounds, *, base, item_id):
             ],
             "base_round_number": n,
             "base_state_identity": base.state_identity,
-            "operations": [{
-                "op": "replace", "field": "plan_steps",
-                "value": [f"Implement the reviewed scope, panel revision {n}."],
-            }],
+            "operations": [],
         }
         base = AuthenticatedPlanState.from_plan(
             assemble_plan_revision(base, payload), round_number=published
@@ -1066,22 +1063,10 @@ def test_post_panel_no_progress_stop_keeps_the_pre_panel_alternative(tmp_path, m
     """`plan-k-unchanged`: an episode from before the panel opening still supplies the
     approach alternative of a later no-progress stop (the replay is per segment)."""
     from coding_review_agent_loop.errors import HumanDecisionRequiredError
-    from coding_review_agent_loop.no_progress import (
-        plan_no_progress_observations as real_observations,
-    )
 
-    def observations(records, **kwargs):
-        # A semantic patch can never return a byte-identical plan, so the
-        # observed subject is normalized to the live plan; every other window
-        # rule stays real.
-        live = next(
-            record.metadata.subject
-            for record in sorted(records, key=lambda item: item.index, reverse=True)
-            if record.metadata.role == "coder"
-        )
-        return tuple(replace(o, subject=live) for o in real_observations(records, **kwargs))
-
-    monkeypatch.setattr(plan_first_loop_module, "plan_no_progress_observations", observations)
+    # The post-panel planner returns real dispositions-only holds (#2156), so
+    # the persisted rounds repeat one plan content identity with no
+    # observation patching.
     fresh, base0 = _m1103_fresh_base()
     codex1, claude1, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
     codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base_round2)
