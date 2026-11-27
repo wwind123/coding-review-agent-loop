@@ -410,8 +410,8 @@ real test gate, and refreshed only afterwards; a gate adopts only new
 artifacts. Each completed turn refreshes it, and a post-turn capture that
 fails, or exceeds the 100,000-path cap, poisons the entry so a later
 clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` (a
-tool-owned temporary directory) and dry-run are exempt; the former `repair` role
-was removed with the repair pass (#2162). The Antigravity backend isolates
+tool-owned temporary directory) and dry-run are the only exemptions; containment
+covers `coder`, `reviewer` and `test-gate`. The Antigravity backend isolates
 `semantic-dedupe`: a GEMINI lock
 beside the temporary directory instead of in git metadata, no checkout
 snapshot or replacement classification, and the strict empty-allowlist

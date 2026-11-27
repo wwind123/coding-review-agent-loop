@@ -18,6 +18,8 @@ import tempfile
 from pathlib import Path
 
 SCRATCH_DIR_NAME = "coding-review-agent-loop"
+# Private subdirectory for the Antigravity help and model-catalog probes.
+AGY_PROBE_DIR_NAME = "agy-probe"
 PRIVATE_DIR_MODE = 0o700
 
 

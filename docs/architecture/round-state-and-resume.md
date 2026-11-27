@@ -171,7 +171,7 @@ later cleared checkpoints remain cleared on repeated restart. Existing comments
 are never edited or deleted. Planning retains its separate ordinary-finding
 and legacy-demotion behavior and receives no PR alias/disposition migration.
 
-An exhausted acknowledgement repair publishes an explicit
+An exhausted acknowledgement re-ask publishes an explicit
 `acknowledgement-repair-failed` boundary. Same-head resume preserves its round,
 full carried ledger and the history-wide item-number high-water mark, including
 round 1. Earlier reviews saw a different ledger and are rerun; the boundary is
@@ -660,8 +660,8 @@ review prompt uses the immutable acquisition frozen for its current round.
 Key contracts to preserve when changing the implementation:
 
 - Validate acquisition, structured fields, footer state, IDs, and provenance
-  before treating a response as an authoritative workflow result. Repair is
-  bounded format correction and is revalidated, not a new substantive review.
+  before treating a response as an authoritative workflow result. Re-asks are
+  bounded format corrections, revalidated, not new substantive reviews.
 - Signed human requirements (`-- Human Reviewer`) are honour-system unless
   `--human-reviewer-trusted-actor LOGIN:ID` entries are configured. With a
   trust set, `github.py` admits a signed issue body, issue/PR comment, or PR
@@ -871,7 +871,7 @@ Role/field consistency violations in a live response (a human-only source
 without its request, mixed or evidence-only without answered items, a request
 or answers on another role, mixed without leftover instructions) are reviewer
 judgements: they take the bounded judgement re-ask and, when it is exhausted,
-the deterministic reviewer-judgement failure, never format repair. Shape errors
+the deterministic reviewer-judgement failure, never a format re-ask. Shape errors
 stay fatal (#2035).
 Signed-source classification runs after the round's reviews are published. In
 an unreconciled round whose surfaced signed requirement identities exactly equal

@@ -53,9 +53,9 @@ steps, never item text or dispute evidence, and is posted best-effort: a
 posting failure is logged and the original `HumanDecisionRequiredError` is
 raised.
 
-Validation and repair share the same required IDs and optional allowance with
+Validation and the same-agent re-ask share the same required IDs and optional allowance with
 ledger-proven exclusions removed, including an explicitly empty required set.
-Repair's complete-valid-set instruction and preservation exemptions permit removal
+The re-ask's complete-valid-set instruction and preservation exemptions permit removal
 of excluded classifications, notes and dispute evidence. Generic optional claims
 without ledger exclusion proof retain their existing protection. Diagnostics are
 internal and unparsed; no persisted schema changes. Carried ledger records, rather
@@ -99,7 +99,7 @@ logic never see them. Notes never block, are allowed in approved and blocking
 reviews, never become planner revision input, and are never filed as issues.
 Each review is bounded deterministically (10 notes of at most 1000
 characters; a note duplicating the same review's blocking or same-plan item
-is dropped) with recorded degradations instead of a rejection, and repair
+is dropped) with recorded degradations instead of a rejection, and re-ask
 preservation keeps every note while letting a blocking duplicate win. Notes
 persist on the reviewer's plan round record (`implementation_notes`, omitted
 when empty so legacy encodings stay byte-identical, spillable to sidecars).
@@ -129,7 +129,7 @@ planning-route children see only their own scope's notes, and notes are never
 written into child issues or handoff records.
 
 An approving PR reviewer whose review lacks the signed-requirements
-acknowledgement is never reformatted by a repair model (#2066): the review
+acknowledgement is never reformatted by another model (#2066): the review
 upserts the dedicated human-requirements acknowledgement machine obligation and immediately persists
 its ledger in an Orchestrator summary with an explicit failure-boundary phase.
 Same-head restart retains the round and full ledger and reruns reviewers against
@@ -241,7 +241,7 @@ Conjunctive findings carry sub-items. A PR-review blocking or same-PR
 finding may declare an ordered `sub_items` array of two to twelve distinct
 statements; a single-obligation finding is unchanged. The orchestrator mints
 the IDs `item-N.s1`..`item-N.sK` on every minting path, including the
-reviewer-repair path, and each carried item persists every sub-item's text,
+reviewer re-ask path, and each carried item persists every sub-item's text,
 status and closing round in round metadata. The persisted fields are optional
 and emitted only when present, so legacy records, dispositions and the
 prior-item ledger signature are byte-identical. A malformed persisted payload
@@ -349,7 +349,7 @@ the non-array citation diagnosis read back from that record
 (`durable_citation_diagnosis`: its persisted `test_observation_degradations`
 and the tool-owned `uncited_acquisition_receipts` count the loop writes on the
 coder record from the frozen original acquisition catalog, before evidence
-bounding, so repair-turn receipts never count and evicted rows are never lost),
+bounding, so re-ask-turn receipts never count and evicted rows are never lost),
 so a resumed stop renders the same section as the live one, the
 newest `Approach alternative:` excerpt at the stop head
 (`review_step_back.pr_approach_alternative_at_head`, selected even after later
@@ -513,7 +513,7 @@ consecutive PR follow-ups that leave one head unchanged and stops at
 at the limit made cited, authoritative evidence progress, meaning a receipt
 that passes three checks:
 - it is in the coder acquisition's frozen catalog
-  (`acquisition_test_observations`, captured before any repair launch can
+  (`acquisition_test_observations`, captured before any re-ask launch can
   repoint the runner's latest test turn);
 - either the live, unbounded reconciliation retained by
   `Runner.render_local_test_evidence` names it as `superseded_by` on a
@@ -540,7 +540,7 @@ reviewer context; admission and progress use the frozen acquisition catalog,
 authenticated canonical derivation and live reconciliation, never projection
 membership. `Runner.render_local_test_evidence` reserves accepted citations
 matching parent-observed, unrestored receipts in the original acquisition
-before older rows under both the 32-row and 16-KiB bounds. Format repair and
+before older rows under both the 32-row and 16-KiB bounds. A format re-ask and
 post-authentication correction cannot replace that acquisition identity.
 If the protected set itself exceeds either capacity, projection raises an
 explicit capacity error and stops the handoff rather than publishing known
@@ -552,14 +552,14 @@ or colliding at reused indices. Legacy declarations remain self-reported with
 unknown attribution and cannot earn canonical satisfaction or progress.
 When the stop fires
 after the last follow-up's `test_observations` were dropped as a non-array,
-the message names that, says whether repair was attempted, and gives the
+the message names that, says whether a re-ask was attempted, and gives the
 number of uncited receipts from the frozen catalog.
 
 **PR evidence-only stall stop** (`--pr-evidence-stall-rounds` K, default 2,
 `0` disables). A `pr_review` blocking item may carry `evidence_row_ids`, parsed in
 `protocol.py` (blocking items only, bounded unique strings), validated against the
-enforceable rows of the approved matrix inside the review validation and repair loop
-(`unresolved_items._validate_review_response`; the repair preserves valid tags and
+enforceable rows of the approved matrix inside the review validation and re-ask loop
+(`unresolved_items._validate_review_response`; the re-ask preserves valid tags and
 invents none), and fixed on the stable `UnresolvedReviewItem` when it is minted.
 `evidence_stall.py` is pure: `unsatisfied_rows` derives `row_id -> explanation` from the
 persisted `risk_test_matrix_evidence` and diagnostics of the coder record whose subject
@@ -774,7 +774,7 @@ stay pending. Full satisfaction publishes a verified screenshot coverage release
 and returns to real same-head qualification; machine and signed-input gates retain
 precedence. Visual findings survive independent of coverage artifact availability.
 Both ordinary typed fields preserve presence and complete decoded values through
-repair, including malformed/extra content and order. Dedicated coverage is a
+a re-ask, including malformed/extra content and order. Dedicated coverage is a
 strict versioned decision set and cannot become a code review. Reports and receipts
 supply no signed-human or risk-matrix conversion authority.
 
@@ -799,7 +799,7 @@ machine and signed-input gates before publication-only recovery.
 `post_merge_runtime.py` admits selected-reviewer declarations and unanimous
 resolution-owner transitions, or deterministic scheduling directives from
 live-verified signed PR comments. Operator-only converted rows and signed
-requirements cannot obtain authority from model claims or repair output.
+requirements cannot obtain authority from model claims or re-ask output.
 Whole-block validation binds target identity and full requirement text; tracker
 preflight requires an existing open same-repository issue outside the closing
 set. Rejection retains the original evidence barrier and reports a target-bound
@@ -831,7 +831,7 @@ still require verified publication before they can change eligibility.
 Signed-source routing (#1922) is owned by `requirement_evidence.py`. Validated
 reviewer associations link surfaced signed IDs to that requester's native
 human-only requests or classify answers as evidence-only/mixed. The shared
-projection precedes acknowledgement repair and coder prompt/validation. Human-only
+projection precedes the acknowledgement re-ask and coder prompt/validation. Human-only
 requirements remain pending evidence; evidence-only answers leave coder work;
 mixed answers keep their original ID. Reviewers agree on a source when they agree
 on its role (#2000); each entry's linkage is still validated against that
@@ -845,7 +845,7 @@ finalization barrier (#1068), stopping at the evidence freeze before merge.
 Every validated review contributes, including a blocking review with code work.
 Unacknowledged signed sources receive one real semantic classification continuation,
 including standalone sources with no evidence ledger or emitted request, never
-format repair. The continuation shows prior classifications as reviewer and role
+a format re-ask. The continuation shows prior classifications as reviewer and role
 only. Missing classifications or role conflicts after that continuation stop
 before acknowledgement reinjection or coder dispatch; a role-conflict stop names
 each reviewer's role per source and the clearing input, a follow-up signed comment

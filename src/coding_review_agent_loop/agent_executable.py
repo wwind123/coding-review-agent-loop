@@ -199,22 +199,6 @@ def agent_executable_environment(
     return {"PATH": path, EXECUTABLE_ENV: str(launcher)}
 
 
-def pinned_agent_environment(
-    overrides: Mapping[str, str] | None = None,
-    *,
-    ambient: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """The complete environment for an agent launch outside ``Runner.run_with_log``.
-
-    Merges ``overrides`` (for example the coder CI-dispatch guard) over the
-    ambient environment, then applies the executable pin last, exactly as the
-    runner's launch sites do.  Every direct agent spawn uses this helper.
-    """
-    launch = {**(os.environ if ambient is None else ambient), **(overrides or {})}
-    launch.update(agent_executable_environment(launch))
-    return launch
-
-
 def _warn_once(message: str) -> None:
     if message in _WARNED:
         return

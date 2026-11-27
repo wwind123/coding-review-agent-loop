@@ -116,15 +116,6 @@ def test_environment_without_inherited_path_is_only_the_launcher_dir():
     assert env["PATH"] == str(Path(env[ae.EXECUTABLE_ENV]).parent)
 
 
-def test_pinned_agent_environment_merges_overrides_then_pins():
-    env = ae.pinned_agent_environment(
-        {"PATH": "/guard:/usr/bin", "MARKER": "x"}, ambient={"PATH": "/ignored", "KEEP": "y"}
-    )
-    directory = str(Path(env[ae.EXECUTABLE_ENV]).parent)
-    assert env["PATH"] == os.pathsep.join([directory, "/guard", "/usr/bin"])
-    assert env["MARKER"] == "x" and env["KEEP"] == "y"
-
-
 def test_install_failure_is_fail_soft_and_warned(tmp_path, monkeypatch, capsys):
     _fail_install(monkeypatch)
     ambient = {"PATH": "/usr/bin"}
