@@ -9389,7 +9389,10 @@ a blocker only when the finding also names a trigger reachable today, or a
 security or data-loss risk; otherwise it goes in `future_followups` or is
 omitted. Issue-derived and signed human requirements block as before. A
 carried item whose only support is a plan-added criterion plus a hypothetical
-input is dispositioned `future` (or `resolved`).
+input is dispositioned `future` (or `resolved`). The approved-plan
+reconciliation guidance's implementation-noncompliance category cross-references
+this narrowing (#2180), so missing a plan-added criterion is not a separate
+route to a blocker; ordinary defects reachable today still block.
 
 ### Operator-declared out of scope
 

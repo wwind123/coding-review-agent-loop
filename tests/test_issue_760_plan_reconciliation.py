@@ -13,6 +13,7 @@ from coding_review_agent_loop.github import PullRequestMetadata
 from coding_review_agent_loop.prompt_context import (
     approved_plan_reconciliation_guidance,
 )
+from coding_review_agent_loop.prompt_support import PLAN_ADDED_CRITERION_PREFIX
 from coding_review_agent_loop.prompts import (
     build_followup_prompt,
     build_review_prompt,
@@ -180,6 +181,58 @@ def test_full_and_compact_review_prompts_share_three_way_reconciliation_guidance
             assert phrase in prompt
         assert prompt.count("Approved-plan reconciliation guidance") == 1
         assert "No approved plan is bound to this PR" not in prompt
+
+
+_PLAN_ADDED_CROSS_REFERENCE = (
+    "Noncompliance with a requirement or acceptance criterion that only the "
+    f"approved plan added (prefixed `{PLAN_ADDED_CRITERION_PREFIX}`, or otherwise "
+    "not traceable to the issue text or a signed human requirement) is still "
+    "subject to the blocking scope criteria: it blocks only when the finding also "
+    "names a trigger reachable today or a security or data-loss risk; otherwise it "
+    "goes to `future_followups` or is omitted."
+)
+_ORDINARY_DEFECT_CLARIFIER = (
+    "This does not narrow ordinary defects, which still block when reachable today."
+)
+
+
+def test_category_one_cross_references_plan_added_blocking_scope(tmp_path):
+    """#2180: category 1 cannot route a plan-added criterion around the narrowing."""
+    context = _plan_context(_scenarios()[0]["plan_context"])
+    guidance = approved_plan_reconciliation_guidance(context)
+    assert _PLAN_ADDED_CROSS_REFERENCE in guidance
+    assert _ORDINARY_DEFECT_CLARIFIER in guidance
+    category_one = guidance.split("1. Implementation noncompliance", 1)[1].split("\n2. ", 1)[0]
+    assert _PLAN_ADDED_CROSS_REFERENCE in category_one
+    assert _ORDINARY_DEFECT_CLARIFIER in category_one
+
+    for compact in (False, True):
+        prompt = _review_prompt(tmp_path, context, compact=compact)
+        assert _PLAN_ADDED_CROSS_REFERENCE in prompt
+        assert "Implementation noncompliance or an ordinary defect" in prompt
+        assert "Plan conformance never defeats category 1 or 2" in prompt
+        assert prompt.count("Approved-plan reconciliation guidance") == 1
+
+
+@pytest.mark.parametrize(
+    "scenario_name",
+    ("budget_omitted_plan_text", "mismatched_plan_identity", "direct_pr_without_plan"),
+)
+def test_unverified_plan_guidance_omits_plan_added_cross_reference(scenario_name):
+    scenario = next(item for item in _scenarios() if item["name"] == scenario_name)
+    guidance = approved_plan_reconciliation_guidance(_plan_context(scenario["plan_context"]))
+    assert "Noncompliance with a requirement or acceptance criterion" not in guidance
+    assert PLAN_ADDED_CRITERION_PREFIX not in guidance
+
+
+def test_budget_truncated_available_plan_omits_plan_added_cross_reference(tmp_path):
+    context = make_approved_plan_context(
+        "Approved decision.\n" + "x" * 5000,
+        source_locator="issue #2180 approved-plan round",
+    )
+    prompt = _review_prompt(tmp_path, context, compact=False, approved_plan_max_chars=1000)
+    assert "Canonical approved plan text omitted" in prompt
+    assert _PLAN_ADDED_CROSS_REFERENCE not in prompt
 
 
 @pytest.mark.parametrize("scenario", _scenarios(), ids=lambda scenario: scenario["name"])
