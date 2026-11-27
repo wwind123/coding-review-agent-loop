@@ -1097,6 +1097,18 @@ def test_repeated_holds_stop_a_primary_then_panel_matrix_plan(tmp_path):
     ]
     assert sorted({r.round_number for r in reviews}) == [1, 2, 3]
     assert _np_prelaunch_rounds(runner) == [1, 2, 3]
+    # #2156 item-1: the second identical hold republishes the first hold's
+    # candidate key, yet both are scheduled broad with the hold reason
+    # instead of the unchanged-key recheck.
+    checkpoints = {
+        r.round_number: r for r in _plan_round_records(runner)
+        if r.phase == "scheduler-prelaunch"
+    }
+    assert checkpoints[3].plan_candidate_key == checkpoints[2].plan_candidate_key
+    for n in (2, 3):
+        reasons = " ".join(checkpoints[n].scheduler_reasons)
+        assert "dispositions-only hold" in reasons
+        assert "candidate plan key is unchanged" not in reasons
 
 
 def test_a_content_edit_after_holds_keeps_the_run_going(tmp_path):

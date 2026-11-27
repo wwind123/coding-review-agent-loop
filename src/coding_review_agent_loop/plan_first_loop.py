@@ -2380,6 +2380,7 @@ def _run_plan_first_loop_body(
                     response_form=current_response_form,
                     sidecar=current_plan_sidecar,
                     patch=current_plan_patch,
+                    current_round=round_number,
                 ),
                 previous_contracts=previous_plan_contracts,
                 current_contracts=_plan_cross_cutting_contracts(current_plan_sidecar),

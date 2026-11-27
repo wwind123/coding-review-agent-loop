@@ -509,6 +509,43 @@ def test_an_observed_hold_is_broad_with_its_own_reason():
     assert "reports no authenticated patch operations" not in classification.reason
 
 
+@pytest.mark.parametrize(
+    "revision_kwargs,current_plan,kind,reason",
+    [
+        # A repeated identical hold republishes the same key: still broad.
+        (dict(operations_observed=True, newly_published=True), "plan-1", "broad", "dispositions-only hold"),
+        # A changed-key hold is broad with the same reason.
+        (dict(operations_observed=True, newly_published=True), "plan-2", "broad", "dispositions-only hold"),
+        # A reviewer-only phase advance re-reviews an earlier hold: recheck.
+        (dict(operations_observed=True, newly_published=False), "plan-1", "recheck", "unchanged"),
+        # An unobserved operation set never claims to be a hold.
+        (dict(operations_observed=False, newly_published=True), "plan-1", "recheck", "unchanged"),
+    ],
+)
+def test_every_newly_published_hold_is_broad_even_with_a_repeated_key(
+    revision_kwargs, current_plan, kind, reason
+):
+    """#2156 item-1: identical holds must not fall into the unchanged-key recheck."""
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan=current_plan),
+        _revision(operation_fields=(), matrix_operations=(), **revision_kwargs),
+        previous_contracts=_contracts(),
+        current_contracts=_contracts(),
+    )
+    assert classification.kind == kind
+    assert reason in classification.reason
+
+
+def test_a_newly_published_edit_with_an_unchanged_key_keeps_the_recheck():
+    """Only holds bypass the recheck; other revisions keep the existing order."""
+    classification = classify_plan_transition(
+        _key(), _key(), _revision(newly_published=True, operations_observed=True),
+        previous_contracts=_contracts(), current_contracts=_contracts(),
+    )
+    assert classification.kind == "recheck"
+
+
 def test_the_descriptor_observes_an_authenticated_hold_patch():
     from coding_review_agent_loop.panel_evidence import _plan_revision_descriptor
     from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
@@ -528,6 +565,13 @@ def test_the_descriptor_observes_an_authenticated_hold_patch():
         response_form="semantic-patch-v1", sidecar=sidecar, patch=hold
     )
     assert descriptor.operations_observed
+    assert not descriptor.newly_published
+    assert _plan_revision_descriptor(
+        response_form="semantic-patch-v1", sidecar=sidecar, patch=hold, current_round=2
+    ).newly_published
+    assert not _plan_revision_descriptor(
+        response_form="semantic-patch-v1", sidecar=sidecar, patch=hold, current_round=3
+    ).newly_published
     assert descriptor.operation_fields == () and descriptor.matrix_operations == ()
     assert PlanRevisionDescriptor().operations_observed is False
 

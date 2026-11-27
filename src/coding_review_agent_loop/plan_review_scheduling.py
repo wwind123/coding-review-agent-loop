@@ -606,6 +606,10 @@ class PlanRevisionDescriptor:
     # set, so an empty set is a real dispositions-only hold (#2156) rather
     # than a defaulted value.
     operations_observed: bool = False
+    # True only when the caller observed that the current sidecar was
+    # published for the round being scheduled, i.e. a planner turn produced
+    # it.  A reviewer-only phase advance re-reviews an earlier sidecar.
+    newly_published: bool = False
 
     def __post_init__(self) -> None:
         for name in ("operation_fields", "matrix_operations"):
@@ -615,6 +619,16 @@ class PlanRevisionDescriptor:
                     f"Planning revision {name} entries must be non-empty strings."
                 )
             object.__setattr__(self, name, values)
+
+    @property
+    def is_hold(self) -> bool:
+        """An observed, authenticated zero-operation semantic patch (#2156)."""
+        return (
+            self.authenticated_semantic_patch
+            and self.operations_observed
+            and not self.operation_fields
+            and not self.matrix_operations
+        )
 
     @property
     def authenticated_semantic_patch(self) -> bool:
@@ -821,6 +835,12 @@ class PlanSchedulingDecision:
     records_panel_opening: bool = False
 
 
+_HOLD_REASON = (
+    "the revision is a dispositions-only hold with no patch operations; "
+    "a hold gets a full re-review of the planner's notes"
+)
+
+
 def classify_plan_transition(
     previous_key: PlanCandidateKey | None,
     current_key: PlanCandidateKey | None,
@@ -859,6 +879,11 @@ def classify_plan_transition(
         return PlanTransitionClassification(
             "broad", f"the previous candidate plan key is unusable: {previous_incomplete}"
         )
+    if revision is not None and revision.is_hold and revision.newly_published:
+        # Checked before the unchanged-key recheck: a repeated identical hold
+        # republishes the same candidate key, but it is a new planner turn
+        # whose dispute notes every reviewer re-reads (#2156).
+        return PlanTransitionClassification("broad", _HOLD_REASON)
     if current_key.matches(previous_key):
         return PlanTransitionClassification(
             "recheck", "the candidate plan key is unchanged"
@@ -919,11 +944,7 @@ def classify_plan_transition(
             # A dispositions-only hold (#2156) changes no plan content, but it
             # carries the planner's dispute notes, so reviewers re-read it in
             # full rather than taking a narrow shortcut.
-            return PlanTransitionClassification(
-                "broad",
-                "the revision is a dispositions-only hold with no patch "
-                "operations; a hold gets a full re-review of the planner's notes",
-            )
+            return PlanTransitionClassification("broad", _HOLD_REASON)
         # Without an observed operation set, an empty set is a defaulted
         # value, not evidence: there is nothing to check against the narrow
         # field and matrix-operation allowances.
