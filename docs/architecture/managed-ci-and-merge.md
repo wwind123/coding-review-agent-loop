@@ -570,16 +570,15 @@ merge-conflict obligation, a CI obligation bound to exactly that transition, or
 the exact rejected-coder recovery chain still fails closed, and every reviewer must still approve the exact final head
 before qualification or merge.
 
-Coder and format-repair turns on a managed PR cannot dispatch CI before
+Coder turns and their re-asks on a managed PR cannot dispatch CI before
 approval. `pr_loop.py` evaluates `managed_ci_active` once per coder
 turn. Issue and approved-plan implementation use the managed creation intent
 instead. That boolean travels as `coder_ci_dispatch_guard` on a
 `dataclasses.replace`d config that is passed only to the coder prompt builder
-and the coder `_run_validated_agent` call. Retries, format repair and the semantic-evidence correction
+and the coder `_run_validated_agent` call. Retries, same-agent re-asks and the semantic-evidence correction
 inherit it, and reviewers never see it. The same flag emits the prompt guidance and
-installs `coder_ci_guard.py`'s `gh` guard. Every coder or repair launch site
-calls `coder_ci_guard_environment`: the four backends, `run_cli_repair`, and the
-Gemini repair subprocess. The guard refuses `gh workflow run`, `gh run rerun`,
+installs `coder_ci_guard.py`'s `gh` guard. Every coder launch site
+calls `coder_ci_guard_environment` through the four backends. The guard refuses `gh workflow run`, `gh run rerun`,
 and dispatch/rerun POSTs. It `exec`s everything else through
 `AGENT_LOOP_CODER_GUARD_TARGET_GH` with its own directory removed from `PATH`,
 and preserves the REST shim's `AGENT_LOOP_REAL_GH`. After the turn,

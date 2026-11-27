@@ -75,7 +75,7 @@ from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment
 from .. import workdir_claims
 from ..review_diff import review_diff_target
-from ..scratch import make_private_dirs, scratch_root
+from ..scratch import AGY_PROBE_DIR_NAME, make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 # The shared agy settings lock is held for a whole agy turn (#1400), so a
@@ -1569,9 +1569,9 @@ class AntigravityBackend:
         self, runner: Runner, config: AgentLoopConfig, *, timeout_seconds: float
     ) -> tuple[set[str] | None, str]:
         """Query agy's model catalog once, preserving the PTY requirement."""
-        repair_root = make_private_dirs(scratch_root() / "repair")
-        log_path = agent_log_path(config, "antigravity-repair-models")
-        with tempfile.TemporaryDirectory(prefix="agy-catalog-", dir=repair_root) as temp_dir:
+        probe_root = make_private_dirs(scratch_root() / AGY_PROBE_DIR_NAME)
+        log_path = agent_log_path(config, "antigravity-models")
+        with tempfile.TemporaryDirectory(prefix="agy-catalog-", dir=probe_root) as temp_dir:
             try:
                 result = runner.run_with_log(
                     [config.antigravity_cmd, *config.antigravity_args, "models"],

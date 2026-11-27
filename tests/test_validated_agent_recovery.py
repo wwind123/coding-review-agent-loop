@@ -3301,3 +3301,19 @@ def test_valid_response_mentioning_agents_never_triggers_completion_recovery(tmp
 
     assert response.marker_value.pr_number == 79
     assert invoke.call_count == 1
+
+
+def test_reask_diagnostic_redacts_antigravity_probe_scratch_dir():
+    """Probe paths in re-ask diagnostics stay redacted after the rename (#2160)."""
+    import tempfile
+    from pathlib import Path
+
+    from coding_review_agent_loop.response_reask import _redact
+    from coding_review_agent_loop.scratch import AGY_PROBE_DIR_NAME, scratch_root
+
+    probe = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / AGY_PROBE_DIR_NAME
+    assert probe == scratch_root() / AGY_PROBE_DIR_NAME
+    text = f"error: agy failed in {probe}/agy-help-abc123"
+    redacted = _redact(text)
+    assert str(probe) not in redacted
+    assert "<probe-path>/agy-help-abc123" in redacted

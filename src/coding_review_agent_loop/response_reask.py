@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
 from .runner import strip_ansi
+from .scratch import AGY_PROBE_DIR_NAME, SCRATCH_DIR_NAME
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -78,7 +79,7 @@ def _redact(text: str, *, config: AgentLoopConfig | None = None) -> str:
     clean = strip_ansi(text)
     clean = _SECRET_RE.sub(r"\1=<redacted>", clean)
     paths: list[Path] = [Path.home()]
-    repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
+    probe_root = Path(tempfile.gettempdir()) / SCRATCH_DIR_NAME / AGY_PROBE_DIR_NAME
     if config is not None:
         paths.extend(
             (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir)
@@ -87,7 +88,7 @@ def _redact(text: str, *, config: AgentLoopConfig | None = None) -> str:
         rendered = str(path)
         if rendered and rendered != "/":
             clean = clean.replace(rendered, "<path>")
-    return clean.replace(str(repair_root), "<repair-path>")
+    return clean.replace(str(probe_root), "<probe-path>")
 
 
 def _sanitize_diagnostic(text: str, *, config: AgentLoopConfig | None = None) -> str:

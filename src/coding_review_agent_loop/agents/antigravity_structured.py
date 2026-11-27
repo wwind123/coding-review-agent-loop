@@ -44,8 +44,8 @@ if TYPE_CHECKING:
 
 
 # Structured kinds that may use agy's schema channel, mapped to the footer
-# marker name their validator expects.  Discuss kinds, semantic-patch kinds,
-# repair and semantic-dedupe turns are deliberately absent.
+# marker name their validator expects.  Discuss kinds, semantic-patch kinds
+# and semantic-dedupe turns are deliberately absent.
 STRUCTURED_KIND_FOOTERS: dict[str, str] = {
     "pr_review": "AGENT_STATE",
     "coder_followup": "AGENT_STATE",
@@ -113,9 +113,9 @@ def _probe_agy_help(runner: Runner, config: "AgentLoopConfig") -> str | None:
     Patched by the test suite so tests never depend on a host agy.
     """
     from ..logging import agent_log_path
-    from ..scratch import make_private_dirs, scratch_root
+    from ..scratch import AGY_PROBE_DIR_NAME, make_private_dirs, scratch_root
 
-    root = make_private_dirs(scratch_root() / "repair")
+    root = make_private_dirs(scratch_root() / AGY_PROBE_DIR_NAME)
     with tempfile.TemporaryDirectory(prefix="agy-help-", dir=root) as temp_dir:
         result = runner.run_with_log(
             [config.antigravity_cmd, "--help"],
