@@ -2596,7 +2596,7 @@ def test_planner_exhaustion_after_reasks_captures_the_last_candidate(tmp_path):
     assert persisted == [(exhaustion, info.value)]
 
 
-def _coder_turn(tmp_path, results, **kwargs):
+def _coder_turn(tmp_path, results, *, retries=0, **kwargs):
     from coding_review_agent_loop.protocol import validate_structured_coder_followup
 
     with patch_object_in(
@@ -2604,7 +2604,7 @@ def _coder_turn(tmp_path, results, **kwargs):
     ) as invoke:
         try:
             response = _run_validated_agent(
-                FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                FakeRunner(), agent="claude", config=make_config(tmp_path, agent_max_retries=retries),
                 prompt="Address review feedback.", marker_description="structured coder follow-up",
                 validate=validate_structured_coder_followup, role="coder",
                 repair_expected_kind="coder_followup", **kwargs,
@@ -2921,6 +2921,269 @@ def test_transient_failures_do_not_consume_the_reask_budget(tmp_path):
     assert "re-ask 1 of 2" in prompts[2]
     assert "re-ask 2 of 2" in prompts[3]
 
+
+
+# --- #2094: a pending re-ask survives retryable invocation failures --------
+
+_TRANSIENT_503 = "HTTP 503 Service Unavailable; please retry later"
+
+
+def _transient(**kwargs):
+    return AgentResult(text="", returncode=1, raw_output=_TRANSIENT_503, **kwargs)
+
+
+def test_transient_retry_of_a_coder_reask_resends_the_reask_under_the_head_guard(tmp_path, monkeypatch):
+    """`coder-reask-transient-retry`."""
+    valid = structured_coder_followup(summary="Updated.")
+    # Baseline before the re-ask, after the failed re-ask, after its retry.
+    reads = _script_heads(monkeypatch, ["H", "H", "H"])
+    response, invoke = _coder_turn(tmp_path, [
+        AgentResult(text=_drop_field(valid, "summary"), returncode=0, session_id="coder"),
+        _transient(session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ], retries=1, session_id="caller-session")
+    assert not isinstance(response, AgentInvocationError), response
+    assert response.text == valid
+    calls = [call.kwargs for call in invoke.call_args_list]
+    assert len(calls) == 3
+    assert calls[0]["prompt"] == "Address review feedback."
+    # The retry is the same re-ask: prompt and session, not the primary ones.
+    assert "re-ask 1 of 2" in calls[1]["prompt"]
+    assert calls[2]["prompt"] == calls[1]["prompt"]
+    assert calls[2]["session_id"] == calls[1]["session_id"] == "coder"
+    assert "Address review feedback." != calls[2]["prompt"]
+    # The head guard ran after the retried dispatch as well.
+    assert len(reads) == 3
+    # A distinguishable Claude log suffix for the retried re-ask.
+    assert calls[1]["attempt_suffix"] == "reask1"
+    assert calls[2]["attempt_suffix"] == "reask1-retry1"
+
+
+def test_transient_retry_of_a_coder_reask_that_moved_the_head_fails_closed(tmp_path, monkeypatch):
+    """`coder-reask-retry-head-moved`."""
+    valid = structured_coder_followup(summary="Updated.")
+    invalid = _drop_field(valid, "summary")
+    _script_heads(monkeypatch, ["H1", "H1", "H2"])
+    error, invoke = _coder_turn(tmp_path, [
+        AgentResult(text=invalid, returncode=0, session_id="coder"),
+        _transient(session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+        AgentResult(text=valid, returncode=0, session_id="coder"),
+    ], retries=2)
+    assert isinstance(error, AgentInvocationError)
+    # The retried re-ask's valid response is not accepted and nothing follows.
+    assert invoke.call_count == 3
+    assert error.failure_category == "deterministic"
+    assert "coder re-ask 1 moved the checkout head (H1 -> H2)" in str(error)
+
+
+def test_transient_retry_of_a_reviewer_reask_spends_no_reask_budget(tmp_path):
+    """`reviewer-reask-retry-budget`."""
+    valid = structured_pr_review(summary="Looks good.")
+    missing = _drop_field(valid, "summary")
+    results = [
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        _transient(),
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        AgentResult(text=valid, returncode=0, session_id="s"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+        )
+    assert response.text == valid
+    prompts = [call.kwargs["prompt"] for call in invoke.call_args_list]
+    assert len(prompts) == 4
+    assert "re-ask 1 of 2" in prompts[1]
+    # The transient retry carried re-ask 1 itself ...
+    assert prompts[2] == prompts[1]
+    # ... so the later validation failure still had re-ask 2 left.
+    assert "re-ask 2 of 2" in prompts[3]
+
+
+def test_retries_exhausted_during_a_reask_keep_the_transient_failure(tmp_path):
+    """`reask-retry-exhausted`."""
+    missing = _drop_field(structured_pr_review(), "summary")
+    results = [
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        _transient(),
+        _transient(),
+        AgentResult(text=structured_pr_review(), returncode=0, session_id="s"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        with pytest.raises(AgentInvocationError) as info:
+            _run_validated_agent(
+                FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=1),
+                prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            )
+    assert invoke.call_count == 3
+    assert info.value.failure_category == "transient"
+    assert "response rejected after" not in str(info.value)
+
+
+def test_transient_retry_of_a_resend_only_reask_keeps_the_earlier_acquisition(tmp_path):
+    """`resend-only-retry-acquisition` (resend-only part)."""
+    malformed = structured_coder_followup(summary="Needs envelope repair") + "\ntrailing text"
+    corrected = structured_coder_followup(summary="Corrected semantic response")
+    primary_observation, failed_observation, retry_observation = object(), object(), object()
+    results = [
+        AgentResult(text=malformed, returncode=0, session_id="coder-session",
+                    test_turn_id="coder-turn", test_turn_observations=(primary_observation,)),
+        _transient(session_id="coder-session", test_turn_id="failed-turn",
+                   test_turn_observations=(failed_observation,)),
+        AgentResult(text=corrected, returncode=0, session_id="coder-session",
+                    test_turn_id="retry-turn", test_turn_observations=(retry_observation,)),
+    ]
+    runner = FakeRunner()
+    seen_catalogs = []
+
+    def validate(text):
+        seen_catalogs.append(response_validation._current_test_turn_observations(runner))
+        if text != corrected:
+            raise AgentLoopError("malformed response")
+        return text
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Provide the coder follow-up.", marker_description="structured coder follow-up",
+            validate=validate, role="coder", repair_expected_kind="coder_followup",
+        )
+    assert response.text == corrected
+    assert invoke.call_count == 3
+    assert invoke.call_args_list[2].kwargs["prompt"] == invoke.call_args_list[1].kwargs["prompt"]
+    # Neither the failed re-ask nor its retry becomes the acquisition.
+    assert response.acquisition_test_turn_id == "coder-turn"
+    assert response.acquisition_test_observations == (primary_observation,)
+    assert seen_catalogs and all(catalog == (primary_observation,) for catalog in seen_catalogs)
+
+
+def test_antigravity_capacity_fallback_during_a_reask_sends_the_reask_to_the_next_model(tmp_path):
+    """`antigravity-fallback-reask`."""
+    valid = structured_pr_review(summary="Looks good.")
+    missing = _drop_field(valid, "summary")
+    config = make_config(
+        tmp_path, reviewer="antigravity", agent_max_retries=0, antigravity_models=("ModelA", "ModelB"),
+    )
+    results = iter((
+        AgentResult(text=missing, returncode=0, session_id="agy-a", model_used="ModelA"),
+        AgentResult(
+            text="",
+            raw_output="Error: Our servers are experiencing high traffic right now, please try again in a minute.",
+            returncode=1,
+            model_used="ModelA",
+        ),
+        AgentResult(text=valid, returncode=0, model_used="ModelB"),
+    ))
+    calls = []
+
+    def mock_run(_runner, *, config, prompt, session_id, **_kwargs):
+        calls.append((config.antigravity_models, prompt, session_id))
+        return next(results)
+
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
+        response = _run_validated_agent(
+            FakeRunner(), agent="antigravity", config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            session_id="caller-session",
+        )
+    assert response.text == valid
+    assert response.model_used == "ModelB"
+    assert [models for models, _prompt, _session in calls] == [("ModelA",), ("ModelA",), ("ModelB",)]
+    reask_prompt = calls[1][1]
+    assert "re-ask 1 of 2" in reask_prompt
+    # The next model receives the re-ask itself, never the primary prompt.
+    assert calls[2][1] == reask_prompt
+    assert calls[2][2] == calls[1][2]
+
+
+def test_timed_out_reask_stays_terminal(tmp_path):
+    """`reask-timeout-terminal`."""
+    missing = _drop_field(structured_pr_review(), "summary")
+    results = [
+        AgentResult(text=missing, returncode=0, session_id="s"),
+        AgentResult(text="", returncode=None, session_id="s"),
+        AgentResult(text=structured_pr_review(), returncode=0, session_id="s"),
+    ]
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        with pytest.raises(AgentInvocationError) as info:
+            _run_validated_agent(
+                FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=2),
+                prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+                timeout_seconds=30,
+            )
+    assert invoke.call_count == 2
+    assert info.value.failure_category == "timeout"
+
+
+_NARRATION = "I reviewed the PR as markdown in chat; it looks fine overall."
+
+
+def test_availability_retry_after_spent_reasks_uses_the_primary_prompt(tmp_path):
+    """`exhausted-reask-substance-retry` (ordinary retry)."""
+    valid = structured_pr_review(summary="Looks good.")
+    results = [AgentResult(text=_NARRATION, returncode=0, session_id=f"s{index}") for index in range(3)]
+    results.append(AgentResult(text=valid, returncode=0, session_id="s3"))
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(), agent="codex", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Review the PR.", marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            session_id="caller-session",
+        )
+    assert response.text == valid
+    calls = [call.kwargs for call in invoke.call_args_list]
+    assert len(calls) == 4
+    assert "re-ask 2 of 2" in calls[2]["prompt"]
+    # The spent re-ask 2 is not carried: primary prompt, caller session.
+    assert calls[3]["prompt"] == "Review the PR."
+    assert calls[3]["session_id"] == "caller-session"
+
+
+def test_format_fallback_after_spent_reasks_uses_the_primary_prompt(tmp_path):
+    """`exhausted-reask-substance-retry` (Antigravity format-fallback)."""
+    valid = structured_pr_review(summary="Looks good.")
+    config = make_config(
+        tmp_path, reviewer="antigravity", agent_max_retries=0, antigravity_models=("ModelA", "ModelB"),
+    )
+    results = iter(
+        [AgentResult(text=_NARRATION, returncode=0, session_id=f"a{index}", model_used="ModelA")
+         for index in range(3)]
+        + [AgentResult(text=valid, returncode=0, session_id="b", model_used="ModelB")]
+    )
+    calls = []
+
+    def mock_run(_runner, *, config, prompt, session_id, **_kwargs):
+        calls.append((config.antigravity_models, prompt, session_id))
+        return next(results)
+
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
+        response = _run_validated_agent(
+            FakeRunner(), agent="antigravity", config=config, prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_review_validator, role="reviewer", repair_expected_kind="pr_review",
+            session_id="caller-session",
+        )
+    assert response.model_used == "ModelB"
+    assert [models for models, _prompt, _session in calls] == [("ModelA",)] * 3 + [("ModelB",)]
+    assert "re-ask 2 of 2" in calls[2][1]
+    assert calls[3][1] == "Review the PR."
+    assert calls[3][2] == "caller-session"
 
 def test_test_observations_degrade_after_reask_exhaustion(tmp_path, monkeypatch):
     """`test-observations-degrade`."""
