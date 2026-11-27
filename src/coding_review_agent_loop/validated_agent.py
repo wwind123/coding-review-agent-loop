@@ -251,6 +251,9 @@ class _PendingReask:
     # The model the rejected response came from, when it differs from the
     # configured one, so the re-ask goes to that same model.
     producer_model: str | None = None
+    # Ordinary transient or fallback retries of this same re-ask (#2094);
+    # diagnostic only (the Claude log suffix), never re-ask budget.
+    retries: int = 0
 
 
 _MODEL_FIELDS_BY_BACKEND = {
@@ -1359,6 +1362,29 @@ def _run_validated_agent_in_scope(
         )
         return True
 
+    def _carry_reask_for_retry() -> None:
+        """Keep the failed re-ask dispatch pending across a retry (#2094).
+
+        A re-ask whose invocation failed (a transient or provider exit, an
+        empty response, Antigravity capacity or structured ambiguity, a
+        retryable agent-unavailable answer, a transient public response) is
+        resent as itself: same prompt, session, evidence scope, model pin and
+        coder head baseline, so the head guard runs after the retry.  It keeps
+        its number and spends no re-ask budget.  The carry applies whenever
+        the budget was not spent, which includes a response the re-ask block
+        declined to re-ask (transient public text, an unsupported-model
+        failure, provider-stop prose).  Once ``schedule_reask`` has marked the
+        budget exhausted, a later availability retry or format-fallback (a
+        reviewer response with no review substance) gets the clean primary
+        prompt and caller session, never the spent re-ask.  A quota-wait
+        replay carries the re-ask through ``last_dispatch`` instead.
+        """
+        nonlocal pending_reask
+        if dispatch_reask is not None and not reask_budget_exhausted:
+            pending_reask = dataclasses_replace(
+                dispatch_reask, retries=dispatch_reask.retries + 1
+            )
+
     attempt = 0
     # A while loop: a quota wait may extend max_attempts mid-turn.
     while attempt < max_attempts:
@@ -1431,7 +1457,11 @@ def _run_validated_agent_in_scope(
                 attempt_prompt = dispatch_reask.prompt
                 attempt_session_id = dispatch_reask.session_id
                 if backend_agent == "claude":
-                    invocation_kwargs["attempt_suffix"] = f"reask{dispatch_reask.number}"
+                    invocation_kwargs["attempt_suffix"] = (
+                        f"reask{dispatch_reask.number}"
+                        if dispatch_reask.retries == 0
+                        else f"reask{dispatch_reask.number}-retry{dispatch_reask.retries}"
+                    )
         last_dispatch = _QuotaReplay(
             attempt_prompt,
             attempt_session_id,
@@ -2781,6 +2811,7 @@ def _run_validated_agent_in_scope(
                                 f"{antigravity_attempts.models[antigravity_attempts.model_index]} "
                                 "without delay",
                             )
+                            _carry_reask_for_retry()
                             continue
                         reservation = _antigravity_quota_wait()
                         if reservation is None:
@@ -2823,6 +2854,10 @@ def _run_validated_agent_in_scope(
                 if antigravity_attempts is not None
                 else ("retry" if ordinary_retries_used < config.agent_max_retries else "stop")
             )
+            # Every remaining continue (retry, format-fallback, fallback)
+            # rebuilds through the ordinary builder; a stop breaks and leaves
+            # the turn's failure unchanged.
+            _carry_reask_for_retry()
             if transition == "retry":
                 if antigravity_attempts is None:
                     ordinary_retries_used += 1

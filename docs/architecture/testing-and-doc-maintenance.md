@@ -307,6 +307,21 @@ rejected-candidate metadata and pr_loop's evidence derivation all read the
 active acquisition, so receipts produced during a resend-only dispatch are
 never admitted and catalogs are never merged.
 
+A re-ask whose own invocation fails retryably (a transient or provider exit,
+an empty response, Antigravity capacity or structured ambiguity, a retryable
+agent-unavailable answer, a transient public response) stays pending across
+the ordinary retry, the Antigravity capacity or format fallback, and the
+no-delay quota-group fallback (#2094). The retry resends that re-ask: the same
+prompt, session, evidence scope, model pin and coder head baseline, so the
+head guard runs after the retried dispatch and a resend-only re-ask still
+inherits the active acquisition. It spends the ordinary retry allowance or a
+fallback step, as any transient retry does, but no re-ask. A timeout stays
+terminal. The carry stops once the re-asks are spent: a later reviewer
+availability retry or format-fallback for a response with no review substance
+gets the primary prompt and the caller's session, never the spent re-ask.
+Quota-wait, structured-off and executable-replacement replays already resend
+the failed dispatch, re-ask included.
+
 When both re-asks fail, the turn fails as before: the same
 `AgentInvocationError`, the deterministic category, the plan-validation
 exhaustion capture for the last planner candidate and the bounded replan for

@@ -262,14 +262,14 @@ def _turn_result(text, turn_id, observations, session_id=None):
     )
 
 
-def _run_real(tmp_path, results):
+def _run_real(tmp_path, results, *, retries=0):
     runner = FakeRunner()
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=list(results)) as invoke:
         try:
             response = _run_validated_agent(
                 runner,
                 agent="claude",
-                config=make_config(tmp_path, agent_max_retries=0),
+                config=make_config(tmp_path, agent_max_retries=retries),
                 prompt="Implement the issue.",
                 marker_description="structured issue_implementation result",
                 validate=_real_validator(runner),
@@ -344,6 +344,33 @@ def test_fresh_evidence_reask_uses_the_rerun_prompt_and_binds_its_own_acquisitio
     assert claims[0].execution_refs == ("turn2:obs-1",)
     assert response.acquisition_test_turn_id == "t2"
 
+
+
+def test_transient_retry_of_a_fresh_evidence_reask_binds_the_retry_acquisition(tmp_path):
+    """`resend-only-retry-acquisition` (fresh-evidence part, #2094)."""
+    first = _turn_result(
+        _claim_text("turn1:obs-1"), "t1",
+        [_obs_for("turn1:obs-1", "t1", suite_start="not-started")], "coder-session",
+    )
+    failed = AgentResult(
+        text="", returncode=1, raw_output="HTTP 503 Service Unavailable; please retry later",
+        session_id="coder-session", test_turn_id="t2", test_turn_observations=(),
+    )
+    retried = _turn_result(
+        _claim_text("turn3:obs-1"), "t3", [_obs_for("turn3:obs-1", "t3")], "coder-session"
+    )
+    response, error, invoke = _run_real(tmp_path, [first, failed, retried], retries=1)
+    assert error is None
+    assert invoke.call_count == 3
+    reask, retry = (call.kwargs for call in invoke.call_args_list[1:])
+    # The retry resends the fresh-evidence re-ask itself.
+    assert "Rerun the test command that covers this change" in retry["prompt"]
+    assert retry["prompt"] == reask["prompt"]
+    assert retry["session_id"] == "coder-session"
+    # The retried fresh-evidence dispatch becomes the active acquisition.
+    assert response.acquisition_test_turn_id == "t3"
+    claims = response.marker_value.risk_test_matrix_claims.claims
+    assert claims[0].execution_refs == ("turn3:obs-1",)
 
 @pytest.mark.parametrize("second_reask_cites", ["turn2:obs-1", "turn3:obs-1"])
 def test_resend_only_reask_after_fresh_evidence_keeps_the_fresh_catalog(tmp_path, second_reask_cites):
