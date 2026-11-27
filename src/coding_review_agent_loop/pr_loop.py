@@ -3722,7 +3722,7 @@ def run_pr_loop(
             round_new_unresolved_items: list[UnresolvedReviewItem] = []
             # (reviewer, requests) pairs from this round's reviews (#1068).
             round_evidence_requests: list[tuple[str, tuple[str, ...]]] = []
-            round_human_check_withdrawals: list[tuple[str, tuple[str, ...]]] = []  # #2105
+            round_human_check_withdrawals: list[tuple[str, tuple[str, ...], tuple[str, ...], int | None]] = []  # #2105
             current_pr_subject = str(pr_metadata.head_sha or "unknown")
             round_ledger_incomplete = _round_ledger_may_be_incomplete(
                 current_resume=current_resume,
@@ -6000,8 +6000,8 @@ def run_pr_loop(
                         subject=current_pr_subject,
                         reviewer_name=reviewer_name,
                     )
-                if carried_approval_record is None and parsed_review.withdrawn_human_checks:
-                    round_human_check_withdrawals.append((reviewer_name, parsed_review.withdrawn_human_checks))
+                if carried_approval_record is None and (parsed_review.withdrawn_human_checks or parsed_review.exact_head_evidence_requests):
+                    round_human_check_withdrawals.append((reviewer_name, parsed_review.withdrawn_human_checks, parsed_review.exact_head_evidence_requests, resumed_record.index if resumed_record is not None else None))
                 if carried_approval_record is None and parsed_review.exact_head_evidence_requests:
                     round_evidence_requests.append(
                         (reviewer_name, parsed_review.exact_head_evidence_requests)
@@ -6086,10 +6086,10 @@ def run_pr_loop(
             if pr_fatal_errors and not pr_round_parallel and not pr_continuation_allowed:
                 # A sequential stop keeps today's shape: no reconciliation record.
                 raise next((e for _n, e in pr_fatal_errors if isinstance(e, QuotaResetExceededError)), pr_fatal_errors[0][1])
-            for withdrawing_reviewer, withdrawn_ids in round_human_check_withdrawals:  # before the reconciliation record (#2105)
-                human_evidence.withdraw(withdrawing_reviewer, withdrawn_ids, round_number=round_number)
-            for requesting_reviewer, requests in round_evidence_requests:  # a re-request re-admits (#2105)
-                human_evidence.requested(requesting_reviewer, requests)
+            for withdrawing_reviewer, withdrawn_ids, _requests, position in round_human_check_withdrawals:  # before the reconciliation record (#2105)
+                human_evidence.withdraw(withdrawing_reviewer, withdrawn_ids, round_number=round_number, position=position)
+            for requesting_reviewer, _ids, requests, position in round_human_check_withdrawals:  # only a later request re-admits
+                human_evidence.requested(requesting_reviewer, requests, position=position)
             if (
                 (
                     pr_round_parallel

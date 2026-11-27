@@ -1336,3 +1336,36 @@ def test_only_the_ordinary_recovery_hold_sites_pass_draft():
     drafted = [any(k.arg == "draft" and k.value.value is True for k in call.keywords) for call in holds]
     assert len(holds) == 6 and drafted.count(True) == 3
     assert all(any(k.arg == "draft" for k in call.keywords) == (id(call) in recovery_holds) for call in holds)
+
+
+@pytest.mark.parametrize("mode", ["advisory", "freeze"])
+def test_returning_to_a_previously_reviewed_head_does_not_resurrect_a_withdrawn_check(
+    tmp_path, monkeypatch, capsys, mode
+):
+    """Items 1 and 2: an older review replayed after its check was withdrawn stays withdrawn."""
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])])
+    config = _config(tmp_path, auto_merge=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _listed(_check_records(runner)[-1]) == [_EVIDENCE_TEXT]
+    # Head B: the requester withdraws the sole check (no merge yet).
+    runner._move_head(_LATER_HEAD, cwd=None)
+    runner.pr_payload["headRefOid"] = _LATER_HEAD
+    runner.codex_outputs.append(_withdrawing(_evidence_review(), _id_for(_EVIDENCE_TEXT)))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, auto_merge=False)) == 0
+    assert runner.codex_outputs == [] and _merge_calls(runner) == []
+    # The branch returns to head A, whose original review requested the check.
+    runner._move_head(HEAD, cwd=None)
+    runner.pr_payload["headRefOid"] = HEAD
+    runner.codex_outputs.append(_evidence_review())  # only used if the head is reviewed again
+    capsys.readouterr()
+    seen = []
+    real_hold = HumanEvidenceRun.hold
+    monkeypatch.setattr(HumanEvidenceRun, "hold",
+                        lambda self, *a, **k: seen.append(self.checks) or real_hold(self, *a, **k))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, pr_human_evidence=mode)) == 0
+    assert all(checks == () for checks in seen)
+    assert _freeze_records(runner) == []
+    assert len(_check_comments(runner)) == 1
+    [merge] = _merge_calls(runner)
+    assert merge[merge.index("--match-head-commit") + 1] == HEAD
+    assert "approved but not merged" not in capsys.readouterr().out

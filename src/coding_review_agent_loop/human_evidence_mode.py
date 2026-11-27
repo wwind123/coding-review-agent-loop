@@ -44,6 +44,8 @@ _OPEN_STATUSES = frozenset({"blocking", "same-pr"})
 DISPLAY_ID_PREFIX = "human-check-"
 WITHDRAWN_HUMAN_CHECKS_FIELD = "withdrawn_human_checks"
 _WITHDRAWAL_ID_LIMIT = 200
+# Live positions sort after every recorded comment index.
+_LIVE_POSITION_BASE = 1 << 62
 
 _logger = logging.getLogger(__name__)
 
@@ -394,9 +396,13 @@ class HumanEvidenceRun:
         self.restore_pending = False
         self.posted: set[tuple[str, tuple[str, ...]]] = set()
         # Requester-scoped withdrawal tombstones (#2105): (display ID,
-        # reviewer) withdrawn and not requested again since, in record order.
-        # A tombstoned native request never re-enters the list.
-        self.tombstones: set[tuple[str, str]] = set()
+        # reviewer) -> position of the latest withdrawal.  Positions are
+        # comment indexes for recorded reviews and ascending run-local values
+        # above every index for live ones, so only a request made after the
+        # withdrawal clears it; a replayed older request never does.  A
+        # tombstoned native request never re-enters the list in any mode.
+        self.tombstones: dict[tuple[str, str], int] = {}
+        self._live_position = _LIVE_POSITION_BASE
 
     @property
     def freeze(self) -> bool:
@@ -417,14 +423,42 @@ class HumanEvidenceRun:
     def _tombstoned(self, item: UnresolvedReviewItem) -> bool:
         return item.converted_row_id is None and (display_id(check_identity(item)), item.reviewer) in self.tombstones
 
-    def requested(self, reviewer: str, texts: Sequence[str]) -> None:
-        """A later request of a withdrawn check by its requester re-admits it."""
+    def _position(self, position: int | None) -> int:
+        """A recorded review keeps its comment index; a live one is later than every record."""
+        if position is not None:
+            return position
+        self._live_position += 1
+        return self._live_position
+
+    def _drop_withdrawn(self, items: Sequence[UnresolvedReviewItem]) -> list[UnresolvedReviewItem]:
+        return [item for item in items if not (
+            is_native_human_evidence(item) and item.status in _OPEN_STATUSES and self._tombstoned(item))]
+
+    def requested(self, reviewer: str, texts: Sequence[str], *, position: int | None = None) -> None:
+        """A request made after a withdrawal by the same requester re-admits the check.
+
+        ``position`` is the comment index of a replayed reviewer record (None
+        for a live review).  A replayed request that predates the withdrawal
+        leaves the tombstone in place.
+        """
         from .unresolved_items import evidence_obligation_identity
 
+        if not texts:
+            return
+        at = self._position(position)
         for text in texts:
-            self.tombstones.discard((display_id(evidence_obligation_identity(text, reviewer)), reviewer))
+            key = (display_id(evidence_obligation_identity(text, reviewer)), reviewer)
+            if key in self.tombstones and self.tombstones[key] < at:
+                del self.tombstones[key]
 
-    def withdraw(self, reviewer: str, display_ids: Sequence[str], *, round_number: int) -> tuple[str, ...]:
+    def _tombstone(self, reviewer: str, display_ids: Sequence[str], position: int) -> None:
+        for wanted in display_ids:
+            key = (wanted, reviewer)
+            self.tombstones[key] = max(self.tombstones.get(key, position), position)
+
+    def withdraw(
+        self, reviewer: str, display_ids: Sequence[str], *, round_number: int, position: int | None = None
+    ) -> tuple[str, ...]:
         """Apply one reviewer's ``withdrawn_human_checks``; returns the applied IDs.
 
         Outside advisory mode the field is ignored with a log line.  Ignored
@@ -440,7 +474,7 @@ class HumanEvidenceRun:
         for wanted, reason in result.ignored:
             log(self.config, f"Round {round_number}: ignored withdrawal of human check {wanted} by {reviewer}: {reason}")
         applied = tuple(display_id(check.identity) for check in result.withdrawn)
-        self.tombstones.update((wanted, reviewer) for wanted in applied)
+        self._tombstone(reviewer, applied, self._position(position))
         if applied:
             self.checks = result.kept
             log(self.config, f"Round {round_number}: {reviewer} withdrew {len(applied)} advisory human check(s)")
@@ -464,9 +498,8 @@ class HumanEvidenceRun:
             reviewer = getattr(metadata, "agent", None)
             if reviewer == "Orchestrator" or not isinstance(reviewer, str):
                 continue
-            self.tombstones.update(
-                (wanted, reviewer) for wanted in getattr(metadata, "withdrawn_human_checks", ()) or ())
-            self.requested(reviewer, getattr(metadata, "evidence_requests", ()) or ())
+            self._tombstone(reviewer, getattr(metadata, "withdrawn_human_checks", ()) or (), record.index)
+            self.requested(reviewer, getattr(metadata, "evidence_requests", ()) or (), position=record.index)
         for record in check_records:
             metadata = record.metadata
             decoded = [HumanCheck.from_mapping(entry) for entry in metadata.human_checks]
@@ -497,11 +530,11 @@ class HumanEvidenceRun:
         clearances: Sequence[tuple[str, str]] = (),
     ) -> list[UnresolvedReviewItem]:
         if self.freeze:
+            # Every freeze pass, not only the restore pass, drops a withdrawn
+            # request that ledger replay or an older replayed review re-derived.
+            items = self._drop_withdrawn(items)
             if not self.restore_pending:
-                return list(items)
-            # The transitional restore pass also drops a withdrawn request
-            # that ledger replay re-derived from an advisory reviewer record.
-            items = [item for item in items if not (is_native_human_evidence(item) and self._tombstoned(item))]
+                return items
             restored = restore_checks_as_obligations(
                 items, self.checks, clearances=clearances, head_sha=head_sha
             )

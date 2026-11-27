@@ -335,7 +335,7 @@ def test_unauthorized_unknown_converted_and_malformed_withdrawals_change_nothing
     lines = []
     run = _advisory_run(tmp_path, monkeypatch, lines, native_a, row)
     assert run.withdraw("Claude", parsed.withdrawn_human_checks, round_number=3) == ()
-    assert run.checks == (native_a, row) and run.tombstones == set()
+    assert run.checks == (native_a, row) and run.tombstones == {}
     assert len([line for line in lines if "ignored withdrawal of human check" in line]) == 3
     # A non-list value degrades to no withdrawals instead of failing the review.
     payload = json.loads(text.split("\n<!--", 1)[0])
@@ -367,7 +367,7 @@ def test_rerequest_after_withdrawal_is_added_back_once(tmp_path, monkeypatch):
     assert run.checks == ()
     # Another reviewer's identical text is a different check and is unaffected.
     run.requested("Claude", [check.text])
-    assert run.tombstones == {(display_id(check.identity), "Codex")}
+    assert set(run.tombstones) == {(display_id(check.identity), "Codex")}
     # The same reviewer requesting it again in a later round re-admits it, once.
     run.requested("Codex", [check.text])
     rerequest = dataclasses.replace(_native(number=4), source_round=3)
@@ -397,7 +397,7 @@ def test_seed_applies_reviewer_record_withdrawals_before_the_mode_branch(tmp_pat
         agent="Codex", subject=HEAD, round_number=3, evidence_requests=(gone.text,)))
     readmitted = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence="advisory"), 77)
     readmitted.seed([orchestrator, withdrawal, rerequest], [])
-    assert len(readmitted.checks) == 2 and readmitted.tombstones == set()
+    assert len(readmitted.checks) == 2 and readmitted.tombstones == {}
     assert run.restore_pending
     # The transitional freeze restore drops a replayed withdrawn request too.
     restored = run.normalize([_native()], round_number=3, head_sha=HEAD)
@@ -436,3 +436,42 @@ def test_non_recovery_hold_wording_is_unchanged_and_draft_wording_is_opt_in():
     assert "draft" not in plain
     drafted = render_human_checks_comment(checks, pr_number=77, head_sha=HEAD, draft=True)
     assert "PR #77 is still a draft" in drafted and "must mark it ready first" in drafted
+
+
+@pytest.mark.parametrize("mode", ["advisory", "freeze"])
+@pytest.mark.parametrize("origin, readmitted", [
+    ("replayed-before-withdrawal", False),
+    ("replayed-same-record", False),
+    ("recorded-after-withdrawal", True),
+    ("live", True),
+])
+def test_only_a_request_made_after_the_withdrawal_readmits_the_check(tmp_path, mode, origin, readmitted):
+    """Item-1 and item-2 class: request replay keeps withdrawal ordering in every mode pass."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    check = _check(_native())
+    request = SimpleNamespace(index=3, metadata=SimpleNamespace(
+        agent="Codex", subject=HEAD, round_number=1, evidence_requests=(check.text,)))
+    withdrawal = SimpleNamespace(index=7, metadata=SimpleNamespace(
+        agent="Codex", subject=OTHER, round_number=1, withdrawn_human_checks=(display_id(check.identity),)))
+    orchestrator = SimpleNamespace(index=8, metadata=SimpleNamespace(
+        agent="Orchestrator", subject=OTHER, round_number=1, human_checks=()))
+    run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence=mode), 77)
+    run.seed([request, withdrawal, orchestrator], [])
+    # The withdrawn check was the only one, so no restoration is pending.
+    assert run.checks == () and not run.restore_pending
+    position = {"replayed-before-withdrawal": 3, "replayed-same-record": 7,
+                "recorded-after-withdrawal": 9, "live": None}[origin]
+    run.requested("Codex", [check.text], position=position)
+    # The same request reaches normalization (resumed review or ledger replay), twice.
+    first = run.normalize([_native()], round_number=2, head_sha=HEAD)
+    second = run.normalize(first, round_number=2, head_sha=HEAD)
+    if mode == "freeze":
+        assert [item.text for item in second] == ([check.text] if readmitted else [])
+    else:
+        assert second == [] and [c.text for c in run.checks] == ([check.text] if readmitted else [])
+    # An unrelated reviewer's request never clears Codex's tombstone.
+    if not readmitted:
+        run.requested("Claude", [check.text])
+        assert set(run.tombstones) == {(display_id(check.identity), "Codex")}
