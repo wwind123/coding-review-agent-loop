@@ -2513,6 +2513,47 @@ def test_a_conversion_after_an_earlier_reconciliation_still_resumes_the_open_rep
     assert resumed.reconciliation_record is None
     assert resumed.completed_reviews == ()
     assert resumed.prior_items == records[5].metadata.prior_items
+    # The reopened repeat has not settled (#2174): its summary is still to come.
+    assert resumed.reconciled is False
+
+
+def test_a_partially_published_conversion_repeat_resumes_unreconciled():
+    """`conv-partial-repeat-reader-unreconciled` (#2174)."""
+    history = [*_conversion_round_history(closed=False), _reviewer(round_number=2, items=(_item(),))]
+    resumed = _resume(history, _OLD)
+    assert resumed is not None and resumed.round_number == 2
+    # The conversion record is no reconciliation summary, and the earlier
+    # pre-conversion reconciliation and review are never restored.
+    assert resumed.reconciled is False
+    assert resumed.reconciliation_record is None
+    assert [r.index for r in resumed.completed_reviews] == [len(history) - 1]
+
+
+def test_a_conversion_repeat_followed_by_its_reconciliation_resumes_reconciled():
+    """Scope-2 (#2174): the repeat's own reconciliation still settles the round."""
+    history = [
+        *_conversion_round_history(closed=False),
+        _reviewer(round_number=2, items=(_item(),)),
+        _summary("reconciliation", _OLD, 2, (_item(),)),
+    ]
+    resumed = _resume(history, _OLD)
+    assert resumed is not None and resumed.round_number == 2
+    assert resumed.reconciled is True
+    assert resumed.reconciliation_record is not None
+    assert resumed.reconciliation_record.index == len(history) - 1
+
+
+def test_an_evidence_release_boundary_resume_stays_reconciled():
+    """Scope-2 (#2174): freeze/release boundary resumes are unchanged."""
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    for phase in ("evidence-freeze", "evidence-release"):
+        metadata = _freeze_metadata(_evidence_ledger())
+        if phase == "evidence-release":
+            metadata = replace(metadata, phase=phase, evidence_freeze=None)
+        resumed = _resume_pr_round(_comments(metadata), head_sha=metadata.subject, configured_reviewers=("codex",))
+        assert resumed is not None and resumed.evidence_boundary is not None
+        assert resumed.evidence_boundary.phase == phase
+        assert resumed.reconciled is True
 
 
 def test_conversion_repeat_round_ends_at_a_later_closure_record():

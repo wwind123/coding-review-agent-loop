@@ -3215,3 +3215,194 @@ def test_optional_visibility_refresh_separates_read_fallback_from_observation(
             assert not _reviews_after(runner, _conversion(runner).index)
         assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands[triggered[0]:])
     assert triggered
+
+
+# --- #2174: a reopened conversion repeat is unreconciled ---------------------
+
+
+def _round_reconciliations_after(runner, index, round_number=3):
+    return [r for r in _records(runner) if r.index > index and r.metadata.phase == "reconciliation"
+            and r.metadata.round_number == round_number and r.metadata.subject == START_HEAD]
+
+
+def _settled_names(runner, record):
+    body = runner.pr_payload["comments"][record.index]["body"]
+    match = re.search(r"settled reviewers: ([^.]*)\.", body)
+    assert match is not None, body
+    return sorted(match.group(1).split(", "))
+
+
+def _stop_before_freeze(monkeypatch):
+    return _stop_on_post(monkeypatch, lambda _r, m: m.phase == "evidence-freeze", "stopped before the freeze")
+
+
+def _assert_restart_reruns_no_reviewer(runner, config, context, reconciliation):
+    """`conv-summary-ends-repeat`: the posted summary ends the repeat on a later restart."""
+    from coding_review_agent_loop.pr_loop_support import conversion_repeat_round
+
+    assert conversion_repeat_round(_records(runner), round_number=3, head_sha=START_HEAD) is False
+    runner.simulate_new_process()
+    launches = _launches(runner)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert _reviewer_rounds_after(runner, reconciliation.index) == []
+    assert [r.metadata.phase for r in _records(runner) if r.index > reconciliation.index] == ["evidence-freeze"]
+    assert _launches(runner) == launches
+    assert _closures(runner) == []
+
+
+@pytest.mark.parametrize("parallel", [True, False])
+def test_a_restarted_conversion_repeat_posts_its_round_reconciliation(tmp_path, monkeypatch, parallel):
+    """`conv-resume-parallel-summary` / `conv-resume-selective-summary` (#2174).
+
+    Run 1 stops after the conversion record and the repeat checkpoint, before
+    any repeat review.  The restart resumes the conversion handoff, reruns the
+    full board fresh, and posts the round's own reconciliation summary.
+    """
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    runner.simulate_new_process()
+    config = dataclasses.replace(config, review_parallel=parallel)
+    restore = _stop_before_freeze(monkeypatch)
+    with pytest.raises(AgentLoopError, match="stopped before the freeze"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    restore()
+    _assert_fresh_repeat(runner, conversion)
+    [reconciliation] = _round_reconciliations_after(runner, conversion.index)
+    # The conversion full-board pass selects (and settles) the whole board.
+    assert _settled_names(runner, reconciliation) == ["Antigravity", "Codex", "Gemini"]
+    assert reconciliation.index > max(r.index for r in _reviews_after(runner, conversion.index))
+    _assert_restart_reruns_no_reviewer(runner, config, context, reconciliation)
+
+
+def test_a_partially_published_conversion_repeat_replays_and_posts_its_reconciliation(tmp_path, monkeypatch):
+    """`conv-partial-repeat-resume-summary` (#2174): one repeat publication, then a restart."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+
+    def second_repeat_publication(runner_, metadata):
+        conversions = [r for r in _records(runner_) if r.metadata.phase == "evidence-conversion"]
+        return (metadata.role == "reviewer" and conversions
+                and len(_reviews_after(runner_, conversions[-1].index)) == 1)
+
+    restore = _stop_on_post(monkeypatch, second_repeat_publication, "stopped after one repeat publication")
+    with pytest.raises(AgentLoopError, match="stopped after one repeat publication"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    restore()
+    conversion = _conversion(runner)
+    [published] = _reviews_after(runner, conversion.index)
+    assert _round_reconciliations_after(runner, conversion.index) == []
+    runner.simulate_new_process()
+    launches = _launches(runner)
+    restore = _stop_before_freeze(monkeypatch)
+    with pytest.raises(AgentLoopError, match="stopped before the freeze"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    restore()
+    # The remaining repeat outcomes replay from the spool: no reviewer runs again.
+    assert _launches(runner) == launches
+    assert _closures(runner) == []
+    repeat = _reviews_after(runner, conversion.index)
+    assert sorted(r.metadata.agent for r in repeat) == ["Antigravity", "Codex", "Gemini"]
+    assert [r.metadata.agent for r in repeat].count(published.metadata.agent) == 1
+    [reconciliation] = _round_reconciliations_after(runner, conversion.index)
+    assert _settled_names(runner, reconciliation) == ["Antigravity", "Codex", "Gemini"]
+    _assert_restart_reruns_no_reviewer(runner, config, context, reconciliation)
+
+
+def test_an_in_process_operator_conversion_on_a_reconciled_round_posts_its_own_reconciliation(
+    tmp_path, monkeypatch
+):
+    """`conv-inprocess-parallel-summary` (#2174): review_parallel=True on the reopened round."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    assert config.review_parallel is True
+    stale = [r for r in _records(runner) if r.metadata.phase == "reconciliation"][-1]
+    assert stale.metadata.round_number == 3
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    _assert_fresh_repeat(runner, conversion)
+    [reconciliation] = _round_reconciliations_after(runner, conversion.index)
+    converted = [(i.item_id, i.status) for i in conversion.metadata.prior_items]
+    assert ("item-1", "converted") in converted
+    # The repeat's summary carries the converted ledger, not the stale one.
+    assert [(i.item_id, i.status) for i in reconciliation.metadata.prior_items] == converted
+    assert [(i.item_id, i.status) for i in stale.metadata.prior_items] != converted
+
+
+def _inject_release_boundary(monkeypatch):
+    """Resume round 3 at an evidence-release boundary on the current head."""
+    real = pr_loop_module._resume_pr_round_admitted
+
+    def resume(*args, **kwargs):
+        resumed = real(*args, **kwargs)
+        if resumed is None or resumed.round_number != 3:
+            return resumed
+        release = PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=3, subject=START_HEAD,
+            prior_items=resumed.prior_items, state="blocking", phase="evidence-release",
+        )
+        return dataclasses.replace(resumed, evidence_boundary=release, reconciled=True)
+
+    monkeypatch.setattr(pr_loop_module, "_resume_pr_round_admitted", resume)
+
+
+@pytest.mark.parametrize("convert", [True, False])
+def test_an_in_process_conversion_after_a_release_resume_reviews_the_repeat(tmp_path, monkeypatch, convert):
+    """`conv-inprocess-release-boundary` (#2174): the stale release boundary is dropped.
+
+    Without a conversion, the plain release resume still skips reviewers.
+    """
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    if not convert:
+        config = dataclasses.replace(config, pr_convert_evidence_rows=())
+    _inject_release_boundary(monkeypatch)
+    before = len(runner.pr_payload["comments"])
+    launches = _launches(runner)
+    stop = "frozen at head" if convert else "stalled on evidence only"
+    with pytest.raises(HumanDecisionRequiredError, match=stop):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    if not convert:
+        assert _launches(runner) == launches
+        assert not any(r.index >= before and r.metadata.role == "reviewer" for r in _records(runner))
+        return
+    conversion = _conversion(runner)
+    assert conversion.index >= before
+    _assert_fresh_repeat(runner, conversion)
+    [reconciliation] = _round_reconciliations_after(runner, conversion.index)
+    assert reconciliation.index > max(r.index for r in _reviews_after(runner, conversion.index))
+
+
+def test_a_reconciled_round_re_entry_posts_no_duplicate_reconciliation(tmp_path, monkeypatch):
+    """`reconciled-reentry-no-duplicate` (#2174): no conversion, review_parallel=True.
+
+    Run 1 stops after the primary's round 1 reconciled, before round 2 opens.
+    The restart re-enters the reconciled round 1 without a second summary and
+    without re-running its reviewer.
+    """
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    assert config.review_parallel is True
+
+    def round_2(_runner, metadata):
+        return metadata.round_number == 2
+
+    for attempt in range(2):
+        if attempt:
+            runner.simulate_new_process()
+        launches = _launches(runner)
+        restore = _stop_on_post(monkeypatch, round_2, "stopped before round 2")
+        with pytest.raises(AgentLoopError, match="stopped before round 2"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+        restore()
+        [reconciliation] = _round_reconciliations_after(runner, -1, round_number=1)
+        assert not any(r.metadata.phase == "evidence-conversion" for r in _records(runner))
+        assert _records(runner)[-1].index == reconciliation.index
+    # The re-entry launched no reviewer: round 1 was already settled.
+    assert _launches(runner) == launches
