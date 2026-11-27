@@ -920,13 +920,37 @@ _REVIEWER_BLOCKING_SCOPE_FLOWS = {
     "plan": ("blocking_plan_issues", "same_plan_followups", "same-plan", "plan"),
 }
 
+# Provenance mark for acceptance criteria and requirements that only the plan
+# added, not the issue text or a signed human requirement (#2177).
+PLAN_ADDED_CRITERION_PREFIX = "Plan-added:"
+
+_REVIEWER_PLAN_ADDED_SCOPE_CLAUSES = {
+    "pr": (
+        "A requirement or acceptance criterion that only the approved plan added (prefixed "
+        f"`{PLAN_ADDED_CRITERION_PREFIX}`, or otherwise not traceable to the issue text or a "
+        "signed human requirement) does not count under (i) on its own: it supports a blocker "
+        "only when the finding also names a trigger reachable today, as (ii) requires, or a "
+        "security or data-loss risk under (iii). Without one, the finding goes to "
+        "`future_followups` or is omitted. Requirements and acceptance criteria from the issue "
+        "text and signed human requirements block under (i) as before. "
+    ),
+    "plan": (
+        "A plan's own beyond-issue criteria (prefixed "
+        f"`{PLAN_ADDED_CRITERION_PREFIX}`, or otherwise not traceable to the issue text or a "
+        "signed human requirement) are not stated requirements under (i), so they do not make "
+        "a hypothetical-input finding eligible. "
+    ),
+}
+
 
 def _reviewer_blocking_scope_guidance(flow: str) -> str:
     """Return the static blocking-scope criteria for one review flow (#1389).
 
     Criterion (ii) requires a defect reachable today with a named current
     trigger; robustness against hypothetical future inputs is hardening
-    (#2164). Like ``_reviewer_exhaustiveness_guidance`` the text depends only
+    (#2164). A requirement only the plan added needs such a trigger to block,
+    and carried items resting on one plus a hypothetical input go to
+    ``future`` (#2177). Like ``_reviewer_exhaustiveness_guidance`` the text depends only
     on ``flow``, so it is safe inside the compact stable prefixes.
     """
     blocking_list, followup_list, same_status, change = _REVIEWER_BLOCKING_SCOPE_FLOWS[flow]
@@ -939,7 +963,7 @@ def _reviewer_blocking_scope_guidance(flow: str) -> str:
         "reachable with the current code, inputs, data, and callers, where the finding "
         "must name the concrete current trigger (the input, call path, or state that "
         f"fails today); or (iii) a security or data-loss risk introduced by this "
-        f"{change}. Decide this scope "
+        f"{change}. " + _REVIEWER_PLAN_ADDED_SCOPE_CLAUSES[flow] + "Decide this scope "
         "eligibility first, before deciding whether a finding is small or fits the "
         "current design. Hardening, robustness, or lifecycle edge cases beyond that "
         "scope (for example cross-process concurrency, signal or cancellation paths, "
@@ -953,12 +977,16 @@ def _reviewer_blocking_scope_guidance(flow: str) -> str:
         "added', or 'values above N that do not exist today'. They belong in "
         "`future_followups` when this review's follow-up rules allow them, or are "
         "omitted; the only exception is when the issue or a signed human requirement "
-        "asks for that robustness, and the finding then cites it under (i). A finding "
+        "asks for that robustness, and the finding then cites it under (i). A "
+        "plan-added criterion does not count as the issue asking. A finding "
         "that is not eligible stays optional however small it is: never put it in "
         f"`{blocking_list}` or `{followup_list}`, and disposition a carried item that "
         "is not eligible, including one whose only remaining concern is a hypothetical "
         "future input, edit, or caller, as `future` (or `resolved` when nothing "
-        "remains) rather than keeping it active. A real defect in the new or changed "
+        "remains) rather than keeping it active. That includes a carried item whose only "
+        "support is a plan-added criterion plus a hypothetical input, edit, or caller: "
+        f"disposition it `future` (or `resolved`), not `blocking` or `{same_status}`. "
+        "A real defect in the new or changed "
         "code that is reachable today (wrong output, a crash, a test that fails today) "
         "still blocks under (ii) however small it is; this rule narrows only what "
         "counts as reachable.\n"

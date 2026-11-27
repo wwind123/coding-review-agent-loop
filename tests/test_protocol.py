@@ -8746,3 +8746,26 @@ def test_over_limit_notes_degrade_deterministically_without_rejection():
         record.outcome in {"note-truncated", "note-dropped"}
         for record in first.implementation_note_degradations
     )
+
+
+# --- plan-added criterion provenance mark (#2177) ----------------------------
+
+
+def test_plan_added_prefixed_scope_items_validate_and_round_trip_verbatim_2177():
+    """A `Plan-added:` mark is plain text: the existing parser keeps it verbatim."""
+    from coding_review_agent_loop.prompt_support import PLAN_ADDED_CRITERION_PREFIX
+
+    requirement = f"{PLAN_ADDED_CRITERION_PREFIX} Reject a revision ID longer than the column today."
+    criterion = f"{PLAN_ADDED_CRITERION_PREFIX} The existing 40-character revision is rejected."
+    recommendation = _staged_recommendation_1333()
+    recommendation["scope_items"][1]["requirement"] = requirement
+    recommendation["scope_items"][1]["acceptance_criteria"] = ["Done.", criterion]
+    recommendation["child_stages"][1]["acceptance_criteria"] = [criterion]
+    payload = json.loads(_plan_state_text_1333().partition("\n")[0])
+    payload["execution_recommendation"] = recommendation
+    parsed = _validate_plan_state_1333(_plan_text_1333(payload))
+    round_tripped = parsed.execution_recommendation.to_payload()
+    assert round_tripped["scope_items"][1]["requirement"] == requirement
+    assert round_tripped["scope_items"][1]["acceptance_criteria"] == ["Done.", criterion]
+    assert round_tripped["scope_items"][0]["requirement"] == "First."
+    assert round_tripped["child_stages"][1]["acceptance_criteria"] == [criterion]
