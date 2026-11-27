@@ -425,6 +425,9 @@ class ParsedReview:
     screenshot_requests: tuple[dict, ...] = ()
     screenshot_coverage_acceptances: tuple[dict, ...] = ()
     exact_head_evidence_requests: tuple[str, ...] = ()
+    # Advisory human-check display IDs the reviewer withdraws (#2105); never
+    # carried ledger item IDs.
+    withdrawn_human_checks: tuple[str, ...] = ()
     requirement_evidence: tuple[dict, ...] = ()
     sub_item_degradations: tuple["ParseDegradation", ...] = ()
     post_merge_obligations: tuple[ObligationRequest, ...] = ()
@@ -1937,6 +1940,7 @@ REVIEW_FINDING_RESERVED_KEYS: frozenset[str] = frozenset(
         "human_requirement_dispositions",
         "architecture_impact",
         "exact_head_evidence_requests",
+        "withdrawn_human_checks",
     }
     | {"disposition", "note", "sub_item_dispositions", "requirement_id", "requirement_label"}
     | {"fix_scope"}
@@ -3706,7 +3710,7 @@ def parse_structured_pr_review(
             "future_followups",
             "architecture_impact",
             "requirement_evidence", "exact_head_evidence_requests", "screenshot_requests", "screenshot_coverage_acceptances",
-            "post_merge_obligations",
+            "post_merge_obligations", "withdrawn_human_checks",
         },
     )
     state = _expect_state(payload["state"], context="pr_review.state")
@@ -3772,6 +3776,7 @@ def parse_structured_pr_review(
     from .review_images_coverage import parse_fields
     typed, votes = parse_fields(payload, legacy=evidence_requests, findings=(*blocking_items, *same_pr_followups, *future_followups))
     from .requirement_evidence import parse_associations
+    from .human_evidence_mode import parse_withdrawn_human_checks
     associations = (
         parse_associations(payload.get("requirement_evidence", []), emitted_requests=tuple(evidence_requests))
         if parse_requirement_evidence else ()
@@ -3780,7 +3785,8 @@ def parse_structured_pr_review(
                                screenshot_requests=typed, screenshot_coverage_acceptances=votes,
                                post_merge_obligations=obligations,
                                dropped_human_requirement_dispositions=dropped_dispositions,
-                               ignored_prior_disposition_ids=ignored_ids)
+                               ignored_prior_disposition_ids=ignored_ids,
+                               withdrawn_human_checks=parse_withdrawn_human_checks(payload))
 
 
 def _expect_evidence_request_list(

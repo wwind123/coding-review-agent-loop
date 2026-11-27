@@ -15,7 +15,7 @@ from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.github import _parse_pr_human_requirements
-from coding_review_agent_loop.human_evidence_mode import HUMAN_CHECKS_FLOW, HumanCheck
+from coding_review_agent_loop.human_evidence_mode import HUMAN_CHECKS_FLOW, HumanCheck, HumanEvidenceRun
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 from agent_loop_helpers import FakeRunner, make_config, patch_attr_in, structured_coder_followup
 from pr_loop_test_helpers import (
@@ -1000,3 +1000,339 @@ def test_release_boundary_with_unavailable_list_sidecar_fails_closed_without_los
     [record] = _check_records(runner)
     assert sorted(HumanCheck.from_mapping(e).text for e in record.metadata.human_checks) == sorted(texts)
     assert _merge_calls(runner) == []
+
+
+# --- reviewer-visible list and requester withdrawal (#2105, #2106) --------------------------
+
+_OTHER_TEXT = "Run the authenticated live-CLI smoke scenario at this exact head."
+_LATER_HEAD = "0b3d8b29493059afd7f9912106279c4643ac4939"
+_SECTION = "Advisory human checks (non-blocking, not in prior items)"
+
+
+def _id_for(text, reviewer="Codex"):
+    from coding_review_agent_loop.human_evidence_mode import display_id
+    from coding_review_agent_loop.unresolved_items import evidence_obligation_identity
+
+    return display_id(evidence_obligation_identity(text, reviewer))
+
+
+def _withdrawing(review, *ids):
+    import json
+
+    raw, footer = review.split("\n<!--", 1)
+    payload = json.loads(raw)
+    payload["withdrawn_human_checks"] = list(ids)
+    return json.dumps(payload) + "\n<!--" + footer
+
+
+def _listed(record):
+    return sorted(HumanCheck.from_mapping(e).text for e in record.metadata.human_checks)
+
+
+def reviewer_head(runner):
+    return [r for r in _pr_records(runner) if r.metadata.role == "reviewer"][-1].metadata.subject
+
+
+def _orchestrator_records(runner):
+    return [r for r in _pr_records(runner) if r.metadata.agent == "Orchestrator"]
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _interrupt_withdrawal(monkeypatch):
+    real = HumanEvidenceRun.withdraw
+
+    def interrupted(self, *args, **kwargs):
+        monkeypatch.setattr(HumanEvidenceRun, "withdraw", real)
+        raise _Interrupted("interrupted after the reviewer record was published")
+
+    monkeypatch.setattr(HumanEvidenceRun, "withdraw", interrupted)
+
+
+def test_withdrawal_that_empties_the_list_lets_auto_merge_merge_the_later_head(tmp_path, capsys):
+    """Row withdraw-empties-automerge."""
+    code = "Guard the pre-spawn git status call."
+    runner = FakeRunner(
+        codex_outputs=[
+            _evidence_review(state="blocking", blocking=[code], evidence=[_EVIDENCE_TEXT]),
+            _withdrawing(_evidence_review(
+                dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]),
+                _id_for(_EVIDENCE_TEXT)),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True)) == 0
+    first_prompt, second_prompt = (cmd[-1] for cmd in _reviewer_calls(runner))
+    assert _SECTION not in first_prompt
+    assert _id_for(_EVIDENCE_TEXT) in second_prompt and "requested by Codex" in second_prompt
+    [merge] = _merge_calls(runner)
+    # The normal exact-head merge path, at the later head the reviewers approved.
+    assert merge[merge.index("--match-head-commit") + 1] == reviewer_head(runner)
+    assert _check_comments(runner) == []
+    reviewer = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"][-1]
+    assert reviewer.metadata.withdrawn_human_checks == (_id_for(_EVIDENCE_TEXT),)
+    assert "approved but not merged" not in capsys.readouterr().out
+    assert reviewer_head(runner) != HEAD
+
+
+def _seeded_list_comment(runner, *checks):
+    from test_pr_loop_evidence_conversion import _comment
+    from coding_review_agent_loop.round_metadata import PostedRoundMetadata, _attach_round_metadata
+
+    runner.pr_payload["comments"].append(_comment(_attach_round_metadata(
+        "## Human checks requested\n\nSeeded.", PostedRoundMetadata(
+            flow=HUMAN_CHECKS_FLOW, role="summary", agent="Orchestrator", round_number=1,
+            subject="0" * 40, state="approved", human_checks=tuple(c.as_dict() for c in checks)))))
+
+
+def _native_and_converted_checks():
+    from coding_review_agent_loop.unresolved_items import (
+        _upsert_converted_evidence_obligation, _upsert_evidence_obligation)
+
+    [native], _ = _upsert_evidence_obligation([], item_number=91, reviewer="Codex", text=_EVIDENCE_TEXT,
+                                             source_round=1, current_head_sha="0" * 40)
+    _ledger, row, _ = _upsert_converted_evidence_obligation(
+        [], item_number=92, row_id="row-a", matrix_identity="e" * 64, head_sha="0" * 40,
+        owners=("Codex",), source_round=1, explanation="")
+    return (HumanCheck("Codex", native.text, 1, "0" * 40, "native", native),
+            HumanCheck(row.reviewer, row.text, 1, "0" * 40, "converted", row))
+
+
+def test_advisory_list_is_rendered_to_reviewers_with_ids_and_guidance(tmp_path):
+    """Row advisory-render."""
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    native, row = _native_and_converted_checks()
+    runner = FakeRunner(codex_outputs=[_evidence_review()])
+    _seeded_list_comment(runner, native, row)
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path)) == 0
+    [prompt] = [cmd[-1] for cmd in _reviewer_calls(runner)]
+    section = prompt[prompt.index(_SECTION):]
+    assert f"`{display_id(native.identity)}` (requested by Codex, round 1, head `{'0' * 40}`): {_EVIDENCE_TEXT}" in section
+    assert f"`{display_id(row.identity)}` (risk-matrix row `row-a`, round 1, head `{'0' * 40}`)" in section
+    assert "Do not re-request a check that is already listed" in section
+    assert "never put their IDs in `prior_item_dispositions`" in section
+    # Not carried as prior items: neither origin item ID reaches the ledger block.
+    assert "item-91" not in prompt and "item-92" not in prompt
+
+
+def test_compact_reviewer_prompt_puts_the_list_in_the_volatile_tail(tmp_path):
+    """Row advisory-render (compact builder)."""
+    from coding_review_agent_loop import prompt_support, prompts
+    from coding_review_agent_loop.human_evidence_mode import render_reviewer_context
+
+    context = render_reviewer_context(_native_and_converted_checks())
+    prompt = prompts.build_review_prompt(77, 2, _config(tmp_path), reviewer="codex", compact_context=True,
+                                         human_checks_context=context)
+    marker = prompt.index(prompt_support.COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER)
+    assert prompt.index(_SECTION) > marker
+
+
+@pytest.mark.parametrize("mode", ["freeze", "off"])
+def test_freeze_and_off_render_nothing_and_ignore_withdrawals(tmp_path, monkeypatch, mode):
+    """Row freeze-off-no-render."""
+    lines = _captured_log(monkeypatch)
+    evidence = [_EVIDENCE_TEXT] if mode == "freeze" else []
+    runner = FakeRunner(codex_outputs=[_withdrawing(_evidence_review(evidence=evidence), _id_for(_EVIDENCE_TEXT))])
+    config = _config(tmp_path, auto_merge=True, pr_human_evidence=mode)
+    if mode == "freeze":
+        with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {HEAD}"):
+            run_pr_loop(runner, pr_number=77, config=config)
+        [freeze] = _freeze_records(runner)
+        # The field never clears a frozen exact-head obligation.
+        assert [i.text for i in _evidence_items(freeze.metadata.prior_items)] == [_EVIDENCE_TEXT]
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert _merge_calls(runner)
+    [prompt] = [cmd[-1] for cmd in _reviewer_calls(runner)]
+    assert _SECTION not in prompt and "withdrawn_human_checks" not in prompt
+    assert any(f"ignored 1 withdrawn human check ID(s) from Codex (--pr-human-evidence {mode})" in line
+               for line in lines)
+    assert runner.codex_outputs == []  # no re-ask
+    reviewer = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"][-1]
+    assert reviewer.metadata.withdrawn_human_checks == ()
+
+
+def test_partial_withdrawal_reposts_the_reduced_list_once_and_still_holds(tmp_path, capsys):
+    """Row withdraw-partial."""
+    code = "Guard the pre-spawn git status call."
+    runner = FakeRunner(
+        codex_outputs=[
+            _evidence_review(state="blocking", blocking=[code], evidence=[_EVIDENCE_TEXT]),
+            _withdrawing(_evidence_review(
+                dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]),
+                _id_for(_EVIDENCE_TEXT)),
+        ],
+        gemini_outputs=[_evidence_review(evidence=[_OTHER_TEXT], reviewer="Google Gemini"),
+                        _evidence_review(reviewer="Google Gemini",
+                                         dispositions=[{"item_id": "item-1", "disposition": "resolved"}])],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = _config(tmp_path, auto_merge=True, reviewer=("codex", "gemini"))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and runner.gemini_outputs == []
+    # The reduced list is posted once, at the holding head, and the hold still applies.
+    assert [_listed(r) for r in _check_records(runner)] == [[_OTHER_TEXT]]
+    assert [r.metadata.subject for r in _check_records(runner)] == [reviewer_head(runner)]
+    assert _merge_calls(runner) == []
+    assert "approved but not merged: 1 human check(s) requested" in capsys.readouterr().out
+    # The other reviewer's entry stays.
+    [remaining] = [HumanCheck.from_mapping(e) for e in _check_records(runner)[-1].metadata.human_checks]
+    assert remaining.reviewer == "Gemini"
+    # A rerun at the same head neither re-posts nor merges.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_check_records(runner)) == 1 and _merge_calls(runner) == []
+
+
+def test_blocking_review_withdrawal_is_applied_before_the_reconciliation_record(tmp_path):
+    """Row withdraw-before-reconciliation."""
+    runner = FakeRunner(
+        codex_outputs=[
+            _evidence_review(evidence=[_EVIDENCE_TEXT]),
+            _withdrawing(_evidence_review(state="blocking", dispositions=[{
+                "item_id": "item-1", "disposition": "blocking",
+                "note": "The status call is still unguarded at line 12; add the guard and a test."}]),
+                _id_for(_EVIDENCE_TEXT)),
+        ],
+        gemini_outputs=[
+            _evidence_review(state="blocking", blocking=["Guard the pre-spawn git status call."],
+                             reviewer="Google Gemini"),
+            _evidence_review(reviewer="Google Gemini",
+                             dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = _config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    with pytest.raises(AgentLoopError, match="still reported blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=2))
+    assert runner.codex_outputs == [] and runner.gemini_outputs == []
+    records = _orchestrator_records(runner)
+    # The round-2 reviewers saw the listed request, so the withdrawal had something to remove.
+    assert all(_id_for(_EVIDENCE_TEXT) in cmd[-1] for cmd in _reviewer_calls(runner)[-1:])
+    [reconciliation] = [r for r in records if r.metadata.phase == "reconciliation" and r.metadata.round_number == 2]
+    assert _listed(reconciliation) == []
+    assert all(_listed(r) == [] for r in records if r.index >= reconciliation.index)
+    # A resume from that record does not bring the entry back.
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    runner.codex_outputs.append(_evidence_review(
+        dispositions=[{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]))
+    runner.gemini_outputs.append(_evidence_review(
+        reviewer="Google Gemini", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, max_rounds=5)) == 0
+    assert _SECTION not in _reviewer_calls(runner)[-1][-1]
+    assert _check_comments(runner) == []
+    assert all(_listed(r) == [] for r in _orchestrator_records(runner) if r.index >= reconciliation.index)
+
+
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel-publication", "sequential-authoritative"])
+def test_interrupted_withdrawal_survives_resume_without_resurrecting_the_entry(tmp_path, monkeypatch, parallel):
+    """Row resume-after-withdrawal."""
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])])
+    config = _config(tmp_path, auto_merge=True, review_parallel=parallel)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_check_comments(runner)) == 1 and _merge_calls(runner) == []
+    # A later head: the request made at the early head is now stale.
+    runner._move_head(_LATER_HEAD, cwd=None)
+    runner.pr_payload["headRefOid"] = _LATER_HEAD
+    runner.codex_outputs.append(_withdrawing(_evidence_review(), _id_for(_EVIDENCE_TEXT)))
+    _interrupt_withdrawal(monkeypatch)
+    with pytest.raises(_Interrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+    [withdrawing] = [r for r in _pr_records(runner) if r.metadata.withdrawn_human_checks]
+    assert withdrawing.metadata.phase == ("publication" if parallel else "authoritative")
+    assert (withdrawing.metadata.canonical_reviewer_response is None) is (not parallel)
+    # Every orchestrator-side record still lists the entry.
+    assert _listed(_check_records(runner)[-1]) == [_EVIDENCE_TEXT]
+    seen = []
+    real_hold = HumanEvidenceRun.hold
+    monkeypatch.setattr(HumanEvidenceRun, "hold", lambda self, *a, **k: seen.append(self.checks) or real_hold(self, *a, **k))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and seen and all(checks == () for checks in seen)
+    assert len(_check_comments(runner)) == 1, "no stale human-checks comment is reposted"
+    assert _merge_calls(runner)
+
+
+@pytest.mark.parametrize("variant", ["recorded", "interrupted"])
+def test_freeze_resume_after_a_withdrawal_restores_only_the_remaining_check(tmp_path, monkeypatch, variant):
+    """Row freeze-resume-after-withdrawal."""
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT, _OTHER_TEXT])])
+    config = _config(tmp_path, auto_merge=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _listed(_check_records(runner)[-1]) == sorted([_EVIDENCE_TEXT, _OTHER_TEXT])
+    runner._move_head(_LATER_HEAD, cwd=None)
+    runner.pr_payload["headRefOid"] = _LATER_HEAD
+    runner.codex_outputs.append(_withdrawing(_evidence_review(), _id_for(_EVIDENCE_TEXT)))
+    if variant == "recorded":
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert _listed(_check_records(runner)[-1]) == [_OTHER_TEXT]
+    else:
+        _interrupt_withdrawal(monkeypatch)
+        with pytest.raises(_Interrupted):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert _listed(_check_records(runner)[-1]) == sorted([_EVIDENCE_TEXT, _OTHER_TEXT])
+    restores = []
+    real_normalize = HumanEvidenceRun.normalize
+
+    def normalize(self, items, **kwargs):
+        pending = self.restore_pending
+        result = real_normalize(self, items, **kwargs)
+        if pending:
+            restores.append(sorted(i.text for i in _evidence_items(result)))
+        return result
+
+    monkeypatch.setattr(HumanEvidenceRun, "normalize", normalize)
+    runner.codex_outputs.append(_evidence_review())
+    with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {_LATER_HEAD}"):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True, pr_human_evidence="freeze"))
+    assert restores == [[_OTHER_TEXT]]
+    [freeze] = _freeze_records(runner)
+    assert [i.text for i in _evidence_items(freeze.metadata.prior_items)] == [_OTHER_TEXT]
+    assert _merge_calls(runner) == []
+
+
+def test_ordinary_recovery_hold_says_the_pr_is_still_a_draft_and_leaves_it_draft(tmp_path, monkeypatch, capsys):
+    """Row recovery-hold-draft (#2106)."""
+    from coding_review_agent_loop.github import PullRequestMetadata
+    from coding_review_agent_loop.managed_ci_types import ManagedCiOutcome
+    from pr_loop_test_helpers import _watch_check_board
+
+    capability = _recovery_capability()
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(pr_loop_support, "wait_for_ordinary_recovery", lambda *a, **k: ManagedCiOutcome(
+        status="passed", checks=_watch_check_board("passing"), head_sha=HEAD))
+    patch_attr_in(monkeypatch, _CONTEXT_MODULES, "get_observed_pr_review_context",
+                  lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
+                      number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+                      base_branch="main", head_sha=HEAD, url=None)))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: pytest.fail("advisory hold must not merge"))
+    config = _config(tmp_path, auto_merge=True)
+    run = HumanEvidenceRun(config, 77)
+    run.checks = _native_and_converted_checks()[:1]
+    runner = FakeRunner()
+    assert pr_loop_support._finalize_ordinary_recovery_checked(
+        runner, config=config, pr_number=77, round_number=1, items=[], current_head_sha=HEAD,
+        capability=capability,
+        hold=lambda: run.hold(runner, head_sha=HEAD, round_number=1, merging=True, draft=True)) is False
+    assert "PR #77 approved but not merged and still a draft: 1 human check(s)" in capsys.readouterr().out
+    [body] = _check_comments(runner)
+    assert "PR #77 is still a draft" in body
+    assert not any(cmd[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"]) for cmd, _cwd in runner.commands)
+
+
+def test_only_the_ordinary_recovery_hold_sites_pass_draft():
+    """Rows recovery-hold-draft and nonrecovery-hold-wording: call-site wiring in pr_loop."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(pr_loop))
+    holds = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "hold"
+             and isinstance(node.func.value, ast.Name) and node.func.value.id == "human_evidence"]
+    # The ordinary-recovery sites pass the hold as `hold=lambda: human_evidence.hold(...)`.
+    recovery_holds = {id(keyword.value.body) for keyword in ast.walk(tree) if isinstance(keyword, ast.keyword)
+                      and keyword.arg == "hold" and isinstance(keyword.value, ast.Lambda)}
+    drafted = [any(k.arg == "draft" and k.value.value is True for k in call.keywords) for call in holds]
+    assert len(holds) == 6 and drafted.count(True) == 3
+    assert all(any(k.arg == "draft" for k in call.keywords) == (id(call) in recovery_holds) for call in holds)

@@ -992,7 +992,19 @@ reviewers' `exact_head_evidence_requests`:
   **unmerged**, the run prints one notice line naming the list
   (`PR #N approved but not merged: K human check(s) requested; see the 'Human
   checks requested' comment ...`) and exits 0. Without `--auto-merge`, or with an
-  empty list, the usual approval and merge paths run unchanged.
+  empty list, the usual approval and merge paths run unchanged. Under ordinary
+  recovery the hold leaves the PR a draft, and the notice says so (`PR #N
+  approved but not merged and still a draft: ...`): a human who decides to merge
+  must mark it ready first.
+  Reviewers see the current list in their prompt, each check under a stable
+  `human-check-<id>` ID with its requester (or risk-matrix row), round and head.
+  They are told not to re-request a listed check. A reviewer can withdraw its
+  own entry, for example one requested at an earlier head that is now stale, by
+  listing the ID in the optional `withdrawn_human_checks` review field. A
+  withdrawal that empties the list lets `--auto-merge` merge through the normal
+  exact-head path. Converted risk-matrix rows and other reviewers' entries
+  cannot be withdrawn this way. Withdrawals survive restarts, and the same
+  reviewer can request the check again later.
 - `off`: requests are dropped with a log line (`dropped K exact-head evidence
   request(s)`) and finalization proceeds as if there were none.
 - `freeze`: the blocking exact-head evidence freeze described below, unchanged.

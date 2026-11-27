@@ -328,6 +328,7 @@ def pr_published_review(record: object, *, reviewer: str, parse_requirement_evid
         architecture_impact=impact,
         architecture_impact_degradations=degradations,
         exact_head_evidence_requests=metadata.evidence_requests,
+        withdrawn_human_checks=metadata.withdrawn_human_checks,
         requirement_evidence=metadata.requirement_evidence,
         screenshot_requests=metadata.screenshot_requests,
         screenshot_coverage_acceptances=metadata.screenshot_coverage_acceptances,

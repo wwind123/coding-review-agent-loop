@@ -425,6 +425,9 @@ class PostedRoundMetadata:
     # records while the advisory list is non-empty and on the human-checks
     # comment; omitted when empty so historical records stay byte-stable.
     human_checks: tuple[dict, ...] = ()
+    # Advisory human-check display IDs a reviewer withdrew (#2105), on that
+    # reviewer's own PR record for every phase; omitted when empty.
+    withdrawn_human_checks: tuple[str, ...] = ()
     # Well-formed prior-item disposition IDs outside the carried set that live
     # validation dropped (#2100).  Complete and untruncated (the transport
     # spills it losslessly); omitted when empty so other records stay
@@ -2509,6 +2512,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["evidence_requests"] = list(metadata.evidence_requests)
     if metadata.human_checks:
         payload["human_checks"] = [dict(entry) for entry in metadata.human_checks]
+    if metadata.withdrawn_human_checks:
+        payload["withdrawn_human_checks"] = list(metadata.withdrawn_human_checks)
     if metadata.ignored_prior_disposition_ids:
         payload["ignored_prior_disposition_ids"] = list(metadata.ignored_prior_disposition_ids)
     if metadata.failed_reviewer_seats:
@@ -2952,6 +2957,11 @@ def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
         if requests is None:
             raise ValueError("evidence_requests must be a list of non-empty strings")
         fields["evidence_requests"] = requests
+    if "withdrawn_human_checks" in payload:
+        withdrawn = _decode_string_list(payload["withdrawn_human_checks"])
+        if withdrawn is None:
+            raise ValueError("withdrawn_human_checks must be a list of non-empty strings")
+        fields["withdrawn_human_checks"] = withdrawn
     if "human_checks" in payload:
         # Advisory and lenient (#2063): a malformed entry is dropped and logged
         # without failing the record.

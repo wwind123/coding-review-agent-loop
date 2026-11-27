@@ -11,12 +11,21 @@ are never touched here.
 The advisory list keeps each removed item verbatim (``origin_item``), so a
 later ``freeze`` resume restores the original typed obligation, including a
 converted row's identity and owners, instead of re-creating it.
+
+Reviewers see the advisory list in their prompt (#2105), each entry under a
+deterministic display ID, and the requesting reviewer may withdraw its own
+native entry through the optional ``withdrawn_human_checks`` review field.
+Converted risk-matrix rows are never reviewer-withdrawable.  Each applied
+withdrawal is persisted on the withdrawing reviewer's own record, and a
+resume re-derives requester-scoped tombstones from those records so neither
+the seeded list nor ledger replay can resurrect a withdrawn request.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from .logging import log
@@ -32,6 +41,9 @@ HUMAN_CHECKS_HEADING = "## Human checks requested"
 HUMAN_CHECKS_RENDER_LIMIT = 50
 _TEXT_LIMIT = 600
 _OPEN_STATUSES = frozenset({"blocking", "same-pr"})
+DISPLAY_ID_PREFIX = "human-check-"
+WITHDRAWN_HUMAN_CHECKS_FIELD = "withdrawn_human_checks"
+_WITHDRAWAL_ID_LIMIT = 200
 
 _logger = logging.getLogger(__name__)
 
@@ -133,6 +145,101 @@ def check_identity(item: UnresolvedReviewItem) -> str:
     return item.obligation_identity or item.item_id
 
 
+def display_id(identity: str) -> str:
+    """The deterministic reviewer-facing ID of one advisory check (#2105)."""
+    return DISPLAY_ID_PREFIX + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_withdrawn_human_checks(payload: Mapping[str, object]) -> tuple[str, ...]:
+    """Leniently parse the optional ``withdrawn_human_checks`` review field.
+
+    Advisory data never fails a review: a non-list value or a non-string or
+    blank element degrades with a warning instead of a re-ask.  Duplicates
+    collapse, preserving first-seen order.
+    """
+    value = payload.get(WITHDRAWN_HUMAN_CHECKS_FIELD, [])
+    if not isinstance(value, list):
+        _logger.warning("Ignored pr_review.%s: expected a JSON array of check IDs", WITHDRAWN_HUMAN_CHECKS_FIELD)
+        return ()
+    result: list[str] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str) or not raw.strip() or len(raw) > _WITHDRAWAL_ID_LIMIT:
+            _logger.warning("Ignored malformed pr_review.%s entry at index %d", WITHDRAWN_HUMAN_CHECKS_FIELD, index)
+            continue
+        if raw.strip() not in result:
+            result.append(raw.strip())
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class Withdrawal:
+    kept: tuple["HumanCheck", ...]
+    withdrawn: tuple["HumanCheck", ...]
+    ignored: tuple[tuple[str, str], ...]  # (display ID, reason)
+
+
+def withdraw_checks(
+    checks: Sequence["HumanCheck"], *, reviewer: str, display_ids: Sequence[str]
+) -> Withdrawal:
+    """Remove the native entries ``reviewer`` itself requested; ignore the rest.
+
+    An ID that names no listed check, another reviewer's entry, or a converted
+    risk-matrix row is ignored with a reason and removes nothing.
+    """
+    by_id = {display_id(check.identity): check for check in checks}
+    removed: set[str] = set()
+    ignored: list[tuple[str, str]] = []
+    for wanted in display_ids:
+        check = by_id.get(wanted)
+        if check is None:
+            ignored.append((wanted, "unknown check ID"))
+        elif check.kind != "native":
+            ignored.append((wanted, "converted risk-matrix rows are not reviewer-withdrawable"))
+        elif check.reviewer != reviewer:
+            ignored.append((wanted, f"requested by {check.reviewer}, not {reviewer}"))
+        else:
+            removed.add(check.identity)
+    return Withdrawal(
+        kept=tuple(check for check in checks if check.identity not in removed),
+        withdrawn=tuple(check for check in checks if check.identity in removed),
+        ignored=tuple(ignored),
+    )
+
+
+def render_reviewer_context(checks: Sequence["HumanCheck"]) -> str:
+    """The advisory list as reviewer prompt context (#2105); empty for no checks."""
+    from .comment_rendering import _normalize_item_summary
+
+    if not checks:
+        return ""
+    lines = [
+        "",
+        "Advisory human checks (non-blocking, not in prior items)",
+        "",
+        "These checks were already requested under `--pr-human-evidence advisory` and left the "
+        "review ledger. They are not prior unresolved items: never put their IDs in "
+        "`prior_item_dispositions`. While any is listed, the orchestrator does not merge on its "
+        "own. Do not re-request a check that is already listed, even rephrased. If you requested "
+        "an entry and it is stale for the current head, or you are replacing it with a rephrased "
+        "request, list its ID in the optional `withdrawn_human_checks` array. Only the requesting "
+        "reviewer can withdraw an entry, and risk-matrix rows cannot be withdrawn.",
+        "",
+    ]
+    for check in checks[:HUMAN_CHECKS_RENDER_LIMIT]:
+        requester = (
+            f"risk-matrix row `{check.origin_item.converted_row_id}`" if check.kind == "converted"
+            else f"requested by {_normalize_item_summary(check.reviewer, limit=80)}"
+        )
+        head = f"`{check.head_sha}`" if check.head_sha else "(unknown head)"
+        text = _normalize_item_summary(check.text, limit=_TEXT_LIMIT)
+        lines.append(
+            f"- `{display_id(check.identity)}` ({requester}, round {check.source_round}, head {head}): {text}"
+        )
+    if len(checks) > HUMAN_CHECKS_RENDER_LIMIT:
+        lines.append(f"- ... and {len(checks) - HUMAN_CHECKS_RENDER_LIMIT} more not shown.")
+    return "\n".join(lines) + "\n"
+
+
 def _check_from_item(item: UnresolvedReviewItem, head_sha: str | None) -> HumanCheck:
     return HumanCheck(
         reviewer=item.reviewer,
@@ -158,8 +265,13 @@ def normalize_human_evidence_ledger(
     *,
     mode: str,
     head_sha: str | None = None,
+    skip: "Callable[[UnresolvedReviewItem], bool] | None" = None,
 ) -> Normalization:
-    """The single choke point: no open native human evidence survives a non-freeze ledger."""
+    """The single choke point: no open native human evidence survives a non-freeze ledger.
+
+    ``skip`` names moved items that leave the ledger without joining the list
+    (a requester-withdrawn request, #2105).
+    """
     if mode == "freeze":
         return Normalization(list(items), tuple(checks))
     kept: list[UnresolvedReviewItem] = []
@@ -176,7 +288,7 @@ def normalize_human_evidence_ledger(
     added = 0
     for item in moved:
         identity = check_identity(item)
-        if identity in known:
+        if identity in known or (skip is not None and skip(item)):
             continue
         known.add(identity)
         result.append(_check_from_item(item, head_sha))
@@ -230,7 +342,7 @@ def restore_checks_as_obligations(
 
 
 def render_human_checks_comment(
-    checks: Sequence[HumanCheck], *, pr_number: int, head_sha: str
+    checks: Sequence[HumanCheck], *, pr_number: int, head_sha: str, draft: bool = False
 ) -> str:
     from .comment_rendering import _normalize_item_summary
 
@@ -243,6 +355,12 @@ def render_human_checks_comment(
         "human decides whether to check and merge.",
         "",
     ]
+    if draft:
+        lines[-1:-1] = [
+            f"PR #{pr_number} is still a draft: this hold leaves it unmerged and does not mark it "
+            "ready. A human who decides to merge must mark it ready first.",
+            "",
+        ]
     for check in checks[:HUMAN_CHECKS_RENDER_LIMIT]:
         text = _normalize_item_summary(check.text, limit=_TEXT_LIMIT)
         if check.kind == "converted":
@@ -257,9 +375,10 @@ def render_human_checks_comment(
     return "\n".join(lines)
 
 
-def notice_line(*, pr_number: int, count: int, head_sha: str) -> str:
+def notice_line(*, pr_number: int, count: int, head_sha: str, draft: bool = False) -> str:
+    state = "approved but not merged and still a draft" if draft else "approved but not merged"
     return (
-        f"PR #{pr_number} approved but not merged: {count} human check(s) requested; see the "
+        f"PR #{pr_number} {state}: {count} human check(s) requested; see the "
         f"'Human checks requested' comment on PR #{pr_number} for head {head_sha}."
     )
 
@@ -274,6 +393,10 @@ class HumanEvidenceRun:
         self.checks: tuple[HumanCheck, ...] = ()
         self.restore_pending = False
         self.posted: set[tuple[str, tuple[str, ...]]] = set()
+        # Requester-scoped withdrawal tombstones (#2105): (display ID,
+        # reviewer) withdrawn and not requested again since, in record order.
+        # A tombstoned native request never re-enters the list.
+        self.tombstones: set[tuple[str, str]] = set()
 
     @property
     def freeze(self) -> bool:
@@ -287,14 +410,63 @@ class HumanEvidenceRun:
         """The list stamped on orchestrator PR records (advisory only)."""
         return tuple(check.as_dict() for check in self.checks) if self.advisory else ()
 
+    def prompt_context(self) -> str:
+        """Reviewer prompt context: the advisory list (advisory only, #2105)."""
+        return render_reviewer_context(self.checks) if self.advisory else ""
+
+    def _tombstoned(self, item: UnresolvedReviewItem) -> bool:
+        return item.converted_row_id is None and (display_id(check_identity(item)), item.reviewer) in self.tombstones
+
+    def requested(self, reviewer: str, texts: Sequence[str]) -> None:
+        """A later request of a withdrawn check by its requester re-admits it."""
+        from .unresolved_items import evidence_obligation_identity
+
+        for text in texts:
+            self.tombstones.discard((display_id(evidence_obligation_identity(text, reviewer)), reviewer))
+
+    def withdraw(self, reviewer: str, display_ids: Sequence[str], *, round_number: int) -> tuple[str, ...]:
+        """Apply one reviewer's ``withdrawn_human_checks``; returns the applied IDs.
+
+        Outside advisory mode the field is ignored with a log line.  Ignored
+        IDs never re-ask, stop, or block: each is logged and removes nothing.
+        """
+        if not display_ids:
+            return ()
+        if not self.advisory:
+            log(self.config, f"Round {round_number}: ignored {len(display_ids)} withdrawn human check "
+                f"ID(s) from {reviewer} (--pr-human-evidence {self.mode})")
+            return ()
+        result = withdraw_checks(self.checks, reviewer=reviewer, display_ids=display_ids)
+        for wanted, reason in result.ignored:
+            log(self.config, f"Round {round_number}: ignored withdrawal of human check {wanted} by {reviewer}: {reason}")
+        applied = tuple(display_id(check.identity) for check in result.withdrawn)
+        self.tombstones.update((wanted, reviewer) for wanted in applied)
+        if applied:
+            self.checks = result.kept
+            log(self.config, f"Round {round_number}: {reviewer} withdrew {len(applied)} advisory human check(s)")
+        return applied
+
     def seed(self, pr_records: Sequence[object], check_records: Sequence[object]) -> None:
         """Rebuild the list from the latest orchestrator record that carries one.
 
         The latest orchestrator PR record or human-checks record is
         authoritative (an empty list on it is authoritative too).  Requests
         recorded only on later reviewer records come back through the normal
-        reconstruction plus normalization.
+        reconstruction plus normalization.  Withdrawals persisted on reviewer
+        records become requester-scoped tombstones (#2105), replayed in record
+        order (a later request by the same reviewer clears one) and applied to
+        the seeded list before the mode branch and to every later
+        normalization, so a withdrawn check is neither restored nor replayed
+        back.
         """
+        for record in sorted(pr_records, key=lambda record: record.index):
+            metadata = record.metadata
+            reviewer = getattr(metadata, "agent", None)
+            if reviewer == "Orchestrator" or not isinstance(reviewer, str):
+                continue
+            self.tombstones.update(
+                (wanted, reviewer) for wanted in getattr(metadata, "withdrawn_human_checks", ()) or ())
+            self.requested(reviewer, getattr(metadata, "evidence_requests", ()) or ())
         for record in check_records:
             metadata = record.metadata
             decoded = [HumanCheck.from_mapping(entry) for entry in metadata.human_checks]
@@ -306,7 +478,8 @@ class HumanEvidenceRun:
             return
         latest = max(candidates, key=lambda record: record.index)
         checks = tuple(
-            check for check in map(HumanCheck.from_mapping, latest.metadata.human_checks) if check
+            check for check in map(HumanCheck.from_mapping, latest.metadata.human_checks)
+            if check and not self._tombstoned(check.origin_item)
         )
         if self.freeze:
             self.checks, self.restore_pending = checks, bool(checks)
@@ -326,6 +499,9 @@ class HumanEvidenceRun:
         if self.freeze:
             if not self.restore_pending:
                 return list(items)
+            # The transitional restore pass also drops a withdrawn request
+            # that ledger replay re-derived from an advisory reviewer record.
+            items = [item for item in items if not (is_native_human_evidence(item) and self._tombstoned(item))]
             restored = restore_checks_as_obligations(
                 items, self.checks, clearances=clearances, head_sha=head_sha
             )
@@ -337,7 +513,8 @@ class HumanEvidenceRun:
             self.checks, self.restore_pending = (), False
             return restored
         result = normalize_human_evidence_ledger(
-            items, self.checks, mode=self.mode, head_sha=head_sha
+            items, self.checks, mode=self.mode, head_sha=head_sha,
+            skip=self._tombstoned if self.advisory else None,
         )
         self.checks = result.checks
         if result.dropped:
@@ -362,11 +539,15 @@ class HumanEvidenceRun:
 
         return not self.freeze and not _frozen_evidence_obligations(items)
 
-    def hold(self, runner: object, *, head_sha: str | None, round_number: int, merging: bool) -> bool:
+    def hold(
+        self, runner: object, *, head_sha: str | None, round_number: int, merging: bool, draft: bool = False
+    ) -> bool:
         """At approval: post the list once per head; True skips the merge.
 
         Runs only after the finalization gate and ``_ensure_finalization_ready``.
-        With an empty list (or outside advisory) it does nothing.
+        With an empty list (or outside advisory) it does nothing.  ``draft``
+        marks the ordinary-recovery hold (#2106), which returns before
+        readiness: the PR stays a draft and the wording says so.
         """
         if not self.advisory or not self.checks or not head_sha:
             return False
@@ -380,7 +561,9 @@ class HumanEvidenceRun:
                 config=self.config,
                 pr_number=self.pr_number,
                 body=_attach_round_metadata(
-                    render_human_checks_comment(self.checks, pr_number=self.pr_number, head_sha=head_sha),
+                    render_human_checks_comment(
+                        self.checks, pr_number=self.pr_number, head_sha=head_sha, draft=draft
+                    ),
                     PostedRoundMetadata(
                         flow=HUMAN_CHECKS_FLOW, role="summary", agent="Orchestrator",
                         round_number=round_number, subject=head_sha, state="approved",
@@ -391,5 +574,5 @@ class HumanEvidenceRun:
             self.posted.add(key)
         if not merging:
             return False
-        print(notice_line(pr_number=self.pr_number, count=len(self.checks), head_sha=head_sha))
+        print(notice_line(pr_number=self.pr_number, count=len(self.checks), head_sha=head_sha, draft=draft))
         return True

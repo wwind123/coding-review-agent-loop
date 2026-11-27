@@ -282,3 +282,157 @@ def test_every_reviewer_response_parse_site_passes_the_flag_explicitly():
 
 def test_human_checks_flow_is_not_a_pr_round_flow():
     assert HUMAN_CHECKS_FLOW != "pr"
+
+
+# --- reviewer-visible list and requester withdrawal (#2105) -------------------------------
+
+
+def _advisory_run(tmp_path, monkeypatch, lines, *checks):
+    import coding_review_agent_loop.human_evidence_mode as module
+
+    run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence="advisory"), 77)
+    run.checks = tuple(checks)
+    monkeypatch.setattr(module, "log", lambda _config, message: lines.append(message))
+    return run
+
+
+def test_display_ids_are_deterministic_and_distinct_per_identity():
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    native, converted = _check(_native()), _check(_converted())
+    assert display_id(native.identity) == display_id(_check(_native(number=5)).identity)
+    assert display_id(native.identity) != display_id(converted.identity)
+    assert display_id(native.identity).startswith("human-check-") and len(display_id(native.identity)) == 24
+
+
+def test_withdraw_checks_honours_only_the_requester_of_a_native_entry():
+    """Row withdraw-unauthorized (pure helper)."""
+    from coding_review_agent_loop.human_evidence_mode import display_id, withdraw_checks
+
+    mine, theirs, row = _check(_native()), _check(_native("Other live run.", reviewer="Claude")), _check(_converted())
+    ids = [display_id(c.identity) for c in (mine, theirs, row)] + ["human-check-000000000000"]
+    result = withdraw_checks((mine, theirs, row), reviewer="Codex", display_ids=ids + [ids[0]])
+    assert result.kept == (theirs, row) and result.withdrawn == (mine,)
+    reasons = dict(result.ignored)
+    assert reasons[ids[1]] == "requested by Claude, not Codex"
+    assert "not reviewer-withdrawable" in reasons[ids[2]]
+    assert reasons["human-check-000000000000"] == "unknown check ID"
+
+
+def test_unauthorized_unknown_converted_and_malformed_withdrawals_change_nothing(tmp_path, monkeypatch):
+    """Row withdraw-unauthorized: ignored with log lines, no re-ask, list unchanged."""
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    native_a, row = _check(_native()), _check(_converted())
+    text = json.dumps({
+        "schema_version": 1, "kind": "pr_review", "state": "approved", "summary": "Reviewed.",
+        "blocking_items": [], "same_pr_followups": [], "future_followups": [], "prior_item_dispositions": [],
+        "withdrawn_human_checks": [display_id(native_a.identity), "human-check-ffffffffffff",
+                                   display_id(row.identity), 7, ""],
+    }) + "\n<!-- AGENT_STATE: approved -->\n-- Claude"
+    parsed = parse_structured_pr_review(text, reviewer="Claude", parse_requirement_evidence=False)
+    assert parsed.state == "approved" and len(parsed.withdrawn_human_checks) == 3
+    lines = []
+    run = _advisory_run(tmp_path, monkeypatch, lines, native_a, row)
+    assert run.withdraw("Claude", parsed.withdrawn_human_checks, round_number=3) == ()
+    assert run.checks == (native_a, row) and run.tombstones == set()
+    assert len([line for line in lines if "ignored withdrawal of human check" in line]) == 3
+    # A non-list value degrades to no withdrawals instead of failing the review.
+    payload = json.loads(text.split("\n<!--", 1)[0])
+    payload["withdrawn_human_checks"] = "human-check-1"
+    degraded = parse_structured_pr_review(json.dumps(payload) + "\n<!-- AGENT_STATE: approved -->\n-- Claude",
+                                          reviewer="Claude", parse_requirement_evidence=False)
+    assert degraded.withdrawn_human_checks == ()
+
+
+def test_withdrawal_metadata_roundtrips_and_is_omitted_when_empty():
+    metadata = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=2, subject=HEAD,
+                                   withdrawn_human_checks=("human-check-abc",))
+    assert _decode_round_metadata(_encode_round_metadata(metadata)).withdrawn_human_checks == ("human-check-abc",)
+    empty = dataclasses.replace(metadata, withdrawn_human_checks=())
+    assert "withdrawn_human_checks" not in _encode_round_metadata(empty)
+
+
+def test_rerequest_after_withdrawal_is_added_back_once(tmp_path, monkeypatch):
+    """Row rerequest-after-withdrawal."""
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    check = _check(_native())
+    lines = []
+    run = _advisory_run(tmp_path, monkeypatch, lines, check)
+    assert run.withdraw("Codex", [display_id(check.identity)], round_number=2) == (display_id(check.identity),)
+    assert run.checks == () and any("Codex withdrew 1 advisory human check(s)" in line for line in lines)
+    # A replayed request that predates the withdrawal stays withdrawn.
+    assert run.normalize([_native()], round_number=2, head_sha=HEAD) == []
+    assert run.checks == ()
+    # Another reviewer's identical text is a different check and is unaffected.
+    run.requested("Claude", [check.text])
+    assert run.tombstones == {(display_id(check.identity), "Codex")}
+    # The same reviewer requesting it again in a later round re-admits it, once.
+    run.requested("Codex", [check.text])
+    rerequest = dataclasses.replace(_native(number=4), source_round=3)
+    assert run.normalize([rerequest], round_number=3, head_sha=OTHER) == []
+    assert run.normalize([rerequest], round_number=3, head_sha=OTHER) == []
+    assert [c.identity for c in run.checks] == [check.identity] and run.checks[0].source_round == 3
+    assert run.gate_needed([])
+
+
+def test_seed_applies_reviewer_record_withdrawals_before_the_mode_branch(tmp_path):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    kept, gone = _check(_native("Keep this live run.")), _check(_native())
+    orchestrator = SimpleNamespace(index=4, metadata=SimpleNamespace(
+        agent="Orchestrator", subject=HEAD, round_number=1, human_checks=(kept.as_dict(), gone.as_dict())))
+    withdrawal = SimpleNamespace(index=6, metadata=SimpleNamespace(
+        agent="Codex", subject=HEAD, round_number=2, withdrawn_human_checks=(display_id(gone.identity),)))
+    foreign = SimpleNamespace(index=7, metadata=SimpleNamespace(
+        agent="Claude", subject=HEAD, round_number=2, withdrawn_human_checks=(display_id(kept.identity),)))
+    for mode in ("advisory", "freeze"):
+        run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence=mode), 77)
+        run.seed([foreign, withdrawal, orchestrator], [])
+        assert [c.identity for c in run.checks] == [kept.identity]
+    # A later request record by the requester re-admits the check on resume.
+    rerequest = SimpleNamespace(index=8, metadata=SimpleNamespace(
+        agent="Codex", subject=HEAD, round_number=3, evidence_requests=(gone.text,)))
+    readmitted = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence="advisory"), 77)
+    readmitted.seed([orchestrator, withdrawal, rerequest], [])
+    assert len(readmitted.checks) == 2 and readmitted.tombstones == set()
+    assert run.restore_pending
+    # The transitional freeze restore drops a replayed withdrawn request too.
+    restored = run.normalize([_native()], round_number=3, head_sha=HEAD)
+    assert [item.text for item in restored] == [kept.text]
+
+
+def test_reviewer_context_lists_ids_requesters_rounds_heads_and_bound(tmp_path):
+    from coding_review_agent_loop.human_evidence_mode import (
+        HUMAN_CHECKS_RENDER_LIMIT, display_id, render_reviewer_context)
+
+    native, row = _check(_native()), _check(_converted(), head=OTHER)
+    text = render_reviewer_context((native, row))
+    assert f"`{display_id(native.identity)}` (requested by Codex, round 1, head `{HEAD}`)" in text
+    assert f"`{display_id(row.identity)}` (risk-matrix row `row-a`, round 2, head `{OTHER}`)" in text
+    assert "Do not re-request" in text and "withdrawn_human_checks" in text
+    assert render_reviewer_context(()) == ""
+    many = tuple(_check(_native(f"Live run {n}.")) for n in range(HUMAN_CHECKS_RENDER_LIMIT + 3))
+    assert "... and 3 more not shown." in render_reviewer_context(many)
+    for mode in ("freeze", "off"):
+        run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence=mode), 77)
+        run.checks = (native,)
+        assert run.prompt_context() == ""
+
+
+def test_non_recovery_hold_wording_is_unchanged_and_draft_wording_is_opt_in():
+    """Rows nonrecovery-hold-wording and recovery-hold-draft (wording)."""
+    from coding_review_agent_loop.human_evidence_mode import notice_line, render_human_checks_comment
+
+    assert notice_line(pr_number=77, count=2, head_sha=HEAD) == (
+        f"PR #77 approved but not merged: 2 human check(s) requested; see the "
+        f"'Human checks requested' comment on PR #77 for head {HEAD}.")
+    assert notice_line(pr_number=77, count=2, head_sha=HEAD, draft=True).startswith(
+        "PR #77 approved but not merged and still a draft: 2 human check(s)")
+    checks = (_check(_native()),)
+    plain = render_human_checks_comment(checks, pr_number=77, head_sha=HEAD)
+    assert "draft" not in plain
+    drafted = render_human_checks_comment(checks, pr_number=77, head_sha=HEAD, draft=True)
+    assert "PR #77 is still a draft" in drafted and "must mark it ready first" in drafted
