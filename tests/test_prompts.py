@@ -6446,6 +6446,48 @@ def test_blocking_scope_guidance_states_reachable_today_rule_per_flow(flow, bloc
     assert _prompt_owner._reviewer_blocking_scope_guidance(flow) == guidance
 
 
+# #2177: a plan-added requirement needs a reachable-today trigger to block.
+_PLAN_ADDED_CLAUSES_2177 = {
+    "pr": (
+        "A requirement or acceptance criterion that only the approved plan added (prefixed "
+        "`Plan-added:`, or otherwise not traceable to the issue text or a signed human "
+        "requirement) does not count under (i) on its own: it supports a blocker only when the "
+        "finding also names a trigger reachable today, as (ii) requires,",
+        "Without one, the finding goes to `future_followups` or is omitted.",
+        "Requirements and acceptance criteria from the issue text and signed human requirements "
+        "block under (i) as before.",
+        "A plan-added criterion does not count as the issue asking.",
+        "That includes a carried item whose only support is a plan-added criterion plus a "
+        "hypothetical input, edit, or caller: disposition it `future` (or `resolved`), not "
+        "`blocking` or `same-pr`.",
+    ),
+    "plan": (
+        "A plan's own beyond-issue criteria (prefixed `Plan-added:`, or otherwise not traceable "
+        "to the issue text or a signed human requirement) are not stated requirements under (i), "
+        "so they do not make a hypothetical-input finding eligible.",
+        "A plan-added criterion does not count as the issue asking.",
+        "That includes a carried item whose only support is a plan-added criterion plus a "
+        "hypothetical input, edit, or caller: disposition it `future` (or `resolved`), not "
+        "`blocking` or `same-plan`.",
+    ),
+}
+
+
+@pytest.mark.parametrize("flow", ["pr", "plan"])
+def test_blocking_scope_guidance_narrows_plan_added_requirements_2177(flow):
+    guidance = _prompt_owner._reviewer_blocking_scope_guidance(flow)
+    flat = " ".join(guidance.split())
+    for clause in _PLAN_ADDED_CLAUSES_2177[flow]:
+        assert clause in flat
+    other = "plan" if flow == "pr" else "pr"
+    assert _PLAN_ADDED_CLAUSES_2177[other][0] not in flat
+    # Pure function of ``flow``: no dynamic reviewer or round token leaks in.
+    assert _prompt_owner._reviewer_blocking_scope_guidance(flow) == guidance
+    for token in ("codex", "Codex", "claude", "Claude", "antigravity", "Antigravity", "{", "}"):
+        assert token not in guidance
+    assert not re.search(r"\bround \d", guidance)
+
+
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize(
     "approved_followups", ["ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"]
@@ -6455,7 +6497,7 @@ def test_pr_review_prompt_states_blocking_criteria_and_future_on_blocking(
 ):
     config = make_config(tmp_path, approved_followups=approved_followups)
     flat = " ".join(build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact).split())
-    for clause in _CRITERIA_CLAUSES_1389 + _REACHABLE_TODAY_CLAUSES_2164:
+    for clause in _CRITERIA_CLAUSES_1389 + _REACHABLE_TODAY_CLAUSES_2164 + _PLAN_ADDED_CLAUSES_2177['pr']:
         assert clause in flat
     assert _prompt_owner._reviewer_blocking_scope_guidance("pr") in build_review_prompt(
         77, 2, config, reviewer="codex", compact_context=compact
@@ -7699,3 +7741,65 @@ def test_pr_review_prompt_carries_notes_as_ordinary_findings_guidance(tmp_path):
         assert "Implementation notes from plan review" in prompt, compact
         assert "an unaddressed note is an ordinary PR review finding, never an automatic block" in prompt
         assert "- Refresh the SIBLINGS fixture. (Codex, Claude)" in prompt
+
+
+# --- plan-added criteria in planner and plan-review prompts (#2177) ---------
+
+_PLAN_ADDED_PLANNER_LINE_2177 = (
+    "becomes an acceptance criterion only if it guards an input, state, or caller that exists "
+    "today, named in the criterion, or a security or data-loss risk."
+)
+
+
+def test_fresh_planner_prompt_requires_plan_added_mark_and_reachable_today_2177(tmp_path):
+    prompt = build_issue_plan_prompt(2177, make_config(tmp_path))
+    flat = " ".join(prompt.split())
+    assert prompts_module.render_plan_added_criteria_guidance() in prompt
+    assert _PLAN_ADDED_PLANNER_LINE_2177 in flat
+    assert "with `Plan-added:`" in flat
+    assert (
+        "A criterion without the `Plan-added:` prefix claims to trace to the issue text or a "
+        "signed human requirement." in flat
+    )
+    assert "apply the same test before adopting it as a criterion" in flat
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"compact_context": True},
+        {
+            "response_form": "semantic-patch-v1",
+            "base_round_number": 1,
+            "base_state_identity": "a" * 64,
+        },
+    ],
+    ids=["full", "compact", "semantic-patch"],
+)
+def test_every_plan_revision_prompt_carries_plan_added_guidance_2177(tmp_path, kwargs):
+    prompt = build_plan_revision_prompt(
+        2177, 2, "Previous plan.", "Blocking review.", make_config(tmp_path), **kwargs
+    )
+    assert prompts_module.render_plan_added_criteria_guidance() in prompt
+    assert _PLAN_ADDED_PLANNER_LINE_2177 in " ".join(prompt.split())
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_plan_review_prompt_routes_hypothetical_beyond_issue_criteria_to_future_2177(
+    tmp_path, compact_context
+):
+    prompt = build_plan_review_prompt(
+        2177, 2, "Plan.", make_config(tmp_path), reviewer="codex",
+        compact_context=compact_context,
+    )
+    flat = " ".join(prompt.split())
+    assert prompts_module.render_plan_added_criteria_review_guidance() in prompt
+    assert "Otherwise it is not eligible: put it in `future_followups` or omit it." in flat
+    assert "do not use `implementation_notes` for it" in flat
+    assert "a beyond-issue criterion that lacks the `Plan-added:` prefix" in flat
+    # The implementation-note qualification rule is still present, unchanged.
+    assert prompts_module._plan_review_implementation_notes_guidance() in prompt
+    review_guidance = prompts_module.render_plan_added_criteria_review_guidance()
+    assert prompts_module.render_plan_added_criteria_guidance() not in prompt
+    assert "Plan-added criteria: a requirement" not in review_guidance

@@ -9370,6 +9370,24 @@ such a hypothetical is dispositioned `future` (or `resolved`). A real defect
 in the new code that is reachable today (wrong output, a crash, a test that
 fails today) still blocks however small it is.
 
+Plan-added criteria (#2177). A requirement that goes beyond the issue text and
+any signed human requirement becomes a plan acceptance criterion only if it
+guards an input, state, or caller that exists today (named in the criterion)
+or a security or data-loss risk. Planners prefix such criteria and scope-item
+requirements with `Plan-added:`; an unmarked criterion claims to trace to the
+issue or a signed requirement. The scope-item schema is unchanged: the mark is
+plain text. Plan reviewers route a beyond-issue proposal that names no current
+trigger or security/data-loss risk to `future_followups` (or omit it), not to
+`implementation_notes`, and may ask for a missing mark or a demotion as a
+same-plan follow-up. In PR review, criterion 1 is narrowed: a requirement only
+the plan added (marked `Plan-added:`, or otherwise not traceable to the issue
+or a signed requirement, which covers plans approved before this rule) supports
+a blocker only when the finding also names a trigger reachable today, or a
+security or data-loss risk; otherwise it goes in `future_followups` or is
+omitted. Issue-derived and signed human requirements block as before. A
+carried item whose only support is a plan-added criterion plus a hypothetical
+input is dispositioned `future` (or `resolved`).
+
 ### Operator-declared out of scope
 
 An issue body or a signed human comment may include an `## Out of scope` or

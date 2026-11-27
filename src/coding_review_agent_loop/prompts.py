@@ -1562,6 +1562,39 @@ def render_smallest_alternative_review_guidance() -> str:
     )
 
 
+def render_plan_added_criteria_guidance() -> str:
+    """Planner rule: beyond-issue criteria need a reachable-today trigger and a mark (#2177)."""
+    prefix = prompt_support.PLAN_ADDED_CRITERION_PREFIX
+    return (
+        "Plan-added criteria: a requirement that goes beyond the issue text and any signed "
+        "human requirement becomes an acceptance criterion only if it guards an input, state, "
+        "or caller that exists today, named in the criterion, or a security or data-loss risk. "
+        f"Start every such acceptance criterion, and every such scope-item `requirement`, with "
+        f"`{prefix}`, wherever it appears (scope items, plan steps, delivery or stage criteria). "
+        f"A criterion without the `{prefix}` prefix claims to trace to the issue text or a "
+        "signed human requirement. Record any other beyond-issue requirement as a `plan_steps` "
+        "note, an optional implementation note, or deferred work, not as an acceptance "
+        "criterion. When a reviewer proposes a requirement beyond the issue, apply the same "
+        "test before adopting it as a criterion.\n"
+    )
+
+
+def render_plan_added_criteria_review_guidance() -> str:
+    """Plan-reviewer rule shared by the full and compact review prompts (#2177)."""
+    prefix = prompt_support.PLAN_ADDED_CRITERION_PREFIX
+    return (
+        "Plan-added criteria: when you propose a requirement beyond the issue text and any "
+        "signed human requirement, you may require it as an acceptance criterion only if you "
+        "name the input, state, or caller that exists today, or the security or data-loss risk "
+        "it guards. Otherwise it is not eligible: put it in `future_followups` or omit it. "
+        "Never put it in `blocking_plan_issues` or `same_plan_followups` as a criterion demand, "
+        "and do not use `implementation_notes` for it; the implementation-note qualification "
+        "rule is unchanged. Two findings are eligible `same_plan_followups` (a small marking or "
+        f"demotion fix): a beyond-issue criterion that lacks the `{prefix}` prefix, and a "
+        f"`{prefix}` criterion that names no current trigger and no security or data-loss risk.\n"
+    )
+
+
 def _plan_growth_review_guidance(
     config: AgentLoopConfig,
     growth_notice: str | None = None,
@@ -1615,7 +1648,7 @@ For a plan (rather than a clarification), respond with exactly one structured JS
 
 {_execution_strategy_contract_guidance()}
 
-{_plan_growth_planner_guidance(config)}{render_smallest_alternative_guidance()}
+{_plan_growth_planner_guidance(config)}{render_smallest_alternative_guidance()}{render_plan_added_criteria_guidance()}
 {{
   "schema_version": 1,
   "kind": "plan_state",
@@ -1787,7 +1820,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}{("Deterministic ownership check (producer correction required): " + ownership_check_failure) if ownership_check_failure else ""}
-{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_smallest_alternative_review_guidance()}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_smallest_alternative_review_guidance()}{render_plan_added_criteria_review_guidance()}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
 Review the plan for correctness, architecture fit, missing edge cases within
 the issue's scope, test strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -1932,6 +1965,7 @@ def _build_compact_plan_review_prompt(
             + _plan_review_provenance_guidance(config)
             + _phased_plan_guard(config) + _plan_growth_review_guidance(config)
             + render_smallest_alternative_review_guidance()
+            + render_plan_added_criteria_review_guidance()
         ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -2163,7 +2197,7 @@ every `row`/`target_row`/`target_rows` entry is a complete matrix row):
 No other operation names exist.
 
 {HUMAN_MATRIX_OWNERSHIP_GUIDANCE}
-{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}{render_smallest_alternative_guidance()}
+{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}{render_smallest_alternative_guidance()}{render_plan_added_criteria_guidance()}
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot
@@ -2300,7 +2334,7 @@ Use this mandatory structured JSON response format:
     include_risk_test_matrix_contract=require_risk_test_matrix_contract
 )}
 
-{_plan_growth_planner_guidance(config, plan_growth_notice)}{render_smallest_alternative_guidance()}
+{_plan_growth_planner_guidance(config, plan_growth_notice)}{render_smallest_alternative_guidance()}{render_plan_added_criteria_guidance()}
 {{
   "schema_version": 1,
   "kind": "plan_revision",
@@ -2410,6 +2444,7 @@ def _build_compact_plan_revision_prompt(
             include_risk_test_matrix_contract=require_risk_test_matrix_contract
         ) + "\n" + _plan_growth_planner_guidance(config)
         + render_smallest_alternative_guidance()
+        + render_plan_added_criteria_guidance()
         + (
             "\n" + render_generalization_guidance(_HISTORY_PHASE_PLAN)
             if generalization_guidance
