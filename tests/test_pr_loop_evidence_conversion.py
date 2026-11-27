@@ -1505,7 +1505,12 @@ def _closure_published(record):
 
 
 def _reviewer_rounds_after(runner, index):
-    return [(r.metadata.round_number, r.metadata.agent) for r in _reviews_after(runner, index)]
+    """Return ``(round, agent)`` pairs sorted by round, then agent.
+
+    Panel reviewers in one round run concurrently, so their comment order is
+    not deterministic; only the per-round membership is asserted.
+    """
+    return sorted((r.metadata.round_number, r.metadata.agent) for r in _reviews_after(runner, index))
 
 
 def _launches(runner):
@@ -1587,7 +1592,7 @@ def test_a_foreign_conversion_comment_moves_no_boundary_and_closes_without_hidin
     assert closure.metadata.prior_items[0].converted_row_ids == ("row-a",)
     # No round-3 repeat reviewer launched: Codex and Gemini ran once before the
     # conversion; the closed round's next round runs the primary, then the panel.
-    assert _reviewer_rounds_after(runner, conversion.index) == [(4, "Codex"), (5, "Gemini"), (5, "Antigravity")]
+    assert _reviewer_rounds_after(runner, conversion.index) == [(4, "Codex"), (5, "Antigravity"), (5, "Gemini")]
     assert _agent_count(runner, "codex") == 2 and _agent_count(runner, "gemini") == 2
     assert not any(isinstance(exc, RoundStateReadError) for _kwargs, exc in calls)
 
@@ -1695,7 +1700,7 @@ def test_a_partial_repeat_pass_closes_and_rolls_over_with_only_post_conversion_r
     assert "Review round 3 closed, incomplete." in body
     # The closed round never approves: no round-3 review follows the closure, and
     # the primary reviews fresh in round 4, then the panel sweep in round 5.
-    assert _reviewer_rounds_after(runner, closure.index) == [(4, "Codex"), (5, "Gemini"), (5, "Antigravity")]
+    assert _reviewer_rounds_after(runner, closure.index) == [(4, "Codex"), (5, "Antigravity"), (5, "Gemini")]
     round_4 = next(r for r in _records(runner) if r.metadata.round_number == 4)
     assert "item-3" in [i.item_id for i in round_4.metadata.prior_items]
     assert "converted row `row-a`" in _prompts(runner, "codex")[-1]
@@ -1798,7 +1803,7 @@ def test_a_restart_after_the_conversion_closure_takes_the_rollover_not_another_r
                     config=dataclasses.replace(config, pr_convert_evidence_rows=()))
     assert len(_closures(runner)) == 1  # no second closure record
     assert len([r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]) == 1
-    assert _reviewer_rounds_after(runner, closure.index) == [(4, "Codex"), (5, "Gemini"), (5, "Antigravity")]
+    assert _reviewer_rounds_after(runner, closure.index) == [(4, "Codex"), (5, "Antigravity"), (5, "Gemini")]
     round_4 = next(r for r in _records(runner) if r.metadata.round_number == 4)
     assert "item-3" in [i.item_id for i in round_4.metadata.prior_items]
 
@@ -1879,7 +1884,7 @@ def test_the_signal_handler_keeps_begun_publications_and_drops_pre_conversion_on
     # Antigravity's only round-3 record precedes the conversion: excluded.
     # Codex keeps its begun, unrecorded publication with no comment ID.
     assert _closure_published(closure) == [("Codex", None)]
-    assert _reviewer_rounds_after(runner, conversion.index) == [(4, "Codex"), (5, "Gemini"), (5, "Antigravity")]
+    assert _reviewer_rounds_after(runner, conversion.index) == [(4, "Codex"), (5, "Antigravity"), (5, "Gemini")]
 
 
 @pytest.mark.parametrize("refresh", ["fails-once", "succeeds"])
