@@ -8769,3 +8769,68 @@ def test_plan_added_prefixed_scope_items_validate_and_round_trip_verbatim_2177()
     assert round_tripped["scope_items"][1]["acceptance_criteria"] == ["Done.", criterion]
     assert round_tripped["scope_items"][0]["requirement"] == "First."
     assert round_tripped["child_stages"][1]["acceptance_criteria"] == [criterion]
+
+
+# --- #2156: dispositions-only hold patches ---------------------------------
+
+from coding_review_agent_loop.protocol_risk import (  # noqa: E402
+    RISK_MATRIX_MAX_CHANGES as _MAX_CHANGES_2156,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    parse_plan_revision_patch as _parse_patch_2156,
+    validate_structured_plan_revision_patch as _validate_patch_2156,
+)
+
+
+def _hold_2156(**overrides):
+    payload = {
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Hold: the blocking item is disputed.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "blocking", "note": "Out of scope."}
+        ],
+        "base_round_number": 2, "base_state_identity": "a" * 64,
+        "operations": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_2156_a_zero_operation_hold_patch_parses():
+    """`hold-parse`: empty operations with a disposition for the carried item."""
+    patch = _parse_patch_2156(
+        _hold_2156(), carried_item_ids=(frozenset({"item-1"}), frozenset())
+    )
+    assert patch.operations == ()
+    assert [d.item_id for d in patch.prior_plan_item_dispositions] == ["item-1"]
+    assert patch.to_payload()["operations"] == []
+    text = json.dumps(_hold_2156()) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    assert _validate_patch_2156(text).operations == ()
+
+
+@pytest.mark.parametrize(
+    "operations,message",
+    [
+        ({"op": "replace"}, "operations must be a JSON array"),
+        (None, "operations must be a JSON array"),
+        ("[]", "operations must be a JSON array"),
+        (
+            [{"op": "replace", "field": "summary", "value": "x"}] * (_MAX_CHANGES_2156 * 2 + 1),
+            "exceeds the bounded operation limit",
+        ),
+    ],
+)
+def test_2156_non_list_and_over_limit_operations_are_still_rejected(operations, message):
+    with pytest.raises(AgentLoopError, match=message):
+        _parse_patch_2156(_hold_2156(operations=operations))
+
+
+def test_2156_a_hold_keeps_every_other_strict_check():
+    """Other exact-key and identity checks are unchanged for a hold."""
+    with pytest.raises(AgentLoopError):
+        _parse_patch_2156(_hold_2156(base_state_identity="A" * 64))
+    with pytest.raises(AgentLoopError):
+        _parse_patch_2156(_hold_2156(extra_key=True))
+    with pytest.raises(AgentLoopError):
+        _parse_patch_2156(_hold_2156(summary=""))

@@ -1427,6 +1427,7 @@ def _plan_revision_descriptor(
     response_form: str | None,
     sidecar: AssembledPlanSidecar | None,
     patch: object | None,
+    current_round: int | None = None,
 ) -> PlanRevisionDescriptor | None:
     """Describe the authenticated revision that produced the current key."""
     if response_form != "semantic-patch-v1" or patch is None or sidecar is None:
@@ -1452,4 +1453,6 @@ def _plan_revision_descriptor(
         sidecar_bound=True,
         operation_fields=fields,
         matrix_operations=matrix_ops,
+        operations_observed=isinstance(operations, (tuple, list)),
+        newly_published=current_round is not None and sidecar.round_number == current_round,
     )

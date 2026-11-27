@@ -255,6 +255,13 @@ def plan_no_progress_observations(
 
     A reviewer-only phase-advance round has no planner record N+1, so it
     never observes.
+
+    The observation subject is the planner record's
+    ``prior_plan_content_identity`` when present (#2156), so a dispositions-
+    only hold revision over unchanged plan content repeats it; historical and
+    free-form records fall back to ``prior_plan_subject``.  The two kinds of
+    value never collide, so a window mixing them cannot fire.  Reviews stay
+    bound to the exact rendered ``prior_plan_subject`` either way.
     """
     ordered = sorted(
         (record for record in records if getattr(record.metadata, "flow", None) == "plan"),
@@ -309,10 +316,11 @@ def plan_no_progress_observations(
             continue
         if not all(requirement_bound(review) for review in round_reviews):
             continue
+        observed_subject = planner.metadata.prior_plan_content_identity or subject
         observations.append(
             NoProgressObservation(
                 review_round,
-                str(subject),
+                str(observed_subject),
                 blocking_item_ids(planner.metadata.prior_items, statuses=PLAN_BLOCKING_STATUSES),
             )
         )

@@ -5108,11 +5108,14 @@ edit, or a newly signed planning requirement (a round counts only with
 affirmative evidence that it was reviewed under the same requirement set, so
 keyless legacy rounds do not count once a requirement is surfaced). Degraded
 `primary-then-panel` history (`absent`, `invalid`, or `contradictory-key`)
-skips the detector with a log line. Under `primary-then-panel` every planner
-revision is a semantic patch and a no-op patch is rejected, so the window fills
-there only from persisted histories with repeated plan hashes; a planner that
-keeps rewording an unchanged design is bounded only by `--max-rounds`. To
-continue after the stop:
+skips the detector with a log line. The plan hash compared here is the plan's
+content identity, which ignores the planner's per-round disposition notes and
+matrix audit (free-form plans and older records use the rendered plan hash).
+Matrix plans are always revised through semantic patches. When the planner
+disputes or cannot address the blocking items, it returns a dispositions-only
+hold (`"operations": []`) that keeps the plan unchanged, so repeated holds
+fill the window (#2156). A planner that keeps rewording an unchanged design is
+still bounded only by `--max-rounds`. To continue after the stop:
 
 - rerun with a larger `--no-progress-rounds` (the run stays bounded by
   `--max-rounds`);

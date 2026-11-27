@@ -168,6 +168,7 @@ from .plan_assembly import (
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
+    sidecar_content_identity,
 )
 from .plan_growth import (
     PlanGrowthThresholds,
@@ -2195,7 +2196,13 @@ def _run_plan_first_loop_body(
                     requirements_surfaced=bool(plan_hr_ids),
                     reset_floor_round=reset_floor,
                 ),
-                live_subject=current_plan_subject,
+                # The live candidate uses the same identity function as the
+                # planner records: content identity when a sidecar exists,
+                # else the rendered plan subject (#2156).
+                live_subject=(
+                    sidecar_content_identity(current_plan_sidecar)
+                    or current_plan_subject
+                ),
                 live_blocking_ids=live_blocking,
                 k=config.no_progress_rounds,
                 through_round=round_number - 1,
@@ -2373,6 +2380,7 @@ def _run_plan_first_loop_body(
                     response_form=current_response_form,
                     sidecar=current_plan_sidecar,
                     patch=current_plan_patch,
+                    current_round=round_number,
                 ),
                 previous_contracts=previous_plan_contracts,
                 current_contracts=_plan_cross_cutting_contracts(current_plan_sidecar),
@@ -4386,6 +4394,10 @@ def _run_plan_first_loop_body(
         # Observed before the sidecar is replaced: the classifier compares the
         # cross-cutting contracts across exactly this transition.
         previous_plan_contracts = _plan_cross_cutting_contracts(current_plan_sidecar)
+        # Captured before the sidecar is replaced as well: the planner record
+        # binds the content identity of the plan it revised, which is what
+        # the plan no-progress detector observes (#2156).
+        revised_plan_content_identity = sidecar_content_identity(current_plan_sidecar)
         current_plan_patch = (
             plan_response.marker_value
             if semantic_revision and isinstance(plan_response.marker_value, PlanRevisionPatch)
@@ -4505,6 +4517,7 @@ def _run_plan_first_loop_body(
                     round_number=round_number + 1,
                     subject=_plan_subject(current_plan),
                     prior_plan_subject=current_plan_subject,
+                    prior_plan_content_identity=revised_plan_content_identity,
                     prior_items=tuple(unresolved_items),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
