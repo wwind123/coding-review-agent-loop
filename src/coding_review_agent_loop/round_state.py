@@ -271,6 +271,9 @@ PR_PRE_RECONCILIATION_PHASES = frozenset(
         round_metadata.CODER_DISPATCH_PHASE,
         round_metadata.CODER_FOLLOWUP_REJECTED_PHASE,
         round_metadata.HEAD_REVIEW_RECOVERY_PHASE,
+        # A conversion record reopens its round (#1325): it is not the
+        # repeat's reconciliation, which is still to come (#2174).
+        round_metadata.EVIDENCE_CONVERSION_PHASE,
     }
 )
 
@@ -2001,7 +2004,10 @@ def _conversion_handoff_resume(
             list(walk_records)
         )
         + 1,
-        reconciled=True,
+        # The conversion record opens a same-round repeat that has not settled:
+        # its reconciliation is still to come, and only the round's own later
+        # reconciliation or closure ends the repeat (#2163, #2174).
+        reconciled=False,
         qualification_checkpoint=None,
     )
 
@@ -2232,13 +2238,15 @@ def _resume_pr_round_from_records(
             if latest_coder_record is not None
             else ()
         ),
+        # The conversion record itself never counts as a reconciliation
+        # (PR_PRE_RECONCILIATION_PHASES): only the repeat's own later
+        # reconciliation or closure settles a reopened round (#2174).
         reconciled=_pr_round_is_reconciled(
             tuple(
                 record
                 for record in current_round_records
                 if record.index >= max(superseded_below, reopened_below)
             )
-            + ((conversion_boundary,) if conversion_boundary is not None else ())
         ),
         local_test_evidence=(
             latest_coder_record.metadata.local_test_evidence

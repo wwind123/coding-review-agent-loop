@@ -3401,8 +3401,11 @@ def run_pr_loop(
                         # The resumed round becomes a conversion handoff (#2163), as on
                         # resume: the converted ledger and no pre-conversion reviews or
                         # reconciliation, so no re-entry, closure or rollover restores them.
+                        # The repeat is unreconciled and drops any freeze/release boundary,
+                        # so it reviews and posts its own summary (#2174).
                         current_resume = dataclasses_replace(
                             current_resume, completed_reviews=(), reconciliation_record=None,
+                            reconciled=False, evidence_boundary=None,
                             prior_items=tuple(unresolved_items),
                             next_unresolved_item_number=max(current_resume.next_unresolved_item_number,
                                                             next_unresolved_item_number))
