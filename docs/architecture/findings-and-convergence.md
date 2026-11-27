@@ -760,10 +760,10 @@ deterministic display IDs, never as carried items. A reviewer may withdraw its
 own native entry via `withdrawn_human_checks`; converted rows, other reviewers'
 entries and unknown IDs are logged and ignored, and the field is ignored outside
 `advisory`. Withdrawals from approving and blocking reviews apply before the
-reconciliation record and persist on the reviewer's own record. Resume replays
-them in record order as requester-scoped tombstones (a later request by the same
-reviewer clears one) that filter the seeded list before the mode branch and
-every normalization, so neither replay nor a `freeze` resume restores them.
+reconciliation record and persist on the reviewer's own record. Requests and
+withdrawals replay in record order per check and requester: the newest wins, and
+a withdrawal counts only after a request. The result filters the seeded list
+before the mode branch and every normalization in every mode.
 
 ## Requester-owned screenshot obligations
 

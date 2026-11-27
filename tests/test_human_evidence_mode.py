@@ -335,7 +335,7 @@ def test_unauthorized_unknown_converted_and_malformed_withdrawals_change_nothing
     lines = []
     run = _advisory_run(tmp_path, monkeypatch, lines, native_a, row)
     assert run.withdraw("Claude", parsed.withdrawn_human_checks, round_number=3) == ()
-    assert run.checks == (native_a, row) and run.tombstones == {}
+    assert run.checks == (native_a, row) and run.tombstones == set()
     assert len([line for line in lines if "ignored withdrawal of human check" in line]) == 3
     # A non-list value degrades to no withdrawals instead of failing the review.
     payload = json.loads(text.split("\n<!--", 1)[0])
@@ -384,20 +384,22 @@ def test_seed_applies_reviewer_record_withdrawals_before_the_mode_branch(tmp_pat
     kept, gone = _check(_native("Keep this live run.")), _check(_native())
     orchestrator = SimpleNamespace(index=4, metadata=SimpleNamespace(
         agent="Orchestrator", subject=HEAD, round_number=1, human_checks=(kept.as_dict(), gone.as_dict())))
+    requests = SimpleNamespace(index=2, metadata=SimpleNamespace(
+        agent="Codex", subject=HEAD, round_number=1, evidence_requests=(kept.text, gone.text)))
     withdrawal = SimpleNamespace(index=6, metadata=SimpleNamespace(
         agent="Codex", subject=HEAD, round_number=2, withdrawn_human_checks=(display_id(gone.identity),)))
     foreign = SimpleNamespace(index=7, metadata=SimpleNamespace(
         agent="Claude", subject=HEAD, round_number=2, withdrawn_human_checks=(display_id(kept.identity),)))
     for mode in ("advisory", "freeze"):
         run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence=mode), 77)
-        run.seed([foreign, withdrawal, orchestrator], [])
+        run.seed([foreign, withdrawal, orchestrator, requests], [])
         assert [c.identity for c in run.checks] == [kept.identity]
     # A later request record by the requester re-admits the check on resume.
     rerequest = SimpleNamespace(index=8, metadata=SimpleNamespace(
         agent="Codex", subject=HEAD, round_number=3, evidence_requests=(gone.text,)))
     readmitted = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence="advisory"), 77)
-    readmitted.seed([orchestrator, withdrawal, rerequest], [])
-    assert len(readmitted.checks) == 2 and readmitted.tombstones == {}
+    readmitted.seed([requests, orchestrator, withdrawal, rerequest], [])
+    assert len(readmitted.checks) == 2 and readmitted.tombstones == set()
     assert run.restore_pending
     # The transitional freeze restore drops a replayed withdrawn request too.
     restored = run.normalize([_native()], round_number=3, head_sha=HEAD)
@@ -441,7 +443,7 @@ def test_non_recovery_hold_wording_is_unchanged_and_draft_wording_is_opt_in():
 @pytest.mark.parametrize("mode", ["advisory", "freeze"])
 @pytest.mark.parametrize("origin, readmitted", [
     ("replayed-before-withdrawal", False),
-    ("replayed-same-record", False),
+    ("recorded-in-withdrawing-review", True),
     ("recorded-after-withdrawal", True),
     ("live", True),
 ])
@@ -461,7 +463,7 @@ def test_only_a_request_made_after_the_withdrawal_readmits_the_check(tmp_path, m
     run.seed([request, withdrawal, orchestrator], [])
     # The withdrawn check was the only one, so no restoration is pending.
     assert run.checks == () and not run.restore_pending
-    position = {"replayed-before-withdrawal": 3, "replayed-same-record": 7,
+    position = {"replayed-before-withdrawal": 3, "recorded-in-withdrawing-review": 7,
                 "recorded-after-withdrawal": 9, "live": None}[origin]
     run.requested("Codex", [check.text], position=position)
     # The same request reaches normalization (resumed review or ledger replay), twice.
@@ -475,3 +477,59 @@ def test_only_a_request_made_after_the_withdrawal_readmits_the_check(tmp_path, m
     if not readmitted:
         run.requested("Claude", [check.text])
         assert set(run.tombstones) == {(display_id(check.identity), "Codex")}
+
+
+def _review_record(index, *, request=False, withdraw=False, reviewer="Codex"):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    check = _check(_native())
+    return SimpleNamespace(index=index, metadata=SimpleNamespace(
+        agent=reviewer, subject=HEAD, round_number=1,
+        evidence_requests=(check.text,) if request else (),
+        withdrawn_human_checks=(display_id(check.identity),) if withdraw else ()))
+
+
+# (recorded reviews, replayed or live review applied after seed, expected withdrawn)
+_EVENT_CASES = {
+    "item-1 replayed older request": ([(3, "r"), (7, "w")], (3, "r"), True),
+    "item-3 replayed older withdrawal after re-request": ([(3, "r"), (7, "w"), (11, "r")], (7, "w"), False),
+    "item-4 ignored withdrawal beside its own request": ([(5, "rw")], None, False),
+    "ignored withdrawal with no request at all": ([(5, "w")], None, False),
+    "foreign withdrawal": ([(3, "r"), (7, "W")], None, False),
+    "effective withdrawal": ([(3, "r"), (7, "w")], None, True),
+    "later re-request": ([(3, "r"), (7, "w"), (11, "r")], None, False),
+    "live withdrawal after re-request": ([(3, "r"), (7, "w"), (11, "r")], (None, "w"), True),
+    "live re-request after withdrawal": ([(3, "r"), (7, "w")], (None, "r"), False),
+}
+
+
+@pytest.mark.parametrize("mode", ["advisory", "freeze"])
+@pytest.mark.parametrize("case", sorted(_EVENT_CASES))
+def test_withdrawal_and_request_events_apply_in_record_order(tmp_path, mode, case):
+    """Items 1-4 class: the newest effective event per (check, requester) wins, recorded or live."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.human_evidence_mode import display_id
+
+    recorded, replay, withdrawn = _EVENT_CASES[case]
+    check = _check(_native())
+    # "r" request, "w" withdrawal by the requester Codex, "W" withdrawal by another reviewer.
+    records = [_review_record(index, request="r" in kind, withdraw="w" in kind.lower(),
+                              reviewer="Claude" if kind == "W" else "Codex") for index, kind in recorded]
+    listed = SimpleNamespace(index=max(i for i, _k in recorded) + 1, metadata=SimpleNamespace(
+        agent="Orchestrator", subject=HEAD, round_number=1, human_checks=(check.as_dict(),)))
+    run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence="advisory"), 77)
+    run.seed([*records, listed], [])
+    if replay is not None:
+        position, kind = replay
+        if kind == "w":
+            run.withdraw("Codex", [display_id(check.identity)], round_number=2, position=position)
+        else:
+            run.requested("Codex", [check.text], position=position)
+    run.mode = mode
+    replayed = run.normalize([_native()], round_number=2, head_sha=HEAD)
+    assert ((display_id(check.identity), "Codex") in run.tombstones) is withdrawn
+    if mode == "advisory":
+        assert replayed == [] and [c.text for c in run.checks] == ([] if withdrawn else [check.text])
+    else:
+        assert [i.text for i in replayed] == ([] if withdrawn else [check.text])

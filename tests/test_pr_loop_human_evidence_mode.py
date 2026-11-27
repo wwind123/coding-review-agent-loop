@@ -1369,3 +1369,59 @@ def test_returning_to_a_previously_reviewed_head_does_not_resurrect_a_withdrawn_
     [merge] = _merge_calls(runner)
     assert merge[merge.index("--match-head-commit") + 1] == HEAD
     assert "approved but not merged" not in capsys.readouterr().out
+
+
+_THIRD_HEAD = "9d2a7c1f0e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c"
+
+
+def _move_to(runner, head):
+    runner._move_head(head, cwd=None)
+    runner.pr_payload["headRefOid"] = head
+
+
+def test_returning_to_the_withdrawing_head_does_not_cancel_a_later_re_request(tmp_path, capsys):
+    """Item-3: request at A, withdraw at B, re-request at C, then return to B: the check still holds."""
+    runner = FakeRunner(codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])])
+    config = _config(tmp_path, auto_merge=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    _move_to(runner, _LATER_HEAD)
+    runner.codex_outputs.append(_withdrawing(_evidence_review(), _id_for(_EVIDENCE_TEXT)))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    _move_to(runner, _THIRD_HEAD)
+    runner.codex_outputs.append(_evidence_review(evidence=[_EVIDENCE_TEXT]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and _listed(_check_records(runner)[-1]) == [_EVIDENCE_TEXT]
+    # Back to head B, whose recorded review withdrew the check before C re-requested it.
+    _move_to(runner, _LATER_HEAD)
+    capsys.readouterr()
+    calls = len(_reviewer_calls(runner))
+    assert run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, auto_merge=True)) == 0
+    assert len(_reviewer_calls(runner)) == calls, "head B's recorded review is reused"
+    assert _merge_calls(runner) == []
+    assert "approved but not merged: 1 human check(s) requested" in capsys.readouterr().out
+    assert _listed(_check_records(runner)[-1]) == [_EVIDENCE_TEXT]
+
+
+@pytest.mark.parametrize("rerun_mode", ["advisory", "freeze"])
+def test_an_ignored_withdrawal_stays_ignored_after_resume(tmp_path, capsys, rerun_mode):
+    """Item-4: a stale ID sent beside a new request is ignored live and on every resume."""
+    runner = FakeRunner(codex_outputs=[_withdrawing(_evidence_review(evidence=[_EVIDENCE_TEXT]),
+                                                    _id_for(_EVIDENCE_TEXT))])
+    config = _config(tmp_path, auto_merge=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    [reviewer] = [r for r in _pr_records(runner) if r.metadata.role == "reviewer"]
+    assert reviewer.metadata.withdrawn_human_checks == (_id_for(_EVIDENCE_TEXT),)
+    assert _listed(_check_records(runner)[-1]) == [_EVIDENCE_TEXT] and _merge_calls(runner) == []
+    capsys.readouterr()
+    runner.codex_outputs.append(_evidence_review())  # only used if the head is reviewed again
+    rerun = dataclasses.replace(config, pr_human_evidence=rerun_mode)
+    if rerun_mode == "freeze":
+        with pytest.raises(HumanDecisionRequiredError, match=f"frozen at head {HEAD}"):
+            run_pr_loop(runner, pr_number=77, config=rerun)
+        [freeze] = _freeze_records(runner)
+        assert [i.text for i in _evidence_items(freeze.metadata.prior_items)] == [_EVIDENCE_TEXT]
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=rerun) == 0
+        assert "approved but not merged: 1 human check(s) requested" in capsys.readouterr().out
+        assert len(_check_comments(runner)) == 1
+    assert _merge_calls(runner) == []
