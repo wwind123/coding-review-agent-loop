@@ -309,6 +309,43 @@ def aggregate_plan_identity(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(_json_bytes(_identity_inputs(payload))).hexdigest()
 
 
+# Per-revision fields that never describe the plan's content: the wire kind
+# (plan_state vs plan_revision), its envelope, the planner's dispositions of
+# the prior round's items, and the derived per-revision matrix audit (#2156).
+PLAN_CONTENT_IDENTITY_EXCLUDED_FIELDS = frozenset(
+    {
+        "kind",
+        "state",
+        "schema_version",
+        "prior_plan_item_dispositions",
+        "risk_test_matrix_changes",
+    }
+)
+PLAN_CONTENT_IDENTITY_VERSION = 1
+
+
+def plan_content_identity(payload: Mapping[str, object]) -> str:
+    """Return the SHA-256 identity of a canonical plan's content (#2156).
+
+    Unlike :func:`aggregate_plan_identity`, which binds approval and handoff
+    to the exact canonical plan, this identity ignores per-revision envelope,
+    disposition and matrix-audit fields.  A ``plan_state`` base and a
+    zero-operation hold revision over it therefore share one identity, while
+    any change to a canonical content field changes it.  It is used only as
+    the plan no-progress observation subject.
+    """
+    if not isinstance(payload, Mapping):
+        raise AgentLoopError("plan content identity requires a canonical plan JSON object.")
+    content = {
+        key: value
+        for key, value in payload.items()
+        if key not in PLAN_CONTENT_IDENTITY_EXCLUDED_FIELDS
+    }
+    return hashlib.sha256(
+        _json_bytes({"version": PLAN_CONTENT_IDENTITY_VERSION, "content": content})
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class AssembledPlanSidecar:
     schema_version: int
@@ -364,6 +401,13 @@ def make_assembled_plan_sidecar(
             rendered_plan_identity(rendered_plan) if rendered_plan is not None else None
         ),
     )
+
+
+def sidecar_content_identity(sidecar: "AssembledPlanSidecar | None") -> str | None:
+    """Content identity of an assembled plan sidecar, or ``None`` without one."""
+    if sidecar is None:
+        return None
+    return plan_content_identity(sidecar.canonical_json)
 
 
 def rendered_plan_identity(text: str) -> str:

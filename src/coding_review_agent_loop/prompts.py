@@ -2198,10 +2198,16 @@ No other operation names exist.
 
 {HUMAN_MATRIX_OWNERSHIP_GUIDANCE}
 {_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}{render_smallest_alternative_guidance()}{render_plan_added_criteria_guidance()}
-Operations are applied atomically and simultaneously. The patch must contain
-at least one real change, and its binding must match the authenticated values
-above exactly. Repair may fix only response-envelope presentation; it cannot
-invent or rewrite semantic operations.
+Operations are applied atomically and simultaneously. Every listed operation
+must be a real change; a payload-identical operation is rejected. The one
+allowed zero-change form is a hold: `"operations": []` with a disposition and
+`note` for every carried item. Use a hold only when you dispute or cannot
+address the blocking items and the plan should stay unchanged; repeated holds
+over unchanged plan content while reviewers keep the same blocking items end
+the run with a no-progress stop that asks for a human decision. The binding
+must match the authenticated values above exactly. Repair may fix only
+response-envelope presentation; it cannot invent or rewrite semantic
+operations.
 """
 
 

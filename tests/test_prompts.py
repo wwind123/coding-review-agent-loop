@@ -319,6 +319,27 @@ def test_semantic_plan_revision_prompt_renders_exact_disposition_contract(tmp_pa
     assert "do not use `rationale` or omit `disposition`" in prompt
 
 
+def test_semantic_plan_revision_prompt_offers_hold_instead_of_mandatory_change(tmp_path):
+    """Issue #2156: a zero-operation hold replaces the mandatory-change rule."""
+    prompt = build_plan_revision_prompt(
+        2156,
+        2,
+        "Authenticated prior plan.",
+        "Blocking review.",
+        make_config(tmp_path),
+        response_form="semantic-patch-v1",
+        base_round_number=1,
+        base_state_identity="a" * 64,
+    )
+    flat = " ".join(prompt.split())
+
+    assert "must contain at least one real change" not in flat
+    assert "The one allowed zero-change form is a hold: `\"operations\": []`" in flat
+    assert "disposition and `note` for every carried item" in flat
+    assert "Every listed operation must be a real change" in flat
+    assert "no-progress stop that asks for a human decision" in flat
+
+
 def test_semantic_plan_revision_prompt_names_every_patch_operation(tmp_path):
     """Issue #922: planners must be told the matrix operation names and shapes."""
     from coding_review_agent_loop.protocol import (

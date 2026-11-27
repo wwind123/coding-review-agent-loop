@@ -5657,8 +5657,10 @@ def parse_plan_revision_patch(
     if not _PLAN_REVISION_PATCH_IDENTITY_RE.fullmatch(identity):
         raise AgentLoopError(f"{context}.base_state_identity must be a lowercase 64-hex identity.")
     operations_payload = payload["operations"]
-    if not isinstance(operations_payload, list) or not operations_payload:
-        raise AgentLoopError(f"{context}.operations must be a non-empty JSON array.")
+    # An empty list is the dispositions-only hold revision (#2156): it keeps
+    # every canonical plan field and records only the planner's dispositions.
+    if not isinstance(operations_payload, list):
+        raise AgentLoopError(f"{context}.operations must be a JSON array.")
     if len(operations_payload) > RISK_MATRIX_MAX_CHANGES * 2:
         raise AgentLoopError(f"{context}.operations exceeds the bounded operation limit.")
     # Semantic operations write approved plan state verbatim: every parser

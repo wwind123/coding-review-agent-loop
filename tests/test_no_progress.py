@@ -917,3 +917,92 @@ def test_the_plan_message_names_the_plan_hash_and_size_only_when_given(present):
     assert ("Plan size: 1200 characters" in message) is present
     assert ("Step-back approach alternative proposed at round 3" in message) is present
     assert "Total PR size" not in message
+
+
+# --- plan content identity as the observation subject (#2156) ---------------
+
+C = "e" * 64  # a plan content identity, distinct from every rendered subject
+
+
+def _planner_with_identity(index, round_number, prior_subject, identity):
+    record = _planner(index, round_number, prior_subject)
+    return PostedRoundRecord(
+        index=record.index,
+        metadata=PostedRoundMetadata(
+            **{
+                **{
+                    name: getattr(record.metadata, name)
+                    for name in (
+                        "flow", "role", "agent", "round_number", "subject",
+                        "prior_plan_subject", "plan_issue_digest", "prior_items",
+                    )
+                },
+                "prior_plan_content_identity": identity,
+            }
+        ),
+        body="",
+    )
+
+
+def _hold_history(subjects, identities):
+    """Each round reviews its own rendered subject; planner N+1 binds both."""
+    records = []
+    for n, (subject, identity) in enumerate(zip(subjects, identities), start=1):
+        records.append(_plan_review(10 * n, n, subject))
+        records.append(_planner_with_identity(10 * n + 5, n + 1, subject, identity))
+    return records
+
+
+def test_hold_rounds_observe_the_content_identity_and_stop():
+    """`resume-same-decision` (unit): rendered subjects differ, content repeats."""
+    subjects = ("1" * 64, "2" * 64, "3" * 64)
+    records = _hold_history(subjects, (C, C, C))
+    observations = _observe(records)
+    assert observations == (Obs(1, C, IDS), Obs(2, C, IDS), Obs(3, C, IDS))
+    decision = no_progress_decision(
+        observations, live_subject=C, live_blocking_ids=IDS, k=3, through_round=3
+    )
+    assert decision == np.NoProgressDecision(C, IDS, (1, 2, 3), 3)
+    # The same records decide the same way on every read: no in-memory state.
+    assert _observe(list(records)) == observations
+
+
+def test_reviews_stay_bound_to_the_exact_rendered_subject():
+    """A review of another rendered plan still breaks the window."""
+    subjects = ("1" * 64, "2" * 64, "3" * 64)
+    records = _hold_history(subjects, (C, C, C))
+    records[2] = _plan_review(20, 2, "9" * 64)
+    assert 2 not in {observation.round_number for observation in _observe(records)}
+
+
+def test_a_legacy_planner_record_observes_its_rendered_subject():
+    """`legacy-mixed-window`: no content identity is inferred for old records."""
+    observations = _observe(_plan_history())
+    assert {observation.subject for observation in observations} == {P}
+    assert all(
+        record.metadata.prior_plan_content_identity is None
+        for record in _plan_history() if record.metadata.role == "coder"
+    )
+
+
+def test_a_window_mixing_legacy_and_content_identity_records_never_fires():
+    """`legacy-mixed-window`: the two kinds of subject never collide."""
+    records = _hold_history((P, P, P), (None, C, C))
+    observations = _observe(records)
+    assert [observation.subject for observation in observations] == [P, C, C]
+    for live in (P, C):
+        assert no_progress_decision(
+            observations, live_subject=live, live_blocking_ids=IDS, k=3, through_round=3
+        ) is None
+
+
+def test_a_free_form_plan_uses_the_rendered_subject_for_both_sides():
+    """`freeform-fallback`: no sidecar, so no content identity anywhere."""
+    from coding_review_agent_loop.plan_assembly import sidecar_content_identity
+
+    assert sidecar_content_identity(None) is None
+    records = _hold_history((P, P, P), (None, None, None))
+    live = sidecar_content_identity(None) or P
+    assert no_progress_decision(
+        _observe(records), live_subject=live, live_blocking_ids=IDS, k=3, through_round=3
+    ) == np.NoProgressDecision(P, IDS, (1, 2, 3), 3)

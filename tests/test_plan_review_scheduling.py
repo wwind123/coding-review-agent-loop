@@ -483,7 +483,7 @@ def test_an_empty_closing_issue_set_is_a_complete_declaration():
 
 
 def test_an_unobserved_operation_set_is_broad_not_narrow():
-    """An authenticated patch always carries an operation; empty means unobserved."""
+    """Without an observed operation set, an empty set is a defaulted value."""
     classification = classify_plan_transition(
         _key(),
         _key(plan="plan-2"),
@@ -493,6 +493,43 @@ def test_an_unobserved_operation_set_is_broad_not_narrow():
     )
     assert classification.broad
     assert "reports no authenticated patch operations" in classification.reason
+
+
+def test_an_observed_hold_is_broad_with_its_own_reason():
+    """`staged-hold-stop` (#2156): a dispositions-only hold is never narrow."""
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=(), matrix_operations=(), operations_observed=True),
+        previous_contracts=_contracts(),
+        current_contracts=_contracts(),
+    )
+    assert classification.broad
+    assert "dispositions-only hold" in classification.reason
+    assert "reports no authenticated patch operations" not in classification.reason
+
+
+def test_the_descriptor_observes_an_authenticated_hold_patch():
+    from coding_review_agent_loop.panel_evidence import _plan_revision_descriptor
+    from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
+    from coding_review_agent_loop.protocol import parse_plan_revision_patch
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    plan = validate_structured_plan_state(structured_v1_plan_state())
+    sidecar = make_assembled_plan_sidecar(plan, round_number=2)
+    hold = parse_plan_revision_patch({
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Hold.", "prior_plan_item_dispositions": [],
+        "base_round_number": 1, "base_state_identity": "a" * 64, "operations": [],
+    })
+    descriptor = _plan_revision_descriptor(
+        response_form="semantic-patch-v1", sidecar=sidecar, patch=hold
+    )
+    assert descriptor.operations_observed
+    assert descriptor.operation_fields == () and descriptor.matrix_operations == ()
+    assert PlanRevisionDescriptor().operations_observed is False
 
 
 @pytest.mark.parametrize(

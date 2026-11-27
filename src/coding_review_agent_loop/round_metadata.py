@@ -99,6 +99,12 @@ class PostedRoundMetadata:
     # and therefore cannot supersede a newer authenticated diagnostic for a
     # revision context.
     prior_plan_subject: str | None = None
+    # Content identity (``plan_assembly.plan_content_identity``) of the plan
+    # this planner record revised, when it had an assembled sidecar (#2156).
+    # The plan no-progress detector observes it in place of
+    # ``prior_plan_subject``.  ``None`` for free-form plans and on every
+    # historical record; omitted from the encoding when ``None``.
+    prior_plan_content_identity: str | None = None
     prior_items: tuple[UnresolvedReviewItem, ...] = ()
     dispositions: tuple[ReviewItemDisposition, ...] = ()
     new_items: tuple[UnresolvedReviewItem, ...] = ()
@@ -479,6 +485,11 @@ class PostedRoundMetadata:
             or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_change_digest)
         ):
             raise ValueError("invalid reviewer board change digest")
+        if self.prior_plan_content_identity is not None and (
+            not isinstance(self.prior_plan_content_identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.prior_plan_content_identity)
+        ):
+            raise ValueError("invalid prior plan content identity")
         for board_field in _BOARD_FIELDS:
             if getattr(self, board_field) is not None and not isinstance(
                 getattr(self, board_field), dict
@@ -2416,6 +2427,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.reviewer_board_change_digest is not None:
         payload["reviewer_board_change_digest"] = metadata.reviewer_board_change_digest
+    if metadata.prior_plan_content_identity is not None:
+        payload["prior_plan_content_identity"] = metadata.prior_plan_content_identity
     for board_field in _BOARD_FIELDS:
         if getattr(metadata, board_field) is not None:
             payload[board_field] = getattr(metadata, board_field)
@@ -3287,6 +3300,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             reviewer_board_change_digest=_decode_plan_supersession_field(
                 payload, "reviewer_board_change_digest"
+            ),
+            # Present-but-malformed (null, non-string, non-hex) is rejected:
+            # only absence decodes as a legacy record (#2156).
+            prior_plan_content_identity=_decode_plan_supersession_field(
+                payload, "prior_plan_content_identity"
             ),
             pr_board_root=_decode_board_object(payload, "pr_board_root"),
             pr_board_identity=_decode_board_object(payload, "pr_board_identity"),

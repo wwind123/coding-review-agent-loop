@@ -121,3 +121,52 @@ def test_malformed_notes_fail_closed(value):
 
     with pytest.raises(ValueError):
         decode_implementation_notes(value)
+
+
+# --- #2156: prior_plan_content_identity on planner records ------------------
+
+from coding_review_agent_loop.round_metadata import (  # noqa: E402
+    _decode_round_metadata,
+    _encode_round_metadata,
+)
+from coding_review_agent_loop.round_transport import (  # noqa: E402
+    decode_mapping as _decode_mapping_2156,
+    encode_mapping as _encode_mapping_2156,
+)
+
+
+def _planner_2156(**changes):
+    return PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=3,
+        subject="b" * 64, prior_plan_subject="a" * 64, **changes,
+    )
+
+
+def test_2156_a_valid_content_identity_round_trips():
+    """`metadata-strict`: a lowercase 64-hex identity survives encode/decode."""
+    metadata = _planner_2156(prior_plan_content_identity="c" * 64)
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.prior_plan_content_identity == "c" * 64
+    assert decoded.prior_plan_subject == "a" * 64
+
+
+def test_2156_an_absent_identity_decodes_as_none_and_is_not_encoded():
+    encoded = _encode_round_metadata(_planner_2156())
+    assert "prior_plan_content_identity" not in _decode_mapping_2156(encoded)
+    assert _decode_round_metadata(encoded).prior_plan_content_identity is None
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "C" * 64, "c" * 63, "g" * 64, 7, ["c" * 64]]
+)
+def test_2156_a_malformed_identity_is_rejected(value):
+    """`metadata-strict`: present-but-malformed never decodes as legacy absence."""
+    payload = dict(_decode_mapping_2156(_encode_round_metadata(_planner_2156())))
+    payload["prior_plan_content_identity"] = value
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    with pytest.raises((ValueError, AgentLoopError), match="prior.plan.content.identity"):
+        _decode_round_metadata(_encode_mapping_2156(payload))
+    if isinstance(value, str):
+        with pytest.raises(ValueError):
+            _planner_2156(prior_plan_content_identity=value)

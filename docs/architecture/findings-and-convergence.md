@@ -375,48 +375,50 @@ retired entry readers in `pr_loop.py`, `pr_loop_support.py` and
 (#2162): hidden `cli.RETIRED_FLAGS` entries exit 2 naming `--no-progress-rounds`.
 
 **Plan no-progress stop** (same `--no-progress-rounds` K; #2098, stage 2 of
-#2067). The plan loop reuses the same `no_progress_decision` and replaces the
-plan step-back escalation stop (round start and post-review) and the
-primary-phase stall stop. The subject is the plan subject (the canonical plan
-hash); `blocking_item_ids(..., statuses=PLAN_BLOCKING_STATUSES)` counts
-`blocking` and `same-plan` items (the PR default stays `blocking`/`same-pr`).
-`plan_no_progress_observations` observes round N through the newest plan
-planner record numbered N+1: subject = its `prior_plan_subject`, IDs = its
-`prior_items`, the round-end ledger the planner was asked to fix. No scheduler
-record is needed. Round N is no
-observation, and breaks the window, when it has a closure boundary or an
-unvalidated closure summary, no complete non-inert review before that planner
-record, review subjects other than exactly `{prior_plan_subject}`, a planner
-`plan_issue_digest` that differs from the live issue digest, or a round number
-below the reset floor (the newest valid `scheduler_stall_reset` prelaunch
-checkpoint's round, in any phase). A reviewer-only phase-advance round has no
-planner record N+1, so it never observes. Requirement binding is conservative:
-with a non-empty live surfaced planning-requirement set every review must carry a
-`plan_candidate_key` whose `surfaced_requirement_id_digest` equals the live one
-(keyless legacy rounds are excluded); with an empty live set a review whose key
-records another digest is excluded. A requirement signed in a comment therefore
-restarts the window even though the issue digest excludes comments.
+#2067). It reuses `no_progress_decision`, replacing the plan step-back
+escalation and primary-phase stall stops. `blocking_item_ids(...,
+statuses=PLAN_BLOCKING_STATUSES)` counts `blocking` and `same-plan` items (the
+PR default stays `blocking`/`same-pr`). `plan_no_progress_observations` observes
+round N through the newest planner record numbered N+1: IDs = its `prior_items`
+(the round-end ledger); subject = its `prior_plan_content_identity`, else its
+`prior_plan_subject` (the rendered plan hash). The content identity
+(`plan_assembly.plan_content_identity`, #2156) hashes the canonical plan JSON
+without `kind`, `state`, `schema_version`, `prior_plan_item_dispositions` and
+the `risk_test_matrix_changes` audit, so a `plan_state` and an unchanged
+revision share it. Planner records take it from the revised sidecar; free-form
+and historical records keep the rendered hash, which never collides, so mixed
+windows cannot fire. Approval and handoff identities are unchanged. A semantic
+patch with `operations: []` is a dispositions-only **hold**: content unchanged,
+audit `[]`, dispositions recorded. The prompt offers it for disputed blocking
+items; classification treats it as `broad` (own reason). Repeated holds make the
+stop reachable for matrix plans. Round N breaks the window when it has a closure
+boundary or unvalidated closure summary, no complete non-inert review before
+that planner record, review subjects other than exactly `{prior_plan_subject}`,
+a `plan_issue_digest` other than the live one, or a number below the reset floor
+(the newest valid `scheduler_stall_reset` checkpoint's round). A reviewer-only
+phase-advance round never observes. Requirement binding: with surfaced planning
+requirements every review needs a `plan_candidate_key` whose
+`surfaced_requirement_id_digest` equals the live one (keyless legacy rounds are
+excluded); with none, a review keyed to another digest is excluded, so a
+requirement signed in a comment restarts the window.
 
-`plan_first_loop` runs the check once per round, outside the staged scheduler
-branch so it applies under every review policy, after the staged history is
-classified and before the scheduler prelaunch checkpoint and every agent turn.
-Under `primary-then-panel` it is skipped with a log line unless the history class
-is intact; it is also skipped on the reset round, ownership, staged-mode,
-force-full and approved-shortcut rounds, a resumed round holding completed
-reviews, and an empty live blocking set.
-The live candidate is the current plan subject plus the blocking IDs of the
-pre-round ledger. The message (lead empty, subject label `plan`) adds the plan
-size (characters plus the growth-assessment measurements) and the newest
-step-back candidate's summary, replayed per primary segment so it survives the
-panel opening, as the approach alternative, and
+`plan_first_loop` runs the check once per round under every review policy, after
+staged history classification and before the prelaunch checkpoint and every
+agent turn. It is skipped (logged) over non-intact `primary-then-panel` history,
+and on reset, ownership, staged-mode, force-full and approved-shortcut rounds, a
+resumed round holding completed reviews, and an empty live blocking set. The
+live candidate is the current plan's identity, by the same fallback, plus the
+pre-round blocking IDs. The message adds the plan size and, as the approach
+alternative, the newest step-back summary, replayed per primary segment;
 `stop_plan_pre_panel_decision` posts it once as a planning diagnostic and raises
-`PlanPrePanelHumanDecisionError` (exit 4) without a round record. The plan step-back and sweep
-stay prompts with internal thresholds (`PLAN_STEP_BACK_ROUNDS`,
-`PLAN_SWEEP_ROUNDS`), and the step-back episode is replay-derived (see
-[review scheduling](review-scheduling.md)). The four plan threshold flags
+`PlanPrePanelHumanDecisionError` (exit 4) without a round record. Plan step-back
+and sweep stay prompts (`PLAN_STEP_BACK_ROUNDS`, `PLAN_SWEEP_ROUNDS`),
+replay-derived (see [review scheduling](review-scheduling.md)).
 `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`,
-`--plan-primary-stall-rounds` and `--plan-sweep-rounds` are in that table too. History export labels the stop `plan-no-progress` and keeps `plan-step-back` and `plan-primary-stall` for old comments. The
-legacy-field AST guard also covers the plan modules.
+`--plan-primary-stall-rounds` and `--plan-sweep-rounds` are in that table too.
+History export labels the stop `plan-no-progress` and keeps `plan-step-back` and
+`plan-primary-stall` for old comments. The legacy-field AST guard also covers
+the plan modules.
 
 **PR step-back turn and reviewer sweep** (a prompt technique only). The PR fix
 loop reuses the plan-phase classification (`classify_review(..., phase="pr")`:

@@ -876,3 +876,141 @@ def test_2009_patch_with_separable_assembles_canonical_safe_payload(caplog) -> N
         assembled.execution_recommendation
     )
     assert any("normalized staging_feasibility `separable` to `safe`" in r.getMessage() for r in caplog.records)
+
+
+# --- dispositions-only hold revisions and plan content identity (#2156) -----
+
+from coding_review_agent_loop.plan_assembly import (  # noqa: E402
+    PLAN_CONTENT_IDENTITY_EXCLUDED_FIELDS,
+    plan_content_identity,
+    sidecar_content_identity,
+)
+
+_HOLD_DISPOSITIONS = [
+    {"item_id": "item-1", "disposition": "blocking", "note": "Disputed: out of scope."}
+]
+
+
+def _edited_base_with_audit() -> AuthenticatedPlanState:
+    """A generation-1 base whose own per-revision matrix audit is non-empty."""
+    state = _state(_base([_row("row-a"), _row("row-b")]))
+    _, sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{
+            "op": "matrix_edit", "row_id": "row-b",
+            "row": _row("row-b", outcome="B changed."), "rationale": "Change B.",
+        }]),
+        result_round_number=5,
+    )
+    assert sidecar.canonical_json["risk_test_matrix_changes"]
+    return hydrate_authenticated_plan_state(sidecar)
+
+
+def test_hold_assembly_keeps_every_content_field_and_resets_the_audit() -> None:
+    """`hold-assemble`: zero operations keep content; only the envelope moves."""
+    base = _edited_base_with_audit()
+    assembled, sidecar = assemble_authenticated_plan_revision(
+        base,
+        _patch(base, [], prior_plan_item_dispositions=_HOLD_DISPOSITIONS),
+        result_round_number=6,
+    )
+    before = dict(base.canonical_payload)
+    after = dict(sidecar.canonical_json)
+    for field in set(before) | set(after):
+        if field not in PLAN_CONTENT_IDENTITY_EXCLUDED_FIELDS:
+            assert after.get(field) == before.get(field), field
+    assert after["plan_steps"] == before["plan_steps"]
+    assert after["risk_test_matrix"] == before["risk_test_matrix"]
+    assert after["risk_test_matrix_changes"] == []
+    assert [d.item_id for d in assembled.prior_plan_item_dispositions] == ["item-1"]
+    assert assembled.prior_plan_item_dispositions[0].note == "Disputed: out of scope."
+    # Content identity is equal; the aggregate (approval) identity may differ.
+    assert sidecar_content_identity(sidecar) == plan_content_identity(before)
+    assert sidecar.aggregate_identity != base.state_identity
+
+
+def test_first_hold_after_a_fresh_plan_state_keeps_its_content_identity() -> None:
+    """`initial-to-hold`: the kind change alone never breaks the first window."""
+    payload = _base([_row("row-a")])
+    payload["kind"] = "plan_state"
+    payload.pop("prior_plan_item_dispositions")
+    fresh = _state(payload, round_number=1)
+    fresh_sidecar = make_assembled_plan_sidecar(
+        fresh.plan, round_number=1, response_form="fresh-plan-state"
+    )
+    assert fresh_sidecar.canonical_json["kind"] == "plan_state"
+    _, hold_sidecar = assemble_authenticated_plan_revision(
+        fresh,
+        _patch(fresh, [], prior_plan_item_dispositions=_HOLD_DISPOSITIONS),
+        result_round_number=2,
+    )
+    assert hold_sidecar.canonical_json["kind"] == "plan_revision"
+    assert sidecar_content_identity(hold_sidecar) == sidecar_content_identity(fresh_sidecar)
+    # A second hold with other notes still repeats the identity.
+    second_base = hydrate_authenticated_plan_state(hold_sidecar)
+    _, second = assemble_authenticated_plan_revision(
+        second_base,
+        _patch(second_base, [], prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Still disputed."}
+        ]),
+        result_round_number=3,
+    )
+    assert sidecar_content_identity(second) == sidecar_content_identity(fresh_sidecar)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("summary", "A different summary."),
+        ("plan_steps", ["A different step."]),
+        ("external_dependencies", []),
+    ],
+)
+def test_content_identity_changes_with_any_content_field(field, value) -> None:
+    """`content-change-continues` (unit): content fields are all in the identity."""
+    base = _base([_row("row-a")])
+    changed = dict(base, **{field: value})
+    assert plan_content_identity(changed) != plan_content_identity(base)
+    matrix_changed = copy.deepcopy(base)
+    matrix_changed["risk_test_matrix"]["rows"][0]["expected_outcome"] = "Changed."
+    assert plan_content_identity(matrix_changed) != plan_content_identity(base)
+
+
+def test_content_identity_ignores_only_the_per_revision_fields() -> None:
+    base = _base([_row("row-a")])
+    varied = dict(
+        base,
+        kind="plan_state",
+        prior_plan_item_dispositions=_HOLD_DISPOSITIONS,
+        risk_test_matrix_changes=[{"operation": "change"}],
+    )
+    assert plan_content_identity(varied) == plan_content_identity(base)
+    assert PLAN_CONTENT_IDENTITY_EXCLUDED_FIELDS == frozenset({
+        "kind", "state", "schema_version", "prior_plan_item_dispositions",
+        "risk_test_matrix_changes",
+    })
+    # A distinct domain: never equal to the aggregate or rendered identities.
+    assert plan_content_identity(base) != aggregate_plan_identity(base)
+
+
+def test_legacy_full_state_revisions_with_new_dispositions_share_content_identity() -> None:
+    """Legacy full-state sidecars also observe unchanged content (#2156 note)."""
+    from agent_loop_helpers import structured_plan_revision
+    from coding_review_agent_loop.protocol import validate_structured_plan_revision
+
+    def revision(note):
+        return validate_structured_plan_revision(structured_plan_revision(
+            plan_steps=["Update the code.", "Run the relevant tests."],
+            prior_plan_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": note}
+            ],
+        ))
+
+    first = make_assembled_plan_sidecar(
+        revision("Out of scope."), round_number=2, response_form="legacy-full-state"
+    )
+    second = make_assembled_plan_sidecar(
+        revision("Still out of scope."), round_number=3, response_form="legacy-full-state"
+    )
+    assert first.aggregate_identity != second.aggregate_identity
+    assert sidecar_content_identity(first) == sidecar_content_identity(second)

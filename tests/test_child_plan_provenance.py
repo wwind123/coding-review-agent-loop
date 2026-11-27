@@ -2363,12 +2363,20 @@ def _m979_patch_with(base_plan_text, *, operations=None, extra_operations=(), su
     return json.dumps(patch) + PLAN_FOOTER
 
 
+def _m979_patch_with_non_list_operations(base_plan_text, *, summary="Patch."):
+    # #2156: an empty operations list is a valid hold, so the strict
+    # patch-schema failure fixture is a non-list operations value instead.
+    patch = json.loads(_m976_patch(base_plan_text, summary=summary).split("\n<!--", 1)[0])
+    patch["operations"] = {"op": "replace"}
+    return json.dumps(patch) + PLAN_FOOTER
+
+
 def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monkeypatch):
     """#979: a semantic patch payload rejection uses the bounded replan."""
     fresh = _m976_full_plan_state()
     # A strict patch-schema failure is a payload rejection (#979); since #2100
     # a non-carried disposition no longer is.
-    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    rejected = _m979_patch_with_non_list_operations(fresh, summary=WEAK_SUMMARY)
     corrected = _m976_patch(fresh, summary="Corrected revision.")
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh, rejected, corrected],
@@ -2388,7 +2396,7 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
     assert len(planner_prompts) == 3
     assert "Trusted orchestration correction record" not in planner_prompts[1]
     assert "Trusted orchestration correction record" in planner_prompts[2]
-    assert "operations must be a non-empty JSON array" in planner_prompts[2]
+    assert "operations must be a JSON array" in planner_prompts[2]
     # Same authenticated base binding on the replan turn.
     binding_line = re.search(r"- base_state_identity: (\S+)", planner_prompts[1]).group(0)
     assert binding_line in planner_prompts[2]
@@ -2556,7 +2564,7 @@ def test_m2100_semantic_patch_overflow_digest_keeps_ignored_ids(tmp_path, monkey
 
 def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
     fresh = _m976_full_plan_state()
-    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    rejected = _m979_patch_with_non_list_operations(fresh, summary=WEAK_SUMMARY)
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh] + [rejected] * 3,
         codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
@@ -2579,7 +2587,7 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     """No rejection class both invokes patch repair and is guaranteed to fail preservation."""
     fresh = _m976_full_plan_state()
     good = _m976_patch(fresh, summary="Good.")
-    unknown = _m979_patch_with(fresh, operations=[], summary="Bad.")
+    unknown = _m979_patch_with_non_list_operations(fresh, summary="Bad.")
     carried = (_m979_carried_item(),)
 
     def validate(text):
@@ -2618,11 +2626,11 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     assert candidate == normalized and "operations" in diagnostic
     # A strict patch-schema failure is payload-level too, even though the
     # full validator reports it as a plain parse error.
-    empty_operations = _m979_patch_with(fresh, operations=[])
-    candidate, diagnostic = classify(empty_operations)
-    assert candidate == empty_operations and "operations" in diagnostic
+    non_list_operations = _m979_patch_with_non_list_operations(fresh)
+    candidate, diagnostic = classify(non_list_operations)
+    assert candidate == non_list_operations and "operations" in diagnostic
     # ...and so is one hidden behind a missing footer.
-    candidate, diagnostic = classify(empty_operations.split("\n<!--", 1)[0])
+    candidate, diagnostic = classify(non_list_operations.split("\n<!--", 1)[0])
     assert "operations" in diagnostic
 
 
@@ -2665,7 +2673,7 @@ def test_m979_envelope_error_does_not_mask_a_payload_disposition_defect():
 @pytest.mark.parametrize(
     ("defect", "expected"),
     [
-        ("empty-operations", "operations"),
+        ("non-list-operations", "operations"),
         ("missing-kind", "kind mismatch"),
         ("misspelled-kind", "kind mismatch"),
     ],
@@ -2675,8 +2683,8 @@ def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
 ):
     """#979 item: a parse-level payload error uses the bounded replan."""
     fresh = _m976_full_plan_state()
-    if defect == "empty-operations":
-        rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    if defect == "non-list-operations":
+        rejected = _m979_patch_with_non_list_operations(fresh, summary=WEAK_SUMMARY)
     else:
         payload = json.loads(
             _m976_patch(fresh, summary=WEAK_SUMMARY).split("\n<!--", 1)[0]

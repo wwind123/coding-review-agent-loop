@@ -602,6 +602,10 @@ class PlanRevisionDescriptor:
     sidecar_bound: bool = True
     operation_fields: tuple[str, ...] = ()
     matrix_operations: tuple[str, ...] = ()
+    # True only when the caller observed the authenticated patch's operation
+    # set, so an empty set is a real dispositions-only hold (#2156) rather
+    # than a defaulted value.
+    operations_observed: bool = False
 
     def __post_init__(self) -> None:
         for name in ("operation_fields", "matrix_operations"):
@@ -911,10 +915,18 @@ def classify_plan_transition(
             "broad", f"cross-cutting plan contract(s) changed: {', '.join(rendered)}"
         )
     if not revision.operation_fields and not revision.matrix_operations:
-        # An authenticated patch always carries at least one operation, so an
-        # empty operation set means the caller did not observe it.  A defaulted
-        # value is not evidence: without the operation set there is nothing to
-        # check against the narrow field and matrix-operation allowances.
+        if revision.operations_observed:
+            # A dispositions-only hold (#2156) changes no plan content, but it
+            # carries the planner's dispute notes, so reviewers re-read it in
+            # full rather than taking a narrow shortcut.
+            return PlanTransitionClassification(
+                "broad",
+                "the revision is a dispositions-only hold with no patch "
+                "operations; a hold gets a full re-review of the planner's notes",
+            )
+        # Without an observed operation set, an empty set is a defaulted
+        # value, not evidence: there is nothing to check against the narrow
+        # field and matrix-operation allowances.
         return PlanTransitionClassification(
             "broad",
             "the candidate plan key changed but the revision reports no "

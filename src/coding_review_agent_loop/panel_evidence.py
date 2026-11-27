@@ -1452,4 +1452,5 @@ def _plan_revision_descriptor(
         sidecar_bound=True,
         operation_fields=fields,
         matrix_operations=matrix_ops,
+        operations_observed=isinstance(operations, (tuple, list)),
     )
