@@ -10433,6 +10433,14 @@ complete list. The bounded plan digest shows only the count. The dropped
 entries are also removed from the stored response text, so resume and
 publication see the same dispositions as live validation.
 
+The visible-defects review (`--review-images-*`) follows the same rule: it must
+still give an explicit disposition to every assigned visual finding, but an
+extra disposition for an ID it was not assigned is dropped and named in the
+same note instead of rejecting the visual review (#2113). A disposition repeated
+with identical entries is kept once; a carried item disposed twice with
+different entries (even only a different note) is still rejected as conflicting
+(#2117).
+
 `--repair-backend`, `--repair-model`, `--repair-reasoning-effort`,
 `--repair-timeout-seconds` and `--containment-repair-*` were removed in #2162
 after one release as no-ops. Passing one is a startup error (exit 2) that says

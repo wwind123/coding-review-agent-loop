@@ -333,8 +333,15 @@ degradations therefore exist only for kept entries, with indices into the
 filtered array. The verdict-consistency check sees only kept entries, so an
 approval whose only active disposition names a non-carried ID is accepted.
 There is no count or length bound, so non-carried IDs alone never cause a
-rejection, re-ask or bounded replan. Duplicate carried IDs are rejected by all
-four validators; for a semantic patch that is a payload rejection.
+rejection, re-ask or bounded replan. Repeats of a carried ID that are equal on
+every parsed field collapse to one entry at parse time (#2114), so a harmless
+repeat never rejects; only conflicting repeats of a carried ID (entries that
+differ in some parsed field, including only the note) are rejected by all four
+validators, and for a semantic patch that is a payload rejection (#2117). The
+visible-defects validator (`review_images.validate_visual`) applies the same
+drop rule with the assigned visual findings as its carried set, still requires
+an explicit disposition for every assigned finding, and records the dropped IDs
+on the visual round like other reviews (#2113).
 Missing dispositions keep their semantics: reviewers still fail on a missing
 carried disposition, and plan candidates, which never had a completeness check,
 gain none. The dropped IDs travel on the parsed result

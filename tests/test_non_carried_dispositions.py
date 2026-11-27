@@ -343,6 +343,52 @@ def test_duplicates_split_between_dropped_and_rejected(kind):
     assert dispositions is not None and [item.item_id for item in dispositions] == ["item-1"]
 
 
+def _kept_dispositions(parsed):
+    dispositions = getattr(parsed, "dispositions", None)
+    if dispositions is None:
+        dispositions = getattr(parsed, "prior_plan_item_dispositions", None)
+    assert dispositions is not None
+    return dispositions
+
+
+@pytest.mark.parametrize("kind", sorted(_DUPLICATE_VALIDATORS))
+def test_equal_repeats_collapse_and_only_conflicting_repeats_reject(kind):
+    """#2117: identical repeats never reject; only a conflicting repeat does."""
+    validate = _DUPLICATE_VALIDATORS[kind]
+    carried = (_item("item-1"),)
+    # (a) Three fully equal repeats collapse to one kept disposition.
+    collapsed = validate(_resolved("item-1", "item-1", "item-1"), carried)
+    kept = _kept_dispositions(collapsed)
+    assert [(d.item_id, d.disposition, d.note) for d in kept] == [("item-1", "resolved", "Done.")]
+    # (b) Same disposition value, different note: still conflicting.  Plan
+    # candidates name the conflict; reviewer messages are unchanged.
+    expected = ("conflicting dispositions more than once: item-1"
+                if kind.startswith("plan_revision") else "more than once: item-1")
+    with pytest.raises(AgentLoopError, match=expected):
+        validate(_conflicting("item-1"), carried)
+    # Differing disposition values conflict too.
+    with pytest.raises(AgentLoopError, match="more than once: item-1"):
+        validate(
+            [*_resolved("item-1"), {"item_id": "item-1", "disposition": "blocking", "note": "Done."}],
+            carried,
+        )
+    # (c) A conflicting carried repeat mixed with a non-carried extra rejects
+    # for the conflict only, never for the extra.
+    with pytest.raises(AgentLoopError) as excinfo:
+        validate([*_conflicting("item-1"), *_resolved("item-9")], carried)
+    assert "more than once: item-1" in str(excinfo.value)
+    assert "item-9" not in str(excinfo.value)
+
+
+def test_equal_patch_repeat_is_accepted_without_payload_rejection():
+    """#2117: an equal semantic-patch repeat raises nothing (no bounded replan)."""
+    carried = (_item("item-1"),)
+    for validate in (_DUPLICATE_VALIDATORS["plan_revision_patch_payload"],
+                     _DUPLICATE_VALIDATORS["plan_revision_patch"]):
+        parsed = validate(_resolved("item-1", "item-1"), carried)
+        assert [d.item_id for d in parsed.prior_plan_item_dispositions] == ["item-1"]
+
+
 def test_duplicate_carried_patch_disposition_is_a_payload_rejection():
     from coding_review_agent_loop.errors import SemanticPatchPayloadRejection
 
