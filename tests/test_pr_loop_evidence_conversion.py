@@ -3371,6 +3371,9 @@ def test_an_in_process_conversion_after_a_release_resume_reviews_the_repeat(tmp_
     if not convert:
         assert _launches(runner) == launches
         assert not any(r.index >= before and r.metadata.role == "reviewer" for r in _records(runner))
+        # The release resume stays reconciled: no repeat summary is posted either.
+        assert not any(r.index >= before and r.metadata.phase in {"reconciliation", "evidence-conversion"}
+                       for r in _records(runner))
         return
     conversion = _conversion(runner)
     assert conversion.index >= before
