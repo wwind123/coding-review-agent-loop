@@ -967,22 +967,30 @@ def test_qualification_board_check_keeps_a_misplaced_amendment_stop_at_exit_4(mo
 # ---------------------------------------------------------------------------
 
 # Handlers that turn a caught error into a fallback result and that the
-# resolved call graph can reach a stop through.  Each stays as it was for a
-# stated reason and is tracked as follow-up; a new entry needs a new reason.
+# resolved call graph can reach a stop through.  A new entry needs a new reason.
+#
+# Review outcome (#2076): the agent-turn failure policies (discuss, plan and PR
+# reviewer seats, visual coverage gate, triage) were listed only because
+# review_images_coverage_history.report() left its prefix reduce_history() call
+# unshielded.  That call cannot raise once the full pass admitted the history,
+# and report() now shields it like the full pass, so no stop reaches those
+# per-seat handlers and they are no longer allow-listed.  Any future stop path
+# into them fails this guard instead of being silently accepted.  The entries
+# below only compute hint or template text; the authoritative stop is raised on
+# a separate path, so degrading here cannot hide it.
 KNOWN_TRANSPORT_FALLBACKS = {
-    "discuss_loop:_run_discuss_analyzer": "discuss analyzer turn failure keeps its degraded outcome",
-    "discuss_loop:_run_discuss_final_analyzer": "discuss final analyzer turn failure keeps its degraded outcome",
-    "discuss_loop:_run_discuss_evidence_reconciler": "discuss evidence reconciler turn failure policy",
-    "discuss_loop:_debater_worker": "discuss debater failure policy records the failed seat",
-    "discuss_loop:_run_discuss_loop": "discuss debater failure policy records the failed seat",
-    "plan_first_loop:_plan_reviewer_worker": "plan reviewer turn failure is recorded per seat",
-    "pr_loop:_pr_reviewer_worker": "PR reviewer turn failure is recorded per seat",
-    "review_images_coverage_run:gate": "visual coverage turn degrades to unavailable evidence",
-    "triage:run_issue_triage": "advisory triage turn",
-    "discuss_loop:_run_discuss_semantic_finalization": "discuss semantic finalization turn failure keeps its degraded outcome",
-    "child_plan_binding:_fresh_child_resume_command": "advisory resume-command hint; the real failure is raised elsewhere",
-    "pr_loop_support:_pr_amendment_plan_board_hint": "advisory rerun hint text only",
-    "review_rounds:_unavailable_reviewer_amendment_advisory": "advisory amendment template; the stop stays authoritative",
+    "child_plan_binding:_fresh_child_resume_command": (
+        "pure, non-raising resume-command hint; the provenance stop is raised by "
+        "execution_policy on the caller's main path"
+    ),
+    "pr_loop_support:_pr_amendment_plan_board_hint": (
+        "chooses rerun hint text only; collect_reviewer_board_amendments raises the "
+        "stop authoritatively in pr_board_state (exit-4 qualification board test)"
+    ),
+    "review_rounds:_unavailable_reviewer_amendment_advisory": (
+        "renders a dry-run amendment template only; the signed amendment path calls "
+        "amend_contract and raises the stop on its own"
+    ),
 }
 
 
