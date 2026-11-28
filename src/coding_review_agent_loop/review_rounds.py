@@ -9,8 +9,8 @@ from __future__ import annotations
 import contextvars
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName
@@ -1151,6 +1151,19 @@ def _same_round_replay_or_invoke(
     )
 
 
+def _is_worker_exception(exc: BaseException, futures: Iterable[Future[object]]) -> bool:
+    """True when ``exc`` is the exception stored on a completed worker future.
+
+    ``future.result()`` re-raises that exact object, so identity separates a
+    worker's own failure from a caller-side exception (#1816), including one
+    that lands while the caller reads a successful future's result.
+    """
+    return any(
+        future.done() and not future.cancelled() and future.exception() is exc
+        for future in futures
+    )
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
@@ -1286,6 +1299,7 @@ def _launch_reviewer_turns(
             max_workers=min(len(to_launch), max_workers or len(to_launch)),
             thread_name_prefix=thread_name_prefix,
         )
+        futures: dict[Future[_ReviewerTurnResult], AgentName] = {}
         try:
             # copy_context: reviewer threads must see the run owner (Antigravity quota memory).
             futures = {
@@ -1302,10 +1316,14 @@ def _launch_reviewer_turns(
                 )
                 for future in done:
                     results[futures[future]] = future.result()
-        except KeyboardInterrupt:
-            # Wake workers sleeping out a quota reset before the shutdown join (#1601).
-            quota_wait.cancel_active_waits()
-            runner.terminate_active_processes()
+        except BaseException as exc:
+            # Wake workers sleeping out a quota reset before the shutdown join
+            # (#1601) on any caller-side exception, not only SIGINT (#1816).  A
+            # worker's own exception re-raised by ``future.result()`` keeps the
+            # no-wake behaviour so sibling reviewers still finish.
+            if isinstance(exc, KeyboardInterrupt) or not _is_worker_exception(exc, futures):
+                quota_wait.cancel_active_waits()
+                runner.terminate_active_processes()
             raise
         finally:
             executor.shutdown(wait=True, cancel_futures=True)

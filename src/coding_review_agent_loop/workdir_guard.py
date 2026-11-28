@@ -650,16 +650,8 @@ def _clause_redirect_kinds(clause: _Clause) -> tuple[RedirectKind, ...]:
 
 
 def _tokenize(text: str) -> list[str]:
-    try:
-        # ``shlex.split`` only separates operators surrounded by whitespace.
-        # A shell does not impose that restriction, so use punctuation-aware
-        # lexing to keep adjacent commands from hiding in an argument token.
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        return text.split()
+    tokens = _strict_tokenize(text)
+    return tokens if tokens is not None else text.split()
 
 
 _SHELL_WHITESPACE = " \t\r\n"
@@ -669,7 +661,11 @@ _FD_DUP_TARGET_RE = re.compile(r"\d+|-")
 
 
 def _strict_tokenize(text: str) -> list[str] | None:
+    """The single shlex configuration; ``None`` for unlexable text (#2137)."""
     try:
+        # ``shlex.split`` only separates operators surrounded by whitespace.
+        # A shell does not impose that restriction, so use punctuation-aware
+        # lexing to keep adjacent commands from hiding in an argument token.
         lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
         lexer.whitespace_split = True
         lexer.commenters = ""

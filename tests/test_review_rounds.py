@@ -631,7 +631,17 @@ def test_evidence_approval_normalizer_preserves_real_blockers_and_requests(mixed
         assert items[0].status == "blocking" and items[0].lifecycle == "evidence_deferred"
 
 
-@pytest.mark.parametrize('outcome', ['success', 'exception', 'interrupt'])
+class _CallerFailed(BaseException):
+    """Non-KeyboardInterrupt caller exception, like pytest-timeout's ``Failed`` (#1816)."""
+
+
+def _raise_caller_failed(*args, **kwargs):
+    raise _CallerFailed('caller timed out')
+
+
+@pytest.mark.parametrize('outcome', [
+    'success', 'exception', 'interrupt', 'caller-exception', 'caller-exception-during-result',
+])
 def test_reviewer_executor_polls_and_consumes_completions_once(monkeypatch, outcome):
     from concurrent.futures import FIRST_COMPLETED
     from agent_loop_helpers import FakeRunner
@@ -649,7 +659,12 @@ def test_reviewer_executor_polls_and_consumes_completions_once(monkeypatch, outc
         if len(polls) == 3:
             if outcome == 'interrupt':
                 raise KeyboardInterrupt
+            if outcome == 'caller-exception':
+                raise _CallerFailed('caller timed out')
             executor.complete(1, error=ValueError('worker failed') if outcome == 'exception' else None)
+            if outcome == 'caller-exception-during-result':
+                # The caller is interrupted while reading a successful result.
+                executor.futures[1].result = _raise_caller_failed
             return {executor.futures[1]}, {executor.futures[0]}
         assert executor.consumed == ['gemini']
         assert set(pending) == {executor.futures[0]}
@@ -672,12 +687,32 @@ def test_reviewer_executor_polls_and_consumes_completions_once(monkeypatch, outc
         assert list(results) == ['gemini', 'codex']
         assert executor.consumed == ['gemini', 'codex']
         assert len(polls) == 4
+    elif outcome in ('caller-exception', 'caller-exception-during-result'):
+        with pytest.raises(_CallerFailed):
+            launch()
+        assert terminated == [True]
+        assert executor.consumed == []
+        assert executor.futures[0].done() is False
     else:
         with pytest.raises(KeyboardInterrupt if outcome == 'interrupt' else ValueError):
             launch()
         assert terminated == ([True] if outcome == 'interrupt' else [])
         assert executor.consumed == ([] if outcome == 'interrupt' else ['gemini'])
     assert executor.shutdown_calls == [{'wait': True, 'cancel_futures': True}]
+
+
+def test_is_worker_exception_matches_only_a_stored_future_exception():
+    from concurrent.futures import Future
+    stored = ValueError('worker failed')
+    failed, succeeded, pending, cancelled = Future(), Future(), Future(), Future()
+    failed.set_exception(stored)
+    succeeded.set_result(None)
+    cancelled.cancel()
+    futures = [cancelled, pending, succeeded, failed]
+    assert review_rounds._is_worker_exception(stored, futures)
+    assert not review_rounds._is_worker_exception(ValueError('worker failed'), futures)
+    assert not review_rounds._is_worker_exception(_CallerFailed(), futures)
+    assert not review_rounds._is_worker_exception(stored, [])
 
 
 # --- #2064 stage 2: round-wide closure decision and defensive signals -------------

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import sys
 
 import pytest
 
@@ -802,6 +803,35 @@ def test_int_like_helper():
     assert _expect_int_like("#5", context="ctx") == 5
     with pytest.raises(AgentLoopError, match="ctx must be an integer"):
         _expect_int_like("five", context="ctx")
+
+
+def _overlong_digits() -> tuple[str, int]:
+    """A digit string longer than the int-conversion limit, and the limit to restore."""
+    original = sys.get_int_max_str_digits()
+    if original == 0:
+        sys.set_int_max_str_digits(640)  # values 1..639 are rejected
+    return "9" * (sys.get_int_max_str_digits() + 1), original
+
+
+@pytest.mark.parametrize("prefix", ["", "#", " #"])
+def test_int_like_helper_rejects_overlong_digit_string(prefix, caplog):
+    digits, original = _overlong_digits()
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            with pytest.raises(AgentLoopError, match="ctx must be an integer"):
+                _expect_int_like(prefix + digits, context="ctx")
+        assert "converted digit string" not in caplog.text
+    finally:
+        sys.set_int_max_str_digits(original)
+
+
+def test_issue_implementation_pr_number_overlong_digit_string():
+    digits, original = _overlong_digits()
+    try:
+        with pytest.raises(AgentLoopError, match="pr_number must be"):
+            _parse_impl(_issue_impl(pr_number=digits))
+    finally:
+        sys.set_int_max_str_digits(original)
 
 
 def test_task_result_pr_number_digit_string():

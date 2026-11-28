@@ -4096,7 +4096,17 @@ def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
     assert _discuss_subject(context(spilled)) == _discuss_subject(context())
 
 
-@pytest.mark.parametrize('outcome', ['success', 'exception', 'interrupt'])
+class _CallerFailed(BaseException):
+    """Non-KeyboardInterrupt caller exception, like pytest-timeout's ``Failed`` (#1816)."""
+
+
+def _raise_caller_failed(*args, **kwargs):
+    raise _CallerFailed('caller timed out')
+
+
+@pytest.mark.parametrize('outcome', [
+    'success', 'exception', 'interrupt', 'caller-exception', 'caller-exception-during-result',
+])
 def test_discuss_executor_polls_with_barrier_and_configured_order(tmp_path, monkeypatch, outcome):
     from concurrent.futures import ALL_COMPLETED
     from types import SimpleNamespace
@@ -4118,9 +4128,14 @@ def test_discuss_executor_polls_with_barrier_and_configured_order(tmp_path, monk
         if len(polls) == 3:
             if outcome == 'interrupt':
                 raise KeyboardInterrupt
+            if outcome == 'caller-exception':
+                raise _CallerFailed('caller timed out')
             executor.complete(1)
             return SimpleNamespace(not_done={executor.futures[0]})
         executor.complete(0, error=ValueError('worker failed') if outcome == 'exception' else None)
+        if outcome == 'caller-exception-during-result':
+            # The caller is interrupted while reading a successful result.
+            executor.futures[0].result = _raise_caller_failed
         return SimpleNamespace(not_done=set())
     monkeypatch.setattr(discuss_loop, 'wait', wait)
     terminated = []
@@ -4135,6 +4150,12 @@ def test_discuss_executor_polls_with_barrier_and_configured_order(tmp_path, monk
         assert 'Codex position' in runner.comments[0]
         assert 'Gemini position' in runner.comments[1]
         assert len(polls) == 4
+    elif outcome in ('caller-exception', 'caller-exception-during-result'):
+        with pytest.raises(_CallerFailed):
+            run_discuss_loop(runner, issue_number=56, config=config)
+        assert runner.comments == []
+        assert terminated == [True]
+        assert executor.consumed == []
     else:
         with pytest.raises(KeyboardInterrupt if outcome == 'interrupt' else ValueError):
             run_discuss_loop(runner, issue_number=56, config=config)
