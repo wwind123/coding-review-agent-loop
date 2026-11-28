@@ -473,6 +473,17 @@ class HumanEvidenceRun:
             if event is not None and event[1] == "request" and event[0] < at:
                 self.events[key] = (at, "withdraw")
 
+    def _seed_listed_requests(self, checks: Sequence["HumanCheck"], index: int) -> None:
+        """Count the authoritative record's native checks as requested at its index (#2198).
+
+        Only a key with no earlier event gets one, so a recorded request or
+        withdrawal is never overridden and a later withdrawal can be replayed.
+        """
+        at = (index, 1)
+        for check in checks:
+            if check.kind == "native":
+                self.events.setdefault((display_id(check.identity), check.reviewer), (at, "request"))
+
     def withdraw(
         self, reviewer: str, display_ids: Sequence[str], *, round_number: int, position: int | None = None
     ) -> tuple[str, ...]:
@@ -514,29 +525,36 @@ class HumanEvidenceRun:
         request by the same reviewer re-admits it.  The result is applied to
         the seeded list before the mode branch and to every later
         normalization, so a withdrawn check is neither restored nor replayed
-        back.
+        back.  A native check listed on the authoritative record also counts
+        as requested at that record's index when its key has no earlier event
+        (#2198), so its requester's later recorded withdrawal is honoured even
+        without an ``evidence_requests`` entry.
         """
+        candidates = [
+            record for record in pr_records if getattr(record.metadata, "agent", None) == "Orchestrator"
+        ] + list(check_records)
+        latest = max(candidates, key=lambda record: record.index) if candidates else None
+        listed = tuple(filter(None, map(HumanCheck.from_mapping, latest.metadata.human_checks))) if latest else ()
+        pending = latest is not None
         for record in sorted(pr_records, key=lambda record: record.index):
             metadata = record.metadata
             reviewer = getattr(metadata, "agent", None)
             if reviewer == "Orchestrator" or not isinstance(reviewer, str):
                 continue
+            if pending and record.index > latest.index:
+                self._seed_listed_requests(listed, latest.index)
+                pending = False
             self._replay_withdrawals(reviewer, getattr(metadata, "withdrawn_human_checks", ()) or (), record.index)
             self.requested(reviewer, getattr(metadata, "evidence_requests", ()) or (), position=record.index)
+        if pending:
+            self._seed_listed_requests(listed, latest.index)
         for record in check_records:
             metadata = record.metadata
             decoded = [HumanCheck.from_mapping(entry) for entry in metadata.human_checks]
             self.posted.add((metadata.subject, tuple(sorted(c.identity for c in decoded if c))))
-        candidates = [
-            record for record in pr_records if getattr(record.metadata, "agent", None) == "Orchestrator"
-        ] + list(check_records)
-        if not candidates:
+        if latest is None:
             return
-        latest = max(candidates, key=lambda record: record.index)
-        checks = tuple(
-            check for check in map(HumanCheck.from_mapping, latest.metadata.human_checks)
-            if check and not self._tombstoned(check.origin_item)
-        )
+        checks = tuple(check for check in listed if not self._tombstoned(check.origin_item))
         if self.freeze:
             self.checks, self.restore_pending = checks, bool(checks)
         elif self.advisory:

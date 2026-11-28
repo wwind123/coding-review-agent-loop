@@ -533,3 +533,51 @@ def test_withdrawal_and_request_events_apply_in_record_order(tmp_path, mode, cas
         assert replayed == [] and [c.text for c in run.checks] == ([] if withdrawn else [check.text])
     else:
         assert [i.text for i in replayed] == ([] if withdrawn else [check.text])
+
+
+def _requestless_native():
+    """A native check whose identity no ``evidence_requests`` text maps to (#2198)."""
+    return dataclasses.replace(_native(), obligation_identity="minted-post-merge-obligation")
+
+
+@pytest.mark.parametrize("mode", ["advisory", "freeze"])
+@pytest.mark.parametrize("listed_on", ["orchestrator", "human-checks"])
+@pytest.mark.parametrize("withdrawal_at, withdrawer, withdrawn", [
+    (6, "Codex", True),    # the requester withdrew after the authoritative listing
+    (3, "Codex", False),   # recorded before the listing that still shows it: not applied live
+    (6, "Claude", False),  # another reviewer cannot withdraw Codex's check
+])
+def test_requestless_check_withdrawn_after_the_seeded_record_stays_withdrawn_on_resume(
+    tmp_path, mode, listed_on, withdrawal_at, withdrawer, withdrawn
+):
+    """#2198: the authoritative listing counts as the request a replayed withdrawal needs."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.human_evidence_mode import display_id
+    from coding_review_agent_loop.unresolved_items import evidence_obligation_identity
+
+    item = _requestless_native()
+    check = _check(item)
+    wanted = display_id(check.identity)
+    assert wanted != display_id(evidence_obligation_identity(check.text, "Codex"))
+    reviewer = SimpleNamespace(index=2, metadata=SimpleNamespace(
+        agent="Codex", subject=HEAD, round_number=1, evidence_requests=(), withdrawn_human_checks=()))
+    listed = SimpleNamespace(index=4, metadata=SimpleNamespace(
+        agent="Orchestrator", subject=HEAD, round_number=1, human_checks=(check.as_dict(),)))
+    withdrawal = SimpleNamespace(index=withdrawal_at, metadata=SimpleNamespace(
+        agent=withdrawer, subject=HEAD, round_number=2, evidence_requests=(), withdrawn_human_checks=(wanted,)))
+    pr_records = [withdrawal, reviewer]
+    check_records = []
+    if listed_on == "orchestrator":
+        pr_records.append(listed)
+    else:
+        check_records.append(listed)
+    run = HumanEvidenceRun(make_config(tmp_path, pr_human_evidence=mode), 77)
+    run.seed(pr_records, check_records)
+    assert ((wanted, "Codex") in run.tombstones) is withdrawn
+    assert (wanted, "Claude") not in run.tombstones
+    assert [c.identity for c in run.checks] == ([] if withdrawn else [check.identity])
+    if mode == "freeze":
+        assert run.restore_pending is not withdrawn
+        first = run.normalize([item], round_number=3, head_sha=HEAD)
+        second = run.normalize(first, round_number=3, head_sha=HEAD)
+        assert [i.text for i in second] == ([] if withdrawn else [check.text])
