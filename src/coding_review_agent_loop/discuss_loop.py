@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName
@@ -126,7 +126,7 @@ from .validated_agent import (
     _persist_usage_summary,
     _run_validated_agent,
 )
-from .review_rounds import _ensure_parallel_discuss_workdirs
+from .review_rounds import _ensure_parallel_discuss_workdirs, _is_worker_exception
 
 
 DISCUSS_CONSENSUS_MARKER_RE = re.compile(
@@ -1896,6 +1896,7 @@ def _run_discuss_loop(
             executor = ThreadPoolExecutor(
                 max_workers=len(pending), thread_name_prefix=f"discuss-r{round_number}"
             )
+            futures: dict[str, Future[_DiscussDebaterTurnResult]] = {}
             try:
                 futures = {
                     agent_display_name(reviewer): executor.submit(
@@ -1912,13 +1913,18 @@ def _run_discuss_loop(
                 while wait(futures.values(), timeout=quota_wait.QUOTA_WAIT_SLICE_SECONDS).not_done:
                     pass
                 turn_results = {name: future.result() for name, future in futures.items()}
-            except KeyboardInterrupt:
+            except BaseException as exc:
                 # Workers never receive the terminal SIGINT; kill their agent
                 # process groups so their wait loops return and the shutdown
                 # below completes promptly, then propagate the interrupt.  A
                 # worker sleeping out a quota reset is woken the same way (#1601).
-                quota_wait.cancel_active_waits()
-                runner.terminate_active_processes()
+                # Any caller-side exception wakes them too (#1816); a worker's
+                # own exception re-raised by ``future.result()`` does not.
+                if isinstance(exc, KeyboardInterrupt) or not _is_worker_exception(
+                    exc, futures.values()
+                ):
+                    quota_wait.cancel_active_waits()
+                    runner.terminate_active_processes()
                 raise
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)

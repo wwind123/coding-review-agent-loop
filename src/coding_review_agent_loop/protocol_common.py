@@ -490,12 +490,16 @@ def _expect_int_like(value: object, *, context: str) -> int:
     """An integer, or a lossless digit string such as ``"77"`` or ``"#77"`` (#2109).
 
     Booleans, signs, decimals and any other text still raise the integer
-    error; range rules (positive, non-null) stay with the caller.
+    error; range rules (positive, non-null) stay with the caller.  A digit
+    string too long for ``int()`` also gets the integer error (#2123).
     """
     if isinstance(value, str):
         match = _INT_LIKE_STRING_RE.fullmatch(value)
         if match is not None:
-            converted = int(match.group(1))
+            try:
+                converted = int(match.group(1))
+            except ValueError:
+                return _expect_int(value, context=context)
             _logger.warning("%s: converted digit string to integer %d", context, converted)
             return converted
     return _expect_int(value, context=context)

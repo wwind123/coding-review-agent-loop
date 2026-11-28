@@ -2315,3 +2315,23 @@ def test_join_preserving_redirects_round_trips(text):
 
 def test_annotated_tokens_falls_back_on_unlexable_text():
     assert workdir_guard._annotated_tokens("pytest 'unterminated") is None
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("git status", ["git", "status"]),
+    ("a&&b", ["a", "&&", "b"]),
+    ("x;y", ["x", ";", "y"]),
+    ("a|b", ["a", "|", "b"]),
+    ("echo 'one two' \"three four\"", ["echo", "one two", "three four"]),
+    ("cmd > out.txt 2>&1", ["cmd", ">", "out.txt", "2>", "&", "1"]),
+    ("echo # not a comment", ["echo", "#", "not", "a", "comment"]),
+    ("echo 'oops", ["echo", "'oops"]),
+])
+def test_tokenize_delegates_to_strict_tokenize(text, expected):
+    """One shlex configuration (#2137): results are unchanged, with the split fallback."""
+    assert workdir_guard._tokenize(text) == expected
+    strict = workdir_guard._strict_tokenize(text)
+    if strict is None:
+        assert workdir_guard._tokenize(text) == text.split()
+    else:
+        assert workdir_guard._tokenize(text) == strict
