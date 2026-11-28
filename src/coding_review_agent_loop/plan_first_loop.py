@@ -142,7 +142,7 @@ from .comment_rendering import (
     render_canonical_plan_state,
 )
 from .config import phased_delivery_guard_active
-from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement, plan_failed_seat_retry_state
+from .failed_seats import describe_failed_seats, failed_seat_continuation_allowed, failure_category, finalization_wording, force_select_failed_seats, peer_blocked_settlement, pending_failed_seat_retries, plan_failed_seat_retry_state
 from .round_metadata import (
     bound_failed_reviewer_seats,
     reset_plan_board_stamp,
@@ -2434,10 +2434,18 @@ def _run_plan_first_loop_body(
                     name == plan_primary_name or plan_panel_evidence.opened
                 ),
             )
-            if plan_force_reinvoke_seats and plan_scheduler_decision is not None:
-                # A failed seat of a continued round is invoked again (#2129).
+            if plan_scheduler_decision is not None and (
+                # A failed seat of a continued round is invoked again (#2129),
+                # rebuilt from the latest reconciliation record after a
+                # restart (#2140), as the PR loop does.
+                plan_force_reinvoke_seats := (
+                    plan_force_reinvoke_seats | pending_failed_seat_retries(plan_records)
+                ) & set(plan_reviewer_names)
+            ):
                 plan_scheduler_decision = force_select_failed_seats(
                     plan_scheduler_decision, plan_force_reinvoke_seats, plan_reviewer_names)
+                log(config, f"Planning round {round_number}: re-invoking failed seat(s) "
+                            f"{', '.join(sorted(plan_force_reinvoke_seats))}")
             plan_force_reinvoke_seats = set()
             plan_selected_names = set(plan_scheduler_decision.selected_reviewers) if plan_scheduler_decision else set()
             round_reviewers = tuple(

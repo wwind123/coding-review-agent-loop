@@ -23,3 +23,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-11-24: The primary-phase stall stop, the plan step-back escalation stop and the step-back deferral checkpoint are removed. The plan step-back episode is replay-derived from review records, `--plan-reset-stall-streak` now restarts the no-progress window and is stamped and decoded in any staged phase (#2098).
 
 - 2026-11-25: `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds` and `--plan-sweep-rounds` are removed after their one-release window and are now startup errors naming `--no-progress-rounds`; `--plan-sweep-reasoning-effort` stays live (#2162, #2098).
+
+- 2026-11-27: A staged-plan restart now rebuilds the pending failed-seat retry from the latest reconciliation record, as a PR restart does, so a failed secondary seat is force-selected in the next round instead of staying paused (#2140).
