@@ -1038,3 +1038,118 @@ def test_staged_paused_primary_approval_cannot_clear_a_failed_seat_item(tmp_path
     assert not any(item_id == "item-1" for item_id, _r, _d in recorded)  # and frozen for Gemini
     ledger = {item.item_id: item for item in settled[-1]}
     assert ledger["item-1"].status == "same-plan" and ledger["item-1"].reviewer == "Gemini"
+
+
+
+
+def _staged_plan_revision(*item_ids):
+    """The staged fixture's revision patch, resolving only ``item_ids``."""
+    _fresh, patch_text = _staged_plan_fixtures()
+    payload = json.loads(patch_text.split("\n", 1)[0])
+    payload["prior_plan_item_dispositions"] = [
+        entry for entry in payload["prior_plan_item_dispositions"] if entry["item_id"] in item_ids
+    ]
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _staged_restart_first_run(tmp_path):
+    """Primary-then-panel: Codex (primary) approves round 1; round 2 is a
+    parallel panel round in which Gemini blocks and Antigravity fails. The
+    first process stops at the planner turn (no scripted answer)."""
+    fresh, _patch = _staged_plan_fixtures()
+    runner = FakeRunner(
+        claude_outputs=[fresh],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="blocking", reviewer=GEMINI, summary="Owner missing.",
+                                               same_plan_followups=["Name the rollout owner."])],
+        antigravity_outputs=[_unavailable("Google Antigravity")],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", max_rounds=8, review_parallel=True,
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    records = _plan_records(runner)
+    assert _reconciliation(records, 2).failed_reviewer_seats == ("Antigravity",)
+    # Round 2's reviewer publication precedes its reconciliation record, so
+    # plan_failed_seat_retry_state does not retry round 2 on the rerun.
+    assert [r.phase for r in records if r.round_number == 2][-2:] == ["publication", "reconciliation"]
+    assert not any(r.round_number == 3 for r in records)
+    return runner, config
+
+
+def _capture_force_selection(monkeypatch, runner):
+    """Record (latest posted round, decision, seats) for every plan force-selection."""
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    calls = []
+    real = plan_first_loop.force_select_failed_seats
+
+    def spy(decision, seats, required):
+        latest_round = max(r.round_number for r in _plan_records(runner))
+        calls.append((latest_round, decision, frozenset(seats)))
+        return real(decision, seats, required)
+
+    monkeypatch.setattr(plan_first_loop, "force_select_failed_seats", spy)
+    return calls
+
+
+def _round_prelaunch(runner, round_number):
+    return [r for r in _plan_records(runner)
+            if r.round_number == round_number and r.phase == "scheduler-prelaunch"][-1]
+
+
+def test_plan_restart_reconstructs_a_pending_failed_seat_retry(tmp_path, monkeypatch):
+    """Rows plan-restart-forces-failed-seat and plan-restart-retry-already-done (#2140).
+
+    A fresh process has no in-memory retry set. The round-3 scheduler would
+    pause Antigravity (it owns no item and is not the primary), so it is
+    selected only because the pending retry is rebuilt from round 2's
+    reconciliation record. Once it has reviewed, round 4 does not force it.
+    """
+    from coding_review_agent_loop.failed_seats import FAILED_SEAT_SCHEDULER_REASON
+
+    runner, config = _staged_restart_first_run(tmp_path)
+    forced = _capture_force_selection(monkeypatch, runner)
+    item_1 = [{"item_id": "item-1", "disposition": "resolved"}]
+    item_2 = [{"item_id": "item-2", "disposition": "resolved"}]
+    # Round 3: Gemini resolves item-1 and raises item-2; Antigravity approves.
+    runner.gemini_outputs.append(structured_plan_review(
+        state="blocking", reviewer=GEMINI, summary="Rollback missing.", prior_plan_item_dispositions=item_1,
+        same_plan_followups=["Name the rollback."]))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="Google Antigravity", prior_plan_item_dispositions=item_1))
+    # Round 4: the planner resolves item-2 and every remaining seat approves.
+    runner.claude_outputs.append(_staged_plan_revision("item-2"))
+    runner.codex_outputs.append(structured_plan_review(state="approved", prior_plan_item_dispositions=item_2))
+    runner.gemini_outputs.append(structured_plan_review(
+        state="approved", reviewer=GEMINI, prior_plan_item_dispositions=item_2))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="Google Antigravity", prior_plan_item_dispositions=item_2))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _plan_records(runner)
+    # Round 3's prelaunch record (not round 2's) selects the failed seat
+    # with the failed-seat reason.
+    prelaunch = _round_prelaunch(runner, 3)
+    assert "Antigravity" in prelaunch.scheduler_selected_reviewers
+    assert any(f"{FAILED_SEAT_SCHEDULER_REASON}: Antigravity" in reason for reason in prelaunch.scheduler_reasons)
+    # Every forcing precedes round 4; without the rebuilt retry, round 3's
+    # scheduler would have paused the seat.
+    assert forced and all(latest <= 3 and seats == {"Antigravity"} for latest, _d, seats in forced)
+    _latest, last_decision, _seats = forced[-1]
+    assert "Antigravity" not in last_decision.selected_reviewers
+    assert "Antigravity" in {name for name, _reason in last_decision.paused_reviewers}
+    # Forcing only adds a seat: every seat the scheduler selected stays selected.
+    assert set(last_decision.selected_reviewers) <= set(prelaunch.scheduler_selected_reviewers)
+    # The failed seat never counted as approving round 2.
+    assert not any(r.agent == "Antigravity" and r.round_number <= 2 for r in records if r.role == "reviewer")
+    # Row plan-restart-retry-already-done: Antigravity reviewed in round 3,
+    # so round 4's ordinary remediation pause stands.
+    assert pending_failed_seat_retries(
+        PostedRoundRecord(index=i, metadata=m, body="") for i, m in enumerate(records)
+        if m.round_number <= 3) == frozenset()
+    round_four = _round_prelaunch(runner, 4)
+    assert "Antigravity" not in round_four.scheduler_selected_reviewers
+    assert not any(FAILED_SEAT_SCHEDULER_REASON in reason for reason in round_four.scheduler_reasons)

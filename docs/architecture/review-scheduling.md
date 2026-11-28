@@ -450,8 +450,9 @@ coder (PR) or planner revision (plan). The shared rule lives in
   the carried-panel no-dispatch shortcut and the migration re-probe.
 - **Invoked again.** The seat is not quarantined for the run: the next round
   invokes it again, and a selective (PR or staged plan) scheduler force-selects
-  it with a logged reason. A PR restart rebuilds the pending retry from the
-  latest reconciliation record until the seat publishes a review.
+  it with a logged reason. A PR or staged-plan restart rebuilds the pending
+  retry from the latest reconciliation record until the seat publishes a
+  review.
 - **Plan resume.** A rerun of a reconciled sequential plan round whose only
   missing reviews are the recorded failed seats re-invokes those seats in the
   same round, resumes the healthy reviews and posts a fresh reconciliation

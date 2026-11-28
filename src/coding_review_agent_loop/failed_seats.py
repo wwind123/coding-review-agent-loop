@@ -210,7 +210,7 @@ def plan_round_retries_failed_seats(current_resume, *, round_reviewers, resumed,
 def pending_failed_seat_retries(records) -> frozenset[str]:
     """Failed seats still owed a retry, reconstructed from durable records.
 
-    The latest PR reconciliation summary names the seats that failed in its
+    The latest PR or plan reconciliation summary names the seats that failed in its
     round.  A named seat is still pending until it publishes a reviewer
     record after that summary, so a restart (or a closed-round rollover)
     keeps force-selecting it under selective policies.  Selecting an extra
