@@ -82,6 +82,31 @@ def test_cache_projection_roundtrip_and_loss_preserves_lifecycle(attachment):
     assert codec.report(history(*success()), repo='OWNER/REPO', pr=77, head=HEAD) is None
 
 
+def test_report_contains_a_prefix_pass_stop(attachment, monkeypatch):
+    """#2076: a stop from the prefix reduce_history pass stays inside report()."""
+    from coding_review_agent_loop import review_images_state
+    value = attachment()
+    h = admitted_report(value)
+    assert codec.report(h, repo='OWNER/REPO', pr=77, head=HEAD) == value
+    real = review_images_state.reduce_history
+    calls = []
+
+    def first_admits_then_stop(history_arg, **kwargs):
+        calls.append(history_arg)
+        if len(calls) == 1:
+            admission = real(history_arg, **kwargs)
+            assert admission.terminal is h[-1]
+            return admission
+        raise HumanDecisionRequiredError.decision(
+            what='prefix stop', clear='clear', safe_to_automate=False, automation_note='note',
+        )
+
+    monkeypatch.setattr(codec, 'reduce_history', first_admits_then_stop)
+    assert codec.report(h, repo='OWNER/REPO', pr=77, head=HEAD) is None
+    assert len(calls) == 2
+    assert calls[0] is h and calls[1] is not h and calls[1].complete
+
+
 @pytest.mark.parametrize('damage', ['symlink', 'bytes', 'inventory', 'binding', 'permissions'])
 def test_cache_tampering_never_supplies_coverage(attachment, damage):
     value = attachment()

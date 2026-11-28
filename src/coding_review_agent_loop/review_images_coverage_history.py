@@ -114,7 +114,11 @@ def report(history, *, repo, pr, head):
     # Later heads must not alter this terminal's original-assessment lineage.
     prefix = History((r for r in history if r.index <= terminal.index), identities=history.identities,
                      repo=repo, pr=pr, complete=True)
-    admitted = reduce_history(prefix, repo=repo, pr=pr, head=head)
+    try:
+        admitted = reduce_history(prefix, repo=repo, pr=pr, head=head)
+    except HumanDecisionRequiredError:
+        # A prefix of an admitted history cannot be refused; the shield keeps the static stop graph exact (#2076).
+        return None
     value = terminal.metadata.screenshot_coverage
     if not isinstance(value, dict):
         return None
