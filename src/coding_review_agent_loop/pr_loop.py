@@ -3846,8 +3846,12 @@ def run_pr_loop(
             panel_evidence: PrPanelEvidence | None = None
             superseded_prepanel_reviews: dict[str, PostedRoundRecord] = {}
             # Completed reviews of the resumed round recorded before any
-            # qualified panel opening (#840); their recovery keeps its own
-            # same-round route and is never rolled over (#1553).
+            # qualified panel opening (#840); each needs a fresh post-opening
+            # turn.  The set blocks the reconciled-round rollover shortcut, and
+            # a reconciled round with a blocking or new-item one keeps its
+            # pre-panel stop.  In an unreconciled round a published one feeds
+            # the round-wide closure, which can close the round incomplete and
+            # roll it over (#2064, #2080).
             prepanel_unqualified_reviews: set[str] = set()
             if scheduler_capabilities.requires_primary:
                 panel_history_error: AgentLoopError | None = None
@@ -9596,10 +9600,10 @@ def run_pr_loop(
                 raise
             except AgentLoopError as coder_followup_error:
                 if coder_ci_guarded:
-                    # A rejected guarded turn (a failed format repair, or a
-                    # rejection after semantic correction) posts no coder
-                    # comment, so the dispatch backstop publishes on its own
-                    # (#1366).
+                    # A rejected guarded turn never reaches the normal coder
+                    # comment's audit note, so its dispatch backstop publishes
+                    # here on its own (#1366); a head-moving rejection's
+                    # degraded or synthesized coder record is separate (#2087).
                     publish_rejected_coder_turn_dispatch_audit(
                         runner,
                         config,
@@ -9618,8 +9622,8 @@ def run_pr_loop(
             coder_dispatch_audit_note = ""
             if coder_ci_guarded:
                 # Backstop for a dispatch that bypassed the gh guard, run after
-                # the turn's last coder continuation (format repair, semantic
-                # correction) so their dispatches are covered too: a visible,
+                # the turn's last coder continuation (semantic correction)
+                # so its dispatches are covered too: a visible,
                 # non-authoritative diagnostic, never qualification, and never
                 # a round blocker (#1366).
                 coder_dispatch_audit_note = coder_turn_dispatch_audit_note(

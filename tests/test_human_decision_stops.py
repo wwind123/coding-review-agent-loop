@@ -979,7 +979,6 @@ KNOWN_TRANSPORT_FALLBACKS = {
     "pr_loop:_pr_reviewer_worker": "PR reviewer turn failure is recorded per seat",
     "review_images_coverage_run:gate": "visual coverage turn degrades to unavailable evidence",
     "triage:run_issue_triage": "advisory triage turn",
-    "execution_policy:_print_dry_run_execution_preview": "dry-run topology preview text (review item-6, deferred)",
     "discuss_loop:_run_discuss_semantic_finalization": "discuss semantic finalization turn failure keeps its degraded outcome",
     "child_plan_binding:_fresh_child_resume_command": "advisory resume-command hint; the real failure is raised elsewhere",
     "pr_loop_support:_pr_amendment_plan_board_hint": "advisory rerun hint text only",

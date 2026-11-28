@@ -1527,3 +1527,71 @@ def test_plan_first_one_shot_selected_child_valid_canonical_record_resumes(tmp_p
     assert not any(
         "<!-- AGENT_ISSUE_PR_HANDOFF:" in comment for comment in runner.comments
     )
+
+
+def _preview_one_phase_topology():
+    from types import SimpleNamespace
+
+    phase = SimpleNamespace(
+        position=1, stage_id="stage-1", title="Only stage", automation="agent-pr",
+        depends_on_stage_ids=(), covered_scope_item_ids=("scope-1",),
+        execution_disposition="direct-implementation",
+    )
+    decomposition = SimpleNamespace(
+        phases=(phase,), final_integration_work=SimpleNamespace(status="none")
+    )
+    resolved = SimpleNamespace(requested_policy="auto", action="implement-by-phase")
+    return resolved, (decomposition, SimpleNamespace(status="none"))
+
+
+def _preview_route_line(output: str) -> str:
+    lines = [line for line in output.splitlines() if "resolved route:" in line]
+    assert len(lines) == 1, output
+    return lines[0]
+
+
+@pytest.mark.parametrize("two_line_what", [False, True])
+def test_dry_run_preview_prints_only_the_what_of_a_human_decision(
+    monkeypatch, capsys, two_line_what
+):
+    """#2075: a caught human-decision stop previews as one 'what'-only line."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    error = HumanDecisionRequiredError.decision(
+        what="Stage stage-1 has an ambiguous route.",
+        clear="Amend the plan, then rerun the same command.",
+        safe_to_automate=False,
+        automation_note="an operator must choose the route",
+    )
+    if two_line_what:
+        error = error.with_context("Extra context line.")
+
+    def _raise(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(execution_policy, "resolve_child_execution_route", _raise)
+    resolved, topology = _preview_one_phase_topology()
+    execution_policy._print_dry_run_execution_preview(
+        issue_number=7, resolved=resolved, normalized_topology=topology
+    )
+    output = capsys.readouterr().out
+    line = _preview_route_line(output)
+    assert "human decision required (Stage stage-1 has an ambiguous route." in line
+    if two_line_what:
+        assert "Extra context line.)" in line
+    assert "To clear" not in output
+    assert "Safe to automate" not in output
+    assert "Remaining child work: none." in output
+
+
+def test_dry_run_preview_keeps_the_fallback_for_other_errors(monkeypatch, capsys):
+    def _raise(*_args, **_kwargs):
+        raise AgentLoopError("route lookup failed")
+
+    monkeypatch.setattr(execution_policy, "resolve_child_execution_route", _raise)
+    resolved, topology = _preview_one_phase_topology()
+    execution_policy._print_dry_run_execution_preview(
+        issue_number=7, resolved=resolved, normalized_topology=topology
+    )
+    line = _preview_route_line(capsys.readouterr().out)
+    assert line.endswith("resolved route: human decision required (route lookup failed)")

@@ -63,6 +63,7 @@ from .errors import (
     DependencyNotMergedError,
     HumanDecisionRequiredError,
     UnmetDependency,
+    parse_human_decision,
     reraise_human_decision,
 )
 from .integration_close import require_child_closed_or_report
@@ -1391,6 +1392,11 @@ def _print_dry_run_execution_preview(
             route_text = resolve_child_execution_route(
                 phase, topology_source=EXECUTION_TOPOLOGY_SOURCE
             ).disposition
+        except HumanDecisionRequiredError as exc:
+            # The preview shows only the 'what' part on one line (#2075).
+            parts = parse_human_decision(str(exc))
+            what = parts.what if parts is not None else str(exc)
+            route_text = f"human decision required ({' '.join(what.split())})"
         except AgentLoopError as exc:
             route_text = f"human decision required ({exc})"
         print(f"   declared disposition: {declared}; resolved route: {route_text}")
