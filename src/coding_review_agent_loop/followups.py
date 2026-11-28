@@ -1641,6 +1641,7 @@ def _format_plan_approval_summary_with_followups(
     publication_details: str | None = None,
     plan_char_budget: int | None = None,
     implementation_notes: object | None = None,
+    delivered_as_notes: int = 0,
 ) -> str:
     approved_plan = _bounded_approved_plan_text(approved_plan, budget=plan_char_budget)
     lines = [
@@ -1705,12 +1706,51 @@ def _format_plan_approval_summary_with_followups(
                 "item IDs are not PR prior review items.",
             ]
         )
+    if delivered_as_notes > 0:
+        # Fixed-size line (#2192): the text already appears in the notes section.
+        lines.extend(
+            [
+                "",
+                f"{delivered_as_notes} planning future follow-up(s) were already delivered "
+                "to the implementer as implementation notes and were not filed as issues.",
+            ]
+        )
     # Fixed-bounded notes section (#2145); never a filed-issue source.
     from .plan_implementation_notes import render_approval_section
 
     lines.extend(render_approval_section(implementation_notes))
     lines.extend(["", "-- coding-review-agent-loop"])
     return "\n".join(lines)
+
+
+def _split_delivered_followup_sources(
+    sources: Sequence[PlanApprovedFollowupSource],
+    implementation_notes: object | None,
+) -> tuple[list[PlanApprovedFollowupSource], list[PlanApprovedFollowupSource]]:
+    """Split sources into (filed, delivered-as-implementation-notes) (#2192).
+
+    Structural rule: a planning future follow-up whose text has the same
+    normalized note key as an implementation note this approval actually
+    delivers is not filed again.  Unavailable notes, or notes left out by the
+    collection bounds, never suppress filing.
+    """
+    from .plan_implementation_notes import PlanImplementationNotes, normalize_note_key
+
+    if (
+        not isinstance(implementation_notes, PlanImplementationNotes)
+        or implementation_notes.unavailable_reason is not None
+        or not implementation_notes.notes
+    ):
+        return list(sources), []
+    delivered = {normalize_note_key(note.text) for note in implementation_notes.notes}
+    filed: list[PlanApprovedFollowupSource] = []
+    delivered_sources: list[PlanApprovedFollowupSource] = []
+    for source in sources:
+        if normalize_note_key(source.text) in delivered:
+            delivered_sources.append(source)
+        else:
+            filed.append(source)
+    return filed, delivered_sources
 
 
 def _publish_plan_approved_followups(
@@ -1751,6 +1791,15 @@ def _publish_plan_approved_followups(
         )
         return False
 
+    sources, delivered_sources = _split_delivered_followup_sources(
+        sources, implementation_notes
+    )
+    if delivered_sources:
+        log(
+            config,
+            f"Planning future follow-ups for issue #{issue_number}: "
+            f"{len(delivered_sources)} already delivered as implementation notes; not filed",
+        )
     semantic_matcher = None
     semantic_provider_matcher: SemanticDedupeMatcher | None = None
     if filing_enabled and config.semantic_followup_dedupe and not config.dry_run:
@@ -1840,6 +1889,7 @@ def _publish_plan_approved_followups(
                 publication_details=publication_details,
                 plan_char_budget=plan_char_budget,
                 implementation_notes=implementation_notes,
+                delivered_as_notes=len(delivered_sources),
             ),
             issue_number=issue_number,
             plan_hash=plan_hash,

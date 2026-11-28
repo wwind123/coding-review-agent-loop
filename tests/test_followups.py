@@ -2054,3 +2054,123 @@ def test_reapproved_identical_plan_in_a_new_scope_posts_one_supplement(tmp_path)
         implementation_notes=rerun_notes, **kwargs,
     )
     assert len(posted) == 1
+
+
+# --- #2192: a planning follow-up delivered as an implementation note is not filed ---
+
+_DELIVERED_NOTE = "Update the pinned inventory in tests/test_help_registry.py."
+_ORDINARY_FOLLOWUP = "Split the transport rewrite into its own stage."
+_DELIVERED_LINE = (
+    "planning future follow-up(s) were already delivered to the implementer as "
+    "implementation notes and were not filed as issues."
+)
+
+
+def _plan_source(item_id, text):
+    from coding_review_agent_loop.followups import PlanApprovedFollowupSource
+
+    return PlanApprovedFollowupSource(item_id=item_id, reviewer="codex", source_round=1, text=text)
+
+
+def _publish_with_notes(runner, tmp_path, *, sources, notes, issue_comments=()):
+    return _publish_plan_approved_followups(
+        runner,
+        config=make_config(tmp_path, approved_followups="fix-and-issue", semantic_followup_dedupe=False),
+        issue_number=2192,
+        approved_plan="Approved plan summary.",
+        plan_hash="bfb7d4c6710af8c0",
+        plan_subject="subject-2192",
+        issue_comments=list(issue_comments),
+        sources=sources,
+        source_context=_source(parent=2192),
+        implementation_notes=notes,
+    )
+
+
+def _filed_text(runner):
+    return "\n".join(issue["title"] + issue["body"] for issue in runner.issues)
+
+
+def test_delivered_note_is_not_filed_but_ordinary_followup_is_2192(tmp_path):
+    """Matrix rows `delivered-note-not-filed` and `ordinary-followup-filed`."""
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/901"])
+    restated = "  update the PINNED inventory\n in tests/test_help_registry.py.  "
+
+    assert _publish_with_notes(
+        runner, tmp_path,
+        sources=[_plan_source("item-1", restated), _plan_source("item-2", _ORDINARY_FOLLOWUP)],
+        notes=_collected_notes(_DELIVERED_NOTE),
+    ) is True
+
+    assert len(runner.issues) == 1
+    filed = _filed_text(runner)
+    assert _ORDINARY_FOLLOWUP in filed
+    assert "inventory" not in filed.casefold()
+    announcement = runner.comments[-1]
+    assert "Filed future follow-up issues:" in announcement
+    assert f"1 {_DELIVERED_LINE}" in announcement
+    assert f"- {_DELIVERED_NOTE} (Codex, Claude)" in announcement
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in announcement
+
+
+def test_all_sources_delivered_still_posts_announcement_2192(tmp_path):
+    """Matrix row `delivered-note-not-filed`: every source delivered (edge case e)."""
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/901"])
+
+    assert _publish_with_notes(
+        runner, tmp_path,
+        sources=[_plan_source("item-1", _DELIVERED_NOTE)],
+        notes=_collected_notes(_DELIVERED_NOTE),
+    ) is True
+
+    assert runner.issues == []
+    announcement = runner.comments[-1]
+    assert f"1 {_DELIVERED_LINE}" in announcement
+    assert "Filed future follow-up issues:" not in announcement
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in announcement
+
+
+@pytest.mark.parametrize(
+    "notes_fields",
+    [
+        {"unavailable_reason": "no authenticated plan reviewer records"},
+        {"omitted_only": True},
+    ],
+)
+def test_undelivered_notes_never_suppress_filing_2192(tmp_path, notes_fields):
+    """Matrix row `notes-unavailable-files`: unavailable or omitted notes."""
+    from coding_review_agent_loop.plan_implementation_notes import PlanImplementationNotes
+
+    if notes_fields.get("omitted_only"):
+        # The matching note was cut by the collection bounds: only a count remains.
+        notes = _collected_notes("A different delivered note.", omitted=1)
+    else:
+        notes = PlanImplementationNotes(**notes_fields)
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/901"])
+
+    assert _publish_with_notes(
+        runner, tmp_path, sources=[_plan_source("item-1", _DELIVERED_NOTE)], notes=notes,
+    ) is True
+
+    assert len(runner.issues) == 1
+    assert "inventory" in _filed_text(runner)
+    assert _DELIVERED_LINE not in runner.comments[-1]
+
+
+def test_resume_after_announcement_files_nothing_2192(tmp_path):
+    """Matrix row `resume-idempotent`."""
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/901"])
+    sources = [_plan_source("item-1", _DELIVERED_NOTE), _plan_source("item-2", _ORDINARY_FOLLOWUP)]
+    notes = _collected_notes(_DELIVERED_NOTE)
+    assert _publish_with_notes(runner, tmp_path, sources=sources, notes=notes) is True
+    announcement = runner.comments[-1]
+    issues_before, comments_before = len(runner.issues), len(runner.comments)
+
+    rerun = _publish_with_notes(
+        runner, tmp_path, sources=sources, notes=notes,
+        issue_comments=[SimpleNamespace(body=announcement)],
+    )
+
+    assert rerun is False
+    assert len(runner.issues) == issues_before == 1
+    assert len(runner.comments) == comments_before

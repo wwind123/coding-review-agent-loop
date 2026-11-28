@@ -3295,7 +3295,11 @@ within the current plan's design (a small addition with no new mechanism) in
 `same_plan_followups` rather than `blocking_plan_issues`; step-back and stall
 counting is unchanged. In `--approved-followups=issue` and `fix-and-issue` modes,
 when implementation will continue after approval, plan-stage future follow-ups
-are filed as separate issues before implementation starts. If implementation
+are filed as separate issues before implementation starts. Future follow-ups
+are only for independent later work that survives the merge of this change;
+advice for the implementer goes in implementation notes, and a planning future
+follow-up whose normalized text matches an implementation note delivered by the
+same approval is listed as delivered and not filed (#2192). If implementation
 continues but issue filing is disabled, they are summarized inline with a note
 that they are not carried into PR review. Planning `item-*` IDs visible in issue
 history are not PR prior review items unless they appear in the active PR

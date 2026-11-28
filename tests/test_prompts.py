@@ -498,6 +498,11 @@ this PR to be merge-ready, such as a broader scaling or performance refinement
 for very large histories. Do not put small cleanup in touched or directly
 adjacent code under Future follow-ups; classify it as Same-PR if it should be
 done before merge, otherwise omit it.
+`future_followups` is only for independent later work that survives the
+merge of this PR. Advice for the implementer of this PR belongs in a
+non-blocking note in the review `summary` (or in current-PR work when it must
+be done before merge), never in `future_followups`. A note about code outside
+the change, or about later work, still belongs in `future_followups`.
 Approved means there are no blocking issues, no Same-PR follow-ups, and no
 carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to Claude and require another review
@@ -531,6 +536,11 @@ adjacent code under Future follow-ups. Indentation/style cleanup in touched
 code should be omitted unless worth requiring before merge; duplicated helper
 or prompt wording introduced by this PR should make the review blocking if it
 must be fixed now.
+`future_followups` is only for independent later work that survives the
+merge of this PR. Advice for the implementer of this PR belongs in a
+non-blocking note in the review `summary` (or in current-PR work when it must
+be done before merge), never in `future_followups`. A note about code outside
+the change, or about later work, still belongs in `future_followups`.
 Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
@@ -6936,7 +6946,8 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     blocked-requirement guidance from #2120, and the plan-review
     implementation-notes list and guidance from #2145, and the shared
     all-background-work coder rule from #2157, and the reachable-today
-    blocking-scope criterion from #2164.
+    blocking-scope criterion from #2164, and the future-follow-up scope
+    guidance from #2192.
     """
     import json as _golden_json
     import os as _golden_os
@@ -7824,3 +7835,63 @@ def test_plan_review_prompt_routes_hypothetical_beyond_issue_criteria_to_future_
     review_guidance = prompts_module.render_plan_added_criteria_review_guidance()
     assert prompts_module.render_plan_added_criteria_guidance() not in prompt
     assert "Plan-added criteria: a requirement" not in review_guidance
+
+
+# --- #2192: future follow-ups vs. advice for the implementer of this change ---
+
+from coding_review_agent_loop.prompts import _future_followup_scope_guidance  # noqa: E402
+
+_PLAN_FLOW_SENTENCE = (
+    "`future_followups` is only for independent later work that survives the\n"
+    "merge of the change this plan produces."
+)
+_PR_FLOW_SENTENCE = (
+    "`future_followups` is only for independent later work that survives the\n"
+    "merge of this PR."
+)
+
+
+def test_future_followup_scope_guidance_is_static_per_flow():
+    plan = _future_followup_scope_guidance("plan")
+    pr = _future_followup_scope_guidance("pr")
+    assert plan.startswith(_PLAN_FLOW_SENTENCE)
+    assert "belongs in `implementation_notes`, never in `future_followups`" in plan
+    assert pr.startswith(_PR_FLOW_SENTENCE)
+    assert "non-blocking note in the review `summary`" in pr
+    for text in (plan, pr):
+        assert "code outside the change, or about later work, still belongs" in " ".join(text.split())
+
+
+def test_plan_review_prompts_carry_future_followup_scope_2192(tmp_path):
+    config = make_config(tmp_path)
+    reviewers_prefixes = []
+    for reviewer, round_number in (("codex", 2), ("codex", 3)):
+        compact = build_plan_review_prompt(
+            56, round_number, f"Plan tail {round_number}.", config, reviewer=reviewer,
+            issue_context=_compact_issue_context(), compact_context=True,
+            compact_tail=CompactPlanTailContext(subject=f"s-{round_number}", action="Review."),
+        )
+        prefix, _ = compact.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert _PLAN_FLOW_SENTENCE in prefix
+        assert "is never a\nfuture follow-up." in prefix
+        reviewers_prefixes.append(prefix.encode())
+    assert reviewers_prefixes[0] == reviewers_prefixes[1]
+    inline = build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex", compact_context=False)
+    assert _PLAN_FLOW_SENTENCE in inline
+    assert "is never a\nfuture follow-up." in inline
+    assert _PR_FLOW_SENTENCE not in inline
+
+
+@pytest.mark.parametrize("approved_followups", ["fix-and-issue", "issue"])
+def test_pr_review_prompts_carry_future_followup_scope_2192(tmp_path, approved_followups):
+    config = make_config(tmp_path, approved_followups=approved_followups)
+    assert _PR_FLOW_SENTENCE in _build_followup_guidance(config)
+    for compact in (False, True):
+        prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+        assert _PR_FLOW_SENTENCE in prompt
+        assert _PLAN_FLOW_SENTENCE not in prompt
+
+
+def test_ignore_followup_guidance_has_no_future_followup_scope_2192(tmp_path):
+    config = make_config(tmp_path, approved_followups="ignore")
+    assert _PR_FLOW_SENTENCE not in _build_followup_guidance(config)
