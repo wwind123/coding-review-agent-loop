@@ -671,6 +671,24 @@ def _plan_review_volatile_blocks(
     )
 
 
+def _future_followup_scope_guidance(flow: str) -> str:
+    """Static guidance separating future work from implementer advice (#2192)."""
+    if flow == "plan":
+        return """`future_followups` is only for independent later work that survives the
+merge of the change this plan produces. Advice for the implementer of this plan
+(step ordering, fixture or inventory updates, what to link from this PR)
+belongs in `implementation_notes`, never in `future_followups`. A note about
+code outside the change, or about later work, still belongs in
+`future_followups`.
+"""
+    return """`future_followups` is only for independent later work that survives the
+merge of this PR. Advice for the implementer of this PR belongs in a
+non-blocking note in the review `summary` (or in current-PR work when it must
+be done before merge), never in `future_followups`. A note about code outside
+the change, or about later work, still belongs in `future_followups`.
+"""
+
+
 def _plan_review_implementation_notes_guidance() -> str:
     """The implementation-note qualification test (#2145), shared by both plan-review prompts."""
     return """`implementation_notes` holds non-blocking notes for the implementer. A
@@ -687,7 +705,9 @@ or `same_plan_followups`; when in doubt, the finding blocks. Implementation
 notes never block, are allowed in approved and blocking reviews, are not carried
 items or planner work, and are never filed as issues: on approval they are
 listed in the approval comment and passed to the implementer and the PR
-reviewers as non-binding context.
+reviewers as non-binding context. Implementer-directed advice for this plan is
+an implementation-note candidate when it meets tests (a)-(c), and is never a
+future follow-up.
 """
 
 
@@ -733,7 +753,8 @@ implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
 plan is approved; they are allowed in both approved and blocking plan reviews,
 never block, are not required work for the planner, and are published when the
-plan is approved. Classify each finding in this order. First decide scope
+plan is approved.
+""" + _future_followup_scope_guidance("plan") + """Classify each finding in this order. First decide scope
 eligibility under the blocking scope criteria: a finding that is not eligible
 goes in `future_followups` or is omitted, however small it is, and never becomes
 `same_plan_followups` or `blocking_plan_issues` work; that includes a trivially
@@ -1852,7 +1873,8 @@ implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
 plan is approved; they are allowed in both approved and blocking plan reviews,
 never block, are not required work for the planner, and are published when the
-plan is approved. Classify each finding in this order. First decide scope
+plan is approved.
+{_future_followup_scope_guidance('plan')}Classify each finding in this order. First decide scope
 eligibility under the blocking scope criteria: a finding that is not eligible
 goes in `future_followups` or is omitted, however small it is, and never becomes
 `same_plan_followups` or `blocking_plan_issues` work; that includes a trivially
@@ -2888,7 +2910,8 @@ regressions, security issues, or consistency gaps. `same_pr_followups` are
 small, localized cleanup in touched files or directly adjacent code that should
 be handled before merge, but is not itself a major correctness blocker.
 `future_followups` are independent later work that remains valid after this PR
-is merge-ready. Keep `blocking_items` and `same_pr_followups` mutually
+is merge-ready.
+{_future_followup_scope_guidance('pr')}Keep `blocking_items` and `same_pr_followups` mutually
 exclusive: a single current-PR concern belongs in exactly one of those lists.
 Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
@@ -3218,7 +3241,7 @@ this PR to be merge-ready, such as a broader scaling or performance refinement
 for very large histories. Do not put small cleanup in touched or directly
 adjacent code under Future follow-ups; classify it as Same-PR if it should be
 done before merge, otherwise omit it.
-Approved means there are no blocking issues, no Same-PR follow-ups, and no
+{_future_followup_scope_guidance('pr')}Approved means there are no blocking issues, no Same-PR follow-ups, and no
 carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to {coder_name} and require another review
 round before final approval. Before returning approved, self-check that no
@@ -3251,7 +3274,7 @@ adjacent code under Future follow-ups. Indentation/style cleanup in touched
 code should be omitted unless worth requiring before merge; duplicated helper
 or prompt wording introduced by this PR should make the review blocking if it
 must be fixed now.
-Do not use the Same-PR follow-ups section in this mode; mark the review blocking
+""" + _future_followup_scope_guidance("pr") + """Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
 local to the current PR; reclassify it as blocking current-PR work or omit it.
@@ -3669,7 +3692,8 @@ regressions, security issues, or consistency gaps. `same_pr_followups` are
 small, localized cleanup in touched files or directly adjacent code that should
 be handled before merge, but is not itself a major correctness blocker.
 `future_followups` are independent later work that remains valid after this PR
-is merge-ready. Keep `blocking_items` and `same_pr_followups` mutually
+is merge-ready.
+{_future_followup_scope_guidance('pr')}Keep `blocking_items` and `same_pr_followups` mutually
 exclusive: a single current-PR concern belongs in exactly one of those lists.
 Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
