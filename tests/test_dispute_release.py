@@ -475,14 +475,21 @@ def test_released_dispute_does_not_block_merge_conflict_routing(tmp_path):
         addressed_items=["item-1"], summary="Merged main and applied the decision.",
         human_requirement_ids=hr_ids,
     ))
+    # The reviewer still blocks after the merge-conflict round, so the coder
+    # answers that review before the final approval.
+    runner.claude_outputs.append(structured_coder_followup(
+        addressed_items=["item-1"], summary="Addressed the remaining review item.",
+        human_requirement_ids=hr_ids,
+    ))
 
-    try:
-        run_pr_loop(runner, pr_number=77, config=_config(tmp_path))
-    except AgentLoopError as exc:
-        assert not isinstance(exc, HumanDecisionRequiredError), exc
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path)) == 0
 
+    # Every scripted turn was used, so the run did not exit early.
+    assert runner.codex_outputs == []
+    assert runner.claude_outputs == []
     coder_prompts = [cmd[-1] for cmd in _coder_calls(runner)]
-    assert len(coder_prompts) >= 2
+    # Dispute, merge conflict, follow-up.
+    assert len(coder_prompts) == 3
     assert "has a merge conflict" in coder_prompts[1]
     (pointer,) = _pointer_lines(coder_prompts[1])
     assert hr_ids[0] in pointer
