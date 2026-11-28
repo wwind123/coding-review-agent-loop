@@ -1669,16 +1669,28 @@ class _PartialPublicationProbeRunner(FakeRunner):
         self.slow_reviewer = slow_reviewer
         self.reviewer_launches: list[str] = []
         self.peer_body_visible_at_launch = False
+        # Set once a non-slow reviewer's command has returned.  The slow
+        # reviewer's first turn waits for it before its own delay, so a slow
+        # CI host that starts the fast reviewer late cannot flip the order.
+        self._fast_reviewer_returned = threading.Event()
 
     def run_with_log(self, args, *, cwd, **kwargs):
         cmd = [str(arg) for arg in args]
-        if cmd[:1] in (["codex"], ["gemini"]) or (cmd[:1] == ["agy"] and "catalog" not in cmd):
-            self.reviewer_launches.append(cmd[0])
-            if any(marker in body for marker in self.round_markers for body in self.comments):
-                self.peer_body_visible_at_launch = True
-            slow = (self.slow_reviewer,) if isinstance(self.slow_reviewer, str) else tuple(self.slow_reviewer or ())
-            if cmd[0] in slow and self.reviewer_launches.count(cmd[0]) == 1:
-                time.sleep(0.2)
+        if not (cmd[:1] in (["codex"], ["gemini"]) or (cmd[:1] == ["agy"] and "catalog" not in cmd)):
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+        self.reviewer_launches.append(cmd[0])
+        if any(marker in body for marker in self.round_markers for body in self.comments):
+            self.peer_body_visible_at_launch = True
+        slow = (self.slow_reviewer,) if isinstance(self.slow_reviewer, str) else tuple(self.slow_reviewer or ())
+        if cmd[0] not in slow:
+            try:
+                return super().run_with_log(args, cwd=cwd, **kwargs)
+            finally:
+                self._fast_reviewer_returned.set()
+        if self.reviewer_launches.count(cmd[0]) == 1:
+            # Bounded: a round with no fast peer launch only pays the timeout.
+            self._fast_reviewer_returned.wait(timeout=5)
+            time.sleep(0.2)
         return super().run_with_log(args, cwd=cwd, **kwargs)
 
 
