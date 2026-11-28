@@ -2227,6 +2227,22 @@ def test_device_working_directory_keeps_outside_handling(tmp_path, command):
 
 
 @pytest.mark.parametrize("command", [
+    "pytest --config=/dev/null",
+    "pytest tests --config=/dev/null",
+    "pytest --config /dev/null",
+])
+def test_device_argument_role_equals_form_is_kept(tmp_path, command):
+    # The argument role treats the standard device path like the positional
+    # `pytest tests /dev/null` case, unlike the working-directory role
+    # (`--directory=`, `-C`), which keeps outside handling.
+    partition = _partition_2134(command, tmp_path)
+
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+    validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+
+
+@pytest.mark.parametrize("command", [
     "du -sk /tmp/scratch-main > /dev/null",
     "du -sk /tmp/scratch-main < /dev/null",
 ])
